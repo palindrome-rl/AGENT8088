@@ -671,7 +671,8 @@ def strip_tool_json(text: str) -> str:
 # ---------------------------------------------------------------------------
 def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
               on_calls=None, on_tool=None, on_result=None, on_answer=None,
-              on_token=None, interrupt_check=None, trace=None):
+              on_token=None, interrupt_check=None, trace=None,
+              system_prompt=None, tools_def=None, allowed_tools=None, depth=0):
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -686,6 +687,8 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     Returns the final answer string.
     """
     spin = spin or (lambda msg: nullcontext())
+    tools_def = tools_def if tools_def is not None else TOOLS_DEF
+    allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     seen = set()      # (name, args) signatures already run -> breaks loops
     forcing = False   # True after we've told a looping model to stop and answer
 
@@ -694,12 +697,13 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
             raise AgentInterrupted()
         with spin("thinking..."):
             response = create_completion(
-                client, messages, TOOLS_DEF, temperature=temperature, on_token=on_token,
+                client, messages, tools_def, temperature=temperature,
+                system_prompt=system_prompt, on_token=on_token,
             )
         content = response.choices[0].message.content or ""
         messages.append({"role": "assistant", "content": content})
 
-        calls = find_tool_calls(content)
+        calls = find_tool_calls(content, allowed_tools)
         if not calls:
             answer = strip_tool_json(content) or content.strip()
             if on_answer:
@@ -730,7 +734,7 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
             if on_tool:
                 on_tool(name)
             with spin(f"running {name}..."):
-                result = exec_tool(name, json.dumps(args))
+                result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
             if on_result:
                 on_result(name, result)

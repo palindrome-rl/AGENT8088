@@ -17,3 +17,16 @@ def test_find_tool_calls_alias_then_restrict(engine):
     assert engine.find_tool_calls(text, allowed={"execute_shell"})[0]["name"] == "execute_shell"
     # ...but rejected when execute_shell is not allowed:
     assert engine.find_tool_calls(text, allowed={"read_text"}) == []
+
+
+def test_run_agent_uses_custom_system_prompt_and_depth(engine):
+    fake = ScriptedModel(["Hello from the sub-agent."])
+    engine.create_completion = fake  # monkeypatch module global
+
+    msgs = [{"role": "user", "content": "say hi"}]
+    answer = engine.run_agent(
+        msgs, max_turns=3, system_prompt="CUSTOM-PROMPT", depth=1,
+    )
+    assert answer == "Hello from the sub-agent."
+    # The custom system prompt was forwarded to create_completion:
+    assert fake.calls[0]["kwargs"].get("system_prompt") == "CUSTOM-PROMPT"
