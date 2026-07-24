@@ -16,3 +16,6 @@ lancedb>=0.3.0
 
 # Web search integration
 requests>=2.31.0
+
+# Testing (dev)
+pytest>=7.0
