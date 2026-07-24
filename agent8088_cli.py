@@ -267,6 +267,35 @@ def on_result(name, result):
     console.print(line)
 
 
+def _handle_escalation(result_text):
+    """Check if a tool result is an escalation request. If so, prompt the user
+    for y/n approval and call grant_escalation() if approved. Returns True if
+    the result was an escalation request (handled or denied), False otherwise."""
+    if not result_text.startswith("ESCALATION_REQUEST:"):
+        return False
+    parts = result_text.split(":", 4)
+    if len(parts) < 5:
+        return False
+    _, target_mode, change_type, paths, reason = parts
+    console.print()
+    console.print(Panel(
+        Text(f"{reason}\n\nPaths: {paths}\nChange type: {change_type}\nRequested mode: {target_mode}"),
+        title="[bold yellow]Permission Escalation Request[/bold yellow]",
+        box=box.ROUNDED, border_style="yellow",
+    ))
+    try:
+        response = console.input("[bold]Approve? (y/n)[/bold] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        response = "n"
+    if response in ("y", "yes"):
+        A.grant_escalation()
+        console.print("[green]Permission granted — edit mode active for this session.[/green]")
+        return True
+    else:
+        console.print("[red]Permission denied — staying in readonly mode.[/red]")
+        return True
+
+
 def render_answer(answer):
     if not answer:
         console.print("[dim](no answer)[/dim]")
@@ -313,11 +342,18 @@ def do_chat(query):
             (reasoning_parts if kind == "reasoning" else content_parts).append(delta)
             live.update(_stream_view(reasoning_parts, content_parts))
 
+        def _on_result(name, result):
+            on_result(name, result)
+            if _handle_escalation(result):
+                # Escalation was handled; the tool didn't actually run.
+                # Tell the model to retry the tool now that we have edit access (if granted).
+                pass
+
         try:
             answer = A.run_agent(
                 S.messages, max_turns=S.max_turns, temperature=S.temperature,
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
-                on_result=on_result, on_answer=None, on_token=on_token,
+                on_result=_on_result, on_answer=None, on_token=on_token,
                 interrupt_check=esc.triggered.is_set, trace=trace,
             )
         except A.AgentInterrupted:
@@ -586,6 +622,10 @@ def _prompt_label():
 
 
 def main():
+    if "--edit" in sys.argv:
+        A.PERMISSION_MODE = "edit"
+        A.grant_escalation()
+        sys.argv.remove("--edit")
     banner()
     while True:
         try:

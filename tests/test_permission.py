@@ -103,3 +103,22 @@ def test_system_prompt_contains_permission_instructions():
     assert "edit" in sp
     assert "request_permission_escalation" in sp
     assert "escalation" in sp.lower()
+
+def test_escalation_message_format():
+    A.PERMISSION_MODE = "readonly"
+    msg = A.request_escalation("edit", ["/tmp/test.txt"], "new_file", "Write test.txt")
+    # Must start with ESCALATION_REQUEST: and contain the mode, change_type, paths, reason
+    parts = msg.split(":", 4)
+    assert parts[0] == "ESCALATION_REQUEST"
+    assert parts[1] == "edit"
+    assert parts[2] == "new_file"
+    assert "/tmp/test.txt" in parts[3]
+    assert "Write test.txt" in parts[4]
+
+def test_grant_escalation_persists():
+    A.PERMISSION_MODE = "readonly"
+    A.grant_escalation()
+    assert A.PERMISSION_MODE == "edit"
+    # Should persist (not auto-revert)
+    assert A.PERMISSION_MODE == "edit"
+    A.PERMISSION_MODE = "readonly"  # cleanup
