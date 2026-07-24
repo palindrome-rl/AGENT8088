@@ -2,7 +2,7 @@ execute_shell|Execute a shell command and return output|mode=shell|command={comm
 write_file|Write content to a file|mode=write_text|path_arg=filename|content_arg=content|timeout=10
 read_text|Read text from a file|mode=read_text|path_arg=filename|timeout=10
 web_search|Search the web for information|mode=http_get|url={search_base_url}{query_q}&format=json|timeout=25
-get_page_title|Fetch a webpage and extract its title|mode=shell|command=curl -s --max-time 15 "{url}" | grep -oP '(?<=<title>).*?(?=</title>)' | head -1|timeout=20
+get_page_title|Fetch a webpage and extract its title|mode=shell|command=python -c "import urllib.request,re,sys;h=urllib.request.urlopen(sys.argv[1]).read().decode(errors='ignore');m=re.search('<title>(.*?)</title>',h,re.S);print(m.group(1).strip() if m else 'No title')" {url}|timeout=20
 calculate|Evaluate a mathematical expression|mode=python_eval|expression={expression}|timeout=10
 last_output|Get full output from the last tool call|mode=last_output
 request_permission_escalation|Request write permission from the user|mode=escalation|args=target_mode,paths,change_type,reason|timeout=5

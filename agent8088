@@ -65,9 +65,16 @@ PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
 
 # Shell commands that are safe in readonly mode (inspection only)
 READONLY_SAFE_COMMANDS = frozenset([
+    # Unix
     "ls", "cat", "grep", "find", "head", "tail", "wc", "pwd", "whoami",
     "echo", "date", "uname", "df", "du", "free", "nproc", "uptime",
-    "git", "diff", "log", "status", "show", "branch",
+    "diff", "log", "status", "show", "branch",
+    # Windows
+    "dir", "type", "findstr", "where", "hostname", "ver", "vol",
+    "tasklist", "systeminfo", "wmic",
+    # Cross-platform
+    "git", "python", "pip", "node", "npm",
+    "curl", "wget",
 ])
 
 
@@ -551,8 +558,12 @@ def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) ->
 
 
 def _exec_shell_command(command: str, timeout: int = 25) -> str:
-    r = subprocess.run(command, shell=True, capture_output=True, text=True,
-                       timeout=timeout, executable="/bin/bash", cwd=str(SHELL_CWD))
+    if sys.platform == "win32":
+        r = subprocess.run(command, shell=True, capture_output=True, text=True,
+                           timeout=timeout, cwd=str(SHELL_CWD))
+    else:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True,
+                           timeout=timeout, executable="/bin/bash", cwd=str(SHELL_CWD))
     return (r.stdout + r.stderr).strip() or "✓ Command completed"
 
 
