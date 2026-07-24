@@ -15,9 +15,9 @@ banner_file=/home/amir/projects/agent8088/banner.txt
 allowed_paths=/home/amir/projects/agent8088,/tmp
 
 # --- model (Ornith-35B on Reality) ---
-model_base_url=http://192.168.1.12:8004/v1
-model_name=ornith-35b
-api_key=ollama
+model_base_url=http://127.0.0.1:8080/v1
+model_name=ornith-1.0-35b
+api_key=REDACTED_REVOKE_HISTORICAL_KEY
 timeout_seconds=120
 
 # --- Gemma fallback (only used when USE_GEMMA4=1) --- (default)

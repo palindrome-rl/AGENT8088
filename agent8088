@@ -6,7 +6,11 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import sys, readline, subprocess, json, re, os, threading, time  # readline enables input history
+import sys, subprocess, json, re, os, threading, time  # readline enables input history
+try:
+    import readline  # Unix-only; enables input history/editing
+except ImportError:
+    pass
 from contextlib import nullcontext
 from pathlib import Path
 from openai import OpenAI
@@ -46,6 +50,7 @@ SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).ex
 MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "http://localhost:11434/v1"))
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
+CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
 
 ALLOWED_PATHS = [
     Path(p.strip()).expanduser().resolve()
@@ -85,13 +90,43 @@ def get_client():
 client, MODEL_NAME = get_client()
 
 
-def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1):
+def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1, on_token=None):
     full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
     # NOTE: Ollama (current backend) rejects the OpenAI "tools" param, so the model emits
     # native ✿FUNCTION✿/✿ARGS✿ text instead. Pass tools= again when moving to llama-server.
-    return client.chat.completions.create(
-        model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature,
+    if on_token is None:
+        # Non-streaming path — unchanged (old REPL, benchmark, one-shot mode)
+        return client.chat.completions.create(
+            model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature,
+        )
+    # Streaming path — Rich UI passes on_token for live token-by-token rendering
+    stream = client.chat.completions.create(
+        model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature, stream=True,
     )
+    collected = []
+    for chunk in stream:
+        delta = chunk.choices[0].delta
+        rc = getattr(delta, "reasoning_content", None)
+        if rc:
+            on_token("reasoning", rc)
+        if delta.content:
+            on_token("content", delta.content)
+            collected.append(delta.content)
+    return _build_response("".join(collected))
+
+
+def _build_response(content):
+    """Reconstruct a ChatCompletion-like object from streamed content
+    so run_agent() can read .choices[0].message.content uniformly."""
+    return type("R", (), {"choices": [type("C", (), {
+        "message": type("M", (), {"content": content}),
+        "finish_reason": "stop",
+    })()]})
+
+
+class AgentInterrupted(Exception):
+    """Raised when the user interrupts the agent loop (e.g. ESC in the Rich UI)."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +262,7 @@ PLAINTEXT_BANNER = f"{_pt_title}\n" + (f"{_pt_author}\n" if _pt_author else "") 
 # ---------------------------------------------------------------------------
 _last_tool_output = ""
 _last_tool_name = ""
+_last_write_diff = None  # set by write_text tool for Rich UI diff display
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +463,7 @@ def _format_with_args(template: str, args: dict) -> str:
     return (template or "").format(**safe)
 
 
-def _exec_plan(args: dict) -> str:
+def _exec_plan(args: dict, on_step=None) -> str:
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
     if isinstance(raw, str):
@@ -440,6 +476,7 @@ def _exec_plan(args: dict) -> str:
         return "Error: execute_plan requires a list of steps or newline plan text."
 
     outputs = []
+    total = len(steps)
     for idx, step in enumerate(steps, 1):
         if isinstance(step, dict):
             step_text = str(step.get("step") or step.get("text") or "")
@@ -450,7 +487,11 @@ def _exec_plan(args: dict) -> str:
             step_text = str(step)
             tool_name = classify_plan_component(step_text)
             tool_args = _infer_step_args(tool_name, step_text, {})
+        if on_step:
+            on_step(idx, total, step_text, tool_name, "running", None)
         result = run_tool(tool_name, tool_args, allow_plan=False)
+        if on_step:
+            on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
     return "\n".join(outputs)
 
@@ -479,13 +520,16 @@ def run_tool(name: str, args: dict, allow_plan: bool = True) -> str:
         return resolve_user_path(fn).read_text()
 
     if mode == "write_text":
+        global _last_write_diff
         path_arg = spec.get("path_arg") or "filename"
         content_arg = spec.get("content_arg") or "content"
         fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
         content = str(args.get(content_arg, ""))
         target = resolve_user_path(fn)
         target.parent.mkdir(parents=True, exist_ok=True)
+        old_content = target.read_text() if target.exists() else ""
         target.write_text(content)
+        _last_write_diff = _make_diff(old_content, content, str(target))
         return f"Wrote {len(content)} bytes to {target}"
 
     if mode == "python_eval":
@@ -503,6 +547,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True) -> str:
         return _exec_shell_command(command, timeout=timeout)
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
+
+
+def _make_diff(old: str, new: str, filename: str) -> list:
+    """Return a unified diff as a list of lines for Rich UI colorized display."""
+    import difflib
+    if old == new:
+        return []
+    return list(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=f"{filename} (old)", tofile=filename, lineterm="",
+    ))
 
 
 def exec_tool(name: str, arguments: str) -> str:
@@ -585,7 +640,8 @@ def strip_tool_json(text: str) -> str:
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
 def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
-              on_calls=None, on_tool=None, on_result=None, on_answer=None, trace=None):
+              on_calls=None, on_tool=None, on_result=None, on_answer=None,
+              on_token=None, interrupt_check=None, trace=None):
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -594,6 +650,8 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
       on_tool(name)     -> just before a tool runs
       on_result(name, out) -> after a tool returns
       on_answer(answer) -> with the final answer (or the fallback)
+      on_token(kind, delta) -> streaming: called per token ('reasoning' or 'content')
+      interrupt_check()  -> returns True if the user interrupted (e.g. ESC); raises AgentInterrupted
     Pass a list as `trace` to collect a step-by-step record for training data.
     Returns the final answer string.
     """
@@ -602,8 +660,12 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     forcing = False   # True after we've told a looping model to stop and answer
 
     for turn in range(max_turns):
+        if interrupt_check and interrupt_check():
+            raise AgentInterrupted()
         with spin("thinking..."):
-            response = create_completion(client, messages, TOOLS_DEF, temperature=temperature)
+            response = create_completion(
+                client, messages, TOOLS_DEF, temperature=temperature, on_token=on_token,
+            )
         content = response.choices[0].message.content or ""
         messages.append({"role": "assistant", "content": content})
 

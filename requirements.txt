@@ -1,6 +1,7 @@
 # Core dependencies
 openai>=1.0.0
 httpx>=0.24.0
+rich>=13.0.0
 
 # Optional dependencies for training
 torch>=2.0.0
