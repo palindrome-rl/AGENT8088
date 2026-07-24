@@ -480,7 +480,7 @@ def _format_with_args(template: str, args: dict) -> str:
     return (template or "").format(**safe)
 
 
-def _exec_plan(args: dict, on_step=None) -> str:
+def _exec_plan(args: dict, on_step=None, depth: int = 0) -> str:
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
     if isinstance(raw, str):
@@ -506,14 +506,14 @@ def _exec_plan(args: dict, on_step=None) -> str:
             tool_args = _infer_step_args(tool_name, step_text, {})
         if on_step:
             on_step(idx, total, step_text, tool_name, "running", None)
-        result = run_tool(tool_name, tool_args, allow_plan=False)
+        result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
         if on_step:
             on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
     return "\n".join(outputs)
 
 
-def run_tool(name: str, args: dict, allow_plan: bool = True) -> str:
+def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     spec = TOOL_SPECS.get(name)
     if not spec:
         return f"Unknown tool: {name}"
@@ -529,7 +529,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True) -> str:
     if mode == "plan":
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
-        return _exec_plan(args)
+        return _exec_plan(args, depth=depth)
 
     if mode == "read_text":
         path_arg = spec.get("path_arg") or "filename"
@@ -577,7 +577,7 @@ def _make_diff(old: str, new: str, filename: str) -> list:
     ))
 
 
-def exec_tool(name: str, arguments: str) -> str:
+def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     global _last_tool_output, _last_tool_name
     try:
         args = json.loads(arguments)
@@ -585,7 +585,7 @@ def exec_tool(name: str, arguments: str) -> str:
         return "Invalid JSON"
 
     try:
-        result = run_tool(name, args)
+        result = run_tool(name, args, depth=depth)
     except subprocess.TimeoutExpired:
         result = "Command timed out"
     except Exception as e:
