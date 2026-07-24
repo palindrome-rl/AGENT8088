@@ -268,17 +268,23 @@ def on_result(name, result):
     console.print(line)
 
 
-def _handle_escalation(result_text, messages=None):
+def _handle_escalation(result_text, messages=None, live=None):
     """Check if a tool result is an escalation request. If so, prompt the user
     with an Allow/Decline selection and call grant_escalation() if approved.
     Returns True if the result was an escalation request (handled or denied),
-    False otherwise. If messages is provided, injects a retry hint on approval."""
+    False otherwise. If messages is provided, injects a retry hint on approval.
+    If live is provided, stops it before prompting and resumes after."""
     if not result_text.startswith("ESCALATION_REQUEST:"):
         return False
     parts = result_text.split(":", 4)
     if len(parts) < 5:
         return False
     _, target_mode, change_type, paths, reason = parts
+
+    # Stop the live display so the prompt can capture stdin
+    if live is not None:
+        live.stop()
+
     console.print()
     console.print(Panel(
         Text(f"{reason}\n\nPaths: {paths}\nChange type: {change_type}\nRequested mode: {target_mode}"),
@@ -294,20 +300,25 @@ def _handle_escalation(result_text, messages=None):
         )
     except (EOFError, KeyboardInterrupt):
         response = "Decline"
+
     if response == "Allow":
         A.grant_escalation()
         console.print("[green]Permission granted — edit mode active for this session.[/green]")
         if messages is not None:
             messages.append({"role": "user", "content":
                 "Permission granted. You now have edit access. Retry the tool call that was blocked."})
-        return True
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
         if messages is not None:
             messages.append({"role": "user", "content":
                 "Permission denied by the user. You remain in readonly mode. "
                 "Tell the user what you could not do and why the task cannot be completed."})
-        return True
+
+    # Resume the live display
+    if live is not None:
+        live.start()
+
+    return True
 
 
 def render_answer(answer):
@@ -358,7 +369,7 @@ def do_chat(query):
 
         def _on_result(name, result):
             on_result(name, result)
-            if _handle_escalation(result, S.messages):
+            if _handle_escalation(result, S.messages, live):
                 # Escalation was handled. If granted, a retry hint was injected
                 # into S.messages so the model will re-attempt the blocked tool.
                 pass

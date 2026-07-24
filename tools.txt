@@ -5,4 +5,3 @@ web_search|Search the web for information|mode=http_get|url={search_base_url}{qu
 get_page_title|Fetch a webpage and extract its title|mode=shell|command=python -c "import urllib.request,re,sys;h=urllib.request.urlopen(sys.argv[1]).read().decode(errors='ignore');m=re.search('<title>(.*?)</title>',h,re.S);print(m.group(1).strip() if m else 'No title')" {url}|timeout=20
 calculate|Evaluate a mathematical expression|mode=python_eval|expression={expression}|timeout=10
 last_output|Get full output from the last tool call|mode=last_output
-request_permission_escalation|Request write permission from the user|mode=escalation|args=target_mode,paths,change_type,reason|timeout=5
