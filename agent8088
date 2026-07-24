@@ -853,6 +853,11 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
             with spin(f"running {name}..."):
                 result = exec_tool(name, json.dumps(args))
             executed = True
+
+            # If blocked by permission gate, remove from seen so retry can run
+            if result.startswith("ESCALATION_REQUEST:"):
+                seen.discard(sig)
+
             if on_result:
                 on_result(name, result)
 
