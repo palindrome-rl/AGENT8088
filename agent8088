@@ -916,6 +916,10 @@ def main():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # The old REPL runs in edit mode by default (backward compatibility).
+    # The Rich UI manages PERMISSION_MODE explicitly.
+    if os.environ.get("AGENT8088_PERMISSION") is None and "--readonly" not in sys.argv:
+        PERMISSION_MODE = "edit"
     trace_mode = "--trace" in sys.argv  # emit full call chain as JSON to stderr
     if trace_mode:
         sys.argv.remove("--trace")

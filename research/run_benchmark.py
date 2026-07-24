@@ -4,6 +4,8 @@
 import subprocess, json, sys, os, time, re
 from pathlib import Path
 
+os.environ.setdefault("AGENT8088_PERMISSION", "edit")
+
 # run_benchmark.py lives in research/ but the agent8088 executable + config
 # stay at the repo root, so resolve one level up.
 PROJECT = Path(__file__).resolve().parent.parent

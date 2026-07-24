@@ -122,3 +122,22 @@ def test_grant_escalation_persists():
     # Should persist (not auto-revert)
     assert A.PERMISSION_MODE == "edit"
     A.PERMISSION_MODE = "readonly"  # cleanup
+
+def test_env_var_sets_edit_mode():
+    import importlib
+    os.environ['AGENT8088_PERMISSION'] = 'edit'
+    # Reload the module to pick up the env var
+    loader2 = SourceFileLoader('agent8088_core2', 'agent8088')
+    spec2 = importlib.util.spec_from_loader('agent8088_core2', loader2)
+    A2 = importlib.util.module_from_spec(spec2)
+    loader2.exec_module(A2)
+    assert A2.PERMISSION_MODE == "edit"
+    del os.environ['AGENT8088_PERMISSION']
+
+def test_env_var_defaults_to_readonly():
+    os.environ.pop('AGENT8088_PERMISSION', None)
+    loader3 = SourceFileLoader('agent8088_core3', 'agent8088')
+    spec3 = importlib.util.spec_from_loader('agent8088_core3', loader3)
+    A3 = importlib.util.module_from_spec(spec3)
+    loader3.exec_module(A3)
+    assert A3.PERMISSION_MODE == "readonly"
