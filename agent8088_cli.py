@@ -372,10 +372,14 @@ def _make_subagent_ui(live):
 # ---------------------------------------------------------------------------
 def _stream_view(reasoning_parts, content_parts):
     """While generating: reasoning (if any) shown dim/italic above the growing answer,
-    so the model's chain-of-thought never gets mistaken for its actual reply."""
+    so the model's chain-of-thought never gets mistaken for its actual reply. The
+    reasoning preview is capped so a runaway thinking block can't render megabytes."""
     blocks = []
     if reasoning_parts:
-        blocks.append(Panel(Text("".join(reasoning_parts), style="dim italic"),
+        reasoning = "".join(reasoning_parts)
+        if len(reasoning) > 2000:  # show only the live tail of long reasoning
+            reasoning = "… " + reasoning[-2000:]
+        blocks.append(Panel(Text(reasoning, style="dim italic"),
                             title="[dim]thinking[/dim]", box=box.MINIMAL, border_style="grey50"))
     if content_parts:
         blocks.append(Panel(Text("".join(content_parts)), title="[bold cyan]Agent8088[/bold cyan]",

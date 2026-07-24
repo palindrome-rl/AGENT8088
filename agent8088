@@ -723,6 +723,9 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except Exception as e:
         result = f"Error: {e}"
 
+    # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
+    result = _redact_secrets(result)
+
     if (TOOL_SPECS.get(name, {}).get("mode") or "").lower() != "last_output":
         _last_tool_output, _last_tool_name = result, name
     return result
@@ -820,6 +823,73 @@ def _attempted_tool_names(text: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Reasoning handling + safety guardrails
+# ---------------------------------------------------------------------------
+_THINK_BLOCK_RE = re.compile(
+    r'<(think|thinking|reason|reasoning|thought|scratchpad)>.*?</\1>',
+    re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(
+    r'<(?:think|thinking|reason|reasoning|thought|scratchpad)>.*$',
+    re.DOTALL | re.IGNORECASE)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove chain-of-thought blocks so they are never (a) stored in context —
+    where they pile up until the request blows the context window and the turn
+    crashes — nor (b) shown to the user as the final answer. Handles both a closed
+    <think>…</think> and a runaway, never-closed <think>… (drops the tail)."""
+    if not text:
+        return text
+    text = _THINK_BLOCK_RE.sub('', text)
+    text = _THINK_OPEN_RE.sub('', text)
+    return text.strip()
+
+
+# Secret values from config (api keys / tokens) — redacted from any tool output
+# or answer so `cat config.txt` / `env` etc. can't be used to exfiltrate them.
+_SECRET_VALUES = sorted(
+    {v for k, v in APP_CONFIG.items()
+     if any(s in k.lower() for s in ("key", "token", "secret", "password"))
+     and isinstance(v, str) and len(v) >= 12
+     and v.lower() not in ("ollama", "sk-dummy", "changeme", "your-api-key")},
+    key=len, reverse=True)
+
+
+def _redact_secrets(text: str) -> str:
+    if not text:
+        return text
+    for v in _SECRET_VALUES:
+        if v in text:
+            text = text.replace(v, "[redacted]")
+    return text
+
+
+# Distinctive lines of the base system prompt, used to detect a verbatim leak.
+_SYSTEM_FINGERPRINTS = [ln.strip() for ln in BASE_SYSTEM_PROMPT.splitlines()
+                        if len(ln.strip()) >= 40]
+
+
+def _is_system_leak(answer: str) -> bool:
+    """True if the answer appears to reproduce the confidential system prompt."""
+    if not answer or len(answer) < 60:
+        return False
+    hits = sum(1 for fp in _SYSTEM_FINGERPRINTS if fp in answer)
+    if hits >= 2:
+        return True
+    return len(answer) >= 200 and answer.strip()[:200] in BASE_SYSTEM_PROMPT
+
+
+def _guard_answer(answer: str) -> str:
+    """Final safety net on every answer: block system-prompt leaks and redact
+    secrets, no matter what the model produced (defense in depth vs. prompt
+    injection / data exfiltration — as in Hermes/Claude/Codex harnesses)."""
+    if _is_system_leak(answer):
+        return ("I can't share my internal system instructions or configuration. "
+                "Tell me what you'd like help with instead.")
+    return _redact_secrets(answer)
+
+
+# ---------------------------------------------------------------------------
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
 def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
@@ -845,16 +915,32 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     seen = set()      # (name, args) signatures already run -> breaks loops
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
+    empty_retries = 0    # times the model returned no answer (reasoning-only turn)
 
     for turn in range(max_turns):
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
-        with spin("thinking..."):
-            response = create_completion(
-                client, messages, tools_def, temperature=temperature,
-                system_prompt=system_prompt, on_token=on_token,
-            )
-        content = response.choices[0].message.content or ""
+        try:
+            with spin("thinking..."):
+                response = create_completion(
+                    client, messages, tools_def, temperature=temperature,
+                    system_prompt=system_prompt, on_token=on_token,
+                )
+        except AgentInterrupted:
+            raise
+        except Exception as e:
+            # Backend/model error (timeout, context overflow, 5xx): don't crash the
+            # turn — return the best we have, guarded.
+            fallback = _last_tool_output[:1000] if _last_tool_output else f"The model backend errored: {e}"
+            answer = _guard_answer(fallback)
+            if on_answer:
+                on_answer(answer)
+            return answer
+
+        # Strip chain-of-thought BEFORE storing: keeps runaway reasoning out of the
+        # context window (the usual cause of the "loops in the reasoning block" crash)
+        # and out of the user-facing answer.
+        content = _strip_reasoning(response.choices[0].message.content or "")
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, allowed_tools)
@@ -882,12 +968,28 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
                 continue
 
             answer = strip_tool_json(content)
+
+            # Reasoning-only / empty turn: nudge once for a plain answer rather than
+            # returning nothing (some models emit only chain-of-thought and stall).
+            if not answer and empty_retries < 1 and not forcing and not unknown:
+                empty_retries += 1
+                if on_result:
+                    on_result("error", "No answer produced — asking the model to respond.")
+                messages.append({"role": "user", "content":
+                    "You did not provide an answer. Reply now with your final answer in "
+                    "plain text. Do not think out loud and do not call any tools."})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "empty_answer"})
+                continue
+
             if not answer:
                 # Stripping removed everything (the message was ONLY a tool-call
-                # attempt) — never fall back to the raw markup.
+                # attempt or pure reasoning) — never fall back to the raw markup.
                 answer = (f"I tried to use a tool that isn't available. "
                           f"Available tools: {', '.join(sorted(allowed_tools)) or 'none'}."
-                          if unknown else "I don't have a further answer.")
+                          if unknown else "I wasn't able to produce an answer to that.")
+
+            answer = _guard_answer(answer)
             if on_answer:
                 on_answer(answer)
             if trace is not None:
@@ -948,7 +1050,7 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
                 "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
 
     # Max turns reached or forced stop: return the best answer we have.
-    fallback = _last_tool_output[:1000] if _last_tool_output else "Could not complete the task."
+    fallback = _guard_answer(_last_tool_output[:1000] if _last_tool_output else "Could not complete the task.")
     if on_answer:
         on_answer(fallback)
     if trace is not None:
