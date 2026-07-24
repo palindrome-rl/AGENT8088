@@ -56,3 +56,32 @@ def test_load_subagent_specs_parses_frontmatter(engine, tmp_path):
 def test_load_subagent_specs_missing_dir_has_default(engine, tmp_path):
     specs = engine.load_subagent_specs(tmp_path / "nope")
     assert "general-purpose" in specs  # built-in fallback
+
+
+def test_exec_subagent_depth_guard(engine):
+    # At/above max depth, refuse immediately (SUBAGENT_MAX_DEPTH default 1).
+    out = engine._exec_subagent({"task": "do a thing"}, depth=engine.SUBAGENT_MAX_DEPTH)
+    assert "depth" in out.lower()
+
+
+def test_exec_subagent_happy_path_and_isolation(engine, monkeypatch):
+    # Sub-agent immediately produces a final answer (no tool calls).
+    monkeypatch.setattr(engine, "create_completion",
+                        ScriptedModel(["Found 3 TODOs in the repo."]))
+    engine._last_tool_output = "PARENT-OUTPUT"  # parent state must survive
+    engine._last_tool_name = "execute_shell"
+
+    out = engine._exec_subagent(
+        {"agent_type": "general-purpose", "task": "count the TODOs"}, depth=0,
+    )
+    assert "Found 3 TODOs" in out
+    assert "general-purpose" in out  # result is labeled with the agent type
+    # Parent's last-output store was restored after the sub-run:
+    assert engine._last_tool_output == "PARENT-OUTPUT"
+    assert engine._last_tool_name == "execute_shell"
+
+
+def test_exec_subagent_unknown_type_falls_back(engine, monkeypatch):
+    monkeypatch.setattr(engine, "create_completion", ScriptedModel(["ok"]))
+    out = engine._exec_subagent({"agent_type": "does-not-exist", "task": "x"}, depth=0)
+    assert "unknown agent_type" in out.lower()

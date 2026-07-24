@@ -569,6 +569,51 @@ def _exec_plan(args: dict, on_step=None, depth: int = 0) -> str:
     return "\n".join(outputs)
 
 
+def _exec_subagent(args: dict, depth: int = 0) -> str:
+    """Run a delegated task in a fresh, tool-restricted sub-agent loop.
+    Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
+    global _last_tool_output, _last_tool_name, _last_write_diff
+
+    if depth >= SUBAGENT_MAX_DEPTH:
+        return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
+                "Complete the task yourself instead of delegating further.")
+
+    task = str(args.get("task") or args.get("prompt") or args.get("instruction") or "").strip()
+    if not task:
+        return "Error: spawn_subagent requires a non-empty 'task'."
+
+    type_name = str(args.get("agent_type") or args.get("type") or DEFAULT_SUBAGENT).strip()
+    profile = SUBAGENT_SPECS.get(type_name)
+    if profile is None:
+        available = ", ".join(sorted(SUBAGENT_SPECS)) or "(none)"
+        return f"Error: unknown agent_type '{type_name}'. Available: {available}."
+
+    # Restrict to the profile's tools that actually exist; sub-agents never get
+    # spawn_subagent (bounds recursion in addition to the depth guard).
+    allowed = {n for n in profile["tools"] if n in TOOL_NAMES and n != "spawn_subagent"}
+    if not allowed:  # empty/misconfigured profile -> give it the safe read-only default
+        allowed = {n for n in ("read_text", "execute_shell", "web_search") if n in TOOL_NAMES}
+    sub_specs = {n: TOOL_SPECS[n] for n in allowed}
+    sub_system = profile["system_prompt"] + "\n" + render_tool_docs(sub_specs)
+    sub_tools_def = build_tools_def(sub_specs)
+
+    # Isolate the parent's "last output" store from the sub-agent's tool calls.
+    saved = (_last_tool_output, _last_tool_name, _last_write_diff)
+    try:
+        answer = run_agent(
+            [{"role": "user", "content": task}],
+            max_turns=profile["max_turns"], temperature=0.2,
+            system_prompt=sub_system, tools_def=sub_tools_def,
+            allowed_tools=allowed, depth=depth + 1,
+        )
+    except Exception as e:  # a broken sub-run must not kill the parent turn
+        answer = f"Sub-agent failed: {e}"
+    finally:
+        _last_tool_output, _last_tool_name, _last_write_diff = saved
+
+    return f"[subagent:{type_name}] {answer}"
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     spec = TOOL_SPECS.get(name)
     if not spec:
@@ -586,6 +631,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
         return _exec_plan(args, depth=depth)
+
+    if mode == "subagent":
+        return _exec_subagent(args, depth=depth)
 
     if mode == "read_text":
         path_arg = spec.get("path_arg") or "filename"
