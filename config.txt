@@ -3,16 +3,18 @@
 # your traces/outputs; (default) values match the code's built-in defaults you
 # were running on. Adjust anything that doesn't match your setup.
 
-# --- paths --- (confirmed: pwd test reported /home/amir/projects/agent8088)
-project_root=/home/amir/projects/agent8088
-shell_cwd=/home/amir/projects/agent8088
-tools_file=/home/amir/projects/agent8088/tools.txt
-system_file=/home/amir/projects/agent8088/system.md
-banner_file=/home/amir/projects/agent8088/banner.txt
+# --- paths --- Use relative paths so the repo works from any location.
+# The engine resolves these relative to the agent8088 script's directory (APP_DIR).
+# Leave them commented out to use the built-in defaults (APP_DIR/tools.txt, etc.).
+# project_root=. (defaults to APP_DIR — the script's own directory)
+# shell_cwd=. (defaults to PROJECT_ROOT)
+# tools_file=tools.txt (defaults to APP_DIR/tools.txt)
+# system_file=system.md (defaults to APP_DIR/system.md)
+# banner_file=banner.txt (defaults to APP_DIR/banner.txt)
 
 # write_file / read_file are restricted to these paths.
-# (confirmed: your benchmark wrote into /tmp, so /tmp must be allowed)
-allowed_paths=/home/amir/projects/agent8088,/tmp
+# Use . for the repo root (resolved to PROJECT_ROOT at runtime), plus /tmp.
+allowed_paths=.,/tmp
 
 # --- model (Ornith-35B on Reality) ---
 model_base_url=http://localhost:11434/v1
