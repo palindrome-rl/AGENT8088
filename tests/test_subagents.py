@@ -174,6 +174,20 @@ def test_mask_system_content_hides_prompt_and_secrets(engine, monkeypatch):
         assert "internal instructions hidden" in out
 
 
+def test_render_tool_docs_no_tools_answers_directly(engine):
+    doc = engine.render_tool_docs({})
+    assert "You have these tools" not in doc
+    assert "answer the user directly" in doc.lower()
+    # Must not prime tool-calling or announce a lack of tools.
+    assert "call a tool whenever" not in doc.lower()
+
+
+def test_render_tool_docs_softened_when_tools_present(engine):
+    doc = engine.render_tool_docs({"web_search": engine.TOOL_SPECS["web_search"]})
+    assert "not every message needs a tool" in doc.lower()
+    assert "web_search(" in doc
+
+
 def test_reasoning_command_registered():
     import agent8088_cli as cli
     assert "reasoning" in cli.COMMANDS

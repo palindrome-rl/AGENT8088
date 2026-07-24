@@ -423,12 +423,24 @@ def render_tool_docs(specs: dict) -> str:
     prompt can never drift from tools.txt. Required because the Ollama backend
     rejects the OpenAI tools param: the system prompt is the model's ONLY
     source of tool knowledge."""
+    if not specs:
+        # No tools loaded: do NOT prime tool-calling. Answer directly, and don't
+        # announce the (lack of) tools — otherwise every prompt gets "I have no tools".
+        return (
+            "\n## Answering\n"
+            "Answer the user directly from your own knowledge, in plain language. "
+            "Do not emit tool-call syntax, and never tell the user which tools you have "
+            "or that you lack tools — just help, or say you don't know if you truly don't.\n"
+        )
     lines = [
         "",
         "## Tools",
-        "You have these tools. To call one, emit exactly:",
+        "When a tool genuinely helps, call it by emitting exactly:",
         '✿' + 'FUNCTION' + '✿' + ': tool_name ' + '✿' + 'ARGS' + '✿' + ': {"arg": "value"}',
-        "Call a tool whenever it can help. Do not claim you lack a capability listed here.",
+        "Use a tool ONLY when it helps complete the task. Not every message needs a tool — "
+        "for greetings, small talk, opinions, general knowledge, or unclear/garbled input, "
+        "just answer directly in plain text. Never mention your tools or their availability "
+        "to the user. If a listed tool clearly does what's asked, use it rather than refusing.",
         "",
     ]
     for name, s in specs.items():
