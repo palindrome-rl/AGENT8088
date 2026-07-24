@@ -87,6 +87,40 @@ def test_exec_subagent_unknown_type_falls_back(engine, monkeypatch):
     assert "unknown agent_type" in out.lower()
 
 
+def test_strip_tool_json_never_leaks_markup(engine):
+    # A message that is ONLY a hallucinated tool call -> stripped to empty.
+    only_call = '✿FUNCTION✿: current_time ✿ARGS✿: {"location": "UTC"}'
+    assert engine.strip_tool_json(only_call) == ""
+    # Mixed prose + call -> prose kept, markup + stray sentinels gone.
+    mixed = 'The time is unknown. ✿FUNCTION✿: current_time ✿ARGS✿: {"x": "y"} ✿'
+    out = engine.strip_tool_json(mixed)
+    assert "✿" not in out
+    assert out.startswith("The time is unknown.")
+
+
+def test_run_agent_recovers_from_unknown_tool(engine):
+    # First the model hallucinates a non-existent tool, then it answers for real.
+    engine.create_completion = ScriptedModel([
+        '✿FUNCTION✿: current_time ✿ARGS✿: {"location": "UTC"}',
+        "It is 12:00 UTC.",
+    ])
+    answer = engine.run_agent([{"role": "user", "content": "what time is it?"}], max_turns=5)
+    assert answer == "It is 12:00 UTC."
+    assert "✿" not in answer
+
+
+def test_run_agent_unknown_tool_gives_clean_fallback(engine):
+    # Model keeps calling a non-existent tool: never leak markup; return a clean note.
+    engine.create_completion = ScriptedModel([
+        '✿FUNCTION✿: current_time ✿ARGS✿: {"x": "1"}',
+        '✿FUNCTION✿: current_time ✿ARGS✿: {"x": "2"}',
+        '✿FUNCTION✿: current_time ✿ARGS✿: {"x": "3"}',
+    ])
+    answer = engine.run_agent([{"role": "user", "content": "time?"}], max_turns=5)
+    assert "✿" not in answer
+    assert "available" in answer.lower()  # clean note, not raw markup
+
+
 def test_exec_subagent_ui_hooks_fire(engine, monkeypatch):
     monkeypatch.setattr(engine, "create_completion", ScriptedModel(["all done"]))
     events = {"factory": [], "done": []}

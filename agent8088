@@ -792,10 +792,31 @@ def strip_tool_json(text: str) -> str:
     text = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', text, flags=re.DOTALL)
     text = re.sub(r'✿FUNCTION✿[^\n]*', '', text)
     text = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', text, flags=re.DOTALL)
+    # Hard sanitize: strip any leftover ✿…✿ fragments and stray sentinels so raw
+    # tool-call markup can NEVER leak into a user-facing answer.
+    text = re.sub(r'✿[^✿\n]*✿', '', text)
+    text = text.replace('✿', '')
     # Tidy whitespace WITHOUT flattening newlines, so multi-line answers survive.
     text = re.sub(r'[ \t]+\n', '\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def _attempted_tool_names(text: str) -> list:
+    """Tool names the model *tried* to call, valid or not — used for error handling
+    when find_tool_calls() finds nothing runnable (e.g. a hallucinated tool)."""
+    names = []
+    for m in re.finditer(r'✿FUNCTION✿\s*:\s*(\w+)', text):
+        names.append(m.group(1))
+    for m in re.finditer(r'"name"\s*:\s*"(\w+)"\s*,\s*"arguments"', text):
+        names.append(m.group(1))
+    # de-dupe, preserve order
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +844,7 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     seen = set()      # (name, args) signatures already run -> breaks loops
     forcing = False   # True after we've told a looping model to stop and answer
+    unknown_retries = 0  # times the model emitted a call to a non-existent tool
 
     for turn in range(max_turns):
         if interrupt_check and interrupt_check():
@@ -837,7 +859,35 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
 
         calls = find_tool_calls(content, allowed_tools)
         if not calls:
-            answer = strip_tool_json(content) or content.strip()
+            # The model may have *tried* to call a tool that doesn't exist (a common
+            # failure — e.g. `current_time`). Rather than leaking the raw ✿FUNCTION✿
+            # markup as the "answer", tell the model what went wrong and loop so it can
+            # recover (call a real tool or just answer). Bounded to avoid infinite loops.
+            unknown = [n for n in _attempted_tool_names(content)
+                       if _resolve_tool_name(n) not in allowed_tools]
+            if unknown and unknown_retries < 2 and not forcing:
+                unknown_retries += 1
+                available = ", ".join(sorted(allowed_tools)) or "(none)"
+                if on_result:
+                    on_result("error", f"Unknown tool '{unknown[0]}' — not available.")
+                messages.append({"role": "user", "content":
+                    f"Error: the tool '{unknown[0]}' does not exist. "
+                    f"Available tools are: {available}. "
+                    "Either call one of those with the exact format "
+                    '`✿FUNCTION✿: name ✿ARGS✿: {\"arg\": \"value\"}`, '
+                    "or, if no tool fits, answer the user directly in plain text "
+                    "without mentioning tools."})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
+                continue
+
+            answer = strip_tool_json(content)
+            if not answer:
+                # Stripping removed everything (the message was ONLY a tool-call
+                # attempt) — never fall back to the raw markup.
+                answer = (f"I tried to use a tool that isn't available. "
+                          f"Available tools: {', '.join(sorted(allowed_tools)) or 'none'}."
+                          if unknown else "I don't have a further answer.")
             if on_answer:
                 on_answer(answer)
             if trace is not None:
