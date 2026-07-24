@@ -840,6 +840,16 @@ def main():
         if line in ("/exit", "/quit", "exit", "quit"):
             console.print("[dim]bye[/dim]")
             break
+        # Bare command parity with the classic REPL: a single word that exactly
+        # names a command (clear, help, tools, agents, config, …) runs it rather
+        # than being sent to the model — so typing 'clear' clears the context
+        # instead of making the model ramble about "confirming the clearing".
+        if " " not in line and not line.startswith("/") and line.lower() in COMMANDS:
+            try:
+                COMMANDS[line.lower()]("")
+            except Exception as e:
+                console.print(f"[red]error:[/red] {e}")
+            continue
         if line.startswith("/"):
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())

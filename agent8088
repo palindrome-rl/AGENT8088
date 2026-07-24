@@ -52,6 +52,13 @@ MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
 
+# Anti-repetition sampling. Small local models can spiral into "I will not use any X…"
+# loops; these penalties curb that. Default 0.0 = no-op (behaviour unchanged) — raise
+# frequency_penalty to ~0.4 in config.txt to suppress repetition. Only sent when non-zero,
+# so backends that don't support them are unaffected unless you opt in.
+FREQUENCY_PENALTY = float(APP_CONFIG.get("frequency_penalty", "0"))
+PRESENCE_PENALTY = float(APP_CONFIG.get("presence_penalty", "0"))
+
 ALLOWED_PATHS = [
     Path(p.strip()).expanduser().resolve()
     for p in APP_CONFIG.get("allowed_paths", str(PROJECT_ROOT)).split(",")
@@ -94,14 +101,21 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
     full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
     # NOTE: Ollama (current backend) rejects the OpenAI "tools" param, so the model emits
     # native ✿FUNCTION✿/✿ARGS✿ text instead. Pass tools= again when moving to llama-server.
+    penalties = {}
+    if FREQUENCY_PENALTY:
+        penalties["frequency_penalty"] = FREQUENCY_PENALTY
+    if PRESENCE_PENALTY:
+        penalties["presence_penalty"] = PRESENCE_PENALTY
     if on_token is None:
         # Non-streaming path — unchanged (old REPL, benchmark, one-shot mode)
         return client.chat.completions.create(
             model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature,
+            **penalties,
         )
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
     stream = client.chat.completions.create(
         model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature, stream=True,
+        **penalties,
     )
     collected = []
     for chunk in stream:
