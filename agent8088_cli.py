@@ -297,10 +297,11 @@ def _handle_escalation(result_text, messages=None, live=None):
 
     if response in ("y", "yes"):
         A.grant_escalation()
-        console.print("[green]Permission granted — edit mode active for this session.[/green]")
+        console.print("[green]Approved for this action only. Next write will ask again.[/green]")
         if messages is not None:
             messages.append({"role": "user", "content":
-                "Permission granted. You now have edit access. Retry the tool call that was blocked."})
+                "Permission granted for this action only. Retry the tool call that was blocked. "
+                "Note: each new write or system command will require separate approval."})
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
         if messages is not None:
@@ -642,8 +643,7 @@ def _prompt_label():
 
 def main():
     if "--edit" in sys.argv:
-        A.PERMISSION_MODE = "edit"
-        A.grant_escalation()
+        A.PERMISSION_MODE = "edit"  # permanent edit mode — no per-action prompts
         sys.argv.remove("--edit")
     banner()
     while True:

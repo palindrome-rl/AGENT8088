@@ -62,6 +62,7 @@ ALLOWED_PATHS = [
 # Permission layer — readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
+_one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
 
 # Shell commands that are safe in readonly mode (inspection only)
 READONLY_SAFE_COMMANDS = frozenset([
@@ -80,7 +81,12 @@ READONLY_SAFE_COMMANDS = frozenset([
 
 def check_permission(mode: str, command: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
+    global _one_shot_grant
     if PERMISSION_MODE == "edit":
+        return True
+    # One-shot grant: allow one blocked tool through, then revert
+    if _one_shot_grant:
+        _one_shot_grant = False
         return True
     # readonly mode
     if mode in ("read_text", "http_get", "last_output", "python_eval", "plan"):
@@ -106,9 +112,10 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
 
 
 def grant_escalation():
-    """Transition PERMISSION_MODE to 'edit' for the remainder of the session."""
-    global PERMISSION_MODE
-    PERMISSION_MODE = "edit"
+    """Allow exactly one blocked tool call to run, then revert to readonly.
+    The user is prompted for every write/mutation — no session-wide grants."""
+    global _one_shot_grant
+    _one_shot_grant = True
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
