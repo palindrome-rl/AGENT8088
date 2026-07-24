@@ -386,6 +386,23 @@ TOOLS_DEF = build_tools_def(TOOL_SPECS)
 TOOL_NAMES = set(TOOL_SPECS.keys())
 TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
 
+TOOL_ALIASES = {
+    "bash": "execute_shell", "sh": "execute_shell",
+    "shell": "execute_shell", "run": "execute_shell",
+    "search": "web_search", "web": "web_search", "google": "web_search",
+    "read": "read_text", "cat": "read_text",
+    "write": "write_file", "create_file": "write_file",
+    "calc": "calculate", "eval": "calculate", "math": "calculate",
+    "last": "last_output", "prev_output": "last_output",
+}
+
+
+def _resolve_tool_name(name):
+    """Resolve a model-emitted tool name to its canonical name via alias map.
+    Canonical names pass through unchanged; unknown names pass through too
+    (so the TOOL_NAMES check fails naturally and the call is skipped)."""
+    return TOOL_ALIASES.get(name, name)
+
 
 def render_tool_docs(specs: dict) -> str:
     """Generate the tool section of the system prompt from TOOL_SPECS, so the
@@ -584,11 +601,13 @@ def exec_tool(name: str, arguments: str) -> str:
 # ---------------------------------------------------------------------------
 def find_tool_calls(text: str) -> list:
     calls = []
-    # 1) <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    for m in re.finditer(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL):
+    # 1) ✿{"name": "...", "arguments": {...}}✿
+    for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
         try:
             d = json.loads(m.group(1).strip())
-            if d.get("name") in TOOL_NAMES:
+            resolved = _resolve_tool_name(d.get("name", ""))
+            if resolved in TOOL_NAMES:
+                d["name"] = resolved
                 d["arguments"] = d.get("arguments", {})
                 calls.append(d)
         except Exception:
@@ -598,20 +617,24 @@ def find_tool_calls(text: str) -> list:
         m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*?\})', text, re.DOTALL)
         if m:
             try:
-                if m.group(1) in TOOL_NAMES:
-                    calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
+                resolved = _resolve_tool_name(m.group(1))
+                if resolved in TOOL_NAMES:
+                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
             except Exception:
                 pass
         if not calls:  # loose ✿FUNCTION✿ line with no args
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
-            if m2 and m2.group(1) in TOOL_NAMES:
-                calls.append({"name": m2.group(1), "arguments": {}})
+            if m2:
+                resolved = _resolve_tool_name(m2.group(1))
+                if resolved in TOOL_NAMES:
+                    calls.append({"name": resolved, "arguments": {}})
     # 3) bare JSON {"name": "...", "arguments": {...}}
     if not calls:
         for m in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
             try:
-                if m.group(1) in TOOL_NAMES:
-                    calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
+                resolved = _resolve_tool_name(m.group(1))
+                if resolved in TOOL_NAMES:
+                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
                     break
             except Exception:
                 pass
@@ -622,6 +645,12 @@ def find_tool_calls(text: str) -> list:
             if m:
                 calls.append({"name": name, "arguments": {"command": m.group(1).replace('\\"', '"')}})
                 break
+        if not calls:
+            for alias, canonical in TOOL_ALIASES.items():
+                m = re.search(re.escape(alias) + r'\s*\{\s*"command"\s*:\s*"([^"]+)"', text)
+                if m and canonical in TOOL_NAMES:
+                    calls.append({"name": canonical, "arguments": {"command": m.group(1).replace('\\"', '"')}})
+                    break
     return calls
 
 
