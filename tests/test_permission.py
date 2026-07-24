@@ -94,3 +94,12 @@ def test_escalation_tool_returns_request():
         "reason": "Need to write test.txt"
     }))
     assert "ESCALATION_REQUEST" in result
+
+def test_system_prompt_contains_permission_instructions():
+    from pathlib import Path
+    sp = Path('system.md').read_text(encoding='utf-8')
+    assert "PERMISSION_MODE" in sp
+    assert "readonly" in sp
+    assert "edit" in sp
+    assert "request_permission_escalation" in sp
+    assert "escalation" in sp.lower()
