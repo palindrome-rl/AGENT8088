@@ -51,3 +51,33 @@ def test_escalation_granted_sets_edit_mode():
     A.grant_escalation()
     assert A.PERMISSION_MODE == "edit"
     A.PERMISSION_MODE = "readonly"  # cleanup
+
+def test_run_tool_blocks_write_in_readonly():
+    A.PERMISSION_MODE = "readonly"
+    result = A.run_tool("write_file", {"filename": "/tmp/test_perm.txt", "content": "hello"})
+    assert "ESCALATION_REQUEST" in result
+
+def test_run_tool_allows_write_in_edit():
+    A.PERMISSION_MODE = "edit"
+    import tempfile, os
+    tmp = os.path.join(tempfile.gettempdir(), "test_perm_edit.txt")
+    result = A.run_tool("write_file", {"filename": tmp, "content": "hello"})
+    assert "Wrote" in result
+    os.unlink(tmp)
+    A.PERMISSION_MODE = "readonly"  # cleanup
+
+def test_run_tool_allows_read_in_readonly():
+    A.PERMISSION_MODE = "readonly"
+    # read_text on tools.txt should work
+    result = A.run_tool("read_text", {"filename": "tools.txt"})
+    assert "execute_shell" in result
+
+def test_run_tool_blocks_dangerous_shell_in_readonly():
+    A.PERMISSION_MODE = "readonly"
+    result = A.run_tool("execute_shell", {"command": "rm -rf /tmp/nonexistent_perm_test"})
+    assert "ESCALATION_REQUEST" in result
+
+def test_run_tool_allows_safe_shell_in_readonly():
+    A.PERMISSION_MODE = "readonly"
+    result = A.run_tool("execute_shell", {"command": "ls"})
+    assert "ESCALATION_REQUEST" not in result
