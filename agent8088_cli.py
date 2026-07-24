@@ -39,6 +39,7 @@ from rich.text import Text
 from rich.padding import Padding
 from rich.spinner import SPINNERS, Spinner
 from rich.live import Live
+from rich.prompt import Prompt
 from rich import box
 
 APP_DIR = Path(__file__).resolve().parent
@@ -267,10 +268,11 @@ def on_result(name, result):
     console.print(line)
 
 
-def _handle_escalation(result_text):
+def _handle_escalation(result_text, messages=None):
     """Check if a tool result is an escalation request. If so, prompt the user
-    for y/n approval and call grant_escalation() if approved. Returns True if
-    the result was an escalation request (handled or denied), False otherwise."""
+    with an Allow/Decline selection and call grant_escalation() if approved.
+    Returns True if the result was an escalation request (handled or denied),
+    False otherwise. If messages is provided, injects a retry hint on approval."""
     if not result_text.startswith("ESCALATION_REQUEST:"):
         return False
     parts = result_text.split(":", 4)
@@ -284,15 +286,27 @@ def _handle_escalation(result_text):
         box=box.ROUNDED, border_style="yellow",
     ))
     try:
-        response = console.input("[bold]Approve? (y/n)[/bold] ").strip().lower()
+        response = Prompt.ask(
+            "[bold]Allow or decline?[/bold]",
+            choices=["Allow", "Decline"],
+            default="Allow",
+            console=console,
+        )
     except (EOFError, KeyboardInterrupt):
-        response = "n"
-    if response in ("y", "yes"):
+        response = "Decline"
+    if response == "Allow":
         A.grant_escalation()
         console.print("[green]Permission granted — edit mode active for this session.[/green]")
+        if messages is not None:
+            messages.append({"role": "user", "content":
+                "Permission granted. You now have edit access. Retry the tool call that was blocked."})
         return True
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
+        if messages is not None:
+            messages.append({"role": "user", "content":
+                "Permission denied by the user. You remain in readonly mode. "
+                "Tell the user what you could not do and why the task cannot be completed."})
         return True
 
 
@@ -344,9 +358,9 @@ def do_chat(query):
 
         def _on_result(name, result):
             on_result(name, result)
-            if _handle_escalation(result):
-                # Escalation was handled; the tool didn't actually run.
-                # Tell the model to retry the tool now that we have edit access (if granted).
+            if _handle_escalation(result, S.messages):
+                # Escalation was handled. If granted, a retry hint was injected
+                # into S.messages so the model will re-attempt the blocked tool.
                 pass
 
         try:
