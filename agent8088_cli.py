@@ -194,6 +194,8 @@ def banner():
     tbl.add_row("Backend", backend)
     tbl.add_row("Endpoint", str(endpoint))
     tbl.add_row("Tools", f"{len(A.TOOL_NAMES)} loaded  ·  " + ", ".join(sorted(A.TOOL_NAMES)))
+    tbl.add_row("Subagents", f"{len(A.SUBAGENT_SPECS)} loaded  ·  " + ", ".join(sorted(A.SUBAGENT_SPECS))
+                + "  [dim](/agent to run)[/dim]")
     tbl.add_row("Temp", str(S.temperature))
     tbl.add_row("Max turns", str(S.max_turns))
     console.print(Panel(tbl, title="[bold]Agent8088 CLI[/bold]",
@@ -456,6 +458,7 @@ def cmd_help(_):
         ("/tools", "List every tool with its args, mode, and description"),
         ("/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)"),
         ("/agents", "List available sub-agent profiles"),
+        ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
         ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [ornith|gemma]", "Show or switch the backend model"),
@@ -488,8 +491,114 @@ def cmd_tools(_):
     console.print(t)
 
 
+def _read_key(fd):
+    """Read one keypress in cbreak mode, decoding arrow keys.
+    Returns 'up'/'down'/'left'/'right'/'enter'/'esc' or the literal character."""
+    b = os.read(fd, 1)
+    if b == b"\x1b":  # ESC — maybe the start of an arrow-key sequence
+        seq = b""
+        while select.select([fd], [], [], 0.02)[0]:
+            seq += os.read(fd, 1)
+        if seq[:1] == b"[":
+            return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(seq[1:2], "esc")
+        return "esc"
+    if b in (b"\r", b"\n"):
+        return "enter"
+    try:
+        return b.decode()
+    except Exception:
+        return "?"
+
+
+def _agent_menu(profiles, names, idx):
+    """Render the arrow-key picker: the highlighted row gets a ▶ marker and reverse-video
+    name chip; descriptions wrap cleanly aligned in their own column."""
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(width=1)                          # ▶ marker
+    grid.add_column(no_wrap=True, min_width=16)       # profile name
+    grid.add_column(overflow="fold", ratio=1)         # description (wraps aligned)
+    for i, n in enumerate(names):
+        selected = i == idx
+        marker = Text("▶", style="bold magenta") if selected else Text(" ")
+        name = Text(f" {n} ", style="bold black on magenta") if selected else Text(n, style="yellow")
+        desc = Text(profiles[n].get("description", ""), style="white" if selected else "dim")
+        grid.add_row(marker, name, desc)
+    hint = Text("↑/↓ move · ⏎ run · esc cancel", style="dim")
+    return Panel(Group(grid, Text(""), hint), title="[bold magenta]🤖 pick a sub-agent[/bold magenta]",
+                box=box.ROUNDED, border_style="magenta", padding=(1, 2))
+
+
+def select_agent(profiles):
+    """Interactive arrow-key picker over sub-agent profiles.
+    Returns the chosen name, or None on cancel / non-interactive stdin."""
+    names = sorted(profiles)
+    if not names or termios is None or not sys.stdin.isatty():
+        return None
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    idx = 0
+    try:
+        tty.setcbreak(fd)
+        with Live(console=console, refresh_per_second=30, transient=True) as live:
+            while True:
+                live.update(_agent_menu(profiles, names, idx))
+                key = _read_key(fd)
+                if key == "up":
+                    idx = (idx - 1) % len(names)
+                elif key == "down":
+                    idx = (idx + 1) % len(names)
+                elif key == "enter":
+                    return names[idx]
+                elif key in ("esc", "q"):
+                    return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _run_subagent(name, task):
+    """Run one sub-agent directly (no parent model) with the animated nested view."""
+    with Live(console=console, refresh_per_second=20, transient=True) as live:
+        A.subagent_ui = _make_subagent_ui(live)
+        try:
+            result = A._exec_subagent({"agent_type": name, "task": task}, depth=0)
+        finally:
+            A.subagent_ui = None
+    # Strip the "[subagent:name] " prefix before rendering the summary panel.
+    answer = result.split("] ", 1)[1] if result.startswith("[subagent:") else result
+    render_answer(answer)
+
+
+def cmd_agent(rest):
+    """Run a sub-agent. Usage: /agent  (interactive picker) | /agent <name> [task]."""
+    rest = (rest or "").strip()
+    name, task = None, None
+    if rest:
+        first, _, remainder = rest.partition(" ")
+        if first in A.SUBAGENT_SPECS:
+            name, task = first, remainder.strip()
+        else:
+            task = rest  # not a known profile -> treat the whole line as the task
+    if not name:
+        name = select_agent(A.SUBAGENT_SPECS)
+        if not name:
+            console.print("[dim]cancelled — try /agent <name> <task>, or /agents to list them[/dim]")
+            return
+    if not task:
+        try:
+            task = console.input(f"[magenta]task for [bold]{name}[/bold] ›[/magenta] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("[dim]cancelled[/dim]")
+            return
+        if not task:
+            console.print("[dim]cancelled — no task given[/dim]")
+            return
+    _run_subagent(name, task)
+
+
 def cmd_agents(_):
-    t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold magenta")
+    t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold magenta",
+              caption="run one with  /agent  (arrow-key picker)  or  /agent <name> <task>",
+              caption_style="dim")
     t.add_column("Name", style="yellow")
     t.add_column("Max turns", style="green")
     t.add_column("Tools", style="cyan")
@@ -665,7 +774,8 @@ def cmd_clear(_):
 
 
 COMMANDS = {
-    "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool, "agents": cmd_agents, "plan": cmd_plan,
+    "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
+    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan,
     "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
     "history": cmd_history, "trace": cmd_trace, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "save": cmd_save, "clear": cmd_clear,
@@ -689,7 +799,35 @@ def _prompt_label():
     return f"\n[bold green]8088[/bold green] [dim]({pct}% ctx)[/dim] [dim]›[/dim] "
 
 
+def _completer(text, state):
+    """Tab-completion: '/<cmd>', profile names after '/agent ', tool names after '/tool '."""
+    if "readline" not in sys.modules:
+        return None
+    buf = readline.get_line_buffer().lstrip()
+    if buf.startswith("/agent "):
+        matches = [n for n in sorted(A.SUBAGENT_SPECS) if n.startswith(text)]
+    elif buf.startswith("/tool "):
+        matches = [n for n in sorted(A.TOOL_NAMES) if n.startswith(text)]
+    elif buf.startswith("/"):
+        matches = ["/" + c for c in sorted(COMMANDS) if ("/" + c).startswith(text)]
+    else:
+        matches = []
+    return matches[state] if state < len(matches) else None
+
+
+def _install_completion():
+    if "readline" not in sys.modules:
+        return
+    try:
+        readline.set_completer_delims(" \t\n")  # keep '/' and names as one token
+        readline.set_completer(_completer)
+        readline.parse_and_bind("tab: complete")
+    except Exception:
+        pass
+
+
 def main():
+    _install_completion()
     banner()
     while True:
         try:
