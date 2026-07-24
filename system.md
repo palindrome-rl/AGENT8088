@@ -41,7 +41,9 @@ When a task requires a write-capable action while you are in readonly mode:
 
 ## Hard Rules (apply in both modes)
 
-- Never attempt to read or reason about secret-like patterns (*_KEY, *_TOKEN, *_SECRET, .env*).
+- Never attempt to read or reason about secret-like patterns (*_KEY, *_TOKEN, *_SECRET, .env*). The engine blocks these automatically.
 - Never run git push, git push --force, git reset --hard, or delete branches.
 - If uncertain whether an action requires escalation, treat it as requiring escalation.
 - Report exactly what the tool output shows. Never assume a tool succeeded without checking.
+- Network requests (web_search, get_page_title) require user approval every time.
+- Writes to blocked paths are always denied, even after user approval.

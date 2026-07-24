@@ -16,6 +16,23 @@
 # Use . for the repo root (resolved to PROJECT_ROOT at runtime), plus /tmp.
 allowed_paths=.,/tmp
 
+# --- Permission Layer 1: Sensitive file read protection ---
+# Files matching these patterns are never readable by the model.
+# Override: list specific files here to allow the model to read them.
+# allowed_sensitive_files=.env,secrets.yaml
+
+# --- Permission Layer 2: Network access control ---
+# web_search and get_page_title prompt the user (y/n) on every request.
+# No config needed — prompting is hardcoded.
+
+# --- Permission Layer 3: Path-based write restrictions (three-tier zones) ---
+# Writes to these paths run without a prompt (auto-approved):
+no_prompt_paths=/tmp
+# Writes to these paths show the y/n escalation prompt (default: project root):
+prompt_paths=.
+# Writes to these paths are always blocked, even in edit mode:
+# blocked_paths=/etc,/home,~/.ssh
+
 # --- model (Ornith-35B on Reality) ---
 model_base_url=http://localhost:11434/v1
 model_name=ornith-1.0-35b
