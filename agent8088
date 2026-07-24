@@ -901,6 +901,31 @@ def _guard_answer(answer: str) -> str:
     return _redact_secrets(answer)
 
 
+# Requests that target the agent's own internals — refused instantly (no model
+# round-trip) rather than looping for 3k tokens before arriving at the same refusal.
+_PROTECTED_TARGET_RE = re.compile(
+    r'\b(system\.md|config\.txt|system\s*(prompt|instructions|message)|'
+    r'your\s+(system\s*)?(prompt|instructions|rules|config|configuration|guidelines)|'
+    r'initial\s+prompt|developer\s+(prompt|message)|the\s+prompt\s+you\s+were\s+given)\b',
+    re.IGNORECASE)
+
+
+def _preflight_refusal(messages) -> str:
+    """If the latest user turn asks to reveal internal instructions/config, return a
+    ready refusal so run_agent can short-circuit before spending any model tokens.
+    Returns None for everything else (the vast majority of prompts)."""
+    user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_msg = m.get("content") or ""
+            break
+    if user_msg and _PROTECTED_TARGET_RE.search(user_msg):
+        return ("I can't share my internal instructions, system prompt, or configuration "
+                "(including files like system.md or config.txt). Let me know what you'd "
+                "like help with instead.")
+    return None
+
+
 def _mask_system_content(text: str) -> str:
     """Sanitize text that will be SHOWN to the user (e.g. a reasoning preview):
     redact secrets and blank out any verbatim system-prompt lines. Chain-of-thought
@@ -941,6 +966,16 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+
+    # Fast path: a request for internal instructions/config is a policy refusal —
+    # answer it immediately instead of burning turns and tokens to reach the same "no".
+    refusal = _preflight_refusal(messages)
+    if refusal:
+        if on_answer:
+            on_answer(refusal)
+        if trace is not None:
+            trace.append({"turn": 0, "type": "preflight_refusal", "content": refusal})
+        return refusal
 
     for turn in range(max_turns):
         if interrupt_check and interrupt_check():
