@@ -39,7 +39,6 @@ from rich.text import Text
 from rich.padding import Padding
 from rich.spinner import SPINNERS, Spinner
 from rich.live import Live
-from rich.prompt import Prompt
 from rich import box
 
 APP_DIR = Path(__file__).resolve().parent
@@ -292,16 +291,11 @@ def _handle_escalation(result_text, messages=None, live=None):
         box=box.ROUNDED, border_style="yellow",
     ))
     try:
-        response = Prompt.ask(
-            "[bold]Allow or decline?[/bold]",
-            choices=["Allow", "Decline"],
-            default="Allow",
-            console=console,
-        )
+        response = console.input("[bold yellow]Allow? (y/n): [/bold yellow]").strip().lower()
     except (EOFError, KeyboardInterrupt):
-        response = "Decline"
+        response = "n"
 
-    if response == "Allow":
+    if response in ("y", "yes"):
         A.grant_escalation()
         console.print("[green]Permission granted — edit mode active for this session.[/green]")
         if messages is not None:
