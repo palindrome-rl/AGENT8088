@@ -1,0 +1,14 @@
+name: directory_management
+description: Creating, organizing, and navigating directory structures cleanly
+when_to_use:
+- directory
+- folder
+- mkdir
+- project
+instruction: '- Create directories with mkdir -p when needed
+
+  - Always verify directory was created with ls
+
+  - Use descriptive names for project folders
+
+  - Clean up empty directories when no longer needed'

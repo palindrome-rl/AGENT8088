@@ -1,0 +1,38 @@
+# Agent8088 config.txt
+# Reconstructed from this session. Values marked (confirmed) were observed in
+# your traces/outputs; (default) values match the code's built-in defaults you
+# were running on. Adjust anything that doesn't match your setup.
+
+# --- paths --- (confirmed: pwd test reported /home/amir/projects/agent8088)
+project_root=/home/amir/projects/agent8088
+shell_cwd=/home/amir/projects/agent8088
+tools_file=/home/amir/projects/agent8088/tools.txt
+system_file=/home/amir/projects/agent8088/system.md
+banner_file=/home/amir/projects/agent8088/banner.txt
+
+# write_file / read_file are restricted to these paths.
+# (confirmed: your benchmark wrote into /tmp, so /tmp must be allowed)
+allowed_paths=/home/amir/projects/agent8088,/tmp
+
+# --- model (Ornith-35B on Reality) ---
+model_base_url=http://localhost:8004/v1
+model_name=ornith-35b
+api_key=ollama
+timeout_seconds=120
+
+# --- Gemma fallback (only used when USE_GEMMA4=1) --- (default)
+gemma_base_url=http://localhost:8003/v1
+gemma_model_name=gemma-4-12B-it-Q4_K_M.gguf
+
+# --- search --- (confirmed: SearXNG on IRIS, port 8888, /search path)
+# Ends at "q=" with no placeholder; tools.txt appends {query_q}&format=json.
+search_base_url=http://localhost:8888/search?q=
+
+# --- SkillOpt --- (text-space optimization, see skillopt.py)
+optimizer_base_url=http://localhost:8004/v1
+optimizer_model=ornith-35b
+optimizer_api_key=ollama
+skillopt_epochs=4
+skillopt_rollout_batch=40
+skillopt_reflection_minibatch=8
+skillopt_textual_lr=4

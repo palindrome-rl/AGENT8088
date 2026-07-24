@@ -1,0 +1,16 @@
+name: python_script_creation
+description: Guidelines for creating clean, reusable Python scripts
+when_to_use:
+- python
+- .py
+- script
+- function
+instruction: '- Always include a main() function
+
+  - Add if __name__ == "__main__": guard
+
+  - Include basic error handling
+
+  - Add docstrings for functions
+
+  - Keep scripts focused on one clear purpose'

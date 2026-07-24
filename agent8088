@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+"""
+Agent8088 - Clean CLI with banner + animated spinner.
+
+A single shared agent loop (run_agent) drives both modes:
+  - interactive REPL          (no args)
+  - one-shot / benchmark mode (query as args, optional --trace)
+"""
+import sys, readline, subprocess, json, re, os, threading, time  # readline enables input history
+from contextlib import nullcontext
+from pathlib import Path
+from openai import OpenAI
+
+APP_DIR = Path(__file__).resolve().parent
+
+
+# ---------------------------------------------------------------------------
+# Config (simple key=value file)
+# ---------------------------------------------------------------------------
+def load_simple_config(path: Path) -> dict:
+    config = {}
+    if not path.exists():
+        return config
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        config[key.strip()] = value.strip()
+    return config
+
+
+CONFIG_PATH = Path(os.environ.get("AGENT8088_CONFIG", str(APP_DIR / "config.txt"))).expanduser()
+APP_CONFIG = load_simple_config(CONFIG_PATH)
+
+PROJECT_ROOT = Path(APP_CONFIG.get("project_root", str(APP_DIR))).expanduser().resolve()
+sys.path.insert(0, str(PROJECT_ROOT))
+
+SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://localhost:8888/search?q={query}")
+GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
+TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
+SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
+BANNER_FILE = Path(APP_CONFIG.get("banner_file", str(APP_DIR / "banner.txt"))).expanduser()
+SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).expanduser()
+
+MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "http://localhost:11434/v1"))
+MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
+TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
+
+ALLOWED_PATHS = [
+    Path(p.strip()).expanduser().resolve()
+    for p in APP_CONFIG.get("allowed_paths", str(PROJECT_ROOT)).split(",")
+    if p.strip()
+]
+
+DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
+
+
+def load_text(path: Path, fallback: str) -> str:
+    try:
+        if path.exists():
+            content = path.read_text().strip()
+            if content:
+                return content
+    except Exception:
+        pass
+    return fallback
+
+
+BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
+
+
+# ---------------------------------------------------------------------------
+# Model client.  USE_GEMMA4=1 switches to the Gemma server on Colossus.
+# ---------------------------------------------------------------------------
+def get_client():
+    if os.environ.get("USE_GEMMA4", "0") == "1":
+        print(f"[agent8088] Using Gemma 4 on Colossus ({GEMMA_BASE_URL})")
+        model = APP_CONFIG.get("gemma_model_name", "gemma-4-12B-it-Q4_K_M.gguf")
+        return OpenAI(base_url=GEMMA_BASE_URL, api_key="sk-dummy"), model
+    client = OpenAI(base_url=MODEL_BASE_URL, api_key=APP_CONFIG.get("api_key", "ollama"), timeout=TIMEOUT_SECONDS)
+    return client, MODEL_NAME
+
+
+client, MODEL_NAME = get_client()
+
+
+def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1):
+    full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
+    # NOTE: Ollama (current backend) rejects the OpenAI "tools" param, so the model emits
+    # native ✿FUNCTION✿/✿ARGS✿ text instead. Pass tools= again when moving to llama-server.
+    return client.chat.completions.create(
+        model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Colors + Banner
+# ---------------------------------------------------------------------------
+class Colors:
+    """ANSI color codes - bpytop inspired palette"""
+    RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"; ITALIC = "\033[3m"
+    BLACK = "\033[30m"; RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"
+    BLUE = "\033[94m"; MAGENTA = "\033[95m"; CYAN = "\033[96m"; WHITE = "\033[97m"
+    GRAY = "\033[90m"; BG_BLACK = "\033[40m"
+    ORANGE = "\033[38;5;208m"; GOLD = "\033[38;5;220m"; TEAL = "\033[38;5;30m"
+
+
+def c(color: str, text: str, bold: bool = False) -> str:
+    return f"{Colors.BOLD if bold else ''}{color}{text}{Colors.RESET}"
+
+
+def get_terminal_width() -> int:
+    try:
+        import shutil
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+BANNER_COLORS = [
+    "\033[38;5;208m",  # Orange
+    "\033[38;5;214m",  # Light orange
+    "\033[38;5;220m",  # Gold
+    "\033[38;5;44m",   # Teal
+    "\033[38;5;38m",   # Cyan
+    "\033[38;5;32m",   # Blue-cyan
+]
+
+
+def load_banner_data(path: Path):
+    default = {
+        "full": [], "compact": [], "mini": ["AGENT8088"],
+        "meta": {
+            "version_text": " v2 ", "author_text": "",
+            "hint_wide": "query|/help|/quit", "hint_narrow": "/help|/quit",
+            "plaintext_title": "AGENT8088", "plaintext_author": "",
+            "plaintext_hint": "query|/help|/quit",
+        },
+    }
+    if not path.exists():
+        return default
+
+    out = {"full": [], "compact": [], "mini": [], "meta": dict(default["meta"])}
+    current = None
+    for raw in path.read_text().splitlines():
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().lower()
+            current = section if section in ("full", "compact", "mini", "meta") else None
+        elif current in ("full", "compact", "mini"):
+            out[current].append(line)
+        elif current == "meta" and "=" in line:
+            k, v = line.split("=", 1)
+            out["meta"][k.strip()] = v.strip()
+
+    for key in ("full", "compact", "mini"):
+        if not out[key]:
+            out[key] = default[key]
+    return out
+
+
+_banner_data = load_banner_data(BANNER_FILE)
+BANNER_ART_FULL = _banner_data["full"]
+BANNER_ART_COMPACT = _banner_data["compact"]
+BANNER_ART_MINI = _banner_data["mini"]
+_banner_meta = _banner_data["meta"]
+
+VERSION_TEXT = _banner_meta.get("version_text", " v2 ")
+AUTHOR_TEXT = _banner_meta.get("author_text", "")
+HINT_WIDE = _banner_meta.get("hint_wide", "query|/help|/quit")
+HINT_NARROW = _banner_meta.get("hint_narrow", "/help|/quit")
+
+
+def _render_hint(spec: str) -> str:
+    rendered = []
+    for p in [p.strip() for p in (spec or "").split("|") if p.strip()]:
+        if p == "query":
+            rendered.append(c(Colors.GREEN, p))
+        elif p in ("/help", "help"):
+            rendered.append(c(Colors.CYAN, p))
+        elif p in ("/quit", "quit", "exit"):
+            rendered.append(c(Colors.RED, p))
+        else:
+            rendered.append(c(Colors.GRAY, p))
+    return f" {c(Colors.GRAY, '·')} ".join(rendered)
+
+
+def make_banner(width: int = None) -> str:
+    if width is None:
+        width = get_terminal_width()
+    if width >= 82:
+        art, banner_width = BANNER_ART_FULL or BANNER_ART_MINI, 80
+    elif width >= 45:
+        art, banner_width = BANNER_ART_COMPACT or BANNER_ART_MINI, min(width - 2, 45)
+    else:
+        art, banner_width = BANNER_ART_MINI or ["AGENT8088"], min(width - 2, 33)
+
+    lines = [f"{BANNER_COLORS[i % len(BANNER_COLORS)]}{art_line}{Colors.RESET}" for i, art_line in enumerate(art)]
+
+    line_width = min(banner_width, width - 2)
+    left = max(0, (line_width - len(VERSION_TEXT)) // 2)
+    right = max(0, line_width - len(VERSION_TEXT) - left)
+    version_line = (f"{Colors.GRAY}{'─' * left}{Colors.RESET}"
+                    f"{c(Colors.CYAN, VERSION_TEXT, bold=True)}"
+                    f"{Colors.GRAY}{'─' * right}{Colors.RESET}")
+    lines += ["", version_line]
+
+    if width >= len(AUTHOR_TEXT) + 4:
+        pad = max(0, (line_width - len(AUTHOR_TEXT)) // 2)
+        lines.append(f"{' ' * pad}{c(Colors.GRAY, AUTHOR_TEXT)}")
+
+    hint = f"  {_render_hint(HINT_WIDE)}" if width >= 40 else f" {_render_hint(HINT_NARROW)}"
+    lines += ["", hint, ""]
+    return "\n".join(lines)
+
+
+_pt_title = _banner_meta.get("plaintext_title", "AGENT8088")
+_pt_author = _banner_meta.get("plaintext_author", "")
+_pt_hint = "  ·  ".join([p.strip() for p in _banner_meta.get("plaintext_hint", "query|/help|/quit").split("|") if p.strip()])
+PLAINTEXT_BANNER = f"{_pt_title}\n" + (f"{_pt_author}\n" if _pt_author else "") + f"{'-' * 79}\n{_pt_hint}\n"
+
+
+# ---------------------------------------------------------------------------
+# Last tool output store (model can fetch full output via a last_output tool)
+# ---------------------------------------------------------------------------
+_last_tool_output = ""
+_last_tool_name = ""
+
+
+# ---------------------------------------------------------------------------
+# Spinner
+# ---------------------------------------------------------------------------
+class Spinner:
+    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, message="thinking..."):
+        self.message = message
+        self._active = False
+        self._frame = 0
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        self._active = True
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self._active = False
+        if self._thread:
+            self._thread.join(timeout=0.4)
+        sys.stdout.write("\r" + " " * 70 + "\r")
+        sys.stdout.flush()
+
+    def _spin(self):
+        while self._active:
+            with self._lock:
+                frame = self.FRAMES[self._frame % len(self.FRAMES)]
+                msg = self.message
+            sys.stdout.write(f"\r{c(Colors.CYAN, frame)} {c(Colors.GRAY, msg)}")
+            sys.stdout.flush()
+            self._frame += 1
+            time.sleep(0.08)
+
+    def set_message(self, msg):
+        with self._lock:
+            self.message = msg
+
+
+# ---------------------------------------------------------------------------
+# Tool specs (loaded from tools.txt, with config.txt as fallback)
+# ---------------------------------------------------------------------------
+def default_tool_description(name: str) -> str:
+    return name.replace("_", " ").strip().capitalize()
+
+
+def parse_csv(raw: str) -> list:
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
+
+
+def parse_kv_segments(segments: list) -> dict:
+    out = {}
+    for seg in segments:
+        seg = seg.strip()
+        if seg and "=" in seg:
+            k, v = seg.split("=", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
+    # Each field prefers the inline tools.txt value, then config.txt, then a default.
+    def g(ekey, ckey, default=""):
+        return extra.get(ekey, config.get(f"{ckey}.{name}", default))
+    return {
+        "name": name,
+        "description": description,
+        "mode": (extra.get("mode") or config.get(f"tool_mode.{name}") or "shell").strip().lower(),
+        "args": parse_csv(g("args", "tool_params")),
+        "keywords": set(parse_csv(g("keywords", "tool_keywords"))),
+        "command": g("command", "tool_command"),
+        "url": g("url", "tool_url"),
+        "expression": g("expression", "tool_expression"),
+        "path_arg": g("path_arg", "tool_path_arg", "filename"),
+        "content_arg": g("content_arg", "tool_content_arg", "content"),
+        "timeout": int(g("timeout", "tool_timeout", "25")),
+    }
+
+
+def load_tool_specs(path: Path, config: dict) -> dict:
+    specs = {}
+    if path.exists():
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            name = parts[0] if parts else ""
+            if not name:
+                continue
+            desc = parts[1] if len(parts) > 1 and parts[1] else default_tool_description(name)
+            extra = parse_kv_segments(parts[2:] if len(parts) > 2 else [])
+            specs[name] = _build_spec(name, extra, config, desc)
+    if not specs:  # fall back to a flat "tools=a,b,c" list in config
+        for name in parse_csv(config.get("tools", "")):
+            specs[name] = _build_spec(name, {}, config, default_tool_description(name))
+    return specs
+
+
+def build_tools_def(tool_specs: dict) -> list:
+    return [{
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": spec["description"],
+            "parameters": {
+                "type": "object",
+                "properties": {param: {"type": "string"} for param in spec["args"]},
+                "required": list(spec["args"]),
+            },
+        },
+    } for name, spec in tool_specs.items()]
+
+
+TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
+TOOLS_DEF = build_tools_def(TOOL_SPECS)
+TOOL_NAMES = set(TOOL_SPECS.keys())
+TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+
+
+def render_tool_docs(specs: dict) -> str:
+    """Generate the tool section of the system prompt from TOOL_SPECS, so the
+    prompt can never drift from tools.txt. Required because the Ollama backend
+    rejects the OpenAI tools param: the system prompt is the model's ONLY
+    source of tool knowledge."""
+    lines = [
+        "",
+        "## Tools",
+        "You have these tools. To call one, emit exactly:",
+        '✿' + 'FUNCTION' + '✿' + ': tool_name ' + '✿' + 'ARGS' + '✿' + ': {"arg": "value"}',
+        "Call a tool whenever it can help. Do not claim you lack a capability listed here.",
+        "",
+    ]
+    for name, s in specs.items():
+        args = ", ".join(s["args"]) or "no args"
+        lines.append(f"- {name}({args}): {s['description']}")
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
+
+
+# ---------------------------------------------------------------------------
+# Tool execution engine
+# ---------------------------------------------------------------------------
+def resolve_user_path(raw_path: str) -> Path:
+    value = (raw_path or "").replace("~", os.path.expanduser("~"))
+    p = Path(value)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    resolved = p.resolve()
+    if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
+        raise ValueError(f"Path not allowed: {resolved}")
+    return resolved
+
+
+def classify_plan_component(step_text: str) -> str:
+    text = (step_text or "").lower()
+    words = set(re.findall(r"[a-z0-9_]+", text))
+    best_tool, best_score = None, -1
+    for name, spec in TOOL_SPECS.items():
+        if spec.get("mode") == "plan":
+            continue
+        score = sum(1 for part in name.lower().split("_") if part and part in text)
+        score += len(words.intersection(spec.get("keywords", set())))
+        if score > best_score:
+            best_score, best_tool = score, name
+    return best_tool or next(iter(TOOL_NAMES), "")
+
+
+def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) -> dict:
+    args = dict(given_args or {})
+    required = TOOL_REQUIRED_PARAMS.get(tool_name, [])
+    missing = [p for p in required if p not in args]
+    if missing and len(required) == 1:
+        args[required[0]] = step_text
+    return args
+
+
+def _exec_shell_command(command: str, timeout: int = 25) -> str:
+    r = subprocess.run(command, shell=True, capture_output=True, text=True,
+                       timeout=timeout, executable="/bin/bash", cwd=str(SHELL_CWD))
+    return (r.stdout + r.stderr).strip() or "✓ Command completed"
+
+
+def _format_with_args(template: str, args: dict) -> str:
+    import urllib.parse
+    # Config supplies defaults like {project_root}; model args override and win.
+    safe = dict(APP_CONFIG)
+    for k, v in args.items():
+        sv = str(v)
+        safe[k] = sv
+        safe[f"{k}_q"] = urllib.parse.quote(sv)
+    return (template or "").format(**safe)
+
+
+def _exec_plan(args: dict) -> str:
+    raw = args.get("steps") or args.get("plan") or ""
+    steps = raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            steps = parsed if isinstance(parsed, list) else [s.strip(" -") for s in raw.splitlines() if s.strip()]
+        except Exception:
+            steps = [s.strip(" -") for s in raw.splitlines() if s.strip()]
+    if not isinstance(steps, list):
+        return "Error: execute_plan requires a list of steps or newline plan text."
+
+    outputs = []
+    for idx, step in enumerate(steps, 1):
+        if isinstance(step, dict):
+            step_text = str(step.get("step") or step.get("text") or "")
+            tool_name = str(step.get("tool") or classify_plan_component(step_text))
+            given = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
+            tool_args = _infer_step_args(tool_name, step_text, given)
+        else:
+            step_text = str(step)
+            tool_name = classify_plan_component(step_text)
+            tool_args = _infer_step_args(tool_name, step_text, {})
+        result = run_tool(tool_name, tool_args, allow_plan=False)
+        outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
+    return "\n".join(outputs)
+
+
+def run_tool(name: str, args: dict, allow_plan: bool = True) -> str:
+    spec = TOOL_SPECS.get(name)
+    if not spec:
+        return f"Unknown tool: {name}"
+
+    mode = (spec.get("mode") or "").lower()
+    timeout = int(spec.get("timeout") or 25)
+
+    if mode == "last_output":
+        if not _last_tool_output:
+            return "No tool has been run yet."
+        return f"Full output from '{_last_tool_name}' ({len(_last_tool_output)} chars):\n\n{_last_tool_output}"
+
+    if mode == "plan":
+        if not allow_plan:
+            return "Error: Nested plan tool execution is not allowed."
+        return _exec_plan(args)
+
+    if mode == "read_text":
+        path_arg = spec.get("path_arg") or "filename"
+        fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
+        return resolve_user_path(fn).read_text()
+
+    if mode == "write_text":
+        path_arg = spec.get("path_arg") or "filename"
+        content_arg = spec.get("content_arg") or "content"
+        fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
+        content = str(args.get(content_arg, ""))
+        target = resolve_user_path(fn)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        return f"Wrote {len(content)} bytes to {target}"
+
+    if mode == "python_eval":
+        expression = spec.get("expression") or args.get("expression") or ""
+        if expression:
+            expression = _format_with_args(expression, args)
+        return str(eval(expression, {"__builtins__": {}}, {}))
+
+    if mode == "http_get":
+        url = _format_with_args(spec.get("url") or "{url}", args)
+        return _exec_shell_command(f'curl -s --max-time {timeout} "{url}"', timeout=timeout)
+
+    if mode == "shell":
+        command = _format_with_args(spec.get("command") or "{command}", args)
+        return _exec_shell_command(command, timeout=timeout)
+
+    return f"Unknown tool mode '{mode}' for tool '{name}'"
+
+
+def exec_tool(name: str, arguments: str) -> str:
+    global _last_tool_output, _last_tool_name
+    try:
+        args = json.loads(arguments)
+    except Exception:
+        return "Invalid JSON"
+
+    try:
+        result = run_tool(name, args)
+    except subprocess.TimeoutExpired:
+        result = "Command timed out"
+    except Exception as e:
+        result = f"Error: {e}"
+
+    if (TOOL_SPECS.get(name, {}).get("mode") or "").lower() != "last_output":
+        _last_tool_output, _last_tool_name = result, name
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Parsing model output for tool calls
+# ---------------------------------------------------------------------------
+def find_tool_calls(text: str) -> list:
+    calls = []
+    # 1) <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    for m in re.finditer(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL):
+        try:
+            d = json.loads(m.group(1).strip())
+            if d.get("name") in TOOL_NAMES:
+                d["arguments"] = d.get("arguments", {})
+                calls.append(d)
+        except Exception:
+            pass
+    # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}
+    if not calls:
+        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*?\})', text, re.DOTALL)
+        if m:
+            try:
+                if m.group(1) in TOOL_NAMES:
+                    calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
+            except Exception:
+                pass
+        if not calls:  # loose ✿FUNCTION✿ line with no args
+            m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
+            if m2 and m2.group(1) in TOOL_NAMES:
+                calls.append({"name": m2.group(1), "arguments": {}})
+    # 3) bare JSON {"name": "...", "arguments": {...}}
+    if not calls:
+        for m in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
+            try:
+                if m.group(1) in TOOL_NAMES:
+                    calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
+                    break
+            except Exception:
+                pass
+    # 4) tool name followed by an inline {"command": "..."}
+    if not calls:
+        for name in TOOL_NAMES:
+            m = re.search(re.escape(name) + r'\s*\{\s*"command"\s*:\s*"([^"]+)"', text)
+            if m:
+                calls.append({"name": name, "arguments": {"command": m.group(1).replace('\\"', '"')}})
+                break
+    return calls
+
+
+def strip_tool_json(text: str) -> str:
+    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
+    text = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', text, flags=re.DOTALL)
+    text = re.sub(r'✿FUNCTION✿[^\n]*', '', text)
+    text = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', text, flags=re.DOTALL)
+    # Tidy whitespace WITHOUT flattening newlines, so multi-line answers survive.
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Shared agent loop (used by both interactive and one-shot modes)
+# ---------------------------------------------------------------------------
+def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
+              on_calls=None, on_tool=None, on_result=None, on_answer=None, trace=None):
+    """Drive the model until it gives a final answer or hits max_turns.
+
+    Optional hooks keep presentation out of the loop:
+      spin(msg)         -> context manager shown while waiting (e.g. Spinner)
+      on_calls(calls)   -> once per round, with the parsed tool calls
+      on_tool(name)     -> just before a tool runs
+      on_result(name, out) -> after a tool returns
+      on_answer(answer) -> with the final answer (or the fallback)
+    Pass a list as `trace` to collect a step-by-step record for training data.
+    Returns the final answer string.
+    """
+    spin = spin or (lambda msg: nullcontext())
+    seen = set()      # (name, args) signatures already run -> breaks loops
+    forcing = False   # True after we've told a looping model to stop and answer
+
+    for turn in range(max_turns):
+        with spin("thinking..."):
+            response = create_completion(client, messages, TOOLS_DEF, temperature=temperature)
+        content = response.choices[0].message.content or ""
+        messages.append({"role": "assistant", "content": content})
+
+        calls = find_tool_calls(content)
+        if not calls:
+            answer = strip_tool_json(content) or content.strip()
+            if on_answer:
+                on_answer(answer)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "final_answer", "content": answer})
+            return answer
+
+        if on_calls:
+            on_calls(calls)
+
+        executed = False
+        turn_tools = [] if trace is not None else None
+        for call in calls:
+            name = call["name"]
+            args = call.get("arguments", {})
+            sig = (name, json.dumps(args, sort_keys=True))
+
+            if sig in seen:  # exact repeat -> feed cached output instead of re-running
+                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
+                          if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
+                messages.append({"role": "user", "content": cached})
+                if turn_tools is not None:
+                    turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
+                continue
+
+            seen.add(sig)
+            if on_tool:
+                on_tool(name)
+            with spin(f"running {name}..."):
+                result = exec_tool(name, json.dumps(args))
+            executed = True
+            if on_result:
+                on_result(name, result)
+
+            if turn_tools is not None:
+                step = {"name": name, "arguments": args, "result": result[:3000]}
+                spec = TOOL_SPECS.get(name, {})
+                content_arg = spec.get("content_arg", "content")
+                if spec.get("mode") == "write_text" and args.get(content_arg):
+                    step["written_content"] = args[content_arg]
+                turn_tools.append(step)
+
+            interactive_fail = "EOFError" in result or "EOF when reading" in result or "input()" in result.lower()
+            note = ("\n\nThis script needs interactive input which is not available. "
+                    "Do NOT retry it. Give your final answer now." if interactive_fail else "")
+            messages.append({"role": "user", "content": f"Tool result ({name}):\n{result[:3000]}{note}"})
+
+        if turn_tools:
+            trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
+
+        # Nothing new ran this round (model is looping): nudge once, then give up.
+        if executed:
+            forcing = False
+        elif forcing:
+            break
+        else:
+            forcing = True
+            messages.append({"role": "user", "content":
+                "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
+
+    # Max turns reached or forced stop: return the best answer we have.
+    fallback = _last_tool_output[:1000] if _last_tool_output else "Could not complete the task."
+    if on_answer:
+        on_answer(fallback)
+    if trace is not None:
+        trace.append({"turn": -1, "type": "max_turns",
+                      "content": _last_tool_output[:3000] if _last_tool_output else fallback})
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# Interactive REPL
+# ---------------------------------------------------------------------------
+def _show_calls(calls):
+    print(f"\n{c(Colors.YELLOW, 'Tools:', bold=True)}")
+
+
+def _show_tool(name):
+    print(f"  🔧 {name}")
+
+
+def _show_result(name, result):
+    print(f"  {result[:400]}")
+
+
+def _show_answer(answer):
+    if answer:
+        print(f"\n{c(Colors.CYAN, 'Answer:', bold=True)} {answer}\n")
+
+
+def main():
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    print(make_banner() if use_color else PLAINTEXT_BANNER)
+    print("  Commands: exit, quit, clear, help\n")
+
+    messages = []
+    while True:
+        try:
+            query = input("\n8088> ").strip()
+            if not query:
+                continue
+            low = query.lower()
+            if low in ("exit", "quit"):
+                print("\nGoodbye!")
+                break
+            if low == "clear":
+                messages.clear()
+                print("Context cleared.")
+                continue
+            if low == "help":
+                for t in TOOLS_DEF:
+                    fn = t["function"]
+                    print(f"  • {fn['name']} — {fn['description']}")
+                continue
+
+            messages.append({"role": "user", "content": query})
+            run_agent(messages, max_turns=10, temperature=0.1, spin=Spinner,
+                      on_calls=_show_calls, on_tool=_show_tool,
+                      on_result=_show_result, on_answer=_show_answer)
+
+        except KeyboardInterrupt:
+            print("\n")
+            continue
+        except EOFError:
+            print("\nGoodbye!")
+            break
+        except Exception as e:
+            print(f"\n❌ Error: {e}\n")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    trace_mode = "--trace" in sys.argv  # emit full call chain as JSON to stderr
+    if trace_mode:
+        sys.argv.remove("--trace")
+
+    if len(sys.argv) > 1:  # one-shot / benchmark mode
+        query = " ".join(sys.argv[1:])
+        messages = [{"role": "user", "content": query}]
+        trace = [] if trace_mode else None
+        try:
+            run_agent(messages, max_turns=12, temperature=0.2,
+                      on_result=lambda name, result: print(result[:800]),
+                      on_answer=print, trace=trace)
+        except Exception as e:
+            print(f"Error: {e}")
+        finally:
+            if trace is not None:
+                json.dump({"query": query, "model": MODEL_NAME, "steps": trace}, sys.stderr)
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+    else:
+        main()

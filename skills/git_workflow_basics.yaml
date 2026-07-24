@@ -1,0 +1,14 @@
+name: git_workflow_basics
+description: Basic git operations and safe branching practices
+when_to_use:
+- git
+- commit
+- branch
+- push
+instruction: '- Always check git status before making changes
+
+  - Use meaningful commit messages
+
+  - Create a branch for experimental work
+
+  - Pull before pushing to avoid conflicts'

@@ -1,0 +1,14 @@
+name: context_switching
+description: Managing state across multiple related but separate tasks
+when_to_use:
+- switch
+- next task
+- meanwhile
+- also
+instruction: '- Save important state to files or memory between tasks
+
+  - Clearly signal when moving to a new task
+
+  - Summarize what was completed before starting the next item
+
+  - Keep working directory consistent unless changing tasks requires otherwise'

@@ -1,0 +1,14 @@
+name: code_review_before_execution
+description: Reviewing generated code or scripts before running them
+when_to_use:
+- run
+- execute
+- test
+- script
+instruction: '- Show the user the code before executing it when possible
+
+  - Check for dangerous patterns (rm -rf, etc.)
+
+  - Prefer running with limited permissions first
+
+  - Capture and display output clearly'

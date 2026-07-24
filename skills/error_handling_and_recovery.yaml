@@ -1,0 +1,14 @@
+name: error_handling_and_recovery
+description: Handling command failures and recovering gracefully
+when_to_use:
+- error
+- fail
+- retry
+- except
+instruction: '- Always check exit codes after shell commands
+
+  - Provide clear error messages to the user
+
+  - Suggest next steps when something fails
+
+  - Clean up partial artifacts on failure when possible'

@@ -1,0 +1,15 @@
+name: config_file_handling
+description: Creating and reading configuration files (json, yaml, env)
+when_to_use:
+- config
+- json
+- yaml
+- .env
+- settings
+instruction: '- Use JSON for simple key-value configs
+
+  - Validate the file was written correctly by reading it back
+
+  - Show the user the final content of config files
+
+  - Keep config files in the project root when possible'

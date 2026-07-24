@@ -1,0 +1,16 @@
+name: file_write_safety
+description: Best practices when writing or editing files to avoid corruption
+when_to_use:
+- write
+- create file
+- save
+- edit
+instruction: '- Always read the file first if it might already exist
+
+  - Use file_write only when creating new content
+
+  - Prefer file_edit when modifying existing files
+
+  - Never overwrite important files without backup
+
+  - Confirm the write succeeded by reading the file back'
