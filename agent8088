@@ -889,6 +889,19 @@ def _guard_answer(answer: str) -> str:
     return _redact_secrets(answer)
 
 
+def _mask_system_content(text: str) -> str:
+    """Sanitize text that will be SHOWN to the user (e.g. a reasoning preview):
+    redact secrets and blank out any verbatim system-prompt lines. Chain-of-thought
+    often quotes the system prompt, so this prevents a leak even in debug views."""
+    if not text:
+        return text
+    text = _redact_secrets(text)
+    for fp in _SYSTEM_FINGERPRINTS:
+        if fp in text:
+            text = text.replace(fp, "[internal instructions hidden]")
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------

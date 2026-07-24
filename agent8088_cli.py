@@ -375,12 +375,13 @@ def _stream_view(reasoning_parts, content_parts):
     so the model's chain-of-thought never gets mistaken for its actual reply. The
     reasoning preview is capped so a runaway thinking block can't render megabytes."""
     blocks = []
-    if reasoning_parts:
-        reasoning = "".join(reasoning_parts)
+    if reasoning_parts:  # only populated when S.show_reasoning is on (see on_token)
+        reasoning = A._mask_system_content("".join(reasoning_parts))
         if len(reasoning) > 2000:  # show only the live tail of long reasoning
             reasoning = "… " + reasoning[-2000:]
         blocks.append(Panel(Text(reasoning, style="dim italic"),
-                            title="[dim]thinking[/dim]", box=box.MINIMAL, border_style="grey50"))
+                            title="[dim]thinking (/reasoning off to hide)[/dim]",
+                            box=box.MINIMAL, border_style="grey50"))
     if content_parts:
         blocks.append(Panel(Text("".join(content_parts)), title="[bold cyan]Agent8088[/bold cyan]",
                             box=box.ROUNDED, border_style="cyan"))
@@ -402,7 +403,16 @@ def do_chat(query):
 
         def on_token(kind, delta):
             tokens_ref[0] += 1
-            (reasoning_parts if kind == "reasoning" else content_parts).append(delta)
+            if kind == "reasoning":
+                # Chain-of-thought is hidden by default: it routinely quotes the
+                # system prompt / internal state, so showing it raw is a leak. Keep
+                # the animated status line instead. `/reasoning on` reveals it (masked).
+                if not S.show_reasoning:
+                    live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=True))
+                    return
+                reasoning_parts.append(delta)
+            else:
+                content_parts.append(delta)
             live.update(_stream_view(reasoning_parts, content_parts))
 
         # Let sub-agents render their own nested, animated activity in this Live.
@@ -470,6 +480,7 @@ def cmd_help(_):
         ("/system", "Show the full system prompt sent to the model"),
         ("/history", "Show the current conversation"),
         ("/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace"),
+        ("/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)"),
         ("/temp <float>", "Set sampling temperature (current: %s)" % S.temperature),
         ("/maxturns <int>", "Set max agent turns (current: %s)" % S.max_turns),
         ("/save <file>", "Save conversation + last trace to a JSON file"),
@@ -748,6 +759,19 @@ def cmd_trace(rest):
     console.print(f"trace capture: [{'green' if S.show_trace else 'red'}]{'on' if S.show_trace else 'off'}[/]")
 
 
+def cmd_reasoning(rest):
+    arg = rest.strip().lower()
+    if arg == "on":
+        S.show_reasoning = True
+    elif arg == "off":
+        S.show_reasoning = False
+    else:
+        S.show_reasoning = not S.show_reasoning
+    state = "on" if S.show_reasoning else "off"
+    note = "  [dim](secrets & system text are masked even when shown)[/dim]" if S.show_reasoning else ""
+    console.print(f"reasoning display: [{'green' if S.show_reasoning else 'red'}]{state}[/]{note}")
+
+
 def cmd_temp(rest):
     try:
         S.temperature = float(rest.strip())
@@ -781,7 +805,7 @@ COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan,
     "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
-    "history": cmd_history, "trace": cmd_trace, "temp": cmd_temp,
+    "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "save": cmd_save, "clear": cmd_clear,
 }
 

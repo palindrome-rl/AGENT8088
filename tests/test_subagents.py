@@ -162,6 +162,25 @@ def test_redact_secrets_masks_config_values(engine, monkeypatch):
     assert "[redacted]" in out
 
 
+def test_mask_system_content_hides_prompt_and_secrets(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_SECRET_VALUES", ["tok_abcdef123456"])
+    # A reasoning-style string that quotes a real system-prompt line + a secret.
+    fp = engine._SYSTEM_FINGERPRINTS[0] if engine._SYSTEM_FINGERPRINTS else "You are Agent8088."
+    text = f"The initial prompt says: {fp} and the key is tok_abcdef123456."
+    out = engine._mask_system_content(text)
+    assert "tok_abcdef123456" not in out
+    if engine._SYSTEM_FINGERPRINTS:
+        assert fp not in out
+        assert "internal instructions hidden" in out
+
+
+def test_reasoning_command_registered():
+    import agent8088_cli as cli
+    assert "reasoning" in cli.COMMANDS
+    # default: chain-of-thought hidden
+    assert cli.S.show_reasoning is False
+
+
 def test_exec_subagent_ui_hooks_fire(engine, monkeypatch):
     monkeypatch.setattr(engine, "create_completion", ScriptedModel(["all done"]))
     events = {"factory": [], "done": []}
