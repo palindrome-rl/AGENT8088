@@ -30,3 +30,29 @@ def test_run_agent_uses_custom_system_prompt_and_depth(engine):
     assert answer == "Hello from the sub-agent."
     # The custom system prompt was forwarded to create_completion:
     assert fake.calls[0]["kwargs"].get("system_prompt") == "CUSTOM-PROMPT"
+
+
+def test_load_subagent_specs_parses_frontmatter(engine, tmp_path):
+    d = tmp_path / "agents"
+    d.mkdir()
+    (d / "explore.md").write_text(
+        "---\n"
+        "name: explore\n"
+        "description: Read-only searcher\n"
+        "tools: read_text, execute_shell\n"
+        "max_turns: 6\n"
+        "---\n"
+        "You are a read-only exploration sub-agent.\n"
+    )
+    specs = engine.load_subagent_specs(d)
+    assert "explore" in specs
+    p = specs["explore"]
+    assert p["description"] == "Read-only searcher"
+    assert p["tools"] == ["read_text", "execute_shell"]
+    assert p["max_turns"] == 6
+    assert p["system_prompt"].startswith("You are a read-only")
+
+
+def test_load_subagent_specs_missing_dir_has_default(engine, tmp_path):
+    specs = engine.load_subagent_specs(tmp_path / "nope")
+    assert "general-purpose" in specs  # built-in fallback

@@ -427,6 +427,62 @@ SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
 
 
 # ---------------------------------------------------------------------------
+# Subagents — profiles loaded from agents/*.md (frontmatter + body prompt)
+# ---------------------------------------------------------------------------
+AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expanduser()
+DEFAULT_SUBAGENT = APP_CONFIG.get("default_subagent", "general-purpose")
+SUBAGENT_MAX_DEPTH = int(APP_CONFIG.get("subagent_max_depth", "1"))
+
+_DEFAULT_SUBAGENT_PROFILE = {
+    "name": "general-purpose",
+    "description": "General-purpose sub-agent for multi-step research, search, and code tasks.",
+    "tools": sorted(n for n in TOOL_NAMES if n != "spawn_subagent"),
+    "max_turns": 8,
+    "system_prompt": (
+        "You are a focused sub-agent spawned to complete ONE delegated task with a "
+        "fresh context. Use your tools actively. When done, reply with a concise final "
+        "report of what you found or did — no preamble. Do not ask the caller questions."
+    ),
+}
+
+
+def _parse_frontmatter_md(text: str) -> tuple:
+    """Split a '---' frontmatter block from the body. Returns (meta: dict, body: str)."""
+    meta, body = {}, text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            block = text[3:end].strip()
+            body = text[end + 4:].lstrip("\n")
+            for line in block.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip().lower()] = v.strip()
+    return meta, body
+
+
+def load_subagent_specs(agents_dir: Path) -> dict:
+    specs = {}
+    if agents_dir.exists() and agents_dir.is_dir():
+        for path in sorted(agents_dir.glob("*.md")):
+            meta, body = _parse_frontmatter_md(path.read_text())
+            name = meta.get("name") or path.stem
+            specs[name] = {
+                "name": name,
+                "description": meta.get("description", default_tool_description(name)),
+                "tools": parse_csv(meta.get("tools", "")),
+                "max_turns": int(meta.get("max_turns", "8")),
+                "system_prompt": body.strip() or _DEFAULT_SUBAGENT_PROFILE["system_prompt"],
+            }
+    if DEFAULT_SUBAGENT not in specs:
+        specs[DEFAULT_SUBAGENT] = dict(_DEFAULT_SUBAGENT_PROFILE, name=DEFAULT_SUBAGENT)
+    return specs
+
+
+SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR)
+
+
+# ---------------------------------------------------------------------------
 # Tool execution engine
 # ---------------------------------------------------------------------------
 def resolve_user_path(raw_path: str) -> Path:
