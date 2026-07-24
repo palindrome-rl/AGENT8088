@@ -599,14 +599,15 @@ def exec_tool(name: str, arguments: str) -> str:
 # ---------------------------------------------------------------------------
 # Parsing model output for tool calls
 # ---------------------------------------------------------------------------
-def find_tool_calls(text: str) -> list:
+def find_tool_calls(text: str, allowed: set = None) -> list:
+    allowed = allowed if allowed is not None else TOOL_NAMES
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
         try:
             d = json.loads(m.group(1).strip())
             resolved = _resolve_tool_name(d.get("name", ""))
-            if resolved in TOOL_NAMES:
+            if resolved in allowed:
                 d["name"] = resolved
                 d["arguments"] = d.get("arguments", {})
                 calls.append(d)
@@ -618,7 +619,7 @@ def find_tool_calls(text: str) -> list:
         if m:
             try:
                 resolved = _resolve_tool_name(m.group(1))
-                if resolved in TOOL_NAMES:
+                if resolved in allowed:
                     calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
             except Exception:
                 pass
@@ -626,21 +627,21 @@ def find_tool_calls(text: str) -> list:
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
                 resolved = _resolve_tool_name(m2.group(1))
-                if resolved in TOOL_NAMES:
+                if resolved in allowed:
                     calls.append({"name": resolved, "arguments": {}})
     # 3) bare JSON {"name": "...", "arguments": {...}}
     if not calls:
         for m in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
             try:
                 resolved = _resolve_tool_name(m.group(1))
-                if resolved in TOOL_NAMES:
+                if resolved in allowed:
                     calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
                     break
             except Exception:
                 pass
     # 4) tool name followed by an inline {"command": "..."}
     if not calls:
-        for name in TOOL_NAMES:
+        for name in allowed:
             m = re.search(re.escape(name) + r'\s*\{\s*"command"\s*:\s*"([^"]+)"', text)
             if m:
                 calls.append({"name": name, "arguments": {"command": m.group(1).replace('\\"', '"')}})
@@ -648,7 +649,7 @@ def find_tool_calls(text: str) -> list:
         if not calls:
             for alias, canonical in TOOL_ALIASES.items():
                 m = re.search(re.escape(alias) + r'\s*\{\s*"command"\s*:\s*"([^"]+)"', text)
-                if m and canonical in TOOL_NAMES:
+                if m and canonical in allowed:
                     calls.append({"name": canonical, "arguments": {"command": m.group(1).replace('\\"', '"')}})
                     break
     return calls
