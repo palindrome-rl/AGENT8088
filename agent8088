@@ -58,6 +58,51 @@ ALLOWED_PATHS = [
     if p.strip()
 ]
 
+# ---------------------------------------------------------------------------
+# Permission layer — readonly by default, escalates to edit on user approval
+# ---------------------------------------------------------------------------
+PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
+
+# Shell commands that are safe in readonly mode (inspection only)
+READONLY_SAFE_COMMANDS = frozenset([
+    "ls", "cat", "grep", "find", "head", "tail", "wc", "pwd", "whoami",
+    "echo", "date", "uname", "df", "du", "free", "nproc", "uptime",
+    "git", "diff", "log", "status", "show", "branch",
+])
+
+
+def check_permission(mode: str, command: str = "") -> bool:
+    """Return True if the tool mode is allowed in the current permission mode."""
+    if PERMISSION_MODE == "edit":
+        return True
+    # readonly mode
+    if mode in ("read_text", "http_get", "last_output", "python_eval", "plan"):
+        return True
+    if mode == "shell":
+        # Allow inspection-only shell commands in readonly
+        cmd_base = command.strip().split()[0] if command.strip() else ""
+        # Handle "git status", "git log", etc.
+        if cmd_base == "git" and len(command.strip().split()) > 1:
+            subcmd = command.strip().split()[1]
+            if subcmd in ("status", "diff", "log", "show", "branch"):
+                return True
+        return cmd_base in READONLY_SAFE_COMMANDS
+    return False
+
+
+def request_escalation(target_mode: str, paths: list, change_type: str, reason: str) -> str:
+    """Return a structured escalation request string for the model to relay
+    to the user. The UI intercepts this and prompts the user for approval."""
+    return (
+        f"ESCALATION_REQUEST:{target_mode}:{change_type}:{','.join(paths)}:{reason}"
+    )
+
+
+def grant_escalation():
+    """Transition PERMISSION_MODE to 'edit' for the remainder of the session."""
+    global PERMISSION_MODE
+    PERMISSION_MODE = "edit"
+
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
 
