@@ -45,7 +45,9 @@ def load_config(path: Path) -> dict:
         config[key.strip()] = value.strip()
     return config
 
-CONFIG = load_config(APP_DIR / "config.txt")
+# skillopt.py lives in research/, but config.txt/system.md stay at the repo root.
+REPO_ROOT = APP_DIR.parent
+CONFIG = load_config(REPO_ROOT / "config.txt")
 
 # Target model (the one being optimized)
 TARGET_BASE_URL = CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "http://localhost:11434/v1"))
@@ -56,8 +58,9 @@ OPTIMIZER_BASE_URL = CONFIG.get("optimizer_base_url", TARGET_BASE_URL)
 OPTIMIZER_MODEL = CONFIG.get("optimizer_model", TARGET_MODEL)
 OPTIMIZER_API_KEY = CONFIG.get("optimizer_api_key", CONFIG.get("api_key", "ollama"))
 
-# Paths
-SYSTEM_FILE = Path(CONFIG.get("system_file", str(APP_DIR / "system.md")))
+# Paths — config.txt + system.md live at repo root (sibling of the agent8088
+# executable); benchmark + skillopt_data stay alongside this script in research/.
+SYSTEM_FILE = Path(CONFIG.get("system_file", str(REPO_ROOT / "system.md")))
 BENCHMARK_FILE = APP_DIR / "run_benchmark.py"
 BENCHMARK_RESULTS = APP_DIR / "benchmark_results.json"
 SKILLOPT_DIR = APP_DIR / "skillopt_data"

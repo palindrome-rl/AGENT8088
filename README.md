@@ -156,22 +156,24 @@ agent.load_skills()
 ```
 agent8088/
 ├── agent8088                 # Main executable
-├── configure.sh              # Configuration wizard
-├── reality7b_config_*.py     # Model configs
-├── skills/                   # Tool implementations
-│   ├── filesystem/
-│   ├── system/
-│   └── web/
-├── lora_training/           # Training pipeline
-├── vast-training/           # Vast.ai automation
-├── data_cleanup/            # Dataset curation
-├── paper/                   # Research documentation
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── TRAINING.md
-│   ├── DEVELOPMENT.md
-│   └── API.md
-├── tests/
+├── config.txt                # Runtime config (model, paths, search, skillopt)
+├── tools.txt                 # Tool specs loaded by the agent
+├── system.md                 # System prompt / skill document
+├── configs/                  # Model-config variants you swap into config.txt
+│   ├── reality7b_config_colossus.py
+│   └── reality7b_config_ollama.py
+├── scripts/                  # One-off repo ops
+│   ├── configure.sh
+│   ├── push-to-github.sh
+│   └── verify-push.sh
+├── research/                 # Non-runtime research/training pipeline
+│   ├── skillopt.py           # SkillOpt self-improver
+│   ├── run_benchmark.py      # Benchmark suite (used by skillopt)
+│   ├── data_cleanup/         # Dataset curation
+│   ├── vast-training/        # Vast.ai automation
+│   └── paper/                # Research documentation
+├── skills/                   # Agent skill YAMLs
+├── docs/                     # Architecture / API docs
 └── README.md
 ```
 
@@ -201,19 +203,19 @@ Agent8088 includes **SkillOpt**, a text-space optimization system that improves 
 
 ```bash
 # Run full optimization (4 epochs by default)
-python3 skillopt.py
+python3 research/skillopt.py
 
 # Custom epochs
-python3 skillopt.py --epochs 6
+python3 research/skillopt.py --epochs 6
 
 # Preview edits without applying
-python3 skillopt.py --dry-run
+python3 research/skillopt.py --dry-run
 
 # View optimization history
-python3 skillopt.py --report
+python3 research/skillopt.py --report
 
 # Restore pre-optimization skill
-python3 skillopt.py --restore
+python3 research/skillopt.py --restore
 ```
 
 ### Configuration

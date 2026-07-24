@@ -31,3 +31,7 @@ qwen-tooluse-lora/
 benchmark_results.json
 traces/
 skillopt_data/
+
+# Local tooling (graphify knowledge graph + opencode config)
+graphify-out/
+.opencode/
