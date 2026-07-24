@@ -439,6 +439,38 @@ TOOL_ALIASES = {
     "write": "write_file", "create_file": "write_file",
     "calc": "calculate", "eval": "calculate", "math": "calculate",
     "last": "last_output", "prev_output": "last_output",
+    "mkdir": "execute_shell", "rmdir": "execute_shell",
+    "touch": "execute_shell", "rm": "execute_shell",
+    "cp": "execute_shell", "mv": "execute_shell",
+    "echo": "execute_shell", "ls": "execute_shell",
+    "grep": "execute_shell", "find": "execute_shell",
+    "pwd": "execute_shell", "cd": "execute_shell",
+    "chmod": "execute_shell", "chown": "execute_shell",
+    "curl": "execute_shell", "wget": "execute_shell",
+    "git": "execute_shell", "pip": "execute_shell",
+    "python": "execute_shell", "node": "execute_shell",
+}
+
+TOOL_ARG_TRANSFORMS = {
+    "mkdir": lambda a: {"command": f"mkdir {a.get('path', a.get('name', a.get('dir', '')))}"},
+    "rmdir": lambda a: {"command": f"rmdir {a.get('path', a.get('dir', ''))}"},
+    "touch": lambda a: {"command": f"touch {a.get('path', a.get('filename', a.get('file', '')))}"},
+    "rm":    lambda a: {"command": f"rm {a.get('path', a.get('file', a.get('filename', '')))}"},
+    "cp":    lambda a: {"command": f"cp {a.get('source', a.get('src', ''))} {a.get('dest', a.get('dst', a.get('destination', '')))}"},
+    "mv":    lambda a: {"command": f"mv {a.get('source', a.get('src', ''))} {a.get('dest', a.get('dst', a.get('destination', '')))}"},
+    "cat":   lambda a: {"command": f"cat {a.get('path', a.get('filename', a.get('file', '')))}"},
+    "echo":  lambda a: {"command": f"echo {a.get('text', a.get('message', a.get('value', '')))}"},
+    "ls":    lambda a: {"command": f"ls {a.get('path', a.get('dir', a.get('directory', '')))}".strip()},
+    "grep":  lambda a: {"command": f"grep {a.get('pattern', a.get('query', ''))} {a.get('path', a.get('file', ''))}"},
+    "find":  lambda a: {"command": f"find {a.get('path', a.get('dir', '.'))} {a.get('name', a.get('pattern', ''))}".strip()},
+    "pwd":   lambda a: {"command": "pwd"},
+    "chmod": lambda a: {"command": f"chmod {a.get('mode', a.get('permissions', ''))} {a.get('path', a.get('file', ''))}"},
+    "curl":  lambda a: {"command": f"curl {a.get('url', a.get('uri', ''))}"},
+    "wget":  lambda a: {"command": f"wget {a.get('url', a.get('uri', ''))}"},
+    "git":   lambda a: {"command": f"git {a.get('command', a.get('subcommand', a.get('args', '')))}"},
+    "pip":   lambda a: {"command": f"pip {a.get('command', a.get('package', a.get('args', '')))}"},
+    "python":lambda a: {"command": f"python {a.get('script', a.get('file', a.get('command', '')))}"},
+    "node":  lambda a: {"command": f"node {a.get('script', a.get('file', a.get('command', '')))}"},
 }
 
 
@@ -447,6 +479,16 @@ def _resolve_tool_name(name):
     Canonical names pass through unchanged; unknown names pass through too
     (so the TOOL_NAMES check fails naturally and the call is skipped)."""
     return TOOL_ALIASES.get(name, name)
+
+
+def _resolve_tool_args(original_name, resolved_name, args):
+    """If the model called a shell command by its natural name (e.g. 'mkdir'),
+    transform the args into the {command: ...} format that execute_shell expects.
+    If the name resolved to execute_shell via a transform alias, apply it.
+    Otherwise return args unchanged."""
+    if original_name in TOOL_ARG_TRANSFORMS and resolved_name == "execute_shell":
+        return TOOL_ARG_TRANSFORMS[original_name](args or {})
+    return args
 
 
 def render_tool_docs(specs: dict) -> str:
@@ -687,10 +729,11 @@ def find_tool_calls(text: str) -> list:
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
         try:
             d = json.loads(m.group(1).strip())
-            resolved = _resolve_tool_name(d.get("name", ""))
+            orig = d.get("name", "")
+            resolved = _resolve_tool_name(orig)
             if resolved in TOOL_NAMES:
                 d["name"] = resolved
-                d["arguments"] = d.get("arguments", {})
+                d["arguments"] = _resolve_tool_args(orig, resolved, d.get("arguments", {}))
                 calls.append(d)
         except Exception:
             pass
@@ -699,24 +742,29 @@ def find_tool_calls(text: str) -> list:
         m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*?\})', text, re.DOTALL)
         if m:
             try:
-                resolved = _resolve_tool_name(m.group(1))
+                orig = m.group(1)
+                resolved = _resolve_tool_name(orig)
                 if resolved in TOOL_NAMES:
-                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
+                    raw_args = json.loads(m.group(2))
+                    calls.append({"name": resolved, "arguments": _resolve_tool_args(orig, resolved, raw_args)})
             except Exception:
                 pass
         if not calls:  # loose ✿FUNCTION✿ line with no args
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
-                resolved = _resolve_tool_name(m2.group(1))
+                orig = m2.group(1)
+                resolved = _resolve_tool_name(orig)
                 if resolved in TOOL_NAMES:
-                    calls.append({"name": resolved, "arguments": {}})
+                    calls.append({"name": resolved, "arguments": _resolve_tool_args(orig, resolved, {})})
     # 3) bare JSON {"name": "...", "arguments": {...}}
     if not calls:
         for m in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
             try:
-                resolved = _resolve_tool_name(m.group(1))
+                orig = m.group(1)
+                resolved = _resolve_tool_name(orig)
                 if resolved in TOOL_NAMES:
-                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
+                    raw_args = json.loads(m.group(2))
+                    calls.append({"name": resolved, "arguments": _resolve_tool_args(orig, resolved, raw_args)})
                     break
             except Exception:
                 pass
