@@ -1,0 +1,259 @@
+<!doctype html><html><head><meta charset="utf-8"><title>8088 Agent Paper Draft</title><style>
+body { font-family: Georgia, serif; max-width: 900px; margin: 40px auto; line-height: 1.5; font-size: 15px; }
+h1,h2,h3 { font-family: Arial, sans-serif; }
+</style></head><body># Self-Evolving Tool-Using Agents: Distilling Grounded Execution into Skill-Centric LoRA Training Data<br>
+<br>
+## Abstract<br>
+Tool-using language agents often fail in predictable ways: they narrate actions instead of executing them, hallucinate tool use, lose grounding across steps, and fail to accumulate reusable procedural knowledge. We present a hybrid pipeline for improving local tool-using agents without relying on large human-labeled instruction-response corpora. Our system begins with human-specified capability domains, expands them into synthetic curricula using a strong external teacher model, executes those tasks through a grounded local agent with real tools, evaluates the resulting traces, extracts reusable skills from successful episodes, and converts those grounded artifacts into LoRA training data. We then pair the adapted model with a progressively structured agent runtime, evolving from a monolithic prototype into a modular capability-aware framework with task graphs, evidence objects, validation objects, configurable web-result ranking, presentation policies, and capability-family benchmarking. The resulting system, `8088-agent_000`, demonstrates materially improved tool-using behavior relative to the base model on system inspection, file manipulation, grounded execution, and exact task completion. Across a 100-experiment benchmark suite spanning system, filesystem, web, workspace, and factual question-answering families, the final system achieved perfect pass rates in the implemented families while maintaining low latency on deterministic tasks. The main contribution is not LoRA training alone, but a grounded execution and skill-distillation pipeline coupled to an architecture that increasingly treats agent behavior as structured planning, execution, evidence accumulation, validation, and presentation.<br>
+<br>
+## 1. Introduction<br>
+Language-model-based agents have made rapid progress, but their performance degrades sharply when tasks require actual grounded execution. In practice, many agents describe what they would do rather than doing it, hallucinate tool calls, or fail to preserve exactness in tasks involving local system state, file operations, and multi-step workflows. These issues become especially severe in local agent systems where users expect the agent to operate on real files, real processes, real web retrieval, and real workspace state.<br>
+<br>
+A second challenge is data. Standard post-training approaches often rely on expensive human supervision in the form of curated instruction-response pairs. For agents, however, the key missing competence is often not natural-language style but grounded procedural behavior. This suggests a different route: generate training data from execution itself. Instead of asking humans to label ideal outputs, we can build a pipeline that seeds capability areas, expands them into task curricula, runs those tasks through a local executor with real tools, filters and evaluates the resulting traces, extracts compact reusable skills, and uses those grounded artifacts to train a LoRA adapter.<br>
+<br>
+This paper describes that approach and the resulting system. We make two linked contributions. First, we define a hybrid self-improving data pipeline combining human-seeded thematic task families, teacher-expanded synthetic curricula, grounded local execution, evaluator-gated skill extraction, and LoRA post-training. Second, we describe the architectural evolution of the runtime itself, which moved from a monolithic local-agent script into a modular capability-aware framework with structured planning, execution, evidence handling, validation, configurable ranking, presentation, and capability-family benchmarking.<br>
+<br>
+Our claim is not that synthetic data alone is sufficient, nor that the system is fully autonomous from zero supervision. Rather, the contribution is a weakly human-seeded, teacher-expanded, execution-grounded, skill-distilled pipeline for producing training material and runtime behavior that more closely resemble real agent competence.<br>
+<br>
+## 2. Problem Statement<br>
+Tool-using agents fail in several recurring ways:<br>
+<br>
+- they narrate actions instead of taking them<br>
+- they hallucinate tool usage<br>
+- they can complete one-off tasks but do not accumulate reusable procedures<br>
+- they lack compact procedural memory and explicit validation<br>
+- they often produce verbose, noisy, or poorly grounded outputs even when the underlying tools succeed<br>
+<br>
+A standard language-model post-training setup does not directly solve these problems because what matters most is not only stylistic alignment but grounded procedural performance. We therefore target a different goal: train and structure the system so that execution traces, validation, and distilled skills become central artifacts.<br>
+<br>
+## 3. Method Overview<br>
+Our system has five core components:<br>
+1. curriculum and task generation<br>
+2. grounded executor agent<br>
+3. evaluator<br>
+4. skill extractor<br>
+5. persistent storage for traces and skills<br>
+<br>
+The core loop is:<br>
+- generate or sample a task<br>
+- run the local executor on the task<br>
+- capture response and execution trace<br>
+- score the episode on correctness, efficiency, and tool use<br>
+- if the quality threshold is met, extract a reusable skill<br>
+- save the raw episode and distilled skill<br>
+- later convert these into LoRA training pairs<br>
+<br>
+This design separates teacher expansion from executor behavior and separates raw execution from distilled skill learning.<br>
+<br>
+## 4. Data Generation and Curriculum Construction<br>
+The training data is hybrid rather than purely synthetic or purely human-authored.<br>
+<br>
+### 4.1 Human-seeded capability taxonomy<br>
+We began by defining a set of target capability domains, including:<br>
+- memory retrieval<br>
+- database querying<br>
+- web search and question answering<br>
+- mathematical tool use<br>
+- shell and file manipulation<br>
+- code generation<br>
+<br>
+For each domain, a human operator supplied a small number of seed tasks, typically two to three exemplars. This ensured that the curriculum remained aligned with intended use cases rather than drifting into abstract benchmark behavior.<br>
+<br>
+### 4.2 Teacher-generated task expansion<br>
+Claude Opus 4.5 was used to expand the seed tasks into domain-specific curricula of roughly 80 to 100 tasks per domain. Crucially, the teacher model was used for **task generation only**, not for generating gold output targets. This distinction matters because our objective was to distill grounded procedural competence, not merely teacher response style.<br>
+<br>
+### 4.3 Grounded execution traces as training substrate<br>
+The resulting prompts were executed by a local tool-using agent. Those runs produced:<br>
+- execution traces<br>
+- evaluator scores<br>
+- extracted skills<br>
+<br>
+These artifacts, not the teacher outputs, formed the actual substrate for downstream LoRA adaptation. This is the central methodological point.<br>
+<br>
+## 5. Skill Distillation and Training Corpus Construction<br>
+The local executor was not just asked to solve tasks. Its episodes were evaluated and filtered, and successful behavior was distilled into skill-like procedural representations. In effect, the system builds a training corpus from grounded traces that satisfy execution quality thresholds.<br>
+<br>
+This is different from both naive self-play and standard distillation. The pipeline is:<br>
+- weakly human-seeded<br>
+- teacher-expanded<br>
+- execution-grounded<br>
+- skill-distilled<br>
+- LoRA-adapted for tool use<br>
+<br>
+The resulting corpus is therefore more procedural than conversational.<br>
+<br>
+## 6. LoRA Training Setup<br>
+We trained a LoRA adapter on top of Qwen2.5-14B-Instruct using QLoRA. The training configuration included:<br>
+- rank `r=32`<br>
+- alpha `64`<br>
+- dropout `0.05`<br>
+- batch size `2`<br>
+- gradient accumulation `8`<br>
+- maximum sequence length `4096`<br>
+<br>
+The final successful training run used a Vast.ai A100 SXM4 40GB instance. It completed in approximately 2 hours 2 minutes over 1162 steps and 9292 samples, converging to a final loss of 0.714 from an initial loss near 0.90.<br>
+<br>
+## 7. Local Deployment<br>
+After training, we deployed the adapted model locally on AmirDesktop. Rather than waiting for slow CPU quantization, we copied a pre-quantized GGUF artifact from colossus. The model was then loaded into Windows Ollama and exposed to WSL through the local endpoint. Validation confirmed correct tool-call tag behavior using the expected `✿FUNCTION✿` format.<br>
+<br>
+This local deployment step matters because the runtime was designed to operate directly on local files, system state, and self-hosted services.<br>
+<br>
+## 8. Observed Improvement from LoRA<br>
+The central thesis that emerged from repeated testing was:<br>
+<br>
+&gt; grounded execution + skill distillation → better tool-calling behavior than the base model<br>
+<br>
+The LoRA-adapted model consistently improved behavior on:<br>
+- direct system inspection<br>
+- exact file operations<br>
+- grounded task completion<br>
+- reduced narration-only behavior<br>
+- better execution fidelity<br>
+<br>
+The base model sometimes retained stronger prose style, but the adapted model was materially better at behaving like a real tool-using agent.<br>
+<br>
+## 9. Runtime Evolution<br>
+The model improvement alone was insufficient. We discovered that many failures arose from the runtime architecture itself rather than from the model.<br>
+<br>
+### 9.1 Monolithic prototype<br>
+The initial runtime lived in a single large script that mixed:<br>
+- routing<br>
+- parsing<br>
+- file ops<br>
+- system execution<br>
+- web handling<br>
+- presentation<br>
+- tests<br>
+<br>
+This made iteration increasingly brittle.<br>
+<br>
+### 9.2 Canonical rebuilt runtime<br>
+We established `agent8088_000.py` as the canonical entrypoint.<br>
+<br>
+### 9.3 Modular framework<br>
+We then split the runtime into a package containing modules for:<br>
+- planning<br>
+- task graphs<br>
+- operation execution<br>
+- capability metadata<br>
+- tool adapters<br>
+- file-op planning<br>
+- web retrieval and ranking<br>
+- workspace state<br>
+- evidence<br>
+- validation<br>
+- presentation<br>
+- summarization<br>
+- benchmarking<br>
+<br>
+### 9.4 Capability-aware architecture<br>
+The system now includes:<br>
+- capability registry<br>
+- capability-to-tool resolver<br>
+- task graphs<br>
+- structured operation executor<br>
+- evidence objects<br>
+- validation objects<br>
+- presentation modes<br>
+- configurable web ranking policy<br>
+- workspace introspection<br>
+- capability-family benchmarking<br>
+<br>
+This was a major architectural shift from a patchwork local agent toward a reusable framework.<br>
+<br>
+## 10. Presentation and Validation<br>
+One important lesson was that execution quality and user-facing quality are separate concerns. A system can successfully execute tasks yet still produce poor outputs if presentation is not structured. We therefore separated presentation into its own layer, with response objects and renderer policies.<br>
+<br>
+Similarly, validation was elevated into a first-class typed object, allowing each operation to emit:<br>
+- whether it verified<br>
+- the verification method<br>
+- expected vs observed state<br>
+- reason for failure or mismatch<br>
+<br>
+This improves both trust and debugging.<br>
+<br>
+## 11. Evaluation Methodology<br>
+Evaluation progressed through increasingly structured suites:<br>
+- 10-query benchmark<br>
+- diverse 10<br>
+- mixed 15<br>
+- varied 20<br>
+- capability-family summaries<br>
+- 100-experiment batch<br>
+<br>
+We also moved beyond prompt lists to capability-family evaluation:<br>
+- `system.inspect`<br>
+- `filesystem.read`<br>
+- `filesystem.write`<br>
+- `filesystem.append`<br>
+- `filesystem.transform_write`<br>
+- `web.search`<br>
+- `workspace.inspect`<br>
+- `fact.answer`<br>
+<br>
+This allows us to understand the system by functional competence rather than by anecdotal task selection.<br>
+<br>
+## 12. Benchmark Results<br>
+The 100-experiment benchmark produced strong results across the implemented families.<br>
+<br>
+By family:<br>
+- `system.inspect`: 20 runs, pass rate 1.0, average latency ~0.00185s<br>
+- `filesystem.list`: 10 runs, pass rate 1.0, average latency ~0.0013s<br>
+- `filesystem.read`: 5 runs, pass rate 1.0<br>
+- `filesystem.write`: 20 runs, pass rate 1.0<br>
+- `filesystem.append`: 5 runs, pass rate 1.0<br>
+- `filesystem.transform_write`: 10 runs, pass rate 1.0<br>
+- `fact.answer`: 10 runs, pass rate 1.0, average latency ~0.585s<br>
+- `web.search`: 10 runs, pass rate 1.0, average latency ~0.569s<br>
+- `workspace.inspect`: 10 runs, pass rate 1.0, average latency ~0.0027s<br>
+<br>
+These results show a clear split between deterministic structured paths and model-dependent paths. The deterministic families are nearly instantaneous and highly reliable. The model-dependent families are slower but still robust within the tested range.<br>
+<br>
+## 13. Lessons Learned<br>
+Several lessons emerged from this process.<br>
+<br>
+### 13.1 Grounded execution matters more than synthetic cleverness<br>
+The major gains came from real execution traces and skill distillation, not merely from prompting or synthetic answer generation.<br>
+<br>
+### 13.2 Tool use must be architected, not merely prompted<br>
+Robust tool behavior required deterministic subsystems, structured parsing, validation, and typed file-operation semantics.<br>
+<br>
+### 13.3 Modularity is essential<br>
+As the runtime grew, monolithic design became a liability. Encapsulation improved both velocity and reliability.<br>
+<br>
+### 13.4 Evaluation by capability family is superior to simple prompt lists<br>
+Capability-family evaluation reveals the true operational profile of the system.<br>
+<br>
+### 13.5 Presentation deserves its own layer<br>
+Without a dedicated presentation subsystem, otherwise successful tool runs still produce poor user-visible outputs.<br>
+<br>
+### 13.6 Shared schemas improve generality<br>
+Capabilities, task graphs, evidence objects, validation objects, and configurable ranking policies proved to be the correct abstractions for building a more general agent framework.<br>
+<br>
+## 14. Limitations<br>
+Despite the strong current state, several limitations remain.<br>
+<br>
+- task-graph execution is still partly driven by high-level intent templates rather than completely arbitrary compositional graphs<br>
+- evidence fusion across file/system/web/workspace sources can be deeper<br>
+- capability-family scoring is still heuristic and should be enriched with more nuanced judgment metrics<br>
+- current performance reflects the implemented families, not arbitrary open-domain agent use<br>
+<br>
+## 15. Future Work<br>
+The next major steps are:<br>
+1. make `TaskGraph.operations` drive more arbitrary compositional execution<br>
+2. deepen cross-source evidence fusion<br>
+3. improve validation semantics with richer expected/observed state capture<br>
+4. enrich benchmark scoring with latency distributions, failure buckets, and higher-resolution quality metrics<br>
+5. test held-out and more adversarial task suites beyond the current structured benchmark families<br>
+<br>
+## 16. Conclusion<br>
+We presented a grounded execution and skill-distillation pipeline for training local tool-using agents, together with the runtime architecture that made the adapted model useful in practice. The key contribution is not simply a LoRA adapter, but the combination of:<br>
+- human-seeded capability areas<br>
+- teacher-expanded synthetic curricula<br>
+- grounded execution traces<br>
+- evaluator-gated skill distillation<br>
+- modular capability-aware runtime architecture<br>
+- capability-family evaluation<br>
+<br>
+The resulting system, `8088-agent_000`, now performs strongly across system, filesystem, web, workspace, and factual families, and has evolved from a fragile prototype into a serious local agent framework. This combination of grounded training data and structured agent architecture offers a practical path toward more reliable tool-using systems.<br>
+</body></html>

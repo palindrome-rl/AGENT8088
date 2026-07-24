@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+
+# Environment
+.env
+venv/
+env/
+
+# Secrets
+*.key
+*.pem
+*_secret*
+*_password*
+
+# Large files
+*.db
+*.safetensors
+*.bin
+*.gguf
+qwen-tooluse-lora/
+
+# Logs
+*.log
+
+# Benchmark outputs (contain dynamic system state)
+benchmark_results.json
+traces/
+skillopt_data/

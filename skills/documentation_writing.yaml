@@ -1,0 +1,14 @@
+name: documentation_writing
+description: Writing clear READMEs, comments, and documentation
+when_to_use:
+- readme
+- document
+- comment
+- explain
+instruction: '- Start with a one-sentence purpose
+
+  - Include usage examples
+
+  - Document any assumptions or requirements
+
+  - Keep documentation close to the code it describes'

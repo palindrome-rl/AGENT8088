@@ -1,0 +1,14 @@
+name: testing_and_validation
+description: Testing created artifacts and validating results
+when_to_use:
+- test
+- verify
+- check
+- validate
+instruction: '- Always verify created files exist and have correct content
+
+  - Run created scripts with sample input when possible
+
+  - Report both success and failure clearly
+
+  - Suggest fixes when validation fails'

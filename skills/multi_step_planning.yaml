@@ -1,0 +1,21 @@
+name: multi_step_planning
+aliases: ["multi_step_plan", "plan_steps", "multi_step"]
+description: Breaking down compound tasks into clear sequential steps with dependencies
+when_to_use:
+- then
+- after
+- next
+- followed by
+- create then
+- write then
+- multi step
+- compound task
+instruction: '- Identify the sequence of operations needed
+
+  - Check dependencies between steps before executing
+
+  - Use memory or temporary files to pass information between steps
+
+  - Verify each step succeeds before moving to the next
+
+  - Summarize the plan before executing complex sequences'

@@ -1,0 +1,19 @@
+name: safe_deletion
+description: Safe patterns for deleting files, directories, or cleaning up artifacts
+  without data loss
+when_to_use:
+- delete
+- remove
+- clean
+- cleanup
+- rm
+- erase
+instruction: '- Never use file_write to delete or truncate files
+
+  - Always prefer execute_shell with `rm` for deletion
+
+  - For bulk cleanup: first list files with ls, then delete
+
+  - Always verify deletion with a follow-up ls command
+
+  - Ask for confirmation on destructive operations when possible'

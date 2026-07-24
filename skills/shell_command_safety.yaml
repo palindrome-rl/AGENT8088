@@ -1,0 +1,17 @@
+name: shell_command_safety
+description: Safe execution of shell commands with proper escaping and verification
+when_to_use:
+- run
+- execute
+- shell
+- bash
+- command
+instruction: '- Quote arguments properly when using variables
+
+  - Prefer full paths for important commands
+
+  - Capture and check exit codes
+
+  - Use timeout on potentially long-running commands
+
+  - Explain what the command does before running it'

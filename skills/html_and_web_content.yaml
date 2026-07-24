@@ -1,0 +1,14 @@
+name: html_and_web_content
+description: Creating simple HTML files and basic web content
+when_to_use:
+- html
+- web
+- index.html
+- website
+instruction: '- Use semantic HTML5 structure
+
+  - Include a clear title and heading
+
+  - Keep styling minimal unless requested
+
+  - Verify the file renders correctly'

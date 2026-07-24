@@ -1,0 +1,12 @@
+name: backup_before_changes
+description: Creating backups before making significant changes to files
+when_to_use:
+- edit
+- modify
+- change
+- update
+instruction: '- Create a .bak or _backup copy before editing important files
+
+  - Use timestamped backups for critical files
+
+  - Verify the backup was created successfully'
