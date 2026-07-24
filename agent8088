@@ -481,6 +481,13 @@ def load_subagent_specs(agents_dir: Path) -> dict:
 
 SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR)
 
+# UI hook: a presentation layer (e.g. the Rich CLI) may set this to a factory
+#   subagent_ui(agent_type, task, depth) -> dict of run_agent hooks
+# with any of the keys: spin, on_calls, on_tool, on_result, done(answer).
+# Left None, sub-agents run silently (benchmark, one-shot, plain REPL) — so this
+# is fully backward-compatible. Kept out of the loop, same as every other hook.
+subagent_ui = None
+
 
 # ---------------------------------------------------------------------------
 # Tool execution engine
@@ -597,6 +604,9 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     sub_system = profile["system_prompt"] + "\n" + render_tool_docs(sub_specs)
     sub_tools_def = build_tools_def(sub_specs)
 
+    # Optional live presentation hooks for the sub-agent's own loop.
+    ui = subagent_ui(type_name, task, depth) if callable(subagent_ui) else {}
+
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
     try:
@@ -605,12 +615,16 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             max_turns=profile["max_turns"], temperature=0.2,
             system_prompt=sub_system, tools_def=sub_tools_def,
             allowed_tools=allowed, depth=depth + 1,
+            spin=ui.get("spin"), on_calls=ui.get("on_calls"),
+            on_tool=ui.get("on_tool"), on_result=ui.get("on_result"),
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
     finally:
         _last_tool_output, _last_tool_name, _last_write_diff = saved
 
+    if ui.get("done"):
+        ui["done"](answer)
     return f"[subagent:{type_name}] {answer}"
 
 

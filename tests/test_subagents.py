@@ -85,3 +85,19 @@ def test_exec_subagent_unknown_type_falls_back(engine, monkeypatch):
     monkeypatch.setattr(engine, "create_completion", ScriptedModel(["ok"]))
     out = engine._exec_subagent({"agent_type": "does-not-exist", "task": "x"}, depth=0)
     assert "unknown agent_type" in out.lower()
+
+
+def test_exec_subagent_ui_hooks_fire(engine, monkeypatch):
+    monkeypatch.setattr(engine, "create_completion", ScriptedModel(["all done"]))
+    events = {"factory": [], "done": []}
+
+    def factory(agent_type, task, depth):
+        events["factory"].append((agent_type, task, depth))
+        return {"done": lambda answer: events["done"].append(answer)}
+
+    monkeypatch.setattr(engine, "subagent_ui", factory)
+    out = engine._exec_subagent({"agent_type": "explore", "task": "look around"}, depth=0)
+
+    assert events["factory"] == [("explore", "look around", 0)]
+    assert events["done"] == ["all done"]
+    assert "all done" in out

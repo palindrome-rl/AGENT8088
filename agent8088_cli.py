@@ -130,6 +130,23 @@ class _StatusLine:
         yield grid
 
 
+class _SubStatusLine:
+    """Animated status line for a running sub-agent: a magenta gutter, a pulsing
+    spinner, and the sub-agent's current activity + elapsed time. Like _StatusLine,
+    it recomputes at render time so Live's background repaint animates it for free
+    even while the model call blocks."""
+    def __init__(self, state):
+        self.state = state
+        self.spinner = Spinner("agent8088_pulse", style="magenta")
+
+    def __rich_console__(self, console, options):
+        elapsed = time.time() - self.state["start"]
+        grid = Table.grid(padding=(0, 1))
+        label = Text(f"{self.state['type']} · {self.state['msg']} ({elapsed:.0f}s)", style="dim")
+        grid.add_row(Text("│", style="magenta"), self.spinner, label)
+        yield grid
+
+
 # ---------------------------------------------------------------------------
 # Load the real Agent8088 engine (script has no .py extension)
 # ---------------------------------------------------------------------------
@@ -245,6 +262,11 @@ def _diff_block(diff_lines, limit=60):
 def on_result(name, result):
     mode = A.TOOL_SPECS.get(name, {}).get("mode")
 
+    if mode == "subagent":
+        console.print(Panel(Text(result), title="[magenta]subagent result[/magenta]",
+                            box=box.ROUNDED, border_style="magenta"))
+        return
+
     if mode == "read_text":
         body, total = _numbered_lines(result)
         console.print(Text(f"  ⎿  Read {total} line{'s' if total != 1 else ''}", style="dim"))
@@ -277,6 +299,70 @@ def render_answer(answer):
     except Exception:
         console.print(Panel(Text(answer), title="[bold cyan]Agent8088[/bold cyan]",
                             box=box.ROUNDED, border_style="cyan"))
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent live view — a nested, animated activity trace inside the parent turn
+# ---------------------------------------------------------------------------
+def _make_subagent_ui(live):
+    """Factory the engine calls (via A.subagent_ui) each time a sub-agent spawns.
+
+    Reuses the parent turn's Live: the sub-agent's status animates in the live
+    region (magenta pulse), while its tool calls/results print into the scrollback
+    as an indented, magenta-gutter trace — so delegation reads as a nested block:
+
+        ⏺ spawn_subagent(agent_type="explore", task="…")
+        ╭─ 🤖 subagent · explore
+        │  find every TODO in the repo
+        │  ⏺ execute_shell(command="grep -rn TODO")
+        │  ⎿  src/app.py:12: # TODO: handle retries  (3 lines)
+        ╰─ ✓ done · 1 tool · 2.4s
+    """
+    def factory(agent_type, task, depth):
+        state = {"type": agent_type, "start": time.time(), "msg": "starting…", "tools": 0}
+
+        head = Text("╭─ ", style="magenta")
+        head.append("🤖 subagent", style="bold magenta")
+        head.append(f" · {agent_type}", style="magenta")
+        console.print(head)
+        task_line = Text("│  ", style="magenta")
+        task_line.append((task or "").strip()[:100], style="dim italic")
+        console.print(task_line)
+
+        def spin(msg):
+            state["msg"] = msg
+            live.update(_SubStatusLine(state))
+            return nullcontext()
+
+        def sub_on_calls(calls):
+            for call in calls:
+                line = Text("│  ", style="magenta")
+                line.append("⏺ ", style="cyan")
+                line.append(call["name"], style="bold")
+                line.append("(" + _format_args(call.get("arguments")) + ")")
+                console.print(line)
+
+        def sub_on_result(name, result):
+            state["tools"] += 1
+            preview = result.strip().replace("\n", " ")
+            if len(preview) > 120:
+                preview = preview[:120] + "…"
+            line = Text("│  ", style="magenta")
+            line.append("⎿  ", style="dim")
+            line.append(preview, style="dim")
+            console.print(line)
+
+        def done(answer):
+            elapsed = time.time() - state["start"]
+            n = state["tools"]
+            foot = Text("╰─ ", style="magenta")
+            foot.append("✓ ", style="green")
+            foot.append(f"done · {n} tool{'s' if n != 1 else ''} · {elapsed:.1f}s", style="dim")
+            console.print(foot)
+
+        return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result, "done": done}
+
+    return factory
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +399,8 @@ def do_chat(query):
             (reasoning_parts if kind == "reasoning" else content_parts).append(delta)
             live.update(_stream_view(reasoning_parts, content_parts))
 
+        # Let sub-agents render their own nested, animated activity in this Live.
+        A.subagent_ui = _make_subagent_ui(live)
         try:
             answer = A.run_agent(
                 S.messages, max_turns=S.max_turns, temperature=S.temperature,
@@ -322,6 +410,8 @@ def do_chat(query):
             )
         except A.AgentInterrupted:
             answer = None
+        finally:
+            A.subagent_ui = None
 
     elapsed = time.time() - turn_start
     if answer is None:
@@ -365,6 +455,7 @@ def cmd_help(_):
         ("<text>", "Chat — run the full agent loop on your message"),
         ("/tools", "List every tool with its args, mode, and description"),
         ("/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)"),
+        ("/agents", "List available sub-agent profiles"),
         ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [ornith|gemma]", "Show or switch the backend model"),
@@ -394,6 +485,19 @@ def cmd_tools(_):
         spec = A.TOOL_SPECS[name]
         args = ", ".join(spec.get("args") or []) or "—"
         t.add_row(name, args, spec.get("mode", "?"), spec.get("description", ""))
+    console.print(t)
+
+
+def cmd_agents(_):
+    t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold magenta")
+    t.add_column("Name", style="yellow")
+    t.add_column("Max turns", style="green")
+    t.add_column("Tools", style="cyan")
+    t.add_column("Description")
+    for name in sorted(A.SUBAGENT_SPECS):
+        p = A.SUBAGENT_SPECS[name]
+        tools = ", ".join(t_ for t_ in p["tools"] if t_ in A.TOOL_NAMES) or "—"
+        t.add_row(name, str(p["max_turns"]), tools, p["description"])
     console.print(t)
 
 
@@ -561,7 +665,7 @@ def cmd_clear(_):
 
 
 COMMANDS = {
-    "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool, "plan": cmd_plan,
+    "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool, "agents": cmd_agents, "plan": cmd_plan,
     "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
     "history": cmd_history, "trace": cmd_trace, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "save": cmd_save, "clear": cmd_clear,
