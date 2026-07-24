@@ -1,4 +1,4 @@
-import os, sys
+import os, sys, json
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
 import importlib.util
@@ -81,3 +81,16 @@ def test_run_tool_allows_safe_shell_in_readonly():
     A.PERMISSION_MODE = "readonly"
     result = A.run_tool("execute_shell", {"command": "ls"})
     assert "ESCALATION_REQUEST" not in result
+
+def test_escalation_tool_in_tool_names():
+    assert "request_permission_escalation" in A.TOOL_NAMES
+
+def test_escalation_tool_returns_request():
+    A.PERMISSION_MODE = "readonly"
+    result = A.exec_tool("request_permission_escalation", json.dumps({
+        "target_mode": "edit",
+        "paths": "/tmp/test.txt",
+        "change_type": "new_file",
+        "reason": "Need to write test.txt"
+    }))
+    assert "ESCALATION_REQUEST" in result

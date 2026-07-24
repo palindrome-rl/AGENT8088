@@ -76,7 +76,7 @@ def check_permission(mode: str, command: str = "") -> bool:
     if PERMISSION_MODE == "edit":
         return True
     # readonly mode
-    if mode in ("read_text", "http_get", "last_output", "python_eval", "plan"):
+    if mode in ("read_text", "http_get", "last_output", "python_eval", "plan", "escalation"):
         return True
     if mode == "shell":
         # Allow inspection-only shell commands in readonly
@@ -593,6 +593,20 @@ def run_tool(name: str, args: dict, allow_plan: bool = True) -> str:
         if not _last_tool_output:
             return "No tool has been run yet."
         return f"Full output from '{_last_tool_name}' ({len(_last_tool_output)} chars):\n\n{_last_tool_output}"
+
+    if mode == "escalation":
+        target = args.get("target_mode", "edit")
+        paths_raw = args.get("paths", "")
+        if isinstance(paths_raw, list):
+            paths = paths_raw
+        else:
+            paths = [p.strip() for p in str(paths_raw).split(",") if p.strip()]
+        return request_escalation(
+            target_mode=target,
+            paths=paths,
+            change_type=args.get("change_type", "filesystem_op"),
+            reason=args.get("reason", ""),
+        )
 
     if mode == "plan":
         if not allow_plan:

@@ -5,3 +5,4 @@ web_search|Search the web for information|mode=http_get|url={search_base_url}{qu
 get_page_title|Fetch a webpage and extract its title|mode=shell|command=curl -s --max-time 15 "{url}" | grep -oP '(?<=<title>).*?(?=</title>)' | head -1|timeout=20
 calculate|Evaluate a mathematical expression|mode=python_eval|expression={expression}|timeout=10
 last_output|Get full output from the last tool call|mode=last_output
+request_permission_escalation|Request write permission from the user|mode=escalation|args=target_mode,paths,change_type,reason|timeout=5
