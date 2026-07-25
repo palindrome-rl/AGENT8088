@@ -22,6 +22,11 @@ Agent 8088 is an enterprise-grade AI agent powered by fine-tuned Qwen 2.5 14B, d
 - ✅ **Grounded execution** - Trained on real production traces
 - ✅ **Extensible skills** - Plugin architecture for custom tools
 - ✅ **Production-ready** - Tested on 100+ real-world scenarios
+- ✅ **Permission layer** - readonly→edit escalation with per-action y/n prompts
+- ✅ **Security layers** - Sensitive file protection, network gating, path-based zones
+- ✅ **Cross-platform** - Works on Windows (cmd.exe) and Linux (bash)
+- ✅ **Rich CLI UI** - Live streaming, ESC interrupt, tool diffs, slash commands
+- ✅ **Tool alias resolution** - Model can call `bash`/`mkdir`/etc. naturally
 
 ### Performance
 
