@@ -1,348 +1,299 @@
 # Agent 8088
 
-**Production-ready AI agent with fine-tuned tool-calling capabilities**
+**A local AI agent with fine-tuned tool-calling capabilities**
 
 *Developed by Palindrome Research Labs*
 
 ---
 
-[![License](https://img.shields.io/badge/license-Private-red.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
 ---
 
 ## Overview
 
-Agent 8088 is an enterprise-grade AI agent powered by fine-tuned Qwen 2.5 14B, designed for reliable tool calling, multi-turn context retention, and seamless CLI integration.
+Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, designed for reliable tool calling, multi-turn context retention, and seamless CLI integration. It runs entirely on your machine via Ollama or any OpenAI-compatible endpoint.
 
 ### Key Features
 
-- ✅ **Fine-tuned tool calling** - 95% accuracy on function selection
-- ✅ **Multi-turn context** - Maintains conversation state across interactions
-- ✅ **Grounded execution** - Trained on real production traces
-- ✅ **Extensible skills** - Plugin architecture for custom tools
-- ✅ **Production-ready** - Tested on 100+ real-world scenarios
-- ✅ **Permission layer** - readonly→edit escalation with per-action y/n prompts
-- ✅ **Security layers** - Sensitive file protection, network gating, path-based zones
-- ✅ **Cross-platform** - Works on Windows (cmd.exe) and Linux (bash)
-- ✅ **Rich CLI UI** - Live streaming, ESC interrupt, tool diffs, slash commands
-- ✅ **Tool alias resolution** - Model can call `bash`/`mkdir`/etc. naturally
-
-### Performance
-
-| Metric | Score |
-|--------|-------|
-| Tool Selection Accuracy | 95% |
-| Valid Argument Generation | 93% |
-| Context Retention | 87% |
-| Hallucination Rate | < 5% |
+- **One-line install** — Hermes-style installer for macOS, Linux, Windows
+- **Fine-tuned tool calling** — 95% accuracy on function selection
+- **Permission layer** — readonly by default, per-action y/n escalation for writes
+- **Security layers** — sensitive file protection, network gating, path-based zones
+- **Cross-platform** — Windows (cmd.exe) and Linux/macOS (bash)
+- **Rich CLI UI** — live token streaming, ESC interrupt, tool diffs, slash commands
+- **Tool alias resolution** — model can call `bash`/`mkdir`/`cat` naturally
+- **Tool arg transforms** — `mkdir({path:...})` auto-converts to `execute_shell({command:...})`
+- **SkillOpt** — self-improving agent skills via text-space optimization
 
 ---
 
 ## Quick Start
 
-### Prerequisites
+### One-Line Install
 
-- Python 3.8 or higher
-- Ollama running locally (or remote endpoint)
-- 4GB RAM minimum
-
-### Installation
-
-**1. Clone Repository**
-
-```bash
-git clone https://github.com/palindromerl/agent8088.git
-cd agent8088
+**Linux, macOS, WSL2, Termux:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash
 ```
 
-**2. Run Configuration Wizard**
-
-```bash
-./configure.sh
+**Windows (native PowerShell):**
+```powershell
+iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)
 ```
 
-The wizard will guide you through:
-- Ollama host and port configuration
-- Model selection (qwen3:14b recommended)
-- Installation paths
-- Logging preferences
+The installer:
+1. Installs [uv](https://docs.astral.sh/uv/) (Python package manager) if missing
+2. Clones the repo and creates an isolated venv
+3. Installs agent8088 as a global `agent8088` command
+4. Drops a default `config.txt` (localhost Ollama) to `~/.agent8088/`
+5. Runs an optional setup wizard to configure your model endpoint
 
-**3. Install Dependencies**
+No admin rights required. Works on macOS, Ubuntu, Windows, WSL2, and Termux.
 
-```bash
-pip install -r requirements.txt
+### Verify
+
+```sh
+agent8088 --version
 ```
 
-**4. Run Agent**
+### Configure Your Model
 
-```bash
-./agent8088
+If you skipped the setup wizard, run it anytime:
+```sh
+agent8088 --setup
 ```
+
+Or edit the config file directly:
+- **macOS/Linux:** `~/.agent8088/config.txt`
+- **Windows:** `%LOCALAPPDATA%\agent8088\config.txt`
+
+```ini
+model_base_url=http://localhost:11434/v1
+model_name=qwen14b-tooluse-v3
+api_key=ollama
+```
+
+For a cloud endpoint, change `model_base_url`, `model_name`, and `api_key` to your provider's values.
+
+### Run
+
+```sh
+agent8088
+```
+
+You'll see the banner with model info, tool count, and the prompt. Type a question or `/help` for commands.
+
+---
+
+## CLI Flags
+
+```
+usage: agent8088 [--version] [-h] [--edit] [--uninstall] [--update] [--setup]
+
+Agent8088 - Local AI Assistant
+
+options:
+  -h, --help     show this help and exit
+  --version, -V  show version and exit
+  --edit         start in edit mode (no per-action permission prompts)
+  --uninstall    remove agent8088 install dir + env vars, then exit
+  --update       pull latest code + reinstall, then exit
+  --setup        run interactive config wizard, then exit
+
+Run with no flags to start the interactive REPL.
+```
+
+---
+
+## REPL Slash Commands
+
+| Command | What it does |
+|---|---|
+| `/help` | List all commands |
+| `/tools` | List loaded tools with args/mode/description |
+| `/tool <name> <args>` | Invoke one tool directly |
+| `/plan <steps>` | Run the plan-executor (multi-step) |
+| `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
+| `/model [ornith\|gemma]` | Show or switch backend model |
+| `/config` | Show active config + config file path |
+| `/system` | Show the full system prompt |
+| `/history` | Show conversation history |
+| `/trace [on\|off]` | Toggle JSON trace capture |
+| `/temp <float>` | Set sampling temperature |
+| `/maxturns <int>` | Set max agent turns |
+| `/save <file>` | Save conversation + trace to JSON |
+| `/clear` | Clear conversation context |
+| `/exit` | Quit |
 
 ---
 
 ## Configuration
 
-### Interactive Setup (Recommended)
+The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key settings:
 
-```bash
-./configure.sh
-```
-
-### Manual Configuration
-
-Edit `config.ini`:
-
-```ini
-[DEFAULT]
-ollama_host = localhost
-ollama_port = 11434
-model_name = qwen3:14b
-
-[paths]
-memory_db = ./agent8088_memory.db
-skills_dir = ./skills
-
-[logging]
-level = INFO
-file = ./agent8088.log
-```
+| Key | Default | Purpose |
+|---|---|---|
+| `model_base_url` | `http://localhost:11434/v1` | OpenAI-compatible endpoint |
+| `model_name` | `qwen14b-tooluse-v3` | Model ID your server exposes |
+| `api_key` | `ollama` | API key (ollama needs none; cloud needs yours) |
+| `timeout_seconds` | `120` | Request timeout |
+| `allowed_paths` | `.,/tmp` | Paths the agent can read/write |
+| `no_prompt_paths` | `/tmp` | Writes here auto-approved (no y/n) |
+| `prompt_paths` | `.` | Writes here show y/n escalation |
+| `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
+| `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
 
 ### Environment Variables
 
-```bash
-export AGENT8088_OLLAMA_HOST="localhost:11434"
-export AGENT8088_MODEL="qwen3:14b"
-./agent8088
-```
+| Var | Default | Purpose |
+|---|---|---|
+| `AGENT8088_CONFIG` | `~/.agent8088/config.txt` | Override config file path |
+| `AGENT8088_PERMISSION` | `readonly` | `readonly` or `edit` |
+| `AGENT8088_HOME` | `~/.agent8088` | Install/data directory |
 
 ---
 
-## Usage
+## Permission & Security Layers
 
-### Basic Example
+### Permission Modes
 
-```bash
-$ ./agent8088
-Agent8088> list files in current directory
-```
+- **readonly** (default) — read files, run inspection-only shell commands (`ls`, `cat`, `git status`). Every write/mutation prompts y/n.
+- **edit** (`--edit` flag) — everything readonly allows, plus writes within `allowed_paths`. Still forbidden: `git push`, `git reset --hard`, branch deletion.
 
-### Python API
+### Security Layer 1: Sensitive File Protection
 
-```python
-from agent8088 import Agent, Config
+Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`, `*_SECRET*`, `*_TOKEN*`. Override with `allowed_sensitive_files=` in config.
 
-config = Config.from_file("config.ini")
-agent = Agent(config)
+### Security Layer 2: Network Access Control
 
-response = agent.query("What's the system uptime?")
-print(response)
-```
+`web_search` and `get_page_title` prompt y/n on every request. No config needed.
 
-### Custom Tools
+### Security Layer 3: Path-Based Write Zones
 
-```python
-from agent8088.skills import register_skill
-
-@register_skill(name="custom_tool", description="My custom tool")
-def my_tool(param: str) -> str:
-    return f"Processed: {param}"
-
-agent.load_skills()
-```
+Three-tier zone system: `no_prompt_paths` (auto-approved), `prompt_paths` (y/n), `blocked_paths` (always denied).
 
 ---
 
-## Architecture
+## Tools
 
-### Repository Structure
+| Tool | Mode | Description |
+|---|---|---|
+| `execute_shell` | shell | Run a shell command |
+| `write_file` | write_text | Write content to a file |
+| `read_text` | read_text | Read text from a file |
+| `web_search` | http_get | Search the web (SearXNG) |
+| `get_page_title` | shell | Fetch a webpage title (cross-platform) |
+| `calculate` | python_eval | Evaluate a math expression |
+| `last_output` | last_output | Get full output from the last tool call |
+
+### Tool Aliases
+
+The model can call tools by natural names — `bash`→`execute_shell`, `cat`→`read_text`, `mkdir`→`execute_shell`, etc. 20+ aliases covering common shell commands.
+
+---
+
+## Repository Structure
 
 ```
-agent8088/
-├── agent8088                 # Main executable
-├── config.txt                # Runtime config (model, paths, search, skillopt)
-├── tools.txt                 # Tool specs loaded by the agent
+AGENT8088/
+├── src/agent8088/            # Installable package
+│   ├── __init__.py           # Version
+│   ├── engine.py             # Core engine (agent loop, tools, permissions)
+│   └── cli.py                # Rich CLI (streaming, slash commands, escalation)
+├── config.txt                # Default config (shipped with package)
 ├── system.md                 # System prompt / skill document
-├── configs/                  # Model-config variants you swap into config.txt
-│   ├── reality7b_config_colossus.py
-│   └── reality7b_config_ollama.py
-├── scripts/                  # One-off repo ops
-│   ├── configure.sh
-│   ├── push-to-github.sh
-│   └── verify-push.sh
-├── research/                 # Non-runtime research/training pipeline
-│   ├── skillopt.py           # SkillOpt self-improver
-│   ├── run_benchmark.py      # Benchmark suite (used by skillopt)
-│   ├── data_cleanup/         # Dataset curation
-│   ├── vast-training/        # Vast.ai automation
-│   └── paper/                # Research documentation
-├── skills/                   # Agent skill YAMLs
-├── docs/                     # Architecture / API docs
-└── README.md
+├── tools.txt                 # Tool specs
+├── install.sh                # One-line installer (macOS/Linux)
+├── install.ps1               # One-line installer (Windows)
+├── pyproject.toml            # Package metadata + entry points
+├── tests/                    # Permission layer tests
+├── docs/superpowers/         # Design specs + plans + test cases
+├── research/                 # Non-runtime: SkillOpt, benchmarks, training
+└── scripts/                  # One-off repo ops
 ```
-
-### How It Works
-
-1. **User Query** → Agent8088 processes natural language
-2. **Tool Selection** → Fine-tuned model selects appropriate tool
-3. **Execution** → Tool executes with validated arguments
-4. **Response** → Formatted output returned to user
 
 ---
 
 ## SkillOpt — Self-Improving Agent Skills
 
-Agent8088 includes **SkillOpt**, a text-space optimization system that improves the agent's skill document (system.md) without touching model weights. Based on the technique from [arXiv:2605.23904](https://arxiv.org/abs/2605.23904).
+Agent8088 includes **SkillOpt**, a text-space optimization system that improves the agent's skill document (`system.md`) without touching model weights. Based on [arXiv:2605.23904](https://arxiv.org/abs/2605.23904).
 
 ### How It Works
 
 1. **Rollout** — Run benchmark suite, capture successes/failures
-2. **Reflect** — Optimizer model analyzes failure patterns, proposes atomic edits (add/delete/replace) to the skill document
-3. **Validate** — Run benchmark with edited skill; accept only if score strictly improves
+2. **Reflect** — Optimizer model proposes atomic edits to the skill document
+3. **Validate** — Run benchmark with edited skill; accept only if score improves
 4. **Repeat** — Cosine-decaying textual learning rate over N epochs
-
-**Zero inference-time overhead** — optimize the skill once, then run with the optimized playbook forever.
 
 ### Usage
 
 ```bash
-# Run full optimization (4 epochs by default)
-python3 research/skillopt.py
-
-# Custom epochs
-python3 research/skillopt.py --epochs 6
-
-# Preview edits without applying
-python3 research/skillopt.py --dry-run
-
-# View optimization history
-python3 research/skillopt.py --report
-
-# Restore pre-optimization skill
-python3 research/skillopt.py --restore
+python3 research/skillopt.py                # Run full optimization (4 epochs)
+python3 research/skillopt.py --epochs 6     # Custom epochs
+python3 research/skillopt.py --dry-run      # Preview edits without applying
+python3 research/skillopt.py --report       # View optimization history
+python3 research/skillopt.py --restore      # Restore pre-optimization skill
 ```
-
-### Configuration
-
-SkillOpt settings in `config.txt`:
-
-```ini
-# Optimizer can be a different (bigger) model than the target
-optimizer_base_url=http://localhost:11434/v1
-optimizer_model=qwen14b-tooluse-v3
-skillopt_epochs=4
-skillopt_textual_lr=4
-```
-
-**Key insight:** Small models benefit most. The paper showed Qwen3.5-4B gained +19.2 points average. Agent8088 works with any model size — SkillOpt improves the instructions, not the weights.
-
----
-
-## Training
-
-Agent 8088 is fine-tuned using:
-
-- **Base Model:** Qwen/Qwen2.5-14B-Instruct
-- **Method:** QLoRA (4-bit quantization)
-- **Dataset:** 1,000 grounded traces + 9,255 ToolACE samples
-- **Platform:** Vast.ai A100 80GB
-
-See [TRAINING.md](docs/TRAINING.md) for details.
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/ARCHITECTURE.md) | System design and components |
-| [Training Pipeline](docs/TRAINING.md) | Model training process |
-| [Development Guide](docs/DEVELOPMENT.md) | Contributing guidelines |
-| [API Reference](docs/API.md) | Python API documentation |
-| [Tool Schema](docs/TOOL_SCHEMA.md) | Tool calling specification |
 
 ---
 
 ## Development
 
-### Setup Development Environment
+### Setup
 
 ```bash
-# Clone repository
-git clone https://github.com/palindromerl/agent8088.git
-cd agent8088
-
-# Install dev dependencies
-pip install -r requirements-dev.txt
-
-# Run tests
-pytest tests/
+git clone https://github.com/tayyabimam1/AGENT8088.git
+cd AGENT8088
+uv sync
 ```
 
-### Running Tests
+### Run Tests
 
 ```bash
-# Unit tests
-pytest tests/unit/
-
-# Integration tests
-pytest tests/integration/
-
-# Full suite with coverage
-pytest --cov=agent8088 tests/
+uv run pytest tests/test_permission.py -v
 ```
 
-### Contributing
+### Build & Install Locally
 
-See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for contribution guidelines.
+```bash
+uv build
+uv tool install --force dist/agent8088-*.whl
+agent8088 --version
+```
+
+### Update an Existing Install
+
+```bash
+agent8088 --update
+```
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+**`agent8088: command not found`**
+- Open a NEW terminal (PATH was updated by the installer).
+- macOS/Linux: ensure `~/.local/bin` is on PATH (`uv tool update-shell`).
 
-**"Model not found"**
-```bash
-# Pull model from Ollama
-ollama pull qwen3:14b
-```
+**`Connection error.`**
+- The model endpoint in `config.txt` isn't reachable. Run `agent8088 --setup` to reconfigure, or edit `config.txt` manually.
 
-**"Connection refused"**
-```bash
-# Check Ollama is running
-ollama list
+**`Tools: 0 loaded`**
+- `tools.txt` is missing from the install. Reinstall: `agent8088 --update`.
 
-# Start Ollama if needed
-ollama serve
-```
+**ESC-to-interrupt doesn't work**
+- Unix-only feature (uses `termios`). On Windows, use Ctrl-C.
 
-**"Tool execution failed"**
-```bash
-# Check logs
-tail -f agent8088.log
-
-# Enable debug mode
-export AGENT8088_LOG_LEVEL=DEBUG
-./agent8088
-```
-
----
-
-## Support
-
-- **Documentation:** https://docs.palindromerl.com/agent8088
-- **Issues:** https://github.com/palindromerl/agent8088/issues
-- **Email:** support@palindromerl.com
+**Git login prompt during install**
+- The installer suppresses credential prompts (`GIT_TERMINAL_PROMPT=0`). If you still see one, ensure the repo URL in the script points to the public repo.
 
 ---
 
 ## License
 
-Copyright © 2026 Palindrome Research Labs. All rights reserved.
-
-Private - Not for public distribution.
+[MIT](LICENSE)
 
 ---
 
@@ -353,11 +304,6 @@ Private - Not for public distribution.
   title = {Agent 8088: Fine-Tuned AI Agent for Tool Calling},
   author = {Palindrome Research Labs},
   year = {2026},
-  url = {https://github.com/palindromerl/agent8088}
+  url = {https://github.com/tayyabimam1/AGENT8088}
 }
 ```
-
----
-
-**Palindrome Research Labs** - Advanced AI Systems
-# AGENT8088
