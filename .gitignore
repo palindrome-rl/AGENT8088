@@ -35,3 +35,6 @@ skillopt_data/
 # Local tooling (graphify knowledge graph + opencode config)
 graphify-out/
 .opencode/
+
+# Config snapshots (may contain secrets - never commit)
+backup.txt
