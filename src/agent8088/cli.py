@@ -652,15 +652,27 @@ def _run_update():
     if not uv_cmd.exists():
         uv_cmd = "uv"
     print(f"Updating {install_dir} ...")
+    # Stash local changes (editable install / wizard edits) before pulling
+    subprocess.run(["git", "stash", "push", "--include-untracked", "-m", "agent8088-update-autostash"],
+                   cwd=str(install_dir), capture_output=True, text=True)
     r = subprocess.run(["git", "pull", "--ff-only"], cwd=str(install_dir), capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"git pull failed:\n{r.stderr.strip()}")
-        return
-    print(r.stdout.strip() or "Already up to date.")
-    r2 = subprocess.run([str(uv_cmd), "pip", "install", "--python", str(venv_python), "-e", str(install_dir)],
+        # FF not possible — reset to remote (managed install, local changes were stashed)
+        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                cwd=str(install_dir), capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "fetch", "origin"], cwd=str(install_dir), capture_output=True, text=True)
+        r2 = subprocess.run(["git", "reset", "--hard", f"origin/{branch}"],
+                             cwd=str(install_dir), capture_output=True, text=True)
+        if r2.returncode != 0:
+            print(f"git update failed:\n{r.stderr.strip()}\n{r2.stderr.strip()}")
+            return
+        print(f"Reset to origin/{branch}")
+    else:
+        print(r.stdout.strip() or "Already up to date.")
+    r3 = subprocess.run([str(uv_cmd), "pip", "install", "--python", str(venv_python), "-e", str(install_dir)],
                         capture_output=True, text=True)
-    if r2.returncode != 0:
-        print(f"reinstall failed:\n{r2.stderr.strip()}")
+    if r3.returncode != 0:
+        print(f"reinstall failed:\n{r3.stderr.strip()}")
         return
     print("Updated. Run 'agent8088 --version' to verify.")
 
