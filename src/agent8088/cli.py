@@ -646,7 +646,8 @@ def _run_update():
         print(f"Install dir not found: {install_dir}")
         print("Run the installer first:  iex (irm https://<YOUR-URL>/install.ps1)")
         return
-    venv_python = install_dir / "venv" / ("Scripts" / "python.exe" if os.name == "nt" else "bin" / "python")
+    venv_subdir = "Scripts" if os.name == "nt" else "bin"
+    venv_python = install_dir / "venv" / venv_subdir / ("python.exe" if os.name == "nt" else "python")
     uv_cmd = home / "bin" / ("uv.exe" if os.name == "nt" else "uv")
     if not uv_cmd.exists():
         uv_cmd = "uv"
