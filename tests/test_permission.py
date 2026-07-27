@@ -1,14 +1,11 @@
 import os, sys, json
 from pathlib import Path
-from importlib.machinery import SourceFileLoader
-import importlib.util
 
 os.environ['AGENT8088_CONFIG'] = str(Path('config.txt').resolve())
 
-loader = SourceFileLoader('agent8088_core', 'agent8088')
-spec = importlib.util.spec_from_loader('agent8088_core', loader)
-A = importlib.util.module_from_spec(spec)
-loader.exec_module(A)
+# Add src/ to path so `agent8088` package is importable, then load the engine module
+sys.path.insert(0, str(Path('src').resolve()))
+from agent8088 import engine as A
 
 # Load tools from local tools.txt
 A.TOOL_SPECS = A.load_tool_specs(Path('tools.txt'), A.APP_CONFIG)
@@ -125,19 +122,16 @@ def test_grant_escalation_persists():
 
 def test_env_var_sets_edit_mode():
     import importlib
+    from agent8088 import engine as engine_mod
     os.environ['AGENT8088_PERMISSION'] = 'edit'
     # Reload the module to pick up the env var
-    loader2 = SourceFileLoader('agent8088_core2', 'agent8088')
-    spec2 = importlib.util.spec_from_loader('agent8088_core2', loader2)
-    A2 = importlib.util.module_from_spec(spec2)
-    loader2.exec_module(A2)
+    A2 = importlib.reload(engine_mod)
     assert A2.PERMISSION_MODE == "edit"
     del os.environ['AGENT8088_PERMISSION']
 
 def test_env_var_defaults_to_readonly():
+    import importlib
+    from agent8088 import engine as engine_mod
     os.environ.pop('AGENT8088_PERMISSION', None)
-    loader3 = SourceFileLoader('agent8088_core3', 'agent8088')
-    spec3 = importlib.util.spec_from_loader('agent8088_core3', loader3)
-    A3 = importlib.util.module_from_spec(spec3)
-    loader3.exec_module(A3)
+    A3 = importlib.reload(engine_mod)
     assert A3.PERMISSION_MODE == "readonly"

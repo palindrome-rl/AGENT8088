@@ -1,12 +1,30 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "agent8088"
 version = "0.1.0"
 description = "Agent8088 - Local AI Assistant"
-dependencies = []
+requires-python = ">=3.8"
+dependencies = [
+    "openai>=1.0.0",
+    "rich>=13.0.0",
+]
 
-[tool.setuptools.packages.find]
-where = ["."]
+[project.optional-dependencies]
+search = ["requests>=2.31.0"]
+training = [
+    "torch>=2.0.0",
+    "transformers>=4.35.0",
+    "peft>=0.5.0",
+    "datasets>=2.14.0",
+    "accelerate>=0.24.0",
+    "bitsandbytes>=0.41.0",
+]
+
+[project.scripts]
+agent8088 = "agent8088.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent8088"]

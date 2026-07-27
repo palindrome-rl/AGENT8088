@@ -23,8 +23,6 @@ except ImportError:
     pass
 from contextlib import nullcontext
 from pathlib import Path
-from importlib.machinery import SourceFileLoader
-import importlib.util
 
 try:
     import termios, tty
@@ -131,17 +129,9 @@ class _StatusLine:
 
 
 # ---------------------------------------------------------------------------
-# Load the real Agent8088 engine (script has no .py extension)
+# Load the real Agent8088 engine
 # ---------------------------------------------------------------------------
-def load_engine():
-    loader = SourceFileLoader("agent8088_core", str(APP_DIR / "agent8088"))
-    spec = importlib.util.spec_from_loader("agent8088_core", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
-
-
-A = load_engine()
+from agent8088 import engine as A
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +632,10 @@ def _prompt_label():
 
 
 def main():
+    if "--version" in sys.argv or "-V" in sys.argv:
+        from agent8088 import __version__
+        print(f"agent8088 {__version__}")
+        return
     if "--edit" in sys.argv:
         A.PERMISSION_MODE = "edit"  # permanent edit mode — no per-action prompts
         sys.argv.remove("--edit")

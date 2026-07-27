@@ -1,0 +1,49 @@
+# Agent8088 config.txt
+#
+# Edit this file to point agent8088 at your model. The default below assumes
+# Ollama running locally on port 11434 with the qwen14b-tooluse-v3 model.
+# For a cloud endpoint, change model_base_url, model_name, and api_key.
+
+# --- paths --- Leave commented to use built-in defaults (APP_DIR-relative).
+# project_root=. (defaults to APP_DIR — the package's own directory)
+# shell_cwd=. (defaults to PROJECT_ROOT)
+# tools_file=tools.txt (defaults to APP_DIR/tools.txt)
+# system_file=system.md (defaults to APP_DIR/system.md)
+# banner_file=banner.txt (defaults to APP_DIR/banner.txt)
+
+# write_file / read_file are restricted to these paths.
+# Use . for the repo root (resolved to PROJECT_ROOT at runtime), plus /tmp.
+allowed_paths=.,/tmp
+
+# --- Permission Layer 1: Sensitive file read protection ---
+# Files matching these patterns are never readable by the model.
+# Override: list specific files here to allow the model to read them.
+# allowed_sensitive_files=.env,secrets.yaml
+
+# --- Permission Layer 2: Network access control ---
+# web_search and get_page_title prompt the user (y/n) on every request.
+# No config needed — prompting is hardcoded.
+
+# --- Permission Layer 3: Path-based write restrictions (three-tier zones) ---
+# Writes to these paths run without a prompt (auto-approved):
+no_prompt_paths=/tmp
+# Writes to these paths show the y/n escalation prompt (default: project root):
+prompt_paths=.
+# Writes to these paths are always blocked, even in edit mode:
+# blocked_paths=/etc,/home,~/.ssh
+
+# --- model ---
+# Default: Ollama running locally. Change these for a cloud endpoint.
+model_base_url=http://localhost:11434/v1
+model_name=qwen14b-tooluse-v3
+api_key=ollama
+timeout_seconds=120
+
+# --- Gemma fallback (only used when USE_GEMMA4=1) ---
+gemma_base_url=http://localhost:8003/v1
+gemma_model_name=gemma-4-12B-it-Q4_K_M.gguf
+
+# --- search (SearXNG) ---
+# Leave commented to disable web_search. The URL must end at "q=" with no
+# placeholder; tools.txt appends {query_q}&format=json.
+# search_base_url=http://localhost:8888/search?q=

@@ -40,7 +40,7 @@ APP_CONFIG = load_simple_config(CONFIG_PATH)
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", str(APP_DIR))).expanduser().resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://localhost:8888/search?q={query}")
+SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "")
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
 SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
