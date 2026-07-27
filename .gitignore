@@ -38,3 +38,4 @@ graphify-out/
 
 # Config snapshots (may contain secrets - never commit)
 backup.txt
+opencode.json
