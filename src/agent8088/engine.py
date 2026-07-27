@@ -37,13 +37,13 @@ def load_simple_config(path: Path) -> dict:
 CONFIG_PATH = Path(os.environ.get("AGENT8088_CONFIG", str(APP_DIR / "config.txt"))).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
 
-PROJECT_ROOT = Path(APP_CONFIG.get("project_root", str(APP_DIR))).expanduser().resolve()
+PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "")
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
-SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
+SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
 BANNER_FILE = Path(APP_CONFIG.get("banner_file", str(APP_DIR / "banner.txt"))).expanduser()
 SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).expanduser()
 

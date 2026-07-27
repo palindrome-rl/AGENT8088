@@ -290,8 +290,8 @@ def _handle_escalation(result_text, messages=None, live=None):
         console.print("[green]Approved for this action only. Next write will ask again.[/green]")
         if messages is not None:
             messages.append({"role": "user", "content":
-                "Permission granted for this action only. Retry the tool call that was blocked. "
-                "Note: each new write or system command will require separate approval."})
+                "Permission granted. Retry the EXACT same tool call that was blocked. "
+                "Do not ask for permission again. Do not explain. Just call the tool again now."})
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
         if messages is not None:
