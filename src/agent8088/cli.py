@@ -631,14 +631,85 @@ def _prompt_label():
     return f"\n[bold green]8088[/bold green] [dim]({pct}% ctx)[/dim] [dim]›[/dim] "
 
 
-def main():
-    if "--version" in sys.argv or "-V" in sys.argv:
-        from agent8088 import __version__
-        print(f"agent8088 {__version__}")
+def _agent8088_home():
+    """Find the agent8088 install home directory."""
+    return Path(os.environ.get("AGENT8088_HOME", os.path.join(
+        os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")), "agent8088")))
+
+
+def _run_update():
+    """Pull latest code + reinstall the package in the venv."""
+    import subprocess
+    home = _agent8088_home()
+    install_dir = home / "agent8088"
+    if not install_dir.exists():
+        print(f"Install dir not found: {install_dir}")
+        print("Run the installer first:  iex (irm https://<YOUR-URL>/install.ps1)")
         return
-    if "--uninstall" in sys.argv:
+    venv_python = install_dir / "venv" / ("Scripts" / "python.exe" if os.name == "nt" else "bin" / "python")
+    uv_cmd = home / "bin" / ("uv.exe" if os.name == "nt" else "uv")
+    if not uv_cmd.exists():
+        uv_cmd = "uv"
+    print(f"Updating {install_dir} ...")
+    r = subprocess.run(["git", "pull", "--ff-only"], cwd=str(install_dir), capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"git pull failed:\n{r.stderr.strip()}")
+        return
+    print(r.stdout.strip() or "Already up to date.")
+    r2 = subprocess.run([str(uv_cmd), "pip", "install", "--python", str(venv_python), "-e", str(install_dir)],
+                        capture_output=True, text=True)
+    if r2.returncode != 0:
+        print(f"reinstall failed:\n{r2.stderr.strip()}")
+        return
+    print("Updated. Run 'agent8088 --version' to verify.")
+
+
+def _run_setup():
+    """Interactive config wizard — prompt for model endpoint, write to config.txt."""
+    import re as _re
+    home = _agent8088_home()
+    config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    if not config_path.exists():
+        print(f"Config not found: {config_path}")
+        print("Run the installer first.")
+        return
+    content = config_path.read_text(encoding="utf-8")
+    def _current(key):
+        m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
+        return m.group(1).strip() if m else ""
+    print("Agent8088 setup — configure your model endpoint")
+    print("  (Press Enter to keep the current value in brackets)\n")
+    cur_url = _current("model_base_url") or "http://localhost:11434/v1"
+    url = input(f"Model base URL [{cur_url}]: ").strip() or cur_url
+    cur_name = _current("model_name") or "qwen14b-tooluse-v3"
+    name = input(f"Model name [{cur_name}]: ").strip() or cur_name
+    cur_key = _current("api_key") or "ollama"
+    key = input(f"API key [{cur_key}]: ").strip() or cur_key
+    content = _re.sub(r'^model_base_url=.*', f'model_base_url={url}', content, flags=_re.MULTILINE)
+    content = _re.sub(r'^model_name=.*', f'model_name={name}', content, flags=_re.MULTILINE)
+    content = _re.sub(r'^api_key=.*', f'api_key={key}', content, flags=_re.MULTILINE)
+    config_path.write_text(content, encoding="utf-8")
+    print(f"\nConfig written to {config_path}")
+
+
+def main():
+    import argparse
+    from agent8088 import __version__
+    parser = argparse.ArgumentParser(
+        prog="agent8088",
+        description="Agent8088 - Local AI Assistant",
+        epilog="Run with no flags to start the interactive REPL.",
+    )
+    parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
+    parser.add_argument("--edit", action="store_true", help="start in edit mode (no per-action permission prompts)")
+    parser.add_argument("--uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
+    parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
+    parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
+    args = parser.parse_args()
+
+    if args.uninstall:
         import shutil
-        home = Path(os.environ.get("AGENT8088_HOME", os.path.join(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")), "agent8088")))
+        home = _agent8088_home()
         print(f"Removing {home} ...")
         if home.exists():
             shutil.rmtree(home, ignore_errors=True)
@@ -652,9 +723,14 @@ def main():
             pass
         print("Done. Open a NEW terminal for PATH to refresh.")
         return
-    if "--edit" in sys.argv:
-        A.PERMISSION_MODE = "edit"  # permanent edit mode — no per-action prompts
-        sys.argv.remove("--edit")
+    if args.update:
+        _run_update()
+        return
+    if args.setup:
+        _run_setup()
+        return
+    if args.edit:
+        A.PERMISSION_MODE = "edit"
     banner()
     while True:
         try:
