@@ -669,12 +669,12 @@ def _run_update():
         print(f"Reset to origin/{branch}")
     else:
         print(r.stdout.strip() or "Already up to date.")
-    r3 = subprocess.run([str(uv_cmd), "pip", "install", "--python", str(venv_python), "-e", str(install_dir)],
-                        capture_output=True, text=True)
-    if r3.returncode != 0:
-        print(f"reinstall failed:\n{r3.stderr.strip()}")
-        return
-    print("Updated. Run 'agent8088 --version' to verify.")
+    # Editable install (-e .) means the clone's source is live — git pull
+    # updates the code in place; next launch picks it up automatically.
+    # No reinstall needed unless pyproject.toml dependencies changed.
+    print("Code updated. Changes take effect on next launch.")
+    print(f"If dependencies changed, reinstall from a fresh terminal:")
+    print(f"  {uv_cmd} pip install --python {venv_python} -e {install_dir}")
 
 
 def _run_setup():
@@ -702,13 +702,13 @@ def _run_setup():
     key = input(f"API key [{cur_key}]: ").strip() or cur_key
     cur_search = _current("search_base_url")
     search = input(f"Web search URL [{cur_search or 'disabled'}]: ").strip()
-    content = _re.sub(r'^allowed_paths=.*', f'allowed_paths={paths}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^model_base_url=.*', f'model_base_url={url}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^model_name=.*', f'model_name={name}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^api_key=.*', f'api_key={key}', content, flags=_re.MULTILINE)
+    content = _re.sub(r'^allowed_paths=.*', lambda _: f'allowed_paths={paths}', content, flags=_re.MULTILINE)
+    content = _re.sub(r'^model_base_url=.*', lambda _: f'model_base_url={url}', content, flags=_re.MULTILINE)
+    content = _re.sub(r'^model_name=.*', lambda _: f'model_name={name}', content, flags=_re.MULTILINE)
+    content = _re.sub(r'^api_key=.*', lambda _: f'api_key={key}', content, flags=_re.MULTILINE)
     if search:
         if _re.search(r'^#?\s*search_base_url=', content, _re.MULTILINE):
-            content = _re.sub(r'^#?\s*search_base_url=.*', f'search_base_url={search}', content, flags=_re.MULTILINE)
+            content = _re.sub(r'^#?\s*search_base_url=.*', lambda _: f'search_base_url={search}', content, flags=_re.MULTILINE)
         else:
             content += f"\nsearch_base_url={search}\n"
     config_path.write_text(content, encoding="utf-8")
