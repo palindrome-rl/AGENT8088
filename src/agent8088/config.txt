@@ -12,8 +12,8 @@
 # banner_file=banner.txt (defaults to APP_DIR/banner.txt)
 
 # write_file / read_file are restricted to these paths.
-# Use . for the repo root (resolved to PROJECT_ROOT at runtime), plus /tmp.
-allowed_paths=.,/tmp
+# Use ~ for the user's home directory (full access to user files), or a specific path.
+allowed_paths=~
 
 # --- Permission Layer 1: Sensitive file read protection ---
 # Files matching these patterns are never readable by the model.
@@ -26,9 +26,9 @@ allowed_paths=.,/tmp
 
 # --- Permission Layer 3: Path-based write restrictions (three-tier zones) ---
 # Writes to these paths run without a prompt (auto-approved):
-no_prompt_paths=/tmp
-# Writes to these paths show the y/n escalation prompt (default: project root):
-prompt_paths=.
+# no_prompt_paths=/tmp
+# Writes to these paths show the y/n escalation prompt (default: home directory):
+prompt_paths=~
 # Writes to these paths are always blocked, even in edit mode:
 # blocked_paths=/etc,/home,~/.ssh
 

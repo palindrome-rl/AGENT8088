@@ -528,8 +528,14 @@ function Run-SetupWizard {
     }
 
     $config = Join-Path $Agent8088Home "config.txt"
-    Write-Info "Setup wizard - configure your model endpoint"
+    Write-Info "Setup wizard"
     Write-Info "  (Press Enter to keep the default shown in brackets)"
+
+    # Working directory
+    $currentPaths = (Select-String -Path $config -Pattern '^allowed_paths=' | ForEach-Object { $_.Line -replace 'allowed_paths=', '' })
+    if (-not $currentPaths) { $currentPaths = "~" }
+    $newPaths = Read-Host "Working directory [$currentPaths]"
+    if (-not $newPaths) { $newPaths = $currentPaths }
 
     # Read current values
     $currentUrl = (Select-String -Path $config -Pattern '^model_base_url=' | ForEach-Object { $_.Line -replace 'model_base_url=', '' })
@@ -547,11 +553,20 @@ function Run-SetupWizard {
     $newKey = Read-Host "API key [$currentKey]"
     if (-not $newKey) { $newKey = $currentKey }
 
+    # Web search URL (optional)
+    $currentSearch = (Select-String -Path $config -Pattern '^search_base_url=' | ForEach-Object { $_.Line -replace 'search_base_url=', '' })
+    $searchLabel = if ($currentSearch) { $currentSearch } else { "disabled" }
+    $newSearch = Read-Host "Web search URL (SearXNG) [$searchLabel]"
+
     # Write back
     $content = Get-Content $config -Raw
+    $content = $content -replace '(?m)^allowed_paths=.*', "allowed_paths=$newPaths"
     $content = $content -replace '(?m)^model_base_url=.*', "model_base_url=$newUrl"
     $content = $content -replace '(?m)^model_name=.*', "model_name=$newName"
     $content = $content -replace '(?m)^api_key=.*', "api_key=$newKey"
+    if ($newSearch) {
+        $content = $content -replace '(?m)^#?\s*search_base_url=.*', "search_base_url=$newSearch"
+    }
     Set-Content -Path $config -Value $content -NoNewline:$false
     Write-Success "Config written to $config"
 }

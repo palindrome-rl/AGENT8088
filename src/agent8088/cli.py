@@ -678,17 +678,27 @@ def _run_setup():
     def _current(key):
         m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
         return m.group(1).strip() if m else ""
-    print("Agent8088 setup — configure your model endpoint")
+    print("Agent8088 setup")
     print("  (Press Enter to keep the current value in brackets)\n")
+    cur_paths = _current("allowed_paths") or "~"
+    paths = input(f"Working directory [{cur_paths}]: ").strip() or cur_paths
     cur_url = _current("model_base_url") or "http://localhost:11434/v1"
     url = input(f"Model base URL [{cur_url}]: ").strip() or cur_url
     cur_name = _current("model_name") or "qwen14b-tooluse-v3"
     name = input(f"Model name [{cur_name}]: ").strip() or cur_name
     cur_key = _current("api_key") or "ollama"
     key = input(f"API key [{cur_key}]: ").strip() or cur_key
+    cur_search = _current("search_base_url")
+    search = input(f"Web search URL [{cur_search or 'disabled'}]: ").strip()
+    content = _re.sub(r'^allowed_paths=.*', f'allowed_paths={paths}', content, flags=_re.MULTILINE)
     content = _re.sub(r'^model_base_url=.*', f'model_base_url={url}', content, flags=_re.MULTILINE)
     content = _re.sub(r'^model_name=.*', f'model_name={name}', content, flags=_re.MULTILINE)
     content = _re.sub(r'^api_key=.*', f'api_key={key}', content, flags=_re.MULTILINE)
+    if search:
+        if _re.search(r'^#?\s*search_base_url=', content, _re.MULTILINE):
+            content = _re.sub(r'^#?\s*search_base_url=.*', f'search_base_url={search}', content, flags=_re.MULTILINE)
+        else:
+            content += f"\nsearch_base_url={search}\n"
     config_path.write_text(content, encoding="utf-8")
     print(f"\nConfig written to {config_path}")
 

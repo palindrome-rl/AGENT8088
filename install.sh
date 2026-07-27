@@ -519,8 +519,19 @@ run_setup_wizard() {
     fi
 
     local config="$AGENT8088_HOME/config.txt"
-    log_info "Setup wizard — configure your model endpoint"
+    log_info "Setup wizard"
     log_info "  (Press Enter to keep the default shown in brackets)"
+
+    # working directory (allowed_paths)
+    local current_paths=$(grep '^allowed_paths=' "$config" 2>/dev/null | cut -d= -f2- || echo "~")
+    local new_paths
+    if [ "$IS_INTERACTIVE" = true ]; then
+        read -r -p "Working directory [$current_paths]: " new_paths || new_paths=""
+    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        printf "Working directory [%s]: " "$current_paths" > /dev/tty
+        IFS= read -r new_paths < /dev/tty || new_paths=""
+    fi
+    new_paths="${new_paths:-$current_paths}"
 
     # model_base_url
     local current_url=$(grep '^model_base_url=' "$config" 2>/dev/null | cut -d= -f2- || echo "http://localhost:11434/v1")
@@ -555,10 +566,25 @@ run_setup_wizard() {
     fi
     new_key="${new_key:-$current_key}"
 
+    # web search URL (optional)
+    local current_search=$(grep '^search_base_url=' "$config" 2>/dev/null | cut -d= -f2- || echo "")
+    local search_label="${current_search:-disabled}"
+    local new_search
+    if [ "$IS_INTERACTIVE" = true ]; then
+        read -r -p "Web search URL (SearXNG) [$search_label]: " new_search || new_search=""
+    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        printf "Web search URL (SearXNG) [%s]: " "$search_label" > /dev/tty
+        IFS= read -r new_search < /dev/tty || new_search=""
+    fi
+
     # Write back
+    sed -i.bak "s|^allowed_paths=.*|allowed_paths=$new_paths|" "$config"
     sed -i.bak "s|^model_base_url=.*|model_base_url=$new_url|" "$config"
     sed -i.bak "s|^model_name=.*|model_name=$new_name|" "$config"
     sed -i.bak "s|^api_key=.*|api_key=$new_key|" "$config"
+    if [ -n "$new_search" ]; then
+        sed -i.bak "s|^#*\s*search_base_url=.*|search_base_url=$new_search|" "$config"
+    fi
     rm -f "$config.bak"
     log_success "Config written to $config"
 }
