@@ -364,6 +364,13 @@ function Install-Git {
 function Clone-Repo {
     Write-Info "Installing to $InstallDir..."
 
+    # Suppress git credential prompts - the repo is public, anonymous clone
+    # works. Without these, Git Credential Manager on Windows pops a login
+    # dialog even for public repos. If the repo were private, the clone would
+    # fail cleanly instead of hanging on a prompt.
+    $env:GIT_TERMINAL_PROMPT = "0"
+    $env:GCM_INTERACTIVE = "never"
+
     # An interrupted previous clone leaves .git with no initial commit.
     if ((Test-Path (Join-Path $InstallDir ".git")) -and -not (& git -C $InstallDir rev-parse --verify HEAD 2>$null)) {
         $backupDir = "${InstallDir}.broken-$(Get-Date -Format 'yyyyMMdd-HHmmss')"

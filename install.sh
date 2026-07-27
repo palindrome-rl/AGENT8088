@@ -336,6 +336,10 @@ check_git() {
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
 
+    # Suppress git credential prompts - the repo is public, anonymous clone
+    # works. Without this, git may prompt for username/password on HTTPS.
+    export GIT_TERMINAL_PROMPT=0
+
     # An interrupted previous clone leaves .git with no initial commit.
     if [ -d "$INSTALL_DIR/.git" ] && ! git -C "$INSTALL_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
         local backup_dir="${INSTALL_DIR}.broken-$(date -u +%Y%m%d-%H%M%S)"
