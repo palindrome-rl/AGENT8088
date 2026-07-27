@@ -33,7 +33,7 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 
 ### One-Line Install
 
-**Linux, macOS, WSL2, Termux:**
+**# Ubuntu / Linux / macOS / WSL2 / Termux **
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash
 ```
