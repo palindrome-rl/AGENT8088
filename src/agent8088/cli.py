@@ -636,6 +636,22 @@ def main():
         from agent8088 import __version__
         print(f"agent8088 {__version__}")
         return
+    if "--uninstall" in sys.argv:
+        import shutil
+        home = Path(os.environ.get("AGENT8088_HOME", os.path.join(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")), "agent8088")))
+        print(f"Removing {home} ...")
+        if home.exists():
+            shutil.rmtree(home, ignore_errors=True)
+        os.environ.pop("AGENT8088_CONFIG", None)
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE)
+            winreg.DeleteValue(k, "AGENT8088_CONFIG")
+            winreg.CloseKey(k)
+        except Exception:
+            pass
+        print("Done. Open a NEW terminal for PATH to refresh.")
+        return
     if "--edit" in sys.argv:
         A.PERMISSION_MODE = "edit"  # permanent edit mode — no per-action prompts
         sys.argv.remove("--edit")
