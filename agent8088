@@ -686,6 +686,41 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     return f"[subagent:{type_name}] {answer}"
 
 
+# ---------------------------------------------------------------------------
+# Sandboxed execution — run untrusted code in a throwaway Docker container
+# ---------------------------------------------------------------------------
+DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
+DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
+
+
+def _docker_available() -> bool:
+    try:
+        r = subprocess.run("docker info", shell=True, capture_output=True,
+                           text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _exec_docker(args: dict) -> str:
+    """Run a Python snippet inside a throwaway container. Network is disabled and
+    resources are capped by default; the container is removed after the run.
+    Degrades with install instructions when Docker isn't available."""
+    code = str(args.get("code") or "").strip()
+    if not code:
+        return "Error: sandboxed execution requires 'code'."
+    if not _docker_available():
+        return ("Docker is not available on this machine. Install Docker Desktop and "
+                "make sure `docker info` succeeds, or use execute_shell instead.")
+    import shlex
+    image = str(args.get("image") or DOCKER_IMAGE)
+    timeout = int(args.get("timeout") or 60)
+    cmd = (f"docker run --rm --network {DOCKER_NETWORK} "
+           f"--memory 512m --cpus 1 "
+           f"{shlex.quote(image)} python -c {shlex.quote(code)}")
+    return _exec_shell_command(cmd, timeout=timeout)
+
+
 _CRON_FIELD_RE = re.compile(r'^[\d\*/,\-]+$')
 _CRON_MARKER = "# agent8088"
 
@@ -747,6 +782,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "cron":
         return _exec_cron(args)
+
+    if mode == "docker":
+        return _exec_docker(args)
 
     if mode == "read_text":
         path_arg = spec.get("path_arg") or "filename"

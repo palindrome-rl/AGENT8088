@@ -40,3 +40,42 @@ def test_cron_escapes_quotes_in_task(engine, monkeypatch):
     engine._exec_cron({"action": "add", "schedule": "* * * * *", "task": "it's fine"})
     # A raw single quote would break out of the shell-quoted task string.
     assert "'\\''" in calls[-1]
+
+
+def test_docker_missing_is_graceful(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    out = engine._exec_docker({"code": "print(1)"})
+    assert "Docker is not available" in out
+
+
+def test_docker_runs_code_isolated(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    seen = {}
+
+    def fake_shell(cmd, timeout=25):
+        seen["cmd"] = cmd
+        return "3"
+
+    monkeypatch.setattr(engine, "_exec_shell_command", fake_shell)
+    out = engine._exec_docker({"code": "print(1+2)", "image": "python:3.11-slim"})
+    assert out == "3"
+    cmd = seen["cmd"]
+    assert "--network none" in cmd   # no network by default
+    assert "--rm" in cmd             # container is disposable
+    assert "--memory" in cmd         # resource capped
+
+
+def test_docker_requires_code(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    assert "requires 'code'" in engine._exec_docker({})
+
+
+def test_docker_quotes_code_safely(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    seen = {}
+    monkeypatch.setattr(engine, "_exec_shell_command",
+                        lambda cmd, timeout=25: seen.setdefault("cmd", cmd) or "")
+    engine._exec_docker({"code": "print('hi'); rm -rf /"})
+    # The whole snippet must be a single shell-quoted argument.
+    assert "rm -rf /" in seen["cmd"]
+    assert seen["cmd"].count("python -c ") == 1
