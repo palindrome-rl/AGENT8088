@@ -97,22 +97,53 @@ FALLBACK_MODELS = {
 
 _cache = {}
 
+import json, os, time
+from pathlib import Path
+
+_CACHE_FILE = Path(os.environ.get("AGENT8088_HOME", str(Path.home() / ".agent8088"))) / "models_cache.json"
+
+
+def _load_disk_cache():
+    try:
+        return json.loads(_CACHE_FILE.read_text()) if _CACHE_FILE.exists() else {}
+    except Exception:
+        return {}
+
+
+def _save_disk_cache(d):
+    try:
+        _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CACHE_FILE.write_text(json.dumps(d))
+    except Exception:
+        pass
+
+
+def _normalize_model_id(provider_name, model_id):
+    # Gemini's /v1/models returns "models/gemini-2.0-flash" — strip the prefix.
+    # Only for gemini — other providers (e.g. Fireworks) use "models/" in real IDs.
+    if provider_name == "gemini" and model_id.startswith("models/"):
+        return model_id[len("models/"):]
+    return model_id
+
+
 def list_models(provider_name, client=None, timeout=15):
     """Fetch available models from provider's /v1/models endpoint.
-    Caches in memory for 1 hour. Falls back to FALLBACK_MODELS on error.
-    Returns a list of model ID strings."""
-    import time
+    Two-tier cache: in-memory + on-disk (survives restarts). 1-hour TTL.
+    Falls back to FALLBACK_MODELS on error. Returns a list of model ID strings."""
     now = time.time()
-    cached = _cache.get(provider_name)
+    disk = _load_disk_cache()
+    cached = disk.get(provider_name) or _cache.get(provider_name)
     if cached and (now - cached["ts"]) < 3600:
         return cached["models"]
     if client is None:
         client, _ = get_client_for(f"{provider_name}:", timeout=timeout)
     try:
         resp = client.models.list()
-        models = [m.id for m in resp.data]
-        models.sort()
-        _cache[provider_name] = {"ts": now, "models": models}
+        models = sorted(_normalize_model_id(provider_name, m.id) for m in resp.data)
+        entry = {"ts": now, "models": models}
+        _cache[provider_name] = entry
+        disk[provider_name] = entry
+        _save_disk_cache(disk)
         return models
     except Exception:
         return list(FALLBACK_MODELS.get(provider_name, []))
