@@ -45,13 +45,34 @@ gemma_model_name=gemma-4-12B-it-Q4_K_M.gguf
 # Ends at "q=" with no placeholder; tools.txt appends {query_q}&format=json.
 search_base_url=http://192.168.1.10:8888/search?q=
 
+# Collapse SearXNG's verbose JSON (engines, positions, score, parsed_url…) down to
+# title/url/snippet. Keeps search results from eating the context window — which
+# matters a lot for smaller local models.
+tool_filter.web_search=if (.results | length) == 0 then "No results." else (.results[:6][] | "• \(.title)\n  \(.url)\n  \(.content // "")") end
+
+# --- search fallbacks (optional; used when the LAN SearXNG is unreachable) ---
+# Tavily: agent-optimized, returns clean ranked content. Free tier ~1000/mo.
+# Get a key at https://tavily.com  then uncomment tavily_api_key.
+# tavily_api_key=tvly-...
+tool_headers.web_search_tavily=Content-Type: application/json;;Authorization: Bearer {tavily_api_key}
+tool_body.web_search_tavily={"query": "{query}", "max_results": 6, "search_depth": "basic", "include_answer": true}
+tool_filter.web_search_tavily=(if .answer then "Answer: \(.answer)\n" else "" end) + ([.results[]? | "• \(.title)\n  \(.url)\n  \(.content // "")"] | join("\n"))
+
+# Exa: semantic/neural search. Free tier ~20,000/mo (largest of the hosted APIs).
+# Get a key at https://exa.ai  then uncomment exa_api_key.
+# exa_api_key=...
+tool_headers.web_search_exa=Content-Type: application/json;;x-api-key: {exa_api_key}
+tool_body.web_search_exa={"query": "{query}", "numResults": 6, "contents": {"text": {"maxCharacters": 600}}}
+tool_filter.web_search_exa=[.results[]? | "• \(.title)\n  \(.url)\n  \((.text // "") | gsub("\\s+"; " "))"] | join("\n")
+
 # --- SSRF guard ---
 # The agent is blocked from fetching private/loopback/link-local addresses so it
-# can't be steered into scanning your internal network. The engine default is 0
-# (block). It is set to 1 here ONLY because search_base_url above is a LAN
-# SearXNG (192.168.1.10) that the guard would otherwise block.
-# Set back to 0 if you move search to a public endpoint.
-ssrf_allow_private=1
+# can't be steered into scanning your internal network.
+#
+# Prefer the narrow allowlist below over ssrf_allow_private: it permits ONLY the
+# SearXNG box, leaving the rest of the private network blocked.
+ssrf_allow_hosts=192.168.1.10
+ssrf_allow_private=0
 
 # --- SkillOpt --- (text-space optimization, see skillopt.py)
 optimizer_base_url=http://192.168.1.12:8004/v1

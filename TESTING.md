@@ -2,7 +2,7 @@
 
 Two suites, both runnable with no model backend and no network.
 
-## 1. Unit tests (fast, hermetic — 70 tests)
+## 1. Unit tests (fast, hermetic — 80 tests)
 
 ```bash
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
@@ -21,9 +21,10 @@ AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_images.py -q      # im
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_skills.py -q      # skill packages
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_persona.py -q     # USER.md
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_new_tools.py -q   # cron/docker/browser
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_http_search.py -q # search/http modes/SSRF allowlist
 ```
 
-## 2. Functional verification (80 checks against real dependencies)
+## 2. Functional verification (92 checks against real dependencies)
 
 ```bash
 python scripts/verify_features.py
@@ -34,7 +35,7 @@ and executes real containers when Docker is up. Anything unavailable is reported
 as `⊘ SKIP` with the reason rather than silently passing. Exit code is non-zero on
 any failure.
 
-To get all 80 (no skips), have Docker running and Playwright installed:
+To get all 92 (no skips), have Docker running and Playwright installed:
 
 ```bash
 open -a Docker                                    # macOS
@@ -50,7 +51,7 @@ python agent8088_cli.py
 
 | Try | What to expect |
 |---|---|
-| `/tools` | 18 tools listed |
+| `/tools` | 20 tools listed |
 | `/agents` | 4 sub-agent profiles |
 | `/agent` | arrow-key picker (↑/↓/⏎/esc), then prompts for a task |
 | `/agent explore list the python files here` | nested animated magenta trace, then a summary |
@@ -61,6 +62,8 @@ python agent8088_cli.py
 | `/tool run_sandboxed code="print(6*7)"` | `42` from inside a container |
 | `/tool browse_page url=https://example.com` | live page text |
 | `/tool git_status` | real git output |
+| `/tool web_search query="python 3.13"` | clean `• title / url / snippet` list |
+| `/tool web_search_tavily query="..."` | needs `tavily_api_key`, else a clear message |
 | `/tool schedule_task action=list` | your agent8088 cron entries |
 | `Tab` after `/agent `, `/tool `, `/model ` | autocompletion |
 
@@ -90,6 +93,7 @@ python agent8088_cli.py
   tool tells you how to install it and suggests `web_search`.
 - **Vision**: `/image` needs a vision-capable provider configured (see `/model`); the
   default local text model will error.
-- **SSRF**: `config.txt` sets `ssrf_allow_private=1` because `search_base_url` is a
-  LAN SearXNG. The engine default is `0` (block). Set it back to `0` if you move
-  search to a public endpoint.
+- **SSRF**: `config.txt` uses `ssrf_allow_hosts=192.168.1.10` to permit only the SearXNG
+  box; `ssrf_allow_private` stays `0` so the rest of the private network is blocked.
+- **Search**: the LAN SearXNG is unreachable off that network — `web_search` will report
+  `No response from ...`. Set `tavily_api_key` or `exa_api_key` for a hosted fallback.

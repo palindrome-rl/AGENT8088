@@ -426,6 +426,13 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "keywords": set(parse_csv(g("keywords", "tool_keywords"))),
         "command": g("command", "tool_command"),
         "url": g("url", "tool_url"),
+        # http_get/http_post extras. jq filters and JSON bodies are pipe- and
+        # comma-heavy, which collides with tools.txt's '|' field separator — so
+        # these are normally set in config.txt as tool_filter.<name> etc., where
+        # the value is everything after the first '='.
+        "headers": g("headers", "tool_headers"),
+        "body": g("body", "tool_body"),
+        "filter": g("filter", "tool_filter"),
         "expression": g("expression", "tool_expression"),
         "path_arg": g("path_arg", "tool_path_arg", "filename"),
         "content_arg": g("content_arg", "tool_content_arg", "content"),
@@ -806,6 +813,86 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     return f"[subagent:{type_name}] {answer}"
 
 
+_PLACEHOLDER_RE = re.compile(r'\{(\w+)\}')
+
+
+def _safe_format(template: str, args: dict) -> str:
+    """Interpolate {name} placeholders WITHOUT str.format's brace semantics.
+
+    Needed for JSON bodies: str.format treats every `{` as a field opener, so
+    `{"query": "{query}"}` raises KeyError '"query"'. Here only `{word}` is
+    substituted (and only when known), leaving JSON braces untouched. Supports the
+    same `{name_q}` url-quoted variants and config defaults as _format_with_args."""
+    import urllib.parse
+
+    safe = dict(APP_CONFIG)
+    for k, v in (args or {}).items():
+        sv = str(v)
+        safe[k] = sv
+        safe[f"{k}_q"] = urllib.parse.quote(sv)
+    return _PLACEHOLDER_RE.sub(
+        lambda m: safe[m.group(1)] if m.group(1) in safe else m.group(0),
+        template or "")
+
+
+def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
+    """SSRF-guarded HTTP GET/POST with optional auth headers and a jq filter.
+
+    Extra spec fields (all optional):
+      headers=H1;;H2   request headers, config placeholders interpolated
+      body={...}       POST body (http_post only)
+      filter=<jq>      jq expression applied to the response — keeps noisy API
+                       JSON (e.g. SearXNG's engines/positions/score metadata) out
+                       of the model's context
+
+    Kept as a tool MODE rather than a shell one-liner so the SSRF guard still
+    applies; a `mode=shell` curl would bypass it entirely."""
+    import shlex
+
+    url = _safe_format(spec.get("url") or "{url}", args)
+    blocked = _ssrf_check(url)
+    if blocked:
+        return blocked
+
+    cmd = ["curl", "-s", "--max-time", str(timeout)]
+    for raw in (spec.get("headers") or "").split(";;"):
+        header = _safe_format(raw.strip(), args)
+        if not header:
+            continue
+        # An unresolved {..._api_key} means the credential isn't in config yet —
+        # say so instead of sending a bogus header and returning a raw 401.
+        missing = _PLACEHOLDER_RE.search(header)
+        if missing:
+            return (f"'{spec['name']}' is not configured: set {missing.group(1)} in "
+                    f"{CONFIG_PATH.name}. Until then use another search tool.")
+        cmd += ["-H", shlex.quote(header)]
+    if mode == "http_post":
+        cmd += ["-X", "POST"]
+        body = _safe_format(spec.get("body") or "{}", args)
+        cmd += ["--data-binary", shlex.quote(body)]
+    cmd.append(shlex.quote(url))
+
+    command = " ".join(cmd)
+    jq_filter = spec.get("filter")
+    if jq_filter:
+        # If jq fails (HTML error page, unexpected shape), fall back to the raw body
+        # so an API error message still reaches the model instead of vanishing.
+        command = (f"{command} > /tmp/_a8088_http.$$ 2>/dev/null; "
+                   f"jq -r {shlex.quote(jq_filter)} < /tmp/_a8088_http.$$ 2>/dev/null "
+                   f"|| cat /tmp/_a8088_http.$$; rm -f /tmp/_a8088_http.$$")
+    result = _exec_shell_command(command, timeout=timeout + 5)
+
+    # A failed curl writes nothing, and _exec_shell_command turns "no output" into
+    # "✓ Command completed" — which reads as SUCCESS to the model. Say what actually
+    # happened instead, so an unreachable endpoint isn't mistaken for "no results".
+    if not result.strip() or result.strip() == "✓ Command completed":
+        import urllib.parse
+        host = urllib.parse.urlparse(url).netloc or url
+        return (f"No response from {host} — the endpoint is unreachable or returned "
+                f"nothing. This is a connectivity/config problem, not an empty result set.")
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Browser — real page rendering via Playwright (optional dependency)
 # ---------------------------------------------------------------------------
@@ -982,12 +1069,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             expression = _format_with_args(expression, args)
         return str(eval(expression, {"__builtins__": {}}, {}))
 
-    if mode == "http_get":
-        url = _format_with_args(spec.get("url") or "{url}", args)
-        blocked = _ssrf_check(url)
-        if blocked:
-            return blocked
-        return _exec_shell_command(f'curl -s --max-time {timeout} "{url}"', timeout=timeout)
+    if mode in ("http_get", "http_post"):
+        return _exec_http(mode, spec, args, timeout)
 
     if mode == "shell":
         command = _format_with_args(spec.get("command") or "{command}", args)
@@ -1223,6 +1306,12 @@ def _preflight_refusal(messages) -> str:
 # ---------------------------------------------------------------------------
 _ALLOWED_URL_SCHEMES = {"http", "https"}
 SSRF_ALLOW_PRIVATE = APP_CONFIG.get("ssrf_allow_private", "0") == "1"
+# Specific internal hosts the agent MAY reach (e.g. a self-hosted SearXNG), as
+# host or host:port. Far tighter than ssrf_allow_private=1, which opens the whole
+# private network — prefer this allowlist.
+SSRF_ALLOW_HOSTS = {h.strip().lower()
+                    for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
+                    if h.strip()}
 
 
 def _ssrf_check(url: str):
@@ -1231,8 +1320,11 @@ def _ssrf_check(url: str):
     Blocks non-http(s) schemes and any host resolving to a private, loopback,
     link-local (incl. the 169.254.169.254 cloud-metadata endpoint), or reserved
     address — so the agent can't be steered into scanning or attacking the
-    internal network. Set ssrf_allow_private=1 in config to permit internal
-    hosts (e.g. a LAN SearXNG) when you trust the environment."""
+    internal network.
+
+    Escape hatches, in order of preference:
+      ssrf_allow_hosts=host[:port],...  allow only these internal hosts
+      ssrf_allow_private=1              allow ALL private ranges (blunt)"""
     import ipaddress
     import socket
     import urllib.parse
@@ -1251,6 +1343,12 @@ def _ssrf_check(url: str):
         return "Blocked: malformed URL host."
     if not host:
         return "Blocked: URL has no host."
+    # Explicitly allowlisted internal host (match on host and on host:port).
+    if SSRF_ALLOW_HOSTS:
+        hl = host.lower()
+        if hl in SSRF_ALLOW_HOSTS or (
+                parts.port and f"{hl}:{parts.port}" in SSRF_ALLOW_HOSTS):
+            return None
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:

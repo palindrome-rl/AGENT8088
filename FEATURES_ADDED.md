@@ -3,8 +3,8 @@
 Everything added to the Agent8088 harness in this development cycle, with the exact
 commands to use each one.
 
-**At a glance:** 8 → 18 tools · 0 → 4 sub-agents · 0 → 70 unit tests + 80 functional
-checks · 1 → unlimited model providers · 6 new security guardrails.
+**At a glance:** 8 → 20 tools · 0 → 4 sub-agents · 0 → 80 unit tests + 92 functional
+checks · 1 → unlimited model providers · 7 new security guardrails.
 
 | # | Feature | Use it with |
 |---|---|---|
@@ -19,7 +19,7 @@ checks · 1 → unlimited model providers · 6 new security guardrails.
 | 9 | Answer-first behavior | automatic |
 | 10 | Pre-flight refusal | automatic |
 | 11 | Bare-command parity + anti-repetition | `clear`, `help`, config knobs |
-| 12 | SSRF protection | automatic, `ssrf_allow_private` |
+| 12 | SSRF protection | automatic, `ssrf_allow_hosts` |
 | 13 | Persona files | `USER.md` |
 | 14 | Git integration | `git_status`, `git_commit`, … |
 | 15 | Cron / scheduled tasks | `schedule_task` |
@@ -29,6 +29,7 @@ checks · 1 → unlimited model providers · 6 new security guardrails.
 | 19 | Image understanding | `/image` |
 | 20 | Skill marketplace | `skills_installed/`, `/skills` |
 | 21 | Test + verification suites | `pytest`, `scripts/verify_features.py` |
+| 22 | Web search overhaul (jq filters, Tavily/Exa, SSRF allowlist) | `web_search`, `web_search_tavily`, `web_search_exa` |
 
 ---
 
@@ -425,13 +426,13 @@ Available modes for package tools: `shell`, `http_get`, `read_text`, `write_text
 
 ## 21. Test + verification suites
 
-**70 unit tests** (hermetic — no model backend, no network):
+**80 unit tests** (hermetic — no model backend, no network):
 
 ```bash
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
 ```
 
-**80 functional checks** against real dependencies (real git, real browser, real
+**92 functional checks** against real dependencies (real git, real browser, real
 containers). Reports `⊘ SKIP` with a reason rather than silently passing:
 
 ```bash
@@ -440,6 +441,67 @@ python scripts/verify_features.py
 
 Full testing guide, including manual CLI checks and guardrail prompts to try by hand:
 **[TESTING.md](TESTING.md)**
+
+## 22. Web search overhaul
+
+Three changes to how search works.
+
+**a) Clean output.** `web_search` now runs its response through a jq filter, collapsing
+SearXNG's verbose JSON (`engines`, `positions`, `score`, `parsed_url`,
+`unresponsive_engines`…) down to `• title / url / snippet`. Search results used to eat
+a large slice of the context window — costly for a small local model.
+
+**b) Hosted fallbacks.** Two new search tools for when the LAN SearXNG is unreachable
+(as it is from any machine off that network):
+
+```bash
+/tool web_search "python 3.13 release notes"       # SearXNG (default, free, private)
+/tool web_search_tavily query="python 3.13 release notes"   # agent-optimized
+/tool web_search_exa query="papers on agent harness design" # semantic/neural
+```
+
+Add a key to `config.txt` to enable one (both are optional; without a key the tool
+returns a clear "not configured" message rather than a raw 401):
+
+```
+tavily_api_key=tvly-...    # https://tavily.com  — ~1000 searches/mo free
+exa_api_key=...            # https://exa.ai      — ~20,000 searches/mo free
+```
+
+Why these two: Tavily returns pre-ranked, pre-extracted content formatted for LLM
+consumption (a bigger win for a 14–35B local model than for a frontier model); Exa has
+the largest free tier and does semantic "find similar" search. **Brave is not included
+— its free tier was removed in February 2026.**
+
+**c) Narrower SSRF escape hatch.** Reaching a LAN SearXNG previously required
+`ssrf_allow_private=1`, which opened the *entire* private network. Replaced with a
+host allowlist:
+
+```
+ssrf_allow_hosts=192.168.1.10      # only this host is reachable
+ssrf_allow_private=0              # the rest of the private network stays blocked
+```
+
+Supports `host` or `host:port`. Verified: `192.168.1.10:8888` allowed,
+`192.168.1.11` blocked, `169.254.169.254` blocked.
+
+### Supporting engine work
+
+- **New `http_post` mode** and extended `http_get`, both with optional `headers`,
+  `body`, and `filter` (jq) fields. Kept as tool *modes* rather than `mode=shell`
+  curl one-liners specifically so the **SSRF guard still applies** — a shell curl
+  would bypass it.
+- **`_safe_format`** — brace-safe placeholder interpolation. `str.format` raises
+  `KeyError '"query"'` on a JSON body like `{"query": "{query}"}`; this substitutes
+  only `{word}` placeholders and leaves JSON braces alone.
+- **Honest failure reporting** — a failed curl writes nothing, and the shell helper
+  turned "no output" into `✓ Command completed`, which read as *success* to the model.
+  HTTP modes now say `No response from <host> — unreachable or returned nothing`, so a
+  dead endpoint is never mistaken for "no results".
+
+Because `headers`, `body`, and `filter` values are full of `|` and `,`, they are set in
+`config.txt` (`tool_headers.<name>`, `tool_body.<name>`, `tool_filter.<name>`) rather
+than in `tools.txt`, where `|` is the field separator.
 
 ---
 
@@ -488,6 +550,8 @@ python agent8088_cli.py                    # Rich CLI (all features)
 | `read_text` | read_text | filename |
 | `write_file` | write_text | filename, content |
 | `web_search` | http_get | query |
+| `web_search_tavily` | http_post | query |
+| `web_search_exa` | http_post | query |
 | `get_page_title` | shell | url |
 | `calculate` | python_eval | expression |
 | `last_output` | last_output | — |
@@ -510,7 +574,8 @@ python agent8088_cli.py                    # Rich CLI (all features)
 allowed_paths=.,/tmp            # relative entries resolve against project_root
 
 # security
-ssrf_allow_private=0            # 1 allows internal hosts (trusted networks only)
+ssrf_allow_hosts=192.168.1.10    # allow ONLY these internal hosts (host or host:port)
+ssrf_allow_private=0            # 1 opens the whole private network (blunt; prefer above)
 
 # providers
 default_provider=openrouter
@@ -524,6 +589,13 @@ skills_dir=skills_installed
 user_file=USER.md
 subagent_max_depth=1
 default_subagent=general-purpose
+
+# search
+tavily_api_key=tvly-...         # optional hosted fallback (~1000/mo free)
+exa_api_key=...                 # optional hosted fallback (~20000/mo free)
+tool_filter.<tool>=<jq expr>    # post-process an http_get/http_post response
+tool_headers.<tool>=H1;;H2      # request headers (placeholders interpolated)
+tool_body.<tool>={"k": "{arg}"} # http_post JSON body
 
 # optional tools
 docker_image=python:3.11-slim
@@ -547,6 +619,10 @@ presence_penalty=0.0
 - **Cron runs non-interactively**, so scheduled tasks can't prompt, and long runs may
   exceed the model timeout silently. Per-task logs would be a good follow-up.
 - **Skill packages can define shell tools** — review any package before installing it.
+- **Search backend must be reachable.** The default `web_search` points at a LAN
+  SearXNG; from any other network it reports `No response from <host>`. Configure
+  `tavily_api_key` or `exa_api_key` for an off-LAN fallback. Note SearXNG also needs
+  `json` added to `search.formats` in its `settings.yml`, or it returns 403.
 - **`config.txt` contains a committed API key** that is already in git history.
   Redaction masks it in output, but it should be **rotated** and moved to an env var
   or a gitignored file.
