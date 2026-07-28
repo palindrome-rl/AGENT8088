@@ -709,6 +709,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "http_get":
         url = _format_with_args(spec.get("url") or "{url}", args)
+        blocked = _ssrf_check(url)
+        if blocked:
+            return blocked
         return _exec_shell_command(f'curl -s --max-time {timeout} "{url}"', timeout=timeout)
 
     if mode == "shell":
@@ -931,6 +934,55 @@ def _preflight_refusal(messages) -> str:
         return ("I can't share my internal instructions, system prompt, or configuration "
                 "(including files like system.md or config.txt). Let me know what you'd "
                 "like help with instead.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# SSRF protection — block requests to internal/private network ranges
+# ---------------------------------------------------------------------------
+_ALLOWED_URL_SCHEMES = {"http", "https"}
+SSRF_ALLOW_PRIVATE = APP_CONFIG.get("ssrf_allow_private", "0") == "1"
+
+
+def _ssrf_check(url: str):
+    """Return None if the URL is safe to fetch, else an error string.
+
+    Blocks non-http(s) schemes and any host resolving to a private, loopback,
+    link-local (incl. the 169.254.169.254 cloud-metadata endpoint), or reserved
+    address — so the agent can't be steered into scanning or attacking the
+    internal network. Set ssrf_allow_private=1 in config to permit internal
+    hosts (e.g. a LAN SearXNG) when you trust the environment."""
+    import ipaddress
+    import socket
+    import urllib.parse
+
+    if SSRF_ALLOW_PRIVATE:
+        return None
+    try:
+        parts = urllib.parse.urlparse((url or "").strip())
+    except Exception:
+        return "Blocked: malformed URL."
+    if parts.scheme.lower() not in _ALLOWED_URL_SCHEMES:
+        return f"Blocked: scheme '{parts.scheme}' is not allowed (only http/https)."
+    try:
+        host = parts.hostname
+    except Exception:
+        return "Blocked: malformed URL host."
+    if not host:
+        return "Blocked: URL has no host."
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return f"Blocked: could not resolve host '{host}'."
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            return "Blocked: unresolvable address."
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return (f"Blocked: '{host}' resolves to internal address {ip}. "
+                    "Requests to private/loopback/link-local networks are not allowed.")
     return None
 
 
