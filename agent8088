@@ -686,6 +686,44 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     return f"[subagent:{type_name}] {answer}"
 
 
+_CRON_FIELD_RE = re.compile(r'^[\d\*/,\-]+$')
+_CRON_MARKER = "# agent8088"
+
+
+def _exec_cron(args: dict) -> str:
+    """Manage scheduled runs of this agent via the user's crontab.
+    actions: list | add (schedule, task) | remove (task)."""
+    action = str(args.get("action") or "list").strip().lower()
+
+    if action == "list":
+        return _exec_shell_command(
+            f'crontab -l 2>/dev/null | grep "{_CRON_MARKER}" || echo "No scheduled tasks."')
+
+    if action == "add":
+        schedule = str(args.get("schedule") or "").strip()
+        task = str(args.get("task") or "").strip()
+        fields = schedule.split()
+        if len(fields) != 5 or not all(_CRON_FIELD_RE.match(f) for f in fields):
+            return ("Invalid schedule. Use 5 cron fields, e.g. '0 9 * * *' "
+                    "(minute hour day month weekday).")
+        if not task:
+            return "Error: cron 'add' requires a task."
+        safe_task = task.replace("'", "'\\''")
+        agent = str(APP_DIR / "agent8088")
+        entry = f"{schedule} cd {SHELL_CWD} && {agent} '{safe_task}' {_CRON_MARKER}"
+        return _exec_shell_command(
+            f'(crontab -l 2>/dev/null; echo "{entry}") | crontab - && echo "Scheduled: {schedule}"')
+
+    if action == "remove":
+        task = str(args.get("task") or "").strip()
+        if not task:
+            return "Error: cron 'remove' requires the task text to match."
+        return _exec_shell_command(
+            f'crontab -l 2>/dev/null | grep -v -F "{task}" | crontab - && echo "Removed."')
+
+    return f"Unknown cron action '{action}'. Use list, add, or remove."
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     spec = TOOL_SPECS.get(name)
     if not spec:
@@ -706,6 +744,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "subagent":
         return _exec_subagent(args, depth=depth)
+
+    if mode == "cron":
+        return _exec_cron(args)
 
     if mode == "read_text":
         path_arg = spec.get("path_arg") or "filename"

@@ -13,3 +13,4 @@ git_clone|Clone a repository into a directory|mode=shell|args=url,directory|comm
 git_commit|Stage all changes and commit with a message. Only use when the user asked you to commit.|mode=shell|args=message|command=git add -A && git commit -m "{message}"|timeout=30
 git_push|Push the current branch to origin. Only use when the user asked you to push.|mode=shell|command=git push origin HEAD|timeout=120
 git_create_pr|Open a pull request with the gh CLI. Only use when the user asked for a PR.|mode=shell|args=title,body|command=gh pr create --title "{title}" --body "{body}"|timeout=120
+schedule_task|Schedule this agent to run a task periodically, or list/remove schedules. action is list, add, or remove; schedule is 5 cron fields (e.g. "0 9 * * *"); task is the query to run.|mode=cron|args=action,schedule,task|timeout=20
