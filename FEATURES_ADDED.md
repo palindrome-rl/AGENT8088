@@ -731,9 +731,7 @@ presence_penalty=0.0
   SearXNG; from any other network it reports `No response from <host>`. Configure
   `tavily_api_key` or `exa_api_key` for an off-LAN fallback. Note SearXNG also needs
   `json` added to `search.formats` in its `settings.yml`, or it returns 403.
-- **`config.txt` contains a committed API key** that is already in git history.
-  Redaction masks it in output, but it should be **rotated** and moved to an env var
-  or a gitignored file.
+
 
 # Design specs
 
