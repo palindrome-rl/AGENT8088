@@ -164,8 +164,8 @@ def banner():
     tbl.add_column(justify="right", style="cyan")
     tbl.add_column(style="white")
     tbl.add_row("Model", str(A.MODEL_NAME))
-    tbl.add_row("Backend", backend)
-    tbl.add_row("Endpoint", str(endpoint))
+    tbl.add_row("Provider", str(getattr(A, "MODEL_REF", "ollama")))
+    tbl.add_row("Endpoint", str(A.APP_CONFIG.get("provider.ollama.base_url", A.APP_CONFIG.get("model_base_url", "?"))))
     tbl.add_row("Tools", f"{len(A.TOOL_NAMES)} loaded  ·  " + ", ".join(sorted(A.TOOL_NAMES)))
     tbl.add_row("Temp", str(S.temperature))
     tbl.add_row("Max turns", str(S.max_turns))
@@ -519,21 +519,19 @@ def cmd_raw(rest):
 
 
 def cmd_model(rest):
-    arg = rest.strip().lower()
+    arg = rest.strip()
     if not arg:
-        backend = "Gemma (fallback)" if os.environ.get("USE_GEMMA4") == "1" else "Ornith / custom"
-        console.print(f"Current: [cyan]{A.MODEL_NAME}[/cyan]  ({backend})")
-        console.print("Switch with: [yellow]/model ornith[/yellow] or [yellow]/model gemma[/yellow]")
+        from agent8088.providers import list_providers
+        console.print(f"Current: [cyan]{A.MODEL_REF}[/cyan]  → [dim]{A.MODEL_NAME}[/dim]")
+        console.print(f"Providers: [yellow]{', '.join(list_providers())}[/yellow]")
+        console.print("Switch with: [yellow]/model provider:model_name[/yellow]")
         return
-    if arg in ("gemma", "gemma4"):
-        os.environ["USE_GEMMA4"] = "1"
-    elif arg in ("ornith", "custom", "default"):
-        os.environ.pop("USE_GEMMA4", None)
-    else:
-        console.print("[red]unknown model[/red] — use 'ornith' or 'gemma'")
-        return
-    A.client, A.MODEL_NAME = A.get_client()
-    console.print(f"[green]switched[/green] → [cyan]{A.MODEL_NAME}[/cyan]")
+    try:
+        A.client, A.MODEL_NAME = A.providers.get_client_for(arg, timeout=A.TIMEOUT_SECONDS)
+        A.MODEL_REF = arg
+        console.print(f"[green]switched[/green] → [cyan]{A.MODEL_NAME}[/cyan]  ({arg})")
+    except Exception as e:
+        console.print(f"[red]error:[/red] {e}")
 
 
 def cmd_config(_):
@@ -680,6 +678,7 @@ def _run_update():
 def _run_setup():
     """Interactive config wizard — prompt for model endpoint, write to config.txt."""
     import re as _re
+    from agent8088.providers import list_providers
     home = _agent8088_home()
     config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
@@ -694,18 +693,25 @@ def _run_setup():
     print("  (Press Enter to keep the current value in brackets)\n")
     cur_paths = _current("allowed_paths") or "~"
     paths = input(f"Working directory [{cur_paths}]: ").strip() or cur_paths
-    cur_url = _current("model_base_url") or "http://localhost:11434/v1"
-    url = input(f"Model base URL [{cur_url}]: ").strip() or cur_url
-    cur_name = _current("model_name") or "qwen14b-tooluse-v3"
+    cur_model = _current("model") or "ollama:qwen14b-tooluse-v3"
+    print(f"Providers: {', '.join(list_providers())}")
+    provider = input(f"Provider (e.g. ollama, openrouter, openai) [{cur_model.split(':')[0]}]: ").strip() or cur_model.split(":")[0]
+    cur_name = cur_model.split(":", 1)[-1] if ":" in cur_model else cur_model
     name = input(f"Model name [{cur_name}]: ").strip() or cur_name
-    cur_key = _current("api_key") or "ollama"
-    key = input(f"API key [{cur_key}]: ").strip() or cur_key
+    model_ref = f"{provider}:{name}"
+    cur_key = _current(f"provider.{provider}.api_key") or ""
+    key = input(f"API key for {provider} [{cur_key or 'press Enter to skip'}]: ").strip()
     cur_search = _current("search_base_url")
     search = input(f"Web search URL [{cur_search or 'disabled'}]: ").strip()
     content = _re.sub(r'^allowed_paths=.*', lambda _: f'allowed_paths={paths}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^model_base_url=.*', lambda _: f'model_base_url={url}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^model_name=.*', lambda _: f'model_name={name}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^api_key=.*', lambda _: f'api_key={key}', content, flags=_re.MULTILINE)
+    content = _re.sub(r'^model=.*', lambda _: f'model={model_ref}', content, flags=_re.MULTILINE)
+    if not _re.search(r'^model=', content, _re.MULTILINE):
+        content += f"\nmodel={model_ref}\n"
+    if key:
+        if _re.search(rf'^provider\.{provider}\.api_key=.*', content, _re.MULTILINE):
+            content = _re.sub(rf'^provider\.{provider}\.api_key=.*', lambda _: f'provider.{provider}.api_key={key}', content, flags=_re.MULTILINE)
+        else:
+            content += f"\nprovider.{provider}.api_key={key}\n"
     if search:
         if _re.search(r'^#?\s*search_base_url=', content, _re.MULTILINE):
             content = _re.sub(r'^#?\s*search_base_url=.*', lambda _: f'search_base_url={search}', content, flags=_re.MULTILINE)
@@ -713,6 +719,7 @@ def _run_setup():
             content += f"\nsearch_base_url={search}\n"
     config_path.write_text(content, encoding="utf-8")
     print(f"\nConfig written to {config_path}")
+    print(f"Active model: {model_ref}")
 
 
 def main():

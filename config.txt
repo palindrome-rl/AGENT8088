@@ -1,49 +1,61 @@
 # Agent8088 config.txt
 #
-# Edit this file to point agent8088 at your model. The default below assumes
-# Ollama running locally on port 11434 with the qwen14b-tooluse-v3 model.
-# For a cloud endpoint, change model_base_url, model_name, and api_key.
+# Multi-model provider support. Set model=provider:model_name to pick your
+# active model. Provider base URLs are built-in; override with
+# provider.<name>.base_url and provider.<name>.api_key below.
+#
+# Built-in providers: ollama, openrouter, openai, anthropic, gemini,
+# cerebras, deepseek, groq, mistral, moonshot, qwen, ollama-cloud, copilot
 
-# --- paths --- Leave commented to use built-in defaults (APP_DIR-relative).
-# project_root=. (defaults to APP_DIR — the package's own directory)
-# shell_cwd=. (defaults to PROJECT_ROOT)
+# --- paths --- Leave commented to use built-in defaults.
+# project_root=. (defaults to CWD)
+# shell_cwd=. (defaults to CWD)
 # tools_file=tools.txt (defaults to APP_DIR/tools.txt)
 # system_file=system.md (defaults to APP_DIR/system.md)
-# banner_file=banner.txt (defaults to APP_DIR/banner.txt)
 
 # write_file / read_file are restricted to these paths.
 # Use ~ for the user's home directory (full access to user files), or a specific path.
 allowed_paths=~
 
 # --- Permission Layer 1: Sensitive file read protection ---
-# Files matching these patterns are never readable by the model.
-# Override: list specific files here to allow the model to read them.
 # allowed_sensitive_files=.env,secrets.yaml
 
 # --- Permission Layer 2: Network access control ---
 # web_search and get_page_title prompt the user (y/n) on every request.
-# No config needed — prompting is hardcoded.
 
-# --- Permission Layer 3: Path-based write restrictions (three-tier zones) ---
+# --- Permission Layer 3: Path-based write restrictions ---
 # Writes to these paths run without a prompt (auto-approved):
 # no_prompt_paths=/tmp
-# Writes to these paths show the y/n escalation prompt (default: home directory):
+# Writes to these paths show the y/n escalation prompt:
 prompt_paths=~
 # Writes to these paths are always blocked, even in edit mode:
 # blocked_paths=/etc,/home,~/.ssh
 
 # --- model ---
-# Default: Ollama running locally. Change these for a cloud endpoint.
-model_base_url=http://localhost:11434/v1
-model_name=qwen14b-tooluse-v3
-api_key=ollama
+# Active model in provider:model format. Built-in providers listed above.
+model=ollama:qwen14b-tooluse-v3
+
+# Fallback chain (comma-separated, tried on 429/503/connection errors):
+# fallback_models=cerebras:gpt-oss-120b,gemini:gemini-2.0-flash
+
+# Provider overrides (optional — built-in defaults work without these):
+# provider.ollama.base_url=http://localhost:11434/v1
+# provider.ollama.api_key=ollama
+# provider.openrouter.api_key=sk-or-...
+# provider.openai.api_key=sk-...
+# provider.anthropic.api_key=sk-ant-...
+# provider.gemini.api_key=AIza...
+# provider.cerebras.api_key=csk-...
+# provider.deepseek.api_key=sk-...
+# provider.groq.api_key=gsk_...
+# provider.mistral.api_key=...
+# provider.moonshot.api_key=sk-...
+# provider.qwen.api_key=sk-...
+# provider.ollama-cloud.api_key=...
+# provider.copilot.api_key=ghp_...
+
 timeout_seconds=120
 
-# --- Gemma fallback (only used when USE_GEMMA4=1) ---
-gemma_base_url=http://localhost:8003/v1
-gemma_model_name=gemma-4-12B-it-Q4_K_M.gguf
-
 # --- search (SearXNG) ---
-# Leave commented to disable web_search. The URL must end at "q=" with no
-# placeholder; tools.txt appends {query_q}&format=json.
+# Leave commented to disable web_search.
 # search_base_url=http://localhost:8888/search?q=

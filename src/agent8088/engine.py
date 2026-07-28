@@ -208,32 +208,34 @@ BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
 
 
 # ---------------------------------------------------------------------------
-# Model client.  USE_GEMMA4=1 switches to the Gemma server on Colossus.
+# Model client — uses providers.py registry for multi-model support
 # ---------------------------------------------------------------------------
+from agent8088 import providers
+providers.load_providers(APP_CONFIG)
+MODEL_REF = APP_CONFIG.get("model", "ollama:" + APP_CONFIG.get("model_name", "qwen14b-tooluse-v3"))
+FALLBACK_CHAIN = providers.get_fallback_chain(APP_CONFIG)
+
+
 def get_client():
-    if os.environ.get("USE_GEMMA4", "0") == "1":
-        print(f"[agent8088] Using Gemma 4 on Colossus ({GEMMA_BASE_URL})")
-        model = APP_CONFIG.get("gemma_model_name", "gemma-4-12B-it-Q4_K_M.gguf")
-        return OpenAI(base_url=GEMMA_BASE_URL, api_key="sk-dummy"), model
-    client = OpenAI(base_url=MODEL_BASE_URL, api_key=APP_CONFIG.get("api_key", "ollama"), timeout=TIMEOUT_SECONDS)
-    return client, MODEL_NAME
+    return providers.get_client_for(MODEL_REF, timeout=TIMEOUT_SECONDS)
 
 
 client, MODEL_NAME = get_client()
 
 
-def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1, on_token=None):
+def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1, on_token=None, model=None):
     full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
+    use_model = model or MODEL_NAME
     # NOTE: Ollama (current backend) rejects the OpenAI "tools" param, so the model emits
     # native ✿FUNCTION✿/✿ARGS✿ text instead. Pass tools= again when moving to llama-server.
     if on_token is None:
         # Non-streaming path — unchanged (old REPL, benchmark, one-shot mode)
         return client.chat.completions.create(
-            model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature,
+            model=use_model, messages=full_messages, max_tokens=max_tokens, temperature=temperature,
         )
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
     stream = client.chat.completions.create(
-        model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature, stream=True,
+        model=use_model, messages=full_messages, max_tokens=max_tokens, temperature=temperature, stream=True,
     )
     collected = []
     for chunk in stream:
@@ -945,14 +947,38 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     spin = spin or (lambda msg: nullcontext())
     seen = set()      # (name, args) signatures already run -> breaks loops
     forcing = False   # True after we've told a looping model to stop and answer
+    global client, MODEL_NAME
 
     for turn in range(max_turns):
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
-        with spin("thinking..."):
-            response = create_completion(
-                client, messages, TOOLS_DEF, temperature=temperature, on_token=on_token,
-            )
+        try:
+            with spin("thinking..."):
+                response = create_completion(
+                    client, messages, TOOLS_DEF, temperature=temperature, on_token=on_token,
+                )
+        except Exception as e:
+            err = str(e)
+            if any(c in err for c in ("429", "503", "Connection error", "timeout", "Timeout")):
+                handled = False
+                for fb_ref in FALLBACK_CHAIN:
+                    try:
+                        fb_client, fb_model = providers.get_client_for(fb_ref, timeout=TIMEOUT_SECONDS)
+                        with spin(f"fallback: {fb_ref}..."):
+                            response = create_completion(
+                                fb_client, messages, TOOLS_DEF, temperature=temperature,
+                                on_token=on_token, model=fb_model,
+                            )
+                        client = fb_client
+                        MODEL_NAME = fb_model
+                        handled = True
+                        break
+                    except Exception:
+                        continue
+                if not handled:
+                    raise
+            else:
+                raise
         content = response.choices[0].message.content or ""
         messages.append({"role": "assistant", "content": content})
 
