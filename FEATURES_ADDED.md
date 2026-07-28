@@ -3,8 +3,8 @@
 Everything added to the Agent8088 harness in this development cycle, with the exact
 commands to use each one.
 
-**At a glance:** 8 → 20 tools · 0 → 4 sub-agents · 95 automated checks · 1 →
-unlimited model providers · 7 new security guardrails.
+**At a glance:** 8 ÔåÆ 20 tools ┬À 0 ÔåÆ 4 sub-agents ┬À 95 automated checks ┬À 1 ÔåÆ
+unlimited model providers ┬À 7 new security guardrails.
 
 | # | Feature | Use it with |
 |---|---|---|
@@ -21,7 +21,7 @@ unlimited model providers · 7 new security guardrails.
 | 11 | Bare-command parity + anti-repetition | `clear`, `help`, config knobs |
 | 12 | SSRF protection | automatic, `ssrf_allow_hosts` |
 | 13 | Persona files | `USER.md` |
-| 14 | Git integration | `git_status`, `git_commit`, … |
+| 14 | Git integration | `git_status`, `git_commit`, ÔÇª |
 | 15 | Cron / scheduled tasks | `schedule_task` |
 | 16 | Docker sandboxing | `run_sandboxed` |
 | 17 | Browser tool | `browse_page` |
@@ -40,16 +40,16 @@ unlimited model providers · 7 new security guardrails.
 
 ---
 
-# Part 1 — Sub-agents
+# Part 1 ÔÇö Sub-agents
 
 ## 1. Delegation (`spawn_subagent`)
 
 The model can delegate a self-contained task to an **independent agent** that runs its
 own loop with fresh context, a specialized prompt, a restricted tool set, and its own
-turn budget — returning only a concise summary. Keeps the main context clean.
+turn budget ÔÇö returning only a concise summary. Keeps the main context clean.
 
 Implemented as a new tool **mode** (`mode=subagent`) that calls the existing
-`run_agent()` recursively. Delegation is **model-driven** — the model calls it when it
+`run_agent()` recursively. Delegation is **model-driven** ÔÇö the model calls it when it
 judges a task warrants it, exactly like any other tool.
 
 **Safety:** depth-bounded (`SUBAGENT_MAX_DEPTH`, default 1), profiles never include
@@ -58,7 +58,7 @@ the sub-run, and a failing sub-run returns an error string rather than killing t
 parent turn.
 
 ```bash
-# Interactive picker (↑/↓ move, ⏎ run, esc cancel)
+# Interactive picker (Ôåæ/Ôåô move, ÔÅÄ run, esc cancel)
 /agent
 
 # Run a named sub-agent directly
@@ -77,13 +77,13 @@ Use a subagent to count the TODOs in this repo, then tell me the total
 
 Each profile is a markdown file: `---` frontmatter (`name`, `description`, `tools`,
 `max_turns`) plus a body used as the system prompt. **Adding a sub-agent needs no
-code** — drop in a new `.md` file. Profiles are presets over the *existing* tools, so
+code** ÔÇö drop in a new `.md` file. Profiles are presets over the *existing* tools, so
 more tools are not required to add more sub-agents.
 
 | Profile | Tools | Turns | Purpose |
 |---|---|---|---|
 | `general-purpose` | 7 | 8 | Multi-step research, search, code |
-| `explore` | 5 (read-only) | 6 | Searching/reading — **cannot write files** |
+| `explore` | 5 (read-only) | 6 | Searching/reading ÔÇö **cannot write files** |
 | `coder` | 4 | 10 | Write code, then verify it runs |
 | `researcher` | 4 | 8 | Web research with citations |
 
@@ -112,12 +112,12 @@ Delegation renders as a nested magenta-gutter block with a pulsing spinner, live
 trace, and a completion footer:
 
 ```
-⏺ spawn_subagent(agent_type="explore", task="find TODOs")
-╭─ 🤖 subagent · explore
-│  find TODOs
-│  ⏺ execute_shell(command="grep -rn TODO")
-│  ⎿  src/app.py:12: # TODO: retries  (3 lines)
-╰─ ✓ done · 1 tool · 2.4s
+ÔÅ║ spawn_subagent(agent_type="explore", task="find TODOs")
+Ôò¡ÔöÇ ­ƒñû subagent ┬À explore
+Ôöé  find TODOs
+Ôöé  ÔÅ║ execute_shell(command="grep -rn TODO")
+Ôöé  ÔÄ┐  src/app.py:12: # TODO: retries  (3 lines)
+Ôò░ÔöÇ Ô£ô done ┬À 1 tool ┬À 2.4s
 ```
 
 Automatic in the Rich CLI. The engine exposes a decoupled `subagent_ui` hook, so
@@ -135,18 +135,18 @@ sub-agents stay silent in benchmark/one-shot/plain-REPL modes.
 
 ---
 
-# Part 2 — Reliability & security guardrails
+# Part 2 ÔÇö Reliability & security guardrails
 
-All automatic — no commands needed unless noted.
+All automatic ÔÇö no commands needed unless noted.
 
 ## 5. Hallucinated-tool recovery
 
 **Before:** the model called a nonexistent tool (e.g. `current_time`) and the raw
-`✿FUNCTION✿…` markup leaked to the user as the "answer".
+`Ô£┐FUNCTIONÔ£┐ÔÇª` markup leaked to the user as the "answer".
 
 **Now:** the engine detects the invalid call, feeds back a clear error listing the real
 tools, and loops (bounded) so the model recovers or answers directly.
-`strip_tool_json` hard-sanitizes any leftover `✿…✿` fragments — raw markup can never
+`strip_tool_json` hard-sanitizes any leftover `Ô£┐ÔÇªÔ£┐` fragments ÔÇö raw markup can never
 reach the user.
 
 ## 6. Runaway-reasoning protection
@@ -155,7 +155,7 @@ reach the user.
 window and the turn crashed, or the model looped in its reasoning block and never
 answered.
 
-**Now:** `<think>`/`<reasoning>` blocks — both closed **and** runaway-unclosed — are
+**Now:** `<think>`/`<reasoning>` blocks ÔÇö both closed **and** runaway-unclosed ÔÇö are
 stripped *before* being stored in context and before use as an answer. A
 reasoning-only turn triggers one nudge for a plain answer. The model call is wrapped,
 so a backend error (timeout / context overflow / 5xx) returns a graceful message
@@ -173,7 +173,7 @@ instead of crashing.
 
 ## 8. Hidden chain-of-thought
 
-**Before:** the CLI streamed raw reasoning, which routinely quoted the system prompt —
+**Before:** the CLI streamed raw reasoning, which routinely quoted the system prompt ÔÇö
 a leak even though it was stripped from the answer.
 
 **Now:** thinking is **hidden by default** (an animated status line shows instead).
@@ -199,7 +199,7 @@ rather than priming tool-calling.
 ## 10. Pre-flight refusal
 
 A request for internal files/instructions is a policy refusal, so it short-circuits
-**before any model call** — previously this burned ~3.4k tokens and 50s+ looping to
+**before any model call** ÔÇö previously this burned ~3.4k tokens and 50s+ looping to
 reach the same "no".
 
 Covers `system.md`, `config.txt`, "your system prompt / instructions / config",
@@ -209,7 +209,7 @@ and ordinary chat are unaffected.
 ## 11. Bare-command parity + anti-repetition
 
 Typing a bare command word (`clear`, `help`) previously fell through to the model as
-chat, and small models would spiral into "I will not use any X…" loops. Now any single
+chat, and small models would spiral into "I will not use any XÔÇª" loops. Now any single
 word that exactly names a command runs it, matching the classic REPL.
 
 ```bash
@@ -238,12 +238,12 @@ a LAN SearXNG that would otherwise be blocked:
 ```
 # config.txt
 ssrf_allow_private=0    # block (engine default, recommended)
-ssrf_allow_private=1    # allow internal hosts — only on a trusted network
+ssrf_allow_private=1    # allow internal hosts ÔÇö only on a trusted network
 ```
 
 ---
 
-# Part 3 — Capability parity
+# Part 3 ÔÇö Capability parity
 
 ## 13. Persona files (`USER.md`)
 
@@ -297,7 +297,7 @@ Schedule format is standard cron: `minute hour day month weekday`.
 ## 16. Docker sandboxing
 
 Runs untrusted or risky Python in a **throwaway container**: no network, memory and
-CPU capped, auto-removed. Verified in live containers — host filesystem invisible,
+CPU capped, auto-removed. Verified in live containers ÔÇö host filesystem invisible,
 `config.txt` unreachable from inside, no leftover containers.
 
 ```bash
@@ -305,7 +305,7 @@ CPU capped, auto-removed. Verified in live containers — host filesystem invisi
 /tool run_sandboxed code="import sys; print(sys.version)"
 ```
 
-Setup (optional — the tool returns install instructions when absent):
+Setup (optional ÔÇö the tool returns install instructions when absent):
 
 ```bash
 open -a Docker              # macOS; or start the daemon your way
@@ -321,7 +321,7 @@ docker_network=none
 
 ## 17. Browser tool
 
-Real headless-browser page loading via Playwright — handles JavaScript-rendered pages
+Real headless-browser page loading via Playwright ÔÇö handles JavaScript-rendered pages
 that `curl | grep` cannot. SSRF-guarded.
 
 ```bash
@@ -340,7 +340,7 @@ pip install playwright && playwright install chromium
 ## 18. Multi-provider LLM
 
 Replaces the hardcoded Ollama/Gemma toggle with a config registry. Any
-OpenAI-compatible endpoint works — OpenAI, OpenRouter, Groq, Together, llama-server,
+OpenAI-compatible endpoint works ÔÇö OpenAI, OpenRouter, Groq, Together, llama-server,
 Ollama, and most gateways (20+ providers). Provider API keys are automatically picked
 up by the secret redactor.
 
@@ -371,8 +371,8 @@ Use it:
 AGENT8088_PROVIDER=groq python agent8088_cli.py    # or via env var
 ```
 
-Selection precedence: explicit `/model` arg → `AGENT8088_PROVIDER` → config
-`default_provider` → legacy `USE_GEMMA4` → flat `model_base_url`.
+Selection precedence: explicit `/model` arg ÔåÆ `AGENT8088_PROVIDER` ÔåÆ config
+`default_provider` ÔåÆ legacy `USE_GEMMA4` ÔåÆ flat `model_base_url`.
 
 ## 19. Image understanding
 
@@ -385,17 +385,17 @@ Analyze screenshots, diagrams, and photos. Local files are inlined as base64 dat
 /image https://example.com/diagram.jpg explain this architecture
 ```
 
-**Requires a vision-capable provider** (see `/model`) — the default local text model
+**Requires a vision-capable provider** (see `/model`) ÔÇö the default local text model
 will error. Context estimation and `/history` handle multimodal messages, so a large
 base64 blob no longer pegs the context meter.
 
 ## 20. Skill marketplace
 
-Extend the agent with installable tool packages — **no code changes**. Each package is
+Extend the agent with installable tool packages ÔÇö **no code changes**. Each package is
 a directory with `SKILL.md` (frontmatter) plus `tools.txt`, merged into the tool set
 before the system prompt is built so the model sees the new tools.
 
-**Security:** a package **cannot override a core tool** — verified that a malicious
+**Security:** a package **cannot override a core tool** ÔÇö verified that a malicious
 package redefining `execute_shell` fails to hijack it. Core definitions always win.
 Packages can still *define* `mode=shell` tools, so review before installing.
 
@@ -424,23 +424,23 @@ Then:
 
 Available modes for package tools: `shell`, `http_get`, `read_text`, `write_text`,
 `python_eval`, `browser`, `docker`, `cron`, `subagent`, `plan`, `last_output`.
-**`|` is the field separator — never use it inside a description.** Full guide:
+**`|` is the field separator ÔÇö never use it inside a description.** Full guide:
 `skills_installed/README.md`.
 
 ---
 
-# Part 4 — Testing
+# Part 4 ÔÇö Testing
 
 ## 21. Test + verification suites
 
-**84 unit tests** (hermetic — no model backend, no network):
+**84 unit tests** (hermetic ÔÇö no model backend, no network):
 
 ```bash
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
 ```
 
 **92 functional checks** against real dependencies (real git, real browser, real
-containers). Reports `⊘ SKIP` with a reason rather than silently passing:
+containers). Reports `Ôèÿ SKIP` with a reason rather than silently passing:
 
 ```bash
 python scripts/verify_features.py
@@ -455,8 +455,8 @@ Three changes to how search works.
 
 **a) Clean output.** `web_search` now runs its response through a jq filter, collapsing
 SearXNG's verbose JSON (`engines`, `positions`, `score`, `parsed_url`,
-`unresponsive_engines`…) down to `• title / url / snippet`. Search results used to eat
-a large slice of the context window — costly for a small local model.
+`unresponsive_engines`ÔÇª) down to `ÔÇó title / url / snippet`. Search results used to eat
+a large slice of the context window ÔÇö costly for a small local model.
 
 **b) Hosted fallbacks.** Two new search tools for when the LAN SearXNG is unreachable
 (as it is from any machine off that network):
@@ -471,14 +471,14 @@ Add a key to `config.txt` to enable one (both are optional; without a key the to
 returns a clear "not configured" message rather than a raw 401):
 
 ```
-tavily_api_key=tvly-...    # https://tavily.com  — ~1000 searches/mo free
-exa_api_key=...            # https://exa.ai      — ~20,000 searches/mo free
+tavily_api_key=tvly-...    # https://tavily.com  ÔÇö ~1000 searches/mo free
+exa_api_key=...            # https://exa.ai      ÔÇö ~20,000 searches/mo free
 ```
 
 Why these two: Tavily returns pre-ranked, pre-extracted content formatted for LLM
-consumption (a bigger win for a 14–35B local model than for a frontier model); Exa has
+consumption (a bigger win for a 14ÔÇô35B local model than for a frontier model); Exa has
 the largest free tier and does semantic "find similar" search. **Brave is not included
-— its free tier was removed in February 2026.**
+ÔÇö its free tier was removed in February 2026.**
 
 **c) Narrower SSRF escape hatch.** Reaching a LAN SearXNG previously required
 `ssrf_allow_private=1`, which opened the *entire* private network. Replaced with a
@@ -496,21 +496,21 @@ Supports `host` or `host:port`. Verified: `192.168.1.10:8888` allowed,
 
 - **New `http_post` mode** and extended `http_get`, both with optional `headers`,
   `body`, and `filter` (jq) fields. Kept as tool *modes* rather than `mode=shell`
-  curl one-liners specifically so the **SSRF guard still applies** — a shell curl
+  curl one-liners specifically so the **SSRF guard still applies** ÔÇö a shell curl
   would bypass it.
-- **`_safe_format`** — brace-safe placeholder interpolation. `str.format` raises
+- **`_safe_format`** ÔÇö brace-safe placeholder interpolation. `str.format` raises
   `KeyError '"query"'` on a JSON body like `{"query": "{query}"}`; this substitutes
   only `{word}` placeholders and leaves JSON braces alone.
-- **Honest failure reporting** — a failed curl writes nothing, and the shell helper
-  turned "no output" into `✓ Command completed`, which read as *success* to the model.
-  HTTP modes now say `No response from <host> — unreachable or returned nothing`, so a
+- **Honest failure reporting** ÔÇö a failed curl writes nothing, and the shell helper
+  turned "no output" into `Ô£ô Command completed`, which read as *success* to the model.
+  HTTP modes now say `No response from <host> ÔÇö unreachable or returned nothing`, so a
   dead endpoint is never mistaken for "no results".
-- **Config defaults reach templates** — tool URLs interpolate from `APP_CONFIG`, but
+- **Config defaults reach templates** ÔÇö tool URLs interpolate from `APP_CONFIG`, but
   engine defaults lived only in Python constants. A missing `search_base_url` left
   `{search_base_url}` literal in the URL, which surfaced as the baffling
   `Blocked: scheme '' is not allowed (only http/https)`. Defaults are now seeded into
   `APP_CONFIG`, and an unresolved placeholder reports itself directly:
-  `'web_search' has an unresolved placeholder {query_q} in its URL — pass query=<value>`.
+  `'web_search' has an unresolved placeholder {query_q} in its URL ÔÇö pass query=<value>`.
 
 Because `headers`, `body`, and `filter` values are full of `|` and `,`, they are set in
 `config.txt` (`tool_headers.<name>`, `tool_body.<name>`, `tool_filter.<name>`) rather
@@ -518,7 +518,7 @@ than in `tools.txt`, where `|` is the field separator.
 
 ---
 
-# Part 5 — Classic CLI & agent UX
+# Part 5 ÔÇö Classic CLI & agent UX
 
 ## 23. Classic AGENT8088 interface
 
@@ -577,13 +577,16 @@ turns unchanged. If the model call fails, the session is left untouched.
 /doctor                                # model, endpoint TCP reachability, auth/config status
 /think on|off                          # safe alias for the masked reasoning display
 /verbose on|off|full                   # tool activity detail; full also enables trace capture
-/trace on|off                          # capture and print the structured trace
+/trace on|off                          # capture/print turns; automatically save to ~/Documents/agent8088/traces
+/trace save [file]                     # export the full conversation plus all captured turns
 /usage off|tokens|full                 # choose the post-turn usage summary
 /status                                # compact dashboard for the active session
 ```
 
 `/doctor` performs only a DNS/TCP reachability check; it does not send a model prompt
-or reveal credentials.
+or reveal credentials. `/trace on` immediately creates a timestamped JSON file in
+`~/Documents/agent8088/traces` and updates it after every captured turn; set `AGENT8088_TRACE_DIR` to
+use another default directory.
 
 ## 28. Universal provider profiles
 
@@ -604,7 +607,7 @@ python agent8088_cli.py --model-setup
 # Complete command reference
 
 ```
-<text>                    Chat — runs the full agent loop
+<text>                    Chat ÔÇö runs the full agent loop
 /agent [name] [task]      Run a sub-agent (no args = arrow-key picker)
 /agents                   List sub-agent profiles
 /skills [name|enable|disable]
@@ -629,7 +632,8 @@ python agent8088_cli.py --model-setup
 /compact [keep]           Summarize older turns and retain recent messages
 /system                   Full system prompt
 /history                  Current conversation
-/trace [on|off]           Capture/print the step-by-step JSON trace
+/trace [on|off|save [file]]
+                          Capture/print traces or export the complete trace history
 /temp <float>             Sampling temperature
 /maxturns <int>           Max agent turns
 /save <file>              Save conversation + trace to JSON
@@ -638,7 +642,7 @@ python agent8088_cli.py --model-setup
 /exit, /quit              Leave
 ```
 
-Bare `clear`, `help`, `tools`, `agents`, … also work (not sent to the model).
+Bare `clear`, `help`, `tools`, `agents`, ÔÇª also work (not sent to the model).
 
 ## Launching
 
@@ -661,23 +665,23 @@ python agent8088_cli.py                    # Rich CLI (all features)
 | `web_search_exa` | http_post | query |
 | `get_page_title` | shell | url |
 | `calculate` | python_eval | expression |
-| `last_output` | last_output | — |
+| `last_output` | last_output | ÔÇö |
 | `spawn_subagent` | subagent | agent_type, task |
 | `browse_page` | browser | url |
 | `run_sandboxed` | docker | code |
 | `schedule_task` | cron | action, schedule, task |
-| `git_status` | shell | — |
-| `git_diff` | shell | — |
-| `git_log` | shell | — |
+| `git_status` | shell | ÔÇö |
+| `git_diff` | shell | ÔÇö |
+| `git_log` | shell | ÔÇö |
 | `git_clone` | shell | url, directory |
 | `git_commit` | shell | message |
-| `git_push` | shell | — |
+| `git_push` | shell | ÔÇö |
 | `git_create_pr` | shell | title, body |
 
 # New config keys
 
 ```
-# paths — omit to default to the script's directory (works on any machine)
+# paths ÔÇö omit to default to the script's directory (works on any machine)
 allowed_paths=.,/tmp            # relative entries resolve against project_root
 
 # security
@@ -726,7 +730,7 @@ presence_penalty=0.0
 - **Playwright must be installed** for `browse_page`; `get_page_title` is the fallback.
 - **Cron runs non-interactively**, so scheduled tasks can't prompt, and long runs may
   exceed the model timeout silently. Per-task logs would be a good follow-up.
-- **Skill packages can define shell tools** — review any package before installing it.
+- **Skill packages can define shell tools** ÔÇö review any package before installing it.
 - **Search backend must be reachable.** The default `web_search` points at a LAN
   SearXNG; from any other network it reports `No response from <host>`. Configure
   `tavily_api_key` or `exa_api_key` for an off-LAN fallback. Note SearXNG also needs
