@@ -1617,11 +1617,9 @@ def _run_setup():
     print("Agent8088 setup\n")
     cur_paths = _current("allowed_paths") or "~"
     paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
-    # Provider picker
-    providers_list = sorted(A.PROVIDERS.keys()) if hasattr(A, 'PROVIDERS') and A.PROVIDERS else [
-        "ollama", "openrouter", "openai", "anthropic", "gemini", "cerebras",
-        "deepseek", "groq", "mistral", "moonshot", "qwen", "ollama-cloud", "copilot"
-    ]
+    # Provider picker — always show all 13 built-in providers
+    from agent8088.providers import BUILTIN_PROVIDERS
+    providers_list = sorted(BUILTIN_PROVIDERS.keys())
     cur_model = _current("model") or _current("model_name") or "ollama:qwen14b-tooluse-v3"
     cur_provider = cur_model.split(":")[0] if ":" in cur_model else "ollama"
     provider = inquirer.fuzzy(
