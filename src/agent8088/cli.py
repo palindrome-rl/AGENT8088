@@ -1638,10 +1638,14 @@ def _run_setup():
     # Fetch models
     print(f"\nFetching models from {provider}...")
     try:
-        from agent8088.providers import list_models, get_client_for, FALLBACK_MODELS
-        client, _ = get_client_for(f"{provider}:", timeout=15)
-        models = list_models(provider, client=client)
-    except Exception:
+        from agent8088.providers import list_models, BUILTIN_PROVIDERS
+        from openai import OpenAI
+        builtin = BUILTIN_PROVIDERS.get(provider, {})
+        base_url = builtin.get("base_url", _current(f"provider.{provider}.base_url") or "http://localhost:11434/v1")
+        api_key = key or _current(f"provider.{provider}.api_key") or "ollama"
+        fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
+        models = list_models(provider, client=fetch_client)
+    except Exception as e:
         from agent8088.providers import FALLBACK_MODELS
         models = FALLBACK_MODELS.get(provider, ["unknown-model"])
     if models:
