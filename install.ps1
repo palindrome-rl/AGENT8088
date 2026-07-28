@@ -537,20 +537,21 @@ function Run-SetupWizard {
     $newPaths = Read-Host "Working directory [$currentPaths]"
     if (-not $newPaths) { $newPaths = $currentPaths }
 
-    # Read current values
-    $currentUrl = (Select-String -Path $config -Pattern '^model_base_url=' | ForEach-Object { $_.Line -replace 'model_base_url=', '' })
-    if (-not $currentUrl) { $currentUrl = "http://localhost:11434/v1" }
-    $newUrl = Read-Host "Model base URL [$currentUrl]"
-    if (-not $newUrl) { $newUrl = $currentUrl }
+    # Provider name
+    $currentProvider = (Select-String -Path $config -Pattern '^default_provider=' | ForEach-Object { $_.Line -replace 'default_provider=', '' })
+    if (-not $currentProvider) { $currentProvider = "ollama" }
+    $newProvider = Read-Host "Provider name (ollama, openrouter, openai, groq, cerebras, etc.) [$currentProvider]"
+    if (-not $newProvider) { $newProvider = $currentProvider }
 
-    $currentName = (Select-String -Path $config -Pattern '^model_name=' | ForEach-Object { $_.Line -replace 'model_name=', '' })
-    if (-not $currentName) { $currentName = "qwen14b-tooluse-v3" }
-    $newName = Read-Host "Model name [$currentName]"
-    if (-not $newName) { $newName = $currentName }
+    # Model name
+    $currentModel = (Select-String -Path $config -Pattern "^provider\.$newProvider\.model=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.model=", '' })
+    if (-not $currentModel) { $currentModel = "qwen14b-tooluse-v3" }
+    $newModel = Read-Host "Model name [$currentModel]"
+    if (-not $newModel) { $newModel = $currentModel }
 
-    $currentKey = (Select-String -Path $config -Pattern '^api_key=' | ForEach-Object { $_.Line -replace 'api_key=', '' })
-    if (-not $currentKey) { $currentKey = "ollama" }
-    $newKey = Read-Host "API key [$currentKey]"
+    # API key
+    $currentKey = (Select-String -Path $config -Pattern "^provider\.$newProvider\.api_key=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.api_key=", '' })
+    $newKey = Read-Host "API key for $newProvider [press Enter to skip]"
     if (-not $newKey) { $newKey = $currentKey }
 
     # Web search URL (optional)
@@ -558,12 +559,41 @@ function Run-SetupWizard {
     $searchLabel = if ($currentSearch) { $currentSearch } else { "disabled" }
     $newSearch = Read-Host "Web search URL (SearXNG) [$searchLabel]"
 
+    # Built-in provider base URLs
+    $builtinUrls = @{
+        "ollama" = "http://localhost:11434/v1"
+        "openrouter" = "https://openrouter.ai/api/v1"
+        "openai" = "https://api.openai.com/v1"
+        "anthropic" = "https://api.anthropic.com/v1"
+        "gemini" = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        "cerebras" = "https://api.cerebras.ai/v1"
+        "deepseek" = "https://api.deepseek.com/v1"
+        "groq" = "https://api.groq.com/openai/v1"
+        "mistral" = "https://api.mistral.ai/v1"
+        "moonshot" = "https://api.moonshot.ai/v1"
+        "qwen" = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        "ollama-cloud" = "https://ollama.com/v1"
+        "copilot" = "https://api.githubcopilot.com"
+    }
+    $baseUrl = $builtinUrls[$newProvider]
+    if (-not $baseUrl) {
+        $currentUrl = (Select-String -Path $config -Pattern "^provider\.$newProvider\.base_url=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.base_url=", '' })
+        $baseUrl = if ($currentUrl) { $currentUrl } else { "http://localhost:11434/v1" }
+    }
+
     # Write back
     $content = Get-Content $config -Raw
     $content = $content -replace '(?m)^allowed_paths=.*', "allowed_paths=$newPaths"
-    $content = $content -replace '(?m)^model_base_url=.*', "model_base_url=$newUrl"
-    $content = $content -replace '(?m)^model_name=.*', "model_name=$newName"
-    $content = $content -replace '(?m)^api_key=.*', "api_key=$newKey"
+    $content = $content -replace '(?m)^default_provider=.*', "default_provider=$newProvider"
+    if (-not ($content -match '(?m)^default_provider=')) { $content += "`ndefault_provider=$newProvider`n" }
+    $content = $content -replace "(?m)^provider\.$newProvider\.base_url=.*", "provider.$newProvider.base_url=$baseUrl"
+    if (-not ($content -match "(?m)^provider\.$newProvider\.base_url=")) { $content += "`nprovider.$newProvider.base_url=$baseUrl`n" }
+    $content = $content -replace "(?m)^provider\.$newProvider\.model=.*", "provider.$newProvider.model=$newModel"
+    if (-not ($content -match "(?m)^provider\.$newProvider\.model=")) { $content += "`nprovider.$newProvider.model=$newModel`n" }
+    if ($newKey) {
+        $content = $content -replace "(?m)^provider\.$newProvider\.api_key=.*", "provider.$newProvider.api_key=$newKey"
+        if (-not ($content -match "(?m)^provider\.$newProvider\.api_key=")) { $content += "`nprovider.$newProvider.api_key=$newKey`n" }
+    }
     if ($newSearch) {
         $content = $content -replace '(?m)^#?\s*search_base_url=.*', "search_base_url=$newSearch"
     }

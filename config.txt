@@ -1,8 +1,7 @@
 # Agent8088 config.txt
 #
-# Multi-model provider support. Set model=provider:model_name to pick your
-# active model. Provider base URLs are built-in; override with
-# provider.<name>.base_url and provider.<name>.api_key below.
+# Multi-model provider support. Set default_provider to pick your active
+# provider, then configure provider.<name>.* keys below.
 #
 # Built-in providers: ollama, openrouter, openai, anthropic, gemini,
 # cerebras, deepseek, groq, mistral, moonshot, qwen, ollama-cloud, copilot
@@ -32,27 +31,27 @@ prompt_paths=~
 # blocked_paths=/etc,/home,~/.ssh
 
 # --- model ---
-# Active model in provider:model format. Built-in providers listed above.
-model=ollama:qwen14b-tooluse-v3
+# Active provider (built-in base URLs are used automatically):
+default_provider=ollama
 
-# Fallback chain (comma-separated, tried on 429/503/connection errors):
-# fallback_models=cerebras:gpt-oss-120b,gemini:gemini-2.0-flash
-
-# Provider overrides (optional — built-in defaults work without these):
-# provider.ollama.base_url=http://localhost:11434/v1
+# Provider config (base_url is built-in, only set api_key + model):
+provider.ollama.model=qwen14b-tooluse-v3
 # provider.ollama.api_key=ollama
-# provider.openrouter.api_key=sk-or-...
-# provider.openai.api_key=sk-...
-# provider.anthropic.api_key=sk-ant-...
-# provider.gemini.api_key=AIza...
+
+# Example: Cerebras
+# default_provider=cerebras
+# provider.cerebras.model=gpt-oss-120b
 # provider.cerebras.api_key=csk-...
-# provider.deepseek.api_key=sk-...
-# provider.groq.api_key=gsk_...
-# provider.mistral.api_key=...
-# provider.moonshot.api_key=sk-...
-# provider.qwen.api_key=sk-...
-# provider.ollama-cloud.api_key=...
-# provider.copilot.api_key=ghp_...
+
+# Example: Groq
+# default_provider=groq
+# provider.groq.model=llama-3.3-70b-versatile
+# provider.groq.api_key=gsk-...
+
+# Example: OpenRouter
+# default_provider=openrouter
+# provider.openrouter.model=anthropic/claude-sonnet-4
+# provider.openrouter.api_key=sk-or-...
 
 timeout_seconds=120
 

@@ -533,38 +533,37 @@ run_setup_wizard() {
     fi
     new_paths="${new_paths:-$current_paths}"
 
-    # model_base_url
-    local current_url=$(grep '^model_base_url=' "$config" 2>/dev/null | cut -d= -f2- || echo "http://localhost:11434/v1")
-    local new_url
+    # provider name
+    local current_provider=$(grep '^default_provider=' "$config" 2>/dev/null | cut -d= -f2- || echo "ollama")
+    local new_provider
     if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "Model base URL [$current_url]: " new_url || new_url=""
+        read -r -p "Provider name (ollama, openrouter, openai, groq, cerebras, etc.) [$current_provider]: " new_provider || new_provider=""
     elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "Model base URL [%s]: " "$current_url" > /dev/tty
-        IFS= read -r new_url < /dev/tty || new_url=""
+        printf "Provider name [%s]: " "$current_provider" > /dev/tty
+        IFS= read -r new_provider < /dev/tty || new_provider=""
     fi
-    new_url="${new_url:-$current_url}"
+    new_provider="${new_provider:-$current_provider}"
 
-    # model_name
-    local current_name=$(grep '^model_name=' "$config" 2>/dev/null | cut -d= -f2- || echo "qwen14b-tooluse-v3")
-    local new_name
+    # model name
+    local current_model=$(grep "^provider\.${new_provider}\.model=" "$config" 2>/dev/null | cut -d= -f2- || echo "qwen14b-tooluse-v3")
+    local new_model
     if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "Model name [$current_name]: " new_name || new_name=""
+        read -r -p "Model name [$current_model]: " new_model || new_model=""
     elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "Model name [%s]: " "$current_name" > /dev/tty
-        IFS= read -r new_name < /dev/tty || new_name=""
+        printf "Model name [%s]: " "$current_model" > /dev/tty
+        IFS= read -r new_model < /dev/tty || new_model=""
     fi
-    new_name="${new_name:-$current_name}"
+    new_model="${new_model:-$current_model}"
 
     # api_key
-    local current_key=$(grep '^api_key=' "$config" 2>/dev/null | cut -d= -f2- || echo "ollama")
+    local current_key=$(grep "^provider\.${new_provider}\.api_key=" "$config" 2>/dev/null | cut -d= -f2- || echo "")
     local new_key
     if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "API key [$current_key]: " new_key || new_key=""
+        read -r -p "API key for $new_provider [press Enter to skip]: " new_key || new_key=""
     elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "API key [%s]: " "$current_key" > /dev/tty
+        printf "API key for %s [press Enter to skip]: " "$new_provider" > /dev/tty
         IFS= read -r new_key < /dev/tty || new_key=""
     fi
-    new_key="${new_key:-$current_key}"
 
     # web search URL (optional)
     local current_search=$(grep '^search_base_url=' "$config" 2>/dev/null | cut -d= -f2- || echo "")
@@ -577,11 +576,37 @@ run_setup_wizard() {
         IFS= read -r new_search < /dev/tty || new_search=""
     fi
 
+    # Resolve base_url from built-in providers
+    local base_url=""
+    case "$new_provider" in
+        ollama)      base_url="http://localhost:11434/v1" ;;
+        openrouter)  base_url="https://openrouter.ai/api/v1" ;;
+        openai)      base_url="https://api.openai.com/v1" ;;
+        anthropic)   base_url="https://api.anthropic.com/v1" ;;
+        gemini)      base_url="https://generativelanguage.googleapis.com/v1beta/openai/" ;;
+        cerebras)    base_url="https://api.cerebras.ai/v1" ;;
+        deepseek)    base_url="https://api.deepseek.com/v1" ;;
+        groq)        base_url="https://api.groq.com/openai/v1" ;;
+        mistral)     base_url="https://api.mistral.ai/v1" ;;
+        moonshot)    base_url="https://api.moonshot.ai/v1" ;;
+        qwen)        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1" ;;
+        ollama-cloud) base_url="https://ollama.com/v1" ;;
+        copilot)     base_url="https://api.githubcopilot.com" ;;
+        *)           base_url=$(grep "^provider\.${new_provider}\.base_url=" "$config" 2>/dev/null | cut -d= -f2- || echo "http://localhost:11434/v1") ;;
+    esac
+
     # Write back
     sed -i.bak "s|^allowed_paths=.*|allowed_paths=$new_paths|" "$config"
-    sed -i.bak "s|^model_base_url=.*|model_base_url=$new_url|" "$config"
-    sed -i.bak "s|^model_name=.*|model_name=$new_name|" "$config"
-    sed -i.bak "s|^api_key=.*|api_key=$new_key|" "$config"
+    sed -i.bak "s|^default_provider=.*|default_provider=$new_provider|" "$config"
+    grep -q "^default_provider=" "$config" || echo "default_provider=$new_provider" >> "$config"
+    sed -i.bak "s|^provider\.${new_provider}\.base_url=.*|provider.${new_provider}.base_url=$base_url|" "$config"
+    grep -q "^provider\.${new_provider}\.base_url=" "$config" || echo "provider.${new_provider}.base_url=$base_url" >> "$config"
+    sed -i.bak "s|^provider\.${new_provider}\.model=.*|provider.${new_provider}.model=$new_model|" "$config"
+    grep -q "^provider\.${new_provider}\.model=" "$config" || echo "provider.${new_provider}.model=$new_model" >> "$config"
+    if [ -n "$new_key" ]; then
+        sed -i.bak "s|^provider\.${new_provider}\.api_key=.*|provider.${new_provider}.api_key=$new_key|" "$config"
+        grep -q "^provider\.${new_provider}\.api_key=" "$config" || echo "provider.${new_provider}.api_key=$new_key" >> "$config"
+    fi
     if [ -n "$new_search" ]; then
         sed -i.bak "s|^#*\s*search_base_url=.*|search_base_url=$new_search|" "$config"
     fi
