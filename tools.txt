@@ -15,3 +15,4 @@ git_push|Push the current branch to origin. Only use when the user asked you to 
 git_create_pr|Open a pull request with the gh CLI. Only use when the user asked for a PR.|mode=shell|args=title,body|command=gh pr create --title "{title}" --body "{body}"|timeout=120
 schedule_task|Schedule this agent to run a task periodically, or list/remove schedules. action is list, add, or remove; schedule is 5 cron fields (e.g. "0 9 * * *"); task is the query to run.|mode=cron|args=action,schedule,task|timeout=20
 run_sandboxed|Run a Python snippet inside an isolated Docker container (no network, memory-capped, auto-removed). Use for untrusted or risky code instead of execute_shell.|mode=docker|args=code|timeout=90
+browse_page|Load a web page in a real headless browser and return its text. Handles JavaScript-rendered pages that curl cannot.|mode=browser|args=url|timeout=60

@@ -19,3 +19,10 @@ requests>=2.31.0
 
 # Testing (dev)
 pytest>=7.0
+
+# --- Optional extras (the harness runs fine without these) ---
+# browse_page tool — real headless browsing of JS-rendered pages:
+#   pip install playwright && playwright install chromium
+# playwright>=1.40.0
+#
+# run_sandboxed tool — needs the Docker daemon running (no pip package).

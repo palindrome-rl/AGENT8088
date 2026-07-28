@@ -79,3 +79,20 @@ def test_docker_quotes_code_safely(engine, monkeypatch):
     # The whole snippet must be a single shell-quoted argument.
     assert "rm -rf /" in seen["cmd"]
     assert seen["cmd"].count("python -c ") == 1
+
+
+def test_browser_missing_is_graceful(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_playwright_available", lambda: False)
+    out = engine._exec_browser({"url": "https://example.com"})
+    assert "Playwright is not installed" in out
+    assert "pip install playwright" in out
+
+
+def test_browser_enforces_ssrf(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_playwright_available", lambda: True)
+    out = engine._exec_browser({"url": "http://127.0.0.1/admin"})
+    assert "Blocked" in out
+
+
+def test_browser_requires_url(engine):
+    assert "requires 'url'" in engine._exec_browser({})

@@ -687,6 +687,55 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Browser — real page rendering via Playwright (optional dependency)
+# ---------------------------------------------------------------------------
+BROWSER_TIMEOUT_MS = int(APP_CONFIG.get("browser_timeout_ms", "20000"))
+
+
+def _playwright_available() -> bool:
+    try:
+        import playwright.sync_api  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _exec_browser(args: dict) -> str:
+    """Load a page in a headless browser and return its text, optionally scoped to
+    a CSS selector. Handles JS-rendered pages that curl cannot. SSRF-guarded.
+    Degrades with install instructions when Playwright isn't present."""
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return "Error: browser tool requires 'url'."
+    blocked = _ssrf_check(url)
+    if blocked:
+        return blocked
+    if not _playwright_available():
+        return ("Playwright is not installed. Install it with:\n"
+                "  pip install playwright && playwright install chromium\n"
+                "Until then, use web_search or get_page_title instead.")
+    selector = str(args.get("selector") or "").strip()
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(url, timeout=BROWSER_TIMEOUT_MS, wait_until="domcontentloaded")
+                if selector:
+                    text = "\n".join(el.inner_text() for el in page.query_selector_all(selector))
+                else:
+                    text = page.inner_text("body")
+                title = page.title()
+            finally:
+                browser.close()
+    except Exception as e:
+        return f"Browser error: {e}"
+    text = re.sub(r'\n{3,}', '\n\n', (text or "").strip())
+    return f"Title: {title}\n\n{text[:5000]}"
+
+
+# ---------------------------------------------------------------------------
 # Sandboxed execution — run untrusted code in a throwaway Docker container
 # ---------------------------------------------------------------------------
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
@@ -785,6 +834,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "docker":
         return _exec_docker(args)
+
+    if mode == "browser":
+        return _exec_browser(args)
 
     if mode == "read_text":
         path_arg = spec.get("path_arg") or "filename"
