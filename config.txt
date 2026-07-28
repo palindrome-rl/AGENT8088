@@ -40,6 +40,23 @@ gemma_model_name=gemma-4-12B-it-Q4_K_M.gguf
 # provider.together.api_key=...
 # provider.ollama.base_url=http://localhost:11434/v1
 # provider.ollama.model=qwen14b-tooluse-v3
+#
+# Universal profiles (Claude, Gemini, OpenRouter, local endpoints, etc.) use LiteLLM.
+# Keep credentials in your shell or .env, never in this file:
+# provider.claude.api_mode=litellm
+# provider.claude.model=anthropic/claude-sonnet-4-5-20250929
+# provider.claude.api_key_env=ANTHROPIC_API_KEY
+# provider.gemini.api_mode=litellm
+# provider.gemini.model=gemini/gemini-2.5-pro
+# provider.gemini.api_key_env=GEMINI_API_KEY
+# provider.openrouter.api_mode=litellm
+# provider.openrouter.model=openrouter/anthropic/claude-sonnet-4-5
+# provider.openrouter.api_key_env=OPENROUTER_API_KEY
+# provider.local.api_mode=litellm
+# provider.local.model=ollama/qwen3
+# provider.local.base_url=http://localhost:11434
+#
+# In a session: /model claude  or  /model claude:anthropic/claude-opus-4-6
 
 # --- search --- (confirmed: SearXNG on IRIS, port 8888, /search path)
 # Ends at "q=" with no placeholder; tools.txt appends {query_q}&format=json.

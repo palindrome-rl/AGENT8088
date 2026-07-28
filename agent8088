@@ -107,9 +107,9 @@ BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
 # ---------------------------------------------------------------------------
 def load_providers(config: dict) -> dict:
     """Parse `provider.<name>.<field>` keys from config into a registry.
-    Fields: base_url (required), model, api_key. Every provider is reached through
-    the OpenAI-compatible API, which covers OpenAI, OpenRouter, Groq, Together,
-    llama-server, Ollama, and most hosted gateways (20+ providers)."""
+    Fields: model, api_mode, base_url, api_key_env. OpenAI mode needs a base URL;
+    LiteLLM mode also supports native provider identifiers such as Anthropic and
+    Gemini without one. Credentials should use api_key_env, not api_key."""
     provs = {}
     for key, value in config.items():
         if not key.startswith("provider."):
@@ -119,11 +119,21 @@ def load_providers(config: dict) -> dict:
             continue
         _, name, field = parts
         provs.setdefault(name, {})[field] = value
-    return {n: p for n, p in provs.items() if p.get("base_url")}
+    return {
+        n: p for n, p in provs.items()
+        if p.get("base_url") or (p.get("api_mode", "").lower() == "litellm" and p.get("model"))
+    }
 
 
 PROVIDERS = load_providers(APP_CONFIG)
 DEFAULT_PROVIDER = APP_CONFIG.get("default_provider", "")
+ACTIVE_PROVIDER = ""
+
+
+def _provider_api_key(provider: dict) -> str:
+    """Resolve a provider key without requiring secrets in config files."""
+    env_name = provider.get("api_key_env", "").strip()
+    return os.environ.get(env_name, "") if env_name else provider.get("api_key", "")
 
 
 def get_client(provider: str = None):
@@ -135,8 +145,14 @@ def get_client(provider: str = None):
 
     if name and name in PROVIDERS:
         p = PROVIDERS[name]
+        if p.get("api_mode", "openai").lower() == "litellm":
+            return {
+                "api_mode": "litellm",
+                "api_base": p.get("base_url", ""),
+                "api_key": _provider_api_key(p),
+            }, p.get("model", MODEL_NAME)
         return OpenAI(base_url=p["base_url"],
-                      api_key=p.get("api_key", "none"),
+                      api_key=_provider_api_key(p) or "none",
                       timeout=TIMEOUT_SECONDS), p.get("model", MODEL_NAME)
 
     if name:
@@ -155,6 +171,18 @@ def get_client(provider: str = None):
 client, MODEL_NAME = get_client()
 
 
+def activate_model(provider: str = "", model: str = ""):
+    """Select a configured provider and optional model for the current session."""
+    global client, MODEL_NAME, ACTIVE_PROVIDER
+    if provider:
+        client, default_model = get_client(provider)
+        ACTIVE_PROVIDER = provider
+        MODEL_NAME = model or default_model
+    elif model:
+        MODEL_NAME = model
+    return client, MODEL_NAME
+
+
 def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1, on_token=None):
     full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
     # NOTE: Ollama (current backend) rejects the OpenAI "tools" param, so the model emits
@@ -164,6 +192,32 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         penalties["frequency_penalty"] = FREQUENCY_PENALTY
     if PRESENCE_PENALTY:
         penalties["presence_penalty"] = PRESENCE_PENALTY
+    if isinstance(client, dict) and client.get("api_mode") == "litellm":
+        try:
+            from litellm import completion
+        except ImportError as e:
+            raise RuntimeError("LiteLLM provider selected; run `pip install litellm`.") from e
+        kwargs = {
+            "model": MODEL_NAME, "messages": full_messages, "max_tokens": max_tokens,
+            "temperature": temperature, "stream": on_token is not None, **penalties,
+        }
+        if client.get("api_base"):
+            kwargs["api_base"] = client["api_base"]
+        if client.get("api_key"):
+            kwargs["api_key"] = client["api_key"]
+        response = completion(**kwargs)
+        if on_token is None:
+            return response
+        collected = []
+        for chunk in response:
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                on_token("reasoning", reasoning)
+            if delta.content:
+                on_token("content", delta.content)
+                collected.append(delta.content)
+        return _build_response("".join(collected))
     if on_token is None:
         # Non-streaming path — unchanged (old REPL, benchmark, one-shot mode)
         return client.chat.completions.create(
@@ -608,6 +662,7 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
             "name": name,
             "description": meta.get("description", default_tool_description(name)),
             "version": meta.get("version", "0"),
+            "category": meta.get("category", "general"),
             "path": str(pkg),
             "prose": body.strip(),
             "tools": tools,
@@ -627,6 +682,19 @@ def merge_skill_tools(core: dict, skills: dict) -> dict:
     return merged
 
 
+def render_skill_docs(skills: dict) -> str:
+    """Make installed skill playbooks available to the agent, not just the CLI UI."""
+    if not skills:
+        return ""
+    lines = ["", "## Installed skills"]
+    for name, skill in skills.items():
+        prose = (skill.get("prose") or "").strip()
+        lines.append(f"\n### {name}\n{skill['description']}")
+        if prose:
+            lines.append(prose)
+    return "\n".join(lines)
+
+
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
 if SKILL_PACKAGES:
     TOOL_SPECS = merge_skill_tools(TOOL_SPECS, SKILL_PACKAGES)
@@ -635,7 +703,8 @@ if SKILL_PACKAGES:
     TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
 
 
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS) + render_persona(USER_FILE)
+SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
+                 + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE))
 
 
 # ---------------------------------------------------------------------------

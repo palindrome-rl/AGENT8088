@@ -3,8 +3,8 @@
 Everything added to the Agent8088 harness in this development cycle, with the exact
 commands to use each one.
 
-**At a glance:** 8 → 20 tools · 0 → 4 sub-agents · 0 → 84 unit tests + 92 functional
-checks · 1 → unlimited model providers · 7 new security guardrails.
+**At a glance:** 8 → 20 tools · 0 → 4 sub-agents · 95 automated checks · 1 →
+unlimited model providers · 7 new security guardrails.
 
 | # | Feature | Use it with |
 |---|---|---|
@@ -30,6 +30,13 @@ checks · 1 → unlimited model providers · 7 new security guardrails.
 | 20 | Skill marketplace | `skills_installed/`, `/skills` |
 | 21 | Test + verification suites | `pytest`, `scripts/verify_features.py` |
 | 22 | Web search overhaul (jq filters, Tavily/Exa, SSRF allowlist) | `web_search`, `web_search_tavily`, `web_search_exa` |
+| 23 | Classic AGENT8088 UI | `python agent8088_cli.py` |
+| 24 | Responsive terminal branding | automatic at narrow widths |
+| 25 | Live slash-command suggestions | type `/`, then type or use `Tab` |
+| 26 | Default skill playbooks | `/skills`, `/skills <name>` |
+| 27 | Named local sessions + compaction | `/new`, `/resume`, `/compact` |
+| 28 | Health and execution-detail controls | `/doctor`, `/think`, `/verbose`, `/usage` |
+| 29 | Universal provider profiles | `/model`, `--model-setup` |
 
 ---
 
@@ -511,21 +518,115 @@ than in `tools.txt`, where `|` is the field separator.
 
 ---
 
+# Part 5 — Classic CLI & agent UX
+
+## 23. Classic AGENT8088 interface
+
+`python agent8088_cli.py` is now the default interactive experience. The temporary
+Textual/Toad interface was removed so there is one complete CLI rather than two
+incomplete front ends. It uses the AGENT8088 masthead, the supplied Palindrome
+Research Labs artwork, and a consistent blue terminal palette.
+
+At less than 70 columns the interface switches to a compact status line; at less
+than 55 columns it uses a one-line AGENT8088 masthead instead of clipping artwork.
+
+## 24. Live command discovery
+
+In an interactive terminal, `/` opens a live command menu. Filtering works as you
+type, and `Tab` accepts a suggestion. It also completes agents, model profiles, and
+tools after their respective commands. A readline fallback retains ordinary Tab
+completion when `prompt_toolkit` is unavailable.
+
+## 25. Default skill playbooks
+
+Five no-dependency skills are installed by default: `plan`, `systematic-debugging`,
+`test-driven-development`, `github-code-review`, and `documentation-writing`.
+Their categorized instructions are included in the agent's system prompt, not merely
+displayed in the UI.
+
+```bash
+/skills                                # list categories, state, and supplied tools
+/skills plan                           # read one playbook
+/skills disable plan                   # disable it for this named session
+/skills enable plan                    # enable it again
+```
+
+Disabled skills are removed from both the prompt and the available tool set for that
+session.
+
+## 26. Named sessions and context compaction
+
+Sessions are local JSON files under `.agent8088/sessions/`. Named sessions persist
+messages, UI preferences, trace state, and enabled skills after each completed turn.
+
+```bash
+/new research_notes                    # start a named session
+/sessions                              # list saved sessions
+/resume research_notes                 # restore one
+/reset                                 # clear its context but retain the name
+/compact                               # summarize all but the newest 6 messages
+/compact 10                            # keep the newest 10 messages
+```
+
+`/compact` asks the configured model for a concise factual summary and retains recent
+turns unchanged. If the model call fails, the session is left untouched.
+
+## 27. Health and execution-detail controls
+
+```bash
+/doctor                                # model, endpoint TCP reachability, auth/config status
+/think on|off                          # safe alias for the masked reasoning display
+/verbose on|off|full                   # tool activity detail; full also enables trace capture
+/trace on|off                          # capture and print the structured trace
+/usage off|tokens|full                 # choose the post-turn usage summary
+/status                                # compact dashboard for the active session
+```
+
+`/doctor` performs only a DNS/TCP reachability check; it does not send a model prompt
+or reveal credentials.
+
+## 28. Universal provider profiles
+
+Provider profiles support both OpenAI-compatible endpoints and LiteLLM-native model
+identifiers, allowing providers such as Claude, Gemini, OpenRouter, Ollama, and local
+OpenAI-compatible servers from the same `/model` command. Credentials are read from
+an environment variable named by `api_key_env`, not saved into a profile.
+
+```bash
+python agent8088_cli.py --model-setup
+/model                                 # list configured profiles
+/model <profile>
+/model <profile>:<model>
+```
+
+---
+
 # Complete command reference
 
 ```
 <text>                    Chat — runs the full agent loop
 /agent [name] [task]      Run a sub-agent (no args = arrow-key picker)
 /agents                   List sub-agent profiles
-/skills                   List installed skill packages
+/skills [name|enable|disable]
+                          List, inspect, or toggle skill packages
 /image <path> [question]  Analyze a screenshot/diagram
 /model [provider]         List or switch LLM provider
 /reasoning [on|off]       Show/hide thinking (hidden by default)
+/think [on|off]           Alias for /reasoning
+/verbose [on|off|full]    Control tool activity detail
+/usage [off|tokens|full]  Control post-turn usage summaries
 /tools                    List every tool with args, mode, description
 /tool <name> <args>       Invoke one tool directly (JSON or key=value)
 /plan <steps>             Run the plan-executor
 /raw <text>               One raw model call (content, reasoning, tool_calls)
 /config                   Active configuration
+/doctor                   Check endpoint reachability and local capability state
+/status                   Active model, context, skills, and UI preferences
+/new <name>               Create a named persistent session
+/sessions                 List named sessions
+/resume <name>            Load a named session
+/reset                    Clear the active session while retaining its name
+/compact [keep]           Summarize older turns and retain recent messages
 /system                   Full system prompt
 /history                  Current conversation
 /trace [on|off]           Capture/print the step-by-step JSON trace
@@ -587,7 +688,8 @@ ssrf_allow_private=0            # 1 opens the whole private network (blunt; pref
 default_provider=openrouter
 provider.<name>.base_url=...
 provider.<name>.model=...
-provider.<name>.api_key=...
+provider.<name>.api_mode=openai      # or litellm
+provider.<name>.api_key_env=...      # environment variable; do not commit secrets
 
 # sub-agents / skills / persona
 agents_dir=agents

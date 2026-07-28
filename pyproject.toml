@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "agent8088"
 version = "0.1.0"
 description = "Agent8088 - Local AI Assistant"
-dependencies = []
+dependencies = ["rich>=13.0.0", "litellm>=1.0.0", "Pillow>=10.0.0", "prompt_toolkit>=3.0.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]

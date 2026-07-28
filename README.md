@@ -123,6 +123,35 @@ $ ./agent8088
 Agent8088> list files in current directory
 ```
 
+### Classic CLI
+
+```bash
+python agent8088_cli.py
+```
+
+The classic Rich REPL provides chat, slash commands, live command suggestions, tool
+activity, and model profiles.
+
+`/status` shows the active model, context usage, tool count, installed skills, and
+session controls. `/doctor` checks the selected endpoint without sending a model
+prompt. Use `/new <name>`, `/sessions`, `/resume <name>`, and `/reset` for named
+local sessions; `/compact [keep]` summarizes older turns. `/think`, `/verbose`,
+`/trace`, and `/usage` control execution detail. Five default, no-dependency skills are bundled under
+`skills_installed/`: planning, systematic debugging, test-driven development, code
+review, and documentation writing. Use `/skills <name>` to inspect a playbook, or
+`/skills enable|disable <name>` to change the active session.
+
+### Model profiles
+
+Agent8088 supports OpenAI-compatible endpoints directly and 100+ provider/model
+identifiers through LiteLLM. Add named profiles to the active `config.txt`, keep keys
+in environment variables, then switch in-session with `/model <profile>` or
+`/model <profile>:<model>`. Examples for Claude, Gemini, OpenRouter, and Ollama are
+included in `config.txt`.
+
+Run `python agent8088_cli.py --model-setup` to save a new profile. Like Hermes,
+setup persists profiles while `/model` only switches among profiles already configured.
+
 ### Python API
 
 ```python
