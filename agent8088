@@ -40,7 +40,9 @@ APP_CONFIG = load_simple_config(CONFIG_PATH)
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", str(APP_DIR))).expanduser().resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://192.168.1.10:8888/search?q={query}")
+# Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
+# {query} here would produce a doubled placeholder in the final URL.)
+SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/search?q=")
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
 SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
@@ -51,6 +53,16 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
+
+# Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
+# command references must exist there too. Without this, a missing config key left
+# `{search_base_url}` literal in the URL and web_search failed with the confusing
+# "Blocked: scheme '' is not allowed" from the SSRF guard.
+APP_CONFIG.setdefault("search_base_url", SEARCH_BASE_URL)
+APP_CONFIG.setdefault("gemma_base_url", GEMMA_BASE_URL)
+APP_CONFIG.setdefault("model_base_url", MODEL_BASE_URL)
+APP_CONFIG.setdefault("model_name", MODEL_NAME)
+APP_CONFIG.setdefault("project_root", str(PROJECT_ROOT))
 
 # Anti-repetition sampling. Small local models can spiral into "I will not use any X…"
 # loops; these penalties curb that. Default 0.0 = no-op (behaviour unchanged) — raise
@@ -850,6 +862,18 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     import shlex
 
     url = _safe_format(spec.get("url") or "{url}", args)
+    # Diagnose an unresolved {placeholder} BEFORE the SSRF guard sees it — otherwise a
+    # missing config key or a forgotten argument surfaces as the baffling
+    # "Blocked: scheme '' is not allowed" instead of naming what's missing.
+    unresolved = _PLACEHOLDER_RE.search(url)
+    if unresolved:
+        key = unresolved.group(1)
+        base = key[:-2] if key.endswith("_q") else key   # {query_q} -> query
+        tool_args = spec.get("args") or []
+        hint = (f"pass {base}=<value> to the tool" if base in tool_args
+                else f"set {key} in {CONFIG_PATH.name}")
+        return (f"'{spec['name']}' has an unresolved placeholder {{{key}}} in its URL — "
+                f"{hint}.")
     blocked = _ssrf_check(url)
     if blocked:
         return blocked

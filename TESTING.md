@@ -2,7 +2,7 @@
 
 Two suites, both runnable with no model backend and no network.
 
-## 1. Unit tests (fast, hermetic — 80 tests)
+## 1. Unit tests (fast, hermetic — 84 tests)
 
 ```bash
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
@@ -63,6 +63,7 @@ python agent8088_cli.py
 | `/tool browse_page url=https://example.com` | live page text |
 | `/tool git_status` | real git output |
 | `/tool web_search query="python 3.13"` | clean `• title / url / snippet` list |
+| `/tool web_search` (no arg) | names the missing arg: `pass query=<value>` |
 | `/tool web_search_tavily query="..."` | needs `tavily_api_key`, else a clear message |
 | `/tool schedule_task action=list` | your agent8088 cron entries |
 | `Tab` after `/agent `, `/tool `, `/model ` | autocompletion |

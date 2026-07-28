@@ -90,3 +90,37 @@ def test_search_tools_declared(engine):
         assert name in engine.TOOL_NAMES
     assert engine.TOOL_SPECS["web_search"]["mode"] == "http_get"
     assert engine.TOOL_SPECS["web_search_tavily"]["mode"] == "http_post"
+
+
+def test_config_defaults_are_visible_to_templates(engine):
+    # Regression: tool URL templates interpolate from APP_CONFIG, so engine
+    # defaults must be seeded there. Otherwise {search_base_url} stayed literal
+    # and web_search failed with "Blocked: scheme '' is not allowed".
+    assert "search_base_url" in engine.APP_CONFIG
+    url = engine._safe_format(engine.TOOL_SPECS["web_search"]["url"], {"query": "x"})
+    assert url.startswith(("http://", "https://")), url
+    assert "{" not in url, f"unresolved placeholder in {url}"
+
+
+def test_default_search_base_url_has_no_trailing_placeholder(engine):
+    # tools.txt appends {query_q}; a trailing {query} in the base would double it.
+    assert "{query}" not in engine.SEARCH_BASE_URL
+
+
+def test_unresolved_placeholder_names_the_missing_arg(engine):
+    spec = {"name": "web_search", "mode": "http_get", "args": ["query"],
+            "url": "http://example.com/s?q={query_q}",
+            "headers": "", "body": "", "filter": ""}
+    out = engine._exec_http("http_get", spec, {}, 10)
+    assert "unresolved placeholder" in out
+    assert "pass query=" in out          # not "query_q="
+    assert "scheme" not in out           # not the confusing SSRF message
+
+
+def test_unresolved_config_key_points_at_config_file(engine):
+    spec = {"name": "t", "mode": "http_get", "args": ["query"],
+            "url": "{some_missing_base}search?q={query_q}",
+            "headers": "", "body": "", "filter": ""}
+    out = engine._exec_http("http_get", spec, {"query": "x"}, 10)
+    assert "some_missing_base" in out
+    assert "config" in out.lower()

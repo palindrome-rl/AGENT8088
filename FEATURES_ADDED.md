@@ -3,7 +3,7 @@
 Everything added to the Agent8088 harness in this development cycle, with the exact
 commands to use each one.
 
-**At a glance:** 8 → 20 tools · 0 → 4 sub-agents · 0 → 80 unit tests + 92 functional
+**At a glance:** 8 → 20 tools · 0 → 4 sub-agents · 0 → 84 unit tests + 92 functional
 checks · 1 → unlimited model providers · 7 new security guardrails.
 
 | # | Feature | Use it with |
@@ -426,7 +426,7 @@ Available modes for package tools: `shell`, `http_get`, `read_text`, `write_text
 
 ## 21. Test + verification suites
 
-**80 unit tests** (hermetic — no model backend, no network):
+**84 unit tests** (hermetic — no model backend, no network):
 
 ```bash
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
@@ -498,6 +498,12 @@ Supports `host` or `host:port`. Verified: `192.168.1.10:8888` allowed,
   turned "no output" into `✓ Command completed`, which read as *success* to the model.
   HTTP modes now say `No response from <host> — unreachable or returned nothing`, so a
   dead endpoint is never mistaken for "no results".
+- **Config defaults reach templates** — tool URLs interpolate from `APP_CONFIG`, but
+  engine defaults lived only in Python constants. A missing `search_base_url` left
+  `{search_base_url}` literal in the URL, which surfaced as the baffling
+  `Blocked: scheme '' is not allowed (only http/https)`. Defaults are now seeded into
+  `APP_CONFIG`, and an unresolved placeholder reports itself directly:
+  `'web_search' has an unresolved placeholder {query_q} in its URL — pass query=<value>`.
 
 Because `headers`, `body`, and `filter` values are full of `|` and `,`, they are set in
 `config.txt` (`tool_headers.<name>`, `tool_body.<name>`, `tool_filter.<name>`) rather
