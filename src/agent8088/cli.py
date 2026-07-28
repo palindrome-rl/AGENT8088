@@ -604,9 +604,46 @@ def cmd_clear(_):
     console.print("[green]context cleared[/green]")
 
 
+def cmd_models(rest):
+    """List available models from the active provider (or a specified one).
+    Usage: /models [provider_name]"""
+    from agent8088.providers import list_models, list_providers, get_client_for, PROVIDERS
+    from InquirerPy import inquirer
+    provider_name = rest.strip()
+    if not provider_name:
+        provider_name = getattr(A, "MODEL_REF", "ollama").split(":")[0] if ":" in getattr(A, "MODEL_REF", "") else "ollama"
+    if provider_name not in PROVIDERS:
+        console.print(f"[red]Unknown provider:[/red] {provider_name}")
+        console.print(f"Available: {', '.join(list_providers())}")
+        return
+    console.print(f"[cyan]Fetching models from {provider_name}...[/cyan]")
+    try:
+        client, _ = get_client_for(f"{provider_name}:", timeout=15)
+        models = list_models(provider_name, client=client)
+    except Exception as e:
+        console.print(f"[red]Could not fetch models:[/red] {e}")
+        return
+    if not models:
+        console.print("[yellow]No models found.[/yellow]")
+        return
+    selected = inquirer.fuzzy(
+        message=f"Select a model from {provider_name}:",
+        choices=models,
+        max_height="70%",
+    ).execute()
+    if selected:
+        model_ref = f"{provider_name}:{selected}"
+        try:
+            A.client, A.MODEL_NAME = get_client_for(model_ref, timeout=A.TIMEOUT_SECONDS)
+            A.MODEL_REF = model_ref
+            console.print(f"[green]switched[/green] → [cyan]{selected}[/cyan]  ({model_ref})")
+        except Exception as e:
+            console.print(f"[red]error:[/red] {e}")
+
+
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool, "plan": cmd_plan,
-    "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
+    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
     "history": cmd_history, "trace": cmd_trace, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "save": cmd_save, "clear": cmd_clear,
 }
@@ -676,9 +713,10 @@ def _run_update():
 
 
 def _run_setup():
-    """Interactive config wizard — prompt for model endpoint, write to config.txt."""
+    """Interactive config wizard with searchable provider + model picker."""
     import re as _re
-    from agent8088.providers import list_providers
+    from agent8088.providers import list_providers, list_models, get_client_for, PROVIDERS
+    from InquirerPy import inquirer
     home = _agent8088_home()
     config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
@@ -689,20 +727,53 @@ def _run_setup():
     def _current(key):
         m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
         return m.group(1).strip() if m else ""
-    print("Agent8088 setup")
-    print("  (Press Enter to keep the current value in brackets)\n")
+    print("Agent8088 setup\n")
+    # 1. Working directory
     cur_paths = _current("allowed_paths") or "~"
-    paths = input(f"Working directory [{cur_paths}]: ").strip() or cur_paths
+    paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
+    # 2. Provider picker (fuzzy searchable)
+    providers = list_providers()
     cur_model = _current("model") or "ollama:qwen14b-tooluse-v3"
-    print(f"Providers: {', '.join(list_providers())}")
-    provider = input(f"Provider (e.g. ollama, openrouter, openai) [{cur_model.split(':')[0]}]: ").strip() or cur_model.split(":")[0]
-    cur_name = cur_model.split(":", 1)[-1] if ":" in cur_model else cur_model
-    name = input(f"Model name [{cur_name}]: ").strip() or cur_name
-    model_ref = f"{provider}:{name}"
+    cur_provider = cur_model.split(":")[0] if ":" in cur_model else "ollama"
+    provider_labels = {p: p for p in providers}
+    provider = inquirer.fuzzy(
+        message="Select model provider:",
+        choices=providers,
+        default=cur_provider,
+        max_height="70%",
+    ).execute()
+    # 3. API key
     cur_key = _current(f"provider.{provider}.api_key") or ""
-    key = input(f"API key for {provider} [{cur_key or 'press Enter to skip'}]: ").strip()
+    key = inquirer.text(
+        message=f"API key for {provider}:",
+        default=cur_key,
+        instruction="(press Enter to skip if not needed)",
+    ).execute()
+    # 4. Fetch models from provider + model picker
+    print(f"\nFetching models from {provider}...")
+    try:
+        client, _ = get_client_for(f"{provider}:", timeout=15)
+        models = list_models(provider, client=client)
+    except Exception:
+        from agent8088.providers import FALLBACK_MODELS
+        models = FALLBACK_MODELS.get(provider, ["unknown-model"])
+    if models:
+        model_name = inquirer.fuzzy(
+            message="Select model:",
+            choices=models,
+            max_height="70%",
+        ).execute()
+    else:
+        model_name = inquirer.text(message="Model name:").execute()
+    model_ref = f"{provider}:{model_name}"
+    # 5. Web search URL
     cur_search = _current("search_base_url")
-    search = input(f"Web search URL [{cur_search or 'disabled'}]: ").strip()
+    search = inquirer.text(
+        message="Web search URL (SearXNG):",
+        default=cur_search,
+        instruction="(press Enter to disable)",
+    ).execute()
+    # Write config
     content = _re.sub(r'^allowed_paths=.*', lambda _: f'allowed_paths={paths}', content, flags=_re.MULTILINE)
     content = _re.sub(r'^model=.*', lambda _: f'model={model_ref}', content, flags=_re.MULTILINE)
     if not _re.search(r'^model=', content, _re.MULTILINE):

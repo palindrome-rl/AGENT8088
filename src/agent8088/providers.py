@@ -76,3 +76,43 @@ def get_fallback_chain(config):
 def list_providers():
     """Return provider names sorted."""
     return sorted(PROVIDERS.keys())
+
+
+# Hardcoded fallback model lists per provider (used if /v1/models is unavailable)
+FALLBACK_MODELS = {
+    "ollama":       ["qwen14b-tooluse-v3", "llama3.3", "qwen2.5-coder:32b"],
+    "openrouter":   ["openrouter/auto", "anthropic/claude-sonnet-4", "openai/gpt-4o"],
+    "openai":       ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
+    "anthropic":    ["claude-sonnet-4-6", "claude-haiku-3-5", "claude-opus-4-6"],
+    "gemini":       ["gemini-2.0-flash", "gemini-2.5-pro", "gemini-1.5-flash"],
+    "cerebras":     ["gpt-oss-120b", "gemma-4-31b", "zai-glm-4.7"],
+    "deepseek":     ["deepseek-chat", "deepseek-reasoner"],
+    "groq":         ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+    "mistral":      ["mistral-small-latest", "mistral-large-latest", "mistral-medium-latest"],
+    "moonshot":     ["kimi-k2.6", "moonshot-v1-8k", "moonshot-v1-32k"],
+    "qwen":         ["qwen-plus", "qwen-max", "qwen-turbo"],
+    "ollama-cloud": ["gpt-oss:120b", "qwen3:14b", "llama3.3"],
+    "copilot":      ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4"],
+}
+
+_cache = {}
+
+def list_models(provider_name, client=None, timeout=15):
+    """Fetch available models from provider's /v1/models endpoint.
+    Caches in memory for 1 hour. Falls back to FALLBACK_MODELS on error.
+    Returns a list of model ID strings."""
+    import time
+    now = time.time()
+    cached = _cache.get(provider_name)
+    if cached and (now - cached["ts"]) < 3600:
+        return cached["models"]
+    if client is None:
+        client, _ = get_client_for(f"{provider_name}:", timeout=timeout)
+    try:
+        resp = client.models.list()
+        models = [m.id for m in resp.data]
+        models.sort()
+        _cache[provider_name] = {"ts": now, "models": models}
+        return models
+    except Exception:
+        return list(FALLBACK_MODELS.get(provider_name, []))
