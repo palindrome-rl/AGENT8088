@@ -158,14 +158,16 @@ def banner():
         print(A.make_banner())
     else:
         console.print(A.PLAINTEXT_BANNER)
-    endpoint = A.APP_CONFIG.get("model_base_url", "?")
-    backend = "Gemma (fallback)" if os.environ.get("USE_GEMMA4") == "1" else "Ornith / custom"
+    # Resolve the active provider's base_url for the banner
+    active_provider = getattr(A, "MODEL_REF", "ollama").split(":")[0] if ":" in getattr(A, "MODEL_REF", "") else "ollama"
+    provider_info = A.providers.PROVIDERS.get(active_provider, {})
+    endpoint = provider_info.get("base_url", A.APP_CONFIG.get("model_base_url", "?"))
     tbl = Table.grid(padding=(0, 2))
     tbl.add_column(justify="right", style="cyan")
     tbl.add_column(style="white")
     tbl.add_row("Model", str(A.MODEL_NAME))
     tbl.add_row("Provider", str(getattr(A, "MODEL_REF", "ollama")))
-    tbl.add_row("Endpoint", str(A.APP_CONFIG.get("provider.ollama.base_url", A.APP_CONFIG.get("model_base_url", "?"))))
+    tbl.add_row("Endpoint", str(endpoint))
     tbl.add_row("Tools", f"{len(A.TOOL_NAMES)} loaded  ·  " + ", ".join(sorted(A.TOOL_NAMES)))
     tbl.add_row("Temp", str(S.temperature))
     tbl.add_row("Max turns", str(S.max_turns))
@@ -538,13 +540,15 @@ def cmd_config(_):
     t = Table(title="Configuration", box=box.SIMPLE, title_style="bold cyan")
     t.add_column("Key", style="cyan")
     t.add_column("Value")
-    keys = ["model_base_url", "model_name", "timeout_seconds", "project_root",
-            "shell_cwd", "allowed_paths", "search_base_url", "gemma_base_url", "gemma_model_name"]
+    keys = ["model", "timeout_seconds", "allowed_paths", "search_base_url",
+            "no_prompt_paths", "prompt_paths", "blocked_paths"]
     for k in keys:
         v = A.APP_CONFIG.get(k, "—")
-        if k == "api_key":
-            v = "[hidden]"
         t.add_row(k, str(v))
+    active_provider = getattr(A, "MODEL_REF", "ollama").split(":")[0] if ":" in getattr(A, "MODEL_REF", "") else "ollama"
+    provider_info = A.providers.PROVIDERS.get(active_provider, {})
+    t.add_row("[dim]provider[/dim]", active_provider)
+    t.add_row("[dim]base_url[/dim]", str(provider_info.get("base_url", "?")))
     t.add_row("[dim]resolved model[/dim]", str(A.MODEL_NAME))
     console.print(t)
     console.print(f"[dim]config file: {os.environ.get('AGENT8088_CONFIG', str(APP_DIR / 'config.txt'))}[/dim]")
