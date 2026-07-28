@@ -3,16 +3,14 @@
 # your traces/outputs; (default) values match the code's built-in defaults you
 # were running on. Adjust anything that doesn't match your setup.
 
-# --- paths --- (confirmed: pwd test reported /home/amir/projects/agent8088)
-project_root=/home/amir/projects/agent8088
-shell_cwd=/home/amir/projects/agent8088
-tools_file=/home/amir/projects/agent8088/tools.txt
-system_file=/home/amir/projects/agent8088/system.md
-banner_file=/home/amir/projects/agent8088/banner.txt
+# --- paths ---
+# Left unset on purpose: every path defaults to the directory holding the
+# agent8088 script, so the harness works from any checkout on any machine.
+# Override only if your tools.txt / system.md / agents live somewhere else.
 
 # write_file / read_file are restricted to these paths.
-# (confirmed: your benchmark wrote into /tmp, so /tmp must be allowed)
-allowed_paths=/home/amir/projects/agent8088,/tmp
+# Relative entries resolve against project_root (the repo), not the shell's CWD.
+allowed_paths=.,/tmp
 
 # --- model (Ornith-35B on Reality) ---
 model_base_url=http://127.0.0.1:8080/v1

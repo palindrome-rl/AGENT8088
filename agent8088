@@ -59,8 +59,16 @@ CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
 FREQUENCY_PENALTY = float(APP_CONFIG.get("frequency_penalty", "0"))
 PRESENCE_PENALTY = float(APP_CONFIG.get("presence_penalty", "0"))
 
+def _resolve_allowed_path(raw: str) -> Path:
+    """Relative allowed_paths entries resolve against PROJECT_ROOT (the repo), not
+    the shell's CWD — so `allowed_paths=.,/tmp` means the same thing no matter
+    where the agent is launched from."""
+    p = Path(raw).expanduser()
+    return p.resolve() if p.is_absolute() else (PROJECT_ROOT / p).resolve()
+
+
 ALLOWED_PATHS = [
-    Path(p.strip()).expanduser().resolve()
+    _resolve_allowed_path(p.strip())
     for p in APP_CONFIG.get("allowed_paths", str(PROJECT_ROOT)).split(",")
     if p.strip()
 ]
