@@ -22,6 +22,25 @@ timeout_seconds=120
 gemma_base_url=http://localhost:8003/v1
 gemma_model_name=gemma-4-12B-it-Q4_K_M.gguf
 
+# --- providers (any OpenAI-compatible endpoint) ---
+# Switch at runtime with /model <name>, or AGENT8088_PROVIDER=<name>, or set
+# default_provider below. Uncomment and fill in the ones you use.
+# default_provider=openrouter
+# provider.openai.base_url=https://api.openai.com/v1
+# provider.openai.model=gpt-4o
+# provider.openai.api_key=sk-...
+# provider.openrouter.base_url=https://openrouter.ai/api/v1
+# provider.openrouter.model=anthropic/claude-3.5-sonnet
+# provider.openrouter.api_key=sk-or-...
+# provider.groq.base_url=https://api.groq.com/openai/v1
+# provider.groq.model=llama-3.3-70b-versatile
+# provider.groq.api_key=gsk_...
+# provider.together.base_url=https://api.together.xyz/v1
+# provider.together.model=meta-llama/Llama-3.3-70B-Instruct-Turbo
+# provider.together.api_key=...
+# provider.ollama.base_url=http://localhost:11434/v1
+# provider.ollama.model=qwen14b-tooluse-v3
+
 # --- search --- (confirmed: SearXNG on IRIS, port 8888, /search path)
 # Ends at "q=" with no placeholder; tools.txt appends {query_q}&format=json.
 search_base_url=http://192.168.1.10:8888/search?q=

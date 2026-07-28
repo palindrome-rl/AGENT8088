@@ -93,11 +93,49 @@ BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
 # ---------------------------------------------------------------------------
 # Model client.  USE_GEMMA4=1 switches to the Gemma server on Colossus.
 # ---------------------------------------------------------------------------
-def get_client():
-    if os.environ.get("USE_GEMMA4", "0") == "1":
+def load_providers(config: dict) -> dict:
+    """Parse `provider.<name>.<field>` keys from config into a registry.
+    Fields: base_url (required), model, api_key. Every provider is reached through
+    the OpenAI-compatible API, which covers OpenAI, OpenRouter, Groq, Together,
+    llama-server, Ollama, and most hosted gateways (20+ providers)."""
+    provs = {}
+    for key, value in config.items():
+        if not key.startswith("provider."):
+            continue
+        parts = key.split(".", 2)
+        if len(parts) != 3:
+            continue
+        _, name, field = parts
+        provs.setdefault(name, {})[field] = value
+    return {n: p for n, p in provs.items() if p.get("base_url")}
+
+
+PROVIDERS = load_providers(APP_CONFIG)
+DEFAULT_PROVIDER = APP_CONFIG.get("default_provider", "")
+
+
+def get_client(provider: str = None):
+    """Return (client, model_name) for a named provider.
+
+    Precedence: explicit arg > AGENT8088_PROVIDER env > config default_provider >
+    legacy USE_GEMMA4 toggle > the flat model_base_url/model_name settings."""
+    name = (provider or os.environ.get("AGENT8088_PROVIDER") or DEFAULT_PROVIDER or "").strip()
+
+    if name and name in PROVIDERS:
+        p = PROVIDERS[name]
+        return OpenAI(base_url=p["base_url"],
+                      api_key=p.get("api_key", "none"),
+                      timeout=TIMEOUT_SECONDS), p.get("model", MODEL_NAME)
+
+    if name:
+        print(f"[agent8088] Unknown provider '{name}' — using default. "
+              f"Known: {', '.join(sorted(PROVIDERS)) or '(none configured)'}")
+
+    if os.environ.get("USE_GEMMA4", "0") == "1":  # legacy toggle, still supported
         print(f"[agent8088] Using Gemma 4 on Colossus ({GEMMA_BASE_URL})")
         model = APP_CONFIG.get("gemma_model_name", "gemma-4-12B-it-Q4_K_M.gguf")
         return OpenAI(base_url=GEMMA_BASE_URL, api_key="sk-dummy"), model
+
     client = OpenAI(base_url=MODEL_BASE_URL, api_key=APP_CONFIG.get("api_key", "ollama"), timeout=TIMEOUT_SECONDS)
     return client, MODEL_NAME
 
@@ -1023,14 +1061,20 @@ def _strip_reasoning(text: str) -> str:
     return text.strip()
 
 
-# Secret values from config (api keys / tokens) — redacted from any tool output
-# or answer so `cat config.txt` / `env` etc. can't be used to exfiltrate them.
-_SECRET_VALUES = sorted(
-    {v for k, v in APP_CONFIG.items()
-     if any(s in k.lower() for s in ("key", "token", "secret", "password"))
-     and isinstance(v, str) and len(v) >= 12
-     and v.lower() not in ("ollama", "sk-dummy", "changeme", "your-api-key")},
-    key=len, reverse=True)
+def collect_secret_values(config: dict) -> list:
+    """Secret values from config (api keys / tokens, including per-provider ones)
+    — redacted from any tool output or answer so `cat config.txt` / `env` etc.
+    can't be used to exfiltrate them. Longest first, so overlapping values mask
+    completely rather than leaving a suffix behind."""
+    return sorted(
+        {v for k, v in config.items()
+         if any(s in k.lower() for s in ("key", "token", "secret", "password"))
+         and isinstance(v, str) and len(v) >= 12
+         and v.lower() not in ("ollama", "sk-dummy", "changeme", "your-api-key")},
+        key=len, reverse=True)
+
+
+_SECRET_VALUES = collect_secret_values(APP_CONFIG)
 
 
 def _redact_secrets(text: str) -> str:

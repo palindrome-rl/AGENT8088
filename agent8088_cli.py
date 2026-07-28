@@ -703,18 +703,34 @@ def cmd_raw(rest):
 def cmd_model(rest):
     arg = rest.strip().lower()
     if not arg:
-        backend = "Gemma (fallback)" if os.environ.get("USE_GEMMA4") == "1" else "Ornith / custom"
-        console.print(f"Current: [cyan]{A.MODEL_NAME}[/cyan]  ({backend})")
-        console.print("Switch with: [yellow]/model ornith[/yellow] or [yellow]/model gemma[/yellow]")
+        if A.PROVIDERS:
+            t = Table(title="Providers", box=box.SIMPLE, title_style="bold cyan")
+            t.add_column("Name", style="yellow")
+            t.add_column("Model", style="green")
+            t.add_column("Endpoint")
+            for name in sorted(A.PROVIDERS):
+                p = A.PROVIDERS[name]
+                t.add_row(name, p.get("model", "—"), p.get("base_url", "—"))
+            console.print(t)
+        else:
+            console.print("[dim]No providers configured — add provider.<name>.base_url "
+                          "and provider.<name>.model to config.txt[/dim]")
+        console.print(f"Active: [cyan]{A.MODEL_NAME}[/cyan]  ·  switch with "
+                      f"[yellow]/model <name>[/yellow]")
         return
     if arg in ("gemma", "gemma4"):
         os.environ["USE_GEMMA4"] = "1"
+        A.client, A.MODEL_NAME = A.get_client()
     elif arg in ("ornith", "custom", "default"):
         os.environ.pop("USE_GEMMA4", None)
+        A.client, A.MODEL_NAME = A.get_client()
+    elif arg in A.PROVIDERS:
+        os.environ.pop("USE_GEMMA4", None)
+        A.client, A.MODEL_NAME = A.get_client(arg)
     else:
-        console.print("[red]unknown model[/red] — use 'ornith' or 'gemma'")
+        console.print(f"[red]unknown provider[/red] '{arg}' — known: "
+                      + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
         return
-    A.client, A.MODEL_NAME = A.get_client()
     console.print(f"[green]switched[/green] → [cyan]{A.MODEL_NAME}[/cyan]")
 
 
@@ -834,6 +850,8 @@ def _completer(text, state):
     buf = readline.get_line_buffer().lstrip()
     if buf.startswith("/agent "):
         matches = [n for n in sorted(A.SUBAGENT_SPECS) if n.startswith(text)]
+    elif buf.startswith("/model "):
+        matches = [n for n in sorted(A.PROVIDERS) if n.startswith(text)]
     elif buf.startswith("/tool "):
         matches = [n for n in sorted(A.TOOL_NAMES) if n.startswith(text)]
     elif buf.startswith("/"):
