@@ -163,6 +163,8 @@ class Session:
         self.show_trace = False
         self.show_reasoning = False
         self.last_trace = None
+        self.conversation_trace = []
+        self.trace_path = ""
         self.name = ""
         self.disabled_skills = set()
         self.verbose = "on"
@@ -172,6 +174,57 @@ class Session:
 
 S = Session()
 SESSIONS_DIR = APP_DIR / ".agent8088" / "sessions"
+
+
+def _trace_export_data():
+    return {
+        "version": 1,
+        "session": S.name or None,
+        "model": A.MODEL_NAME,
+        "messages": S.messages,
+        "trace": S.conversation_trace,
+    }
+
+
+def _write_trace_export(path):
+    destination = Path(path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(_trace_export_data(), indent=2))
+    return destination
+
+
+def _default_trace_path():
+    trace_dir = Path(os.environ.get(
+        "AGENT8088_TRACE_DIR", str(Path.home() / "Documents" / "agent8088" / "traces")
+    )).expanduser()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return trace_dir / f"agent8088-trace-{stamp}-{time.time_ns() % 1_000_000:06d}.json"
+
+
+def _start_trace_export():
+    path = _write_trace_export(_default_trace_path())
+    S.trace_path = str(path)
+    return path
+
+
+def _record_trace(query, trace, elapsed, interrupted=False):
+    """Keep a per-turn trace so /trace save can export the whole conversation."""
+    if trace is None:
+        return
+    S.last_trace = trace
+    S.conversation_trace.append({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "input": query,
+        "steps": trace,
+        "seconds": round(elapsed, 3),
+        "interrupted": interrupted,
+    })
+    if S.trace_path:
+        try:
+            _write_trace_export(S.trace_path)
+        except OSError as exc:
+            console.print(f"[red]could not update trace export:[/red] {exc}")
+            S.trace_path = ""
 
 
 def _session_name(raw):
@@ -202,6 +255,8 @@ def _save_active_session():
         "verbose": S.verbose,
         "usage_mode": S.usage_mode,
         "last_trace": S.last_trace,
+        "conversation_trace": S.conversation_trace,
+        "trace_path": S.trace_path,
     }, indent=2))
 
 
@@ -589,6 +644,7 @@ def do_chat(query):
             render_answer(partial)
         console.print(f"[dim]⏹ interrupted · {elapsed:.1f}s[/dim]")
         S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "interrupted": True}
+        _record_trace(query, trace, elapsed, interrupted=True)
         _save_active_session()
         return
 
@@ -601,7 +657,7 @@ def do_chat(query):
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
     if trace is not None:
-        S.last_trace = trace
+        _record_trace(query, trace, elapsed)
         console.print(Panel(Text(json.dumps(trace, indent=2)), title="[#237dd7]trace[/#237dd7]",
                             box=box.MINIMAL, border_style="#0077B6"))
     _save_active_session()
@@ -1187,15 +1243,27 @@ def cmd_resume(rest):
     S.verbose = data.get("verbose", "on") if data.get("verbose") in {"on", "off", "full"} else "on"
     S.usage_mode = data.get("usage_mode", "tokens") if data.get("usage_mode") in {"off", "tokens", "full"} else "tokens"
     S.last_trace = data.get("last_trace")
-    console.print(f"[#237dd7]resumed[/#237dd7] → {name} · {len(S.messages)} messages")
+    S.conversation_trace = data.get("conversation_trace", [])
+    if not isinstance(S.conversation_trace, list):
+        S.conversation_trace = []
+    S.trace_path = str(data.get("trace_path", ""))
+    console.print(f"[#237dd7]resumed[/#237dd7] -> {name} · {len(S.messages)} messages")
 
 
 def cmd_reset(_):
     S.messages.clear()
     S.last_trace = None
+    S.conversation_trace.clear()
+    S.trace_path = ""
     S.last_usage = None
+    if S.show_trace:
+        try:
+            _start_trace_export()
+        except OSError as exc:
+            S.show_trace = False
+            console.print(f"[red]could not enable trace export:[/red] {exc}")
     _save_active_session()
-    console.print(f"[#237dd7]session reset[/#237dd7] → {S.name or 'ephemeral'}")
+    console.print(f"[#237dd7]session reset[/#237dd7] -> {S.name or 'ephemeral'}")
 
 
 def _message_text(message):
@@ -1260,14 +1328,34 @@ def cmd_history(_):
 
 
 def cmd_trace(rest):
-    arg = rest.strip().lower()
+    raw = rest.strip()
+    arg = raw.lower()
+    if arg == "save" or arg.startswith("save "):
+        _, _, requested = raw.partition(" ")
+        try:
+            path = _write_trace_export(requested.strip() or f"{S.name or 'agent8088'}_trace.json")
+        except OSError as exc:
+            console.print(f"[red]could not save trace:[/red] {exc}")
+            return
+        S.trace_path = str(path)
+        _save_active_session()
+        console.print(f"[#237dd7]full conversation trace saved[/#237dd7] -> {path}")
+        return
     if arg == "on":
         S.show_trace = True
     elif arg == "off":
         S.show_trace = False
     else:
         S.show_trace = not S.show_trace
-    console.print(f"trace capture: [{'green' if S.show_trace else 'red'}]{'on' if S.show_trace else 'off'}[/]")
+    if S.show_trace and not S.trace_path:
+        try:
+            _start_trace_export()
+        except OSError as exc:
+            S.show_trace = False
+            console.print(f"[red]could not enable trace export:[/red] {exc}")
+            return
+    console.print(f"trace capture: [{'green' if S.show_trace else 'red'}]{'on' if S.show_trace else 'off'}[/]"
+                  f"  [dim]{S.trace_path or 'use /trace save [file] to export'}[/dim]")
     _save_active_session()
 
 
@@ -1338,9 +1426,10 @@ def cmd_maxturns(rest):
 def cmd_save(rest):
     path = rest.strip() or "agent8088_session.json"
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
-            "session": S.name or None, "disabled_skills": sorted(S.disabled_skills)}
+            "conversation_trace": S.conversation_trace, "session": S.name or None,
+            "disabled_skills": sorted(S.disabled_skills)}
     Path(path).write_text(json.dumps(data, indent=2))
-    console.print(f"[#237dd7]saved[/#237dd7] → {path}")
+    console.print(f"[#237dd7]saved[/#237dd7] -> {path}")
 
 
 def cmd_clear(_):
