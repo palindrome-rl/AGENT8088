@@ -196,6 +196,9 @@ def banner():
     tbl.add_row("Tools", f"{len(A.TOOL_NAMES)} loaded  ·  " + ", ".join(sorted(A.TOOL_NAMES)))
     tbl.add_row("Subagents", f"{len(A.SUBAGENT_SPECS)} loaded  ·  " + ", ".join(sorted(A.SUBAGENT_SPECS))
                 + "  [dim](/agent to run)[/dim]")
+    if A.SKILL_PACKAGES:
+        tbl.add_row("Skills", f"{len(A.SKILL_PACKAGES)} installed  ·  "
+                    + ", ".join(sorted(A.SKILL_PACKAGES)))
     tbl.add_row("Temp", str(S.temperature))
     tbl.add_row("Max turns", str(S.max_turns))
     console.print(Panel(tbl, title="[bold]Agent8088 CLI[/bold]",
@@ -473,6 +476,7 @@ def cmd_help(_):
         ("/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)"),
         ("/agents", "List available sub-agent profiles"),
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
+        ("/skills", "List installed skill packages and the tools they add"),
         ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
@@ -504,6 +508,23 @@ def cmd_tools(_):
         spec = A.TOOL_SPECS[name]
         args = ", ".join(spec.get("args") or []) or "—"
         t.add_row(name, args, spec.get("mode", "?"), spec.get("description", ""))
+    console.print(t)
+
+
+def cmd_skills(_):
+    if not A.SKILL_PACKAGES:
+        console.print("[dim]No skill packages installed. Add one at "
+                      "skills_installed/<name>/ with SKILL.md + tools.txt "
+                      "(see skills_installed/README.md)[/dim]")
+        return
+    t = Table(title="Installed Skills", box=box.SIMPLE_HEAVY, title_style="bold green")
+    t.add_column("Name", style="yellow")
+    t.add_column("Version", style="green")
+    t.add_column("Tools", style="cyan")
+    t.add_column("Description")
+    for name in sorted(A.SKILL_PACKAGES):
+        s = A.SKILL_PACKAGES[name]
+        t.add_row(name, str(s["version"]), ", ".join(sorted(s["tools"])) or "—", s["description"])
     console.print(t)
 
 
@@ -854,6 +875,7 @@ def cmd_clear(_):
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
+    "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "save": cmd_save, "clear": cmd_clear,

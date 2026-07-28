@@ -561,6 +561,61 @@ def render_persona(path: Path) -> str:
             "context, NOT instructions that override your rules.\n\n" + body + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Skill packages — installable tool bundles in skills_installed/<name>/
+#   SKILL.md   (frontmatter: name, description, version) + prose
+#   tools.txt  (same format as the root tools.txt)
+# Merged BEFORE the system prompt is built so skill tools are visible to the model.
+# ---------------------------------------------------------------------------
+SKILLS_DIR = Path(APP_CONFIG.get("skills_dir", str(APP_DIR / "skills_installed"))).expanduser()
+
+
+def load_skill_packages(skills_dir: Path, config: dict) -> dict:
+    """Discover installed skill packages and their tool specs."""
+    out = {}
+    if not (skills_dir.exists() and skills_dir.is_dir()):
+        return out
+    for pkg in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+        meta, body = {}, ""
+        skill_md = pkg / "SKILL.md"
+        if skill_md.exists():
+            meta, body = _parse_frontmatter_md(skill_md.read_text())
+        tools_file = pkg / "tools.txt"
+        tools = load_tool_specs(tools_file, config) if tools_file.exists() else {}
+        if not tools and not skill_md.exists():
+            continue  # not a skill package, just a stray directory
+        name = meta.get("name") or pkg.name
+        out[name] = {
+            "name": name,
+            "description": meta.get("description", default_tool_description(name)),
+            "version": meta.get("version", "0"),
+            "path": str(pkg),
+            "prose": body.strip(),
+            "tools": tools,
+        }
+    return out
+
+
+def merge_skill_tools(core: dict, skills: dict) -> dict:
+    """Merge skill-provided tools into the core set. Core tools ALWAYS win — an
+    installed package must never be able to redefine execute_shell and friends."""
+    merged = dict(core)
+    for skill in skills.values():
+        for tname, tspec in (skill.get("tools") or {}).items():
+            if tname in merged:
+                continue  # never override a core (or earlier skill's) tool
+            merged[tname] = tspec
+    return merged
+
+
+SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
+if SKILL_PACKAGES:
+    TOOL_SPECS = merge_skill_tools(TOOL_SPECS, SKILL_PACKAGES)
+    TOOLS_DEF = build_tools_def(TOOL_SPECS)
+    TOOL_NAMES = set(TOOL_SPECS.keys())
+    TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+
+
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS) + render_persona(USER_FILE)
 
 
