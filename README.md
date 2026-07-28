@@ -18,6 +18,9 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 ### Key Features
 
 - **One-line install** — Hermes-style installer for macOS, Linux, Windows
+- **13 model providers** — Ollama, OpenRouter, OpenAI, Anthropic, Gemini, Cerebras, DeepSeek, Groq, Mistral, Moonshot, Qwen, Ollama Cloud, GitHub Copilot
+- **Interactive model picker** — fuzzy searchable provider + model selection (InquirerPy)
+- **Fallback chains** — automatically switches to backup provider on 429/503 errors
 - **Fine-tuned tool calling** — 95% accuracy on function selection
 - **Permission layer** — readonly by default, per-action y/n escalation for writes
 - **Security layers** — sensitive file protection, network gating, path-based zones
@@ -60,22 +63,35 @@ agent8088 --version
 
 ### Configure Your Model
 
-If you skipped the setup wizard, run it anytime:
+The setup wizard uses an interactive fuzzy searchable picker — type to filter providers, arrow keys to navigate, Enter to select:
+
 ```sh
 agent8088 --setup
 ```
+
+The wizard prompts for:
+1. **Working directory** — where the agent can read/write files (default: `~`)
+2. **Provider** — fuzzy search through 13 built-in providers (Ollama, OpenRouter, OpenAI, Anthropic, Gemini, Cerebras, DeepSeek, Groq, Mistral, Moonshot, Qwen, Ollama Cloud, GitHub Copilot)
+3. **API key** — for the selected provider
+4. **Model** — fetches the provider's available models via `/v1/models` and shows them in a fuzzy picker
+5. **Web search URL** — optional SearXNG endpoint
 
 Or edit the config file directly:
 - **macOS/Linux:** `~/.agent8088/config.txt`
 - **Windows:** `%LOCALAPPDATA%\agent8088\config.txt`
 
 ```ini
-model_base_url=http://localhost:11434/v1
-model_name=qwen14b-tooluse-v3
-api_key=ollama
+# Active model in provider:model_name format
+model=cerebras:gpt-oss-120b
+
+# Provider API key (or set the env var, e.g. CEREBRAS_API_KEY)
+provider.cerebras.api_key=csk-...
+
+# Fallback chain (tried on 429/503/connection errors)
+fallback_models=groq:llama-3.3-70b-versatile,gemini:gemini-2.0-flash
 ```
 
-For a cloud endpoint, change `model_base_url`, `model_name`, and `api_key` to your provider's values.
+See [Multi-Model Provider Support](docs/multi-model-providers.md) for the full provider list and configuration details.
 
 ### Run
 
@@ -116,7 +132,8 @@ Run with no flags to start the interactive REPL.
 | `/tool <name> <args>` | Invoke one tool directly |
 | `/plan <steps>` | Run the plan-executor (multi-step) |
 | `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
-| `/model [ornith\|gemma]` | Show or switch backend model |
+| `/model <provider:model>` | Switch provider + model (e.g. `/model cerebras:gpt-oss-120b`) |
+| `/models [provider]` | Fuzzy searchable model picker — lists + switches models from active or specified provider |
 | `/config` | Show active config + config file path |
 | `/system` | Show the full system prompt |
 | `/history` | Show conversation history |
@@ -135,13 +152,13 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 
 | Key | Default | Purpose |
 |---|---|---|
-| `model_base_url` | `http://localhost:11434/v1` | OpenAI-compatible endpoint |
-| `model_name` | `qwen14b-tooluse-v3` | Model ID your server exposes |
-| `api_key` | `ollama` | API key (ollama needs none; cloud needs yours) |
+| `model` | `ollama:qwen14b-tooluse-v3` | Active model in `provider:model_name` format |
+| `provider.<name>.api_key` | (env var) | API key for a provider (e.g. `provider.cerebras.api_key=csk-...`) |
+| `provider.<name>.base_url` | (built-in) | Override a provider's endpoint URL |
+| `fallback_models` | (empty) | Comma-separated fallback chain (e.g. `groq:llama-3.3-70b-versatile,gemini:gemini-2.0-flash`) |
 | `timeout_seconds` | `120` | Request timeout |
-| `allowed_paths` | `.,/tmp` | Paths the agent can read/write |
-| `no_prompt_paths` | `/tmp` | Writes here auto-approved (no y/n) |
-| `prompt_paths` | `.` | Writes here show y/n escalation |
+| `allowed_paths` | `~` | Paths the agent can read/write |
+| `prompt_paths` | `~` | Writes here show y/n escalation |
 | `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
 
@@ -201,7 +218,8 @@ AGENT8088/
 ├── src/agent8088/            # Installable package
 │   ├── __init__.py           # Version
 │   ├── engine.py             # Core engine (agent loop, tools, permissions)
-│   └── cli.py                # Rich CLI (streaming, slash commands, escalation)
+│   ├── cli.py                # Rich CLI (streaming, slash commands, escalation)
+│   └── providers.py          # Multi-model provider registry (13 providers)
 ├── config.txt                # Default config (shipped with package)
 ├── system.md                 # System prompt / skill document
 ├── tools.txt                 # Tool specs
@@ -209,7 +227,7 @@ AGENT8088/
 ├── install.ps1               # One-line installer (Windows)
 ├── pyproject.toml            # Package metadata + entry points
 ├── tests/                    # Permission layer tests
-├── docs/superpowers/         # Design specs + plans + test cases
+├── docs/                     # Architecture docs + multi-model providers + roadmap
 ├── research/                 # Non-runtime: SkillOpt, benchmarks, training
 └── scripts/                  # One-off repo ops
 ```
@@ -278,7 +296,10 @@ agent8088 --update
 - macOS/Linux: ensure `~/.local/bin` is on PATH (`uv tool update-shell`).
 
 **`Connection error.`**
-- The model endpoint in `config.txt` isn't reachable. Run `agent8088 --setup` to reconfigure, or edit `config.txt` manually.
+- The model endpoint isn't reachable. Run `agent8088 --setup` to pick a different provider, or use `/models` in the REPL to switch providers at runtime.
+
+**`429 Rate limit` / `Quota exceeded`**
+- Your provider's rate limit is hit. Set `fallback_models` in config to automatically switch to a backup provider on 429 errors.
 
 **`Tools: 0 loaded`**
 - `tools.txt` is missing from the install. Reinstall: `agent8088 --update`.
