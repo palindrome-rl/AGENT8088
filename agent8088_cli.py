@@ -474,6 +474,7 @@ def cmd_help(_):
         ("/agents", "List available sub-agent profiles"),
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
         ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
+        ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [ornith|gemma]", "Show or switch the backend model"),
         ("/config", "Show the active configuration (model, endpoint, paths)"),
@@ -700,6 +701,32 @@ def cmd_raw(rest):
     console.print(f"[dim]finish_reason={fr}[/dim]")
 
 
+def cmd_image(rest):
+    parts = rest.split(None, 1)
+    if not parts:
+        console.print("[red]usage:[/red] /image <path-or-url> [question]")
+        return
+    ref = parts[0]
+    question = parts[1] if len(parts) > 1 else "Describe this image."
+    try:
+        msg = A.build_image_message(question, [ref])
+    except Exception as e:
+        console.print(f"[red]error:[/red] {e}")
+        return
+    S.messages.append(msg)
+    try:
+        with status_cm("analyzing image..."):
+            resp = A.create_completion(A.client, S.messages, A.TOOLS_DEF,
+                                       temperature=S.temperature)
+        answer = A._guard_answer(A._strip_reasoning(resp.choices[0].message.content or ""))
+    except Exception as e:
+        console.print(f"[red]model error:[/red] {e}")
+        console.print("[dim]Vision needs a vision-capable provider — see /model[/dim]")
+        return
+    S.messages.append({"role": "assistant", "content": answer})
+    render_answer(answer)
+
+
 def cmd_model(rest):
     arg = rest.strip().lower()
     if not arg:
@@ -761,7 +788,14 @@ def cmd_history(_):
     for msg in S.messages:
         role = msg["role"]
         style = {"user": "green", "assistant": "cyan", "system": "blue"}.get(role, "white")
-        console.print(f"[{style} bold]{role}:[/{style} bold] {msg['content'][:1000]}")
+        content = msg.get("content")
+        if isinstance(content, list):  # multimodal (see /image)
+            bits = [p.get("text", "") if p.get("type") == "text" else "<image>"
+                    for p in content]
+            content = " ".join(b for b in bits if b)
+        line = Text(f"{role}: ", style=f"{style} bold")
+        line.append(str(content or "")[:1000])
+        console.print(line)
 
 
 def cmd_trace(rest):
@@ -819,7 +853,7 @@ def cmd_clear(_):
 
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
-    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan,
+    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "save": cmd_save, "clear": cmd_clear,
@@ -831,8 +865,19 @@ COMMANDS = {
 # ---------------------------------------------------------------------------
 def _estimate_context_pct():
     """Rough ~4-chars-per-token estimate against CONTEXT_WINDOW — good enough for a
-    progress hint, not meant to be exact."""
-    chars = len(A.SYSTEM_PROMPT) + sum(len(m.get("content") or "") for m in S.messages)
+    progress hint, not meant to be exact. Image parts count as a flat allowance
+    rather than their (huge) base64 length, which would peg the meter at 100%."""
+    chars = len(A.SYSTEM_PROMPT)
+    for m in S.messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if part.get("type") == "text":
+                    chars += len(part.get("text") or "")
+                else:
+                    chars += 3000  # flat per-image allowance
+        else:
+            chars += len(content or "")
     if not A.CONTEXT_WINDOW:
         return 0
     return min(100, int(100 * (chars // 4) / A.CONTEXT_WINDOW))

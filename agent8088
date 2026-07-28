@@ -184,6 +184,33 @@ def _build_response(content):
     })()]})
 
 
+_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def build_image_message(text: str, images: list) -> dict:
+    """Build a multimodal user message: text plus one or more images.
+    Local paths are inlined as base64 data URLs; http(s) URLs pass through
+    (SSRF-checked). Requires a vision-capable model/provider."""
+    import base64 as _b64
+    parts = [{"type": "text", "text": text or ""}]
+    for ref in images or []:
+        ref = str(ref).strip()
+        if ref.startswith(("http://", "https://")):
+            blocked = _ssrf_check(ref)
+            if blocked:
+                raise ValueError(blocked)
+            parts.append({"type": "image_url", "image_url": {"url": ref}})
+            continue
+        path = resolve_user_path(ref)
+        if not path.exists():
+            raise ValueError(f"Image not found: {path}")
+        mime = _IMAGE_MIME.get(path.suffix.lower(), "image/png")
+        b64 = _b64.b64encode(path.read_bytes()).decode()
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    return {"role": "user", "content": parts}
+
+
 class AgentInterrupted(Exception):
     """Raised when the user interrupts the agent loop (e.g. ESC in the Rich UI)."""
     pass
