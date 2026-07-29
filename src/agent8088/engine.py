@@ -718,7 +718,7 @@ def _parse_frontmatter_md(text: str) -> tuple:
 # ---------------------------------------------------------------------------
 # Persona — optional user profile (USER.md) folded into the system prompt
 # ---------------------------------------------------------------------------
-USER_FILE = Path(APP_CONFIG.get("user_file", str(Path.cwd() / "USER.md"))).expanduser()
+USER_FILE = Path(APP_CONFIG.get("user_file", str(APP_DIR / "USER.md"))).expanduser()
 
 
 def render_persona(path: Path) -> str:
@@ -743,7 +743,7 @@ def render_persona(path: Path) -> str:
 #   tools.txt  (same format as the root tools.txt)
 # Merged BEFORE the system prompt is built so skill tools are visible to the model.
 # ---------------------------------------------------------------------------
-SKILLS_DIR = Path(APP_CONFIG.get("skills_dir", str(Path.cwd() / "skills_installed"))).expanduser()
+SKILLS_DIR = Path(APP_CONFIG.get("skills_dir", str(APP_DIR / "skills_installed"))).expanduser()
 
 
 def load_skill_packages(skills_dir: Path, config: dict) -> dict:
@@ -813,7 +813,7 @@ SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
 # ---------------------------------------------------------------------------
 # Subagents — profiles loaded from agents/*.md (frontmatter + body prompt)
 # ---------------------------------------------------------------------------
-AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(Path.cwd() / "agents"))).expanduser()
+AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expanduser()
 DEFAULT_SUBAGENT = APP_CONFIG.get("default_subagent", "general-purpose")
 SUBAGENT_MAX_DEPTH = int(APP_CONFIG.get("subagent_max_depth", "1"))
 

@@ -593,6 +593,45 @@ def _stream_view(reasoning_parts, content_parts):
     return Group(*blocks) if blocks else Text("")
 
 
+def _handle_escalation(result_text, messages=None, live=None):
+    """Check if a tool result is an escalation request. If so, prompt the user
+    for y/n approval and call grant_escalation() if approved."""
+    if not result_text.startswith("ESCALATION_REQUEST:"):
+        return False
+    parts = result_text.split(":", 4)
+    if len(parts) < 5:
+        return False
+    _, target_mode, change_type, paths, reason = parts
+    if live is not None:
+        live.stop()
+    console.print()
+    console.print(Panel(
+        Text(f"{reason}\n\nPaths: {paths}\nChange type: {change_type}\nRequested mode: {target_mode}"),
+        title="[bold yellow]Permission Escalation Request[/bold yellow]",
+        box=box.ROUNDED, border_style="yellow",
+    ))
+    try:
+        response = console.input("[bold yellow]Allow? (y/n): [/bold yellow]").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        response = "n"
+    if response in ("y", "yes"):
+        A.grant_escalation()
+        console.print("[green]Approved for this action only. Next write will ask again.[/green]")
+        if messages is not None:
+            messages.append({"role": "user", "content":
+                "Permission granted. Retry the EXACT same tool call that was blocked. "
+                "Do not ask for permission again. Do not explain. Just call the tool again now."})
+    else:
+        console.print("[red]Permission denied — staying in readonly mode.[/red]")
+        if messages is not None:
+            messages.append({"role": "user", "content":
+                "Permission denied by the user. You remain in readonly mode. "
+                "Tell the user what you could not do and why the task cannot be completed."})
+    if live is not None:
+        live.start()
+    return True
+
+
 def do_chat(query):
     S.messages.append({"role": "user", "content": query})
     trace = [] if S.show_trace else None
@@ -622,11 +661,17 @@ def do_chat(query):
 
         # Let sub-agents render their own nested, animated activity in this Live.
         A.subagent_ui = _make_subagent_ui(live)
+
+        def _on_result(name, result):
+            on_result(name, result)
+            if _handle_escalation(result, S.messages, live):
+                pass  # Escalation handled — retry hint injected into messages
+
         try:
             answer = A.run_agent(
                 S.messages, max_turns=S.max_turns, temperature=S.temperature,
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
-                on_result=on_result, on_answer=None, on_token=on_token,
+                on_result=_on_result, on_answer=None, on_token=on_token,
                 interrupt_check=esc.triggered.is_set, trace=trace,
                 system_prompt=_session_system_prompt(),
                 tools_def=A.build_tools_def(_active_tool_specs()),
@@ -1437,10 +1482,52 @@ def cmd_clear(_):
     cmd_reset("")
 
 
+def cmd_models(rest):
+    """List available models from the active provider (or a specified one).
+    Usage: /models [provider_name]"""
+    from agent8088.providers import list_models, BUILTIN_PROVIDERS, get_client_for, FALLBACK_MODELS
+    from InquirerPy import inquirer
+    provider_name = rest.strip()
+    if not provider_name:
+        provider_name = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "ollama")
+    if not provider_name:
+        provider_name = "ollama"
+    # Get the API key from config or env
+    builtin = BUILTIN_PROVIDERS.get(provider_name, {})
+    base_url = builtin.get("base_url", A.APP_CONFIG.get(f"provider.{provider_name}.base_url", "http://localhost:11434/v1"))
+    api_key = A.APP_CONFIG.get(f"provider.{provider_name}.api_key", "") or "ollama"
+    console.print(f"[#237dd7]Fetching models from {provider_name}...[/#237dd7]")
+    try:
+        from openai import OpenAI
+        fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
+        models = list_models(provider_name, client=fetch_client)
+    except Exception as e:
+        console.print(f"[red]Could not fetch models:[/red] {e}")
+        models = FALLBACK_MODELS.get(provider_name, [])
+    if not models:
+        console.print("[yellow]No models found.[/yellow]")
+        return
+    selected = inquirer.fuzzy(
+        message=f"Select a model from {provider_name}:",
+        choices=models,
+        max_height="70%",
+    ).execute()
+    if selected:
+        # Update the provider's model and switch
+        model_ref = f"{provider_name}:{selected}"
+        try:
+            A.client, A.MODEL_NAME = A.get_client(provider_name)
+            A.MODEL_NAME = selected
+            A.ACTIVE_PROVIDER = provider_name
+            console.print(f"[#237dd7]switched[/#237dd7] -> {selected}  ({model_ref})")
+        except Exception as e:
+            console.print(f"[red]error:[/red] {e}")
+
+
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
-    "skills": cmd_skills,
+    "skills": cmd_skills, "models": cmd_models,
     "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
     "status": cmd_status, "doctor": cmd_doctor,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
