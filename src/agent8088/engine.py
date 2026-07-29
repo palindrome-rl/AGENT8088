@@ -237,12 +237,20 @@ BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
 # ---------------------------------------------------------------------------
 # Model client.  USE_GEMMA4=1 switches to the Gemma server on Colossus.
 # ---------------------------------------------------------------------------
-def load_providers(config: dict) -> dict:
+def load_providers(config: dict, include_builtins: bool = False) -> dict:
     """Parse `provider.<name>.<field>` keys from config into a registry.
     Fields: model, api_mode, base_url, api_key_env. OpenAI mode needs a base URL;
     LiteLLM mode also supports native provider identifiers such as Anthropic and
     Gemini without one. Credentials should use api_key_env, not api_key."""
     provs = {}
+    from agent8088.providers import BUILTIN_PROVIDERS
+    if include_builtins:
+        for name, info in BUILTIN_PROVIDERS.items():
+            provs[name] = {
+                key: value for key, value in info.items()
+                if key in {"base_url", "api_key", "api_key_env"}
+            }
+            provs[name]["model"] = info["default_model"]
     for key, value in config.items():
         if not key.startswith("provider."):
             continue
@@ -253,24 +261,9 @@ def load_providers(config: dict) -> dict:
         provs.setdefault(name, {})[field] = value
 
     # Seed built-in base_urls so providers work with just api_key + model in config
-    _BUILTIN_BASE_URLS = {
-        "ollama": "http://localhost:11434/v1",
-        "openrouter": "https://openrouter.ai/api/v1",
-        "openai": "https://api.openai.com/v1",
-        "anthropic": "https://api.anthropic.com/v1",
-        "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "cerebras": "https://api.cerebras.ai/v1",
-        "deepseek": "https://api.deepseek.com/v1",
-        "groq": "https://api.groq.com/openai/v1",
-        "mistral": "https://api.mistral.ai/v1",
-        "moonshot": "https://api.moonshot.ai/v1",
-        "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "ollama-cloud": "https://ollama.com/v1",
-        "copilot": "https://api.githubcopilot.com",
-    }
-    for name, base_url in _BUILTIN_BASE_URLS.items():
+    for name, info in BUILTIN_PROVIDERS.items():
         if name in provs and "base_url" not in provs[name]:
-            provs[name]["base_url"] = base_url
+            provs[name]["base_url"] = info["base_url"]
 
     return {
         n: p for n, p in provs.items()
@@ -278,7 +271,7 @@ def load_providers(config: dict) -> dict:
     }
 
 
-PROVIDERS = load_providers(APP_CONFIG)
+PROVIDERS = load_providers(APP_CONFIG, include_builtins=True)
 DEFAULT_PROVIDER = APP_CONFIG.get("default_provider", "")
 ACTIVE_PROVIDER = ""
 
@@ -1676,5 +1669,3 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         trace.append({"turn": -1, "type": "max_turns",
                       "content": _last_tool_output[:3000] if _last_tool_output else fallback})
     return fallback
-
-

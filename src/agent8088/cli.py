@@ -1456,7 +1456,7 @@ def cmd_clear(_):
 def cmd_models(rest):
     """List available models from the active provider (or a specified one).
     Usage: /models [provider_name]"""
-    from agent8088.providers import list_models, BUILTIN_PROVIDERS, get_client_for, FALLBACK_MODELS
+    from agent8088.providers import list_models, BUILTIN_PROVIDERS
     from InquirerPy import inquirer
     provider_name = rest.strip()
     if not provider_name:
@@ -1466,15 +1466,19 @@ def cmd_models(rest):
     # Get the API key from config or env
     builtin = BUILTIN_PROVIDERS.get(provider_name, {})
     base_url = builtin.get("base_url", A.APP_CONFIG.get(f"provider.{provider_name}.base_url", "http://localhost:11434/v1"))
-    api_key = A.APP_CONFIG.get(f"provider.{provider_name}.api_key", "") or "ollama"
+    api_key = (
+        A.APP_CONFIG.get(f"provider.{provider_name}.api_key", "")
+        or os.environ.get(builtin.get("api_key_env", ""), "")
+        or builtin.get("api_key", "ollama")
+    )
     console.print(f"[#237dd7]Fetching models from {provider_name}...[/#237dd7]")
     try:
         from openai import OpenAI
         fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
-        models = list_models(provider_name, client=fetch_client)
+        models = list_models(provider_name, client=fetch_client, fallback=False)
     except Exception as e:
         console.print(f"[red]Could not fetch models:[/red] {e}")
-        models = FALLBACK_MODELS.get(provider_name, [])
+        models = []
     if not models:
         console.print("[yellow]No models found.[/yellow]")
         return
@@ -1663,6 +1667,7 @@ def _run_setup():
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
     from InquirerPy import inquirer
+    from agent8088 import providers as provider_registry
     home = _agent8088_home()
     config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
@@ -1673,89 +1678,109 @@ def _run_setup():
     def _current(key):
         m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
         return m.group(1).strip() if m else ""
+    def _set_line(text, key, value):
+        pattern = rf'^{_re.escape(key)}=.*'
+        if _re.search(pattern, text, _re.MULTILINE):
+            return _re.sub(pattern, lambda _: f"{key}={value}", text, flags=_re.MULTILINE)
+        return text + f"\n{key}={value}\n"
     print("Agent8088 setup\n")
     cur_paths = _current("allowed_paths") or "~"
     paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
-    # Provider picker — always show all 13 built-in providers
-    from agent8088.providers import BUILTIN_PROVIDERS
-    providers_list = sorted(BUILTIN_PROVIDERS.keys())
-    cur_model = _current("model") or _current("model_name") or "ollama:qwen14b-tooluse-v3"
-    cur_provider = cur_model.split(":")[0] if ":" in cur_model else "ollama"
-    provider = inquirer.fuzzy(
+    builtin_names = provider_registry.builtin_provider_names()
+    provider_choices = [
+        {"name": provider_registry.builtin_provider_choice_label(name), "value": name}
+        for name in builtin_names
+    ]
+    provider_choices.append({"name": "Custom OpenAI-compatible", "value": "__custom__"})
+    cur_provider = _current("default_provider") or "ollama"
+    provider_choice = inquirer.select(
         message="Select model provider:",
-        choices=providers_list,
+        choices=provider_choices,
         default=cur_provider,
         max_height="70%",
     ).execute()
+    custom_base_url = ""
+    if provider_choice == "__custom__":
+        default_name = cur_provider if cur_provider not in builtin_names else "custom"
+        provider = inquirer.text(message="Custom provider name:", default=default_name).execute().strip().lower()
+        if not provider.replace("_", "").replace("-", "").isalnum():
+            print("Custom provider names use letters, numbers, _ or -.")
+            return
+        custom_base_url = inquirer.text(
+            message="OpenAI-compatible URL:",
+            instruction="(required; Enter keeps current if already configured)",
+        ).execute().strip() or _current(f"provider.{provider}.base_url")
+        if not custom_base_url:
+            print("An OpenAI-compatible URL is required.")
+            return
+    else:
+        provider = provider_choice
     # API key
-    cur_key = _current(f"provider.{provider}.api_key") or ""
-    key = inquirer.text(
+    key = inquirer.secret(
         message=f"API key for {provider}:",
-        default=cur_key,
-        instruction="(press Enter to skip if not needed)",
+        instruction="(hidden; Enter keeps existing/skips)",
     ).execute()
     # Fetch models
     print(f"\nFetching models from {provider}...")
     try:
-        from agent8088.providers import list_models, BUILTIN_PROVIDERS
         from openai import OpenAI
-        builtin = BUILTIN_PROVIDERS.get(provider, {})
-        base_url = builtin.get("base_url", _current(f"provider.{provider}.base_url") or "http://localhost:11434/v1")
-        api_key = key or _current(f"provider.{provider}.api_key") or "ollama"
+        builtin = provider_registry.builtin_provider_defaults(provider)
+        base_url = custom_base_url or _current(f"provider.{provider}.base_url") or builtin.get("base_url", "")
+        api_key = (
+            key
+            or _current(f"provider.{provider}.api_key")
+            or os.environ.get(builtin.get("api_key_env", ""), "")
+            or builtin.get("api_key", "ollama")
+        )
         fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
-        models = list_models(provider, client=fetch_client)
-    except Exception as e:
-        from agent8088.providers import FALLBACK_MODELS
-        models = FALLBACK_MODELS.get(provider, ["unknown-model"])
+        models = provider_registry.list_models(provider, client=fetch_client, fallback=False)
+    except Exception:
+        models = []
+    current_model = _current(f"provider.{provider}.model") or provider_registry.builtin_provider_defaults(provider).get("default_model", "")
     if models:
+        model_kwargs = {
+            "message": "Select model:",
+            "choices": models,
+            "max_height": "70%",
+        }
+        if current_model in models:
+            model_kwargs["default"] = current_model
         model_name = inquirer.fuzzy(
-            message="Select model:",
-            choices=models,
-            max_height="70%",
+            **model_kwargs,
         ).execute()
     else:
-        model_name = inquirer.text(message="Model name:").execute()
+        model_name = inquirer.text(message="Model name:", default=current_model, instruction="(required)").execute()
+    if not model_name:
+        print("A model is required.")
+        return
     model_ref = f"{provider}:{model_name}"
     # Web search
-    cur_search = _current("search_base_url")
     search = inquirer.text(
         message="Web search URL (SearXNG):",
-        default=cur_search,
-        instruction="(press Enter to disable)",
+        instruction="(Enter keeps current; type none to disable)",
     ).execute()
     # Write config — use the format the engine's load_providers() expects:
     #   default_provider=<name>
     #   provider.<name>.base_url=<url>
     #   provider.<name>.model=<model>
     #   provider.<name>.api_key=<key>
-    content = _re.sub(r'^allowed_paths=.*', lambda _: f'allowed_paths={paths}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^default_provider=.*', lambda _: f'default_provider={provider}', content, flags=_re.MULTILINE)
-    if not _re.search(r'^default_provider=', content, _re.MULTILINE):
-        content += f"\ndefault_provider={provider}\n"
+    content = _set_line(content, "allowed_paths", paths)
+    content = _set_line(content, "default_provider", provider)
     # Write provider base_url + model
     # Look up the built-in base_url from our providers registry
-    from agent8088.providers import BUILTIN_PROVIDERS
-    builtin = BUILTIN_PROVIDERS.get(provider, {})
-    base_url = builtin.get("base_url", _current(f"provider.{provider}.base_url") or "")
+    builtin = provider_registry.builtin_provider_defaults(provider)
+    base_url = custom_base_url or _current(f"provider.{provider}.base_url") or builtin.get("base_url", "")
     if base_url:
-        if _re.search(rf'^provider\.{provider}\.base_url=.*', content, _re.MULTILINE):
-            content = _re.sub(rf'^provider\.{provider}\.base_url=.*', lambda _: f'provider.{provider}.base_url={base_url}', content, flags=_re.MULTILINE)
-        else:
-            content += f"\nprovider.{provider}.base_url={base_url}\n"
-    if _re.search(rf'^provider\.{provider}\.model=.*', content, _re.MULTILINE):
-        content = _re.sub(rf'^provider\.{provider}\.model=.*', lambda _: f'provider.{provider}.model={model_name}', content, flags=_re.MULTILINE)
-    else:
-        content += f"\nprovider.{provider}.model={model_name}\n"
+        content = _set_line(content, f"provider.{provider}.base_url", base_url)
+    if provider_choice == "__custom__":
+        content = _set_line(content, f"provider.{provider}.api_mode", "openai")
+    content = _set_line(content, f"provider.{provider}.model", model_name)
     if key:
-        if _re.search(rf'^provider\.{provider}\.api_key=.*', content, _re.MULTILINE):
-            content = _re.sub(rf'^provider\.{provider}\.api_key=.*', lambda _: f'provider.{provider}.api_key={key}', content, flags=_re.MULTILINE)
-        else:
-            content += f"\nprovider.{provider}.api_key={key}\n"
-    if search:
-        if _re.search(r'^#?\s*search_base_url=', content, _re.MULTILINE):
-            content = _re.sub(r'^#?\s*search_base_url=.*', lambda _: f'search_base_url={search}', content, flags=_re.MULTILINE)
-        else:
-            content += f"\nsearch_base_url={search}\n"
+        content = _set_line(content, f"provider.{provider}.api_key", key)
+    if search.strip().lower() == "none":
+        content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
+    elif search:
+        content = _set_line(content, "search_base_url", search)
     config_path.write_text(content, encoding="utf-8")
     print(f"\nConfig written to {config_path}")
     print(f"Active model: {model_ref}")

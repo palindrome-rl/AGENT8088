@@ -93,3 +93,43 @@ def test_provider_api_keys_are_redacted(engine, monkeypatch):
     cfg["provider.openai.api_key"] = "sk-supersecretvalue12345"
     secrets = engine.collect_secret_values(cfg)
     assert "sk-supersecretvalue12345" in secrets
+
+
+def test_builtin_provider_catalog_skips_anthropic():
+    from agent8088 import providers
+
+    names = providers.builtin_provider_names()
+    assert names == [
+        "ollama", "openrouter", "openai", "gemini", "cerebras", "deepseek",
+        "groq", "mistral", "moonshot", "qwen", "ollama-cloud", "copilot",
+    ]
+    assert "anthropic" not in names
+    assert providers.builtin_provider_defaults("copilot")["default_model"] == "gpt-4o-mini"
+
+
+def test_load_providers_can_seed_builtins(engine):
+    provs = engine.load_providers({}, include_builtins=True)
+    assert "copilot" in provs
+    assert "anthropic" not in provs
+    assert provs["openrouter"]["model"] == "anthropic/claude-sonnet-4"
+
+
+def test_list_models_fetches_and_serves_cache(tmp_path, monkeypatch):
+    from agent8088 import providers
+
+    monkeypatch.setattr(providers, "_CACHE_FILE", tmp_path / "models_cache.json")
+
+    class Model:
+        def __init__(self, model_id):
+            self.id = model_id
+
+    class Models:
+        def list(self):
+            return type("Response", (), {"data": [Model("b"), Model("a")]})()
+
+    class Client:
+        models = Models()
+
+    assert providers.list_models("openai", client=None, fallback=False) == []
+    assert providers.list_models("openai", client=Client(), fallback=False) == ["a", "b"]
+    assert providers.list_models("openai", client=None, fallback=False) == ["a", "b"]

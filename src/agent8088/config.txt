@@ -3,8 +3,8 @@
 # Multi-model provider support. Set default_provider to pick your active
 # provider, then configure provider.<name>.* keys below.
 #
-# Built-in providers: ollama, openrouter, openai, anthropic, gemini,
-# cerebras, deepseek, groq, mistral, moonshot, qwen, ollama-cloud, copilot
+# Built-in providers: ollama, openrouter, openai, gemini, cerebras,
+# deepseek, groq, mistral, moonshot, qwen, ollama-cloud, copilot
 
 # --- paths --- Leave commented to use built-in defaults.
 # project_root=. (defaults to CWD)

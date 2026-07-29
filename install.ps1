@@ -520,14 +520,27 @@ function Drop-Config {
 # Stage 8: Setup wizard
 # ----------------------------------------------------------------------------
 $BuiltinModelProviders = @(
-    "ollama", "openrouter", "openai", "anthropic", "gemini", "cerebras", "deepseek",
+    "ollama", "openrouter", "openai", "gemini", "cerebras", "deepseek",
     "groq", "mistral", "moonshot", "qwen", "ollama-cloud", "copilot"
 )
+$BuiltinProviderLabels = @{
+    "ollama" = "Ollama (local)"
+    "openrouter" = "OpenRouter"
+    "openai" = "OpenAI"
+    "gemini" = "Google Gemini"
+    "cerebras" = "Cerebras"
+    "deepseek" = "DeepSeek"
+    "groq" = "Groq"
+    "mistral" = "Mistral"
+    "moonshot" = "Moonshot (Kimi)"
+    "qwen" = "Qwen (DashScope)"
+    "ollama-cloud" = "Ollama Cloud"
+    "copilot" = "GitHub Copilot"
+}
 $BuiltinProviderUrls = @{
     "ollama" = "http://localhost:11434/v1"
     "openrouter" = "https://openrouter.ai/api/v1"
     "openai" = "https://api.openai.com/v1"
-    "anthropic" = "https://api.anthropic.com/v1"
     "gemini" = "https://generativelanguage.googleapis.com/v1beta/openai/"
     "cerebras" = "https://api.cerebras.ai/v1"
     "deepseek" = "https://api.deepseek.com/v1"
@@ -540,9 +553,8 @@ $BuiltinProviderUrls = @{
 }
 $BuiltinProviderModels = @{
     "ollama" = "qwen14b-tooluse-v3"
-    "openrouter" = "openrouter/auto"
+    "openrouter" = "anthropic/claude-sonnet-4"
     "openai" = "gpt-4o"
-    "anthropic" = "claude-sonnet-4-6"
     "gemini" = "gemini-2.0-flash"
     "cerebras" = "gpt-oss-120b"
     "deepseek" = "deepseek-chat"
@@ -551,14 +563,15 @@ $BuiltinProviderModels = @{
     "moonshot" = "kimi-k2.6"
     "qwen" = "qwen-plus"
     "ollama-cloud" = "gpt-oss:120b"
-    "copilot" = "gpt-4o"
+    "copilot" = "gpt-4o-mini"
 }
 
 function Select-ModelProvider {
     param([string]$CurrentProvider)
     Write-Host "Select model provider:"
     for ($i = 0; $i -lt $BuiltinModelProviders.Count; $i++) {
-        Write-Host ("  {0,2}) {1}" -f ($i + 1), $BuiltinModelProviders[$i])
+        $provider = $BuiltinModelProviders[$i]
+        Write-Host ("  {0,2}) {1} ({2}) - default: {3}" -f ($i + 1), $BuiltinProviderLabels[$provider], $provider, $BuiltinProviderModels[$provider])
     }
     $customIndex = $BuiltinModelProviders.Count + 1
     Write-Host ("  {0,2}) Custom OpenAI-compatible" -f $customIndex)

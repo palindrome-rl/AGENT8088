@@ -508,15 +508,32 @@ drop_config() {
 # Stage 8: Setup wizard
 # ----------------------------------------------------------------------------
 BUILTIN_MODEL_PROVIDERS=(
-    ollama openrouter openai anthropic gemini cerebras deepseek groq mistral moonshot qwen ollama-cloud copilot
+    ollama openrouter openai gemini cerebras deepseek groq mistral moonshot qwen ollama-cloud copilot
 )
+
+provider_label() {
+    case "$1" in
+        ollama)       echo "Ollama (local)" ;;
+        openrouter)   echo "OpenRouter" ;;
+        openai)       echo "OpenAI" ;;
+        gemini)       echo "Google Gemini" ;;
+        cerebras)     echo "Cerebras" ;;
+        deepseek)     echo "DeepSeek" ;;
+        groq)         echo "Groq" ;;
+        mistral)      echo "Mistral" ;;
+        moonshot)     echo "Moonshot (Kimi)" ;;
+        qwen)         echo "Qwen (DashScope)" ;;
+        ollama-cloud) echo "Ollama Cloud" ;;
+        copilot)      echo "GitHub Copilot" ;;
+        *)            echo "$1" ;;
+    esac
+}
 
 provider_base_url() {
     case "$1" in
         ollama)       echo "http://localhost:11434/v1" ;;
         openrouter)   echo "https://openrouter.ai/api/v1" ;;
         openai)       echo "https://api.openai.com/v1" ;;
-        anthropic)    echo "https://api.anthropic.com/v1" ;;
         gemini)       echo "https://generativelanguage.googleapis.com/v1beta/openai/" ;;
         cerebras)     echo "https://api.cerebras.ai/v1" ;;
         deepseek)     echo "https://api.deepseek.com/v1" ;;
@@ -533,9 +550,8 @@ provider_base_url() {
 provider_default_model() {
     case "$1" in
         ollama)       echo "qwen14b-tooluse-v3" ;;
-        openrouter)   echo "openrouter/auto" ;;
+        openrouter)   echo "anthropic/claude-sonnet-4" ;;
         openai)       echo "gpt-4o" ;;
-        anthropic)    echo "claude-sonnet-4-6" ;;
         gemini)       echo "gemini-2.0-flash" ;;
         cerebras)     echo "gpt-oss-120b" ;;
         deepseek)     echo "deepseek-chat" ;;
@@ -544,7 +560,7 @@ provider_default_model() {
         moonshot)     echo "kimi-k2.6" ;;
         qwen)         echo "qwen-plus" ;;
         ollama-cloud) echo "gpt-oss:120b" ;;
-        copilot)      echo "gpt-4o" ;;
+        copilot)      echo "gpt-4o-mini" ;;
         *)            echo "model-name" ;;
     esac
 }
@@ -585,7 +601,8 @@ select_model_provider() {
     local current_provider="$1" answer current_lower provider i
     echo "Select model provider:" >&2
     for i in "${!BUILTIN_MODEL_PROVIDERS[@]}"; do
-        printf "  %2d) %s\n" "$((i + 1))" "${BUILTIN_MODEL_PROVIDERS[$i]}" >&2
+        provider="${BUILTIN_MODEL_PROVIDERS[$i]}"
+        printf "  %2d) %s (%s) - default: %s\n" "$((i + 1))" "$(provider_label "$provider")" "$provider" "$(provider_default_model "$provider")" >&2
     done
     printf "  %2d) %s\n" "$((${#BUILTIN_MODEL_PROVIDERS[@]} + 1))" "Custom OpenAI-compatible" >&2
     answer="$(read_setup_value "Choice [$current_provider]: ")"
