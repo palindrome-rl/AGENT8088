@@ -86,13 +86,13 @@ ALLOWED_PATHS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Permission layer — readonly by default, escalates to edit on user approval
+# Permission layer ÔÇö readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
-_one_shot_grant = False
+_one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
 
 # ---------------------------------------------------------------------------
-# Layer 1: Sensitive file read protection — hardcoded blocklist + config override
+# Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
 # ---------------------------------------------------------------------------
 SENSITIVE_FILE_PATTERNS = [
     ".env", "config.txt", "configb.txt", "id_rsa", "id_ed25519",
@@ -101,54 +101,58 @@ SENSITIVE_FILE_PATTERNS = [
 SENSITIVE_FILE_EXTENSIONS = frozenset([".pem", ".key", ".rsa", ".p12"])
 SENSITIVE_FILE_GLOBS = ["*_KEY*", "*_SECRET*", "*_TOKEN*", "*_PASSWORD*",
                         "*_key*", "*_secret*", "*_token*", "*_password*"]
+
 ALLOWED_SENSITIVE_FILES = set(
     p.strip() for p in APP_CONFIG.get("allowed_sensitive_files", "").split(",") if p.strip()
 )
 
-NO_PROMPT_PATHS = [
-    Path(p.strip()).expanduser().resolve()
-    for p in APP_CONFIG.get("no_prompt_paths", "").split(",") if p.strip()
-]
-PROMPT_PATHS = [
-    Path(p.strip()).expanduser().resolve()
-    for p in APP_CONFIG.get("prompt_paths", "~").split(",") if p.strip()
-]
-BLOCKED_PATHS = [
-    Path(p.strip()).expanduser().resolve()
-    for p in APP_CONFIG.get("blocked_paths", "").split(",") if p.strip()
-]
-
-READONLY_SAFE_COMMANDS = frozenset([
-    "ls", "cat", "grep", "find", "head", "tail", "wc", "pwd", "whoami",
-    "echo", "date", "uname", "df", "du", "free", "nproc", "uptime",
-    "diff", "log", "status", "show", "branch",
-    "dir", "type", "findstr", "where", "hostname", "ver", "vol",
-    "tasklist", "systeminfo", "wmic",
-    "git", "python", "pip", "node", "npm",
-    "curl", "wget",
-])
-
 
 def _is_sensitive_path(filepath: str) -> bool:
+    """Check if a file path matches the sensitive blocklist. Returns True if blocked."""
     fn = Path(filepath).name.lower()
     fp = str(filepath).lower()
+
+    # Config override ÔÇö user explicitly allowed this file
     for allowed in ALLOWED_SENSITIVE_FILES:
         if allowed.lower() in fn or allowed.lower() in fp:
             return False
+
+    # Exact filename match
     for pattern in SENSITIVE_FILE_PATTERNS:
         if pattern.lower() in fn or pattern.lower() in fp:
             return True
+
+    # Extension match
     for ext in SENSITIVE_FILE_EXTENSIONS:
         if fn.endswith(ext):
             return True
+
+    # Glob patterns
     import fnmatch
     for glob in SENSITIVE_FILE_GLOBS:
         if fnmatch.fnmatch(fn, glob):
             return True
+
     return False
 
 
+# ---------------------------------------------------------------------------
+# Layer 3: Path-based write restrictions ÔÇö three-tier zones
+# ---------------------------------------------------------------------------
+def _resolve_path_list(config_key: str, default: str = "") -> list:
+    """Parse a comma-separated path list from config, resolve each to an absolute Path."""
+    raw = APP_CONFIG.get(config_key, default)
+    if not raw.strip():
+        return []
+    return [Path(p.strip()).expanduser().resolve() for p in raw.split(",") if p.strip()]
+
+NO_PROMPT_PATHS = _resolve_path_list("no_prompt_paths")
+PROMPT_PATHS = _resolve_path_list("prompt_paths", ".")
+BLOCKED_PATHS = _resolve_path_list("blocked_paths")
+
+
 def _check_path_zone(target: Path) -> str:
+    """Return 'blocked', 'no_prompt', 'prompt', or 'default' for a write target."""
     for base in BLOCKED_PATHS:
         if target == base or base in target.parents:
             return "blocked"
@@ -160,18 +164,37 @@ def _check_path_zone(target: Path) -> str:
             return "prompt"
     return "default"
 
+# Shell commands that are safe in readonly mode (inspection only)
+READONLY_SAFE_COMMANDS = frozenset([
+    # Unix
+    "ls", "cat", "grep", "find", "head", "tail", "wc", "pwd", "whoami",
+    "echo", "date", "uname", "df", "du", "free", "nproc", "uptime",
+    "diff", "log", "status", "show", "branch",
+    # Windows
+    "dir", "type", "findstr", "where", "hostname", "ver", "vol",
+    "tasklist", "systeminfo", "wmic",
+    # Cross-platform
+    "git", "python", "pip", "node", "npm",
+    "curl", "wget",
+])
+
 
 def check_permission(mode: str, command: str = "") -> bool:
+    """Return True if the tool mode is allowed in the current permission mode."""
     global _one_shot_grant
     if PERMISSION_MODE == "edit":
         return True
+    # One-shot grant: allow one blocked tool through, then revert
     if _one_shot_grant:
         _one_shot_grant = False
         return True
-    if mode in ("read_text", "last_output", "python_eval", "plan", "http_get", "http_post", "browser", "subagent", "cron", "docker"):
+    # readonly mode
+    if mode in ("read_text", "last_output", "python_eval", "plan"):
         return True
     if mode == "shell":
+        # Allow inspection-only shell commands in readonly
         cmd_base = command.strip().split()[0] if command.strip() else ""
+        # Handle "git status", "git log", etc.
         if cmd_base == "git" and len(command.strip().split()) > 1:
             subcmd = command.strip().split()[1]
             if subcmd in ("status", "diff", "log", "show", "branch"):
@@ -181,13 +204,20 @@ def check_permission(mode: str, command: str = "") -> bool:
 
 
 def request_escalation(target_mode: str, paths: list, change_type: str, reason: str) -> str:
-    return f"ESCALATION_REQUEST:{target_mode}:{change_type}:{','.join(paths)}:{reason}"
+    """Return a structured escalation request string for the model to relay
+    to the user. The UI intercepts this and prompts the user for approval."""
+    return (
+        f"ESCALATION_REQUEST:{target_mode}:{change_type}:{','.join(paths)}:{reason}"
+    )
 
 
 def grant_escalation():
+    """Allow exactly one blocked tool call to run, then revert to readonly.
+    The user is prompted for every write/mutation ÔÇö no session-wide grants."""
     global _one_shot_grant
     _one_shot_grant = True
 
+DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
 
@@ -1223,21 +1253,33 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     mode = (spec.get("mode") or "").lower()
     timeout = int(spec.get("timeout") or 25)
 
-    # Sensitive file check for read_text
+    # --- Layer 1: Sensitive file read protection (before anything else) ---
     if mode == "read_text":
         path_arg = spec.get("path_arg") or "filename"
-        fn = args.get(path_arg) or args.get("filename") or args.get("file") or ""
-        if fn and _is_sensitive_path(fn):
-            return "Access to sensitive file denied"
+        fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
+        if _is_sensitive_path(fn):
+            return f"Error: Access to sensitive file denied: {fn}"
 
-    # Permission gate — check before any execution
+    # --- Layer 2: Network access control (http_get requires escalation) ---
+    if mode == "http_get":
+        url = _format_with_args(spec.get("url") or "{url}", args)
+        if not check_permission(mode, url):
+            return request_escalation(
+                target_mode="edit",
+                paths=[url[:120]],
+                change_type="network_request",
+                reason=f"Tool '{name}' wants to make an HTTP request to: {url[:200]}",
+            )
+        return _exec_shell_command(f'curl -s --max-time {timeout} "{url}"', timeout=timeout)
+
+    # --- Permission gate for write/shell (Layers 1+3) ---
     command = ""
     if mode == "shell":
         command = _format_with_args(spec.get("command") or "{command}", args)
     elif mode == "write_text":
         command = "write_file"
 
-    if not check_permission(mode, command):
+    if mode in ("write_text", "shell") and not check_permission(mode, command):
         paths_str = ""
         if mode == "write_text":
             path_arg = spec.get("path_arg") or "filename"
@@ -1749,6 +1791,11 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
             with spin(f"running {name}..."):
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
+
+            # If blocked by permission gate, remove from seen so retry can run
+            if result.startswith("ESCALATION_REQUEST:"):
+                seen.discard(sig)
+
             if on_result:
                 on_result(name, result)
 
