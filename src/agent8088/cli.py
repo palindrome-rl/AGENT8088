@@ -724,7 +724,11 @@ def parse_tool_args(raw):
     for pair in raw.split():
         if "=" in pair:
             k, v = pair.split("=", 1)
-            args[k.strip()] = v.strip()
+            v = v.strip()
+            # Strip surrounding quotes: "value" -> value, 'value' -> value
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            args[k.strip()] = v
     return args
 
 
