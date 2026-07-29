@@ -26,6 +26,20 @@ BUILTIN_PROVIDERS = {
 
 PROVIDERS = {}
 
+
+def default_provider_name():
+    return "ollama"
+
+
+def builtin_provider_names():
+    """Return built-in provider names without exposing endpoint details in callers."""
+    return sorted(BUILTIN_PROVIDERS)
+
+
+def builtin_provider_defaults(name):
+    """Return a copy of a built-in provider profile."""
+    return dict(BUILTIN_PROVIDERS.get(name, {}))
+
 def load_providers(config):
     """Build PROVIDERS from config.txt + BUILTIN_PROVIDERS defaults."""
     PROVIDERS.clear()
@@ -126,10 +140,10 @@ def _normalize_model_id(provider_name, model_id):
     return model_id
 
 
-def list_models(provider_name, client=None, timeout=15):
+def list_models(provider_name, client=None, timeout=15, fallback=True):
     """Fetch available models from provider's /v1/models endpoint.
     Two-tier cache: in-memory + on-disk (survives restarts). 1-hour TTL.
-    Falls back to FALLBACK_MODELS on error. Returns a list of model ID strings."""
+    Optionally falls back to FALLBACK_MODELS on error. Returns model ID strings."""
     now = time.time()
     disk = _load_disk_cache()
     cached = disk.get(provider_name) or _cache.get(provider_name)
@@ -146,4 +160,6 @@ def list_models(provider_name, client=None, timeout=15):
         _save_disk_cache(disk)
         return models
     except Exception:
+        if not fallback:
+            return []
         return list(FALLBACK_MODELS.get(provider_name, []))

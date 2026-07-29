@@ -1565,8 +1565,89 @@ def _install_completion():
 
 def _agent8088_home():
     """Find the agent8088 install home directory."""
-    return Path(os.environ.get("AGENT8088_HOME", os.path.join(
-        os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")), "agent8088")))
+    if os.environ.get("AGENT8088_HOME"):
+        return Path(os.environ["AGENT8088_HOME"]).expanduser()
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "agent8088"
+    return Path.home() / ".agent8088"
+
+
+def _agent8088_link_dir():
+    if os.environ.get("AGENT8088_LINK_DIR"):
+        return Path(os.environ["AGENT8088_LINK_DIR"]).expanduser()
+    if os.name == "nt":
+        return _agent8088_home() / "agent8088" / "venv" / "Scripts"
+    return Path.home() / ".local" / "bin"
+
+
+def _safe_uninstall_home(path):
+    target = path.expanduser().resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    root = Path(target.anchor).resolve(strict=False)
+    return target not in {root, home}
+
+
+def _remove_agent8088_shim(home):
+    name = "agent8088.exe" if os.name == "nt" else "agent8088"
+    shim = _agent8088_link_dir() / name
+    if not shim.exists() or shim.is_dir():
+        return False
+    try:
+        text = shim.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        text = ""
+    if str(home) not in text and "-m agent8088.cli" not in text:
+        return False
+    shim.unlink()
+    return True
+
+
+def _remove_agent8088_config_exports():
+    removed = 0
+    markers = ("AGENT8088_CONFIG",)
+    for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
+               Path.home() / ".bashrc", Path.home() / ".bash_profile",
+               Path.home() / ".profile"):
+        if not rc.exists() or not rc.is_file():
+            continue
+        lines = rc.read_text(encoding="utf-8", errors="ignore").splitlines()
+        kept = [line for line in lines if not any(marker in line for marker in markers)]
+        if kept != lines:
+            rc.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            removed += 1
+    return removed
+
+
+def _run_uninstall():
+    import shutil
+    home = _agent8088_home()
+    print(f"This will permanently remove Agent8088 from: {home}")
+    answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
+    if answer.strip() != "yes":
+        print("Uninstall cancelled.")
+        return False
+    if not _safe_uninstall_home(home):
+        print(f"Refusing to remove unsafe path: {home}")
+        return False
+    if home.exists():
+        shutil.rmtree(home)
+        print(f"Removed {home}")
+    else:
+        print(f"Install directory not found: {home}")
+    if _remove_agent8088_shim(home):
+        print("Removed agent8088 command shim.")
+    os.environ.pop("AGENT8088_CONFIG", None)
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE)
+        winreg.DeleteValue(k, "AGENT8088_CONFIG")
+        winreg.CloseKey(k)
+    except Exception:
+        pass
+    if os.name != "nt":
+        _remove_agent8088_config_exports()
+    print("Done. Open a NEW terminal for PATH to refresh.")
+    return True
 
 
 def _run_update():
@@ -1605,6 +1686,7 @@ def _run_setup():
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
     from InquirerPy import inquirer
+    from agent8088 import providers as provider_registry
     home = _agent8088_home()
     config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
@@ -1618,52 +1700,62 @@ def _run_setup():
     print("Agent8088 setup\n")
     cur_paths = _current("allowed_paths") or "~"
     paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
-    # Provider picker — always show all 13 built-in providers
-    from agent8088.providers import BUILTIN_PROVIDERS
-    providers_list = sorted(BUILTIN_PROVIDERS.keys())
-    cur_model = _current("model") or _current("model_name") or "ollama:qwen14b-tooluse-v3"
-    cur_provider = cur_model.split(":")[0] if ":" in cur_model else "ollama"
+    # Provider picker — include built-ins plus any custom providers already in config.
+    configured = {
+        name for name in _re.findall(r'^provider\.([^.]+)\.[^=]+=', content, _re.MULTILINE)
+    }
+    providers_list = sorted(set(provider_registry.builtin_provider_names()) | configured)
+    cur_provider = _current("default_provider") or provider_registry.default_provider_name()
     provider = inquirer.fuzzy(
         message="Select model provider:",
         choices=providers_list,
         default=cur_provider,
         max_height="70%",
     ).execute()
-    # API key
-    cur_key = _current(f"provider.{provider}.api_key") or ""
-    key = inquirer.text(
+    provider_pat = _re.escape(provider)
+    current_model = _current(f"provider.{provider}.model")
+    current_key = _current(f"provider.{provider}.api_key")
+
+    # API key input is deliberately hidden and has no default, so existing keys are
+    # never echoed back to the terminal. Empty input preserves the existing value.
+    key = inquirer.secret(
         message=f"API key for {provider}:",
-        default=cur_key,
-        instruction="(press Enter to skip if not needed)",
+        instruction="(hidden; Enter keeps existing/skips)",
     ).execute()
     # Fetch models
-    print(f"\nFetching models from {provider}...")
+    print("\nFetching model list...")
     try:
-        from agent8088.providers import list_models, BUILTIN_PROVIDERS
+        from agent8088.providers import list_models
         from openai import OpenAI
-        builtin = BUILTIN_PROVIDERS.get(provider, {})
-        base_url = builtin.get("base_url", _current(f"provider.{provider}.base_url") or "http://localhost:11434/v1")
-        api_key = key or _current(f"provider.{provider}.api_key") or "ollama"
+        defaults = provider_registry.builtin_provider_defaults(provider)
+        base_url = _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
+        api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
         fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
-        models = list_models(provider, client=fetch_client)
-    except Exception as e:
-        from agent8088.providers import FALLBACK_MODELS
-        models = FALLBACK_MODELS.get(provider, ["unknown-model"])
+        models = list_models(provider, client=fetch_client, fallback=False)
+    except Exception:
+        models = []
     if models:
-        model_name = inquirer.fuzzy(
-            message="Select model:",
-            choices=models,
-            max_height="70%",
-        ).execute()
+        kwargs = {
+            "message": "Select model:",
+            "choices": models,
+            "max_height": "70%",
+        }
+        if current_model in models:
+            kwargs["default"] = current_model
+        model_name = inquirer.fuzzy(**kwargs).execute()
     else:
-        model_name = inquirer.text(message="Model name:").execute()
-    model_ref = f"{provider}:{model_name}"
+        model_name = inquirer.text(
+            message="Model name:",
+            default=current_model,
+            instruction="(required)",
+        ).execute()
+    if not model_name:
+        print("A model is required.")
+        return
     # Web search
-    cur_search = _current("search_base_url")
     search = inquirer.text(
         message="Web search URL (SearXNG):",
-        default=cur_search,
-        instruction="(press Enter to disable)",
+        instruction="(Enter keeps current setting; type none to disable)",
     ).execute()
     # Write config — use the format the engine's load_providers() expects:
     #   default_provider=<name>
@@ -1674,33 +1766,33 @@ def _run_setup():
     content = _re.sub(r'^default_provider=.*', lambda _: f'default_provider={provider}', content, flags=_re.MULTILINE)
     if not _re.search(r'^default_provider=', content, _re.MULTILINE):
         content += f"\ndefault_provider={provider}\n"
-    # Write provider base_url + model
-    # Look up the built-in base_url from our providers registry
-    from agent8088.providers import BUILTIN_PROVIDERS
-    builtin = BUILTIN_PROVIDERS.get(provider, {})
-    base_url = builtin.get("base_url", _current(f"provider.{provider}.base_url") or "")
+    # Write provider base_url + model. Endpoint defaults live in the provider registry.
+    defaults = provider_registry.builtin_provider_defaults(provider)
+    base_url = _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
     if base_url:
-        if _re.search(rf'^provider\.{provider}\.base_url=.*', content, _re.MULTILINE):
-            content = _re.sub(rf'^provider\.{provider}\.base_url=.*', lambda _: f'provider.{provider}.base_url={base_url}', content, flags=_re.MULTILINE)
+        if _re.search(rf'^provider\.{provider_pat}\.base_url=.*', content, _re.MULTILINE):
+            content = _re.sub(rf'^provider\.{provider_pat}\.base_url=.*', lambda _: f'provider.{provider}.base_url={base_url}', content, flags=_re.MULTILINE)
         else:
             content += f"\nprovider.{provider}.base_url={base_url}\n"
-    if _re.search(rf'^provider\.{provider}\.model=.*', content, _re.MULTILINE):
-        content = _re.sub(rf'^provider\.{provider}\.model=.*', lambda _: f'provider.{provider}.model={model_name}', content, flags=_re.MULTILINE)
+    if _re.search(rf'^provider\.{provider_pat}\.model=.*', content, _re.MULTILINE):
+        content = _re.sub(rf'^provider\.{provider_pat}\.model=.*', lambda _: f'provider.{provider}.model={model_name}', content, flags=_re.MULTILINE)
     else:
         content += f"\nprovider.{provider}.model={model_name}\n"
     if key:
-        if _re.search(rf'^provider\.{provider}\.api_key=.*', content, _re.MULTILINE):
-            content = _re.sub(rf'^provider\.{provider}\.api_key=.*', lambda _: f'provider.{provider}.api_key={key}', content, flags=_re.MULTILINE)
+        if _re.search(rf'^provider\.{provider_pat}\.api_key=.*', content, _re.MULTILINE):
+            content = _re.sub(rf'^provider\.{provider_pat}\.api_key=.*', lambda _: f'provider.{provider}.api_key={key}', content, flags=_re.MULTILINE)
         else:
             content += f"\nprovider.{provider}.api_key={key}\n"
-    if search:
+    if search.strip().lower() == "none":
+        content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
+    elif search:
         if _re.search(r'^#?\s*search_base_url=', content, _re.MULTILINE):
             content = _re.sub(r'^#?\s*search_base_url=.*', lambda _: f'search_base_url={search}', content, flags=_re.MULTILINE)
         else:
             content += f"\nsearch_base_url={search}\n"
     config_path.write_text(content, encoding="utf-8")
     print(f"\nConfig written to {config_path}")
-    print(f"Active model: {model_ref}")
+    print("Setup complete.")
 
 
 def main():
@@ -1713,28 +1805,14 @@ def main():
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
     parser.add_argument("--edit", action="store_true", help="start in edit mode (no per-action permission prompts)")
-    parser.add_argument("--uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
+    parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     args = parser.parse_args()
 
     if args.uninstall:
-        import shutil
-        home = Path(os.environ.get("AGENT8088_HOME", os.path.join(
-            os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")), "agent8088")))
-        print(f"Removing {home} ...")
-        if home.exists():
-            shutil.rmtree(home, ignore_errors=True)
-        os.environ.pop("AGENT8088_CONFIG", None)
-        try:
-            import winreg
-            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE)
-            winreg.DeleteValue(k, "AGENT8088_CONFIG")
-            winreg.CloseKey(k)
-        except Exception:
-            pass
-        print("Done. Open a NEW terminal for PATH to refresh.")
+        _run_uninstall()
         return
     if args.update:
         _run_update()

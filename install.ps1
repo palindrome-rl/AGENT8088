@@ -612,7 +612,7 @@ function Verify-Install {
     Write-Host ""
     Write-Success "Done. Run 'agent8088' to start."
     Write-Host "  Config: $Agent8088Home\config.txt"
-    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)"
+    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }
