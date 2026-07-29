@@ -388,13 +388,13 @@ install_deps() {
         # shellcheck disable=SC1091
         source "$INSTALL_DIR/venv/bin/activate"
         pip install --upgrade pip >/dev/null 2>&1
-        pip install -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
+        pip install --upgrade --force-reinstall -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
     else
         log_info "Creating venv and installing via uv..."
         "$UV_CMD" venv "$INSTALL_DIR/venv" >/dev/null 2>&1
-        "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" -e "$INSTALL_DIR" >/dev/null 2>&1 || {
+        "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
             log_error "uv pip install failed; trying with --all-extras"
-            "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" -e "$INSTALL_DIR" >/dev/null 2>&1 || {
+            "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
                 log_error "Failed to install agent8088"
                 exit 1
             }

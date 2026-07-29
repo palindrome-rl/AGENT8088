@@ -1679,7 +1679,7 @@ def _run_update():
         print(r.stdout.strip() or "Already up to date.")
     print("Code updated. Changes take effect on next launch.")
     print(f"If dependencies changed, reinstall from a fresh terminal:")
-    print(f"  {uv_cmd} pip install --python {venv_python} -e {install_dir}")
+    print(f"  {uv_cmd} pip install --python {venv_python} --reinstall-package agent8088 -e {install_dir}")
 
 
 def _run_setup():
