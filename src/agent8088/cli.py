@@ -1753,11 +1753,9 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     builtin_names = provider_registry.builtin_provider_names()
     provider_choices = [*builtin_names, CUSTOM_PROVIDER_CHOICE]
     cur_provider = _current("default_provider") or provider_registry.default_provider_name()
-    provider_default = cur_provider if cur_provider in builtin_names else CUSTOM_PROVIDER_CHOICE
     provider_choice = inquirer.fuzzy(
         message="Select model provider:",
         choices=provider_choices,
-        default=provider_default,
         max_height="70%",
     ).execute()
 

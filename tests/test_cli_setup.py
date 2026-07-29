@@ -63,6 +63,7 @@ def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys
     provider_prompt = [kwargs for kind, kwargs in fake.calls if kind == "fuzzy"][0]
     assert len(providers.builtin_provider_names()) == 13
     assert provider_prompt["choices"] == [*providers.builtin_provider_names(), cli.CUSTOM_PROVIDER_CHOICE]
+    assert "default" not in provider_prompt
 
     secret_calls = [kwargs for kind, kwargs in fake.calls if kind == "secret"]
     assert secret_calls
