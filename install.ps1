@@ -11,7 +11,7 @@
 
 param(
     [switch]$SkipSetup,
-    [string]$Branch = "main",
+    [string]$Branch = "development",
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = ""
 )

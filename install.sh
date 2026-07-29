@@ -29,7 +29,7 @@ export UV_NO_CONFIG=1
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/tayyabimam1/AGENT8088.git"
-REPO_BRANCH="main"
+REPO_BRANCH="development"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
