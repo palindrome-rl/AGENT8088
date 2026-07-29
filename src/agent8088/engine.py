@@ -896,8 +896,12 @@ def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) ->
 
 
 def _exec_shell_command(command: str, timeout: int = 25) -> str:
-    r = subprocess.run(command, shell=True, capture_output=True, text=True,
-                       timeout=timeout, executable="/bin/bash", cwd=str(SHELL_CWD))
+    if sys.platform == "win32":
+        r = subprocess.run(command, shell=True, capture_output=True, text=True,
+                           timeout=timeout, cwd=str(SHELL_CWD))
+    else:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True,
+                           timeout=timeout, executable="/bin/bash", cwd=str(SHELL_CWD))
     return (r.stdout + r.stderr).strip() or "✓ Command completed"
 
 
