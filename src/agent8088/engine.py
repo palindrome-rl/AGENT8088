@@ -208,12 +208,18 @@ BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
 # ---------------------------------------------------------------------------
 # Model client.  USE_GEMMA4=1 switches to the Gemma server on Colossus.
 # ---------------------------------------------------------------------------
-def load_providers(config: dict) -> dict:
+def load_providers(config: dict, include_builtins: bool = False) -> dict:
     """Parse `provider.<name>.<field>` keys from config into a registry.
     Fields: model, api_mode, base_url, api_key_env. OpenAI mode needs a base URL;
     LiteLLM mode also supports native provider identifiers such as Anthropic and
     Gemini without one. Credentials should use api_key_env, not api_key."""
     provs = {}
+    if include_builtins:
+        try:
+            from agent8088.providers import BUILTIN_PROVIDERS
+            provs.update({name: dict(info) for name, info in BUILTIN_PROVIDERS.items()})
+        except Exception:
+            pass
     for key, value in config.items():
         if not key.startswith("provider."):
             continue
@@ -228,7 +234,7 @@ def load_providers(config: dict) -> dict:
     }
 
 
-PROVIDERS = load_providers(APP_CONFIG)
+PROVIDERS = load_providers(APP_CONFIG, include_builtins=True)
 DEFAULT_PROVIDER = APP_CONFIG.get("default_provider", "")
 ACTIVE_PROVIDER = ""
 

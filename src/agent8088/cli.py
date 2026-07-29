@@ -300,6 +300,8 @@ _COMPACT_BANNER = r"""    _   ___ ___ _  _ _____ ___  __  ___  ___
 
 # The supplied Palindrome Research Labs PNG is rendered directly in classic mode.
 _PALINDROME_LOGO = APP_DIR / "assets" / "palindrome-research-labs.png"
+if not _PALINDROME_LOGO.is_file():
+    _PALINDROME_LOGO = APP_DIR.parent.parent / "assets" / "palindrome-research-labs.png"
 
 
 def _catalog(items, columns=4):
@@ -315,8 +317,7 @@ def _palindrome_logo():
     try:
         from PIL import Image
     except ImportError:
-        from rich.text import Text
-        return Text("")
+        return Text("▀" * 24)
 
     image = Image.open(_PALINDROME_LOGO).convert("RGB")
     blue = image.getchannel("B")
@@ -696,7 +697,8 @@ def cmd_help(_):
         ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
-        ("/model [ornith|gemma]", "Show or switch the backend model"),
+        ("/model [provider[:model]|setup]", "Show/switch providers or add a provider"),
+        ("/models [provider]", "Pick a provider/model interactively"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
         ("/new <name>", "Create a named persistent session"),
@@ -1009,7 +1011,7 @@ def cmd_model(rest):
     raw_arg = rest.strip()
     arg = raw_arg.lower()
     if arg == "setup":
-        console.print("[#237dd7]Run [bold]python agent8088_cli.py --model-setup[/bold] outside a chat session.[/#237dd7]")
+        configure_model_profile()
         return
     if not arg:
         if A.PROVIDERS:
@@ -1024,7 +1026,7 @@ def cmd_model(rest):
                 t.add_row(name, p.get("model", "—"), p.get("api_mode", "openai"), p.get("base_url", "—"))
             console.print(t)
         else:
-            console.print(f"[dim]No providers configured — run `python agent8088_cli.py --model-setup` "
+            console.print(f"[dim]No providers configured — run `/model setup` "
                           f"or add one to {A.CONFIG_PATH}[/dim]")
         active = A.ACTIVE_PROVIDER or "default"
         console.print(f"Active: [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]  ·  switch with "
@@ -1051,6 +1053,56 @@ def cmd_model(rest):
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
 
 
+def _fetch_models_for_provider(provider):
+    try:
+        from agent8088.providers import FALLBACK_MODELS, list_models
+        client, _ = A.get_client(provider)
+        if hasattr(client, "models"):
+            return list_models(provider, client=client, fallback=True)
+        return list(FALLBACK_MODELS.get(provider, []))
+    except Exception:
+        return []
+
+
+def cmd_models(rest):
+    """Interactive provider/model picker for switching models inside the REPL."""
+    try:
+        from InquirerPy import inquirer
+    except ImportError:
+        console.print("[red]InquirerPy is missing.[/red] Run the installer/update again.")
+        return
+    provider = rest.strip().lower()
+    if not provider:
+        choices = sorted(A.PROVIDERS)
+        if not choices:
+            console.print(f"[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
+            return
+        kwargs = {"message": "Select provider:", "choices": choices, "max_height": "70%"}
+        active = A.ACTIVE_PROVIDER or A.APP_CONFIG.get("default_provider", "")
+        if active in choices:
+            kwargs["default"] = active
+        provider = inquirer.fuzzy(**kwargs).execute()
+    if provider not in A.PROVIDERS:
+        console.print(f"[red]unknown provider[/red] '{provider}' — known: "
+                      + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
+        return
+    models = _fetch_models_for_provider(provider)
+    if models:
+        kwargs = {"message": "Select model:", "choices": models, "max_height": "70%"}
+        current = A.PROVIDERS.get(provider, {}).get("model", "")
+        if current in models:
+            kwargs["default"] = current
+        model = inquirer.fuzzy(**kwargs).execute()
+    else:
+        model = inquirer.text(message="Model name:", default=A.PROVIDERS.get(provider, {}).get("model", "")).execute()
+    if not model:
+        console.print("[red]A model is required.[/red]")
+        return
+    os.environ.pop("USE_GEMMA4", None)
+    A.activate_model(provider, model)
+    console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{provider}:{A.MODEL_NAME}[/#237dd7]")
+
+
 def save_model_profile(path, name, api_mode, model, base_url="", api_key_env=""):
     """Append a safe provider profile; credentials stay in the environment."""
     fields = [
@@ -1067,35 +1119,8 @@ def save_model_profile(path, name, api_mode, model, base_url="", api_key_env="")
 
 
 def configure_model_profile():
-    """Hermes-style setup: configure a profile now, switch it with /model later."""
-    console.print(Panel(
-        "Profiles are saved to {}. API keys are read from an environment variable, never saved here.".format(A.CONFIG_PATH),
-        title="Model setup",
-        border_style="#00C8FF",
-    ))
-    try:
-        name = console.input("profile name › ").strip().lower()
-        api_mode = console.input("mode [litellm/openai] (litellm) › ").strip().lower() or "litellm"
-        model = console.input("model (for example anthropic/claude-sonnet-4-5-20250929) › ").strip()
-        base_url = console.input("base URL (optional for LiteLLM) › ").strip()
-        api_key_env = console.input("API-key environment variable (optional) › ").strip()
-    except EOFError:
-        console.print("[dim]Model setup cancelled.[/dim]")
-        return
-    if not name.replace("_", "").replace("-", "").isalnum():
-        console.print("[red]Profile names use letters, numbers, _ or -.[/red]")
-        return
-    if api_mode not in {"litellm", "openai"}:
-        console.print("[red]mode must be litellm or openai[/red]")
-        return
-    if not model:
-        console.print("[red]A model is required.[/red]")
-        return
-    if api_mode == "openai" and not base_url:
-        console.print("[red]An OpenAI-compatible profile needs a base URL.[/red]")
-        return
-    save_model_profile(A.CONFIG_PATH, name, api_mode, model, base_url, api_key_env)
-    console.print("[#237dd7]Saved {}. Restart the app, then run /model {}.[/#237dd7]".format(name, name))
+    """Configure a model profile from inside the running REPL."""
+    _run_setup(config_path=A.CONFIG_PATH, include_workspace=False, activate_runtime=True, heading="Model setup")
 
 
 def cmd_config(_):
@@ -1441,7 +1466,7 @@ COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "skills": cmd_skills,
-    "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
+    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
     "status": cmd_status, "doctor": cmd_doctor,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
@@ -1682,13 +1707,28 @@ def _run_update():
     print(f"  {uv_cmd} pip install --python {venv_python} --reinstall-package agent8088 -e {install_dir}")
 
 
-def _run_setup():
+CUSTOM_PROVIDER_CHOICE = "Custom OpenAI-compatible"
+
+
+def _valid_provider_name(name):
+    return bool(name) and name.replace("_", "").replace("-", "").isalnum()
+
+
+def _reload_model_runtime(config_path, provider="", model=""):
+    A.APP_CONFIG = A.load_simple_config(Path(config_path))
+    A.PROVIDERS = A.load_providers(A.APP_CONFIG, include_builtins=True)
+    A.DEFAULT_PROVIDER = A.APP_CONFIG.get("default_provider", "")
+    if provider:
+        A.activate_model(provider, model)
+
+
+def _run_setup(config_path=None, include_workspace=True, activate_runtime=False, heading="Agent8088 setup"):
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
     from InquirerPy import inquirer
     from agent8088 import providers as provider_registry
     home = _agent8088_home()
-    config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
         print(f"Config not found: {config_path}")
         print("Run the installer first.")
@@ -1697,22 +1737,49 @@ def _run_setup():
     def _current(key):
         m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
         return m.group(1).strip() if m else ""
-    print("Agent8088 setup\n")
-    cur_paths = _current("allowed_paths") or "~"
-    paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
-    # Provider picker — include built-ins plus any custom providers already in config.
-    configured = {
-        name for name in _re.findall(r'^provider\.([^.]+)\.[^=]+=', content, _re.MULTILINE)
-    }
-    providers_list = sorted(set(provider_registry.builtin_provider_names()) | configured)
+    def _set_line(text, key, value):
+        pattern = rf'^{_re.escape(key)}=.*'
+        if _re.search(pattern, text, _re.MULTILINE):
+            return _re.sub(pattern, lambda _: f"{key}={value}", text, flags=_re.MULTILINE)
+        return text + f"\n{key}={value}\n"
+
+    print(f"{heading}\n")
+    if include_workspace:
+        cur_paths = _current("allowed_paths") or "~"
+        paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
+    else:
+        paths = ""
+
+    builtin_names = provider_registry.builtin_provider_names()
+    provider_choices = [*builtin_names, CUSTOM_PROVIDER_CHOICE]
     cur_provider = _current("default_provider") or provider_registry.default_provider_name()
-    provider = inquirer.fuzzy(
+    provider_default = cur_provider if cur_provider in builtin_names else CUSTOM_PROVIDER_CHOICE
+    provider_choice = inquirer.fuzzy(
         message="Select model provider:",
-        choices=providers_list,
-        default=cur_provider,
+        choices=provider_choices,
+        default=provider_default,
         max_height="70%",
     ).execute()
-    provider_pat = _re.escape(provider)
+
+    custom_base_url = ""
+    if provider_choice == CUSTOM_PROVIDER_CHOICE:
+        default_name = cur_provider if cur_provider not in builtin_names else "custom"
+        provider = inquirer.text(message="Custom provider name:", default=default_name).execute().strip().lower()
+        if not _valid_provider_name(provider):
+            print("Custom provider names use letters, numbers, _ or -.")
+            return
+        custom_base_url = inquirer.text(
+            message="OpenAI-compatible URL:",
+            instruction="(required, e.g. https://host/v1)",
+        ).execute().strip()
+        if not custom_base_url:
+            custom_base_url = _current(f"provider.{provider}.base_url")
+        if not custom_base_url:
+            print("An OpenAI-compatible URL is required.")
+            return
+    else:
+        provider = provider_choice
+
     current_model = _current(f"provider.{provider}.model")
     current_key = _current(f"provider.{provider}.api_key")
 
@@ -1728,7 +1795,7 @@ def _run_setup():
         from agent8088.providers import list_models
         from openai import OpenAI
         defaults = provider_registry.builtin_provider_defaults(provider)
-        base_url = _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
+        base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
         api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
         fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
         models = list_models(provider, client=fetch_client, fallback=False)
@@ -1752,37 +1819,29 @@ def _run_setup():
     if not model_name:
         print("A model is required.")
         return
-    # Web search
-    search = inquirer.text(
-        message="Web search URL (SearXNG):",
-        instruction="(Enter keeps current setting; type none to disable)",
-    ).execute()
-    # Write config — use the format the engine's load_providers() expects:
-    #   default_provider=<name>
-    #   provider.<name>.base_url=<url>
-    #   provider.<name>.model=<model>
-    #   provider.<name>.api_key=<key>
-    content = _re.sub(r'^allowed_paths=.*', lambda _: f'allowed_paths={paths}', content, flags=_re.MULTILINE)
-    content = _re.sub(r'^default_provider=.*', lambda _: f'default_provider={provider}', content, flags=_re.MULTILINE)
-    if not _re.search(r'^default_provider=', content, _re.MULTILINE):
-        content += f"\ndefault_provider={provider}\n"
+
+    if include_workspace:
+        search = inquirer.text(
+            message="Web search URL (SearXNG):",
+            instruction="(Enter keeps current setting; type none to disable)",
+        ).execute()
+    else:
+        search = ""
+
+    if paths:
+        content = _set_line(content, "allowed_paths", paths)
+    content = _set_line(content, "default_provider", provider)
+
     # Write provider base_url + model. Endpoint defaults live in the provider registry.
     defaults = provider_registry.builtin_provider_defaults(provider)
-    base_url = _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
+    base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
     if base_url:
-        if _re.search(rf'^provider\.{provider_pat}\.base_url=.*', content, _re.MULTILINE):
-            content = _re.sub(rf'^provider\.{provider_pat}\.base_url=.*', lambda _: f'provider.{provider}.base_url={base_url}', content, flags=_re.MULTILINE)
-        else:
-            content += f"\nprovider.{provider}.base_url={base_url}\n"
-    if _re.search(rf'^provider\.{provider_pat}\.model=.*', content, _re.MULTILINE):
-        content = _re.sub(rf'^provider\.{provider_pat}\.model=.*', lambda _: f'provider.{provider}.model={model_name}', content, flags=_re.MULTILINE)
-    else:
-        content += f"\nprovider.{provider}.model={model_name}\n"
+        content = _set_line(content, f"provider.{provider}.base_url", base_url)
+    if provider_choice == CUSTOM_PROVIDER_CHOICE:
+        content = _set_line(content, f"provider.{provider}.api_mode", "openai")
+    content = _set_line(content, f"provider.{provider}.model", model_name)
     if key:
-        if _re.search(rf'^provider\.{provider_pat}\.api_key=.*', content, _re.MULTILINE):
-            content = _re.sub(rf'^provider\.{provider_pat}\.api_key=.*', lambda _: f'provider.{provider}.api_key={key}', content, flags=_re.MULTILINE)
-        else:
-            content += f"\nprovider.{provider}.api_key={key}\n"
+        content = _set_line(content, f"provider.{provider}.api_key", key)
     if search.strip().lower() == "none":
         content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
     elif search:
@@ -1791,6 +1850,8 @@ def _run_setup():
         else:
             content += f"\nsearch_base_url={search}\n"
     config_path.write_text(content, encoding="utf-8")
+    if activate_runtime:
+        _reload_model_runtime(config_path, provider, model_name)
     print(f"\nConfig written to {config_path}")
     print("Setup complete.")
 

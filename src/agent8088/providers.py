@@ -46,16 +46,15 @@ def load_providers(config):
     for name, info in BUILTIN_PROVIDERS.items():
         PROVIDERS[name] = dict(info)
     for key, val in config.items():
-        if key.startswith("provider.") and key.endswith(".base_url"):
-            name = key[len("provider."):-len(".base_url")]
-            if name not in PROVIDERS:
-                PROVIDERS[name] = {}
-            PROVIDERS[name]["base_url"] = val
-        elif key.startswith("provider.") and key.endswith(".api_key"):
-            name = key[len("provider."):-len(".api_key")]
-            if name not in PROVIDERS:
-                PROVIDERS[name] = {}
-            PROVIDERS[name]["api_key"] = val
+        if not key.startswith("provider."):
+            continue
+        parts = key.split(".", 2)
+        if len(parts) != 3:
+            continue
+        _, name, field = parts
+        if name not in PROVIDERS:
+            PROVIDERS[name] = {}
+        PROVIDERS[name][field] = val
 
 def _resolve_api_key(info):
     """Get the API key: direct value first, then env var."""
