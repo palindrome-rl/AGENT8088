@@ -39,6 +39,8 @@ PYTHON_FALLBACK_VERSIONS=("3.12" "3.10")
 SKIP_SETUP=false
 BRANCH="$REPO_BRANCH"
 IS_INTERACTIVE=true
+FRESH_INSTALL=false
+INITIAL_SETUP_RAN=false
 
 # Detect non-interactive mode (curl | bash). When stdin is not a terminal,
 # read -p fails with EOF, causing set -e to abort.
@@ -375,6 +377,7 @@ clone_repo() {
         git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
         cd "$INSTALL_DIR"
         git config core.autocrlf false
+        FRESH_INSTALL=true
     fi
     log_success "Repository ready at $INSTALL_DIR"
 }
@@ -741,6 +744,52 @@ verify_install() {
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
 }
 
+run_agent8088_command() {
+    if [ "$IS_INTERACTIVE" = false ] && (: </dev/tty) 2>/dev/null; then
+        "$@" < /dev/tty
+    else
+        "$@"
+    fi
+}
+
+run_initial_setup() {
+    if [ "$FRESH_INSTALL" != true ]; then
+        log_info "Existing installation updated — skipping first-run setup."
+        return 0
+    fi
+    if [ "$SKIP_SETUP" = true ]; then
+        log_info "Skipping first-run setup (--skip-setup)"
+        return 0
+    fi
+    if [ "$IS_INTERACTIVE" = false ] && ! (: </dev/tty) 2>/dev/null; then
+        log_info "No TTY detected — skipping first-run setup"
+        log_info "Run agent8088 --setup later to configure your model."
+        return 0
+    fi
+
+    local shim="$(get_command_link_dir)/agent8088"
+    if [ ! -x "$shim" ]; then
+        log_warn "agent8088 command is not ready yet; run agent8088 --setup later."
+        return 0
+    fi
+    log_info "Starting first-run setup..."
+    if run_agent8088_command "$shim" --setup; then
+        INITIAL_SETUP_RAN=true
+    else
+        log_warn "First-run setup did not complete; run agent8088 --setup later."
+    fi
+}
+
+launch_initial_agent() {
+    [ "$FRESH_INSTALL" = true ] || return 0
+    [ "$INITIAL_SETUP_RAN" = true ] || return 0
+
+    local shim="$(get_command_link_dir)/agent8088"
+    echo ""
+    log_info "Starting Agent8088..."
+    run_agent8088_command "$shim"
+}
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -754,8 +803,9 @@ main() {
     install_deps
     setup_path
     drop_config
-    run_setup_wizard
+    run_initial_setup
     verify_install
+    launch_initial_agent
 }
 
 main "$@"

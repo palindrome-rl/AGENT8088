@@ -81,6 +81,8 @@ if (-not $InstallDir) { $InstallDir = Join-Path $Agent8088Home "agent8088" }
 $RepoUrl = "https://github.com/tayyabimam1/AGENT8088.git"
 $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
+$FreshInstall = $false
+$InitialSetupRan = $false
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -433,6 +435,7 @@ function Clone-Repo {
             & git -C $InstallDir fetch --depth 1 origin $Branch 2>$null
             & git -C $InstallDir checkout -t origin/$Branch 2>$null
         }
+        $script:FreshInstall = $true
     }
     Write-Success "Repository ready at $InstallDir"
 }
@@ -700,6 +703,44 @@ function Verify-Install {
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }
 
+function Run-InitialSetup {
+    if (-not $script:FreshInstall) {
+        Write-Info "Existing installation updated - skipping first-run setup."
+        return
+    }
+    if ($SkipSetup) {
+        Write-Info "Skipping first-run setup (--SkipSetup)"
+        return
+    }
+    if ($NonInteractive) {
+        Write-Info "Non-interactive mode - skipping first-run setup"
+        Write-Info "Run agent8088 --setup later to configure your model."
+        return
+    }
+
+    $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
+    if (-not (Test-Path $agentExe)) {
+        Write-Warn "agent8088 command is not ready yet; run agent8088 --setup later."
+        return
+    }
+    Write-Info "Starting first-run setup..."
+    & $agentExe --setup
+    if ($LASTEXITCODE -eq 0) {
+        $script:InitialSetupRan = $true
+    } else {
+        Write-Warn "First-run setup did not complete; run agent8088 --setup later."
+    }
+}
+
+function Start-InitialAgent {
+    if (-not $script:FreshInstall -or -not $script:InitialSetupRan) { return }
+
+    $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
+    Write-Host ""
+    Write-Info "Starting Agent8088..."
+    & $agentExe
+}
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -711,5 +752,6 @@ Clone-Repo
 Install-Deps
 Setup-Path
 Drop-Config
-Run-SetupWizard
+Run-InitialSetup
 Verify-Install
+Start-InitialAgent
