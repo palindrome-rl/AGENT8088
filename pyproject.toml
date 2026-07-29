@@ -13,17 +13,6 @@ dependencies = [
     "InquirerPy>=0.3.4",
 ]
 
-[project.optional-dependencies]
-search = ["requests>=2.31.0"]
-training = [
-    "torch>=2.0.0",
-    "transformers>=4.35.0",
-    "peft>=0.5.0",
-    "datasets>=2.14.0",
-    "accelerate>=0.24.0",
-    "bitsandbytes>=0.41.0",
-]
-
 [project.scripts]
 agent8088 = "agent8088.cli:main"
 

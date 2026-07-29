@@ -214,7 +214,7 @@ def test_render_tool_docs_softened_when_tools_present(engine):
 
 
 def test_reasoning_command_registered():
-    import agent8088_cli as cli
+    import agent8088.cli as cli
     assert "reasoning" in cli.COMMANDS
     # default: chain-of-thought hidden
     assert cli.S.show_reasoning is False

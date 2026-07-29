@@ -3,7 +3,7 @@ import json
 
 from rich.console import Console
 
-import agent8088_cli as classic
+import agent8088.cli as classic
 
 
 def test_classic_banner_includes_brand_and_catalogues(monkeypatch):

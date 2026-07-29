@@ -65,7 +65,7 @@ def test_litellm_completion_uses_normalized_arguments(engine, monkeypatch):
 
 
 def test_save_model_profile_never_writes_the_key(tmp_path):
-    from agent8088_cli import save_model_profile
+    from agent8088.cli import save_model_profile
 
     path = tmp_path / "config.txt"
     save_model_profile(path, "claude", "litellm", "anthropic/claude", api_key_env="ANTHROPIC_API_KEY")

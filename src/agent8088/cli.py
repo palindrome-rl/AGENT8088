@@ -311,43 +311,8 @@ def _catalog(items, columns=4):
 
 
 def _palindrome_logo():
-    """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
-    try:
-        from PIL import Image
-    except ImportError:
-        from rich.text import Text
-        return Text("")
-
-    image = Image.open(_PALINDROME_LOGO).convert("RGB")
-    blue = image.getchannel("B")
-    bounds = blue.point(lambda value: 255 if value > 24 else 0).getbbox()
-    image = image.crop(bounds) if bounds else image
-    height = max(2, round(image.height / image.width * 24))
-    height += height % 2
-    image = image.resize((24, height), Image.Resampling.LANCZOS)
-
-    logo = Text()
-    pixels = image.load()
-    for y in range(0, height, 2):
-        for x in range(image.width):
-            top, bottom = pixels[x, y], pixels[x, y + 1]
-            if max(*top, *bottom) < 12:
-                logo.append(" ")
-            elif max(*top) < 12:
-                logo.append("▄", style=f"rgb({bottom[0]},{bottom[1]},{bottom[2]})")
-            elif max(*bottom) < 12:
-                logo.append("▀", style=f"rgb({top[0]},{top[1]},{top[2]})")
-            else:
-                logo.append(
-                    "▀",
-                    style=(f"rgb({top[0]},{top[1]},{top[2]}) "
-                           f"on rgb({bottom[0]},{bottom[1]},{bottom[2]})"),
-                )
-        if y + 2 < height:
-            logo.append("\n")
-    return logo
-
-
+    from rich.text import Text
+    return Text("")
 def _classic_masthead():
     """Mirror Hermes's layered ANSI Shadow logo with blue true-color bands."""
     masthead = Text()
