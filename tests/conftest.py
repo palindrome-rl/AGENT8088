@@ -1,7 +1,7 @@
-"""Shared fixtures: load the extension-less `agent8088` engine as a module."""
+"""Shared fixtures: load the agent8088 engine as a module."""
 import importlib.util
 import os
-from importlib.machinery import SourceFileLoader
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,15 +10,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_engine():
-    # Force repo-relative loading: the committed config.txt points at another
-    # machine's paths, so point AGENT8088_CONFIG at a non-existent file. The
-    # engine then defaults every path to APP_DIR (the repo) — its own tools.txt,
-    # system.md, and agents/ — making tests hermetic and machine-independent.
     os.environ["AGENT8088_CONFIG"] = str(ROOT / "_no_such_config.txt")
-    loader = SourceFileLoader("agent8088_core", str(ROOT / "agent8088"))
-    spec = importlib.util.spec_from_loader("agent8088_core", loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
+    sys.path.insert(0, str(ROOT / "src"))
+    from agent8088 import engine as mod
     return mod
 
 
@@ -46,3 +40,9 @@ class ScriptedModel:
             "message": type("M", (), {"content": content}),
             "finish_reason": "stop",
         })()]})
+
+
+@pytest.fixture
+def scripted():
+    """Factory for ScriptedModel instances."""
+    return ScriptedModel

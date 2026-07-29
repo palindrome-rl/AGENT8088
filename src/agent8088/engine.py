@@ -168,7 +168,7 @@ def check_permission(mode: str, command: str = "") -> bool:
     if _one_shot_grant:
         _one_shot_grant = False
         return True
-    if mode in ("read_text", "last_output", "python_eval", "plan"):
+    if mode in ("read_text", "last_output", "python_eval", "plan", "http_get", "http_post", "browser", "subagent", "cron", "docker"):
         return True
     if mode == "shell":
         cmd_base = command.strip().split()[0] if command.strip() else ""
