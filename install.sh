@@ -504,6 +504,113 @@ drop_config() {
 # ----------------------------------------------------------------------------
 # Stage 8: Setup wizard
 # ----------------------------------------------------------------------------
+BUILTIN_MODEL_PROVIDERS=(
+    ollama openrouter openai anthropic gemini cerebras deepseek groq mistral moonshot qwen ollama-cloud copilot
+)
+
+provider_base_url() {
+    case "$1" in
+        ollama)       echo "http://localhost:11434/v1" ;;
+        openrouter)   echo "https://openrouter.ai/api/v1" ;;
+        openai)       echo "https://api.openai.com/v1" ;;
+        anthropic)    echo "https://api.anthropic.com/v1" ;;
+        gemini)       echo "https://generativelanguage.googleapis.com/v1beta/openai/" ;;
+        cerebras)     echo "https://api.cerebras.ai/v1" ;;
+        deepseek)     echo "https://api.deepseek.com/v1" ;;
+        groq)         echo "https://api.groq.com/openai/v1" ;;
+        mistral)      echo "https://api.mistral.ai/v1" ;;
+        moonshot)     echo "https://api.moonshot.ai/v1" ;;
+        qwen)         echo "https://dashscope.aliyuncs.com/compatible-mode/v1" ;;
+        ollama-cloud) echo "https://ollama.com/v1" ;;
+        copilot)      echo "https://api.githubcopilot.com" ;;
+        *)            return 1 ;;
+    esac
+}
+
+provider_default_model() {
+    case "$1" in
+        ollama)       echo "qwen14b-tooluse-v3" ;;
+        openrouter)   echo "openrouter/auto" ;;
+        openai)       echo "gpt-4o" ;;
+        anthropic)    echo "claude-sonnet-4-6" ;;
+        gemini)       echo "gemini-2.0-flash" ;;
+        cerebras)     echo "gpt-oss-120b" ;;
+        deepseek)     echo "deepseek-chat" ;;
+        groq)         echo "llama-3.3-70b-versatile" ;;
+        mistral)      echo "mistral-small-latest" ;;
+        moonshot)     echo "kimi-k2.6" ;;
+        qwen)         echo "qwen-plus" ;;
+        ollama-cloud) echo "gpt-oss:120b" ;;
+        copilot)      echo "gpt-4o" ;;
+        *)            echo "model-name" ;;
+    esac
+}
+
+is_builtin_provider() {
+    local candidate="$1" provider
+    for provider in "${BUILTIN_MODEL_PROVIDERS[@]}"; do
+        [ "$candidate" = "$provider" ] && return 0
+    done
+    return 1
+}
+
+read_setup_value() {
+    local prompt="$1" answer=""
+    if [ "$IS_INTERACTIVE" = true ]; then
+        read -r -p "$prompt" answer || answer=""
+    elif (: </dev/tty) 2>/dev/null; then
+        printf "%s" "$prompt" > /dev/tty
+        IFS= read -r answer < /dev/tty || answer=""
+    fi
+    printf "%s" "$answer"
+}
+
+read_secret_setup_value() {
+    local prompt="$1" answer=""
+    if [ "$IS_INTERACTIVE" = true ]; then
+        read -r -s -p "$prompt" answer || answer=""
+        printf "\n" >&2
+    elif (: </dev/tty) 2>/dev/null; then
+        printf "%s" "$prompt" > /dev/tty
+        IFS= read -r -s answer < /dev/tty || answer=""
+        printf "\n" > /dev/tty
+    fi
+    printf "%s" "$answer"
+}
+
+select_model_provider() {
+    local current_provider="$1" answer current_lower provider i
+    echo "Select model provider:" >&2
+    for i in "${!BUILTIN_MODEL_PROVIDERS[@]}"; do
+        printf "  %2d) %s\n" "$((i + 1))" "${BUILTIN_MODEL_PROVIDERS[$i]}" >&2
+    done
+    printf "  %2d) %s\n" "$((${#BUILTIN_MODEL_PROVIDERS[@]} + 1))" "Custom OpenAI-compatible" >&2
+    answer="$(read_setup_value "Choice [$current_provider]: ")"
+    answer="${answer:-$current_provider}"
+    if [[ "$answer" =~ ^[0-9]+$ ]]; then
+        if [ "$answer" -ge 1 ] && [ "$answer" -le "${#BUILTIN_MODEL_PROVIDERS[@]}" ]; then
+            printf "%s" "${BUILTIN_MODEL_PROVIDERS[$((answer - 1))]}"
+            return 0
+        fi
+        if [ "$answer" -eq "$((${#BUILTIN_MODEL_PROVIDERS[@]} + 1))" ]; then
+            printf "%s" "__custom__"
+            return 0
+        fi
+    fi
+    answer="$(printf "%s" "$answer" | tr '[:upper:]' '[:lower:]')"
+    current_lower="$(printf "%s" "$current_provider" | tr '[:upper:]' '[:lower:]')"
+    if is_builtin_provider "$answer"; then
+        printf "%s" "$answer"
+    elif [ "$answer" = "$current_lower" ]; then
+        printf "%s" "$current_provider"
+    elif [ "$answer" = "custom" ] || [ "$answer" = "custom openai-compatible" ] || [ "$answer" = "openai-compatible" ]; then
+        printf "%s" "__custom__"
+    else
+        printf "Unknown provider '%s'; keeping %s\n" "$answer" "$current_provider" >&2
+        printf "%s" "$current_provider"
+    fi
+}
+
 run_setup_wizard() {
     if [ "$SKIP_SETUP" = true ]; then
         log_info "Skipping setup wizard (--skip-setup)"
@@ -523,77 +630,73 @@ run_setup_wizard() {
     log_info "  (Press Enter to keep the default shown in brackets)"
 
     # working directory (allowed_paths)
-    local current_paths=$(grep '^allowed_paths=' "$config" 2>/dev/null | cut -d= -f2- || echo "~")
+    local current_paths
+    current_paths="$(grep '^allowed_paths=' "$config" 2>/dev/null | cut -d= -f2- || true)"
+    current_paths="${current_paths:-~}"
     local new_paths
-    if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "Working directory [$current_paths]: " new_paths || new_paths=""
-    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "Working directory [%s]: " "$current_paths" > /dev/tty
-        IFS= read -r new_paths < /dev/tty || new_paths=""
-    fi
+    new_paths="$(read_setup_value "Working directory [$current_paths]: ")"
     new_paths="${new_paths:-$current_paths}"
 
-    # provider name
-    local current_provider=$(grep '^default_provider=' "$config" 2>/dev/null | cut -d= -f2- || echo "ollama")
-    local new_provider
-    if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "Provider name (ollama, openrouter, openai, groq, cerebras, etc.) [$current_provider]: " new_provider || new_provider=""
-    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "Provider name [%s]: " "$current_provider" > /dev/tty
-        IFS= read -r new_provider < /dev/tty || new_provider=""
+    # provider picker
+    local current_provider
+    current_provider="$(grep '^default_provider=' "$config" 2>/dev/null | cut -d= -f2- || true)"
+    current_provider="${current_provider:-ollama}"
+    local selected_provider
+    selected_provider="$(select_model_provider "$current_provider")"
+    local new_provider="$selected_provider"
+    local base_url=""
+    if [ "$selected_provider" = "__custom__" ]; then
+        local default_custom="custom"
+        is_builtin_provider "$current_provider" || default_custom="$current_provider"
+        new_provider="$(read_setup_value "Custom provider name [$default_custom]: ")"
+        new_provider="${new_provider:-$default_custom}"
+        if [[ ! "$new_provider" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            log_error "Custom provider names use letters, numbers, _ or -"
+            exit 1
+        fi
+        local current_url
+        current_url="$(grep "^provider\.${new_provider}\.base_url=" "$config" 2>/dev/null | cut -d= -f2- || true)"
+        local url_label="required"
+        [ -n "$current_url" ] && url_label="Enter keeps current"
+        base_url="$(read_setup_value "OpenAI-compatible URL [$url_label]: ")"
+        base_url="${base_url:-$current_url}"
+        if [ -z "$base_url" ]; then
+            log_error "OpenAI-compatible URL is required for custom providers"
+            exit 1
+        fi
+    elif ! is_builtin_provider "$new_provider"; then
+        base_url="$(grep "^provider\.${new_provider}\.base_url=" "$config" 2>/dev/null | cut -d= -f2- || true)"
+        if [ -z "$base_url" ]; then
+            log_error "OpenAI-compatible URL is required for custom providers"
+            exit 1
+        fi
     fi
-    new_provider="${new_provider:-$current_provider}"
 
     # model name
-    local current_model=$(grep "^provider\.${new_provider}\.model=" "$config" 2>/dev/null | cut -d= -f2- || echo "qwen14b-tooluse-v3")
+    local default_model
+    default_model="$(provider_default_model "$new_provider")"
+    local current_model
+    current_model="$(grep "^provider\.${new_provider}\.model=" "$config" 2>/dev/null | cut -d= -f2- || true)"
+    current_model="${current_model:-$default_model}"
     local new_model
-    if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "Model name [$current_model]: " new_model || new_model=""
-    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "Model name [%s]: " "$current_model" > /dev/tty
-        IFS= read -r new_model < /dev/tty || new_model=""
-    fi
+    new_model="$(read_setup_value "Model name [$current_model]: ")"
     new_model="${new_model:-$current_model}"
 
     # api_key
-    local current_key=$(grep "^provider\.${new_provider}\.api_key=" "$config" 2>/dev/null | cut -d= -f2- || echo "")
+    local current_key
+    current_key="$(grep "^provider\.${new_provider}\.api_key=" "$config" 2>/dev/null | cut -d= -f2- || true)"
     local new_key
-    if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "API key for $new_provider [press Enter to skip]: " new_key || new_key=""
-    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "API key for %s [press Enter to skip]: " "$new_provider" > /dev/tty
-        IFS= read -r new_key < /dev/tty || new_key=""
-    fi
+    new_key="$(read_secret_setup_value "API key for $new_provider [hidden; Enter keeps existing/skips]: ")"
 
     # web search URL (optional)
-    local current_search=$(grep '^search_base_url=' "$config" 2>/dev/null | cut -d= -f2- || echo "")
-    local search_label="${current_search:-disabled}"
+    local current_search
+    current_search="$(grep '^search_base_url=' "$config" 2>/dev/null | cut -d= -f2- || true)"
     local new_search
-    if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "Web search URL (SearXNG) [$search_label]: " new_search || new_search=""
-    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
-        printf "Web search URL (SearXNG) [%s]: " "$search_label" > /dev/tty
-        IFS= read -r new_search < /dev/tty || new_search=""
-    fi
+    new_search="$(read_setup_value "Web search URL (SearXNG) [Enter keeps current; type none to disable]: ")"
 
-    # Resolve base_url from built-in providers
-    local base_url=""
-    case "$new_provider" in
-        ollama)      base_url="http://localhost:11434/v1" ;;
-        openrouter)  base_url="https://openrouter.ai/api/v1" ;;
-        openai)      base_url="https://api.openai.com/v1" ;;
-        anthropic)   base_url="https://api.anthropic.com/v1" ;;
-        gemini)      base_url="https://generativelanguage.googleapis.com/v1beta/openai/" ;;
-        cerebras)    base_url="https://api.cerebras.ai/v1" ;;
-        deepseek)    base_url="https://api.deepseek.com/v1" ;;
-        groq)        base_url="https://api.groq.com/openai/v1" ;;
-        mistral)     base_url="https://api.mistral.ai/v1" ;;
-        moonshot)    base_url="https://api.moonshot.ai/v1" ;;
-        qwen)        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1" ;;
-        ollama-cloud) base_url="https://ollama.com/v1" ;;
-        copilot)     base_url="https://api.githubcopilot.com" ;;
-        *)           base_url=$(grep "^provider\.${new_provider}\.base_url=" "$config" 2>/dev/null | cut -d= -f2- || echo "http://localhost:11434/v1") ;;
-    esac
+    if [ -z "$base_url" ]; then
+        base_url="$(provider_base_url "$new_provider" || true)"
+    fi
 
     # Write back
     sed -i.bak "s|^allowed_paths=.*|allowed_paths=$new_paths|" "$config"
@@ -601,14 +704,21 @@ run_setup_wizard() {
     grep -q "^default_provider=" "$config" || echo "default_provider=$new_provider" >> "$config"
     sed -i.bak "s|^provider\.${new_provider}\.base_url=.*|provider.${new_provider}.base_url=$base_url|" "$config"
     grep -q "^provider\.${new_provider}\.base_url=" "$config" || echo "provider.${new_provider}.base_url=$base_url" >> "$config"
+    if ! is_builtin_provider "$new_provider"; then
+        sed -i.bak "s|^provider\.${new_provider}\.api_mode=.*|provider.${new_provider}.api_mode=openai|" "$config"
+        grep -q "^provider\.${new_provider}\.api_mode=" "$config" || echo "provider.${new_provider}.api_mode=openai" >> "$config"
+    fi
     sed -i.bak "s|^provider\.${new_provider}\.model=.*|provider.${new_provider}.model=$new_model|" "$config"
     grep -q "^provider\.${new_provider}\.model=" "$config" || echo "provider.${new_provider}.model=$new_model" >> "$config"
     if [ -n "$new_key" ]; then
         sed -i.bak "s|^provider\.${new_provider}\.api_key=.*|provider.${new_provider}.api_key=$new_key|" "$config"
         grep -q "^provider\.${new_provider}\.api_key=" "$config" || echo "provider.${new_provider}.api_key=$new_key" >> "$config"
     fi
-    if [ -n "$new_search" ]; then
-        sed -i.bak "s|^#*\s*search_base_url=.*|search_base_url=$new_search|" "$config"
+    if [ "$(printf "%s" "$new_search" | tr '[:upper:]' '[:lower:]')" = "none" ]; then
+        sed -i.bak '/^#*[[:space:]]*search_base_url=.*/d' "$config"
+    elif [ -n "$new_search" ]; then
+        sed -i.bak "s|^#*[[:space:]]*search_base_url=.*|search_base_url=$new_search|" "$config"
+        grep -q "^search_base_url=" "$config" || echo "search_base_url=$new_search" >> "$config"
     fi
     rm -f "$config.bak"
     log_success "Config written to $config"

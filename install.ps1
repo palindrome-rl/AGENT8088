@@ -516,6 +516,78 @@ function Drop-Config {
 # ----------------------------------------------------------------------------
 # Stage 8: Setup wizard
 # ----------------------------------------------------------------------------
+$BuiltinModelProviders = @(
+    "ollama", "openrouter", "openai", "anthropic", "gemini", "cerebras", "deepseek",
+    "groq", "mistral", "moonshot", "qwen", "ollama-cloud", "copilot"
+)
+$BuiltinProviderUrls = @{
+    "ollama" = "http://localhost:11434/v1"
+    "openrouter" = "https://openrouter.ai/api/v1"
+    "openai" = "https://api.openai.com/v1"
+    "anthropic" = "https://api.anthropic.com/v1"
+    "gemini" = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    "cerebras" = "https://api.cerebras.ai/v1"
+    "deepseek" = "https://api.deepseek.com/v1"
+    "groq" = "https://api.groq.com/openai/v1"
+    "mistral" = "https://api.mistral.ai/v1"
+    "moonshot" = "https://api.moonshot.ai/v1"
+    "qwen" = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    "ollama-cloud" = "https://ollama.com/v1"
+    "copilot" = "https://api.githubcopilot.com"
+}
+$BuiltinProviderModels = @{
+    "ollama" = "qwen14b-tooluse-v3"
+    "openrouter" = "openrouter/auto"
+    "openai" = "gpt-4o"
+    "anthropic" = "claude-sonnet-4-6"
+    "gemini" = "gemini-2.0-flash"
+    "cerebras" = "gpt-oss-120b"
+    "deepseek" = "deepseek-chat"
+    "groq" = "llama-3.3-70b-versatile"
+    "mistral" = "mistral-small-latest"
+    "moonshot" = "kimi-k2.6"
+    "qwen" = "qwen-plus"
+    "ollama-cloud" = "gpt-oss:120b"
+    "copilot" = "gpt-4o"
+}
+
+function Select-ModelProvider {
+    param([string]$CurrentProvider)
+    Write-Host "Select model provider:"
+    for ($i = 0; $i -lt $BuiltinModelProviders.Count; $i++) {
+        Write-Host ("  {0,2}) {1}" -f ($i + 1), $BuiltinModelProviders[$i])
+    }
+    $customIndex = $BuiltinModelProviders.Count + 1
+    Write-Host ("  {0,2}) Custom OpenAI-compatible" -f $customIndex)
+    $answer = Read-Host "Choice [$CurrentProvider]"
+    if (-not $answer) { $answer = $CurrentProvider }
+    $number = 0
+    if ([int]::TryParse($answer, [ref]$number)) {
+        if ($number -ge 1 -and $number -le $BuiltinModelProviders.Count) {
+            return $BuiltinModelProviders[$number - 1]
+        }
+        if ($number -eq $customIndex) { return "__custom__" }
+    }
+    $answer = $answer.ToLowerInvariant()
+    if ($BuiltinModelProviders -contains $answer) { return $answer }
+    if ($answer -eq $CurrentProvider.ToLowerInvariant()) { return $CurrentProvider }
+    if ($answer -in @("custom", "custom openai-compatible", "openai-compatible")) { return "__custom__" }
+    Write-Warn "Unknown provider '$answer'; keeping $CurrentProvider"
+    return $CurrentProvider
+}
+
+function Read-SecretValue {
+    param([string]$Prompt)
+    $secure = Read-Host $Prompt -AsSecureString
+    if (-not $secure -or $secure.Length -eq 0) { return "" }
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+    }
+}
+
 function Run-SetupWizard {
     if ($SkipSetup) {
         Write-Info "Skipping setup wizard (--SkipSetup)"
@@ -537,49 +609,52 @@ function Run-SetupWizard {
     $newPaths = Read-Host "Working directory [$currentPaths]"
     if (-not $newPaths) { $newPaths = $currentPaths }
 
-    # Provider name
+    # Provider picker
     $currentProvider = (Select-String -Path $config -Pattern '^default_provider=' | ForEach-Object { $_.Line -replace 'default_provider=', '' })
     if (-not $currentProvider) { $currentProvider = "ollama" }
-    $newProvider = Read-Host "Provider name (ollama, openrouter, openai, groq, cerebras, etc.) [$currentProvider]"
-    if (-not $newProvider) { $newProvider = $currentProvider }
+    $selectedProvider = Select-ModelProvider $currentProvider
+    $newProvider = $selectedProvider
+    $baseUrl = ""
+    if ($selectedProvider -eq "__custom__") {
+        $defaultCustom = if ($BuiltinModelProviders -contains $currentProvider) { "custom" } else { $currentProvider }
+        $newProvider = Read-Host "Custom provider name [$defaultCustom]"
+        if (-not $newProvider) { $newProvider = $defaultCustom }
+        if ($newProvider -notmatch '^[A-Za-z0-9_-]+$') {
+            Write-Err "Custom provider names use letters, numbers, _ or -"
+            exit 1
+        }
+        $currentUrl = (Select-String -Path $config -Pattern "^provider\.$newProvider\.base_url=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.base_url=", '' })
+        $urlLabel = if ($currentUrl) { "Enter keeps current" } else { "required" }
+        $baseUrl = Read-Host "OpenAI-compatible URL [$urlLabel]"
+        if (-not $baseUrl) { $baseUrl = $currentUrl }
+        if (-not $baseUrl) {
+            Write-Err "OpenAI-compatible URL is required for custom providers"
+            exit 1
+        }
+    } elseif ($BuiltinModelProviders -notcontains $newProvider) {
+        $baseUrl = (Select-String -Path $config -Pattern "^provider\.$newProvider\.base_url=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.base_url=", '' })
+        if (-not $baseUrl) {
+            Write-Err "OpenAI-compatible URL is required for custom providers"
+            exit 1
+        }
+    }
 
     # Model name
     $currentModel = (Select-String -Path $config -Pattern "^provider\.$newProvider\.model=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.model=", '' })
-    if (-not $currentModel) { $currentModel = "qwen14b-tooluse-v3" }
+    if (-not $currentModel) { $currentModel = if ($BuiltinProviderModels[$newProvider]) { $BuiltinProviderModels[$newProvider] } else { "model-name" } }
     $newModel = Read-Host "Model name [$currentModel]"
     if (-not $newModel) { $newModel = $currentModel }
 
     # API key
     $currentKey = (Select-String -Path $config -Pattern "^provider\.$newProvider\.api_key=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.api_key=", '' })
-    $newKey = Read-Host "API key for $newProvider [press Enter to skip]"
+    $newKey = Read-SecretValue "API key for $newProvider [hidden; Enter keeps existing/skips]"
     if (-not $newKey) { $newKey = $currentKey }
 
     # Web search URL (optional)
     $currentSearch = (Select-String -Path $config -Pattern '^search_base_url=' | ForEach-Object { $_.Line -replace 'search_base_url=', '' })
-    $searchLabel = if ($currentSearch) { $currentSearch } else { "disabled" }
-    $newSearch = Read-Host "Web search URL (SearXNG) [$searchLabel]"
+    $newSearch = Read-Host "Web search URL (SearXNG) [Enter keeps current; type none to disable]"
 
-    # Built-in provider base URLs
-    $builtinUrls = @{
-        "ollama" = "http://localhost:11434/v1"
-        "openrouter" = "https://openrouter.ai/api/v1"
-        "openai" = "https://api.openai.com/v1"
-        "anthropic" = "https://api.anthropic.com/v1"
-        "gemini" = "https://generativelanguage.googleapis.com/v1beta/openai/"
-        "cerebras" = "https://api.cerebras.ai/v1"
-        "deepseek" = "https://api.deepseek.com/v1"
-        "groq" = "https://api.groq.com/openai/v1"
-        "mistral" = "https://api.mistral.ai/v1"
-        "moonshot" = "https://api.moonshot.ai/v1"
-        "qwen" = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        "ollama-cloud" = "https://ollama.com/v1"
-        "copilot" = "https://api.githubcopilot.com"
-    }
-    $baseUrl = $builtinUrls[$newProvider]
-    if (-not $baseUrl) {
-        $currentUrl = (Select-String -Path $config -Pattern "^provider\.$newProvider\.base_url=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.base_url=", '' })
-        $baseUrl = if ($currentUrl) { $currentUrl } else { "http://localhost:11434/v1" }
-    }
+    if (-not $baseUrl) { $baseUrl = $BuiltinProviderUrls[$newProvider] }
 
     # Write back
     $content = Get-Content $config -Raw
@@ -588,14 +663,21 @@ function Run-SetupWizard {
     if (-not ($content -match '(?m)^default_provider=')) { $content += "`ndefault_provider=$newProvider`n" }
     $content = $content -replace "(?m)^provider\.$newProvider\.base_url=.*", "provider.$newProvider.base_url=$baseUrl"
     if (-not ($content -match "(?m)^provider\.$newProvider\.base_url=")) { $content += "`nprovider.$newProvider.base_url=$baseUrl`n" }
+    if ($BuiltinModelProviders -notcontains $newProvider) {
+        $content = $content -replace "(?m)^provider\.$newProvider\.api_mode=.*", "provider.$newProvider.api_mode=openai"
+        if (-not ($content -match "(?m)^provider\.$newProvider\.api_mode=")) { $content += "`nprovider.$newProvider.api_mode=openai`n" }
+    }
     $content = $content -replace "(?m)^provider\.$newProvider\.model=.*", "provider.$newProvider.model=$newModel"
     if (-not ($content -match "(?m)^provider\.$newProvider\.model=")) { $content += "`nprovider.$newProvider.model=$newModel`n" }
     if ($newKey) {
         $content = $content -replace "(?m)^provider\.$newProvider\.api_key=.*", "provider.$newProvider.api_key=$newKey"
         if (-not ($content -match "(?m)^provider\.$newProvider\.api_key=")) { $content += "`nprovider.$newProvider.api_key=$newKey`n" }
     }
-    if ($newSearch) {
+    if ($newSearch -and $newSearch.Trim().ToLowerInvariant() -eq "none") {
+        $content = $content -replace '(?m)^#?\s*search_base_url=.*\r?\n?', ''
+    } elseif ($newSearch) {
         $content = $content -replace '(?m)^#?\s*search_base_url=.*', "search_base_url=$newSearch"
+        if (-not ($content -match '(?m)^search_base_url=')) { $content += "`nsearch_base_url=$newSearch`n" }
     }
     Set-Content -Path $config -Value $content -NoNewline:$false
     Write-Success "Config written to $config"
