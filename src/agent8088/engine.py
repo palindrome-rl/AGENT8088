@@ -37,7 +37,7 @@ def load_simple_config(path: Path) -> dict:
 CONFIG_PATH = Path(os.environ.get("AGENT8088_CONFIG", str(APP_DIR / "config.txt"))).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
 
-PROJECT_ROOT = Path(APP_CONFIG.get("project_root", str(APP_DIR))).expanduser().resolve()
+PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
@@ -45,7 +45,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/search?q=")
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
-SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
+SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
 BANNER_FILE = Path(APP_CONFIG.get("banner_file", str(APP_DIR / "banner.txt"))).expanduser()
 SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).expanduser()
 
@@ -84,6 +84,109 @@ ALLOWED_PATHS = [
     for p in APP_CONFIG.get("allowed_paths", str(PROJECT_ROOT)).split(",")
     if p.strip()
 ]
+
+# ---------------------------------------------------------------------------
+# Permission layer — readonly by default, escalates to edit on user approval
+# ---------------------------------------------------------------------------
+PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
+_one_shot_grant = False
+
+# ---------------------------------------------------------------------------
+# Layer 1: Sensitive file read protection — hardcoded blocklist + config override
+# ---------------------------------------------------------------------------
+SENSITIVE_FILE_PATTERNS = [
+    ".env", "config.txt", "configb.txt", "id_rsa", "id_ed25519",
+    ".ssh", ".gnupg", ".aws", ".gitconfig",
+]
+SENSITIVE_FILE_EXTENSIONS = frozenset([".pem", ".key", ".rsa", ".p12"])
+SENSITIVE_FILE_GLOBS = ["*_KEY*", "*_SECRET*", "*_TOKEN*", "*_PASSWORD*",
+                        "*_key*", "*_secret*", "*_token*", "*_password*"]
+ALLOWED_SENSITIVE_FILES = set(
+    p.strip() for p in APP_CONFIG.get("allowed_sensitive_files", "").split(",") if p.strip()
+)
+
+NO_PROMPT_PATHS = [
+    Path(p.strip()).expanduser().resolve()
+    for p in APP_CONFIG.get("no_prompt_paths", "").split(",") if p.strip()
+]
+PROMPT_PATHS = [
+    Path(p.strip()).expanduser().resolve()
+    for p in APP_CONFIG.get("prompt_paths", "~").split(",") if p.strip()
+]
+BLOCKED_PATHS = [
+    Path(p.strip()).expanduser().resolve()
+    for p in APP_CONFIG.get("blocked_paths", "").split(",") if p.strip()
+]
+
+READONLY_SAFE_COMMANDS = frozenset([
+    "ls", "cat", "grep", "find", "head", "tail", "wc", "pwd", "whoami",
+    "echo", "date", "uname", "df", "du", "free", "nproc", "uptime",
+    "diff", "log", "status", "show", "branch",
+    "dir", "type", "findstr", "where", "hostname", "ver", "vol",
+    "tasklist", "systeminfo", "wmic",
+    "git", "python", "pip", "node", "npm",
+    "curl", "wget",
+])
+
+
+def _is_sensitive_path(filepath: str) -> bool:
+    fn = Path(filepath).name.lower()
+    fp = str(filepath).lower()
+    for allowed in ALLOWED_SENSITIVE_FILES:
+        if allowed.lower() in fn or allowed.lower() in fp:
+            return False
+    for pattern in SENSITIVE_FILE_PATTERNS:
+        if pattern.lower() in fn or pattern.lower() in fp:
+            return True
+    for ext in SENSITIVE_FILE_EXTENSIONS:
+        if fn.endswith(ext):
+            return True
+    import fnmatch
+    for glob in SENSITIVE_FILE_GLOBS:
+        if fnmatch.fnmatch(fn, glob):
+            return True
+    return False
+
+
+def _check_path_zone(target: Path) -> str:
+    for base in BLOCKED_PATHS:
+        if target == base or base in target.parents:
+            return "blocked"
+    for base in NO_PROMPT_PATHS:
+        if target == base or base in target.parents:
+            return "no_prompt"
+    for base in PROMPT_PATHS:
+        if target == base or base in target.parents:
+            return "prompt"
+    return "default"
+
+
+def check_permission(mode: str, command: str = "") -> bool:
+    global _one_shot_grant
+    if PERMISSION_MODE == "edit":
+        return True
+    if _one_shot_grant:
+        _one_shot_grant = False
+        return True
+    if mode in ("read_text", "last_output", "python_eval", "plan"):
+        return True
+    if mode == "shell":
+        cmd_base = command.strip().split()[0] if command.strip() else ""
+        if cmd_base == "git" and len(command.strip().split()) > 1:
+            subcmd = command.strip().split()[1]
+            if subcmd in ("status", "diff", "log", "show", "branch"):
+                return True
+        return cmd_base in READONLY_SAFE_COMMANDS
+    return False
+
+
+def request_escalation(target_mode: str, paths: list, change_type: str, reason: str) -> str:
+    return f"ESCALATION_REQUEST:{target_mode}:{change_type}:{','.join(paths)}:{reason}"
+
+
+def grant_escalation():
+    global _one_shot_grant
+    _one_shot_grant = True
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
@@ -615,7 +718,7 @@ def _parse_frontmatter_md(text: str) -> tuple:
 # ---------------------------------------------------------------------------
 # Persona — optional user profile (USER.md) folded into the system prompt
 # ---------------------------------------------------------------------------
-USER_FILE = Path(APP_CONFIG.get("user_file", str(APP_DIR / "USER.md"))).expanduser()
+USER_FILE = Path(APP_CONFIG.get("user_file", str(Path.cwd() / "USER.md"))).expanduser()
 
 
 def render_persona(path: Path) -> str:
@@ -640,7 +743,7 @@ def render_persona(path: Path) -> str:
 #   tools.txt  (same format as the root tools.txt)
 # Merged BEFORE the system prompt is built so skill tools are visible to the model.
 # ---------------------------------------------------------------------------
-SKILLS_DIR = Path(APP_CONFIG.get("skills_dir", str(APP_DIR / "skills_installed"))).expanduser()
+SKILLS_DIR = Path(APP_CONFIG.get("skills_dir", str(Path.cwd() / "skills_installed"))).expanduser()
 
 
 def load_skill_packages(skills_dir: Path, config: dict) -> dict:
@@ -710,7 +813,7 @@ SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
 # ---------------------------------------------------------------------------
 # Subagents — profiles loaded from agents/*.md (frontmatter + body prompt)
 # ---------------------------------------------------------------------------
-AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expanduser()
+AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(Path.cwd() / "agents"))).expanduser()
 DEFAULT_SUBAGENT = APP_CONFIG.get("default_subagent", "general-purpose")
 SUBAGENT_MAX_DEPTH = int(APP_CONFIG.get("subagent_max_depth", "1"))
 
@@ -1115,6 +1218,36 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     mode = (spec.get("mode") or "").lower()
     timeout = int(spec.get("timeout") or 25)
+
+    # Sensitive file check for read_text
+    if mode == "read_text":
+        path_arg = spec.get("path_arg") or "filename"
+        fn = args.get(path_arg) or args.get("filename") or args.get("file") or ""
+        if fn and _is_sensitive_path(fn):
+            return "Access to sensitive file denied"
+
+    # Permission gate — check before any execution
+    command = ""
+    if mode == "shell":
+        command = _format_with_args(spec.get("command") or "{command}", args)
+    elif mode == "write_text":
+        command = "write_file"
+
+    if not check_permission(mode, command):
+        paths_str = ""
+        if mode == "write_text":
+            path_arg = spec.get("path_arg") or "filename"
+            fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
+            paths_str = fn or "unknown"
+        elif mode == "shell":
+            paths_str = command[:80]
+        change_type = "new_file" if mode == "write_text" else "filesystem_op"
+        return request_escalation(
+            target_mode="edit",
+            paths=[paths_str],
+            change_type=change_type,
+            reason=f"Tool '{name}' requires {mode} access, which is blocked in readonly mode.",
+        )
 
     if mode == "last_output":
         if not _last_tool_output:

@@ -1103,16 +1103,17 @@ def cmd_config(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Key", style="#237dd7")
     t.add_column("Value", style="#237dd7")
-    keys = ["model_base_url", "model_name", "timeout_seconds", "project_root",
-            "shell_cwd", "allowed_paths", "search_base_url", "gemma_base_url", "gemma_model_name"]
+    keys = ["default_provider", "timeout_seconds", "allowed_paths", "search_base_url",
+            "ssrf_allow_hosts", "prompt_paths", "blocked_paths"]
     for k in keys:
         v = A.APP_CONFIG.get(k, "—")
-        if k == "api_key":
-            v = "[hidden]"
         t.add_row(k, str(v))
+    active_provider = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "")
+    t.add_row("[dim]provider[/dim]", active_provider)
     t.add_row("[dim]resolved model[/dim]", str(A.MODEL_NAME))
     console.print(t)
-    console.print(f"[dim]config file: {os.environ.get('AGENT8088_CONFIG', str(APP_DIR / 'config.txt'))}[/dim]")
+    config_path = os.environ.get('AGENT8088_CONFIG', str(A.APP_DIR / 'config.txt'))
+    console.print(f"[dim]config file: {config_path}[/dim]")
 
 
 def cmd_status(_):

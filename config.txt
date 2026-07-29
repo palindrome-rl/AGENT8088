@@ -22,6 +22,10 @@ allowed_paths=~
 # --- Permission Layer 2: Network access control ---
 # web_search and get_page_title prompt the user (y/n) on every request.
 
+# --- SSRF protection ---
+# Allow these internal hosts (for local SearXNG etc.):
+ssrf_allow_hosts=127.0.0.1,localhost
+
 # --- Permission Layer 3: Path-based write restrictions ---
 # Writes to these paths run without a prompt (auto-approved):
 # no_prompt_paths=/tmp
