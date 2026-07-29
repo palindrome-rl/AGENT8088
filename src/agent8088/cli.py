@@ -364,9 +364,11 @@ def _classic_masthead():
 
 def banner():
     console.print(_classic_masthead(), justify="center")
-    endpoint = A.APP_CONFIG.get("model_base_url", "?")
-    backend = "Gemma (fallback)" if os.environ.get("USE_GEMMA4") == "1" else "Ornith / custom"
-    active_profile = getattr(A, "ACTIVE_PROVIDER", "default")
+    active_profile = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "default")
+    # Get endpoint from the provider registry, not old config keys
+    provider_info = A.PROVIDERS.get(active_profile, {})
+    endpoint = provider_info.get("base_url", A.APP_CONFIG.get("model_base_url", "?"))
+    backend = active_profile or "default"
 
     if console.width < 70:
         compact = Text()

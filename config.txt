@@ -39,7 +39,7 @@ prompt_paths=~
 default_provider=ollama
 
 # Provider config (base_url is built-in, only set api_key + model):
-provider.ollama.model=qwen14b-tooluse-v3
+# provider.ollama.model=qwen14b-tooluse-v3
 # provider.ollama.api_key=ollama
 
 # Example: Cerebras

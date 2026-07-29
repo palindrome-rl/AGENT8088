@@ -218,7 +218,6 @@ def grant_escalation():
     _one_shot_grant = True
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
-DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
 
 def load_text(path: Path, fallback: str) -> str:
@@ -252,6 +251,27 @@ def load_providers(config: dict) -> dict:
             continue
         _, name, field = parts
         provs.setdefault(name, {})[field] = value
+
+    # Seed built-in base_urls so providers work with just api_key + model in config
+    _BUILTIN_BASE_URLS = {
+        "ollama": "http://localhost:11434/v1",
+        "openrouter": "https://openrouter.ai/api/v1",
+        "openai": "https://api.openai.com/v1",
+        "anthropic": "https://api.anthropic.com/v1",
+        "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "cerebras": "https://api.cerebras.ai/v1",
+        "deepseek": "https://api.deepseek.com/v1",
+        "groq": "https://api.groq.com/openai/v1",
+        "mistral": "https://api.mistral.ai/v1",
+        "moonshot": "https://api.moonshot.ai/v1",
+        "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "ollama-cloud": "https://ollama.com/v1",
+        "copilot": "https://api.githubcopilot.com",
+    }
+    for name, base_url in _BUILTIN_BASE_URLS.items():
+        if name in provs and "base_url" not in provs[name]:
+            provs[name]["base_url"] = base_url
+
     return {
         n: p for n, p in provs.items()
         if p.get("base_url") or (p.get("api_mode", "").lower() == "litellm" and p.get("model"))
