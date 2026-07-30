@@ -584,12 +584,14 @@ def _handle_escalation(result_text, messages=None, live=None):
     if response in ("y", "yes"):
         # Map change_type to the mode the grant applies to
         grant_mode = "write_text" if change_type == "new_file" else "shell"
-        A.grant_escalation(grant_mode)
-        console.print("[green]Approved for this action only. Next write will ask again.[/green]")
+        grant_path = paths if paths and paths != "unknown" else ""
+        A.grant_escalation(grant_mode, grant_path)
+        console.print("[green]Approved for this action. The agent will retry now.[/green]")
         if messages is not None:
             messages.append({"role": "user", "content":
-                "Permission granted. Retry the EXACT same tool call that was blocked. "
-                "Do not ask for permission again. Do not explain. Just call the tool again now."})
+                "Permission granted. Call write_file again with the SAME arguments right now. "
+                "Do NOT use execute_shell, touch, run_sandboxed, or any other tool. "
+                "Only call write_file again."})
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
         if messages is not None:

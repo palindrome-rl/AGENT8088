@@ -99,8 +99,8 @@ ALLOWED_PATHS = [
 # Permission layer ÔÇö readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
-_one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
-_one_shot_grant_mode = ""  # the mode the grant applies to (write_text, shell, etc.)
+_turn_grants = {}  # {mode: True} — approved modes for the current turn
+_approved_paths = set()  # write paths approved this turn
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -190,17 +190,15 @@ READONLY_SAFE_COMMANDS = frozenset([
 ])
 
 
-def check_permission(mode: str, command: str = "") -> bool:
+def check_permission(mode: str, command: str = "", path: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
-    global _one_shot_grant, _one_shot_grant_mode
     if PERMISSION_MODE == "edit":
         return True
-    # One-shot grant: allow one blocked tool through, but only for the mode
-    # that was originally blocked (so a write_text grant isn't consumed by
-    # a shell command the model tries instead)
-    if _one_shot_grant and (not _one_shot_grant_mode or _one_shot_grant_mode == mode):
-        _one_shot_grant = False
-        _one_shot_grant_mode = ""
+    # Turn-level grants: if the user approved this mode this turn, allow it
+    if _turn_grants.get(mode):
+        return True
+    # Approved paths: if the user approved writing to this specific path
+    if mode == "write_text" and path and path in _approved_paths:
         return True
     # readonly mode
     if mode in ("read_text", "last_output", "python_eval", "plan"):
@@ -225,13 +223,19 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
     )
 
 
-def grant_escalation(mode: str = ""):
-    """Allow exactly one blocked tool call to run, then revert to readonly.
-    If mode is given, the grant only applies to that mode (so a write_text
-    grant isn't consumed by a shell command)."""
-    global _one_shot_grant, _one_shot_grant_mode
-    _one_shot_grant = True
-    _one_shot_grant_mode = mode
+def grant_escalation(mode: str = "", path: str = ""):
+    """Approve a mode (and optionally a specific path) for the rest of this turn.
+    All subsequent tools with the same mode pass without re-prompting."""
+    if mode:
+        _turn_grants[mode] = True
+    if path:
+        _approved_paths.add(path)
+
+
+def clear_turn_grants():
+    """Clear per-turn permission grants. Called at the start of each run_agent turn."""
+    _turn_grants.clear()
+    _approved_paths.clear()
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
@@ -1137,22 +1141,25 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             )
         return _exec_shell_command(f'curl -s --max-time {timeout} "{url}"', timeout=timeout)
 
-    # --- Permission gate for write/shell (Layers 1+3) ---
+    # --- Permission gate for write/shell/docker (Layers 1+3) ---
     command = ""
+    write_path = ""
     if mode == "shell":
         command = _format_with_args(spec.get("command") or "{command}", args)
     elif mode == "write_text":
         command = "write_file"
+        path_arg = spec.get("path_arg") or "filename"
+        write_path = (args.get(path_arg) or args.get("filename") or args.get("file")
+                      or args.get("file_path") or args.get("filepath") or args.get("path") or "")
 
-    if mode in ("write_text", "shell") and not check_permission(mode, command):
+    if mode in ("write_text", "shell", "docker") and not check_permission(mode, command, write_path):
         paths_str = ""
         if mode == "write_text":
-            path_arg = spec.get("path_arg") or "filename"
-            fn = (args.get(path_arg) or args.get("filename") or args.get("file")
-                  or args.get("file_path") or args.get("filepath") or args.get("path") or "")
-            paths_str = fn or "unknown"
+            paths_str = write_path or "unknown"
         elif mode == "shell":
             paths_str = command[:80]
+        elif mode == "docker":
+            paths_str = "sandboxed_code"
         change_type = "new_file" if mode == "write_text" else "filesystem_op"
         return request_escalation(
             target_mode="edit",
@@ -1555,6 +1562,7 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         return refusal
 
     for turn in range(max_turns):
+        clear_turn_grants()
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         try:
