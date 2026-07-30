@@ -158,6 +158,22 @@ def test_models_command_picks_and_switches_model(monkeypatch):
     assert switched == {"provider": "openai", "model": "gpt-new"}
 
 
+def test_model_command_prefers_configured_custom_provider(monkeypatch):
+    monkeypatch.setattr(cli.A, "PROVIDERS", {"custom": {"model": "ornith-1.0-35b"}})
+    monkeypatch.setattr(cli.A, "ACTIVE_PROVIDER", "")
+    monkeypatch.setattr(cli.A, "MODEL_NAME", "")
+    switched = {}
+    monkeypatch.setattr(
+        cli.A,
+        "activate_model",
+        lambda provider, model="": switched.update(provider=provider, model=model),
+    )
+
+    cli.cmd_model("custom")
+
+    assert switched == {"provider": "custom", "model": ""}
+
+
 def test_list_models_can_disable_hardcoded_fallbacks(monkeypatch):
     monkeypatch.setattr(providers, "_load_disk_cache", lambda: {})
     monkeypatch.setattr(providers, "_save_disk_cache", lambda data: None)

@@ -1088,12 +1088,12 @@ def cmd_model(rest):
     if arg in ("gemma", "gemma4"):
         os.environ["USE_GEMMA4"] = "1"
         A.client, A.MODEL_NAME = A.get_client()
-    elif arg in ("ornith", "custom", "default"):
-        os.environ.pop("USE_GEMMA4", None)
-        A.client, A.MODEL_NAME = A.get_client()
     elif arg in A.PROVIDERS:
         os.environ.pop("USE_GEMMA4", None)
         A.activate_model(arg)
+    elif arg in ("ornith", "custom", "default"):
+        os.environ.pop("USE_GEMMA4", None)
+        A.client, A.MODEL_NAME = A.get_client()
     elif ":" in raw_arg and raw_arg.partition(":")[0].lower() in A.PROVIDERS:
         provider, _, model = raw_arg.partition(":")
         provider = provider.lower()

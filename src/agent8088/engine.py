@@ -192,12 +192,10 @@ def check_permission(mode: str, command: str = "") -> bool:
         return True
     if mode == "shell":
         # Allow inspection-only shell commands in readonly
-        cmd_base = command.strip().split()[0] if command.strip() else ""
-        # Handle "git status", "git log", etc.
-        if cmd_base == "git" and len(command.strip().split()) > 1:
-            subcmd = command.strip().split()[1]
-            if subcmd in ("status", "diff", "log", "show", "branch"):
-                return True
+        parts = command.strip().split()
+        cmd_base = parts[0] if parts else ""
+        if cmd_base == "git":
+            return len(parts) > 1 and parts[1] in ("status", "diff", "log", "show", "branch")
         return cmd_base in READONLY_SAFE_COMMANDS
     return False
 

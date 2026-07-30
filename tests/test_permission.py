@@ -80,6 +80,12 @@ def test_run_tool_allows_safe_shell_in_readonly():
     result = A.run_tool("execute_shell", {"command": "ls"})
     assert "ESCALATION_REQUEST" not in result
 
+def test_readonly_git_allows_only_inspection():
+    for subcommand in ("status", "diff", "log", "show", "branch"):
+        assert A.check_permission("shell", f"git {subcommand}") is True
+    for subcommand in ("clone", "commit", "push", "reset", "checkout"):
+        assert A.check_permission("shell", f"git {subcommand}") is False
+
 def test_escalation_tool_is_not_model_callable():
     assert "request_permission_escalation" not in A.TOOL_NAMES
 
