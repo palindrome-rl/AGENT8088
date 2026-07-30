@@ -293,9 +293,14 @@ ACTIVE_PROVIDER = ""
 
 
 def _provider_api_key(provider: dict) -> str:
-    """Resolve a provider key without requiring secrets in config files."""
+    """Resolve a provider key: direct api_key value first, then env var."""
+    direct = provider.get("api_key", "").strip()
+    if direct:
+        return direct
     env_name = provider.get("api_key_env", "").strip()
-    return os.environ.get(env_name, "") if env_name else provider.get("api_key", "")
+    if env_name:
+        return os.environ.get(env_name, "")
+    return ""
 
 
 def get_client(provider: str = None):
