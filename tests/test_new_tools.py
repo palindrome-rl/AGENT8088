@@ -151,6 +151,8 @@ def test_native_sandbox_writes_private_policy(engine, tmp_path, monkeypatch):
     settings = engine.json.loads(path.read_text())
     assert settings["network"]["allowedDomains"] == []
     assert str(engine.PROJECT_ROOT) in settings["filesystem"]["allowWrite"]
+    if engine.sys.platform != "win32":
+        assert str(engine.Path("/tmp").resolve()) in settings["filesystem"]["allowWrite"]
     assert path.stat().st_mode & 0o777 == 0o600
 
 

@@ -1474,6 +1474,8 @@ def _sandbox_settings_data() -> dict:
     ]
     deny_paths = [str(path.expanduser().resolve()) for path in denied]
     allow_write = [str(PROJECT_ROOT), tempfile.gettempdir()]
+    if sys.platform != "win32":
+        allow_write.append(str(Path("/tmp").resolve()))
     allow_write.extend(str(path) for path in NO_PROMPT_PATHS)
     return {
         "network": {
