@@ -46,7 +46,10 @@ def test_image_rejects_sensitive_symlink(engine, tmp_path, monkeypatch):
     secret = tmp_path / "private.key"
     secret.write_bytes(b"secret")
     link = tmp_path / "photo.png"
-    link.symlink_to(secret)
+    try:
+        link.symlink_to(secret)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
 

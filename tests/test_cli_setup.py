@@ -90,7 +90,16 @@ def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys
     assert "sk-existing-secret" not in output
     assert "http://private-search.local" not in output
     assert "gpt-live" not in output
-    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    if sys.platform != "win32":
+        assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+def test_windows_installer_restricts_config_by_sid():
+    installer = (Path(__file__).resolve().parent.parent / "install.ps1").read_text()
+    assert "WindowsIdentity]::GetCurrent()" in installer
+    assert 'icacls $Path /grant:r "*$sid`:(R,W)"' in installer
+    assert installer.index("/grant:r") < installer.index("/inheritance:r")
+    assert "$env:USERNAME`:(R,W)" not in installer
 
 
 def test_setup_fetch_failure_asks_for_model_without_fallback_choices(tmp_path, monkeypatch):

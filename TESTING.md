@@ -95,7 +95,8 @@ use a subagent to count the TODOs here
   tool tells you how to install it and suggests `web_search`.
 - **Vision**: `/image` needs a vision-capable provider configured (see `/model`); the
   default local text model will error.
-- **SSRF**: `config.txt` uses `ssrf_allow_hosts=192.168.1.10` to permit only the SearXNG
-  box; `ssrf_allow_private` stays `0` so the rest of the private network is blocked.
+- **SSRF**: `config.txt` allows only `127.0.0.1,localhost` for a local SearXNG;
+  add a LAN host explicitly when needed. `ssrf_allow_private` stays `0` so every
+  other private address remains blocked.
 - **Search**: the LAN SearXNG is unreachable off that network — `web_search` will report
   `No response from ...`. Set `tavily_api_key` or `exa_api_key` for a hosted fallback.
