@@ -34,7 +34,17 @@ def load_simple_config(path: Path) -> dict:
     return config
 
 
-CONFIG_PATH = Path(os.environ.get("AGENT8088_CONFIG", str(APP_DIR / "config.txt"))).expanduser()
+# Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
+_user_config = Path.home() / ".agent8088" / "config.txt"
+_win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
+if os.environ.get("AGENT8088_CONFIG"):
+    CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+elif _user_config.exists():
+    CONFIG_PATH = _user_config
+elif _win_config.exists():
+    CONFIG_PATH = _win_config
+else:
+    CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
 
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
