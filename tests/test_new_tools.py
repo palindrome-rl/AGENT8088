@@ -65,12 +65,16 @@ def test_cron_remove_matches_the_shell_quoted_task(engine, monkeypatch):
 
 
 def test_docker_missing_is_graceful(engine, monkeypatch):
+    engine.SANDBOX_BACKEND = "auto"
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
     out = engine._exec_docker({"code": "print(1)"})
-    assert "Docker is not available" in out
+    assert "ESCALATION_REQUEST:edit:local_execution:" in out
 
 
-def test_docker_runs_code_isolated(engine, monkeypatch):
+def test_docker_runs_code_isolated(engine, tmp_path, monkeypatch):
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     seen = {}
 
@@ -86,6 +90,8 @@ def test_docker_runs_code_isolated(engine, monkeypatch):
     assert cmd[cmd.index("--network") + 1] == "none"
     assert "--rm" in cmd
     assert "--memory" in cmd
+    assert "--cap-drop" in cmd
+    assert "--mount" in cmd
     assert seen["shell"] is False
 
 
@@ -94,7 +100,9 @@ def test_docker_requires_code(engine, monkeypatch):
     assert "requires 'code'" in engine._exec_docker({})
 
 
-def test_docker_quotes_code_safely(engine, monkeypatch):
+def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     seen = {}
     code = "print('hi'); rm -rf /"
@@ -105,6 +113,65 @@ def test_docker_quotes_code_safely(engine, monkeypatch):
     )
     engine._exec_docker({"code": code})
     assert seen["cmd"][-3:] == ["python", "-c", code]
+
+
+def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
+    secret = tmp_path / ".env"
+    secret.write_text("TOKEN=secret")
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    seen = {}
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda command, **_: seen.setdefault("command", command) and "done",
+    )
+    engine._exec_docker({"code": "print(1)"})
+    mounts = [seen["command"][i + 1] for i, value in enumerate(seen["command"][:-1])
+              if value == "--mount"]
+    assert any("dst=/workspace/.env,readonly" in mount for mount in mounts)
+
+
+def test_auto_prefers_native_then_docker(engine, monkeypatch):
+    engine.SANDBOX_BACKEND = "auto"
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    assert engine._resolve_sandbox_backend() == "native"
+    monkeypatch.setattr(
+        engine, "_native_sandbox_missing_requirements",
+        lambda: ["sandbox-runtime"],
+    )
+    assert engine._resolve_sandbox_backend() == "docker"
+
+
+def test_native_sandbox_writes_private_policy(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    path = engine._write_sandbox_settings()
+    settings = engine.json.loads(path.read_text())
+    assert settings["network"]["allowedDomains"] == []
+    assert str(engine.PROJECT_ROOT) in settings["filesystem"]["allowWrite"]
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_approved_local_fallback_runs_once(engine, monkeypatch):
+    engine.SANDBOX_BACKEND = "auto"
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "ran locally")
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+    engine.grant_escalation("local_execution")
+    assert engine._exec_sandbox_command("pwd") == "ran locally"
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+
+
+def test_sandbox_backend_setting_persists(engine, tmp_path, monkeypatch):
+    config = tmp_path / "config.txt"
+    monkeypatch.setattr(engine, "CONFIG_PATH", config)
+    monkeypatch.setattr(engine, "APP_CONFIG", {})
+    status = engine.set_sandbox_backend("local")
+    assert status["requested"] == "local"
+    assert "sandbox_backend=local" in config.read_text()
 
 
 def test_browser_missing_is_graceful(engine, monkeypatch):

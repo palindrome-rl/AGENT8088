@@ -92,6 +92,15 @@ MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
+SANDBOX_BACKEND = os.environ.get(
+    "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
+).strip().lower()
+SANDBOX_RUNTIME_VERSION = APP_CONFIG.get("sandbox_runtime_version", "0.0.67")
+SANDBOX_ALLOWED_DOMAINS = [
+    value.strip()
+    for value in APP_CONFIG.get("sandbox_allowed_domains", "").split(",")
+    if value.strip()
+]
 
 # Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
 # command references must exist there too. Without this, a missing config key left
@@ -129,6 +138,7 @@ ALLOWED_PATHS = [
 # ---------------------------------------------------------------------------
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
 _one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
+_local_fallback_grant = False
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -314,11 +324,12 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
     )
 
 
-def grant_escalation():
+def grant_escalation(change_type: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
     The user is prompted for every write/mutation - no session-wide grants."""
-    global _one_shot_grant
+    global _one_shot_grant, _local_fallback_grant
     _one_shot_grant = True
+    _local_fallback_grant = change_type == "local_execution"
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
@@ -1016,7 +1027,7 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
 
 
 def _exec_shell_command(command: str, timeout: int = 25) -> str:
-    return _exec_process(command, timeout=timeout, shell=True)
+    return _exec_sandbox_command(command, timeout=timeout)
 
 
 def _process_display(argv: list) -> str:
@@ -1039,10 +1050,10 @@ def _structured_tool_argv(name: str, args: dict):
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     argv = _structured_tool_argv(name, args)
     if name == "git_commit":
-        staged = _exec_process(["git", "add", "-A"], timeout=timeout)
+        staged = _exec_sandbox_argv(["git", "add", "-A"], timeout=timeout)
         if "exited with status" in staged or "timed out" in staged:
             return staged
-    return _exec_process(argv, timeout=timeout)
+    return _exec_sandbox_argv(argv, timeout=timeout)
 
 
 def _format_with_args(template: str, args: dict) -> str:
@@ -1351,38 +1362,279 @@ def _exec_browser(args: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Sandboxed execution — run untrusted code in a throwaway Docker container
+# Sandboxed execution — native OS isolation, with Docker as a fallback
 # ---------------------------------------------------------------------------
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
+_SANDBOX_BACKENDS = frozenset(("auto", "native", "docker", "local"))
+
+
+def _agent_data_dir() -> Path:
+    if os.environ.get("AGENT8088_HOME"):
+        return Path(os.environ["AGENT8088_HOME"]).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088"
+    return Path.home() / ".agent8088"
+
+
+def _native_sandbox_argv():
+    override = os.environ.get("AGENT8088_SRT")
+    if override:
+        return shlex.split(override, posix=sys.platform != "win32")
+    cli = (_agent_data_dir() / "runtime" / "node_modules"
+           / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
+    node = shutil.which("node")
+    if node and cli.exists():
+        return [node, str(cli)]
+    executable = shutil.which("srt")
+    return [executable] if executable else None
+
+
+def _native_sandbox_missing_requirements() -> list:
+    if not _native_sandbox_argv():
+        return ["sandbox-runtime"]
+    if sys.platform == "darwin":
+        required = ("sandbox-exec", "rg")
+    elif sys.platform.startswith("linux"):
+        required = ("bwrap", "socat", "rg")
+    else:
+        required = ()
+    return [command for command in required if not shutil.which(command)]
 
 
 def _docker_available() -> bool:
+    docker = shutil.which("docker")
+    if not docker:
+        return False
     try:
-        r = subprocess.run("docker info", shell=True, capture_output=True,
-                           text=True, timeout=10)
-        return r.returncode == 0
-    except Exception:
+        return subprocess.run(
+            [docker, "info"], capture_output=True, timeout=10
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
 
+def _resolve_sandbox_backend() -> str:
+    requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
+    native_available = not _native_sandbox_missing_requirements()
+    if requested == "local":
+        return "local"
+    if requested == "native":
+        return "native" if native_available else "unavailable"
+    if requested == "docker":
+        return "docker" if _docker_available() else "unavailable"
+    if native_available:
+        return "native"
+    return "docker" if _docker_available() else "unavailable"
+
+
+def sandbox_status() -> dict:
+    resolved = _resolve_sandbox_backend()
+    detail = {
+        "native": "OS-native isolation via sandbox-runtime",
+        "docker": "Docker fallback with no network and capped resources",
+        "local": "unsandboxed local execution (explicit opt-in)",
+        "unavailable": "native runtime and Docker are unavailable",
+    }[resolved]
+    missing = _native_sandbox_missing_requirements()
+    if resolved == "unavailable" and missing:
+        detail += f" (missing: {', '.join(missing)})"
+    return {
+        "requested": SANDBOX_BACKEND,
+        "resolved": resolved,
+        "detail": detail,
+        "network": ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked",
+        "runtime_version": SANDBOX_RUNTIME_VERSION,
+    }
+
+
+def set_sandbox_backend(backend: str) -> dict:
+    global SANDBOX_BACKEND
+    backend = str(backend or "").strip().lower()
+    if backend not in _SANDBOX_BACKENDS:
+        raise ValueError("Sandbox must be auto, native, docker, or local.")
+    update_simple_config(CONFIG_PATH, {"sandbox_backend": backend})
+    APP_CONFIG["sandbox_backend"] = backend
+    SANDBOX_BACKEND = backend
+    return sandbox_status()
+
+
+def _sandbox_settings_data() -> dict:
+    home = Path.home()
+    denied = [
+        CONFIG_PATH, _agent_data_dir() / "srt-settings.json",
+        home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
+        home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
+        home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
+        PROJECT_ROOT / "**" / ".env*", PROJECT_ROOT / "**" / "*.pem",
+        PROJECT_ROOT / "**" / "*.key", PROJECT_ROOT / "**" / "*.p12",
+        PROJECT_ROOT / "**" / "*_KEY*",
+        PROJECT_ROOT / "**" / "*_SECRET*", PROJECT_ROOT / "**" / "*_TOKEN*",
+        PROJECT_ROOT / "**" / "*_PASSWORD*",
+    ]
+    deny_paths = [str(path.expanduser().resolve()) for path in denied]
+    allow_write = [str(PROJECT_ROOT), tempfile.gettempdir()]
+    allow_write.extend(str(path) for path in NO_PROMPT_PATHS)
+    return {
+        "network": {
+            "allowedDomains": SANDBOX_ALLOWED_DOMAINS,
+            "deniedDomains": [],
+            "allowLocalBinding": False,
+        },
+        "filesystem": {
+            "denyRead": deny_paths,
+            "allowRead": [],
+            "allowWrite": list(dict.fromkeys(allow_write)),
+            "denyWrite": deny_paths + [str(path) for path in BLOCKED_PATHS],
+        },
+        "enableWeakerNestedSandbox": False,
+        "enableWeakerNetworkIsolation": False,
+        "allowAppleEvents": False,
+    }
+
+
+def _write_sandbox_settings() -> Path:
+    path = _agent_data_dir() / "srt-settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as stream:
+        json.dump(_sandbox_settings_data(), stream, indent=2)
+        stream.write("\n")
+        temporary = Path(stream.name)
+    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(temporary, path)
+    return path
+
+
+def _exec_native_sandbox(command: str, timeout: int) -> str:
+    argv = _native_sandbox_argv()
+    if not argv:
+        return "Native sandbox runtime is unavailable."
+    settings = _write_sandbox_settings()
+    return _exec_process(
+        argv + ["--settings", str(settings), "-c", command], timeout=timeout
+    )
+
+
+def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
+    global _local_fallback_grant
+    backend = _resolve_sandbox_backend()
+    if backend == "native":
+        runtime = _native_sandbox_argv()
+        settings = _write_sandbox_settings()
+        return _exec_process(
+            runtime + ["--settings", str(settings), *argv], timeout=timeout
+        )
+    if backend == "docker":
+        return _exec_docker_command(_process_display(argv), timeout)
+    if backend == "local" or _local_fallback_grant:
+        _local_fallback_grant = False
+        return _exec_process(argv, timeout=timeout)
+    return _local_execution_request(_process_display(argv))
+
+
+def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
+                         image: str = "") -> str:
+    workspace = str(PROJECT_ROOT)
+    container_command = ["python", "-c", command] if python_code else ["sh", "-lc", command]
+    argv = [
+        "docker", "run", "--rm", "--network", DOCKER_NETWORK,
+        "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--mount", f"type=bind,src={workspace},dst=/workspace",
+    ]
+    empty = _agent_data_dir() / "sandbox-empty"
+    empty.parent.mkdir(parents=True, exist_ok=True)
+    empty.touch(mode=0o600, exist_ok=True)
+    for path in PROJECT_ROOT.rglob("*"):
+        if path.is_file() and _is_sensitive_path(str(path)):
+            destination = Path("/workspace") / path.relative_to(PROJECT_ROOT)
+            argv.extend([
+                "--mount", f"type=bind,src={empty},dst={destination},readonly",
+            ])
+    argv.extend(["-w", "/workspace", image or DOCKER_IMAGE, *container_command])
+    return _exec_process(argv, timeout=timeout)
+
+
+def _local_execution_request(command: str) -> str:
+    return request_escalation(
+        target_mode="edit",
+        paths=[str(SHELL_CWD)],
+        change_type="local_execution",
+        reason=(
+            "No native sandbox or Docker fallback is available. "
+            f"Run this command locally without isolation? {_redact_secrets(command[:160])}"
+        ),
+    )
+
+
+def _exec_sandbox_command(command: str, timeout: int = 25,
+                          python_code: bool = False, image: str = "") -> str:
+    global _local_fallback_grant
+    backend = _resolve_sandbox_backend()
+    if backend == "native":
+        local_command = (
+            _process_display([sys.executable, "-c", command])
+            if python_code else command
+        )
+        return _exec_native_sandbox(local_command, timeout)
+    if backend == "docker":
+        return _exec_docker_command(command, timeout, python_code, image)
+    if backend == "local" or _local_fallback_grant:
+        _local_fallback_grant = False
+        if python_code:
+            return _exec_process([sys.executable, "-c", command], timeout=timeout)
+        return _exec_process(command, timeout=timeout, shell=True)
+    return _local_execution_request(command)
+
+
+def install_native_sandbox() -> str:
+    node = shutil.which("node")
+    npm = shutil.which("npm")
+    if not node or not npm:
+        return "Node.js 20.11 or newer is required to install the native sandbox runtime."
+    try:
+        version = subprocess.run(
+            [node, "--version"], capture_output=True, text=True, timeout=10
+        ).stdout.strip().lstrip("v")
+        major, minor = (int(part) for part in version.split(".")[:2])
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return "Could not determine the installed Node.js version."
+    if (major, minor) < (20, 11):
+        return f"Node.js 20.11 or newer is required (found {version})."
+
+    runtime_dir = _agent_data_dir() / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    result = _exec_process([
+        npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
+        f"@anthropic-ai/sandbox-runtime@{SANDBOX_RUNTIME_VERSION}",
+    ], timeout=300)
+    if "exited with status" in result or "timed out" in result:
+        return result
+    if sys.platform == "win32":
+        setup = _exec_process(
+            _native_sandbox_argv() + ["windows-install"], timeout=300
+        )
+        if "exited with status" in setup or "timed out" in setup:
+            return setup
+    missing = _native_sandbox_missing_requirements()
+    if missing:
+        return (
+            f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed. "
+            f"Install the remaining OS packages: {', '.join(missing)}."
+        )
+    return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed."
+
+
 def _exec_docker(args: dict) -> str:
-    """Run a Python snippet inside a throwaway container. Network is disabled and
-    resources are capped by default; the container is removed after the run.
-    Degrades with install instructions when Docker isn't available."""
+    """Run a Python snippet through the configured sandbox backend."""
     code = str(args.get("code") or "").strip()
     if not code:
         return "Error: sandboxed execution requires 'code'."
-    if not _docker_available():
-        return ("Docker is not available on this machine. Install Docker Desktop and "
-                "make sure `docker info` succeeds, or use execute_shell instead.")
     image = str(args.get("image") or DOCKER_IMAGE)
     timeout = int(args.get("timeout") or 60)
-    command = [
-        "docker", "run", "--rm", "--network", DOCKER_NETWORK,
-        "--memory", "512m", "--cpus", "1", image, "python", "-c", code,
-    ]
-    return _exec_process(command, timeout=timeout)
+    return _exec_sandbox_command(code, timeout=timeout, python_code=True, image=image)
 
 
 _CRON_FIELD_RE = re.compile(r'^[\d\*/,\-]+$')
@@ -1524,16 +1776,23 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             paths_str = command
         elif mode == "browser":
             paths_str = command[:120]
+        sandbox_missing = mode in ("shell", "docker") and _resolve_sandbox_backend() == "unavailable"
         change_type = {
             "write_text": "new_file",
             "cron": "scheduled_task",
             "browser": "network_request",
-        }.get(mode, "filesystem_op")
+        }.get(mode, "local_execution" if sandbox_missing else "filesystem_op")
+        reason = (
+            f"Tool '{name}' needs permission and no sandbox is available. "
+            "Run this action locally without isolation?"
+            if sandbox_missing else
+            f"Tool '{name}' requires {mode} access, which is blocked in readonly mode."
+        )
         return request_escalation(
             target_mode="edit",
             paths=[paths_str],
             change_type=change_type,
-            reason=f"Tool '{name}' requires {mode} access, which is blocked in readonly mode.",
+            reason=reason,
         )
 
     if mode == "last_output":
