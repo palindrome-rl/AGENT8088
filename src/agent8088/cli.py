@@ -1931,15 +1931,12 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     custom_base_url = ""
     if provider_choice == CUSTOM_PROVIDER_CHOICE:
-        default_name = cur_provider if cur_provider not in builtin_names else "custom"
-        provider = _custom_prompt("Custom provider name:", default_name).strip().lower()
+        provider = _custom_prompt("Custom provider name:").strip().lower()
         if not _valid_provider_name(provider):
             print("Custom provider names use letters, numbers, _ or -.")
             return
-        custom_base_url = _custom_prompt(
-            "OpenAI-compatible URL:",
-            instruction="(required, e.g. https://host/v1)",
-        ).strip()
+        custom_base_url = _custom_prompt("OpenAI-compatible URL:").strip()
+        custom_base_url = _openai_base_url(custom_base_url)
         if not custom_base_url:
             custom_base_url = _current(f"provider.{provider}.base_url")
         if not custom_base_url:
