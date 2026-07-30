@@ -141,6 +141,27 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     assert "provider.localai.api_key=secret-key" in saved
 
 
+def test_model_setup_works_without_inquirerpy(tmp_path, monkeypatch):
+    config = tmp_path / "config.txt"
+    config.write_text("allowed_paths=~\ndefault_provider=ollama\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "InquirerPy", None)
+    inputs = iter(["ollama-cloud", "glm-5.2:cloud"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    monkeypatch.setattr("getpass.getpass", lambda _: "cloud-key")
+    monkeypatch.setattr(
+        providers,
+        "list_models",
+        lambda provider, client=None, fallback=True: ["glm-5.2:cloud"],
+    )
+
+    cli._run_setup(config_path=config, include_workspace=False)
+
+    saved = config.read_text(encoding="utf-8")
+    assert "default_provider=ollama-cloud" in saved
+    assert "provider.ollama-cloud.model=glm-5.2:cloud" in saved
+    assert "provider.ollama-cloud.api_key=cloud-key" in saved
+
+
 def test_models_command_picks_and_switches_model(monkeypatch):
     fake = _FakeInquirer({
         "text": [],
@@ -152,6 +173,26 @@ def test_models_command_picks_and_switches_model(monkeypatch):
     monkeypatch.setattr(cli, "_fetch_models_for_provider", lambda provider: ["gpt-new"])
     switched = {}
     monkeypatch.setattr(cli.A, "activate_model", lambda provider, model="": switched.update(provider=provider, model=model))
+
+    cli.cmd_models("")
+
+    assert switched == {"provider": "openai", "model": "gpt-new"}
+
+
+def test_models_picker_works_without_inquirerpy(monkeypatch):
+    monkeypatch.setitem(sys.modules, "InquirerPy", None)
+    inputs = iter(["openai", "gpt-new"])
+    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    monkeypatch.setattr(cli.A, "PROVIDERS", {"openai": {"model": "gpt-old"}})
+    monkeypatch.setattr(cli.A, "APP_CONFIG", {})
+    monkeypatch.setattr(cli, "_fetch_models_for_provider", lambda provider: ["gpt-new"])
+    switched = {}
+    monkeypatch.setattr(
+        cli.A,
+        "activate_model",
+        lambda provider, model="": switched.update(provider=provider, model=model),
+    )
+    monkeypatch.setattr(cli, "banner", lambda: None)
 
     cli.cmd_models("")
 

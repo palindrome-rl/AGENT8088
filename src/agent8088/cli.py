@@ -1158,34 +1158,23 @@ def cmd_models(rest):
     if provider in {"custom", "selfhosted", "self-hosted"}:
         _configure_custom_models_endpoint()
         return
-    try:
-        from InquirerPy import inquirer
-    except ImportError:
-        console.print("[red]InquirerPy is missing.[/red] Run the installer/update again.")
-        return
     if not provider:
         choices = sorted(A.PROVIDERS)
         if not choices:
             console.print(f"[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
             return
-        kwargs = {"message": "Select provider:", "choices": choices, "max_height": "70%"}
         active = A.ACTIVE_PROVIDER or A.APP_CONFIG.get("default_provider", "")
-        if active in choices:
-            kwargs["default"] = active
-        provider = inquirer.fuzzy(**kwargs).execute()
+        provider = _choice_prompt("Select provider:", choices, active if active in choices else "")
     if provider not in A.PROVIDERS:
         console.print(f"[red]unknown provider[/red] '{provider}' — known: "
                       + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
         return
     models = _fetch_models_for_provider(provider)
     if models:
-        kwargs = {"message": "Select model:", "choices": models, "max_height": "70%"}
         current = A.PROVIDERS.get(provider, {}).get("model", "")
-        if current in models:
-            kwargs["default"] = current
-        model = inquirer.fuzzy(**kwargs).execute()
+        model = _choice_prompt("Select model:", models, current if current in models else "")
     else:
-        model = inquirer.text(message="Model name:", default=A.PROVIDERS.get(provider, {}).get("model", "")).execute()
+        model = _custom_prompt("Model name:", A.PROVIDERS.get(provider, {}).get("model", ""))
     if not model:
         console.print("[red]A model is required.[/red]")
         return
@@ -1580,21 +1569,49 @@ def _api_key_from_auth(auth):
     return auth or "none"
 
 
-def _custom_prompt(message, default="", secret=False):
+def _custom_prompt(message, default="", secret=False, instruction=""):
     try:
         from InquirerPy import inquirer
         prompt = inquirer.secret if secret else inquirer.text
         kwargs = {"message": message}
         if default:
             kwargs["default"] = default
+        if instruction:
+            kwargs["instruction"] = instruction
         return prompt(**kwargs).execute()
     except ImportError:
         suffix = f" [{default}]" if default and not secret else ""
+        if instruction:
+            suffix += f" {instruction}"
         if secret:
             import getpass
             return getpass.getpass(f"{message}{suffix} ")
         value = input(f"{message}{suffix} ").strip()
         return value or default
+
+
+def _choice_prompt(message, choices, default=""):
+    try:
+        from InquirerPy import inquirer
+        kwargs = {"message": message, "choices": choices, "max_height": "70%"}
+        if default:
+            kwargs["default"] = default
+        return inquirer.fuzzy(**kwargs).execute()
+    except ImportError:
+        print(message)
+        for index, choice in enumerate(choices, 1):
+            marker = " (default)" if choice == default else ""
+            print(f"  {index}. {choice}{marker}")
+        while True:
+            value = input("Choose number or name: ").strip()
+            if not value and default:
+                return default
+            if value.isdigit() and 1 <= int(value) <= len(choices):
+                return choices[int(value) - 1]
+            matches = [choice for choice in choices if choice.lower() == value.lower()]
+            if matches:
+                return matches[0]
+            print("Invalid choice.")
 
 
 def _configure_custom_models_endpoint():
@@ -1884,7 +1901,6 @@ def _reload_model_runtime(config_path, provider="", model=""):
 def _run_setup(config_path=None, include_workspace=True, activate_runtime=False, heading="Agent8088 setup"):
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
-    from InquirerPy import inquirer
     from agent8088 import providers as provider_registry
     home = _agent8088_home()
     config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
@@ -1904,30 +1920,26 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     print(f"{heading}\n")
     if include_workspace:
         cur_paths = _current("allowed_paths") or "~"
-        paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
+        paths = _custom_prompt("Working directory:", cur_paths)
     else:
         paths = ""
 
     builtin_names = provider_registry.builtin_provider_names()
     provider_choices = [*builtin_names, CUSTOM_PROVIDER_CHOICE]
     cur_provider = _current("default_provider") or provider_registry.default_provider_name()
-    provider_choice = inquirer.fuzzy(
-        message="Select model provider:",
-        choices=provider_choices,
-        max_height="70%",
-    ).execute()
+    provider_choice = _choice_prompt("Select model provider:", provider_choices)
 
     custom_base_url = ""
     if provider_choice == CUSTOM_PROVIDER_CHOICE:
         default_name = cur_provider if cur_provider not in builtin_names else "custom"
-        provider = inquirer.text(message="Custom provider name:", default=default_name).execute().strip().lower()
+        provider = _custom_prompt("Custom provider name:", default_name).strip().lower()
         if not _valid_provider_name(provider):
             print("Custom provider names use letters, numbers, _ or -.")
             return
-        custom_base_url = inquirer.text(
-            message="OpenAI-compatible URL:",
+        custom_base_url = _custom_prompt(
+            "OpenAI-compatible URL:",
             instruction="(required, e.g. https://host/v1)",
-        ).execute().strip()
+        ).strip()
         if not custom_base_url:
             custom_base_url = _current(f"provider.{provider}.base_url")
         if not custom_base_url:
@@ -1944,10 +1956,11 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     # API key input is deliberately hidden and has no default, so existing keys are
     # never echoed back to the terminal. Empty input preserves the existing value.
-    key = inquirer.secret(
-        message=f"API key for {provider}:",
+    key = _custom_prompt(
+        f"API key for {provider}:",
+        secret=True,
         instruction="(hidden; Enter keeps existing/skips)",
-    ).execute()
+    )
     # Fetch models
     print("\nFetching model list...")
     try:
@@ -1961,29 +1974,22 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     except Exception:
         models = []
     if models:
-        kwargs = {
-            "message": "Select model:",
-            "choices": models,
-            "max_height": "70%",
-        }
-        if current_model in models:
-            kwargs["default"] = current_model
-        model_name = inquirer.fuzzy(**kwargs).execute()
+        model_name = _choice_prompt(
+            "Select model:",
+            models,
+            current_model if current_model in models else "",
+        )
     else:
-        model_name = inquirer.text(
-            message="Model name:",
-            default=current_model,
-            instruction="(required)",
-        ).execute()
+        model_name = _custom_prompt("Model name:", current_model, instruction="(required)")
     if not model_name:
         print("A model is required.")
         return
 
     if include_workspace:
-        search = inquirer.text(
-            message="Web search URL (SearXNG):",
+        search = _custom_prompt(
+            "Web search URL (SearXNG):",
             instruction="(Enter keeps current setting; type none to disable)",
-        ).execute()
+        )
     else:
         search = ""
 
