@@ -1,5 +1,7 @@
 import sys
+import stat
 import types
+from pathlib import Path
 
 from agent8088 import cli
 from agent8088 import providers
@@ -34,6 +36,13 @@ class _FakeInquirer:
 
 def _install_fake_inquirer(monkeypatch, fake):
     monkeypatch.setitem(sys.modules, "InquirerPy", types.SimpleNamespace(inquirer=fake))
+
+
+def test_packaged_config_matches_repository_default():
+    root = Path(__file__).resolve().parent.parent
+    assert (root / "config.txt").read_bytes() == (
+        root / "src" / "agent8088" / "config.txt"
+    ).read_bytes()
 
 
 def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys):
@@ -81,6 +90,16 @@ def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys
     assert "sk-existing-secret" not in output
     assert "http://private-search.local" not in output
     assert "gpt-live" not in output
+    if sys.platform != "win32":
+        assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+def test_windows_installer_restricts_config_by_sid():
+    installer = (Path(__file__).resolve().parent.parent / "install.ps1").read_text()
+    assert "WindowsIdentity]::GetCurrent()" in installer
+    assert 'icacls $Path /grant:r "*$sid`:(R,W)"' in installer
+    assert installer.index("/grant:r") < installer.index("/inheritance:r")
+    assert "$env:USERNAME`:(R,W)" not in installer
 
 
 def test_setup_fetch_failure_asks_for_model_without_fallback_choices(tmp_path, monkeypatch):

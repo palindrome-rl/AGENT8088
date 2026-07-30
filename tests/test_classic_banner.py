@@ -1,6 +1,7 @@
 import io
 import json
 import sys
+from types import SimpleNamespace
 
 from rich.console import Console
 
@@ -31,7 +32,33 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
 def test_palindrome_logo_falls_back_when_asset_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
 
-    assert classic._palindrome_logo().plain == "▀" * 24
+    logo = classic._palindrome_logo().plain
+    assert len(logo.splitlines()) == 8
+    assert max(map(len, logo.splitlines())) <= 24
+
+
+def test_palindrome_logo_uses_ascii_on_legacy_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
+    monkeypatch.setattr(
+        classic, "console",
+        SimpleNamespace(legacy_windows=True, encoding="cp1252"),
+    )
+
+    logo = classic._palindrome_logo().plain
+
+    assert "######" in logo
+    assert all(ord(character) < 128 for character in logo)
+
+
+def test_narrow_banner_keeps_the_palindrome_brand(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(classic, "console", Console(file=output, width=50, color_system=None))
+
+    classic.banner()
+
+    rendered = output.getvalue()
+    assert "Palindrome Research Labs" in rendered
+    assert any(pixel in rendered for pixel in ("#", "█", "▀", "▄"))
 
 
 def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
@@ -120,6 +147,8 @@ def test_trace_save_exports_full_conversation(tmp_path, monkeypatch):
     monkeypatch.setattr(classic.S, "name", "trace_demo")
     monkeypatch.setattr(classic.S, "messages", [{"role": "user", "content": "hello"}])
     monkeypatch.setattr(classic.S, "conversation_trace", [])
+    monkeypatch.setattr(classic.A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [tmp_path])
 
     classic._record_trace("hello", [{"type": "final_answer", "content": "hi"}], 0.25)
     export_path = tmp_path / "conversation.json"
@@ -129,6 +158,22 @@ def test_trace_save_exports_full_conversation(tmp_path, monkeypatch):
     assert exported["messages"] == [{"role": "user", "content": "hello"}]
     assert exported["trace"][0]["input"] == "hello"
     assert "full conversation trace saved" in output.getvalue()
+
+
+def test_trace_save_respects_write_permissions(tmp_path, monkeypatch):
+    output = io.StringIO()
+    target = tmp_path / "blocked.json"
+    monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
+    monkeypatch.setattr(classic.A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [])
+    monkeypatch.setattr(classic.A, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(classic, "_handle_escalation", lambda _: False)
+
+    classic.cmd_trace(f"save {target}")
+
+    assert not target.exists()
+    assert "could not save" in output.getvalue()
 
 
 def test_trace_on_creates_and_updates_a_default_export(tmp_path, monkeypatch):

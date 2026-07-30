@@ -30,7 +30,7 @@ unlimited model providers · 7 new security guardrails.
 | 20 | Skill marketplace | `skills_installed/`, `/skills` |
 | 21 | Test + verification suites | `pytest`, `scripts/verify_features.py` |
 | 22 | Web search overhaul (jq filters, Tavily/Exa, SSRF allowlist) | `web_search`, `web_search_tavily`, `web_search_exa` |
-| 23 | Classic AGENT8088 UI | `python agent8088_cli.py` |
+| 23 | Classic AGENT8088 UI | `agent8088` |
 | 24 | Responsive terminal branding | automatic at narrow widths |
 | 25 | Live slash-command suggestions | type `/`, then type or use `Tab` |
 | 26 | Default skill playbooks | `/skills`, `/skills <name>` |
@@ -120,8 +120,8 @@ trace, and a completion footer:
 ╰─ ✓ done · 1 tool · 2.4s
 ```
 
-Automatic in the Rich CLI. The engine exposes a decoupled `subagent_ui` hook, so
-sub-agents stay silent in benchmark/one-shot/plain-REPL modes.
+Automatic in the Rich CLI. The engine exposes a decoupled `subagent_ui` hook for
+other frontends.
 
 ## 4. Picker + autocompletion
 
@@ -368,7 +368,7 @@ Use it:
 ```
 
 ```bash
-AGENT8088_PROVIDER=groq python agent8088_cli.py    # or via env var
+AGENT8088_PROVIDER=groq agent8088    # or via env var
 ```
 
 Selection precedence: explicit `/model` arg → `AGENT8088_PROVIDER` → config
@@ -522,7 +522,7 @@ than in `tools.txt`, where `|` is the field separator.
 
 ## 23. Classic AGENT8088 interface
 
-`python agent8088_cli.py` is now the default interactive experience. The temporary
+`agent8088` is now the default interactive experience. The temporary
 Textual/Toad interface was removed so there is one complete CLI rather than two
 incomplete front ends. It uses the AGENT8088 masthead, the supplied Palindrome
 Research Labs artwork, and a consistent blue terminal palette.
@@ -593,7 +593,7 @@ OpenAI-compatible servers from the same `/model` command. Credentials are read f
 an environment variable named by `api_key_env`, not saved into a profile.
 
 ```bash
-python agent8088_cli.py --model-setup
+agent8088 --model-setup
 /model                                 # list configured profiles
 /model <profile>
 /model <profile>:<model>
@@ -643,10 +643,7 @@ Bare `clear`, `help`, `tools`, `agents`, … also work (not sent to the model).
 ## Launching
 
 ```bash
-python agent8088_cli.py                    # Rich CLI (all features)
-./agent8088                                # classic REPL
-./agent8088 "list the files here"          # one-shot
-./agent8088 --trace "count the TODOs"      # one-shot + JSON trace to stderr
+agent8088                                   # Rich CLI (all features)
 ```
 
 # Complete tool reference

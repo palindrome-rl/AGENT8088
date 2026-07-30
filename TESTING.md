@@ -31,14 +31,14 @@ python scripts/verify_features.py
 ```
 
 Uses your **real** `config.txt`, runs real git commands, launches a real browser,
-and executes real containers when Docker is up. Anything unavailable is reported
+and executes in the native sandbox when installed, or Docker when it is up. Anything unavailable is reported
 as `⊘ SKIP` with the reason rather than silently passing. Exit code is non-zero on
 any failure.
 
-To get all 92 (no skips), have Docker running and Playwright installed:
+For sandbox integration coverage, install the native runtime (preferred) or have Docker running:
 
 ```bash
-open -a Docker                                    # macOS
+agent8088 --sandbox-setup
 pip install playwright && playwright install chromium
 docker pull python:3.11-slim
 ```
@@ -46,7 +46,7 @@ docker pull python:3.11-slim
 ## 3. Manual testing in the CLI
 
 ```bash
-python agent8088_cli.py
+agent8088
 ```
 
 | Try | What to expect |
@@ -59,7 +59,7 @@ python agent8088_cli.py
 | `/model` | provider table + active model |
 | `/reasoning on` | shows thinking (masked); default is hidden |
 | `/image /path/to/shot.png what is this?` | needs a vision-capable provider |
-| `/tool run_sandboxed code="print(6*7)"` | `42` from inside a container |
+| `/tool run_sandboxed code="print(6*7)"` | `42` from the native sandbox or Docker fallback |
 | `/tool browse_page url=https://example.com` | live page text |
 | `/tool git_status` | real git output |
 | `/tool web_search query="python 3.13"` | clean `• title / url / snippet` list |
@@ -77,24 +77,26 @@ python agent8088_cli.py
 | `hello how are you` | normal reply — **not** "I have no tools" |
 | `what oolsyo` (garbled) | normal reply asking for clarification |
 
-## 4. One-shot / trace mode
+## 4. Trace mode
 
 ```bash
-./agent8088 "list the files in this directory"
-./agent8088 --trace "use a subagent to count the TODOs here"
+agent8088
+/trace on
+use a subagent to count the TODOs here
 ```
 
-`--trace` prints the full step-by-step JSON call chain to stderr.
+`/trace on` records the full step-by-step call chain and persists the setting.
 
 ## Notes
 
-- **Docker**: `run_sandboxed` needs the daemon running. Without it the tool returns
-  install instructions instead of failing.
+- **Sandbox**: `run_sandboxed` prefers the free native runtime, then Docker.
+  Without either it asks before running locally without isolation.
 - **Playwright**: `browse_page` needs `playwright install chromium`. Without it the
   tool tells you how to install it and suggests `web_search`.
 - **Vision**: `/image` needs a vision-capable provider configured (see `/model`); the
   default local text model will error.
-- **SSRF**: `config.txt` uses `ssrf_allow_hosts=192.168.1.10` to permit only the SearXNG
-  box; `ssrf_allow_private` stays `0` so the rest of the private network is blocked.
+- **SSRF**: `config.txt` allows only `127.0.0.1,localhost` for a local SearXNG;
+  add a LAN host explicitly when needed. `ssrf_allow_private` stays `0` so every
+  other private address remains blocked.
 - **Search**: the LAN SearXNG is unreachable off that network — `web_search` will report
   `No response from ...`. Set `tavily_api_key` or `exa_api_key` for a hosted fallback.

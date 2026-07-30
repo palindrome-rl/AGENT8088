@@ -16,7 +16,7 @@ feature is reachable here:
 
 Run:  python agent8088_cli.py
 """
-import sys, os, json, time, threading, select, socket  # noqa: F401
+import sys, os, json, stat, tempfile, time, threading, select, socket  # noqa: F401
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -187,7 +187,21 @@ class Session:
 
 
 S = Session()
-SESSIONS_DIR = APP_DIR / ".agent8088" / "sessions"
+SESSIONS_DIR = Path(os.environ.get(
+    "AGENT8088_HOME", str(Path.home() / ".agent8088")
+)).expanduser() / "sessions"
+
+
+def _write_private_text(path, content):
+    destination = Path(path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=destination.parent,
+                                     delete=False) as stream:
+        stream.write(content)
+        temporary = Path(stream.name)
+    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(temporary, destination)
+    return destination
 
 
 def _trace_export_data():
@@ -201,10 +215,7 @@ def _trace_export_data():
 
 
 def _write_trace_export(path):
-    destination = Path(path).expanduser()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(_trace_export_data(), indent=2))
-    return destination
+    return _write_private_text(path, json.dumps(_trace_export_data(), indent=2))
 
 
 def _default_trace_path():
@@ -257,7 +268,7 @@ def _save_active_session():
     if not S.name:
         return
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _session_path(S.name).write_text(json.dumps({
+    _write_private_text(_session_path(S.name), json.dumps({
         "version": 1,
         "name": S.name,
         "messages": S.messages,
@@ -303,6 +314,10 @@ def _active_tool_specs():
     return {name: spec for name, spec in A.TOOL_SPECS.items() if name in allowed}
 
 
+def _active_provider_name():
+    return A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER or "default"
+
+
 def _session_system_prompt():
     specs = _active_tool_specs()
     return (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
@@ -327,6 +342,26 @@ _COMPACT_BANNER = r"""    _   ___ ___ _  _ _____ ___  __  ___  ___
  /_/ \_\___|___|_|\_| |_| \___/\__/\___/\___/
 """
 
+_PALINDROME_BLOCK_LOGO = """\
+   ▄▄████▄    ▄▄███▄▄
+ ▄████▀████▄▄████▀████▄
+███▀▀   ▀██████▀   ▀▀███
+████▄  ▄████████▄  ▄████
+████▀ ▀▀████████▀  ▀████
+███▄▄    ██████▄    ▄███
+▀▀████▄████▀▀████▄████▀▀
+   ▀▀████▀    ▀█████▀"""
+
+_PALINDROME_ASCII_LOGO = """\
+    ######     #####
+ ########### ##########
+####     ######     ####
+#####  ##########  #####
+#####  ##########  #####
+####     ######     ####
+ ########### ##########
+    ######    #######"""
+
 # The supplied Palindrome Research Labs PNG is rendered directly in classic mode.
 _PALINDROME_LOGO = APP_DIR / "assets" / "palindrome-research-labs.png"
 if not _PALINDROME_LOGO.is_file():
@@ -343,12 +378,17 @@ def _catalog(items, columns=4):
 
 def _palindrome_logo():
     """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
+    fallback = (
+        _PALINDROME_ASCII_LOGO
+        if console.legacy_windows or "utf" not in console.encoding.lower()
+        else _PALINDROME_BLOCK_LOGO
+    )
     if not _PALINDROME_LOGO.is_file():
-        return Text("▀" * 24)
+        return Text(fallback, style="bold #00C8FF")
     try:
         from PIL import Image
     except ImportError:
-        return Text("▀" * 24)
+        return Text(fallback, style="bold #00C8FF")
 
     image = Image.open(_PALINDROME_LOGO).convert("RGB")
     blue = image.getchannel("B")
@@ -396,13 +436,15 @@ def _classic_masthead():
 
 def banner():
     console.print(_classic_masthead(), justify="center")
-    active_profile = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "default")
+    active_profile = _active_provider_name()
     # Get endpoint from the provider registry, not old config keys
     provider_info = A.PROVIDERS.get(active_profile, {})
     endpoint = provider_info.get("base_url", A.APP_CONFIG.get("model_base_url", "?"))
     backend = active_profile or "default"
 
     if console.width < 70:
+        console.print(_palindrome_logo(), justify="center")
+        console.print(Text("Palindrome Research Labs", style="bold #00edff"), justify="center")
         compact = Text()
         compact.append(f"{active_profile}:{A.MODEL_NAME}", style="bold #00edff")
         compact.append(f" · {len(_active_tool_specs())} tools · {len(_active_skills())} skills · /help", style="#237dd7")
@@ -418,6 +460,7 @@ def banner():
     details.add_row("Model", f"{active_profile}:{A.MODEL_NAME}")
     details.add_row("Backend", backend)
     details.add_row("Endpoint", str(endpoint))
+    details.add_row("Sandbox", A.sandbox_status()["resolved"])
     details.add_row("Subagents", f"{len(A.SUBAGENT_SPECS)} loaded · {', '.join(sorted(A.SUBAGENT_SPECS))}")
     details.add_row("Session", f"temperature {S.temperature} · max turns {S.max_turns}")
 
@@ -593,6 +636,9 @@ def _make_subagent_ui(live):
             line.append(preview, style="dim")
             console.print(line)
 
+        def sub_on_escalation(_name, result):
+            return _handle_escalation(result, live)
+
         def done(answer):
             elapsed = time.time() - state["start"]
             n = state["tools"]
@@ -601,7 +647,8 @@ def _make_subagent_ui(live):
             foot.append(f"done · {n} tool{'s' if n != 1 else ''} · {elapsed:.1f}s", style="dim")
             console.print(foot)
 
-        return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result, "done": done}
+        return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result,
+                "on_escalation": sub_on_escalation, "done": done}
 
     return factory
 
@@ -627,7 +674,7 @@ def _stream_view(reasoning_parts, content_parts):
     return Group(*blocks) if blocks else Text("")
 
 
-def _handle_escalation(result_text, messages=None, live=None):
+def _handle_escalation(result_text, live=None):
     """Check if a tool result is an escalation request. If so, prompt the user
     for y/n approval and call grant_escalation() if approved."""
     if not result_text.startswith("ESCALATION_REQUEST:"):
@@ -649,21 +696,13 @@ def _handle_escalation(result_text, messages=None, live=None):
     except (EOFError, KeyboardInterrupt):
         response = "n"
     if response in ("y", "yes"):
-        A.grant_escalation()
+        A.grant_escalation(change_type)
         console.print("[green]Approved for this action only. Next write will ask again.[/green]")
-        if messages is not None:
-            messages.append({"role": "user", "content":
-                "Permission granted. Retry the EXACT same tool call that was blocked. "
-                "Do not ask for permission again. Do not explain. Just call the tool again now."})
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
-        if messages is not None:
-            messages.append({"role": "user", "content":
-                "Permission denied by the user. You remain in readonly mode. "
-                "Tell the user what you could not do and why the task cannot be completed."})
     if live is not None:
         live.start()
-    return True
+    return response in ("y", "yes")
 
 
 def do_chat(query):
@@ -698,14 +737,16 @@ def do_chat(query):
 
         def _on_result(name, result):
             on_result(name, result)
-            if _handle_escalation(result, S.messages, live):
-                pass  # Escalation handled — retry hint injected into messages
+
+        def _on_escalation(_name, result):
+            return _handle_escalation(result, live)
 
         try:
             answer = A.run_agent(
                 S.messages, max_turns=S.max_turns, temperature=S.temperature,
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
-                on_result=_on_result, on_answer=None, on_token=on_token,
+                on_result=_on_result, on_escalation=_on_escalation,
+                on_answer=None, on_token=on_token,
                 interrupt_check=esc.triggered.is_set, trace=trace,
                 system_prompt=_session_system_prompt(),
                 tools_def=A.build_tools_def(_active_tool_specs()),
@@ -732,7 +773,7 @@ def do_chat(query):
     if S.usage_mode == "tokens":
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens[/dim]")
     elif S.usage_mode == "full":
-        active = A.ACTIVE_PROVIDER or "default"
+        active = _active_provider_name()
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
     if trace is not None:
@@ -781,6 +822,7 @@ def cmd_help(_):
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
         ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
+        ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
         ("/new <name>", "Create a named persistent session"),
@@ -1003,6 +1045,9 @@ def cmd_tool(rest):
         return
     with status_cm(f"running {name}..."):
         result = A.exec_tool(name, json.dumps(args))
+    if result.startswith("ESCALATION_REQUEST:") and _handle_escalation(result):
+        with status_cm(f"running {name}..."):
+            result = A.exec_tool(name, json.dumps(args))
     console.print(Panel(Text(result), title=f"[#237dd7]{name}[/#237dd7]  {json.dumps(args)}",
                         box=box.ROUNDED, border_style="#0077B6"))
 
@@ -1035,7 +1080,11 @@ def cmd_plan(rest):
         live.update(render_checklist())
 
     with Live(console=console, refresh_per_second=10, transient=False) as live:
-        result = A._exec_plan({"steps": rest}, on_step=on_step)
+        result = A._exec_plan(
+            {"steps": rest},
+            on_step=on_step,
+            on_escalation=lambda request: _handle_escalation(request, live),
+        )
 
     console.print(Panel(Text(result), title="[#237dd7]plan result[/#237dd7]",
                         box=box.ROUNDED, border_style="#0077B6"))
@@ -1117,7 +1166,7 @@ def cmd_model(rest):
         else:
             console.print(f"[dim]No providers configured — run `/model setup` "
                           f"or add one to {A.CONFIG_PATH}[/dim]")
-        active = A.ACTIVE_PROVIDER or "default"
+        active = _active_provider_name()
         console.print(f"Active: [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]  ·  switch with "
                       f"[#237dd7]/model <profile>[:model][/#237dd7]")
         return
@@ -1136,7 +1185,7 @@ def cmd_model(rest):
         console.print(f"[red]unknown provider[/red] '{arg}' — known: "
                       + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
         return
-    active = A.ACTIVE_PROVIDER or "default"
+    active = _active_provider_name()
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
     banner()
 
@@ -1163,7 +1212,7 @@ def cmd_models(rest):
         if not choices:
             console.print(f"[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
             return
-        active = A.ACTIVE_PROVIDER or A.APP_CONFIG.get("default_provider", "")
+        active = _active_provider_name()
         provider = _choice_prompt("Select provider:", choices, active if active in choices else "")
     if provider not in A.PROVIDERS:
         console.print(f"[red]unknown provider[/red] '{provider}' — known: "
@@ -1215,12 +1264,10 @@ def cmd_config(_):
     for k in keys:
         v = A.APP_CONFIG.get(k, "—")
         t.add_row(k, str(v))
-    active_provider = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "")
-    t.add_row("[dim]provider[/dim]", active_provider)
+    t.add_row("[dim]provider[/dim]", _active_provider_name())
     t.add_row("[dim]resolved model[/dim]", str(A.MODEL_NAME))
     console.print(t)
-    config_path = os.environ.get('AGENT8088_CONFIG', str(A.APP_DIR / 'config.txt'))
-    console.print(f"[dim]config file: {config_path}[/dim]")
+    console.print(f"[dim]config file: {A.CONFIG_PATH}[/dim]")
 
 
 def cmd_status(_):
@@ -1229,11 +1276,13 @@ def cmd_status(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Item", style="#00edff", no_wrap=True)
     t.add_column("Value", style="#237dd7")
-    active = A.ACTIVE_PROVIDER or "default"
+    active = _active_provider_name()
     t.add_row("Model", f"{active}:{A.MODEL_NAME}")
     t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
+    sandbox = A.sandbox_status()
+    t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['requested']}) · network {sandbox['network']}")
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
     t.add_row("Detail", f"verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
@@ -1254,8 +1303,8 @@ def _endpoint_probe(endpoint):
 
 
 def cmd_doctor(_):
-    active = A.ACTIVE_PROVIDER or "default"
-    provider = A.PROVIDERS.get(A.ACTIVE_PROVIDER, {})
+    active = _active_provider_name()
+    provider = A.PROVIDERS.get(active, {})
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
     key_env = provider.get("api_key_env", "")
     if key_env:
@@ -1263,7 +1312,7 @@ def cmd_doctor(_):
     elif provider.get("api_mode", "").lower() == "litellm":
         auth = "provider-managed / not configured"
     else:
-        auth = "configured" if A.APP_CONFIG.get("api_key") else "not required / not configured"
+        auth = "configured" if A._provider_api_key(provider) else "not required / not configured"
     t = Table(title="Doctor", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Check", style="#00edff", no_wrap=True)
@@ -1273,7 +1322,33 @@ def cmd_doctor(_):
     t.add_row("Reachability", _endpoint_probe(endpoint) if endpoint else "provider-managed")
     t.add_row("Authentication", auth)
     t.add_row("Configuration", f"{A.CONFIG_PATH} ({'found' if A.CONFIG_PATH.exists() else 'missing'})")
+    sandbox = A.sandbox_status()
+    t.add_row("Sandbox", f"{sandbox['resolved']} · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
+    console.print(t)
+
+
+def cmd_sandbox(rest):
+    action = rest.strip().lower()
+    if action == "setup":
+        with status_cm("installing native sandbox runtime..."):
+            result = A.install_native_sandbox()
+        console.print(result)
+    elif action:
+        try:
+            A.set_sandbox_backend(action)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+    status = A.sandbox_status()
+    t = Table(title="Sandbox", box=box.SIMPLE, title_style="bold #00edff")
+    t.add_column("Item", style="#00edff")
+    t.add_column("Value", style="#237dd7")
+    t.add_row("Configured", status["requested"])
+    t.add_row("Active", status["resolved"])
+    t.add_row("Isolation", status["detail"])
+    t.add_row("Network", status["network"])
+    t.add_row("Runtime", status["runtime_version"])
     console.print(t)
 
 
@@ -1435,15 +1510,27 @@ def cmd_history(_):
         console.print(line)
 
 
+def _write_user_export(path, content):
+    arguments = {"filename": path, "content": content}
+    result = A.run_tool("write_file", arguments)
+    if result.startswith("ESCALATION_REQUEST:") and _handle_escalation(result):
+        result = A.run_tool("write_file", arguments)
+    if not result.startswith("Wrote "):
+        console.print(f"[red]could not save:[/red] {result}")
+        return None
+    return A.resolve_user_path(path)
+
+
 def cmd_trace(rest):
     raw = rest.strip()
     arg = raw.lower()
     if arg == "save" or arg.startswith("save "):
         _, _, requested = raw.partition(" ")
-        try:
-            path = _write_trace_export(requested.strip() or f"{S.name or 'agent8088'}_trace.json")
-        except OSError as exc:
-            console.print(f"[red]could not save trace:[/red] {exc}")
+        path = _write_user_export(
+            requested.strip() or f"{S.name or 'agent8088'}_trace.json",
+            json.dumps(_trace_export_data(), indent=2),
+        )
+        if not path:
             return
         S.trace_path = str(path)
         _save_active_session()
@@ -1546,8 +1633,9 @@ def cmd_save(rest):
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
             "conversation_trace": S.conversation_trace, "session": S.name or None,
             "disabled_skills": sorted(S.disabled_skills)}
-    Path(path).write_text(json.dumps(data, indent=2))
-    console.print(f"[#237dd7]saved[/#237dd7] -> {path}")
+    destination = _write_user_export(path, json.dumps(data, indent=2))
+    if destination:
+        console.print(f"[#237dd7]saved[/#237dd7] -> {destination}")
 
 
 def cmd_clear(_):
@@ -1643,7 +1731,7 @@ COMMANDS = {
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
-    "status": cmd_status, "doctor": cmd_doctor,
+    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
@@ -1859,28 +1947,37 @@ def _run_update():
     if not install_dir.exists():
         print(f"Install dir not found: {install_dir}")
         print("Run the installer first.")
-        return
+        return False
     venv_subdir = "Scripts" if os.name == "nt" else "bin"
     venv_python = install_dir / "venv" / venv_subdir / ("python.exe" if os.name == "nt" else "python")
     uv_cmd = home / "bin" / ("uv.exe" if os.name == "nt" else "uv")
     if not uv_cmd.exists():
         uv_cmd = "uv"
     print(f"Updating {install_dir} ...")
-    subprocess.run(["git", "stash", "push", "--include-untracked", "-m", "agent8088-update-autostash"],
-                   cwd=str(install_dir), capture_output=True, text=True)
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(install_dir),
+                            capture_output=True, text=True)
+    if status.returncode != 0:
+        print(status.stderr.strip() or "Could not inspect the install directory.")
+        return False
+    if status.stdout.strip():
+        print("Update stopped: the install directory has local changes.")
+        print("Commit or remove them, then run /update again.")
+        return False
     r = subprocess.run(["git", "pull", "--ff-only"], cwd=str(install_dir), capture_output=True, text=True)
     if r.returncode != 0:
-        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                                cwd=str(install_dir), capture_output=True, text=True).stdout.strip()
-        subprocess.run(["git", "fetch", "origin"], cwd=str(install_dir), capture_output=True, text=True)
-        subprocess.run(["git", "reset", "--hard", f"origin/{branch}"],
-                             cwd=str(install_dir), capture_output=True, text=True)
-        print(f"Reset to origin/{branch}")
-    else:
-        print(r.stdout.strip() or "Already up to date.")
-    print("Code updated. Changes take effect on next launch.")
-    print(f"If dependencies changed, reinstall from a fresh terminal:")
-    print(f"  {uv_cmd} pip install --python {venv_python} --reinstall-package agent8088 -e {install_dir}")
+        print(r.stderr.strip() or "Update failed; no local files were changed.")
+        return False
+    print(r.stdout.strip() or "Already up to date.")
+    install = subprocess.run(
+        [str(uv_cmd), "pip", "install", "--python", str(venv_python),
+         "--reinstall-package", "agent8088", "-e", str(install_dir)],
+        cwd=str(install_dir),
+    )
+    if install.returncode != 0:
+        print("Code updated, but package reinstall failed.")
+        return False
+    print("Code and dependencies updated. Changes take effect on next launch.")
+    return True
 
 
 CUSTOM_PROVIDER_CHOICE = "Custom OpenAI-compatible"
@@ -1910,7 +2007,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         return
     content = config_path.read_text(encoding="utf-8")
     def _current(key):
-        m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
+        m = _re.search(rf'^{_re.escape(key)}=(.*)$', content, _re.MULTILINE)
         return m.group(1).strip() if m else ""
     def _set_line(text, key, value):
         pattern = rf'^{_re.escape(key)}=.*'
@@ -2008,7 +2105,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
     elif search:
         content = _set_line(content, "search_base_url", search)
-    config_path.write_text(content, encoding="utf-8")
+    _write_private_text(config_path, content)
     if activate_runtime:
         _reload_model_runtime(config_path, provider, model_name)
     print(f"\nConfig written to {config_path}")
@@ -2029,6 +2126,7 @@ def main():
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
+    parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -2042,6 +2140,9 @@ def main():
         return
     if args.model_setup:
         configure_model_profile()
+        return
+    if args.sandbox_setup:
+        print(A.install_native_sandbox())
         return
     if args.edit:
         A.PERMISSION_MODE = "edit"

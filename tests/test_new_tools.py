@@ -1,7 +1,21 @@
+from shlex import quote as shlex_quote
+from types import SimpleNamespace
+
+import pytest
+
+
+def _fake_crontab(calls, current=""):
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command == ["crontab", "-l"]:
+            return SimpleNamespace(returncode=0 if current else 1, stdout=current, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    return run
+
+
 def test_cron_rejects_bad_schedule(engine, monkeypatch):
     calls = []
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: calls.append(cmd) or "ok")
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
     out = engine._exec_cron({"action": "add", "schedule": "not a cron", "task": "hi"})
     assert "Invalid" in out
     assert not calls  # crontab never touched
@@ -9,24 +23,26 @@ def test_cron_rejects_bad_schedule(engine, monkeypatch):
 
 def test_cron_add_builds_entry(engine, monkeypatch):
     calls = []
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: calls.append(cmd) or "ok")
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
     engine._exec_cron({"action": "add", "schedule": "0 9 * * *", "task": "daily report"})
-    assert calls and "0 9 * * *" in calls[-1]
-    assert "daily report" in calls[-1]
+    payload = calls[-1][1]["input"]
+    assert "0 9 * * *" in payload
+    assert "daily report" in payload
+    assert all(kwargs["timeout"] == 20 for _, kwargs in calls)
 
 
 def test_cron_add_requires_task(engine, monkeypatch):
-    monkeypatch.setattr(engine, "_exec_shell_command", lambda cmd, timeout=25: "ok")
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab([]))
     assert "requires a task" in engine._exec_cron({"action": "add", "schedule": "0 9 * * *"})
 
 
 def test_cron_list_filters_by_marker(engine, monkeypatch):
-    seen = {}
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: seen.setdefault("cmd", cmd) or "")
-    engine._exec_cron({"action": "list"})
-    assert "agent8088" in seen["cmd"]
+    calls = []
+    current = "0 9 * * * agent8088 # agent8088\n0 10 * * * backup\n"
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls, current))
+    output = engine._exec_cron({"action": "list"})
+    assert "# agent8088" in output
+    assert "backup" not in output
 
 
 def test_cron_unknown_action(engine):
@@ -35,34 +51,51 @@ def test_cron_unknown_action(engine):
 
 def test_cron_escapes_quotes_in_task(engine, monkeypatch):
     calls = []
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: calls.append(cmd) or "ok")
-    engine._exec_cron({"action": "add", "schedule": "* * * * *", "task": "it's fine"})
-    # A raw single quote would break out of the shell-quoted task string.
-    assert "'\\''" in calls[-1]
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
+    task = "it's $(touch /tmp/nope) fine"
+    engine._exec_cron({"action": "add", "schedule": "* * * * *", "task": task})
+    payload = calls[-1][1]["input"]
+    assert shlex_quote(task) in payload
+
+
+def test_cron_remove_matches_the_shell_quoted_task(engine, monkeypatch):
+    calls = []
+    task = "it's $(safe) fine"
+    current = f"* * * * * agent8088 {shlex_quote(task)} # agent8088\n"
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls, current))
+    assert engine._exec_cron({"action": "remove", "task": task}) == "Removed."
+    assert calls[-1][1]["input"] == ""
 
 
 def test_docker_missing_is_graceful(engine, monkeypatch):
+    engine.SANDBOX_BACKEND = "auto"
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
     out = engine._exec_docker({"code": "print(1)"})
-    assert "Docker is not available" in out
+    assert "ESCALATION_REQUEST:edit:local_execution:" in out
 
 
-def test_docker_runs_code_isolated(engine, monkeypatch):
+def test_docker_runs_code_isolated(engine, tmp_path, monkeypatch):
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     seen = {}
 
-    def fake_shell(cmd, timeout=25):
+    def fake_process(cmd, timeout=25, shell=False):
         seen["cmd"] = cmd
+        seen["shell"] = shell
         return "3"
 
-    monkeypatch.setattr(engine, "_exec_shell_command", fake_shell)
+    monkeypatch.setattr(engine, "_exec_process", fake_process)
     out = engine._exec_docker({"code": "print(1+2)", "image": "python:3.11-slim"})
     assert out == "3"
     cmd = seen["cmd"]
-    assert "--network none" in cmd   # no network by default
-    assert "--rm" in cmd             # container is disposable
-    assert "--memory" in cmd         # resource capped
+    assert cmd[cmd.index("--network") + 1] == "none"
+    assert "--rm" in cmd
+    assert "--memory" in cmd
+    assert "--cap-drop" in cmd
+    assert "--mount" in cmd
+    assert seen["shell"] is False
 
 
 def test_docker_requires_code(engine, monkeypatch):
@@ -70,15 +103,120 @@ def test_docker_requires_code(engine, monkeypatch):
     assert "requires 'code'" in engine._exec_docker({})
 
 
-def test_docker_quotes_code_safely(engine, monkeypatch):
+def test_docker_rejects_option_like_image(engine, tmp_path, monkeypatch):
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    assert "invalid container image" in engine._exec_docker({
+        "code": "print(1)", "image": "--privileged",
+    })
+
+
+def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     seen = {}
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: seen.setdefault("cmd", cmd) or "")
-    engine._exec_docker({"code": "print('hi'); rm -rf /"})
-    # The whole snippet must be a single shell-quoted argument.
-    assert "rm -rf /" in seen["cmd"]
-    assert seen["cmd"].count("python -c ") == 1
+    code = "print('hi'); rm -rf /"
+    monkeypatch.setattr(
+        engine,
+        "_exec_process",
+        lambda cmd, **_: seen.setdefault("cmd", cmd) and "",
+    )
+    engine._exec_docker({"code": code})
+    assert seen["cmd"][-3:] == ["python", "-c", code]
+
+
+def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
+    secret = tmp_path / ".env"
+    secret.write_text("TOKEN=secret")
+    skipped_secret = tmp_path / "node_modules" / ".env"
+    skipped_secret.parent.mkdir()
+    skipped_secret.write_text("DEPENDENCY_TOKEN=secret")
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    seen = {}
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda command, **_: seen.setdefault("command", command) and "done",
+    )
+    engine._exec_docker({"code": "print(1)"})
+    mounts = [seen["command"][i + 1] for i, value in enumerate(seen["command"][:-1])
+              if value == "--mount"]
+    assert any("dst=/workspace/.env,readonly" in mount for mount in mounts)
+    assert not any("node_modules/.env" in mount for mount in mounts)
+
+
+def test_docker_refuses_unbounded_sensitive_mounts(engine, tmp_path, monkeypatch):
+    for index in range(129):
+        (tmp_path / f".env-{index}").write_text("secret")
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda *_args, **_kwargs: pytest.fail("Docker must not run"),
+    )
+
+    assert "too many sensitive" in engine._exec_docker({"code": "print(1)"})
+
+
+def test_auto_prefers_native_then_docker(engine, monkeypatch):
+    engine.SANDBOX_BACKEND = "auto"
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    assert engine._resolve_sandbox_backend() == "native"
+    monkeypatch.setattr(
+        engine, "_native_sandbox_missing_requirements",
+        lambda: ["sandbox-runtime"],
+    )
+    assert engine._resolve_sandbox_backend() == "docker"
+
+
+def test_native_sandbox_writes_private_policy(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    path = engine._write_sandbox_settings()
+    settings = engine.json.loads(path.read_text())
+    assert settings["network"]["allowedDomains"] == []
+    assert str(engine.PROJECT_ROOT) in settings["filesystem"]["allowWrite"]
+    if engine.sys.platform != "win32":
+        assert str(engine.Path("/tmp").resolve()) in settings["filesystem"]["allowWrite"]
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_windows_sandbox_setup_handles_missing_runtime(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setattr(engine.shutil, "which", lambda name: f"C:\\{name}.exe")
+    monkeypatch.setattr(
+        engine.subprocess,
+        "run",
+        lambda *_, **__: SimpleNamespace(stdout="v20.11.0"),
+    )
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "Command completed.")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    assert "CLI could not be located" in engine.install_native_sandbox()
+
+
+def test_approved_local_fallback_runs_once(engine, monkeypatch):
+    engine.SANDBOX_BACKEND = "auto"
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "ran locally")
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+    engine.grant_escalation("local_execution")
+    assert engine._exec_sandbox_command("pwd") == "ran locally"
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+
+
+def test_sandbox_backend_setting_persists(engine, tmp_path, monkeypatch):
+    config = tmp_path / "config.txt"
+    monkeypatch.setattr(engine, "CONFIG_PATH", config)
+    monkeypatch.setattr(engine, "APP_CONFIG", {})
+    status = engine.set_sandbox_backend("local")
+    assert status["requested"] == "local"
+    assert "sandbox_backend=local" in config.read_text()
 
 
 def test_browser_missing_is_graceful(engine, monkeypatch):
@@ -96,3 +234,34 @@ def test_browser_enforces_ssrf(engine, monkeypatch):
 
 def test_browser_requires_url(engine):
     assert "requires 'url'" in engine._exec_browser({})
+
+
+def test_shell_reports_failure_and_caps_output(engine, monkeypatch):
+    monkeypatch.setattr(engine, "MAX_TOOL_OUTPUT_BYTES", 8)
+    failed = engine._exec_process(
+        [engine.sys.executable, "-c", "import sys; print('bad'); sys.exit(3)"])
+    assert "bad" in failed
+    assert "status 3" in failed
+
+    large = engine._exec_process(
+        [engine.sys.executable, "-c", "print('0123456789abcdef')"])
+    assert "truncated at 8 bytes" in large
+
+
+def test_structured_git_arguments_never_enter_a_shell(engine, monkeypatch):
+    title = 'ok"; touch /tmp/injected; echo "'
+    seen = {}
+    monkeypatch.setattr(
+        engine,
+        "_exec_process",
+        lambda command, **kwargs: seen.update(
+            {"command": command, "shell": kwargs.get("shell", False)}
+        ) or "created",
+    )
+
+    assert engine._exec_structured_tool(
+        "git_create_pr", {"title": title, "body": "body"}, 10) == "created"
+    assert seen["command"] == [
+        "gh", "pr", "create", "--title", title, "--body", "body",
+    ]
+    assert seen["shell"] is False

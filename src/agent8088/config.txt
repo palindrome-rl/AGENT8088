@@ -22,6 +22,10 @@ allowed_paths=~
 # --- Permission Layer 2: Network access control ---
 # web_search and get_page_title prompt the user (y/n) on every request.
 
+# --- SSRF protection ---
+# Allow these internal hosts (for local SearXNG etc.):
+ssrf_allow_hosts=127.0.0.1,localhost
+
 # --- Permission Layer 3: Path-based write restrictions ---
 # Writes to these paths run without a prompt (auto-approved):
 # no_prompt_paths=/tmp
@@ -35,7 +39,7 @@ prompt_paths=~
 default_provider=ollama
 
 # Provider config (base_url is built-in, only set api_key + model):
-provider.ollama.model=qwen14b-tooluse-v3
+# provider.ollama.model=qwen14b-tooluse-v3
 # provider.ollama.api_key=ollama
 
 # Example: Cerebras
@@ -54,6 +58,13 @@ provider.ollama.model=qwen14b-tooluse-v3
 # provider.openrouter.api_key=sk-or-...
 
 timeout_seconds=120
+
+# --- sandbox ---
+# auto uses free native OS isolation first, then Docker when available.
+# local disables isolation and should only be used on trusted commands.
+sandbox_backend=auto
+sandbox_runtime_version=0.0.67
+# sandbox_allowed_domains=api.example.com
 
 # --- search (SearXNG) ---
 # Leave commented to disable web_search.

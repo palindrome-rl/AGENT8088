@@ -59,6 +59,13 @@ default_provider=ollama
 
 timeout_seconds=120
 
+# --- sandbox ---
+# auto uses free native OS isolation first, then Docker when available.
+# local disables isolation and should only be used on trusted commands.
+sandbox_backend=auto
+sandbox_runtime_version=0.0.67
+# sandbox_allowed_domains=api.example.com
+
 # --- search (SearXNG) ---
 # Leave commented to disable web_search.
 # search_base_url=http://localhost:8888/search?q=

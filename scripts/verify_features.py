@@ -4,20 +4,16 @@
 Exercises real code paths (not mocks) wherever the dependency exists, and reports
 SKIP with the reason where it doesn't. Run from the repo root.
 """
-import importlib.util
 import os
 import sys
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-REPO = Path(__file__).resolve()
 # repo root is where agent8088 lives; allow override by argv
-ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
+ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
+os.chdir(ROOT)
 
-loader = SourceFileLoader("agent8088_core", str(ROOT / "agent8088"))
-spec = importlib.util.spec_from_loader("agent8088_core", loader)
-A = importlib.util.module_from_spec(spec)
-loader.exec_module(A)
+sys.path.insert(0, str(ROOT / "src"))
+from agent8088 import engine as A
 
 PASS, FAIL, SKIP = [], [], []
 
@@ -113,69 +109,69 @@ sub_prompt = explore["system_prompt"] + "\n" + A.render_tool_docs(sub_specs)
 check("restricted subagent prompt hides other tools",
       "write_file(" not in sub_prompt and "read_text(" in sub_prompt)
 
-# ------------------------------------------------------- 3. SANDBOX / DOCKER
-section("3. SANDBOXING / DOCKERIZATION")
-docker_up = A._docker_available()
-print(f"  (docker daemon available: {docker_up})")
+# ------------------------------------------------------- 3. SANDBOX
+section("3. SANDBOXING")
+print(f"  (active backend: {A._resolve_sandbox_backend()})")
 
-# 3a. command construction has the isolation flags — checked without needing docker
+# 3a. Docker fallback construction has the isolation flags
 built = {}
-_orig_shell = A._exec_shell_command
+_orig_process = A._exec_process
+_orig_backend = A.SANDBOX_BACKEND
+_orig_docker_available = A._docker_available
 
 
-def _capture(cmd, timeout=25):
+def _capture(cmd, timeout=25, shell=False):
     built["cmd"] = cmd
+    built["shell"] = shell
     return "captured"
 
 
-A._docker_available = lambda: True          # force the build path
-A._exec_shell_command = _capture
+A.SANDBOX_BACKEND = "docker"
+A._docker_available = lambda: True
+A._exec_process = _capture
 A._exec_docker({"code": "print('hello')"})
-A._exec_shell_command = _orig_shell         # restore
+A._exec_process = _orig_process
 cmd = built.get("cmd", "")
-check("sandbox disables networking", "--network none" in cmd)
+check("sandbox disables networking",
+      cmd[cmd.index("--network") + 1] == "none")
 check("sandbox container is disposable", "--rm" in cmd)
-check("sandbox caps memory", "--memory 512m" in cmd)
-check("sandbox caps cpu", "--cpus 1" in cmd)
+check("sandbox caps memory", cmd[cmd.index("--memory") + 1] == "512m")
+check("sandbox caps cpu", cmd[cmd.index("--cpus") + 1] == "1")
+check("sandbox drops Linux capabilities", cmd[cmd.index("--cap-drop") + 1] == "ALL")
 check("sandbox pins an image", "python:3.11-slim" in cmd)
-check("sandbox shell-quotes the payload", "python -c 'print(" in cmd)
+check("sandbox bypasses the host shell",
+      built.get("shell") is False and cmd[-3:] == ["python", "-c", "print('hello')"])
 
-# 3b. injection resistance in the quoting
+# 3b. injection resistance in the argument list
 built.clear()
-A._exec_shell_command = _capture
-A._exec_docker({"code": "import os; os.system('id')\"; rm -rf / #"})
-A._exec_shell_command = _orig_shell
+payload = "import os; os.system('id')\"; rm -rf / #"
+A._exec_process = _capture
+A._exec_docker({"code": payload})
+A._exec_process = _orig_process
 c2 = built.get("cmd", "")
-check("sandbox payload cannot break out of quoting",
-      c2.count("python -c ") == 1 and c2.rstrip().endswith("'"),
-      "single quoted arg")
+check("sandbox payload remains one argument",
+      c2[-3:] == ["python", "-c", payload] and built.get("shell") is False,
+      "argv, no shell")
 
-A._docker_available = A.__dict__.get("_docker_available")  # leave forced-True off
-# restore the real detector
-exec(compile("def _docker_available():\n"
-             "    import subprocess\n"
-             "    try:\n"
-             "        r = subprocess.run('docker info', shell=True, capture_output=True, text=True, timeout=10)\n"
-             "        return r.returncode == 0\n"
-             "    except Exception:\n"
-             "        return False\n", "<restore>", "exec"), A.__dict__)
+A._docker_available = _orig_docker_available
+A.SANDBOX_BACKEND = _orig_backend
 
-# 3c. real container execution, if the daemon is up
-if A._docker_available():
+# 3c. real execution through the selected native/Docker backend
+if A._resolve_sandbox_backend() in ("native", "docker"):
     real = A._exec_docker({"code": "print(6*7)"})
-    check("REAL container executes code", real.strip() == "42", real[:40])
+    check("REAL sandbox executes code", real.strip() == "42", real[:40])
     net = A._exec_docker({"code":
         "import urllib.request;\n"
         "try:\n"
         "    urllib.request.urlopen('http://example.com', timeout=5); print('NET_OK')\n"
         "except Exception as e: print('NET_BLOCKED')"})
-    check("REAL container has no network egress", "NET_BLOCKED" in net, net[:40])
+    check("REAL sandbox has no network egress", "NET_BLOCKED" in net, net[:40])
 else:
-    skip("REAL container execution", "docker daemon not running")
-    skip("REAL container network isolation", "docker daemon not running")
+    skip("REAL sandbox execution", "native runtime and Docker unavailable")
+    skip("REAL sandbox network isolation", "native runtime and Docker unavailable")
     graceful = A._exec_docker({"code": "print(1)"})
-    check("graceful degradation message when docker absent",
-          "Docker is not available" in graceful and "docker info" in graceful)
+    check("missing sandbox asks before local execution",
+          "ESCALATION_REQUEST:edit:local_execution:" in graceful)
 
 # --------------------------------------------------------------- 4. BROWSER
 section("4. BROWSER TOOL")
@@ -191,9 +187,11 @@ check("browser requires a url", "requires 'url'" in A._exec_browser({}))
 # ------------------------------------------------------------------ 5. SSRF
 section("5. SSRF PROTECTION")
 print(f"  (ssrf_allow_private in this config: {A.SSRF_ALLOW_PRIVATE})")
+_private, _hosts = A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS
 if A.SSRF_ALLOW_PRIVATE:
     # Verify the guard itself by testing with the opt-out disabled
     A.SSRF_ALLOW_PRIVATE = False
+A.SSRF_ALLOW_HOSTS = set()
 for url, label in [("http://127.0.0.1/admin", "loopback"),
                    ("http://169.254.169.254/latest/meta-data/", "cloud metadata"),
                    ("http://10.0.0.5/x", "private 10.x"),
@@ -209,7 +207,7 @@ try:
     check("image URLs enforce SSRF", False, "not blocked!")
 except ValueError as e:
     check("image URLs enforce SSRF", "Blocked" in str(e))
-A.SSRF_ALLOW_PRIVATE = A.APP_CONFIG.get("ssrf_allow_private", "0") == "1"  # restore
+A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = _private, _hosts
 
 # ------------------------------------------------------------------- 6. GIT
 section("6. GIT INTEGRATION")
@@ -224,9 +222,19 @@ for t in ("git_commit", "git_push", "git_create_pr"):
 # ------------------------------------------------------------------ 7. CRON
 section("7. CRON / SCHEDULED TASKS")
 built.clear()
-A._exec_shell_command = _capture
+_orig_run = A.subprocess.run
+
+
+def _capture_crontab(command, **kwargs):
+    if command == ["crontab", "-l"]:
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+    built["cmd"] = kwargs.get("input", "")
+    return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+A.subprocess.run = _capture_crontab
 A._exec_cron({"action": "add", "schedule": "0 9 * * *", "task": "daily report"})
-A._exec_shell_command = _orig_shell
+A.subprocess.run = _orig_run
 check("valid schedule builds a crontab entry", "0 9 * * *" in built.get("cmd", ""))
 check("entry is marker-tagged", "# agent8088" in built.get("cmd", ""))
 check("rejects a malformed schedule",
@@ -265,7 +273,7 @@ check("provider api keys are collected for redaction", "sk-secretvalue123456" in
 
 # ----------------------------------------------------------------- 9. IMAGE
 section("9. IMAGE UNDERSTANDING")
-tmp_png = Path("/tmp/_a8088_verify.png")
+tmp_png = ROOT / ".a8088_verify.png"
 tmp_png.write_bytes(b"\x89PNG\r\n\x1a\nDATA")
 msg = A.build_image_message("what is this?", [str(tmp_png)])
 check("builds multimodal message", msg["role"] == "user" and len(msg["content"]) == 2)
@@ -278,7 +286,7 @@ check("base64 round-trips",
 msg2 = A.build_image_message("d", ["https://example.com/a.jpg"])
 check("remote url passes through", msg2["content"][1]["image_url"]["url"].endswith("a.jpg"))
 try:
-    A.build_image_message("x", ["/tmp/_definitely_missing_a8088.png"])
+    A.build_image_message("x", [str(ROOT / "_definitely_missing_a8088.png")])
     check("missing image rejected", False)
 except Exception as e:
     check("missing image rejected", "not found" in str(e).lower())
@@ -341,20 +349,28 @@ check("blocks system prompt leak",
 
 # ---------------------------------------------------------------- 13. SEARCH
 section("13. WEB SEARCH (http_get/http_post modes, jq filters, SSRF allowlist)")
+_permission_mode = A.PERMISSION_MODE
+A.PERMISSION_MODE = "edit"
 check("brace-safe interpolation survives JSON bodies",
       A._safe_format('{"q": "{query}", "n": {"a": 1}}', {"query": "x"})
       == '{"q": "x", "n": {"a": 1}}')
 check("unknown placeholders left intact",
       A._safe_format("Bearer {absent_key}", {}) == "Bearer {absent_key}")
-check("web_search declared with a jq filter",
-      bool(A.TOOL_SPECS["web_search"].get("filter")),
-      "collapses SearXNG JSON to title/url/snippet")
+check("web_search is configured as HTTP GET",
+      A.TOOL_SPECS["web_search"]["mode"] == "http_get"
+      and bool(A.TOOL_SPECS["web_search"]["url"]))
 for t in ("web_search_tavily", "web_search_exa"):
     check(f"{t} declared", t in A.TOOL_NAMES and A.TOOL_SPECS[t]["mode"] == "http_post")
     msg = A.run_tool(t, {"query": "x"})
     configured = "not configured" not in msg
     if configured:
-        check(f"{t} REAL query returns results", bool(msg.strip()), msg[:50].replace("\n", " "))
+        api_error = (msg.startswith("HTTP ") or msg.startswith("HTTP request failed:")
+                     or "unauthorized" in msg.lower() or "invalid api key" in msg.lower())
+        if api_error:
+            skip(f"{t} REAL query", msg.splitlines()[0][:100])
+        else:
+            check(f"{t} REAL query returns results", bool(msg.strip()),
+                  msg[:50].replace("\n", " "))
     else:
         skip(f"{t} REAL query", "api key not set in config")
         check(f"{t} degrades with a clear message", "not configured" in msg)
@@ -386,16 +402,18 @@ del A.TOOL_SPECS["_probe"]
 sb = A.APP_CONFIG.get("search_base_url", "")
 if sb:
     live = A.run_tool("web_search", {"query": "test"})
-    dead = ("timed out" in live.lower() or "No response from" in live
-            or not live.strip() or live.strip() == "✓ Command completed")
+    dead = (live.startswith("HTTP ") or "timed out" in live.lower()
+            or "No response from" in live or not live.strip())
     if dead:
         skip("configured search backend reachable",
              f"{sb.split('/')[2] if '/' in sb else sb} unreachable from here")
         check("unreachable search reports a real error (not silent success)",
-              "No response from" in live or "timed out" in live.lower(),
+              live.startswith("HTTP ") or "No response from" in live
+              or "timed out" in live.lower(),
               live[:45])
     else:
         check("configured search backend reachable", True, live[:40].replace("\n", " "))
+A.PERMISSION_MODE = _permission_mode
 
 # ----------------------------------------------------------------- SUMMARY
 section("SUMMARY")

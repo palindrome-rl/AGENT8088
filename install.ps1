@@ -102,6 +102,15 @@ function Write-Success { param([string]$Message) Write-Host "[OK] $Message" -For
 function Write-Warn    { param([string]$Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -ForegroundColor Red }
 
+function Protect-ConfigFile {
+    param([string]$Path)
+    $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    icacls $Path /grant:r "*$sid`:(R,W)" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not grant config access to the current user: $Path" }
+    icacls $Path /inheritance:r | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not remove inherited config permissions: $Path" }
+}
+
 # Detect non-interactive mode (iex (irm ...))
 $NonInteractive = -not [Environment]::UserInteractive
 
@@ -505,9 +514,11 @@ function Drop-Config {
             Write-Warn "No default config.txt found; you'll need to create one"
             return
         }
+        Protect-ConfigFile $configPath
         Write-Success "Default config.txt copied"
     } else {
         Write-Info "config.txt already exists at $configPath - preserving"
+        Protect-ConfigFile $configPath
     }
 
     # Set AGENT8088_CONFIG env var
@@ -710,6 +721,7 @@ function Verify-Install {
     Write-Host ""
     Write-Success "Done. Run 'agent8088' to start."
     Write-Host "  Config: $Agent8088Home\config.txt"
+    Write-Host "  Native sandbox: agent8088 --sandbox-setup (Docker is the fallback)"
     Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."

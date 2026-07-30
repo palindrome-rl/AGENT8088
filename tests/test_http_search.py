@@ -1,4 +1,31 @@
 """Tests for the http_get/http_post modes, jq filters, and the SSRF allowlist."""
+from types import SimpleNamespace
+import urllib.error
+
+
+class _Response:
+    def __init__(self, body):
+        self._body = body.encode()
+        self.headers = SimpleNamespace(get_content_charset=lambda: "utf-8")
+
+    def read(self, _limit):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+
+def _mock_http(monkeypatch, body, seen):
+    class Opener:
+        def open(self, request, timeout):
+            seen["request"] = request
+            seen["timeout"] = timeout
+            return _Response(body)
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_: Opener())
 
 
 def test_safe_format_survives_json_braces(engine):
@@ -18,26 +45,25 @@ def test_safe_format_supports_quoted_variant(engine):
 
 def test_http_get_applies_jq_filter(engine, monkeypatch):
     seen = {}
-
-    def fake_shell(cmd, timeout=25):
-        seen["cmd"] = cmd
-        return "filtered"
-
-    monkeypatch.setattr(engine, "_exec_shell_command", fake_shell)
+    _mock_http(monkeypatch, '{"results": ["raw"]}', seen)
+    monkeypatch.setattr(
+        engine.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            seen.update({"jq": command, "jq_input": kwargs["input"]})
+            or SimpleNamespace(returncode=0, stdout="filtered", stderr="")
+        ),
+    )
     spec = {"name": "t", "mode": "http_get", "url": "https://example.com/api",
             "filter": ".results[]", "headers": "", "body": ""}
     out = engine._exec_http("http_get", spec, {}, 10)
     assert out == "filtered"
-    assert "jq -r" in seen["cmd"]
-    assert "curl -s" in seen["cmd"]
+    assert seen["jq"] == ["jq", "-r", ".results[]"]
+    assert seen["request"].full_url == "https://example.com/api"
 
 
 def test_http_get_extracts_html_title(engine, monkeypatch):
-    monkeypatch.setattr(
-        engine,
-        "_exec_shell_command",
-        lambda command, timeout=25: "<html><title> Agent  8088 </title></html>",
-    )
+    _mock_http(monkeypatch, "<html><title> Agent  8088 </title></html>", {})
     spec = {
         "name": "get_page_title",
         "mode": "http_get",
@@ -50,21 +76,16 @@ def test_http_get_extracts_html_title(engine, monkeypatch):
 
 def test_http_post_sends_body_and_headers(engine, monkeypatch):
     seen = {}
-
-    def fake_shell(cmd, timeout=25):
-        seen["cmd"] = cmd
-        return "ok"
-
-    monkeypatch.setattr(engine, "_exec_shell_command", fake_shell)
+    _mock_http(monkeypatch, "ok", seen)
     spec = {"name": "t", "mode": "http_post", "url": "https://example.com/s",
             "headers": "Content-Type: application/json;;X-Key: abc",
             "body": '{"q": "{query}"}', "filter": ""}
     engine._exec_http("http_post", spec, {"query": "hi"}, 10)
-    cmd = seen["cmd"]
-    assert "-X POST" in cmd
-    assert "Content-Type: application/json" in cmd
-    assert "X-Key: abc" in cmd
-    assert '"q": "hi"' in cmd
+    request = seen["request"]
+    assert request.method == "POST"
+    assert request.headers["Content-type"] == "application/json"
+    assert request.headers["X-key"] == "abc"
+    assert request.data == b'{"q": "hi"}'
 
 
 def test_http_reports_unconfigured_api_key(engine):
@@ -83,6 +104,25 @@ def test_http_enforces_ssrf(engine, monkeypatch):
     spec = {"name": "t", "mode": "http_get", "url": "http://127.0.0.1/admin",
             "headers": "", "body": "", "filter": ""}
     assert "Blocked" in engine._exec_http("http_get", spec, {}, 10)
+
+
+def test_http_rechecks_redirect_targets(engine, monkeypatch):
+    class RedirectingOpener:
+        def __init__(self, handler):
+            self.handler = handler
+
+        def open(self, request, timeout):
+            return self.handler.redirect_request(
+                request, None, 302, "Found", {}, "http://127.0.0.1/private")
+
+    monkeypatch.setattr(
+        "urllib.request.build_opener",
+        lambda handler: RedirectingOpener(handler),
+    )
+    spec = {"name": "t", "mode": "http_get", "url": "https://example.com",
+            "headers": "", "body": "", "filter": ""}
+    out = engine._exec_http("http_get", spec, {}, 10)
+    assert "Blocked" in out
 
 
 def test_ssrf_host_allowlist_permits_only_listed_host(engine, monkeypatch):

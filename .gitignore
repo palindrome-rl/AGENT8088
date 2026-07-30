@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 *.egg-info/
+.DS_Store
 
 # Environment
 .env
@@ -27,8 +28,12 @@ qwen-tooluse-lora/
 # Logs
 *.log
 
+# Generated reports
+output/pdf/
+
 # Benchmark outputs (contain dynamic system state)
 benchmark_results.json
+.a8088_verify.png
 traces/
 skillopt_data/
 

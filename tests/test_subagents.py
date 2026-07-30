@@ -81,6 +81,27 @@ def test_exec_subagent_happy_path_and_isolation(engine, monkeypatch):
     assert engine._last_tool_name == "execute_shell"
 
 
+def test_subagent_retries_an_approved_write(engine, tmp_path, monkeypatch):
+    target = tmp_path / "subagent.txt"
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(engine, "SUBAGENT_SPECS", {
+        "writer": {"tools": ["write_file"], "max_turns": 3, "system_prompt": "Write the file."},
+    })
+    monkeypatch.setattr(engine, "create_completion", ScriptedModel([
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        "Done.",
+    ]))
+
+    def approve(_name, _result):
+        engine.grant_escalation()
+        return True
+
+    monkeypatch.setattr(engine, "subagent_ui", lambda *_: {"on_escalation": approve})
+    assert "Done." in engine._exec_subagent({"agent_type": "writer", "task": "write"})
+    assert target.read_text() == "ok"
+
+
 def test_exec_subagent_unknown_type_falls_back(engine, monkeypatch):
     monkeypatch.setattr(engine, "create_completion", ScriptedModel(["ok"]))
     out = engine._exec_subagent({"agent_type": "does-not-exist", "task": "x"}, depth=0)
@@ -160,6 +181,30 @@ def test_redact_secrets_masks_config_values(engine, monkeypatch):
     out = engine._redact_secrets("the key is supersecretapikey1234567890 ok")
     assert "supersecretapikey1234567890" not in out
     assert "[redacted]" in out
+
+
+def test_redact_secrets_refreshes_environment_keys(engine, monkeypatch):
+    monkeypatch.setenv("NEW_PROVIDER_KEY", "runtime-secret-value")
+    monkeypatch.setitem(engine.APP_CONFIG, "provider.new.api_key_env", "NEW_PROVIDER_KEY")
+    assert engine._redact_secrets("runtime-secret-value") == "[redacted]"
+
+
+def test_run_agent_executes_native_tool_call(engine, monkeypatch):
+    function = type("Function", (), {
+        "name": "calculate", "arguments": '{"expression": "1 + 2"}',
+    })()
+    tool_call = type("ToolCall", (), {"id": "call_1", "function": function})()
+    responses = iter([
+        type("Response", (), {"choices": [type("Choice", (), {
+            "message": type("Message", (), {"content": None, "tool_calls": [tool_call]})(),
+        })()]})(),
+        type("Response", (), {"choices": [type("Choice", (), {
+            "message": type("Message", (), {"content": "The answer is 3.", "tool_calls": []})(),
+        })()]})(),
+    ])
+    monkeypatch.setattr(engine, "create_completion", lambda *_args, **_kwargs: next(responses))
+
+    assert engine.run_agent([{"role": "user", "content": "calculate 1 + 2"}]) == "The answer is 3."
 
 
 def test_mask_system_content_hides_prompt_and_secrets(engine, monkeypatch):

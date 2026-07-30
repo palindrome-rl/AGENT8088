@@ -17,13 +17,14 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 
 ### Key Features
 
-- **One-line install** — Hermes-style installer for macOS, Linux, Windows
+- **One-line install** — install on macOS, Linux, and Windows
 - **13 model providers** — Ollama, OpenRouter, OpenAI, Anthropic, Gemini, Cerebras, DeepSeek, Groq, Mistral, Moonshot, Qwen, Ollama Cloud, GitHub Copilot
 - **Interactive model picker** — fuzzy searchable provider + model selection (InquirerPy)
 - **Fallback chains** — automatically switches to backup provider on 429/503 errors
 - **Fine-tuned tool calling** — 95% accuracy on function selection
 - **Permission layer** — readonly by default, per-action y/n escalation for writes
 - **Security layers** — sensitive file protection, network gating, path-based zones
+- **Free native sandbox** — OS isolation on macOS, Linux, and Windows; Docker fallback
 - **Cross-platform** — Windows (cmd.exe) and Linux/macOS (bash)
 - **Rich CLI UI** — live token streaming, ESC interrupt, tool diffs, slash commands
 - **Tool alias resolution** — model can call `bash`/`mkdir`/`cat` naturally
@@ -54,6 +55,18 @@ The installer:
 5. Runs an optional setup wizard to configure your model endpoint
 
 No admin rights required. Works on macOS, Ubuntu, Windows, WSL2, and Termux.
+
+Install the free native sandbox runtime after setup:
+
+```sh
+agent8088 --sandbox-setup
+```
+
+This uses the open-source Anthropic sandbox runtime. Agent8088 uses Docker
+automatically when the native runtime is unavailable, and asks before running
+locally when neither backend exists. Native setup needs Node.js 20.11+; Linux
+also needs `bubblewrap`, `socat`, and `ripgrep`, macOS needs `ripgrep`, and
+Windows shows one UAC prompt to provision its restricted sandbox account.
 
 ### Verify
 
@@ -106,7 +119,7 @@ You'll see the banner with model info, tool count, and the prompt. Type a questi
 ## CLI Flags
 
 ```
-usage: agent8088 [--version] [-h] [--edit] [--uninstall] [--update] [--setup]
+usage: agent8088 [--version] [-h] [--edit] [--uninstall] [--update] [--setup] [--sandbox-setup]
 
 Agent8088 - Local AI Assistant
 
@@ -117,6 +130,7 @@ options:
   --uninstall    remove agent8088 install dir + env vars, then exit
   --update       pull latest code + reinstall, then exit
   --setup        run interactive config wizard, then exit
+  --sandbox-setup install the free native sandbox runtime
 
 Run with no flags to start the interactive REPL.
 ```
@@ -134,6 +148,7 @@ Run with no flags to start the interactive REPL.
 | `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
 | `/model <provider:model>` | Switch provider + model (e.g. `/model cerebras:gpt-oss-120b`); `/model setup` adds/updates a provider |
 | `/models [provider]` | Fuzzy searchable model picker — lists + switches models from active or specified provider |
+| `/sandbox [auto\|native\|docker\|local\|setup]` | Show, install, or select command isolation |
 | `/config` | Show active config + config file path |
 | `/system` | Show the full system prompt |
 | `/history` | Show conversation history |
@@ -160,6 +175,8 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `allowed_paths` | `~` | Paths the agent can read/write |
 | `prompt_paths` | `~` | Writes here show y/n escalation |
 | `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
+| `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
+| `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
 
 ### Environment Variables
@@ -168,6 +185,7 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 |---|---|---|
 | `AGENT8088_CONFIG` | `~/.agent8088/config.txt` | Override config file path |
 | `AGENT8088_PERMISSION` | `readonly` | `readonly` or `edit` |
+| `AGENT8088_SANDBOX` | (config value) | Temporary `auto`, `native`, `docker`, or `local` override |
 | `AGENT8088_HOME` | `~/.agent8088` | Install/data directory |
 
 ---
@@ -190,6 +208,13 @@ Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`,
 ### Security Layer 3: Path-Based Write Zones
 
 Three-tier zone system: `no_prompt_paths` (auto-approved), `prompt_paths` (y/n), `blocked_paths` (always denied).
+
+### Command Sandbox
+
+Shell tools, structured Git tools, sandboxed Python, and subagent tool calls use
+the same backend. `auto` prefers native OS isolation and falls back to Docker.
+Sandboxed commands have no network unless `sandbox_allowed_domains` is set.
+When neither backend is available, Agent8088 asks before running locally.
 
 ---
 
