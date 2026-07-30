@@ -1940,6 +1940,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             "OpenAI-compatible URL:",
             instruction="(required, e.g. https://host/v1)",
         ).strip()
+        custom_base_url = _openai_base_url(custom_base_url)
         if not custom_base_url:
             custom_base_url = _current(f"provider.{provider}.base_url")
         if not custom_base_url:

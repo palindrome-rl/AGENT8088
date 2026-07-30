@@ -264,6 +264,12 @@ BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
 # ---------------------------------------------------------------------------
 # Model client.  USE_GEMMA4=1 switches to the Gemma server on Colossus.
 # ---------------------------------------------------------------------------
+def _normalize_openai_base_url(url: str) -> str:
+    url = str(url or "").strip().rstrip("/")
+    suffix = "/chat/completions"
+    return url[:-len(suffix)] if url.endswith(suffix) else url
+
+
 def load_providers(config: dict, include_builtins: bool = False) -> dict:
     """Parse `provider.<name>.<field>` keys from config into a registry.
     Fields: model, api_mode, base_url, api_key, api_key_env. OpenAI mode needs a base URL;
@@ -291,6 +297,9 @@ def load_providers(config: dict, include_builtins: bool = False) -> dict:
     for name, info in BUILTIN_PROVIDERS.items():
         if name in provs and "base_url" not in provs[name]:
             provs[name]["base_url"] = info["base_url"]
+    for provider in provs.values():
+        if "base_url" in provider:
+            provider["base_url"] = _normalize_openai_base_url(provider["base_url"])
 
     return {
         n: p for n, p in provs.items()

@@ -123,7 +123,7 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     config = tmp_path / "config.txt"
     config.write_text("allowed_paths=~\ndefault_provider=ollama\n", encoding="utf-8")
     fake = _FakeInquirer({
-        "text": ["~", "localai", "https://llm.example.test/v1", "custom-model", ""],
+        "text": ["~", "localai", "https://llm.example.test/v1/chat/completions", "custom-model", ""],
         "secret": ["secret-key"],
         "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE],
     })

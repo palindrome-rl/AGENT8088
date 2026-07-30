@@ -5,12 +5,15 @@ def test_load_providers_from_config(engine):
         "provider.openai.api_key": "sk-test",
         "provider.openrouter.base_url": "https://openrouter.ai/api/v1",
         "provider.openrouter.model": "anthropic/claude-3.5-sonnet",
+        "provider.ornith.base_url": "http://127.0.0.1:8080/v1/chat/completions",
+        "provider.ornith.model": "ornith-1.0-35b",
         "unrelated_key": "ignored",
     }
     provs = engine.load_providers(cfg)
-    assert set(provs) == {"openai", "openrouter"}
+    assert set(provs) == {"openai", "openrouter", "ornith"}
     assert provs["openai"]["model"] == "gpt-4o"
     assert provs["openrouter"]["base_url"].endswith("/api/v1")
+    assert provs["ornith"]["base_url"] == "http://127.0.0.1:8080/v1"
 
 
 def test_load_providers_requires_base_url(engine):
