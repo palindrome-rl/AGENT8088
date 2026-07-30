@@ -1036,7 +1036,11 @@ def cmd_plan(rest):
         live.update(render_checklist())
 
     with Live(console=console, refresh_per_second=10, transient=False) as live:
-        result = A._exec_plan({"steps": rest}, on_step=on_step)
+        result = A._exec_plan(
+            {"steps": rest},
+            on_step=on_step,
+            on_escalation=lambda request: _handle_escalation(request, live),
+        )
 
     console.print(Panel(Text(result), title="[#237dd7]plan result[/#237dd7]",
                         box=box.ROUNDED, border_style="#0077B6"))
@@ -1860,28 +1864,37 @@ def _run_update():
     if not install_dir.exists():
         print(f"Install dir not found: {install_dir}")
         print("Run the installer first.")
-        return
+        return False
     venv_subdir = "Scripts" if os.name == "nt" else "bin"
     venv_python = install_dir / "venv" / venv_subdir / ("python.exe" if os.name == "nt" else "python")
     uv_cmd = home / "bin" / ("uv.exe" if os.name == "nt" else "uv")
     if not uv_cmd.exists():
         uv_cmd = "uv"
     print(f"Updating {install_dir} ...")
-    subprocess.run(["git", "stash", "push", "--include-untracked", "-m", "agent8088-update-autostash"],
-                   cwd=str(install_dir), capture_output=True, text=True)
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(install_dir),
+                            capture_output=True, text=True)
+    if status.returncode != 0:
+        print(status.stderr.strip() or "Could not inspect the install directory.")
+        return False
+    if status.stdout.strip():
+        print("Update stopped: the install directory has local changes.")
+        print("Commit or remove them, then run /update again.")
+        return False
     r = subprocess.run(["git", "pull", "--ff-only"], cwd=str(install_dir), capture_output=True, text=True)
     if r.returncode != 0:
-        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                                cwd=str(install_dir), capture_output=True, text=True).stdout.strip()
-        subprocess.run(["git", "fetch", "origin"], cwd=str(install_dir), capture_output=True, text=True)
-        subprocess.run(["git", "reset", "--hard", f"origin/{branch}"],
-                             cwd=str(install_dir), capture_output=True, text=True)
-        print(f"Reset to origin/{branch}")
-    else:
-        print(r.stdout.strip() or "Already up to date.")
-    print("Code updated. Changes take effect on next launch.")
-    print(f"If dependencies changed, reinstall from a fresh terminal:")
-    print(f"  {uv_cmd} pip install --python {venv_python} --reinstall-package agent8088 -e {install_dir}")
+        print(r.stderr.strip() or "Update failed; no local files were changed.")
+        return False
+    print(r.stdout.strip() or "Already up to date.")
+    install = subprocess.run(
+        [str(uv_cmd), "pip", "install", "--python", str(venv_python),
+         "--reinstall-package", "agent8088", "-e", str(install_dir)],
+        cwd=str(install_dir),
+    )
+    if install.returncode != 0:
+        print("Code updated, but package reinstall failed.")
+        return False
+    print("Code and dependencies updated. Changes take effect on next launch.")
+    return True
 
 
 CUSTOM_PROVIDER_CHOICE = "Custom OpenAI-compatible"

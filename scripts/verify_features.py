@@ -4,20 +4,16 @@
 Exercises real code paths (not mocks) wherever the dependency exists, and reports
 SKIP with the reason where it doesn't. Run from the repo root.
 """
-import importlib.util
 import os
 import sys
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve()
 # repo root is where agent8088 lives; allow override by argv
 ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
 
-loader = SourceFileLoader("agent8088_core", str(ROOT / "agent8088"))
-spec = importlib.util.spec_from_loader("agent8088_core", loader)
-A = importlib.util.module_from_spec(spec)
-loader.exec_module(A)
+sys.path.insert(0, str(ROOT / "src"))
+from agent8088 import engine as A
 
 PASS, FAIL, SKIP = [], [], []
 
@@ -191,9 +187,11 @@ check("browser requires a url", "requires 'url'" in A._exec_browser({}))
 # ------------------------------------------------------------------ 5. SSRF
 section("5. SSRF PROTECTION")
 print(f"  (ssrf_allow_private in this config: {A.SSRF_ALLOW_PRIVATE})")
+_private, _hosts = A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS
 if A.SSRF_ALLOW_PRIVATE:
     # Verify the guard itself by testing with the opt-out disabled
     A.SSRF_ALLOW_PRIVATE = False
+A.SSRF_ALLOW_HOSTS = set()
 for url, label in [("http://127.0.0.1/admin", "loopback"),
                    ("http://169.254.169.254/latest/meta-data/", "cloud metadata"),
                    ("http://10.0.0.5/x", "private 10.x"),
@@ -209,7 +207,7 @@ try:
     check("image URLs enforce SSRF", False, "not blocked!")
 except ValueError as e:
     check("image URLs enforce SSRF", "Blocked" in str(e))
-A.SSRF_ALLOW_PRIVATE = A.APP_CONFIG.get("ssrf_allow_private", "0") == "1"  # restore
+A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = _private, _hosts
 
 # ------------------------------------------------------------------- 6. GIT
 section("6. GIT INTEGRATION")
@@ -224,9 +222,19 @@ for t in ("git_commit", "git_push", "git_create_pr"):
 # ------------------------------------------------------------------ 7. CRON
 section("7. CRON / SCHEDULED TASKS")
 built.clear()
-A._exec_shell_command = _capture
+_orig_run = A.subprocess.run
+
+
+def _capture_crontab(command, **kwargs):
+    if command == ["crontab", "-l"]:
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+    built["cmd"] = kwargs.get("input", "")
+    return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+A.subprocess.run = _capture_crontab
 A._exec_cron({"action": "add", "schedule": "0 9 * * *", "task": "daily report"})
-A._exec_shell_command = _orig_shell
+A.subprocess.run = _orig_run
 check("valid schedule builds a crontab entry", "0 9 * * *" in built.get("cmd", ""))
 check("entry is marker-tagged", "# agent8088" in built.get("cmd", ""))
 check("rejects a malformed schedule",
@@ -265,7 +273,7 @@ check("provider api keys are collected for redaction", "sk-secretvalue123456" in
 
 # ----------------------------------------------------------------- 9. IMAGE
 section("9. IMAGE UNDERSTANDING")
-tmp_png = Path("/tmp/_a8088_verify.png")
+tmp_png = ROOT / ".a8088_verify.png"
 tmp_png.write_bytes(b"\x89PNG\r\n\x1a\nDATA")
 msg = A.build_image_message("what is this?", [str(tmp_png)])
 check("builds multimodal message", msg["role"] == "user" and len(msg["content"]) == 2)
@@ -278,7 +286,7 @@ check("base64 round-trips",
 msg2 = A.build_image_message("d", ["https://example.com/a.jpg"])
 check("remote url passes through", msg2["content"][1]["image_url"]["url"].endswith("a.jpg"))
 try:
-    A.build_image_message("x", ["/tmp/_definitely_missing_a8088.png"])
+    A.build_image_message("x", [str(ROOT / "_definitely_missing_a8088.png")])
     check("missing image rejected", False)
 except Exception as e:
     check("missing image rejected", "not found" in str(e).lower())
@@ -341,20 +349,27 @@ check("blocks system prompt leak",
 
 # ---------------------------------------------------------------- 13. SEARCH
 section("13. WEB SEARCH (http_get/http_post modes, jq filters, SSRF allowlist)")
+_permission_mode = A.PERMISSION_MODE
+A.PERMISSION_MODE = "edit"
 check("brace-safe interpolation survives JSON bodies",
       A._safe_format('{"q": "{query}", "n": {"a": 1}}', {"query": "x"})
       == '{"q": "x", "n": {"a": 1}}')
 check("unknown placeholders left intact",
       A._safe_format("Bearer {absent_key}", {}) == "Bearer {absent_key}")
-check("web_search declared with a jq filter",
-      bool(A.TOOL_SPECS["web_search"].get("filter")),
-      "collapses SearXNG JSON to title/url/snippet")
+check("web_search is configured as HTTP GET",
+      A.TOOL_SPECS["web_search"]["mode"] == "http_get"
+      and bool(A.TOOL_SPECS["web_search"]["url"]))
 for t in ("web_search_tavily", "web_search_exa"):
     check(f"{t} declared", t in A.TOOL_NAMES and A.TOOL_SPECS[t]["mode"] == "http_post")
     msg = A.run_tool(t, {"query": "x"})
     configured = "not configured" not in msg
     if configured:
-        check(f"{t} REAL query returns results", bool(msg.strip()), msg[:50].replace("\n", " "))
+        auth_error = "unauthorized" in msg.lower() or "invalid api key" in msg.lower()
+        if auth_error:
+            skip(f"{t} REAL query", "configured API rejected its credential")
+        else:
+            check(f"{t} REAL query returns results", bool(msg.strip()),
+                  msg[:50].replace("\n", " "))
     else:
         skip(f"{t} REAL query", "api key not set in config")
         check(f"{t} degrades with a clear message", "not configured" in msg)
@@ -396,6 +411,7 @@ if sb:
               live[:45])
     else:
         check("configured search backend reachable", True, live[:40].replace("\n", " "))
+A.PERMISSION_MODE = _permission_mode
 
 # ----------------------------------------------------------------- SUMMARY
 section("SUMMARY")

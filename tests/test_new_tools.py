@@ -1,7 +1,19 @@
+from shlex import quote as shlex_quote
+from types import SimpleNamespace
+
+
+def _fake_crontab(calls, current=""):
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command == ["crontab", "-l"]:
+            return SimpleNamespace(returncode=0 if current else 1, stdout=current, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    return run
+
+
 def test_cron_rejects_bad_schedule(engine, monkeypatch):
     calls = []
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: calls.append(cmd) or "ok")
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
     out = engine._exec_cron({"action": "add", "schedule": "not a cron", "task": "hi"})
     assert "Invalid" in out
     assert not calls  # crontab never touched
@@ -9,24 +21,25 @@ def test_cron_rejects_bad_schedule(engine, monkeypatch):
 
 def test_cron_add_builds_entry(engine, monkeypatch):
     calls = []
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: calls.append(cmd) or "ok")
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
     engine._exec_cron({"action": "add", "schedule": "0 9 * * *", "task": "daily report"})
-    assert calls and "0 9 * * *" in calls[-1]
-    assert "daily report" in calls[-1]
+    payload = calls[-1][1]["input"]
+    assert "0 9 * * *" in payload
+    assert "daily report" in payload
 
 
 def test_cron_add_requires_task(engine, monkeypatch):
-    monkeypatch.setattr(engine, "_exec_shell_command", lambda cmd, timeout=25: "ok")
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab([]))
     assert "requires a task" in engine._exec_cron({"action": "add", "schedule": "0 9 * * *"})
 
 
 def test_cron_list_filters_by_marker(engine, monkeypatch):
-    seen = {}
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: seen.setdefault("cmd", cmd) or "")
-    engine._exec_cron({"action": "list"})
-    assert "agent8088" in seen["cmd"]
+    calls = []
+    current = "0 9 * * * agent8088 # agent8088\n0 10 * * * backup\n"
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls, current))
+    output = engine._exec_cron({"action": "list"})
+    assert "# agent8088" in output
+    assert "backup" not in output
 
 
 def test_cron_unknown_action(engine):
@@ -35,11 +48,20 @@ def test_cron_unknown_action(engine):
 
 def test_cron_escapes_quotes_in_task(engine, monkeypatch):
     calls = []
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: calls.append(cmd) or "ok")
-    engine._exec_cron({"action": "add", "schedule": "* * * * *", "task": "it's fine"})
-    # A raw single quote would break out of the shell-quoted task string.
-    assert "'\\''" in calls[-1]
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
+    task = "it's $(touch /tmp/nope) fine"
+    engine._exec_cron({"action": "add", "schedule": "* * * * *", "task": task})
+    payload = calls[-1][1]["input"]
+    assert shlex_quote(task) in payload
+
+
+def test_cron_remove_matches_the_shell_quoted_task(engine, monkeypatch):
+    calls = []
+    task = "it's $(safe) fine"
+    current = f"* * * * * agent8088 {shlex_quote(task)} # agent8088\n"
+    monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls, current))
+    assert engine._exec_cron({"action": "remove", "task": task}) == "Removed."
+    assert calls[-1][1]["input"] == ""
 
 
 def test_docker_missing_is_graceful(engine, monkeypatch):

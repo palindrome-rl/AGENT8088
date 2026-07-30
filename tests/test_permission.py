@@ -53,9 +53,13 @@ def test_escalation_grants_one_blocked_action():
     assert A.check_permission("write_text") is True
     assert A.check_permission("write_text") is False
 
-def test_run_tool_blocks_write_in_readonly():
+def test_run_tool_blocks_write_in_readonly(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "readonly"
-    result = A.run_tool("write_file", {"filename": "/tmp/test_perm.txt", "content": "hello"})
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    result = A.run_tool(
+        "write_file",
+        {"filename": str(tmp_path / "test_perm.txt"), "content": "hello"},
+    )
     assert "ESCALATION_REQUEST" in result
 
 
@@ -144,6 +148,93 @@ def test_readonly_git_allows_only_inspection():
         assert A.check_permission("shell", f"git {subcommand}") is True
     for subcommand in ("clone", "commit", "push", "reset", "checkout"):
         assert A.check_permission("shell", f"git {subcommand}") is False
+
+
+def test_readonly_shell_rejects_mutation_bypasses():
+    commands = (
+        "echo changed > /tmp/changed",
+        "python -c \"open('/tmp/changed','w').write('x')\"",
+        "pip install example",
+        "find . -delete",
+        "git branch feature",
+        "git diff --output=/tmp/changed",
+    )
+    assert all(not A.check_permission("shell", command) for command in commands)
+
+
+def test_hard_git_blocks_survive_edit_and_one_shot_grants():
+    A.PERMISSION_MODE = "edit"
+    for command in (
+        "git push",
+        "git reset --hard HEAD",
+        "git branch -D main",
+        "git status && git push",
+        "git -C . push origin HEAD",
+    ):
+        A.grant_escalation()
+        assert A.check_permission("shell", command) is False
+        assert "forbidden" in A.run_tool("execute_shell", {"command": command}).lower()
+
+
+def test_write_path_zones_are_enforced(tmp_path, monkeypatch):
+    no_prompt = tmp_path / "scratch"
+    prompt = tmp_path / "project"
+    blocked = tmp_path / "blocked"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "NO_PROMPT_PATHS", [no_prompt])
+    monkeypatch.setattr(A, "PROMPT_PATHS", [prompt])
+    monkeypatch.setattr(A, "BLOCKED_PATHS", [blocked])
+
+    assert "Wrote" in A.run_tool(
+        "write_file", {"filename": str(no_prompt / "a.txt"), "content": "ok"})
+    assert "ESCALATION_REQUEST" in A.run_tool(
+        "write_file", {"filename": str(prompt / "a.txt"), "content": "ok"})
+    A.PERMISSION_MODE = "edit"
+    assert "blocked" in A.run_tool(
+        "write_file", {"filename": str(blocked / "a.txt"), "content": "no"}).lower()
+
+
+def test_cron_and_browser_require_one_shot_approval(monkeypatch):
+    cron_calls = []
+    browser_calls = []
+    monkeypatch.setattr(A, "_exec_cron", lambda args: cron_calls.append(args) or "scheduled")
+    monkeypatch.setattr(A, "_exec_browser", lambda args: browser_calls.append(args) or "loaded")
+    monkeypatch.setattr(A, "_ssrf_check", lambda url: None)
+
+    cron_args = {"action": "add", "schedule": "0 9 * * *", "task": "report"}
+    assert "ESCALATION_REQUEST" in A.run_tool("schedule_task", cron_args)
+    A.grant_escalation()
+    assert A.run_tool("schedule_task", cron_args) == "scheduled"
+
+    browser_args = {"url": "https://example.com"}
+    assert "ESCALATION_REQUEST" in A.run_tool("browse_page", browser_args)
+    A.grant_escalation()
+    assert A.run_tool("browse_page", browser_args) == "loaded"
+    assert len(cron_calls) == len(browser_calls) == 1
+
+
+def test_plan_approves_and_retries_exact_structured_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "PROMPT_PATHS", [tmp_path])
+    target = tmp_path / "plan.txt"
+    approvals = []
+    result = A._exec_plan(
+        {"steps": [{
+            "step": "write plan output",
+            "tool": "write_file",
+            "arguments": {"filename": str(target), "content": "done"},
+        }]},
+        on_escalation=lambda request: approvals.append(request) or A.grant_escalation() or True,
+    )
+    assert target.read_text() == "done"
+    assert len(approvals) == 1
+    assert "Wrote" in result
+
+
+def test_plan_reports_missing_arguments_instead_of_crashing():
+    result = A._exec_plan({"steps": [{"step": "write a file", "tool": "write_file"}]})
+    assert "requires arguments" in result
+    assert "filename" in result
 
 def test_escalation_tool_is_not_model_callable():
     assert "request_permission_escalation" not in A.TOOL_NAMES

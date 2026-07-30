@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import sys, subprocess, json, re, os, threading, time  # readline enables input history
+import sys, subprocess, json, re, os, shlex, shutil, threading, time  # readline enables input history
 try:
     import readline  # Unix-only; enables input history/editing
 except ImportError:
@@ -174,7 +174,7 @@ def _resolve_path_list(config_key: str, default: str = "") -> list:
     raw = APP_CONFIG.get(config_key, default)
     if not raw.strip():
         return []
-    return [Path(p.strip()).expanduser().resolve() for p in raw.split(",") if p.strip()]
+    return [_resolve_allowed_path(p.strip()) for p in raw.split(",") if p.strip()]
 
 NO_PROMPT_PATHS = _resolve_path_list("no_prompt_paths")
 PROMPT_PATHS = _resolve_path_list("prompt_paths", ".")
@@ -197,21 +197,91 @@ def _check_path_zone(target: Path) -> str:
 # Shell commands that are safe in readonly mode (inspection only)
 READONLY_SAFE_COMMANDS = frozenset([
     # Unix
-    "ls", "cat", "grep", "find", "head", "tail", "wc", "pwd", "whoami",
-    "echo", "date", "uname", "df", "du", "free", "nproc", "uptime",
-    "diff", "log", "status", "show", "branch",
+    "ls", "cat", "grep", "head", "tail", "wc", "pwd", "whoami",
+    "date", "uname", "df", "du", "free", "nproc", "uptime", "diff",
     # Windows
     "dir", "type", "findstr", "where", "hostname", "ver", "vol",
-    "tasklist", "systeminfo", "wmic",
-    # Cross-platform
-    "git", "python", "pip", "node", "npm",
+    "tasklist", "systeminfo",
+])
+
+_SHELL_CONTROL_RE = re.compile(r"[|&;<>\n`]|\$\(")
+_GIT_READ_COMMANDS = frozenset(["status", "diff", "log", "show"])
+_GIT_BRANCH_FLAGS = frozenset([
+    "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
+    "--list", "--show-current", "--color", "--no-color",
 ])
 
 
-def check_permission(mode: str, command: str = "") -> bool:
+def _shell_parts(command: str) -> list:
+    if _SHELL_CONTROL_RE.search(command):
+        return []
+    try:
+        return shlex.split(command, posix=sys.platform != "win32")
+    except ValueError:
+        return []
+
+
+def _hard_blocked_shell(command: str) -> bool:
+    try:
+        lexer = shlex.shlex(command, posix=sys.platform != "win32",
+                            punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        parts = list(lexer)
+    except ValueError:
+        return False
+    separators = {";", "&&", "||", "&", "|"}
+    for index, part in enumerate(parts):
+        if Path(part).stem.lower() != "git":
+            continue
+        rest = parts[index + 1:]
+        end = next((i for i, token in enumerate(rest) if token in separators), len(rest))
+        segment = rest[:end]
+        cursor = 0
+        while cursor < len(segment) and segment[cursor].startswith("-"):
+            cursor += 2 if segment[cursor] in ("-C", "-c", "--git-dir", "--work-tree") else 1
+        if cursor >= len(segment):
+            continue
+        action = segment[cursor].lower()
+        flags = [token.lower() for token in segment[cursor + 1:]]
+        if (action == "push"
+                or (action == "reset" and "--hard" in flags)
+                or (action == "branch" and any(flag in ("-d", "--delete") for flag in flags))):
+            return True
+    return False
+
+
+def _readonly_shell(command: str) -> bool:
+    parts = _shell_parts(command)
+    if not parts:
+        return False
+    executable = Path(parts[0]).stem.lower()
+    if executable != "git":
+        return executable in READONLY_SAFE_COMMANDS
+    if len(parts) < 2:
+        return False
+    action = parts[1].lower()
+    rest = parts[2:]
+    if action == "branch":
+        return all(
+            part in _GIT_BRANCH_FLAGS or part.startswith("--color=")
+            for part in rest
+        )
+    if action not in _GIT_READ_COMMANDS:
+        return False
+    unsafe_flags = ("--output", "--ext-diff", "--textconv")
+    return not any(part == flag or part.startswith(flag + "=")
+                   for part in rest for flag in unsafe_flags)
+
+
+def check_permission(mode: str, command: str = "", path_zone: str = "default") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
     global _one_shot_grant
+    if mode == "shell" and _hard_blocked_shell(command):
+        return False
     if PERMISSION_MODE == "edit":
+        return True
+    if mode == "write_text" and path_zone == "no_prompt":
         return True
     # One-shot grant: allow one blocked tool through, then revert
     if _one_shot_grant:
@@ -220,13 +290,10 @@ def check_permission(mode: str, command: str = "") -> bool:
     # readonly mode
     if mode in ("read_text", "last_output", "python_eval", "plan"):
         return True
+    if mode == "cron":
+        return command == "list"
     if mode == "shell":
-        # Allow inspection-only shell commands in readonly
-        parts = command.strip().split()
-        cmd_base = parts[0] if parts else ""
-        if cmd_base == "git":
-            return len(parts) > 1 and parts[1] in ("status", "diff", "log", "show", "branch")
-        return cmd_base in READONLY_SAFE_COMMANDS
+        return _readonly_shell(command)
     return False
 
 
@@ -848,10 +915,13 @@ def _format_with_args(template: str, args: dict) -> str:
         sv = str(v)
         safe[k] = sv
         safe[f"{k}_q"] = urllib.parse.quote(sv)
-    return (template or "").format(**safe)
+    try:
+        return (template or "").format(**safe)
+    except KeyError as exc:
+        raise ValueError(f"Missing required argument: {exc.args[0]}") from None
 
 
-def _exec_plan(args: dict, on_step=None, depth: int = 0) -> str:
+def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
     if isinstance(raw, str):
@@ -875,9 +945,30 @@ def _exec_plan(args: dict, on_step=None, depth: int = 0) -> str:
             step_text = str(step)
             tool_name = classify_plan_component(step_text)
             tool_args = _infer_step_args(tool_name, step_text, {})
+        if tool_name not in TOOL_SPECS:
+            outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
+            continue
+        missing = [param for param in TOOL_REQUIRED_PARAMS.get(tool_name, [])
+                   if param not in tool_args]
+        if missing:
+            result = (f"Error: plan step requires arguments for {tool_name}: "
+                      f"{', '.join(missing)}. Use a JSON step with tool and arguments.")
+            outputs.append(f"[{idx}] {tool_name}: {result}")
+            if on_step:
+                on_step(idx, total, step_text, tool_name, "done", result)
+            continue
         if on_step:
             on_step(idx, total, step_text, tool_name, "running", None)
-        result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
+        try:
+            result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
+        except Exception as exc:
+            result = f"Error: {exc}"
+        if result.startswith("ESCALATION_REQUEST:") and callable(on_escalation):
+            if on_escalation(result):
+                try:
+                    result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
+                except Exception as exc:
+                    result = f"Error: {exc}"
         if on_step:
             on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
@@ -1126,9 +1217,16 @@ def _exec_cron(args: dict) -> str:
     actions: list | add (schedule, task) | remove (task)."""
     action = str(args.get("action") or "list").strip().lower()
 
+    if sys.platform == "win32":
+        return "Cron scheduling is not available on Windows."
+
+    def read_crontab():
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        return "" if result.returncode else result.stdout
+
     if action == "list":
-        return _exec_shell_command(
-            f'crontab -l 2>/dev/null | grep "{_CRON_MARKER}" || echo "No scheduled tasks."')
+        entries = [line for line in read_crontab().splitlines() if _CRON_MARKER in line]
+        return "\n".join(entries) or "No scheduled tasks."
 
     if action == "add":
         schedule = str(args.get("schedule") or "").strip()
@@ -1139,18 +1237,27 @@ def _exec_cron(args: dict) -> str:
                     "(minute hour day month weekday).")
         if not task:
             return "Error: cron 'add' requires a task."
-        safe_task = task.replace("'", "'\\''")
-        agent = str(APP_DIR / "agent8088")
-        entry = f"{schedule} cd {SHELL_CWD} && {agent} '{safe_task}' {_CRON_MARKER}"
-        return _exec_shell_command(
-            f'(crontab -l 2>/dev/null; echo "{entry}") | crontab - && echo "Scheduled: {schedule}"')
+        agent = shutil.which("agent8088") or "agent8088"
+        entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
+                 f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
+        current = read_crontab()
+        payload = current + ("" if not current or current.endswith("\n") else "\n") + entry + "\n"
+        result = subprocess.run(["crontab", "-"], input=payload, capture_output=True, text=True)
+        return f"Scheduled: {schedule}" if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     if action == "remove":
         task = str(args.get("task") or "").strip()
         if not task:
             return "Error: cron 'remove' requires the task text to match."
-        return _exec_shell_command(
-            f'crontab -l 2>/dev/null | grep -v -F "{task}" | crontab - && echo "Removed."')
+        quoted_task = shlex.quote(task)
+        payload = "\n".join(
+            line for line in read_crontab().splitlines()
+            if not (_CRON_MARKER in line and quoted_task in line)
+        )
+        if payload:
+            payload += "\n"
+        result = subprocess.run(["crontab", "-"], input=payload, capture_output=True, text=True)
+        return "Removed." if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     return f"Unknown cron action '{action}'. Use list, add, or remove."
 
@@ -1190,24 +1297,55 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             )
         return _exec_http(mode, spec, args, timeout)
 
-    # --- Permission gate for write/shell/docker (Layers 1+3) ---
+    # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
     write_path = ""
+    path_zone = "default"
     if mode == "shell":
         command = _format_with_args(spec.get("command") or "{command}", args)
     elif mode == "write_text":
         command = "write_file"
         write_path = _tool_path(spec, args)
+        if not write_path:
+            return "Error: write tool requires a file path."
+        try:
+            target = resolve_user_path(write_path)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        path_zone = _check_path_zone(target)
+        if path_zone == "blocked":
+            return f"Error: Write path is blocked: {target}"
+    elif mode == "cron":
+        command = str(args.get("action") or "list").strip().lower()
+    elif mode == "browser":
+        command = str(args.get("url") or "").strip()
+        if not command:
+            return "Error: browser tool requires 'url'."
+        blocked = _ssrf_check(command)
+        if blocked:
+            return blocked
 
-    if mode in ("write_text", "shell", "docker") and not check_permission(mode, command):
+    if mode == "shell" and _hard_blocked_shell(command):
+        return "Error: This git operation is forbidden by Agent8088's safety policy."
+
+    gated_modes = ("write_text", "shell", "docker", "cron", "browser")
+    if mode in gated_modes and not check_permission(mode, command, path_zone):
         paths_str = ""
         if mode == "write_text":
-            paths_str = write_path or "unknown"
+            paths_str = str(target)
         elif mode == "shell":
             paths_str = command[:80]
         elif mode == "docker":
             paths_str = "sandboxed_code"
-        change_type = "new_file" if mode == "write_text" else "filesystem_op"
+        elif mode == "cron":
+            paths_str = command
+        elif mode == "browser":
+            paths_str = command[:120]
+        change_type = {
+            "write_text": "new_file",
+            "cron": "scheduled_task",
+            "browser": "network_request",
+        }.get(mode, "filesystem_op")
         return request_escalation(
             target_mode="edit",
             paths=[paths_str],
@@ -1244,7 +1382,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
         content = str(args.get(content_arg, ""))
-        target = resolve_user_path(_tool_path(spec, args))
         target.parent.mkdir(parents=True, exist_ok=True)
         old_content = target.read_text() if target.exists() else ""
         target.write_text(content)
