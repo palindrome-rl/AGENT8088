@@ -1,6 +1,8 @@
 from shlex import quote as shlex_quote
 from types import SimpleNamespace
 
+import pytest
+
 
 def _fake_crontab(calls, current=""):
     def run(command, **kwargs):
@@ -101,6 +103,14 @@ def test_docker_requires_code(engine, monkeypatch):
     assert "requires 'code'" in engine._exec_docker({})
 
 
+def test_docker_rejects_option_like_image(engine, tmp_path, monkeypatch):
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    assert "invalid container image" in engine._exec_docker({
+        "code": "print(1)", "image": "--privileged",
+    })
+
+
 def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
@@ -119,6 +129,9 @@ def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
 def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
     secret = tmp_path / ".env"
     secret.write_text("TOKEN=secret")
+    skipped_secret = tmp_path / "node_modules" / ".env"
+    skipped_secret.parent.mkdir()
+    skipped_secret.write_text("DEPENDENCY_TOKEN=secret")
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
@@ -132,6 +145,21 @@ def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
     mounts = [seen["command"][i + 1] for i, value in enumerate(seen["command"][:-1])
               if value == "--mount"]
     assert any("dst=/workspace/.env,readonly" in mount for mount in mounts)
+    assert not any("node_modules/.env" in mount for mount in mounts)
+
+
+def test_docker_refuses_unbounded_sensitive_mounts(engine, tmp_path, monkeypatch):
+    for index in range(129):
+        (tmp_path / f".env-{index}").write_text("secret")
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda *_args, **_kwargs: pytest.fail("Docker must not run"),
+    )
+
+    assert "too many sensitive" in engine._exec_docker({"code": "print(1)"})
 
 
 def test_auto_prefers_native_then_docker(engine, monkeypatch):
@@ -154,7 +182,21 @@ def test_native_sandbox_writes_private_policy(engine, tmp_path, monkeypatch):
     assert str(engine.PROJECT_ROOT) in settings["filesystem"]["allowWrite"]
     if engine.sys.platform != "win32":
         assert str(engine.Path("/tmp").resolve()) in settings["filesystem"]["allowWrite"]
-    assert path.stat().st_mode & 0o777 == 0o600
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_windows_sandbox_setup_handles_missing_runtime(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setattr(engine.shutil, "which", lambda name: f"C:\\{name}.exe")
+    monkeypatch.setattr(
+        engine.subprocess,
+        "run",
+        lambda *_, **__: SimpleNamespace(stdout="v20.11.0"),
+    )
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "Command completed.")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    assert "CLI could not be located" in engine.install_native_sandbox()
 
 
 def test_approved_local_fallback_runs_once(engine, monkeypatch):

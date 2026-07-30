@@ -1007,32 +1007,32 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     }
     if shell and sys.platform != "win32":
         kwargs["executable"] = "/bin/bash"
-    process = subprocess.Popen(command, **kwargs)
     output = bytearray()
     truncated = False
 
-    def drain():
-        nonlocal truncated
-        while True:
-            chunk = process.stdout.read(65536)
-            if not chunk:
-                break
-            remaining = MAX_TOOL_OUTPUT_BYTES - len(output)
-            if remaining > 0:
-                output.extend(chunk[:remaining])
-            if len(chunk) > remaining:
-                truncated = True
+    with subprocess.Popen(command, **kwargs) as process:
+        def drain():
+            nonlocal truncated
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                remaining = MAX_TOOL_OUTPUT_BYTES - len(output)
+                if remaining > 0:
+                    output.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated = True
 
-    reader = threading.Thread(target=drain, daemon=True)
-    reader.start()
-    try:
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            reader.join()
+            return f"Command timed out after {timeout}s."
         reader.join()
-        return f"Command timed out after {timeout}s."
-    reader.join()
     text = output.decode(errors="replace").strip()
     if truncated:
         text += f"\n[output truncated at {MAX_TOOL_OUTPUT_BYTES} bytes]"
@@ -1382,6 +1382,7 @@ def _exec_browser(args: dict) -> str:
 # ---------------------------------------------------------------------------
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
+_DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker", "local"))
 
 
@@ -1554,6 +1555,9 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
 
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "") -> str:
+    selected_image = image or DOCKER_IMAGE
+    if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
+        return f"Error: invalid container image name: {selected_image}"
     workspace = str(PROJECT_ROOT)
     container_command = ["python", "-c", command] if python_code else ["sh", "-lc", command]
     argv = [
@@ -1565,13 +1569,22 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
-    for path in PROJECT_ROOT.rglob("*"):
-        if path.is_file() and _is_sensitive_path(str(path)):
+    skipped_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"}
+    sensitive_mounts = 0
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        dirs[:] = [name for name in dirs if name not in skipped_dirs]
+        for filename in files:
+            path = Path(root) / filename
+            if not _is_sensitive_path(str(path)):
+                continue
+            sensitive_mounts += 1
+            if sensitive_mounts > 128:
+                return "Error: too many sensitive workspace files to mask safely."
             destination = Path("/workspace") / path.relative_to(PROJECT_ROOT)
             argv.extend([
                 "--mount", f"type=bind,src={empty},dst={destination},readonly",
             ])
-    argv.extend(["-w", "/workspace", image or DOCKER_IMAGE, *container_command])
+    argv.extend(["-w", "/workspace", selected_image, *container_command])
     return _exec_process(argv, timeout=timeout)
 
 
@@ -1631,9 +1644,10 @@ def install_native_sandbox() -> str:
     if "exited with status" in result or "timed out" in result:
         return result
     if sys.platform == "win32":
-        setup = _exec_process(
-            _native_sandbox_argv() + ["windows-install"], timeout=300
-        )
+        runtime = _native_sandbox_argv()
+        if not runtime:
+            return "Native sandbox runtime installed but its CLI could not be located."
+        setup = _exec_process([*runtime, "windows-install"], timeout=300)
         if "exited with status" in setup or "timed out" in setup:
             return setup
     missing = _native_sandbox_missing_requirements()
@@ -1846,7 +1860,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         content_arg = spec.get("content_arg") or "content"
         content = str(args.get(content_arg, ""))
         target.parent.mkdir(parents=True, exist_ok=True)
-        old_content = _read_text_limited(target) if target.exists() else ""
+        try:
+            old_content = _read_text_limited(target) if target.exists() else ""
+        except ValueError:
+            old_content = ""
         target.write_text(content)
         _last_write_diff = _make_diff(old_content, content, str(target))
         return f"Wrote {len(content)} bytes to {target}"

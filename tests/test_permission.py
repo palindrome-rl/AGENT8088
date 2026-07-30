@@ -124,6 +124,18 @@ def test_run_tool_allows_write_in_edit(tmp_path, monkeypatch):
     assert "Wrote" in result
 
 
+def test_write_can_replace_file_too_large_to_diff(tmp_path, monkeypatch):
+    A.PERMISSION_MODE = "edit"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    target = tmp_path / "large.txt"
+    target.write_bytes(b"x" * (A.MAX_READ_BYTES + 1))
+
+    result = A.run_tool("write_file", {"filename": str(target), "content": "small"})
+
+    assert "Wrote" in result
+    assert target.read_text() == "small"
+
+
 def test_file_path_alias_round_trips(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "edit"
     monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
