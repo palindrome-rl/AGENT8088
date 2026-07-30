@@ -157,18 +157,32 @@ from agent8088 import engine as A
 # ---------------------------------------------------------------------------
 class Session:
     def __init__(self):
+        config = A.APP_CONFIG
         self.messages = []
-        self.temperature = 0.1
-        self.max_turns = 10
-        self.show_trace = False
-        self.show_reasoning = False
+        try:
+            self.temperature = float(config.get("temperature", "0.1"))
+        except ValueError:
+            self.temperature = 0.1
+        try:
+            self.max_turns = int(config.get("max_turns", "10"))
+        except ValueError:
+            self.max_turns = 10
+        self.show_trace = config.get("show_trace", "0").lower() in {"1", "true", "on", "yes"}
+        self.show_reasoning = config.get("show_reasoning", "0").lower() in {"1", "true", "on", "yes"}
         self.last_trace = None
         self.conversation_trace = []
         self.trace_path = ""
         self.name = ""
-        self.disabled_skills = set()
-        self.verbose = "on"
-        self.usage_mode = "tokens"
+        self.disabled_skills = {
+            name.strip() for name in config.get("disabled_skills", "").split(",")
+            if name.strip() in A.SKILL_PACKAGES
+        }
+        self.verbose = config.get("verbose", "on")
+        if self.verbose not in {"on", "off", "full"}:
+            self.verbose = "on"
+        self.usage_mode = config.get("usage_mode", "tokens")
+        if self.usage_mode not in {"off", "tokens", "full"}:
+            self.usage_mode = "tokens"
         self.last_usage = None
 
 
@@ -258,6 +272,21 @@ def _save_active_session():
         "conversation_trace": S.conversation_trace,
         "trace_path": S.trace_path,
     }, indent=2))
+
+
+def _save_preferences():
+    values = {
+        "temperature": S.temperature,
+        "max_turns": S.max_turns,
+        "show_trace": int(S.show_trace),
+        "show_reasoning": int(S.show_reasoning),
+        "verbose": S.verbose,
+        "usage_mode": S.usage_mode,
+        "disabled_skills": ",".join(sorted(S.disabled_skills)),
+    }
+    A.update_simple_config(A.CONFIG_PATH, values)
+    A.APP_CONFIG.update({key: str(value) for key, value in values.items()})
+    _save_active_session()
 
 
 def _active_skills():
@@ -805,7 +834,7 @@ def cmd_skills(rest):
             S.disabled_skills.discard(name)
         else:
             S.disabled_skills.add(name)
-        _save_active_session()
+        _save_preferences()
         console.print(f"[#237dd7]skill {action}d[/#237dd7] → {name}")
         return
     if action:
@@ -1187,8 +1216,9 @@ def cmd_config(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Key", style="#237dd7")
     t.add_column("Value", style="#237dd7")
-    keys = ["default_provider", "timeout_seconds", "allowed_paths", "search_base_url",
-            "ssrf_allow_hosts", "prompt_paths", "blocked_paths"]
+    keys = ["default_provider", "temperature", "max_turns", "show_trace", "show_reasoning",
+            "verbose", "usage_mode", "disabled_skills", "timeout_seconds", "allowed_paths",
+            "search_base_url", "ssrf_allow_hosts", "prompt_paths", "blocked_paths"]
     for k in keys:
         v = A.APP_CONFIG.get(k, "—")
         t.add_row(k, str(v))
@@ -1212,7 +1242,8 @@ def cmd_status(_):
     t.add_row("Tools", str(len(_active_tool_specs())))
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
-    t.add_row("Detail", f"verbose {S.verbose} · reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
+    t.add_row("Detail", f"verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
+              f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
     console.print(t)
 
 
@@ -1267,7 +1298,6 @@ def cmd_new(rest):
     S.messages.clear()
     S.last_trace = None
     S.last_usage = None
-    S.disabled_skills.clear()
     S.name = name
     _save_active_session()
     console.print(f"[#237dd7]new session[/#237dd7] → {name}")
@@ -1441,7 +1471,7 @@ def cmd_trace(rest):
             return
     console.print(f"trace capture: [{'green' if S.show_trace else 'red'}]{'on' if S.show_trace else 'off'}[/]"
                   f"  [dim]{S.trace_path or 'use /trace save [file] to export'}[/dim]")
-    _save_active_session()
+    _save_preferences()
 
 
 def cmd_reasoning(rest):
@@ -1455,7 +1485,7 @@ def cmd_reasoning(rest):
     state = "on" if S.show_reasoning else "off"
     note = "  [dim](secrets & system text are masked even when shown)[/dim]" if S.show_reasoning else ""
     console.print(f"reasoning display: [{'green' if S.show_reasoning else 'red'}]{state}[/]{note}")
-    _save_active_session()
+    _save_preferences()
 
 
 def cmd_think(rest):
@@ -1469,9 +1499,15 @@ def cmd_verbose(rest):
         console.print("[red]usage:[/red] /verbose [on|off|full]")
         return
     S.verbose = mode
-    if mode == "full":
+    if mode == "full" and not S.show_trace:
         S.show_trace = True
-    _save_active_session()
+        if not S.trace_path:
+            try:
+                _start_trace_export()
+            except OSError as exc:
+                S.show_trace = False
+                console.print(f"[red]could not enable trace export:[/red] {exc}")
+    _save_preferences()
     console.print(f"tool activity: [#237dd7]{mode}[/#237dd7]")
 
 
@@ -1482,7 +1518,7 @@ def cmd_usage(rest):
             console.print("[red]usage:[/red] /usage [off|tokens|full]")
             return
         S.usage_mode = mode
-        _save_active_session()
+        _save_preferences()
     last = S.last_usage or {}
     state = f"usage summary: [#237dd7]{S.usage_mode}[/#237dd7]"
     if last:
@@ -1492,20 +1528,24 @@ def cmd_usage(rest):
 
 def cmd_temp(rest):
     try:
-        S.temperature = float(rest.strip())
-        console.print(f"temperature = [#237dd7]{S.temperature}[/#237dd7]")
-        _save_active_session()
-    except Exception:
+        value = float(rest.strip())
+    except ValueError:
         console.print("[red]usage:[/red] /temp <float>")
+        return
+    S.temperature = value
+    console.print(f"temperature = [#237dd7]{S.temperature}[/#237dd7]")
+    _save_preferences()
 
 
 def cmd_maxturns(rest):
     try:
-        S.max_turns = int(rest.strip())
-        console.print(f"max_turns = [#237dd7]{S.max_turns}[/#237dd7]")
-        _save_active_session()
-    except Exception:
+        value = int(rest.strip())
+    except ValueError:
         console.print("[red]usage:[/red] /maxturns <int>")
+        return
+    S.max_turns = value
+    console.print(f"max_turns = [#237dd7]{S.max_turns}[/#237dd7]")
+    _save_preferences()
 
 
 def cmd_save(rest):
@@ -1998,6 +2038,12 @@ def main():
         return
     if args.edit:
         A.PERMISSION_MODE = "edit"
+    if S.show_trace:
+        try:
+            _start_trace_export()
+        except OSError as exc:
+            S.show_trace = False
+            console.print(f"[red]could not enable trace export:[/red] {exc}")
     _install_completion()
     banner()
     while True:

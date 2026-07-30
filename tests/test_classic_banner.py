@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 
 from rich.console import Console
 
@@ -66,6 +67,8 @@ def test_named_session_round_trips_skill_state(tmp_path, monkeypatch):
     output = io.StringIO()
     monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
     monkeypatch.setattr(classic, "SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(classic.A, "CONFIG_PATH", tmp_path / "config.txt")
+    monkeypatch.setattr(classic.A, "APP_CONFIG", {})
     monkeypatch.setattr(classic.S, "name", "")
     monkeypatch.setattr(classic.S, "messages", [])
     monkeypatch.setattr(classic.S, "disabled_skills", set())
@@ -132,6 +135,8 @@ def test_trace_on_creates_and_updates_a_default_export(tmp_path, monkeypatch):
     output = io.StringIO()
     monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
     monkeypatch.setenv("AGENT8088_TRACE_DIR", str(tmp_path))
+    monkeypatch.setattr(classic.A, "CONFIG_PATH", tmp_path / "config.txt")
+    monkeypatch.setattr(classic.A, "APP_CONFIG", {})
     monkeypatch.setattr(classic.S, "name", "")
     monkeypatch.setattr(classic.S, "messages", [{"role": "user", "content": "hello"}])
     monkeypatch.setattr(classic.S, "conversation_trace", [])
@@ -145,3 +150,57 @@ def test_trace_on_creates_and_updates_a_default_export(tmp_path, monkeypatch):
     exported = json.loads(export_path.read_text())
     assert export_path.parent == tmp_path
     assert exported["trace"][0]["input"] == "hello"
+
+
+def test_preferences_persist_across_launches(tmp_path, monkeypatch):
+    config = tmp_path / "config.txt"
+    output = io.StringIO()
+    monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
+    monkeypatch.setattr(classic.A, "CONFIG_PATH", config)
+    monkeypatch.setattr(classic.A, "APP_CONFIG", {})
+    monkeypatch.setenv("AGENT8088_TRACE_DIR", str(tmp_path / "traces"))
+    monkeypatch.setattr(classic.S, "name", "")
+    monkeypatch.setattr(classic.S, "temperature", 0.1)
+    monkeypatch.setattr(classic.S, "max_turns", 10)
+    monkeypatch.setattr(classic.S, "show_trace", False)
+    monkeypatch.setattr(classic.S, "show_reasoning", False)
+    monkeypatch.setattr(classic.S, "verbose", "on")
+    monkeypatch.setattr(classic.S, "usage_mode", "tokens")
+    monkeypatch.setattr(classic.S, "disabled_skills", set())
+    monkeypatch.setattr(classic.S, "trace_path", "")
+
+    assert classic.Session().show_trace is False
+    classic.cmd_verbose("full")
+    assert classic.S.show_trace is True
+    assert classic.Path(classic.S.trace_path).is_file()
+    classic.cmd_trace("off")
+    classic.cmd_trace("on")
+    classic.cmd_reasoning("on")
+    classic.cmd_usage("full")
+    classic.cmd_temp("0.35")
+    classic.cmd_maxturns("14")
+    classic.cmd_skills("disable plan")
+
+    monkeypatch.setattr(classic.A, "APP_CONFIG", classic.A.load_simple_config(config))
+    restored = classic.Session()
+    assert restored.temperature == 0.35
+    assert restored.max_turns == 14
+    assert restored.show_trace is True
+    assert restored.show_reasoning is True
+    assert restored.verbose == "full"
+    assert restored.usage_mode == "full"
+    assert restored.disabled_skills == {"plan"}
+
+    monkeypatch.setattr(classic, "S", restored)
+    monkeypatch.setattr(sys, "argv", ["agent8088"])
+    monkeypatch.setattr(classic, "_install_completion", lambda: None)
+    monkeypatch.setattr(classic, "banner", lambda: None)
+    monkeypatch.setattr(classic, "_read_line", lambda: "exit")
+    classic.main()
+
+    assert restored.trace_path
+    assert classic.Path(restored.trace_path).is_file()
+
+    classic.cmd_trace("off")
+    monkeypatch.setattr(classic.A, "APP_CONFIG", classic.A.load_simple_config(config))
+    assert classic.Session().show_trace is False
