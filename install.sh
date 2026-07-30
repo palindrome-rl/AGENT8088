@@ -759,6 +759,7 @@ verify_install() {
     echo ""
     echo -e "\033[0;32mDone.\033[0m  Run \033[1magent8088\033[0m to start."
     echo "  Config: $AGENT8088_HOME/config.txt"
+    echo "  Native sandbox: agent8088 --sandbox-setup (Docker is the fallback)"
     echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."

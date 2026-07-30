@@ -342,6 +342,26 @@ _COMPACT_BANNER = r"""    _   ___ ___ _  _ _____ ___  __  ___  ___
  /_/ \_\___|___|_|\_| |_| \___/\__/\___/\___/
 """
 
+_PALINDROME_BLOCK_LOGO = """\
+   ▄▄████▄    ▄▄███▄▄
+ ▄████▀████▄▄████▀████▄
+███▀▀   ▀██████▀   ▀▀███
+████▄  ▄████████▄  ▄████
+████▀ ▀▀████████▀  ▀████
+███▄▄    ██████▄    ▄███
+▀▀████▄████▀▀████▄████▀▀
+   ▀▀████▀    ▀█████▀"""
+
+_PALINDROME_ASCII_LOGO = """\
+    ######     #####
+ ########### ##########
+####     ######     ####
+#####  ##########  #####
+#####  ##########  #####
+####     ######     ####
+ ########### ##########
+    ######    #######"""
+
 # The supplied Palindrome Research Labs PNG is rendered directly in classic mode.
 _PALINDROME_LOGO = APP_DIR / "assets" / "palindrome-research-labs.png"
 if not _PALINDROME_LOGO.is_file():
@@ -358,12 +378,17 @@ def _catalog(items, columns=4):
 
 def _palindrome_logo():
     """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
+    fallback = (
+        _PALINDROME_ASCII_LOGO
+        if console.legacy_windows or "utf" not in console.encoding.lower()
+        else _PALINDROME_BLOCK_LOGO
+    )
     if not _PALINDROME_LOGO.is_file():
-        return Text("▀" * 24)
+        return Text(fallback, style="bold #00C8FF")
     try:
         from PIL import Image
     except ImportError:
-        return Text("▀" * 24)
+        return Text(fallback, style="bold #00C8FF")
 
     image = Image.open(_PALINDROME_LOGO).convert("RGB")
     blue = image.getchannel("B")
@@ -418,6 +443,8 @@ def banner():
     backend = active_profile or "default"
 
     if console.width < 70:
+        console.print(_palindrome_logo(), justify="center")
+        console.print(Text("Palindrome Research Labs", style="bold #00edff"), justify="center")
         compact = Text()
         compact.append(f"{active_profile}:{A.MODEL_NAME}", style="bold #00edff")
         compact.append(f" · {len(_active_tool_specs())} tools · {len(_active_skills())} skills · /help", style="#237dd7")
@@ -433,6 +460,7 @@ def banner():
     details.add_row("Model", f"{active_profile}:{A.MODEL_NAME}")
     details.add_row("Backend", backend)
     details.add_row("Endpoint", str(endpoint))
+    details.add_row("Sandbox", A.sandbox_status()["resolved"])
     details.add_row("Subagents", f"{len(A.SUBAGENT_SPECS)} loaded · {', '.join(sorted(A.SUBAGENT_SPECS))}")
     details.add_row("Session", f"temperature {S.temperature} · max turns {S.max_turns}")
 
@@ -668,7 +696,7 @@ def _handle_escalation(result_text, live=None):
     except (EOFError, KeyboardInterrupt):
         response = "n"
     if response in ("y", "yes"):
-        A.grant_escalation()
+        A.grant_escalation(change_type)
         console.print("[green]Approved for this action only. Next write will ask again.[/green]")
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
@@ -794,6 +822,7 @@ def cmd_help(_):
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
         ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
+        ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
         ("/new <name>", "Create a named persistent session"),
@@ -1252,6 +1281,8 @@ def cmd_status(_):
     t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
+    sandbox = A.sandbox_status()
+    t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['requested']}) · network {sandbox['network']}")
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
     t.add_row("Detail", f"verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
@@ -1291,7 +1322,33 @@ def cmd_doctor(_):
     t.add_row("Reachability", _endpoint_probe(endpoint) if endpoint else "provider-managed")
     t.add_row("Authentication", auth)
     t.add_row("Configuration", f"{A.CONFIG_PATH} ({'found' if A.CONFIG_PATH.exists() else 'missing'})")
+    sandbox = A.sandbox_status()
+    t.add_row("Sandbox", f"{sandbox['resolved']} · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
+    console.print(t)
+
+
+def cmd_sandbox(rest):
+    action = rest.strip().lower()
+    if action == "setup":
+        with status_cm("installing native sandbox runtime..."):
+            result = A.install_native_sandbox()
+        console.print(result)
+    elif action:
+        try:
+            A.set_sandbox_backend(action)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return
+    status = A.sandbox_status()
+    t = Table(title="Sandbox", box=box.SIMPLE, title_style="bold #00edff")
+    t.add_column("Item", style="#00edff")
+    t.add_column("Value", style="#237dd7")
+    t.add_row("Configured", status["requested"])
+    t.add_row("Active", status["resolved"])
+    t.add_row("Isolation", status["detail"])
+    t.add_row("Network", status["network"])
+    t.add_row("Runtime", status["runtime_version"])
     console.print(t)
 
 
@@ -1674,7 +1731,7 @@ COMMANDS = {
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
-    "status": cmd_status, "doctor": cmd_doctor,
+    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
@@ -2069,6 +2126,7 @@ def main():
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
+    parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -2082,6 +2140,9 @@ def main():
         return
     if args.model_setup:
         configure_model_profile()
+        return
+    if args.sandbox_setup:
+        print(A.install_native_sandbox())
         return
     if args.edit:
         A.PERMISSION_MODE = "edit"

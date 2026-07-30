@@ -1,6 +1,7 @@
 import io
 import json
 import sys
+from types import SimpleNamespace
 
 from rich.console import Console
 
@@ -31,7 +32,33 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
 def test_palindrome_logo_falls_back_when_asset_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
 
-    assert classic._palindrome_logo().plain == "▀" * 24
+    logo = classic._palindrome_logo().plain
+    assert len(logo.splitlines()) == 8
+    assert max(map(len, logo.splitlines())) <= 24
+
+
+def test_palindrome_logo_uses_ascii_on_legacy_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
+    monkeypatch.setattr(
+        classic, "console",
+        SimpleNamespace(legacy_windows=True, encoding="cp1252"),
+    )
+
+    logo = classic._palindrome_logo().plain
+
+    assert "######" in logo
+    assert all(ord(character) < 128 for character in logo)
+
+
+def test_narrow_banner_keeps_the_palindrome_brand(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(classic, "console", Console(file=output, width=50, color_system=None))
+
+    classic.banner()
+
+    rendered = output.getvalue()
+    assert "Palindrome Research Labs" in rendered
+    assert any(pixel in rendered for pixel in ("#", "█", "▀", "▄"))
 
 
 def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):

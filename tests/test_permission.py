@@ -15,6 +15,8 @@ A.TOOL_NAMES = set(A.TOOL_SPECS.keys())
 def setup_function():
     A.PERMISSION_MODE = "readonly"
     A._one_shot_grant = False
+    A._local_fallback_grant = False
+    A.SANDBOX_BACKEND = "local"
 
 def test_permission_mode_defaults_to_readonly():
     assert A.PERMISSION_MODE == "readonly"

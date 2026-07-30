@@ -109,14 +109,15 @@ sub_prompt = explore["system_prompt"] + "\n" + A.render_tool_docs(sub_specs)
 check("restricted subagent prompt hides other tools",
       "write_file(" not in sub_prompt and "read_text(" in sub_prompt)
 
-# ------------------------------------------------------- 3. SANDBOX / DOCKER
-section("3. SANDBOXING / DOCKERIZATION")
-docker_up = A._docker_available()
-print(f"  (docker daemon available: {docker_up})")
+# ------------------------------------------------------- 3. SANDBOX
+section("3. SANDBOXING")
+print(f"  (active backend: {A._resolve_sandbox_backend()})")
 
-# 3a. command construction has the isolation flags — checked without needing docker
+# 3a. Docker fallback construction has the isolation flags
 built = {}
 _orig_process = A._exec_process
+_orig_backend = A.SANDBOX_BACKEND
+_orig_docker_available = A._docker_available
 
 
 def _capture(cmd, timeout=25, shell=False):
@@ -125,16 +126,18 @@ def _capture(cmd, timeout=25, shell=False):
     return "captured"
 
 
-A._docker_available = lambda: True          # force the build path
+A.SANDBOX_BACKEND = "docker"
+A._docker_available = lambda: True
 A._exec_process = _capture
 A._exec_docker({"code": "print('hello')"})
-A._exec_process = _orig_process             # restore
+A._exec_process = _orig_process
 cmd = built.get("cmd", "")
 check("sandbox disables networking",
       cmd[cmd.index("--network") + 1] == "none")
 check("sandbox container is disposable", "--rm" in cmd)
 check("sandbox caps memory", cmd[cmd.index("--memory") + 1] == "512m")
 check("sandbox caps cpu", cmd[cmd.index("--cpus") + 1] == "1")
+check("sandbox drops Linux capabilities", cmd[cmd.index("--cap-drop") + 1] == "ALL")
 check("sandbox pins an image", "python:3.11-slim" in cmd)
 check("sandbox bypasses the host shell",
       built.get("shell") is False and cmd[-3:] == ["python", "-c", "print('hello')"])
@@ -150,32 +153,25 @@ check("sandbox payload remains one argument",
       c2[-3:] == ["python", "-c", payload] and built.get("shell") is False,
       "argv, no shell")
 
-A._docker_available = A.__dict__.get("_docker_available")  # leave forced-True off
-# restore the real detector
-exec(compile("def _docker_available():\n"
-             "    import subprocess\n"
-             "    try:\n"
-             "        r = subprocess.run('docker info', shell=True, capture_output=True, text=True, timeout=10)\n"
-             "        return r.returncode == 0\n"
-             "    except Exception:\n"
-             "        return False\n", "<restore>", "exec"), A.__dict__)
+A._docker_available = _orig_docker_available
+A.SANDBOX_BACKEND = _orig_backend
 
-# 3c. real container execution, if the daemon is up
-if A._docker_available():
+# 3c. real execution through the selected native/Docker backend
+if A._resolve_sandbox_backend() in ("native", "docker"):
     real = A._exec_docker({"code": "print(6*7)"})
-    check("REAL container executes code", real.strip() == "42", real[:40])
+    check("REAL sandbox executes code", real.strip() == "42", real[:40])
     net = A._exec_docker({"code":
         "import urllib.request;\n"
         "try:\n"
         "    urllib.request.urlopen('http://example.com', timeout=5); print('NET_OK')\n"
         "except Exception as e: print('NET_BLOCKED')"})
-    check("REAL container has no network egress", "NET_BLOCKED" in net, net[:40])
+    check("REAL sandbox has no network egress", "NET_BLOCKED" in net, net[:40])
 else:
-    skip("REAL container execution", "docker daemon not running")
-    skip("REAL container network isolation", "docker daemon not running")
+    skip("REAL sandbox execution", "native runtime and Docker unavailable")
+    skip("REAL sandbox network isolation", "native runtime and Docker unavailable")
     graceful = A._exec_docker({"code": "print(1)"})
-    check("graceful degradation message when docker absent",
-          "Docker is not available" in graceful and "docker info" in graceful)
+    check("missing sandbox asks before local execution",
+          "ESCALATION_REQUEST:edit:local_execution:" in graceful)
 
 # --------------------------------------------------------------- 4. BROWSER
 section("4. BROWSER TOOL")

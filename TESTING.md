@@ -31,14 +31,14 @@ python scripts/verify_features.py
 ```
 
 Uses your **real** `config.txt`, runs real git commands, launches a real browser,
-and executes real containers when Docker is up. Anything unavailable is reported
+and executes in the native sandbox when installed, or Docker when it is up. Anything unavailable is reported
 as `⊘ SKIP` with the reason rather than silently passing. Exit code is non-zero on
 any failure.
 
-To get all 92 (no skips), have Docker running and Playwright installed:
+For sandbox integration coverage, install the native runtime (preferred) or have Docker running:
 
 ```bash
-open -a Docker                                    # macOS
+agent8088 --sandbox-setup
 pip install playwright && playwright install chromium
 docker pull python:3.11-slim
 ```
@@ -59,7 +59,7 @@ agent8088
 | `/model` | provider table + active model |
 | `/reasoning on` | shows thinking (masked); default is hidden |
 | `/image /path/to/shot.png what is this?` | needs a vision-capable provider |
-| `/tool run_sandboxed code="print(6*7)"` | `42` from inside a container |
+| `/tool run_sandboxed code="print(6*7)"` | `42` from the native sandbox or Docker fallback |
 | `/tool browse_page url=https://example.com` | live page text |
 | `/tool git_status` | real git output |
 | `/tool web_search query="python 3.13"` | clean `• title / url / snippet` list |
@@ -89,8 +89,8 @@ use a subagent to count the TODOs here
 
 ## Notes
 
-- **Docker**: `run_sandboxed` needs the daemon running. Without it the tool returns
-  install instructions instead of failing.
+- **Sandbox**: `run_sandboxed` prefers the free native runtime, then Docker.
+  Without either it asks before running locally without isolation.
 - **Playwright**: `browse_page` needs `playwright install chromium`. Without it the
   tool tells you how to install it and suggests `web_search`.
 - **Vision**: `/image` needs a vision-capable provider configured (see `/model`); the
