@@ -26,6 +26,7 @@ def test_cron_add_builds_entry(engine, monkeypatch):
     payload = calls[-1][1]["input"]
     assert "0 9 * * *" in payload
     assert "daily report" in payload
+    assert all(kwargs["timeout"] == 20 for _, kwargs in calls)
 
 
 def test_cron_add_requires_task(engine, monkeypatch):

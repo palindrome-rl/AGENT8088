@@ -8,9 +8,9 @@ import os
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve()
 # repo root is where agent8088 lives; allow override by argv
-ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
+ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
+os.chdir(ROOT)
 
 sys.path.insert(0, str(ROOT / "src"))
 from agent8088 import engine as A
