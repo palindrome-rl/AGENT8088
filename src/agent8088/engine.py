@@ -925,6 +925,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             allowed_tools=allowed, depth=depth + 1,
             spin=ui.get("spin"), on_calls=ui.get("on_calls"),
             on_tool=ui.get("on_tool"), on_result=ui.get("on_result"),
+            on_escalation=ui.get("on_escalation"),
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
@@ -1567,6 +1568,7 @@ def _mask_system_content(text: str) -> str:
 # ---------------------------------------------------------------------------
 def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
               on_calls=None, on_tool=None, on_result=None, on_answer=None,
+              on_escalation=None,
               on_token=None, interrupt_check=None, trace=None,
               system_prompt=None, tools_def=None, allowed_tools=None, depth=0):
     """Drive the model until it gives a final answer or hits max_turns.
@@ -1576,6 +1578,7 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
       on_calls(calls)   -> once per round, with the parsed tool calls
       on_tool(name)     -> just before a tool runs
       on_result(name, out) -> after a tool returns
+      on_escalation(name, out) -> prompt for a blocked action; return True to retry it
       on_answer(answer) -> with the final answer (or the fallback)
       on_token(kind, delta) -> streaming: called per token ('reasoning' or 'content')
       interrupt_check()  -> returns True if the user interrupted (e.g. ESC); raises AgentInterrupted
@@ -1704,12 +1707,25 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
 
-            # If blocked by permission gate, remove from seen so retry can run
-            if result.startswith("ESCALATION_REQUEST:"):
+            # A granted escalation retries the exact call once; remove it from the
+            # repeat guard before asking the UI for approval.
+            blocked = result.startswith("ESCALATION_REQUEST:")
+            if blocked:
                 seen.discard(sig)
 
             if on_result:
                 on_result(name, result)
+
+            if blocked and on_escalation:
+                if on_escalation(name, result):
+                    messages.append({"role": "user", "content":
+                        "Permission granted. Retry the EXACT same tool call that was blocked. "
+                        "Do not ask for permission again. Do not explain. Just call the tool again now."})
+                else:
+                    messages.append({"role": "user", "content":
+                        "Permission denied by the user. You remain in readonly mode. "
+                        "Tell the user what you could not do and why the task cannot be completed."})
+                continue
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}

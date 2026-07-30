@@ -81,6 +81,27 @@ def test_exec_subagent_happy_path_and_isolation(engine, monkeypatch):
     assert engine._last_tool_name == "execute_shell"
 
 
+def test_subagent_retries_an_approved_write(engine, tmp_path, monkeypatch):
+    target = tmp_path / "subagent.txt"
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(engine, "SUBAGENT_SPECS", {
+        "writer": {"tools": ["write_file"], "max_turns": 3, "system_prompt": "Write the file."},
+    })
+    monkeypatch.setattr(engine, "create_completion", ScriptedModel([
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        "Done.",
+    ]))
+
+    def approve(_name, _result):
+        engine.grant_escalation()
+        return True
+
+    monkeypatch.setattr(engine, "subagent_ui", lambda *_: {"on_escalation": approve})
+    assert "Done." in engine._exec_subagent({"agent_type": "writer", "task": "write"})
+    assert target.read_text() == "ok"
+
+
 def test_exec_subagent_unknown_type_falls_back(engine, monkeypatch):
     monkeypatch.setattr(engine, "create_completion", ScriptedModel(["ok"]))
     out = engine._exec_subagent({"agent_type": "does-not-exist", "task": "x"}, depth=0)

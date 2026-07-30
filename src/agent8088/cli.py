@@ -593,6 +593,9 @@ def _make_subagent_ui(live):
             line.append(preview, style="dim")
             console.print(line)
 
+        def sub_on_escalation(_name, result):
+            return _handle_escalation(result, live)
+
         def done(answer):
             elapsed = time.time() - state["start"]
             n = state["tools"]
@@ -601,7 +604,8 @@ def _make_subagent_ui(live):
             foot.append(f"done · {n} tool{'s' if n != 1 else ''} · {elapsed:.1f}s", style="dim")
             console.print(foot)
 
-        return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result, "done": done}
+        return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result,
+                "on_escalation": sub_on_escalation, "done": done}
 
     return factory
 
@@ -627,7 +631,7 @@ def _stream_view(reasoning_parts, content_parts):
     return Group(*blocks) if blocks else Text("")
 
 
-def _handle_escalation(result_text, messages=None, live=None):
+def _handle_escalation(result_text, live=None):
     """Check if a tool result is an escalation request. If so, prompt the user
     for y/n approval and call grant_escalation() if approved."""
     if not result_text.startswith("ESCALATION_REQUEST:"):
@@ -651,19 +655,11 @@ def _handle_escalation(result_text, messages=None, live=None):
     if response in ("y", "yes"):
         A.grant_escalation()
         console.print("[green]Approved for this action only. Next write will ask again.[/green]")
-        if messages is not None:
-            messages.append({"role": "user", "content":
-                "Permission granted. Retry the EXACT same tool call that was blocked. "
-                "Do not ask for permission again. Do not explain. Just call the tool again now."})
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
-        if messages is not None:
-            messages.append({"role": "user", "content":
-                "Permission denied by the user. You remain in readonly mode. "
-                "Tell the user what you could not do and why the task cannot be completed."})
     if live is not None:
         live.start()
-    return True
+    return response in ("y", "yes")
 
 
 def do_chat(query):
@@ -698,14 +694,16 @@ def do_chat(query):
 
         def _on_result(name, result):
             on_result(name, result)
-            if _handle_escalation(result, S.messages, live):
-                pass  # Escalation handled — retry hint injected into messages
+
+        def _on_escalation(_name, result):
+            return _handle_escalation(result, live)
 
         try:
             answer = A.run_agent(
                 S.messages, max_turns=S.max_turns, temperature=S.temperature,
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
-                on_result=_on_result, on_answer=None, on_token=on_token,
+                on_result=_on_result, on_escalation=_on_escalation,
+                on_answer=None, on_token=on_token,
                 interrupt_check=esc.triggered.is_set, trace=trace,
                 system_prompt=_session_system_prompt(),
                 tools_def=A.build_tools_def(_active_tool_specs()),
@@ -1003,6 +1001,9 @@ def cmd_tool(rest):
         return
     with status_cm(f"running {name}..."):
         result = A.exec_tool(name, json.dumps(args))
+    if result.startswith("ESCALATION_REQUEST:") and _handle_escalation(result):
+        with status_cm(f"running {name}..."):
+            result = A.exec_tool(name, json.dumps(args))
     console.print(Panel(Text(result), title=f"[#237dd7]{name}[/#237dd7]  {json.dumps(args)}",
                         box=box.ROUNDED, border_style="#0077B6"))
 

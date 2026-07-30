@@ -1,4 +1,5 @@
 import os, sys, json
+from contextlib import nullcontext
 from pathlib import Path
 
 os.environ['AGENT8088_CONFIG'] = str(Path('config.txt').resolve())
@@ -56,6 +57,52 @@ def test_run_tool_blocks_write_in_readonly():
     A.PERMISSION_MODE = "readonly"
     result = A.run_tool("write_file", {"filename": "/tmp/test_perm.txt", "content": "hello"})
     assert "ESCALATION_REQUEST" in result
+
+
+def test_run_agent_retries_an_approved_write(engine, tmp_path, monkeypatch):
+    from tests.conftest import ScriptedModel
+
+    target = tmp_path / "approved.txt"
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(engine, "create_completion", ScriptedModel([
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        "Done.",
+    ]))
+    approvals = []
+
+    def approve(name, result):
+        approvals.append((name, result))
+        engine.grant_escalation()
+        return True
+
+    answer = engine.run_agent(
+        [{"role": "user", "content": "write the file"}],
+        on_escalation=approve,
+    )
+
+    assert answer == "Done."
+    assert target.read_text() == "ok"
+    assert approvals and approvals[0][0] == "write_file"
+
+
+def test_direct_tool_retries_an_approved_action(monkeypatch):
+    from agent8088 import cli
+
+    calls = []
+    monkeypatch.setattr(cli, "_active_tool_specs", lambda: {"write_file": {}})
+    monkeypatch.setattr(cli, "status_cm", lambda _: nullcontext())
+    monkeypatch.setattr(cli.console, "print", lambda *_: None)
+    monkeypatch.setattr(cli, "_handle_escalation", lambda _: True)
+
+    def exec_tool(name, arguments):
+        calls.append((name, arguments))
+        return "ESCALATION_REQUEST:edit:new_file:test.txt:blocked" if len(calls) == 1 else "Wrote 2 bytes"
+
+    monkeypatch.setattr(cli.A, "exec_tool", exec_tool)
+    cli.cmd_tool('write_file {"filename": "test.txt", "content": "ok"}')
+
+    assert len(calls) == 2
 
 def test_run_tool_allows_write_in_edit(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "edit"
