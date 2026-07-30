@@ -19,6 +19,8 @@ BUILTIN_PROVIDERS = {
     "ollama-cloud": {"label": "Ollama Cloud", "base_url": "https://ollama.com/v1", "api_key_env": "OLLAMA_API_KEY", "default_model": "gpt-oss:120b"},
     "copilot":      {"label": "GitHub Copilot", "base_url": "https://api.githubcopilot.com", "api_key_env": "GH_TOKEN", "default_model": "gpt-4o-mini"},
 }
+for _name, _provider in BUILTIN_PROVIDERS.items():
+    _provider["native_tools"] = _name != "ollama"
 
 def default_provider_name():
     return "ollama"
@@ -37,7 +39,7 @@ FALLBACK_MODELS = {
     "copilot":      ["gpt-4o-mini", "gpt-4o", "claude-sonnet-4"],
 }
 
-import json, os, time
+import hashlib, json, os, time
 from pathlib import Path
 
 _CACHE_FILE = Path(os.environ.get("AGENT8088_HOME", str(Path.home() / ".agent8088"))) / "models_cache.json"
@@ -86,15 +88,20 @@ def list_models(provider_name, client=None, timeout=15, fallback=True):
     Disk-cached for 1 hour. Falls back to FALLBACK_MODELS on error."""
     now = time.time()
     disk = _load_disk_cache()
-    cached = disk.get(provider_name)
-    if cached and (now - cached["ts"]) < 3600:
-        return cached["models"]
     if client is None:
         return list(FALLBACK_MODELS.get(provider_name, [])) if fallback else []
+    endpoint = str(getattr(client, "base_url", ""))
+    credential = str(getattr(client, "api_key", ""))
+    identity = hashlib.sha256(credential.encode()).hexdigest()[:12] if credential else "anonymous"
+    cache_key = f"{provider_name}|{endpoint.rstrip('/')}|{identity}"
+    cached = disk.get(cache_key)
+    if cached and (now - cached["ts"]) < 3600:
+        return cached["models"]
     try:
-        resp = client.models.list()
+        fetch_client = client.with_options(timeout=timeout) if hasattr(client, "with_options") else client
+        resp = fetch_client.models.list()
         models = sorted(_normalize_model_id(provider_name, m.id) for m in resp.data)
-        disk[provider_name] = {"ts": now, "models": models}
+        disk[cache_key] = {"ts": now, "models": models}
         _save_disk_cache(disk)
         return models
     except Exception:

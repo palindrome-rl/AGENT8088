@@ -16,7 +16,7 @@ feature is reachable here:
 
 Run:  python agent8088_cli.py
 """
-import sys, os, json, time, threading, select, socket  # noqa: F401
+import sys, os, json, stat, tempfile, time, threading, select, socket  # noqa: F401
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -187,7 +187,21 @@ class Session:
 
 
 S = Session()
-SESSIONS_DIR = APP_DIR / ".agent8088" / "sessions"
+SESSIONS_DIR = Path(os.environ.get(
+    "AGENT8088_HOME", str(Path.home() / ".agent8088")
+)).expanduser() / "sessions"
+
+
+def _write_private_text(path, content):
+    destination = Path(path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=destination.parent,
+                                     delete=False) as stream:
+        stream.write(content)
+        temporary = Path(stream.name)
+    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(temporary, destination)
+    return destination
 
 
 def _trace_export_data():
@@ -201,10 +215,7 @@ def _trace_export_data():
 
 
 def _write_trace_export(path):
-    destination = Path(path).expanduser()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(_trace_export_data(), indent=2))
-    return destination
+    return _write_private_text(path, json.dumps(_trace_export_data(), indent=2))
 
 
 def _default_trace_path():
@@ -257,7 +268,7 @@ def _save_active_session():
     if not S.name:
         return
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _session_path(S.name).write_text(json.dumps({
+    _write_private_text(_session_path(S.name), json.dumps({
         "version": 1,
         "name": S.name,
         "messages": S.messages,
@@ -301,6 +312,10 @@ def _active_tool_specs():
                           for tool in skill.get("tools", {})}
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
     return {name: spec for name, spec in A.TOOL_SPECS.items() if name in allowed}
+
+
+def _active_provider_name():
+    return A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER or "default"
 
 
 def _session_system_prompt():
@@ -396,7 +411,7 @@ def _classic_masthead():
 
 def banner():
     console.print(_classic_masthead(), justify="center")
-    active_profile = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "default")
+    active_profile = _active_provider_name()
     # Get endpoint from the provider registry, not old config keys
     provider_info = A.PROVIDERS.get(active_profile, {})
     endpoint = provider_info.get("base_url", A.APP_CONFIG.get("model_base_url", "?"))
@@ -730,7 +745,7 @@ def do_chat(query):
     if S.usage_mode == "tokens":
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens[/dim]")
     elif S.usage_mode == "full":
-        active = A.ACTIVE_PROVIDER or "default"
+        active = _active_provider_name()
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
     if trace is not None:
@@ -1122,7 +1137,7 @@ def cmd_model(rest):
         else:
             console.print(f"[dim]No providers configured — run `/model setup` "
                           f"or add one to {A.CONFIG_PATH}[/dim]")
-        active = A.ACTIVE_PROVIDER or "default"
+        active = _active_provider_name()
         console.print(f"Active: [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]  ·  switch with "
                       f"[#237dd7]/model <profile>[:model][/#237dd7]")
         return
@@ -1141,7 +1156,7 @@ def cmd_model(rest):
         console.print(f"[red]unknown provider[/red] '{arg}' — known: "
                       + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
         return
-    active = A.ACTIVE_PROVIDER or "default"
+    active = _active_provider_name()
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
     banner()
 
@@ -1168,7 +1183,7 @@ def cmd_models(rest):
         if not choices:
             console.print(f"[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
             return
-        active = A.ACTIVE_PROVIDER or A.APP_CONFIG.get("default_provider", "")
+        active = _active_provider_name()
         provider = _choice_prompt("Select provider:", choices, active if active in choices else "")
     if provider not in A.PROVIDERS:
         console.print(f"[red]unknown provider[/red] '{provider}' — known: "
@@ -1220,12 +1235,10 @@ def cmd_config(_):
     for k in keys:
         v = A.APP_CONFIG.get(k, "—")
         t.add_row(k, str(v))
-    active_provider = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "")
-    t.add_row("[dim]provider[/dim]", active_provider)
+    t.add_row("[dim]provider[/dim]", _active_provider_name())
     t.add_row("[dim]resolved model[/dim]", str(A.MODEL_NAME))
     console.print(t)
-    config_path = os.environ.get('AGENT8088_CONFIG', str(A.APP_DIR / 'config.txt'))
-    console.print(f"[dim]config file: {config_path}[/dim]")
+    console.print(f"[dim]config file: {A.CONFIG_PATH}[/dim]")
 
 
 def cmd_status(_):
@@ -1234,7 +1247,7 @@ def cmd_status(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Item", style="#00edff", no_wrap=True)
     t.add_column("Value", style="#237dd7")
-    active = A.ACTIVE_PROVIDER or "default"
+    active = _active_provider_name()
     t.add_row("Model", f"{active}:{A.MODEL_NAME}")
     t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
@@ -1259,8 +1272,8 @@ def _endpoint_probe(endpoint):
 
 
 def cmd_doctor(_):
-    active = A.ACTIVE_PROVIDER or "default"
-    provider = A.PROVIDERS.get(A.ACTIVE_PROVIDER, {})
+    active = _active_provider_name()
+    provider = A.PROVIDERS.get(active, {})
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
     key_env = provider.get("api_key_env", "")
     if key_env:
@@ -1268,7 +1281,7 @@ def cmd_doctor(_):
     elif provider.get("api_mode", "").lower() == "litellm":
         auth = "provider-managed / not configured"
     else:
-        auth = "configured" if A.APP_CONFIG.get("api_key") else "not required / not configured"
+        auth = "configured" if A._provider_api_key(provider) else "not required / not configured"
     t = Table(title="Doctor", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Check", style="#00edff", no_wrap=True)
@@ -1440,15 +1453,27 @@ def cmd_history(_):
         console.print(line)
 
 
+def _write_user_export(path, content):
+    arguments = {"filename": path, "content": content}
+    result = A.run_tool("write_file", arguments)
+    if result.startswith("ESCALATION_REQUEST:") and _handle_escalation(result):
+        result = A.run_tool("write_file", arguments)
+    if not result.startswith("Wrote "):
+        console.print(f"[red]could not save:[/red] {result}")
+        return None
+    return A.resolve_user_path(path)
+
+
 def cmd_trace(rest):
     raw = rest.strip()
     arg = raw.lower()
     if arg == "save" or arg.startswith("save "):
         _, _, requested = raw.partition(" ")
-        try:
-            path = _write_trace_export(requested.strip() or f"{S.name or 'agent8088'}_trace.json")
-        except OSError as exc:
-            console.print(f"[red]could not save trace:[/red] {exc}")
+        path = _write_user_export(
+            requested.strip() or f"{S.name or 'agent8088'}_trace.json",
+            json.dumps(_trace_export_data(), indent=2),
+        )
+        if not path:
             return
         S.trace_path = str(path)
         _save_active_session()
@@ -1551,8 +1576,9 @@ def cmd_save(rest):
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
             "conversation_trace": S.conversation_trace, "session": S.name or None,
             "disabled_skills": sorted(S.disabled_skills)}
-    Path(path).write_text(json.dumps(data, indent=2))
-    console.print(f"[#237dd7]saved[/#237dd7] -> {path}")
+    destination = _write_user_export(path, json.dumps(data, indent=2))
+    if destination:
+        console.print(f"[#237dd7]saved[/#237dd7] -> {destination}")
 
 
 def cmd_clear(_):
@@ -1924,7 +1950,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         return
     content = config_path.read_text(encoding="utf-8")
     def _current(key):
-        m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
+        m = _re.search(rf'^{_re.escape(key)}=(.*)$', content, _re.MULTILINE)
         return m.group(1).strip() if m else ""
     def _set_line(text, key, value):
         pattern = rf'^{_re.escape(key)}=.*'
@@ -2022,7 +2048,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
     elif search:
         content = _set_line(content, "search_base_url", search)
-    config_path.write_text(content, encoding="utf-8")
+    _write_private_text(config_path, content)
     if activate_runtime:
         _reload_model_runtime(config_path, provider, model_name)
     print(f"\nConfig written to {config_path}")

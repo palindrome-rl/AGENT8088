@@ -203,8 +203,36 @@ def test_list_models_fetches_and_serves_cache(tmp_path, monkeypatch):
             return type("Response", (), {"data": [Model("b"), Model("a")]})()
 
     class Client:
+        base_url = "https://api.example/v1"
+        api_key = "secret"
         models = Models()
 
+    client = Client()
     assert providers.list_models("openai", client=None, fallback=False) == []
-    assert providers.list_models("openai", client=Client(), fallback=False) == ["a", "b"]
-    assert providers.list_models("openai", client=None, fallback=False) == ["a", "b"]
+    assert providers.list_models("openai", client=client, fallback=False) == ["a", "b"]
+    assert providers.list_models("openai", client=client, fallback=False) == ["a", "b"]
+
+
+def test_model_cache_isolated_by_endpoint_and_account(tmp_path, monkeypatch):
+    from agent8088 import providers
+
+    monkeypatch.setattr(providers, "_CACHE_FILE", tmp_path / "models_cache.json")
+
+    class Models:
+        def __init__(self, model):
+            self.model = model
+
+        def list(self):
+            item = type("Model", (), {"id": self.model})()
+            return type("Response", (), {"data": [item]})()
+
+    class Client:
+        def __init__(self, endpoint, key, model):
+            self.base_url = endpoint
+            self.api_key = key
+            self.models = Models(model)
+
+    first = Client("https://one.example/v1", "key-one", "model-one")
+    second = Client("https://two.example/v1", "key-two", "model-two")
+    assert providers.list_models("custom", first, fallback=False) == ["model-one"]
+    assert providers.list_models("custom", second, fallback=False) == ["model-two"]

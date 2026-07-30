@@ -40,3 +40,30 @@ def test_build_image_message_infers_jpeg_mime(engine, tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "resolve_user_path", lambda r: img)
     msg = engine.build_image_message("q", [str(img)])
     assert msg["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_image_rejects_sensitive_symlink(engine, tmp_path, monkeypatch):
+    secret = tmp_path / "private.key"
+    secret.write_bytes(b"secret")
+    link = tmp_path / "photo.png"
+    link.symlink_to(secret)
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+
+    with pytest.raises(ValueError, match="sensitive"):
+        engine.build_image_message("x", [str(link)])
+
+
+def test_image_rejects_unknown_type_and_oversize(engine, tmp_path, monkeypatch):
+    unknown = tmp_path / "image.bin"
+    unknown.write_bytes(b"data")
+    monkeypatch.setattr(engine, "resolve_user_path", lambda _: unknown)
+    with pytest.raises(ValueError, match="Unsupported"):
+        engine.build_image_message("x", [str(unknown)])
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"too large")
+    monkeypatch.setattr(engine, "resolve_user_path", lambda _: image)
+    monkeypatch.setattr(engine, "MAX_IMAGE_BYTES", 2)
+    with pytest.raises(ValueError, match="too large"):
+        engine.build_image_message("x", [str(image)])

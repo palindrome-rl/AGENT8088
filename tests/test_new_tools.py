@@ -74,17 +74,19 @@ def test_docker_runs_code_isolated(engine, monkeypatch):
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     seen = {}
 
-    def fake_shell(cmd, timeout=25):
+    def fake_process(cmd, timeout=25, shell=False):
         seen["cmd"] = cmd
+        seen["shell"] = shell
         return "3"
 
-    monkeypatch.setattr(engine, "_exec_shell_command", fake_shell)
+    monkeypatch.setattr(engine, "_exec_process", fake_process)
     out = engine._exec_docker({"code": "print(1+2)", "image": "python:3.11-slim"})
     assert out == "3"
     cmd = seen["cmd"]
-    assert "--network none" in cmd   # no network by default
-    assert "--rm" in cmd             # container is disposable
-    assert "--memory" in cmd         # resource capped
+    assert cmd[cmd.index("--network") + 1] == "none"
+    assert "--rm" in cmd
+    assert "--memory" in cmd
+    assert seen["shell"] is False
 
 
 def test_docker_requires_code(engine, monkeypatch):
@@ -95,12 +97,14 @@ def test_docker_requires_code(engine, monkeypatch):
 def test_docker_quotes_code_safely(engine, monkeypatch):
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     seen = {}
-    monkeypatch.setattr(engine, "_exec_shell_command",
-                        lambda cmd, timeout=25: seen.setdefault("cmd", cmd) or "")
-    engine._exec_docker({"code": "print('hi'); rm -rf /"})
-    # The whole snippet must be a single shell-quoted argument.
-    assert "rm -rf /" in seen["cmd"]
-    assert seen["cmd"].count("python -c ") == 1
+    code = "print('hi'); rm -rf /"
+    monkeypatch.setattr(
+        engine,
+        "_exec_process",
+        lambda cmd, **_: seen.setdefault("cmd", cmd) and "",
+    )
+    engine._exec_docker({"code": code})
+    assert seen["cmd"][-3:] == ["python", "-c", code]
 
 
 def test_browser_missing_is_graceful(engine, monkeypatch):
@@ -118,3 +122,34 @@ def test_browser_enforces_ssrf(engine, monkeypatch):
 
 def test_browser_requires_url(engine):
     assert "requires 'url'" in engine._exec_browser({})
+
+
+def test_shell_reports_failure_and_caps_output(engine, monkeypatch):
+    monkeypatch.setattr(engine, "MAX_TOOL_OUTPUT_BYTES", 8)
+    failed = engine._exec_process(
+        [engine.sys.executable, "-c", "import sys; print('bad'); sys.exit(3)"])
+    assert "bad" in failed
+    assert "status 3" in failed
+
+    large = engine._exec_process(
+        [engine.sys.executable, "-c", "print('0123456789abcdef')"])
+    assert "truncated at 8 bytes" in large
+
+
+def test_structured_git_arguments_never_enter_a_shell(engine, monkeypatch):
+    title = 'ok"; touch /tmp/injected; echo "'
+    seen = {}
+    monkeypatch.setattr(
+        engine,
+        "_exec_process",
+        lambda command, **kwargs: seen.update(
+            {"command": command, "shell": kwargs.get("shell", False)}
+        ) or "created",
+    )
+
+    assert engine._exec_structured_tool(
+        "git_create_pr", {"title": title, "body": "body"}, 10) == "created"
+    assert seen["command"] == [
+        "gh", "pr", "create", "--title", title, "--body", "body",
+    ]
+    assert seen["shell"] is False

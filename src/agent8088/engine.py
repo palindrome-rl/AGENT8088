@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import sys, subprocess, json, re, os, shlex, shutil, threading, time  # readline enables input history
+import sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time  # readline enables input history
 try:
     import readline  # Unix-only; enables input history/editing
 except ImportError:
@@ -51,7 +51,12 @@ def update_simple_config(path: Path, values: dict) -> None:
                 content += "\n"
             content += line + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                     delete=False) as stream:
+        stream.write(content)
+        temporary = Path(stream.name)
+    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(temporary, path)
 
 
 # Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
@@ -83,6 +88,10 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
+MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
+MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
+MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
+MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
 
 # Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
 # command references must exist there too. Without this, a missing config key left
@@ -348,7 +357,7 @@ def load_providers(config: dict, include_builtins: bool = False) -> dict:
         for name, info in BUILTIN_PROVIDERS.items():
             provs[name] = {
                 key: value for key, value in info.items()
-                if key in {"base_url", "api_key", "api_key_env"}
+                if key in {"base_url", "api_key", "api_key_env", "native_tools"}
             }
             provs[name]["model"] = info["default_model"]
     for key, value in config.items():
@@ -396,6 +405,10 @@ def get_client(provider: str = None):
     Precedence: explicit arg > AGENT8088_PROVIDER env > config default_provider >
     legacy USE_GEMMA4 toggle > the flat model_base_url/model_name settings."""
     name = (provider or os.environ.get("AGENT8088_PROVIDER") or DEFAULT_PROVIDER or "").strip()
+    if name and name not in PROVIDERS and DEFAULT_PROVIDER in PROVIDERS:
+        print(f"[agent8088] Unknown provider '{name}' — using {DEFAULT_PROVIDER}. "
+              f"Known: {', '.join(sorted(PROVIDERS)) or '(none configured)'}")
+        name = DEFAULT_PROVIDER
 
     if name and name in PROVIDERS:
         p = PROVIDERS[name]
@@ -410,7 +423,7 @@ def get_client(provider: str = None):
                       timeout=TIMEOUT_SECONDS), p.get("model", MODEL_NAME)
 
     if name:
-        print(f"[agent8088] Unknown provider '{name}' — using default. "
+        print(f"[agent8088] Unknown provider '{name}' — using legacy endpoint. "
               f"Known: {', '.join(sorted(PROVIDERS)) or '(none configured)'}")
 
     if os.environ.get("USE_GEMMA4", "0") == "1":  # legacy toggle, still supported
@@ -423,6 +436,9 @@ def get_client(provider: str = None):
 
 
 client, MODEL_NAME = get_client()
+_initial_provider = (os.environ.get("AGENT8088_PROVIDER") or DEFAULT_PROVIDER or "").strip()
+ACTIVE_PROVIDER = (_initial_provider if _initial_provider in PROVIDERS
+                   else DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else "")
 
 
 def activate_model(provider: str = "", model: str = ""):
@@ -439,7 +455,7 @@ def activate_model(provider: str = "", model: str = ""):
             "default_provider": provider,
             f"provider.{provider}.model": selected_model,
         }
-        for field in ("api_mode", "base_url", "api_key", "api_key_env"):
+        for field in ("api_mode", "base_url", "api_key", "api_key_env", "native_tools"):
             value = PROVIDERS[provider].get(field)
             if value:
                 settings[f"provider.{provider}.{field}"] = value
@@ -460,10 +476,16 @@ def activate_model(provider: str = "", model: str = ""):
     return client, MODEL_NAME
 
 
+def _native_tools_enabled(tools) -> bool:
+    if not tools:
+        return False
+    provider = PROVIDERS.get(ACTIVE_PROVIDER or DEFAULT_PROVIDER, {})
+    value = provider.get("native_tools", False)
+    return value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes", "on")
+
+
 def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1, on_token=None):
     full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
-    # NOTE: Ollama (current backend) rejects the OpenAI "tools" param, so the model emits
-    # native ✿FUNCTION✿/✿ARGS✿ text instead. Pass tools= again when moving to llama-server.
     penalties = {}
     if FREQUENCY_PENALTY:
         penalties["frequency_penalty"] = FREQUENCY_PENALTY
@@ -478,6 +500,8 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
             "model": MODEL_NAME, "messages": full_messages, "max_tokens": max_tokens,
             "temperature": temperature, "stream": on_token is not None, **penalties,
         }
+        if _native_tools_enabled(tools):
+            kwargs["tools"] = tools
         if client.get("api_base"):
             kwargs["api_base"] = client["api_base"]
         if client.get("api_key"):
@@ -485,7 +509,7 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         response = completion(**kwargs)
         if on_token is None:
             return response
-        collected = []
+        collected, tool_chunks = [], {}
         for chunk in response:
             delta = chunk.choices[0].delta
             reasoning = getattr(delta, "reasoning_content", None)
@@ -494,19 +518,19 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
             if delta.content:
                 on_token("content", delta.content)
                 collected.append(delta.content)
-        return _build_response("".join(collected))
-    if on_token is None:
-        # Non-streaming path — unchanged (old REPL, benchmark, one-shot mode)
-        return client.chat.completions.create(
-            model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature,
-            **penalties,
-        )
-    # Streaming path — Rich UI passes on_token for live token-by-token rendering
-    stream = client.chat.completions.create(
-        model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens, temperature=temperature, stream=True,
-        **penalties,
+            _collect_stream_tool_calls(delta, tool_chunks)
+        return _build_response("".join(collected), tool_chunks)
+    request_options = dict(
+        model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens,
+        temperature=temperature, **penalties,
     )
-    collected = []
+    if _native_tools_enabled(tools):
+        request_options["tools"] = tools
+    if on_token is None:
+        return client.chat.completions.create(**request_options)
+    # Streaming path — Rich UI passes on_token for live token-by-token rendering
+    stream = client.chat.completions.create(**request_options, stream=True)
+    collected, tool_chunks = [], {}
     for chunk in stream:
         delta = chunk.choices[0].delta
         rc = getattr(delta, "reasoning_content", None)
@@ -515,16 +539,52 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         if delta.content:
             on_token("content", delta.content)
             collected.append(delta.content)
-    return _build_response("".join(collected))
+        _collect_stream_tool_calls(delta, tool_chunks)
+    return _build_response("".join(collected), tool_chunks)
 
 
-def _build_response(content):
+def _collect_stream_tool_calls(delta, chunks):
+    for tool_call in getattr(delta, "tool_calls", None) or []:
+        index = getattr(tool_call, "index", 0)
+        entry = chunks.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        entry["id"] += getattr(tool_call, "id", None) or ""
+        function = getattr(tool_call, "function", None)
+        if function:
+            entry["name"] += getattr(function, "name", None) or ""
+            entry["arguments"] += getattr(function, "arguments", None) or ""
+
+
+def _build_response(content, tool_chunks=None):
     """Reconstruct a ChatCompletion-like object from streamed content
     so run_agent() can read .choices[0].message.content uniformly."""
+    tool_calls = []
+    for index in sorted(tool_chunks or {}):
+        call = tool_chunks[index]
+        function = type("F", (), {
+            "name": call["name"], "arguments": call["arguments"] or "{}",
+        })()
+        tool_calls.append(type("T", (), {
+            "id": call["id"] or f"call_{index}", "type": "function", "function": function,
+        })())
     return type("R", (), {"choices": [type("C", (), {
-        "message": type("M", (), {"content": content}),
-        "finish_reason": "stop",
+        "message": type("M", (), {"content": content, "tool_calls": tool_calls}),
+        "finish_reason": "tool_calls" if tool_calls else "stop",
     })()]})
+
+
+def _native_tool_text(message) -> str:
+    lines = []
+    for tool_call in getattr(message, "tool_calls", None) or []:
+        function = getattr(tool_call, "function", None)
+        if not function or not getattr(function, "name", ""):
+            continue
+        arguments = getattr(function, "arguments", None) or "{}"
+        try:
+            arguments = json.dumps(json.loads(arguments))
+        except (TypeError, json.JSONDecodeError):
+            arguments = "{}"
+        lines.append(f"✿FUNCTION✿: {function.name} ✿ARGS✿: {arguments}")
+    return "\n".join(lines)
 
 
 _IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -548,7 +608,13 @@ def build_image_message(text: str, images: list) -> dict:
         path = resolve_user_path(ref)
         if not path.exists():
             raise ValueError(f"Image not found: {path}")
-        mime = _IMAGE_MIME.get(path.suffix.lower(), "image/png")
+        if _is_sensitive_path(str(path)):
+            raise ValueError(f"Access to sensitive file denied: {path}")
+        mime = _IMAGE_MIME.get(path.suffix.lower())
+        if not mime:
+            raise ValueError(f"Unsupported image type: {path.suffix or '(none)'}")
+        if path.stat().st_size > MAX_IMAGE_BYTES:
+            raise ValueError(f"Image is too large (limit: {MAX_IMAGE_BYTES} bytes): {path}")
         b64 = _b64.b64encode(path.read_bytes()).decode()
         parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
     return {"role": "user", "content": parts}
@@ -874,6 +940,14 @@ def resolve_user_path(raw_path: str) -> Path:
     return resolved
 
 
+def _read_text_limited(path: Path, limit: int = MAX_READ_BYTES) -> str:
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"File is too large to read (limit: {limit} bytes): {path}")
+    return data.decode("utf-8")
+
+
 def classify_plan_component(step_text: str) -> str:
     text = (step_text or "").lower()
     words = set(re.findall(r"[a-z0-9_]+", text))
@@ -897,14 +971,78 @@ def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) ->
     return args
 
 
+def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
+    kwargs = {
+        "shell": shell,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "cwd": str(SHELL_CWD),
+    }
+    if shell and sys.platform != "win32":
+        kwargs["executable"] = "/bin/bash"
+    process = subprocess.Popen(command, **kwargs)
+    output = bytearray()
+    truncated = False
+
+    def drain():
+        nonlocal truncated
+        while True:
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                break
+            remaining = MAX_TOOL_OUTPUT_BYTES - len(output)
+            if remaining > 0:
+                output.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                truncated = True
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        reader.join()
+        return f"Command timed out after {timeout}s."
+    reader.join()
+    text = output.decode(errors="replace").strip()
+    if truncated:
+        text += f"\n[output truncated at {MAX_TOOL_OUTPUT_BYTES} bytes]"
+    if returncode:
+        suffix = f"Command exited with status {returncode}."
+        return f"{text}\n{suffix}".strip()
+    return text or "Command completed."
+
+
 def _exec_shell_command(command: str, timeout: int = 25) -> str:
-    if sys.platform == "win32":
-        r = subprocess.run(command, shell=True, capture_output=True, text=True,
-                           timeout=timeout, cwd=str(SHELL_CWD))
-    else:
-        r = subprocess.run(command, shell=True, capture_output=True, text=True,
-                           timeout=timeout, executable="/bin/bash", cwd=str(SHELL_CWD))
-    return (r.stdout + r.stderr).strip() or "✓ Command completed"
+    return _exec_process(command, timeout=timeout, shell=True)
+
+
+def _process_display(argv: list) -> str:
+    return subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
+
+
+def _structured_tool_argv(name: str, args: dict):
+    if name == "git_clone":
+        return ["git", "clone", str(args.get("url", "")), str(args.get("directory", ""))]
+    if name == "git_commit":
+        return ["git", "commit", "-m", str(args.get("message", ""))]
+    if name == "git_push":
+        return ["git", "push", "origin", "HEAD"]
+    if name == "git_create_pr":
+        return ["gh", "pr", "create", "--title", str(args.get("title", "")),
+                "--body", str(args.get("body", ""))]
+    return None
+
+
+def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
+    argv = _structured_tool_argv(name, args)
+    if name == "git_commit":
+        staged = _exec_process(["git", "add", "-A"], timeout=timeout)
+        if "exited with status" in staged or "timed out" in staged:
+            return staged
+    return _exec_process(argv, timeout=timeout)
 
 
 def _format_with_args(template: str, args: dict) -> str:
@@ -1063,7 +1201,8 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 
     Kept as a tool MODE rather than a shell one-liner so the SSRF guard still
     applies; a `mode=shell` curl would bypass it entirely."""
-    import shlex
+    import urllib.error
+    import urllib.request
 
     url = _safe_format(spec.get("url") or "{url}", args)
     # Diagnose an unresolved {placeholder} BEFORE the SSRF guard sees it — otherwise a
@@ -1082,7 +1221,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     if blocked:
         return blocked
 
-    cmd = ["curl", "-s", "--max-time", str(timeout)]
+    headers = {}
     for raw in (spec.get("headers") or "").split(";;"):
         header = _safe_format(raw.strip(), args)
         if not header:
@@ -1093,31 +1232,52 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
         if missing:
             return (f"'{spec['name']}' is not configured: set {missing.group(1)} in "
                     f"{CONFIG_PATH.name}. Until then use another search tool.")
-        cmd += ["-H", shlex.quote(header)]
+        if ":" not in header:
+            return f"'{spec['name']}' has an invalid HTTP header: {header}"
+        key, value = header.split(":", 1)
+        headers[key.strip()] = value.strip()
+    data = None
     if mode == "http_post":
-        cmd += ["-X", "POST"]
         body = _safe_format(spec.get("body") or "{}", args)
-        cmd += ["--data-binary", shlex.quote(body)]
-    cmd.append(shlex.quote(url))
+        data = body.encode()
 
-    command = " ".join(cmd)
+    class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, msg, response_headers, new_url):
+            redirect_blocked = _ssrf_check(new_url)
+            if redirect_blocked:
+                raise urllib.error.URLError(redirect_blocked)
+            return super().redirect_request(
+                request, fp, code, msg, response_headers, new_url)
+
+    request = urllib.request.Request(
+        url, data=data, headers=headers, method="POST" if mode == "http_post" else "GET")
+    opener = urllib.request.build_opener(SafeRedirectHandler())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read(MAX_HTTP_BYTES + 1)
+            encoding = response.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(MAX_HTTP_BYTES + 1)
+        detail = raw[:MAX_HTTP_BYTES].decode(errors="replace").strip()
+        return f"HTTP {exc.code}: {detail or exc.reason}"
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return f"HTTP request failed: {exc}"
+    if len(raw) > MAX_HTTP_BYTES:
+        return f"HTTP response exceeded the {MAX_HTTP_BYTES}-byte limit."
+    result = raw.decode(encoding, errors="replace")
     jq_filter = spec.get("filter")
     if jq_filter:
-        # If jq fails (HTML error page, unexpected shape), fall back to the raw body
-        # so an API error message still reaches the model instead of vanishing.
-        command = (f"{command} > /tmp/_a8088_http.$$ 2>/dev/null; "
-                   f"jq -r {shlex.quote(jq_filter)} < /tmp/_a8088_http.$$ 2>/dev/null "
-                   f"|| cat /tmp/_a8088_http.$$; rm -f /tmp/_a8088_http.$$")
-    result = _exec_shell_command(command, timeout=timeout + 5)
-
-    # A failed curl writes nothing, and _exec_shell_command turns "no output" into
-    # "✓ Command completed" — which reads as SUCCESS to the model. Say what actually
-    # happened instead, so an unreachable endpoint isn't mistaken for "no results".
-    if not result.strip() or result.strip() == "✓ Command completed":
-        import urllib.parse
-        host = urllib.parse.urlparse(url).netloc or url
-        return (f"No response from {host} — the endpoint is unreachable or returned "
-                f"nothing. This is a connectivity/config problem, not an empty result set.")
+        try:
+            filtered = subprocess.run(
+                ["jq", "-r", jq_filter], input=result, capture_output=True,
+                text=True, timeout=timeout,
+            )
+            if filtered.returncode == 0:
+                result = filtered.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    if not result.strip():
+        return "HTTP request completed with an empty response."
     if spec.get("extract") == "title":
         match = re.search(r"<title[^>]*>(.*?)</title>", result, re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s+", " ", match.group(1)).strip() if match else "No title"
@@ -1159,7 +1319,24 @@ def _exec_browser(args: dict) -> str:
             browser = p.chromium.launch(headless=True)
             try:
                 page = browser.new_page()
+                blocked_requests = []
+
+                def guard_request(route):
+                    request_url = route.request.url
+                    if request_url.startswith(("data:", "blob:", "about:")):
+                        route.continue_()
+                        return
+                    reason = _ssrf_check(request_url)
+                    if reason:
+                        blocked_requests.append(reason)
+                        route.abort()
+                    else:
+                        route.continue_()
+
+                page.route("**/*", guard_request)
                 page.goto(url, timeout=BROWSER_TIMEOUT_MS, wait_until="domcontentloaded")
+                if blocked_requests:
+                    return blocked_requests[0]
                 if selector:
                     text = "\n".join(el.inner_text() for el in page.query_selector_all(selector))
                 else:
@@ -1199,13 +1376,13 @@ def _exec_docker(args: dict) -> str:
     if not _docker_available():
         return ("Docker is not available on this machine. Install Docker Desktop and "
                 "make sure `docker info` succeeds, or use execute_shell instead.")
-    import shlex
     image = str(args.get("image") or DOCKER_IMAGE)
     timeout = int(args.get("timeout") or 60)
-    cmd = (f"docker run --rm --network {DOCKER_NETWORK} "
-           f"--memory 512m --cpus 1 "
-           f"{shlex.quote(image)} python -c {shlex.quote(code)}")
-    return _exec_shell_command(cmd, timeout=timeout)
+    command = [
+        "docker", "run", "--rm", "--network", DOCKER_NETWORK,
+        "--memory", "512m", "--cpus", "1", image, "python", "-c", code,
+    ]
+    return _exec_process(command, timeout=timeout)
 
 
 _CRON_FIELD_RE = re.compile(r'^[\d\*/,\-]+$')
@@ -1277,10 +1454,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     timeout = int(spec.get("timeout") or 25)
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
+    read_target = None
     if mode == "read_text":
-        fn = _tool_path(spec, args)
-        if _is_sensitive_path(fn):
-            return f"Error: Access to sensitive file denied: {fn}"
+        try:
+            read_target = resolve_user_path(_tool_path(spec, args))
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if _is_sensitive_path(str(read_target)):
+            return f"Error: Access to sensitive file denied: {read_target}"
 
     # --- Layer 2: Network access control ---
     if mode in ("http_get", "http_post"):
@@ -1302,7 +1483,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     write_path = ""
     path_zone = "default"
     if mode == "shell":
-        command = _format_with_args(spec.get("command") or "{command}", args)
+        argv = _structured_tool_argv(name, args)
+        command = _process_display(argv) if argv else _format_with_args(
+            spec.get("command") or "{command}", args)
     elif mode == "write_text":
         command = "write_file"
         write_path = _tool_path(spec, args)
@@ -1376,14 +1559,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _exec_browser(args)
 
     if mode == "read_text":
-        return resolve_user_path(_tool_path(spec, args)).read_text()
+        return _read_text_limited(read_target)
 
     if mode == "write_text":
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
         content = str(args.get(content_arg, ""))
         target.parent.mkdir(parents=True, exist_ok=True)
-        old_content = target.read_text() if target.exists() else ""
+        old_content = _read_text_limited(target) if target.exists() else ""
         target.write_text(content)
         _last_write_diff = _make_diff(old_content, content, str(target))
         return f"Wrote {len(content)} bytes to {target}"
@@ -1395,6 +1578,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return str(eval(expression, {"__builtins__": {}}, {}))
 
     if mode == "shell":
+        if _structured_tool_argv(name, args):
+            return _exec_structured_tool(name, args, timeout)
         command = _format_with_args(spec.get("command") or "{command}", args)
         return _exec_shell_command(command, timeout=timeout)
 
@@ -1553,12 +1738,16 @@ def collect_secret_values(config: dict) -> list:
     — redacted from any tool output or answer so `cat config.txt` / `env` etc.
     can't be used to exfiltrate them. Longest first, so overlapping values mask
     completely rather than leaving a suffix behind."""
-    return sorted(
-        {v for k, v in config.items()
-         if any(s in k.lower() for s in ("key", "token", "secret", "password"))
-         and isinstance(v, str) and len(v) >= 12
-         and v.lower() not in ("ollama", "sk-dummy", "changeme", "your-api-key")},
-        key=len, reverse=True)
+    values = set()
+    for key, value in config.items():
+        if not isinstance(value, str):
+            continue
+        candidate = os.environ.get(value, "") if key.lower().endswith("api_key_env") else value
+        if (any(part in key.lower() for part in ("key", "token", "secret", "password"))
+                and len(candidate) >= 12
+                and candidate.lower() not in ("ollama", "sk-dummy", "changeme", "your-api-key")):
+            values.add(candidate)
+    return sorted(values, key=len, reverse=True)
 
 
 _SECRET_VALUES = collect_secret_values(APP_CONFIG)
@@ -1567,7 +1756,8 @@ _SECRET_VALUES = collect_secret_values(APP_CONFIG)
 def _redact_secrets(text: str) -> str:
     if not text:
         return text
-    for v in _SECRET_VALUES:
+    for v in sorted(set(_SECRET_VALUES) | set(collect_secret_values(APP_CONFIG)),
+                    key=len, reverse=True):
         if v in text:
             text = text.replace(v, "[redacted]")
     return text
@@ -1763,7 +1953,11 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Strip chain-of-thought BEFORE storing: keeps runaway reasoning out of the
         # context window (the usual cause of the "loops in the reasoning block" crash)
         # and out of the user-facing answer.
-        content = _strip_reasoning(response.choices[0].message.content or "")
+        message = response.choices[0].message
+        content = _strip_reasoning(message.content or "")
+        native_text = _native_tool_text(message)
+        if native_text:
+            content = "\n".join(part for part in (content, native_text) if part)
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, allowed_tools)

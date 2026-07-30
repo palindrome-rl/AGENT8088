@@ -46,7 +46,7 @@ docker pull python:3.11-slim
 ## 3. Manual testing in the CLI
 
 ```bash
-python agent8088_cli.py
+agent8088
 ```
 
 | Try | What to expect |
@@ -77,14 +77,15 @@ python agent8088_cli.py
 | `hello how are you` | normal reply — **not** "I have no tools" |
 | `what oolsyo` (garbled) | normal reply asking for clarification |
 
-## 4. One-shot / trace mode
+## 4. Trace mode
 
 ```bash
-./agent8088 "list the files in this directory"
-./agent8088 --trace "use a subagent to count the TODOs here"
+agent8088
+/trace on
+use a subagent to count the TODOs here
 ```
 
-`--trace` prints the full step-by-step JSON call chain to stderr.
+`/trace on` records the full step-by-step call chain and persists the setting.
 
 ## Notes
 

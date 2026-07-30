@@ -505,9 +505,11 @@ function Drop-Config {
             Write-Warn "No default config.txt found; you'll need to create one"
             return
         }
+        icacls $configPath /inheritance:r /grant:r "$env:USERNAME`:(R,W)" | Out-Null
         Write-Success "Default config.txt copied"
     } else {
         Write-Info "config.txt already exists at $configPath - preserving"
+        icacls $configPath /inheritance:r /grant:r "$env:USERNAME`:(R,W)" | Out-Null
     }
 
     # Set AGENT8088_CONFIG env var

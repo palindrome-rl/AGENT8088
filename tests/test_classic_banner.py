@@ -120,6 +120,8 @@ def test_trace_save_exports_full_conversation(tmp_path, monkeypatch):
     monkeypatch.setattr(classic.S, "name", "trace_demo")
     monkeypatch.setattr(classic.S, "messages", [{"role": "user", "content": "hello"}])
     monkeypatch.setattr(classic.S, "conversation_trace", [])
+    monkeypatch.setattr(classic.A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [tmp_path])
 
     classic._record_trace("hello", [{"type": "final_answer", "content": "hi"}], 0.25)
     export_path = tmp_path / "conversation.json"
@@ -129,6 +131,22 @@ def test_trace_save_exports_full_conversation(tmp_path, monkeypatch):
     assert exported["messages"] == [{"role": "user", "content": "hello"}]
     assert exported["trace"][0]["input"] == "hello"
     assert "full conversation trace saved" in output.getvalue()
+
+
+def test_trace_save_respects_write_permissions(tmp_path, monkeypatch):
+    output = io.StringIO()
+    target = tmp_path / "blocked.json"
+    monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
+    monkeypatch.setattr(classic.A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [])
+    monkeypatch.setattr(classic.A, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(classic, "_handle_escalation", lambda _: False)
+
+    classic.cmd_trace(f"save {target}")
+
+    assert not target.exists()
+    assert "could not save" in output.getvalue()
 
 
 def test_trace_on_creates_and_updates_a_default_export(tmp_path, monkeypatch):

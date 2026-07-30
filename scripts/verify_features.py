@@ -116,35 +116,39 @@ print(f"  (docker daemon available: {docker_up})")
 
 # 3a. command construction has the isolation flags — checked without needing docker
 built = {}
-_orig_shell = A._exec_shell_command
+_orig_process = A._exec_process
 
 
-def _capture(cmd, timeout=25):
+def _capture(cmd, timeout=25, shell=False):
     built["cmd"] = cmd
+    built["shell"] = shell
     return "captured"
 
 
 A._docker_available = lambda: True          # force the build path
-A._exec_shell_command = _capture
+A._exec_process = _capture
 A._exec_docker({"code": "print('hello')"})
-A._exec_shell_command = _orig_shell         # restore
+A._exec_process = _orig_process             # restore
 cmd = built.get("cmd", "")
-check("sandbox disables networking", "--network none" in cmd)
+check("sandbox disables networking",
+      cmd[cmd.index("--network") + 1] == "none")
 check("sandbox container is disposable", "--rm" in cmd)
-check("sandbox caps memory", "--memory 512m" in cmd)
-check("sandbox caps cpu", "--cpus 1" in cmd)
+check("sandbox caps memory", cmd[cmd.index("--memory") + 1] == "512m")
+check("sandbox caps cpu", cmd[cmd.index("--cpus") + 1] == "1")
 check("sandbox pins an image", "python:3.11-slim" in cmd)
-check("sandbox shell-quotes the payload", "python -c 'print(" in cmd)
+check("sandbox bypasses the host shell",
+      built.get("shell") is False and cmd[-3:] == ["python", "-c", "print('hello')"])
 
-# 3b. injection resistance in the quoting
+# 3b. injection resistance in the argument list
 built.clear()
-A._exec_shell_command = _capture
-A._exec_docker({"code": "import os; os.system('id')\"; rm -rf / #"})
-A._exec_shell_command = _orig_shell
+payload = "import os; os.system('id')\"; rm -rf / #"
+A._exec_process = _capture
+A._exec_docker({"code": payload})
+A._exec_process = _orig_process
 c2 = built.get("cmd", "")
-check("sandbox payload cannot break out of quoting",
-      c2.count("python -c ") == 1 and c2.rstrip().endswith("'"),
-      "single quoted arg")
+check("sandbox payload remains one argument",
+      c2[-3:] == ["python", "-c", payload] and built.get("shell") is False,
+      "argv, no shell")
 
 A._docker_available = A.__dict__.get("_docker_available")  # leave forced-True off
 # restore the real detector
@@ -364,9 +368,10 @@ for t in ("web_search_tavily", "web_search_exa"):
     msg = A.run_tool(t, {"query": "x"})
     configured = "not configured" not in msg
     if configured:
-        auth_error = "unauthorized" in msg.lower() or "invalid api key" in msg.lower()
-        if auth_error:
-            skip(f"{t} REAL query", "configured API rejected its credential")
+        api_error = (msg.startswith("HTTP ") or msg.startswith("HTTP request failed:")
+                     or "unauthorized" in msg.lower() or "invalid api key" in msg.lower())
+        if api_error:
+            skip(f"{t} REAL query", msg.splitlines()[0][:100])
         else:
             check(f"{t} REAL query returns results", bool(msg.strip()),
                   msg[:50].replace("\n", " "))
@@ -401,13 +406,14 @@ del A.TOOL_SPECS["_probe"]
 sb = A.APP_CONFIG.get("search_base_url", "")
 if sb:
     live = A.run_tool("web_search", {"query": "test"})
-    dead = ("timed out" in live.lower() or "No response from" in live
-            or not live.strip() or live.strip() == "✓ Command completed")
+    dead = (live.startswith("HTTP ") or "timed out" in live.lower()
+            or "No response from" in live or not live.strip())
     if dead:
         skip("configured search backend reachable",
              f"{sb.split('/')[2] if '/' in sb else sb} unreachable from here")
         check("unreachable search reports a real error (not silent success)",
-              "No response from" in live or "timed out" in live.lower(),
+              live.startswith("HTTP ") or "No response from" in live
+              or "timed out" in live.lower(),
               live[:45])
     else:
         check("configured search backend reachable", True, live[:40].replace("\n", " "))

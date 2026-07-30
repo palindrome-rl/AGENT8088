@@ -133,6 +133,17 @@ def test_run_tool_allows_read_in_readonly():
     result = A.run_tool("read_text", {"filename": "tools.txt"})
     assert "execute_shell" in result
 
+
+def test_read_text_rejects_sensitive_symlink(tmp_path, monkeypatch):
+    secret = tmp_path / ".env"
+    secret.write_text("API_KEY=secret")
+    link = tmp_path / "notes.txt"
+    link.symlink_to(secret)
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+
+    result = A.run_tool("read_text", {"filename": str(link)})
+    assert "sensitive file denied" in result
+
 def test_run_tool_blocks_dangerous_shell_in_readonly():
     A.PERMISSION_MODE = "readonly"
     result = A.run_tool("execute_shell", {"command": "rm -rf /tmp/nonexistent_perm_test"})

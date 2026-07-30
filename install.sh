@@ -488,9 +488,11 @@ drop_config() {
             log_warn "No default config.txt found; you'll need to create one"
             return 0
         fi
+        chmod 600 "$AGENT8088_HOME/config.txt"
         log_success "Default config.txt copied"
     else
         log_info "config.txt already exists at $AGENT8088_HOME/config.txt — preserving"
+        chmod 600 "$AGENT8088_HOME/config.txt"
     fi
 
     # Set AGENT8088_CONFIG env var so the engine finds the user config.
