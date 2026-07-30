@@ -55,6 +55,12 @@ def test_escalation_grants_one_blocked_action():
     assert A.check_permission("write_text") is True
     assert A.check_permission("write_text") is False
 
+def test_safe_action_does_not_consume_one_shot_grant():
+    A.grant_escalation()
+    assert A.check_permission("read_text") is True
+    assert A.check_permission("write_text") is True
+    assert A.check_permission("write_text") is False
+
 def test_run_tool_blocks_write_in_readonly(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "readonly"
     monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
@@ -183,6 +189,9 @@ def test_hard_git_blocks_survive_edit_and_one_shot_grants():
         "git branch -D main",
         "git status && git push",
         "git -C . push origin HEAD",
+        "sh -c 'git push'",
+        "bash -lc 'git reset --hard HEAD'",
+        "sh -c \"sh -c 'git branch -D main'\"",
     ):
         A.grant_escalation()
         assert A.check_permission("shell", command) is False

@@ -240,7 +240,7 @@ def _shell_parts(command: str) -> list:
         return []
 
 
-def _hard_blocked_shell(command: str) -> bool:
+def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     try:
         lexer = shlex.shlex(command, posix=sys.platform != "win32",
                             punctuation_chars=";&|")
@@ -250,6 +250,22 @@ def _hard_blocked_shell(command: str) -> bool:
     except ValueError:
         return False
     separators = {";", "&&", "||", "&", "|"}
+    if _depth < 8:
+        wrappers = {"sh", "bash", "dash", "zsh", "ksh", "fish", "cmd", "powershell", "pwsh"}
+        command_flags = {"-c", "-lc", "/c", "-command"}
+        for index, part in enumerate(parts):
+            if Path(part).stem.lower() not in wrappers:
+                continue
+            end = next(
+                (i for i in range(index + 1, len(parts)) if parts[i] in separators),
+                len(parts),
+            )
+            for flag_index in range(index + 1, end - 1):
+                if parts[flag_index].lower() in command_flags:
+                    payload = " ".join(parts[flag_index + 1:end])
+                    if _hard_blocked_shell(payload, _depth + 1):
+                        return True
+                    break
     for index, part in enumerate(parts):
         if Path(part).stem.lower() != "git":
             continue
@@ -302,17 +318,17 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default") -
         return True
     if mode == "write_text" and path_zone == "no_prompt":
         return True
+    # readonly mode
+    if mode in ("read_text", "last_output", "python_eval", "plan"):
+        return True
+    if mode == "cron" and command == "list":
+        return True
+    if mode == "shell" and _readonly_shell(command):
+        return True
     # One-shot grant: allow one blocked tool through, then revert
     if _one_shot_grant:
         _one_shot_grant = False
         return True
-    # readonly mode
-    if mode in ("read_text", "last_output", "python_eval", "plan"):
-        return True
-    if mode == "cron":
-        return command == "list"
-    if mode == "shell":
-        return _readonly_shell(command)
     return False
 
 
@@ -1652,7 +1668,8 @@ def _exec_cron(args: dict) -> str:
         return "Cron scheduling is not available on Windows."
 
     def read_crontab():
-        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=20)
         return "" if result.returncode else result.stdout
 
     if action == "list":
@@ -1673,7 +1690,8 @@ def _exec_cron(args: dict) -> str:
                  f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
         current = read_crontab()
         payload = current + ("" if not current or current.endswith("\n") else "\n") + entry + "\n"
-        result = subprocess.run(["crontab", "-"], input=payload, capture_output=True, text=True)
+        result = subprocess.run(
+            ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20)
         return f"Scheduled: {schedule}" if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     if action == "remove":
@@ -1687,7 +1705,8 @@ def _exec_cron(args: dict) -> str:
         )
         if payload:
             payload += "\n"
-        result = subprocess.run(["crontab", "-"], input=payload, capture_output=True, text=True)
+        result = subprocess.run(
+            ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20)
         return "Removed." if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     return f"Unknown cron action '{action}'. Use list, add, or remove."
