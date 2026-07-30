@@ -269,6 +269,11 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     for index, part in enumerate(parts):
         if Path(part).stem.lower() != "git":
             continue
+        # Only treat `git` as a command when it sits in COMMAND position — the start
+        # of the string or right after a separator. Otherwise `echo git push` and
+        # `grep git push file` were blocked as if they were real git invocations.
+        if index and parts[index - 1] not in separators:
+            continue
         rest = parts[index + 1:]
         end = next((i for i, token in enumerate(rest) if token in separators), len(rest))
         segment = rest[:end]
@@ -689,6 +694,11 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         # comma-heavy, which collides with tools.txt's '|' field separator — so
         # these are normally set in config.txt as tool_filter.<name> etc., where
         # the value is everything after the first '='.
+        # host=1 runs a CURATED tool on the host instead of inside the sandbox.
+        # Only for tools whose command is fixed or built as structured argv (no shell
+        # interpolation of model input) and that need host binaries/credentials — the
+        # git tools. Never set this on execute_shell, which takes arbitrary commands.
+        "host": g("host", "tool_host"),
         "headers": g("headers", "tool_headers"),
         "body": g("body", "tool_body"),
         "filter": g("filter", "tool_filter"),
@@ -1065,11 +1075,23 @@ def _structured_tool_argv(name: str, args: dict):
 
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     argv = _structured_tool_argv(name, args)
+    on_host = bool((TOOL_SPECS.get(name) or {}).get("host"))
+    runner = (lambda a: _exec_process(a, timeout=timeout)) if on_host else (
+        lambda a: _exec_sandbox_argv(a, timeout=timeout))
     if name == "git_commit":
-        staged = _exec_sandbox_argv(["git", "add", "-A"], timeout=timeout)
+        staged = runner(["git", "add", "-A"])
         if "exited with status" in staged or "timed out" in staged:
             return staged
-    return _exec_sandbox_argv(argv, timeout=timeout)
+    return _missing_binary_hint(argv[0] if argv else "", runner(argv))
+
+
+def _missing_binary_hint(program: str, result: str) -> str:
+    """Turn a bare 'not found' / status 127 into an actionable message. Without this a
+    missing binary inside the sandbox surfaced as an opaque `sh: 1: git: not found`."""
+    if program and ("not found" in result or "status 127" in result):
+        return (f"'{program}' is not available where this tool ran. "
+                f"Install {program}, or set host=1 for this tool if it needs host binaries.")
+    return result
 
 
 def _format_with_args(template: str, args: dict) -> str:
@@ -1782,6 +1804,11 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             target = resolve_user_path(write_path)
         except ValueError as exc:
             return f"Error: {exc}"
+        # Layer 1 applies to WRITES as well as reads. Without this a sensitive file
+        # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
+        # overwritten even though reading it is denied.
+        if _is_sensitive_path(str(target)):
+            return f"Error: Writing to sensitive file denied: {target}"
         path_zone = _check_path_zone(target)
         if path_zone == "blocked":
             return f"Error: Write path is blocked: {target}"
@@ -1878,6 +1905,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if _structured_tool_argv(name, args):
             return _exec_structured_tool(name, args, timeout)
         command = _format_with_args(spec.get("command") or "{command}", args)
+        if spec.get("host"):
+            return _missing_binary_hint(
+                command.split()[0] if command.split() else "",
+                _exec_process(command, timeout=timeout, shell=True))
         return _exec_shell_command(command, timeout=timeout)
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"

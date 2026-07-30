@@ -38,11 +38,26 @@ def _install_fake_inquirer(monkeypatch, fake):
     monkeypatch.setitem(sys.modules, "InquirerPy", types.SimpleNamespace(inquirer=fake))
 
 
-def test_packaged_config_matches_repository_default():
+def test_data_files_are_not_duplicated_at_repo_root():
+    """Data files must live ONLY in src/agent8088/.
+
+    They used to be duplicated at the repo root, where nothing ever read them —
+    edits there silently did nothing. This guards against the copies returning.
+    """
     root = Path(__file__).resolve().parent.parent
-    assert (root / "config.txt").read_bytes() == (
-        root / "src" / "agent8088" / "config.txt"
-    ).read_bytes()
+    strays = [name for name in
+              ("tools.txt", "system.md", "config.txt", "agents", "skills_installed")
+              if (root / name).exists()]
+    assert not strays, (
+        f"these belong only in src/agent8088/, not the repo root: {strays}")
+
+
+def test_packaged_data_files_exist():
+    pkg = Path(__file__).resolve().parent.parent / "src" / "agent8088"
+    for name in ("tools.txt", "system.md", "config.txt"):
+        assert (pkg / name).is_file(), f"missing packaged data file: {name}"
+    for name in ("agents", "skills_installed"):
+        assert (pkg / name).is_dir(), f"missing packaged data dir: {name}"
 
 
 def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys):

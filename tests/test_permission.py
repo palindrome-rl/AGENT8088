@@ -2,14 +2,17 @@ import os, sys, json
 from contextlib import nullcontext
 from pathlib import Path
 
-os.environ['AGENT8088_CONFIG'] = str(Path('config.txt').resolve())
+# Data files live inside the package (that is what the engine loads and what ships
+# in the wheel) — never at the repo root.
+PKG = Path(__file__).resolve().parent.parent / "src" / "agent8088"
+os.environ['AGENT8088_CONFIG'] = str(PKG / 'config.txt')
 
 # Add src/ to path so `agent8088` package is importable, then load the engine module
 sys.path.insert(0, str(Path('src').resolve()))
 from agent8088 import engine as A
 
-# Load tools from local tools.txt
-A.TOOL_SPECS = A.load_tool_specs(Path('tools.txt'), A.APP_CONFIG)
+# Load the packaged tool specs
+A.TOOL_SPECS = A.load_tool_specs(PKG / 'tools.txt', A.APP_CONFIG)
 A.TOOL_NAMES = set(A.TOOL_SPECS.keys())
 
 def setup_function():
@@ -147,10 +150,16 @@ def test_file_path_alias_round_trips(tmp_path, monkeypatch):
     assert A.run_tool("read_text", {"filepath": str(target)}) == "hello"
 
 
-def test_run_tool_allows_read_in_readonly():
+def test_run_tool_allows_read_in_readonly(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "readonly"
-    # read_text on tools.txt should work
-    result = A.run_tool("read_text", {"filename": "tools.txt"})
+    # Use a fixture file rather than a real repo file, so the test does not depend
+    # on repo layout (and never reads anything outside its own tmp dir).
+    target = tmp_path / "sample.txt"
+    target.write_text("execute_shell|Execute a shell command\n")
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+
+    result = A.run_tool("read_text", {"filename": str(target)})
+
     assert "execute_shell" in result
 
 
@@ -283,8 +292,8 @@ def test_removed_escalation_tool_is_unknown():
     assert result == "Unknown tool: request_permission_escalation"
 
 def test_system_prompt_contains_security_instructions():
-    from pathlib import Path
-    sp = Path('system.md').read_text(encoding='utf-8')
+    # Assert against the PACKAGED system.md — that is what actually ships and loads.
+    sp = (PKG / 'system.md').read_text(encoding='utf-8')
     assert "Never try to fetch internal or private addresses" in sp
     assert "Security & Confidentiality" in sp
     assert "request_permission_escalation" not in sp

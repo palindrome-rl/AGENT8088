@@ -6,13 +6,13 @@ get_page_title|Fetch a webpage and extract its title|mode=http_get|args=url|url=
 calculate|Evaluate a mathematical expression|mode=python_eval|args=expression|expression={expression}|timeout=10
 last_output|Get full output from the last tool call|mode=last_output
 spawn_subagent|Delegate a self-contained task to an independent sub-agent that runs its own tool-using loop with fresh context and returns a concise summary. Use for multi-step research or search that would clutter the main context. Args: agent_type (e.g. general-purpose, explore), task (the full standalone instruction).|mode=subagent|args=agent_type,task|timeout=300
-git_status|Show git status and current branch for the working repo|mode=shell|command=git status --short --branch|timeout=20
-git_diff|Show the current git diff|mode=shell|command=git diff|timeout=20
-git_log|Show recent commit history|mode=shell|command=git log --oneline -20|timeout=20
-git_clone|Clone a repository into a directory|mode=shell|args=url,directory|command=git clone {url} {directory}|timeout=180
-git_commit|Stage all changes and commit with a message. Only use when the user asked you to commit.|mode=shell|args=message|command=git add -A && git commit -m "{message}"|timeout=30
-git_push|Push the current branch to origin. Only use when the user asked you to push.|mode=shell|command=git push origin HEAD|timeout=120
-git_create_pr|Open a pull request with the gh CLI. Only use when the user asked for a PR.|mode=shell|args=title,body|command=gh pr create --title "{title}" --body "{body}"|timeout=120
+git_status|Show git status and current branch for the working repo|mode=shell|command=git status --short --branch|timeout=20|host=1
+git_diff|Show the current git diff|mode=shell|command=git diff|timeout=20|host=1
+git_log|Show recent commit history|mode=shell|command=git log --oneline -20|timeout=20|host=1
+git_clone|Clone a repository into a directory|mode=shell|args=url,directory|command=git clone {url} {directory}|timeout=180|host=1
+git_commit|Stage all changes and commit with a message. Only use when the user asked you to commit.|mode=shell|args=message|command=git add -A && git commit -m "{message}"|timeout=30|host=1
+git_push|Push the current branch to origin. Only use when the user asked you to push.|mode=shell|command=git push origin HEAD|timeout=120|host=1
+git_create_pr|Open a pull request with the gh CLI. Only use when the user asked for a PR.|mode=shell|args=title,body|command=gh pr create --title "{title}" --body "{body}"|timeout=120|host=1
 schedule_task|Schedule this agent to run a task periodically, or list/remove schedules. action is list, add, or remove; schedule is 5 cron fields (e.g. "0 9 * * *"); task is the query to run.|mode=cron|args=action,schedule,task|timeout=20
 run_sandboxed|Run a Python snippet with native OS isolation and no network, using Docker only as a fallback. Use for untrusted or risky code instead of execute_shell.|mode=docker|args=code|timeout=90
 browse_page|Load a web page in a real headless browser and return its text. Handles JavaScript-rendered pages that curl cannot.|mode=browser|args=url|timeout=60
