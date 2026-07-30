@@ -342,6 +342,26 @@ _COMPACT_BANNER = r"""    _   ___ ___ _  _ _____ ___  __  ___  ___
  /_/ \_\___|___|_|\_| |_| \___/\__/\___/\___/
 """
 
+_PALINDROME_BLOCK_LOGO = """\
+   ▄▄████▄    ▄▄███▄▄
+ ▄████▀████▄▄████▀████▄
+███▀▀   ▀██████▀   ▀▀███
+████▄  ▄████████▄  ▄████
+████▀ ▀▀████████▀  ▀████
+███▄▄    ██████▄    ▄███
+▀▀████▄████▀▀████▄████▀▀
+   ▀▀████▀    ▀█████▀"""
+
+_PALINDROME_ASCII_LOGO = """\
+    ######     #####
+ ########### ##########
+####     ######     ####
+#####  ##########  #####
+#####  ##########  #####
+####     ######     ####
+ ########### ##########
+    ######    #######"""
+
 # The supplied Palindrome Research Labs PNG is rendered directly in classic mode.
 _PALINDROME_LOGO = APP_DIR / "assets" / "palindrome-research-labs.png"
 if not _PALINDROME_LOGO.is_file():
@@ -358,12 +378,17 @@ def _catalog(items, columns=4):
 
 def _palindrome_logo():
     """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
+    fallback = (
+        _PALINDROME_ASCII_LOGO
+        if console.legacy_windows or "utf" not in console.encoding.lower()
+        else _PALINDROME_BLOCK_LOGO
+    )
     if not _PALINDROME_LOGO.is_file():
-        return Text("▀" * 24)
+        return Text(fallback, style="bold #00C8FF")
     try:
         from PIL import Image
     except ImportError:
-        return Text("▀" * 24)
+        return Text(fallback, style="bold #00C8FF")
 
     image = Image.open(_PALINDROME_LOGO).convert("RGB")
     blue = image.getchannel("B")
@@ -418,6 +443,8 @@ def banner():
     backend = active_profile or "default"
 
     if console.width < 70:
+        console.print(_palindrome_logo(), justify="center")
+        console.print(Text("Palindrome Research Labs", style="bold #00edff"), justify="center")
         compact = Text()
         compact.append(f"{active_profile}:{A.MODEL_NAME}", style="bold #00edff")
         compact.append(f" · {len(_active_tool_specs())} tools · {len(_active_skills())} skills · /help", style="#237dd7")
