@@ -713,6 +713,7 @@ def cmd_help(_):
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [ornith|gemma]", "Show or switch the backend model"),
+        ("/models [provider|custom]", "Pick a provider model, or connect a custom endpoint"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
         ("/new <name>", "Create a named persistent session"),
@@ -1453,12 +1454,73 @@ def cmd_clear(_):
     cmd_reset("")
 
 
+def _openai_base_url(endpoint):
+    endpoint = endpoint.strip().rstrip("/")
+    suffix = "/chat/completions"
+    return endpoint[:-len(suffix)] if endpoint.endswith(suffix) else endpoint
+
+
+def _api_key_from_auth(auth):
+    auth = (auth or "").strip()
+    if auth.lower().startswith("authorization:"):
+        auth = auth.split(":", 1)[1].strip()
+    if auth.lower().startswith("bearer "):
+        auth = auth[7:].strip()
+    return auth or "none"
+
+
+def _custom_prompt(message, default="", secret=False):
+    try:
+        from InquirerPy import inquirer
+        prompt = inquirer.secret if secret else inquirer.text
+        kwargs = {"message": message}
+        if default:
+            kwargs["default"] = default
+        return prompt(**kwargs).execute()
+    except ImportError:
+        suffix = f" [{default}]" if default and not secret else ""
+        if secret:
+            import getpass
+            return getpass.getpass(f"{message}{suffix} ")
+        value = input(f"{message}{suffix} ").strip()
+        return value or default
+
+
+def _configure_custom_models_endpoint():
+    try:
+        endpoint = _custom_prompt("OpenAI-compatible URL:")
+        model = _custom_prompt("Model:")
+        auth = _custom_prompt("API key:", secret=True)
+    except EOFError:
+        console.print("[dim]Custom endpoint cancelled.[/dim]")
+        return
+    endpoint = _openai_base_url(endpoint)
+    model = model.strip()
+    if not endpoint or not model:
+        console.print("[red]URL and model are required.[/red]")
+        return
+    A.PROVIDERS["custom"] = {
+        "api_mode": "openai",
+        "base_url": endpoint,
+        "model": model,
+        "api_key": _api_key_from_auth(auth),
+    }
+    A.APP_CONFIG["provider.custom.base_url"] = endpoint
+    A.APP_CONFIG["provider.custom.model"] = model
+    A.client, A.MODEL_NAME = A.get_client("custom")
+    A.ACTIVE_PROVIDER = "custom"
+    console.print(f"[#237dd7]switched[/#237dd7] -> custom:{model} ({endpoint})")
+
+
 def cmd_models(rest):
     """List available models from the active provider (or a specified one).
-    Usage: /models [provider_name]"""
+    Usage: /models [provider_name|custom]"""
     from agent8088.providers import list_models, BUILTIN_PROVIDERS
-    from InquirerPy import inquirer
     provider_name = rest.strip()
+    if provider_name.lower() in {"custom", "selfhosted", "self-hosted"}:
+        _configure_custom_models_endpoint()
+        return
+    from InquirerPy import inquirer
     if not provider_name:
         provider_name = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "ollama")
     if not provider_name:
