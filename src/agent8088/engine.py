@@ -677,6 +677,14 @@ SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
 
 
 # ---------------------------------------------------------------------------
+# Last tool output store (model can fetch full output via last_output tool)
+# ---------------------------------------------------------------------------
+_last_tool_output = ""
+_last_tool_name = ""
+_last_write_diff = None
+
+
+# ---------------------------------------------------------------------------
 # Subagents — profiles loaded from agents/*.md (frontmatter + body prompt)
 # ---------------------------------------------------------------------------
 AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expanduser()
