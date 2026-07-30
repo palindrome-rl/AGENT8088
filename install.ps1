@@ -11,7 +11,7 @@
 
 param(
     [switch]$SkipSetup,
-    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
+    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "main" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = ""
 )
@@ -710,7 +710,7 @@ function Verify-Install {
     Write-Host ""
     Write-Success "Done. Run 'agent8088' to start."
     Write-Host "  Config: $Agent8088Home\config.txt"
-    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.ps1)"
+    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }
