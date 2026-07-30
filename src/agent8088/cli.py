@@ -1065,6 +1065,7 @@ def cmd_model(rest):
     arg = raw_arg.lower()
     if arg == "setup":
         configure_model_profile()
+        banner()
         return
     if not arg:
         if A.PROVIDERS:
@@ -1104,6 +1105,7 @@ def cmd_model(rest):
         return
     active = A.ACTIVE_PROVIDER or "default"
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
+    banner()
 
 
 def _fetch_models_for_provider(provider):
@@ -1157,6 +1159,7 @@ def cmd_models(rest):
     os.environ.pop("USE_GEMMA4", None)
     A.activate_model(provider, model)
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{provider}:{A.MODEL_NAME}[/#237dd7]")
+    banner()
 
 
 def save_model_profile(path, name, api_mode, model, base_url="", api_key_env=""):
@@ -1569,11 +1572,9 @@ def _configure_custom_models_endpoint():
         "model": model,
         "api_key": _api_key_from_auth(auth),
     }
-    A.APP_CONFIG["provider.custom.base_url"] = endpoint
-    A.APP_CONFIG["provider.custom.model"] = model
-    A.client, A.MODEL_NAME = A.get_client("custom")
-    A.ACTIVE_PROVIDER = "custom"
+    A.activate_model("custom", model)
     console.print(f"[#237dd7]switched[/#237dd7] -> custom:{model} ({endpoint})")
+    banner()
 
 
 COMMANDS = {

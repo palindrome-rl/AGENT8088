@@ -163,15 +163,18 @@ def test_model_command_prefers_configured_custom_provider(monkeypatch):
     monkeypatch.setattr(cli.A, "ACTIVE_PROVIDER", "")
     monkeypatch.setattr(cli.A, "MODEL_NAME", "")
     switched = {}
+    redrawn = []
     monkeypatch.setattr(
         cli.A,
         "activate_model",
         lambda provider, model="": switched.update(provider=provider, model=model),
     )
+    monkeypatch.setattr(cli, "banner", lambda: redrawn.append(True))
 
     cli.cmd_model("custom")
 
     assert switched == {"provider": "custom", "model": ""}
+    assert redrawn == [True]
 
 
 def test_list_models_can_disable_hardcoded_fallbacks(monkeypatch):
@@ -207,7 +210,14 @@ def test_models_custom_connects_openai_compatible_endpoint(monkeypatch):
         def get_client(cls, provider):
             return {"provider": provider}, cls.PROVIDERS[provider]["model"]
 
+        @classmethod
+        def activate_model(cls, provider, model=""):
+            cls.client, cls.MODEL_NAME = cls.get_client(provider)
+            cls.MODEL_NAME = model or cls.MODEL_NAME
+            cls.ACTIVE_PROVIDER = provider
+
     monkeypatch.setattr(cli, "A", FakeEngine)
+    monkeypatch.setattr(cli, "banner", lambda: None)
     cli.cmd_models("custom")
 
     assert FakeEngine.PROVIDERS["custom"] == {
@@ -239,7 +249,14 @@ def test_models_custom_works_without_inquirerpy(monkeypatch):
         def get_client(cls, provider):
             return {"provider": provider}, cls.PROVIDERS[provider]["model"]
 
+        @classmethod
+        def activate_model(cls, provider, model=""):
+            cls.client, cls.MODEL_NAME = cls.get_client(provider)
+            cls.MODEL_NAME = model or cls.MODEL_NAME
+            cls.ACTIVE_PROVIDER = provider
+
     monkeypatch.setattr(cli, "A", FakeEngine)
+    monkeypatch.setattr(cli, "banner", lambda: None)
     cli.cmd_models("custom")
 
     assert FakeEngine.PROVIDERS["custom"]["base_url"] == "http://127.0.0.1:8080/v1"

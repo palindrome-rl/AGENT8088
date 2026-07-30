@@ -34,6 +34,26 @@ def load_simple_config(path: Path) -> dict:
     return config
 
 
+def update_simple_config(path: Path, values: dict) -> None:
+    """Update key=value settings while preserving the rest of the config file."""
+    path = Path(path)
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    for key, raw_value in values.items():
+        value = str(raw_value)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", key) or "\n" in value or "\r" in value:
+            raise ValueError(f"Invalid config value for {key!r}")
+        line = f"{key}={value}"
+        pattern = rf"^{re.escape(key)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, lambda _: line, content, flags=re.MULTILINE)
+        else:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += line + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
 CONFIG_PATH = Path(os.environ.get("AGENT8088_CONFIG", str(APP_DIR / "config.txt"))).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
 
@@ -315,14 +335,37 @@ client, MODEL_NAME = get_client()
 
 
 def activate_model(provider: str = "", model: str = ""):
-    """Select a configured provider and optional model for the current session."""
-    global client, MODEL_NAME, ACTIVE_PROVIDER
+    """Select and persist a configured provider and optional model."""
+    global client, MODEL_NAME, ACTIVE_PROVIDER, DEFAULT_PROVIDER
     if provider:
-        client, default_model = get_client(provider)
+        if provider not in PROVIDERS:
+            raise ValueError(f"Unknown provider: {provider}")
+        next_client, default_model = get_client(provider)
+        selected_model = (model or default_model).strip()
+        if not selected_model:
+            raise ValueError("A model is required")
+        settings = {
+            "default_provider": provider,
+            f"provider.{provider}.model": selected_model,
+        }
+        for field in ("api_mode", "base_url", "api_key", "api_key_env"):
+            value = PROVIDERS[provider].get(field)
+            if value:
+                settings[f"provider.{provider}.{field}"] = value
+        update_simple_config(CONFIG_PATH, settings)
+        APP_CONFIG.update(settings)
+        PROVIDERS[provider]["model"] = selected_model
+        client = next_client
         ACTIVE_PROVIDER = provider
-        MODEL_NAME = model or default_model
+        DEFAULT_PROVIDER = provider
+        MODEL_NAME = selected_model
     elif model:
-        MODEL_NAME = model
+        selected_model = model.strip()
+        if not selected_model:
+            raise ValueError("A model is required")
+        update_simple_config(CONFIG_PATH, {"model_name": selected_model})
+        APP_CONFIG["model_name"] = selected_model
+        MODEL_NAME = selected_model
     return client, MODEL_NAME
 
 

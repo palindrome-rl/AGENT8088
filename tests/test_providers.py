@@ -87,6 +87,30 @@ def test_get_client_env_var_selects_provider(engine, monkeypatch):
     assert model == "env-1"
 
 
+def test_activate_model_persists_new_default(engine, tmp_path, monkeypatch):
+    config = tmp_path / "config.txt"
+    config.write_text("allowed_paths=~\ndefault_provider=ollama\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "CONFIG_PATH", config)
+    monkeypatch.setattr(engine, "APP_CONFIG", engine.load_simple_config(config))
+    monkeypatch.setattr(engine, "PROVIDERS", {
+        "custom": {
+            "api_mode": "openai",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "model": "old-model",
+            "api_key": "sk-local",
+        },
+    })
+
+    engine.activate_model("custom", "ornith-1.0-35b")
+
+    restarted = engine.load_simple_config(config)
+    assert restarted["default_provider"] == "custom"
+    assert restarted["provider.custom.model"] == "ornith-1.0-35b"
+    assert restarted["provider.custom.base_url"] == "http://127.0.0.1:8080/v1"
+    assert restarted["provider.custom.api_key"] == "sk-local"
+    assert engine.load_providers(restarted)["custom"]["model"] == "ornith-1.0-35b"
+
+
 def test_provider_api_keys_are_redacted(engine, monkeypatch):
     # A provider key in config must be masked in any output, like the flat api_key.
     cfg = dict(engine.APP_CONFIG)
