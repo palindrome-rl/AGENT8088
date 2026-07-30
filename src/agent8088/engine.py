@@ -100,6 +100,7 @@ ALLOWED_PATHS = [
 # ---------------------------------------------------------------------------
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
 _one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
+_one_shot_grant_mode = ""  # the mode the grant applies to (write_text, shell, etc.)
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -191,12 +192,15 @@ READONLY_SAFE_COMMANDS = frozenset([
 
 def check_permission(mode: str, command: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
-    global _one_shot_grant
+    global _one_shot_grant, _one_shot_grant_mode
     if PERMISSION_MODE == "edit":
         return True
-    # One-shot grant: allow one blocked tool through, then revert
-    if _one_shot_grant:
+    # One-shot grant: allow one blocked tool through, but only for the mode
+    # that was originally blocked (so a write_text grant isn't consumed by
+    # a shell command the model tries instead)
+    if _one_shot_grant and (not _one_shot_grant_mode or _one_shot_grant_mode == mode):
         _one_shot_grant = False
+        _one_shot_grant_mode = ""
         return True
     # readonly mode
     if mode in ("read_text", "last_output", "python_eval", "plan"):
@@ -221,11 +225,13 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
     )
 
 
-def grant_escalation():
+def grant_escalation(mode: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
-    The user is prompted for every write/mutation ÔÇö no session-wide grants."""
-    global _one_shot_grant
+    If mode is given, the grant only applies to that mode (so a write_text
+    grant isn't consumed by a shell command)."""
+    global _one_shot_grant, _one_shot_grant_mode
     _one_shot_grant = True
+    _one_shot_grant_mode = mode
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
@@ -1137,7 +1143,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         paths_str = ""
         if mode == "write_text":
             path_arg = spec.get("path_arg") or "filename"
-            fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
+            fn = (args.get(path_arg) or args.get("filename") or args.get("file")
+                  or args.get("file_path") or args.get("filepath") or args.get("path") or "")
             paths_str = fn or "unknown"
         elif mode == "shell":
             paths_str = command[:80]

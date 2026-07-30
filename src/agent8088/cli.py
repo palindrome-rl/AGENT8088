@@ -582,7 +582,9 @@ def _handle_escalation(result_text, messages=None, live=None):
     except (EOFError, KeyboardInterrupt):
         response = "n"
     if response in ("y", "yes"):
-        A.grant_escalation()
+        # Map change_type to the mode the grant applies to
+        grant_mode = "write_text" if change_type == "new_file" else "shell"
+        A.grant_escalation(grant_mode)
         console.print("[green]Approved for this action only. Next write will ask again.[/green]")
         if messages is not None:
             messages.append({"role": "user", "content":
