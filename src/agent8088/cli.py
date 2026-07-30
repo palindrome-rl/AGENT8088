@@ -582,11 +582,12 @@ def _handle_escalation(result_text, messages=None, live=None):
     except (EOFError, KeyboardInterrupt):
         response = "n"
     if response in ("y", "yes"):
-        # Map change_type to the mode the grant applies to
-        grant_mode = "write_text" if change_type == "new_file" else "shell"
-        grant_path = paths if paths and paths != "unknown" else ""
-        A.grant_escalation(grant_mode, grant_path)
-        console.print("[green]Approved for this action. The agent will retry now.[/green]")
+        # Grant both write_text AND shell for this turn — the user approved
+        # a filesystem action, so both modes should pass without re-prompting
+        # regardless of which tool the model retries with.
+        A.grant_escalation("write_text", paths if paths and paths != "unknown" else "")
+        A.grant_escalation("shell")
+        console.print("[green]Approved. The agent will retry now.[/green]")
         if messages is not None:
             messages.append({"role": "user", "content":
                 "Permission granted. Call write_file again with the SAME arguments right now. "
