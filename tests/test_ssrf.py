@@ -31,6 +31,12 @@ def test_http_get_mode_is_blocked(engine, monkeypatch):
     assert "Blocked" in out
 
 
+def test_page_title_tool_is_ssrf_guarded(engine):
+    out = engine.run_tool("get_page_title", {"url": "http://169.254.169.254/latest/meta-data/"})
+
+    assert "Blocked" in out
+
+
 def test_allow_private_opt_out(engine, monkeypatch):
     # Environments with a trusted LAN service (e.g. SearXNG) can opt out.
     monkeypatch.setattr(engine, "SSRF_ALLOW_PRIVATE", True)

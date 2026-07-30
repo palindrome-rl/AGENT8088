@@ -314,6 +314,8 @@ def _catalog(items, columns=4):
 
 def _palindrome_logo():
     """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
+    if not _PALINDROME_LOGO.is_file():
+        return Text("▀" * 24)
     try:
         from PIL import Image
     except ImportError:

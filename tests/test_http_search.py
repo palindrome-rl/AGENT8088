@@ -32,6 +32,22 @@ def test_http_get_applies_jq_filter(engine, monkeypatch):
     assert "curl -s" in seen["cmd"]
 
 
+def test_http_get_extracts_html_title(engine, monkeypatch):
+    monkeypatch.setattr(
+        engine,
+        "_exec_shell_command",
+        lambda command, timeout=25: "<html><title> Agent  8088 </title></html>",
+    )
+    spec = {
+        "name": "get_page_title",
+        "mode": "http_get",
+        "url": "https://example.com",
+        "extract": "title",
+    }
+
+    assert engine._exec_http("http_get", spec, {}, 10) == "Agent 8088"
+
+
 def test_http_post_sends_body_and_headers(engine, monkeypatch):
     seen = {}
 

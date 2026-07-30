@@ -175,7 +175,6 @@ READONLY_SAFE_COMMANDS = frozenset([
     "tasklist", "systeminfo", "wmic",
     # Cross-platform
     "git", "python", "pip", "node", "npm",
-    "curl", "wget",
 ])
 
 
@@ -468,6 +467,7 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "headers": g("headers", "tool_headers"),
         "body": g("body", "tool_body"),
         "filter": g("filter", "tool_filter"),
+        "extract": g("extract", "tool_extract"),
         "expression": g("expression", "tool_expression"),
         "path_arg": g("path_arg", "tool_path_arg", "filename"),
         "content_arg": g("content_arg", "tool_content_arg", "content"),
@@ -901,6 +901,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
       body={...}       POST body (http_post only)
       filter=<jq>      jq expression applied to the response — keeps noisy API
                        JSON (e.g. SearXNG's engines/positions/score metadata) out
+      extract=title    return only an HTML page's title
                        of the model's context
 
     Kept as a tool MODE rather than a shell one-liner so the SSRF guard still
@@ -960,6 +961,9 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
         host = urllib.parse.urlparse(url).netloc or url
         return (f"No response from {host} — the endpoint is unreachable or returned "
                 f"nothing. This is a connectivity/config problem, not an empty result set.")
+    if spec.get("extract") == "title":
+        match = re.search(r"<title[^>]*>(.*?)</title>", result, re.IGNORECASE | re.DOTALL)
+        return re.sub(r"\s+", " ", match.group(1)).strip() if match else "No title"
     return result
 
 

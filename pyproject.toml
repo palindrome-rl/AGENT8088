@@ -18,3 +18,6 @@ agent8088 = "agent8088.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent8088"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"assets/palindrome-research-labs.png" = "agent8088/assets/palindrome-research-labs.png"

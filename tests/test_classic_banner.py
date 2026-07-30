@@ -27,6 +27,12 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     assert classic._catalog(["delta", "alpha"], columns=1) == "alpha\ndelta"
 
 
+def test_palindrome_logo_falls_back_when_asset_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
+
+    assert classic._palindrome_logo().plain == "▀" * 24
+
+
 def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
     monkeypatch.setattr(classic, "console", Console(file=io.StringIO(), width=79, color_system=None))
 
