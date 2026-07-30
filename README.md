@@ -17,7 +17,7 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 
 ### Key Features
 
-- **One-line install** — Hermes-style installer for macOS, Linux, Windows
+- **One-line install** —  for macOS, Linux, Windows
 - **13 model providers** — Ollama, OpenRouter, OpenAI, Anthropic, Gemini, Cerebras, DeepSeek, Groq, Mistral, Moonshot, Qwen, Ollama Cloud, GitHub Copilot
 - **Interactive model picker** — fuzzy searchable provider + model selection (InquirerPy)
 - **Fallback chains** — automatically switches to backup provider on 429/503 errors
