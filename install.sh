@@ -29,7 +29,7 @@ export UV_NO_CONFIG=1
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/tayyabimam1/AGENT8088.git"
-REPO_BRANCH="${AGENT8088_BRANCH:-development}"
+REPO_BRANCH="${AGENT8088_BRANCH:-main}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
@@ -757,7 +757,7 @@ verify_install() {
     echo ""
     echo -e "\033[0;32mDone.\033[0m  Run \033[1magent8088\033[0m to start."
     echo "  Config: $AGENT8088_HOME/config.txt"
-    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.sh | bash"
+    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
 }
