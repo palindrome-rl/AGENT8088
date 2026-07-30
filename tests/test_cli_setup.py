@@ -177,6 +177,23 @@ def test_model_command_prefers_configured_custom_provider(monkeypatch):
     assert redrawn == [True]
 
 
+def test_model_command_supports_space_separated_switch(monkeypatch):
+    monkeypatch.setattr(cli.A, "PROVIDERS", {"openai": {"model": "gpt-old"}})
+    monkeypatch.setattr(cli.A, "ACTIVE_PROVIDER", "openai")
+    monkeypatch.setattr(cli.A, "MODEL_NAME", "gpt-old")
+    switched = {}
+    monkeypatch.setattr(
+        cli.A,
+        "activate_model",
+        lambda provider, model="": switched.update(provider=provider, model=model),
+    )
+    monkeypatch.setattr(cli, "banner", lambda: None)
+
+    cli.cmd_model("openai gpt-new")
+
+    assert switched == {"provider": "openai", "model": "gpt-new"}
+
+
 def test_list_models_can_disable_hardcoded_fallbacks(monkeypatch):
     monkeypatch.setattr(providers, "_load_disk_cache", lambda: {})
     monkeypatch.setattr(providers, "_save_disk_cache", lambda data: None)

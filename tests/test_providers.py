@@ -36,6 +36,54 @@ def test_get_client_for_named_provider(engine, monkeypatch):
     assert "acme.test" in str(client.base_url)
 
 
+def test_configured_api_key_wins_over_adapter_environment_key(engine, monkeypatch):
+    monkeypatch.setenv("ACME_API_KEY", "environment-key")
+
+    assert engine._provider_api_key({
+        "api_key": "configured-key",
+        "api_key_env": "ACME_API_KEY",
+    }) == "configured-key"
+
+
+def test_all_builtin_adapters_accept_configured_api_keys(engine, monkeypatch):
+    from agent8088.providers import BUILTIN_PROVIDERS
+
+    config = {}
+    for name in BUILTIN_PROVIDERS:
+        config[f"provider.{name}.api_key"] = f"key-{name}"
+        config[f"provider.{name}.model"] = f"model-{name}"
+    monkeypatch.setattr(engine, "PROVIDERS", engine.load_providers(config, include_builtins=True))
+
+    for name in BUILTIN_PROVIDERS:
+        client, model = engine.get_client(name)
+        assert client.api_key == f"key-{name}"
+        assert model == f"model-{name}"
+
+
+def test_openai_compatible_adapter_uses_active_model(engine, monkeypatch):
+    calls = []
+    response = type("Response", (), {"choices": []})()
+
+    class Completions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            return response
+
+    client = type("Client", (), {
+        "chat": type("Chat", (), {"completions": Completions()})(),
+    })()
+    monkeypatch.setattr(engine, "MODEL_NAME", "adapter-model")
+
+    assert engine.create_completion(
+        client,
+        [{"role": "user", "content": "hello"}],
+        [],
+    ) is response
+    assert calls[0]["model"] == "adapter-model"
+    assert calls[0]["messages"][-1] == {"role": "user", "content": "hello"}
+
+
 def test_get_client_for_litellm_provider_uses_environment_key(engine, monkeypatch):
     monkeypatch.setattr(engine, "PROVIDERS", {
         "claude": {"api_mode": "litellm", "model": "anthropic/claude", "api_key_env": "ANTHROPIC_API_KEY"}})

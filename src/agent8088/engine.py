@@ -54,7 +54,17 @@ def update_simple_config(path: Path, values: dict) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-CONFIG_PATH = Path(os.environ.get("AGENT8088_CONFIG", str(APP_DIR / "config.txt"))).expanduser()
+# Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
+_user_config = Path.home() / ".agent8088" / "config.txt"
+_win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
+if os.environ.get("AGENT8088_CONFIG"):
+    CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+elif _user_config.exists():
+    CONFIG_PATH = _user_config
+elif _win_config.exists():
+    CONFIG_PATH = _win_config
+else:
+    CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
 
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
@@ -230,7 +240,7 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
 
 def grant_escalation():
     """Allow exactly one blocked tool call to run, then revert to readonly.
-    The user is prompted for every write/mutation ÔÇö no session-wide grants."""
+    The user is prompted for every write/mutation - no session-wide grants."""
     global _one_shot_grant
     _one_shot_grant = True
 
@@ -256,7 +266,7 @@ BASE_SYSTEM_PROMPT = load_text(SYSTEM_FILE, DEFAULT_SYSTEM_PROMPT)
 # ---------------------------------------------------------------------------
 def load_providers(config: dict, include_builtins: bool = False) -> dict:
     """Parse `provider.<name>.<field>` keys from config into a registry.
-    Fields: model, api_mode, base_url, api_key_env. OpenAI mode needs a base URL;
+    Fields: model, api_mode, base_url, api_key, api_key_env. OpenAI mode needs a base URL;
     LiteLLM mode also supports native provider identifiers such as Anthropic and
     Gemini without one. Credentials should use api_key_env, not api_key."""
     provs = {}
@@ -294,9 +304,14 @@ ACTIVE_PROVIDER = ""
 
 
 def _provider_api_key(provider: dict) -> str:
-    """Resolve a provider key without requiring secrets in config files."""
+    """Resolve a provider key: direct api_key value first, then env var."""
+    direct = provider.get("api_key", "").strip()
+    if direct:
+        return direct
     env_name = provider.get("api_key_env", "").strip()
-    return os.environ.get(env_name, "") if env_name else provider.get("api_key", "")
+    if env_name:
+        return os.environ.get(env_name, "")
+    return ""
 
 
 def get_client(provider: str = None):
@@ -1130,6 +1145,12 @@ def _exec_cron(args: dict) -> str:
     return f"Unknown cron action '{action}'. Use list, add, or remove."
 
 
+def _tool_path(spec: dict, args: dict) -> str:
+    path_arg = spec.get("path_arg") or "filename"
+    return (args.get(path_arg) or args.get("filename") or args.get("file")
+            or args.get("file_path") or args.get("filepath") or args.get("path") or "")
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     spec = TOOL_SPECS.get(name)
     if not spec:
@@ -1140,8 +1161,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     if mode == "read_text":
-        path_arg = spec.get("path_arg") or "filename"
-        fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
+        fn = _tool_path(spec, args)
         if _is_sensitive_path(fn):
             return f"Error: Access to sensitive file denied: {fn}"
 
@@ -1160,21 +1180,23 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             )
         return _exec_http(mode, spec, args, timeout)
 
-    # --- Permission gate for write/shell (Layers 1+3) ---
+    # --- Permission gate for write/shell/docker (Layers 1+3) ---
     command = ""
+    write_path = ""
     if mode == "shell":
         command = _format_with_args(spec.get("command") or "{command}", args)
     elif mode == "write_text":
         command = "write_file"
+        write_path = _tool_path(spec, args)
 
-    if mode in ("write_text", "shell") and not check_permission(mode, command):
+    if mode in ("write_text", "shell", "docker") and not check_permission(mode, command):
         paths_str = ""
         if mode == "write_text":
-            path_arg = spec.get("path_arg") or "filename"
-            fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
-            paths_str = fn or "unknown"
+            paths_str = write_path or "unknown"
         elif mode == "shell":
             paths_str = command[:80]
+        elif mode == "docker":
+            paths_str = "sandboxed_code"
         change_type = "new_file" if mode == "write_text" else "filesystem_op"
         return request_escalation(
             target_mode="edit",
@@ -1206,17 +1228,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _exec_browser(args)
 
     if mode == "read_text":
-        path_arg = spec.get("path_arg") or "filename"
-        fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
-        return resolve_user_path(fn).read_text()
+        return resolve_user_path(_tool_path(spec, args)).read_text()
 
     if mode == "write_text":
         global _last_write_diff
-        path_arg = spec.get("path_arg") or "filename"
         content_arg = spec.get("content_arg") or "content"
-        fn = args.get(path_arg) or args.get("filename") or args.get("file") or args.get("path") or ""
         content = str(args.get(content_arg, ""))
-        target = resolve_user_path(fn)
+        target = resolve_user_path(_tool_path(spec, args))
         target.parent.mkdir(parents=True, exist_ok=True)
         old_content = target.read_text() if target.exists() else ""
         target.write_text(content)

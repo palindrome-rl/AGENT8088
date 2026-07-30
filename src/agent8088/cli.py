@@ -779,7 +779,7 @@ def cmd_help(_):
         ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
-        ("/model [provider[:model]|setup]", "Show/switch providers or add a provider"),
+        ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
         ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
@@ -1092,6 +1092,12 @@ def cmd_image(rest):
 def cmd_model(rest):
     raw_arg = rest.strip()
     arg = raw_arg.lower()
+    provider_ref, separator, model_ref = raw_arg.partition(":")
+    if not separator:
+        parts = raw_arg.split(None, 1)
+        if len(parts) == 2:
+            provider_ref, model_ref = parts
+            separator = " "
     if arg == "setup":
         configure_model_profile()
         banner()
@@ -1124,10 +1130,8 @@ def cmd_model(rest):
     elif arg in ("ornith", "custom", "default"):
         os.environ.pop("USE_GEMMA4", None)
         A.client, A.MODEL_NAME = A.get_client()
-    elif ":" in raw_arg and raw_arg.partition(":")[0].lower() in A.PROVIDERS:
-        provider, _, model = raw_arg.partition(":")
-        provider = provider.lower()
-        A.activate_model(provider, model)
+    elif separator and provider_ref.lower() in A.PROVIDERS:
+        A.activate_model(provider_ref.lower(), model_ref)
     else:
         console.print(f"[red]unknown provider[/red] '{arg}' — known: "
                       + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))

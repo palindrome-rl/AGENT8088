@@ -64,6 +64,18 @@ def test_run_tool_allows_write_in_edit(tmp_path, monkeypatch):
     result = A.run_tool("write_file", {"filename": str(target), "content": "hello"})
     assert "Wrote" in result
 
+
+def test_file_path_alias_round_trips(tmp_path, monkeypatch):
+    A.PERMISSION_MODE = "edit"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    target = tmp_path / "alias.txt"
+
+    result = A.run_tool("write_file", {"file_path": str(target), "content": "hello"})
+
+    assert "Wrote" in result
+    assert A.run_tool("read_text", {"filepath": str(target)}) == "hello"
+
+
 def test_run_tool_allows_read_in_readonly():
     A.PERMISSION_MODE = "readonly"
     # read_text on tools.txt should work
