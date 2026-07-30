@@ -139,6 +139,11 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     assert "provider.localai.base_url=https://llm.example.test/v1" in saved
     assert "provider.localai.model=custom-model" in saved
     assert "provider.localai.api_key=secret-key" in saved
+    custom_prompts = [
+        kwargs for kind, kwargs in fake.calls
+        if kind == "text" and kwargs["message"] in {"Custom provider name:", "OpenAI-compatible URL:"}
+    ]
+    assert all("default" not in kwargs and "instruction" not in kwargs for kwargs in custom_prompts)
 
 
 def test_model_setup_works_without_inquirerpy(tmp_path, monkeypatch):
