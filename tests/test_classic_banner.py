@@ -14,10 +14,10 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
 
     rendered = output.getvalue()
     assert "AGENT8088" in rendered
-    assert "ÔûêÔûêÔûêÔûêÔûêÔòù  ÔûêÔûêÔûêÔûêÔûêÔûêÔòù" in rendered
+    assert "█████╗  ██████╗" in rendered
     assert classic._PALINDROME_LOGO.is_file()
     logo = classic._palindrome_logo().plain
-    assert "ÔûÇ" in logo
+    assert "▀" in logo
     assert max(map(len, logo.splitlines())) == 24
     assert len(classic._classic_masthead().spans) == 6
     assert "Palindrome" in rendered
@@ -32,16 +32,16 @@ def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
 
     assert "/_\\ / __| __|" in classic._classic_masthead().plain
     monkeypatch.setattr(classic, "console", Console(file=io.StringIO(), width=80, color_system=None))
-    assert "ÔûêÔûêÔûêÔûêÔûêÔòù  ÔûêÔûêÔûêÔûêÔûêÔûêÔòù" in classic._classic_masthead().plain
+    assert "█████╗  ██████╗" in classic._classic_masthead().plain
 
 
 def test_command_suggestions_cover_slash_and_bare_prefixes():
     assert "/help" in classic._command_matches("/")
     assert "/quit" in classic._command_matches("/")
-    assert classic._command_matches("m", slash=False) == ["maxturns", "model"]
+    assert classic._command_matches("m", slash=False) == ["maxturns", "model", "models"]
     assert classic._live_matches("/")[1] == classic._command_matches("/")
-    assert classic._live_matches("/m")[1] == ["/maxturns", "/model"]
-    assert classic._live_matches("m") == ("m", ["maxturns", "model"])
+    assert classic._live_matches("/m")[1] == ["/maxturns", "/model", "/models"]
+    assert classic._live_matches("m") == ("m", ["maxturns", "model", "models"])
 
 
 def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):
@@ -107,6 +107,7 @@ def test_masthead_uses_one_line_mode_on_very_narrow_terminals(monkeypatch):
 def test_trace_save_exports_full_conversation(tmp_path, monkeypatch):
     output = io.StringIO()
     monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
+    monkeypatch.setattr(classic, "SESSIONS_DIR", tmp_path / "sessions")
     monkeypatch.setattr(classic.S, "name", "trace_demo")
     monkeypatch.setattr(classic.S, "messages", [{"role": "user", "content": "hello"}])
     monkeypatch.setattr(classic.S, "conversation_trace", [])

@@ -11,7 +11,7 @@
 
 param(
     [switch]$SkipSetup,
-    [string]$Branch = "development",
+    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = ""
 )
@@ -397,13 +397,10 @@ function Clone-Repo {
                 Write-Info "Local changes detected, stashing before update..."
                 & git -c windows.appendAtomically=false stash push --include-untracked -m "agent8088-install-autostash" 2>$null | Out-Null
             }
-            & git -c windows.appendAtomically=false remote set-branches origin $Branch 2>$null
-            & git -c windows.appendAtomically=false fetch origin $Branch 2>$null
-            & git -c windows.appendAtomically=false checkout $Branch 2>$null
-            if (-not (& git -c windows.appendAtomically=false pull --ff-only origin $Branch 2>$null)) {
-                Write-Warn "Fast-forward not possible; resetting to origin/$Branch..."
-                & git -c windows.appendAtomically=false reset --hard "origin/$Branch" 2>$null
-            }
+            & git -c windows.appendAtomically=false remote set-url origin $RepoUrl 2>$null
+            & git -c windows.appendAtomically=false fetch --depth 1 origin $Branch 2>$null
+            & git -c windows.appendAtomically=false checkout -B $Branch FETCH_HEAD 2>$null
+            & git -c windows.appendAtomically=false reset --hard FETCH_HEAD 2>$null
         } finally {
             Pop-Location
         }
@@ -437,7 +434,9 @@ function Clone-Repo {
         }
         $script:FreshInstall = $true
     }
-    Write-Success "Repository ready at $InstallDir"
+    $installedCommit = (& git -C $InstallDir rev-parse --short HEAD 2>$null)
+    if (-not $installedCommit) { $installedCommit = "unknown" }
+    Write-Success "Repository ready at $InstallDir ($Branch@$installedCommit)"
 }
 
 # ----------------------------------------------------------------------------
@@ -454,7 +453,7 @@ function Install-Deps {
         $ErrorActionPreference = "Continue"
         & $script:UvCmd venv $venvDir 2>&1 | Out-Null
         if (-not (Test-Path $py)) { throw "venv creation failed: $py not found" }
-        & $script:UvCmd pip install --python $py -e $InstallDir 2>&1 | Out-Null
+        & $script:UvCmd pip install --python $py --reinstall-package agent8088 -e $InstallDir 2>&1 | Out-Null
         $exit = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
         if ($exit -ne 0) {
@@ -711,7 +710,7 @@ function Verify-Install {
     Write-Host ""
     Write-Success "Done. Run 'agent8088' to start."
     Write-Host "  Config: $Agent8088Home\config.txt"
-    Write-Host "  Update: cd $InstallDir; git pull; uv pip install --python venv\Scripts\python.exe -e ."
+    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }

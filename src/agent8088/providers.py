@@ -20,6 +20,8 @@ BUILTIN_PROVIDERS = {
     "copilot":      {"label": "GitHub Copilot", "base_url": "https://api.githubcopilot.com", "api_key_env": "GH_TOKEN", "default_model": "gpt-4o-mini"},
 }
 
+def default_provider_name():
+    return "ollama"
 FALLBACK_MODELS = {
     "ollama":       ["qwen14b-tooluse-v3", "llama3.3", "qwen2.5-coder:32b"],
     "openrouter":   ["anthropic/claude-sonnet-4", "openrouter/auto", "openai/gpt-4o"],

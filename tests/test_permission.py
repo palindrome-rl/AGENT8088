@@ -11,8 +11,11 @@ from agent8088 import engine as A
 A.TOOL_SPECS = A.load_tool_specs(Path('tools.txt'), A.APP_CONFIG)
 A.TOOL_NAMES = set(A.TOOL_SPECS.keys())
 
+def setup_function():
+    A.PERMISSION_MODE = "readonly"
+    A._one_shot_grant = False
+
 def test_permission_mode_defaults_to_readonly():
-    A.PERMISSION_MODE = "readonly"  # reset
     assert A.PERMISSION_MODE == "readonly"
 
 def test_check_permission_blocks_write_in_readonly():
@@ -23,7 +26,7 @@ def test_check_permission_blocks_write_in_readonly():
 def test_check_permission_allows_read_in_readonly():
     A.PERMISSION_MODE = "readonly"
     assert A.check_permission("read_text") is True
-    assert A.check_permission("http_get") is True
+    assert A.check_permission("http_get") is False
     assert A.check_permission("last_output") is True
 
 def test_check_permission_allows_all_in_edit():
@@ -43,25 +46,23 @@ def test_escalation_request_returns_structured_message():
     assert "edit" in result
     assert "test.txt" in result
 
-def test_escalation_granted_sets_edit_mode():
-    A.PERMISSION_MODE = "readonly"
+def test_escalation_grants_one_blocked_action():
     A.grant_escalation()
-    assert A.PERMISSION_MODE == "edit"
-    A.PERMISSION_MODE = "readonly"  # cleanup
+    assert A.PERMISSION_MODE == "readonly"
+    assert A.check_permission("write_text") is True
+    assert A.check_permission("write_text") is False
 
 def test_run_tool_blocks_write_in_readonly():
     A.PERMISSION_MODE = "readonly"
     result = A.run_tool("write_file", {"filename": "/tmp/test_perm.txt", "content": "hello"})
     assert "ESCALATION_REQUEST" in result
 
-def test_run_tool_allows_write_in_edit():
+def test_run_tool_allows_write_in_edit(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "edit"
-    import tempfile, os
-    tmp = os.path.join(tempfile.gettempdir(), "test_perm_edit.txt")
-    result = A.run_tool("write_file", {"filename": tmp, "content": "hello"})
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    target = tmp_path / "test_perm_edit.txt"
+    result = A.run_tool("write_file", {"filename": str(target), "content": "hello"})
     assert "Wrote" in result
-    os.unlink(tmp)
-    A.PERMISSION_MODE = "readonly"  # cleanup
 
 def test_run_tool_allows_read_in_readonly():
     A.PERMISSION_MODE = "readonly"
@@ -79,27 +80,24 @@ def test_run_tool_allows_safe_shell_in_readonly():
     result = A.run_tool("execute_shell", {"command": "ls"})
     assert "ESCALATION_REQUEST" not in result
 
-def test_escalation_tool_in_tool_names():
-    assert "request_permission_escalation" in A.TOOL_NAMES
+def test_escalation_tool_is_not_model_callable():
+    assert "request_permission_escalation" not in A.TOOL_NAMES
 
-def test_escalation_tool_returns_request():
-    A.PERMISSION_MODE = "readonly"
+def test_removed_escalation_tool_is_unknown():
     result = A.exec_tool("request_permission_escalation", json.dumps({
         "target_mode": "edit",
         "paths": "/tmp/test.txt",
         "change_type": "new_file",
         "reason": "Need to write test.txt"
     }))
-    assert "ESCALATION_REQUEST" in result
+    assert result == "Unknown tool: request_permission_escalation"
 
-def test_system_prompt_contains_permission_instructions():
+def test_system_prompt_contains_security_instructions():
     from pathlib import Path
     sp = Path('system.md').read_text(encoding='utf-8')
-    assert "PERMISSION_MODE" in sp
-    assert "readonly" in sp
-    assert "edit" in sp
-    assert "request_permission_escalation" in sp
-    assert "escalation" in sp.lower()
+    assert "Never try to fetch internal or private addresses" in sp
+    assert "Security & Confidentiality" in sp
+    assert "request_permission_escalation" not in sp
 
 def test_escalation_message_format():
     A.PERMISSION_MODE = "readonly"
@@ -112,13 +110,10 @@ def test_escalation_message_format():
     assert "/tmp/test.txt" in parts[3]
     assert "Write test.txt" in parts[4]
 
-def test_grant_escalation_persists():
-    A.PERMISSION_MODE = "readonly"
+def test_grant_escalation_does_not_persist():
     A.grant_escalation()
-    assert A.PERMISSION_MODE == "edit"
-    # Should persist (not auto-revert)
-    assert A.PERMISSION_MODE == "edit"
-    A.PERMISSION_MODE = "readonly"  # cleanup
+    assert A.check_permission("shell", "rm file") is True
+    assert A.check_permission("shell", "rm file") is False
 
 def test_env_var_sets_edit_mode():
     import importlib

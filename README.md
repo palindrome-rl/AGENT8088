@@ -38,12 +38,12 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 
 ** Ubuntu / Linux / macOS / WSL2 / Termux:**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.sh | bash
 ```
 
 **Windows (native PowerShell):**
 ```powershell
-iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)
+iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.ps1)
 ```
 
 The installer:
@@ -71,9 +71,9 @@ agent8088 --setup
 
 The wizard prompts for:
 1. **Working directory** — where the agent can read/write files (default: `~`)
-2. **Provider** — fuzzy search through 13 built-in providers (Ollama, OpenRouter, OpenAI, Anthropic, Gemini, Cerebras, DeepSeek, Groq, Mistral, Moonshot, Qwen, Ollama Cloud, GitHub Copilot)
-3. **API key** — for the selected provider
-4. **Model** — fetches the provider's available models via `/v1/models` and shows them in a fuzzy picker
+2. **Provider** — fuzzy search through 13 built-in providers, plus **Custom OpenAI-compatible**
+3. **API key** — hidden input for the selected provider
+4. **Model** — fetches the provider's available models via `/v1/models` and shows them in a fuzzy picker; custom providers ask for URL, model, and auth/API key
 5. **Web search URL** — optional SearXNG endpoint
 
 Or edit the config file directly:
@@ -132,7 +132,7 @@ Run with no flags to start the interactive REPL.
 | `/tool <name> <args>` | Invoke one tool directly |
 | `/plan <steps>` | Run the plan-executor (multi-step) |
 | `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
-| `/model <provider:model>` | Switch provider + model (e.g. `/model cerebras:gpt-oss-120b`) |
+| `/model <provider:model>` | Switch provider + model (e.g. `/model cerebras:gpt-oss-120b`); `/model setup` adds/updates a provider |
 | `/models [provider]` | Fuzzy searchable model picker — lists + switches models from active or specified provider |
 | `/config` | Show active config + config file path |
 | `/system` | Show the full system prompt |

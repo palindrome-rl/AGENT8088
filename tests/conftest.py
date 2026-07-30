@@ -1,5 +1,5 @@
 """Shared fixtures: load the agent8088 engine as a module."""
-import importlib.util
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -13,7 +13,7 @@ def _load_engine():
     os.environ["AGENT8088_CONFIG"] = str(ROOT / "_no_such_config.txt")
     sys.path.insert(0, str(ROOT / "src"))
     from agent8088 import engine as mod
-    return mod
+    return importlib.reload(mod)
 
 
 @pytest.fixture

@@ -300,6 +300,8 @@ _COMPACT_BANNER = r"""    _   ___ ___ _  _ _____ ___  __  ___  ___
 
 # The supplied Palindrome Research Labs PNG is rendered directly in classic mode.
 _PALINDROME_LOGO = APP_DIR / "assets" / "palindrome-research-labs.png"
+if not _PALINDROME_LOGO.is_file():
+    _PALINDROME_LOGO = APP_DIR.parent.parent / "assets" / "palindrome-research-labs.png"
 
 
 def _catalog(items, columns=4):
@@ -311,8 +313,42 @@ def _catalog(items, columns=4):
 
 
 def _palindrome_logo():
-    from rich.text import Text
-    return Text("")
+    """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return Text("▀" * 24)
+
+    image = Image.open(_PALINDROME_LOGO).convert("RGB")
+    blue = image.getchannel("B")
+    bounds = blue.point(lambda value: 255 if value > 24 else 0).getbbox()
+    image = image.crop(bounds) if bounds else image
+    height = max(2, round(image.height / image.width * 24))
+    height += height % 2
+    image = image.resize((24, height), Image.Resampling.LANCZOS)
+
+    logo = Text()
+    pixels = image.load()
+    for y in range(0, height, 2):
+        for x in range(image.width):
+            top, bottom = pixels[x, y], pixels[x, y + 1]
+            if max(*top, *bottom) < 12:
+                logo.append(" ")
+            elif max(*top) < 12:
+                logo.append("▄", style=f"rgb({bottom[0]},{bottom[1]},{bottom[2]})")
+            elif max(*bottom) < 12:
+                logo.append("▀", style=f"rgb({top[0]},{top[1]},{top[2]})")
+            else:
+                logo.append(
+                    "▀",
+                    style=(f"rgb({top[0]},{top[1]},{top[2]}) "
+                           f"on rgb({bottom[0]},{bottom[1]},{bottom[2]})"),
+                )
+        if y + 2 < height:
+            logo.append("\n")
+    return logo
+
+
 def _classic_masthead():
     """Mirror Hermes's layered ANSI Shadow logo with blue true-color bands."""
     masthead = Text()
@@ -712,8 +748,8 @@ def cmd_help(_):
         ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
-        ("/model [ornith|gemma]", "Show or switch the backend model"),
-        ("/models [provider|custom]", "Pick a provider model, or connect a custom endpoint"),
+        ("/model [provider[:model]|setup]", "Show/switch providers or add a provider"),
+        ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
         ("/new <name>", "Create a named persistent session"),
@@ -1026,7 +1062,7 @@ def cmd_model(rest):
     raw_arg = rest.strip()
     arg = raw_arg.lower()
     if arg == "setup":
-        console.print("[#237dd7]Run [bold]python agent8088_cli.py --model-setup[/bold] outside a chat session.[/#237dd7]")
+        configure_model_profile()
         return
     if not arg:
         if A.PROVIDERS:
@@ -1041,7 +1077,7 @@ def cmd_model(rest):
                 t.add_row(name, p.get("model", "—"), p.get("api_mode", "openai"), p.get("base_url", "—"))
             console.print(t)
         else:
-            console.print(f"[dim]No providers configured — run `python agent8088_cli.py --model-setup` "
+            console.print(f"[dim]No providers configured — run `/model setup` "
                           f"or add one to {A.CONFIG_PATH}[/dim]")
         active = A.ACTIVE_PROVIDER or "default"
         console.print(f"Active: [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]  ·  switch with "
@@ -1068,6 +1104,59 @@ def cmd_model(rest):
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
 
 
+def _fetch_models_for_provider(provider):
+    try:
+        from agent8088.providers import FALLBACK_MODELS, list_models
+        client, _ = A.get_client(provider)
+        if hasattr(client, "models"):
+            return list_models(provider, client=client, fallback=True)
+        return list(FALLBACK_MODELS.get(provider, []))
+    except Exception:
+        return []
+
+
+def cmd_models(rest):
+    """Interactive provider/model picker for switching models inside the REPL."""
+    provider = rest.strip().lower()
+    if provider in {"custom", "selfhosted", "self-hosted"}:
+        _configure_custom_models_endpoint()
+        return
+    try:
+        from InquirerPy import inquirer
+    except ImportError:
+        console.print("[red]InquirerPy is missing.[/red] Run the installer/update again.")
+        return
+    if not provider:
+        choices = sorted(A.PROVIDERS)
+        if not choices:
+            console.print(f"[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
+            return
+        kwargs = {"message": "Select provider:", "choices": choices, "max_height": "70%"}
+        active = A.ACTIVE_PROVIDER or A.APP_CONFIG.get("default_provider", "")
+        if active in choices:
+            kwargs["default"] = active
+        provider = inquirer.fuzzy(**kwargs).execute()
+    if provider not in A.PROVIDERS:
+        console.print(f"[red]unknown provider[/red] '{provider}' — known: "
+                      + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
+        return
+    models = _fetch_models_for_provider(provider)
+    if models:
+        kwargs = {"message": "Select model:", "choices": models, "max_height": "70%"}
+        current = A.PROVIDERS.get(provider, {}).get("model", "")
+        if current in models:
+            kwargs["default"] = current
+        model = inquirer.fuzzy(**kwargs).execute()
+    else:
+        model = inquirer.text(message="Model name:", default=A.PROVIDERS.get(provider, {}).get("model", "")).execute()
+    if not model:
+        console.print("[red]A model is required.[/red]")
+        return
+    os.environ.pop("USE_GEMMA4", None)
+    A.activate_model(provider, model)
+    console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{provider}:{A.MODEL_NAME}[/#237dd7]")
+
+
 def save_model_profile(path, name, api_mode, model, base_url="", api_key_env=""):
     """Append a safe provider profile; credentials stay in the environment."""
     fields = [
@@ -1084,35 +1173,8 @@ def save_model_profile(path, name, api_mode, model, base_url="", api_key_env="")
 
 
 def configure_model_profile():
-    """Hermes-style setup: configure a profile now, switch it with /model later."""
-    console.print(Panel(
-        "Profiles are saved to {}. API keys are read from an environment variable, never saved here.".format(A.CONFIG_PATH),
-        title="Model setup",
-        border_style="#00C8FF",
-    ))
-    try:
-        name = console.input("profile name › ").strip().lower()
-        api_mode = console.input("mode [litellm/openai] (litellm) › ").strip().lower() or "litellm"
-        model = console.input("model (for example anthropic/claude-sonnet-4-5-20250929) › ").strip()
-        base_url = console.input("base URL (optional for LiteLLM) › ").strip()
-        api_key_env = console.input("API-key environment variable (optional) › ").strip()
-    except EOFError:
-        console.print("[dim]Model setup cancelled.[/dim]")
-        return
-    if not name.replace("_", "").replace("-", "").isalnum():
-        console.print("[red]Profile names use letters, numbers, _ or -.[/red]")
-        return
-    if api_mode not in {"litellm", "openai"}:
-        console.print("[red]mode must be litellm or openai[/red]")
-        return
-    if not model:
-        console.print("[red]A model is required.[/red]")
-        return
-    if api_mode == "openai" and not base_url:
-        console.print("[red]An OpenAI-compatible profile needs a base URL.[/red]")
-        return
-    save_model_profile(A.CONFIG_PATH, name, api_mode, model, base_url, api_key_env)
-    console.print("[#237dd7]Saved {}. Restart the app, then run /model {}.[/#237dd7]".format(name, name))
+    """Configure a model profile from inside the running REPL."""
+    _run_setup(config_path=A.CONFIG_PATH, include_workspace=False, activate_runtime=True, heading="Model setup")
 
 
 def cmd_config(_):
@@ -1512,60 +1574,11 @@ def _configure_custom_models_endpoint():
     console.print(f"[#237dd7]switched[/#237dd7] -> custom:{model} ({endpoint})")
 
 
-def cmd_models(rest):
-    """List available models from the active provider (or a specified one).
-    Usage: /models [provider_name|custom]"""
-    from agent8088.providers import list_models, BUILTIN_PROVIDERS
-    provider_name = rest.strip()
-    if provider_name.lower() in {"custom", "selfhosted", "self-hosted"}:
-        _configure_custom_models_endpoint()
-        return
-    from InquirerPy import inquirer
-    if not provider_name:
-        provider_name = getattr(A, "ACTIVE_PROVIDER", "") or A.APP_CONFIG.get("default_provider", "ollama")
-    if not provider_name:
-        provider_name = "ollama"
-    # Get the API key from config or env
-    builtin = BUILTIN_PROVIDERS.get(provider_name, {})
-    base_url = builtin.get("base_url", A.APP_CONFIG.get(f"provider.{provider_name}.base_url", "http://localhost:11434/v1"))
-    api_key = (
-        A.APP_CONFIG.get(f"provider.{provider_name}.api_key", "")
-        or os.environ.get(builtin.get("api_key_env", ""), "")
-        or builtin.get("api_key", "ollama")
-    )
-    console.print(f"[#237dd7]Fetching models from {provider_name}...[/#237dd7]")
-    try:
-        from openai import OpenAI
-        fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
-        models = list_models(provider_name, client=fetch_client, fallback=False)
-    except Exception as e:
-        console.print(f"[red]Could not fetch models:[/red] {e}")
-        models = []
-    if not models:
-        console.print("[yellow]No models found.[/yellow]")
-        return
-    selected = inquirer.fuzzy(
-        message=f"Select a model from {provider_name}:",
-        choices=models,
-        max_height="70%",
-    ).execute()
-    if selected:
-        # Update the provider's model and switch
-        model_ref = f"{provider_name}:{selected}"
-        try:
-            A.client, A.MODEL_NAME = A.get_client(provider_name)
-            A.MODEL_NAME = selected
-            A.ACTIVE_PROVIDER = provider_name
-            console.print(f"[#237dd7]switched[/#237dd7] -> {selected}  ({model_ref})")
-        except Exception as e:
-            console.print(f"[red]error:[/red] {e}")
-
-
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
-    "skills": cmd_skills, "models": cmd_models,
-    "raw": cmd_raw, "model": cmd_model, "config": cmd_config, "system": cmd_system,
+    "skills": cmd_skills,
+    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
     "status": cmd_status, "doctor": cmd_doctor,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
@@ -1689,8 +1702,89 @@ def _install_completion():
 
 def _agent8088_home():
     """Find the agent8088 install home directory."""
-    return Path(os.environ.get("AGENT8088_HOME", os.path.join(
-        os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")), "agent8088")))
+    if os.environ.get("AGENT8088_HOME"):
+        return Path(os.environ["AGENT8088_HOME"]).expanduser()
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "agent8088"
+    return Path.home() / ".agent8088"
+
+
+def _agent8088_link_dir():
+    if os.environ.get("AGENT8088_LINK_DIR"):
+        return Path(os.environ["AGENT8088_LINK_DIR"]).expanduser()
+    if os.name == "nt":
+        return _agent8088_home() / "agent8088" / "venv" / "Scripts"
+    return Path.home() / ".local" / "bin"
+
+
+def _safe_uninstall_home(path):
+    target = path.expanduser().resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    root = Path(target.anchor).resolve(strict=False)
+    return target not in {root, home}
+
+
+def _remove_agent8088_shim(home):
+    name = "agent8088.exe" if os.name == "nt" else "agent8088"
+    shim = _agent8088_link_dir() / name
+    if not shim.exists() or shim.is_dir():
+        return False
+    try:
+        text = shim.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        text = ""
+    if str(home) not in text and "-m agent8088.cli" not in text:
+        return False
+    shim.unlink()
+    return True
+
+
+def _remove_agent8088_config_exports():
+    removed = 0
+    markers = ("AGENT8088_CONFIG",)
+    for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
+               Path.home() / ".bashrc", Path.home() / ".bash_profile",
+               Path.home() / ".profile"):
+        if not rc.exists() or not rc.is_file():
+            continue
+        lines = rc.read_text(encoding="utf-8", errors="ignore").splitlines()
+        kept = [line for line in lines if not any(marker in line for marker in markers)]
+        if kept != lines:
+            rc.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            removed += 1
+    return removed
+
+
+def _run_uninstall():
+    import shutil
+    home = _agent8088_home()
+    print(f"This will permanently remove Agent8088 from: {home}")
+    answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
+    if answer.strip() != "yes":
+        print("Uninstall cancelled.")
+        return False
+    if not _safe_uninstall_home(home):
+        print(f"Refusing to remove unsafe path: {home}")
+        return False
+    if home.exists():
+        shutil.rmtree(home)
+        print(f"Removed {home}")
+    else:
+        print(f"Install directory not found: {home}")
+    if _remove_agent8088_shim(home):
+        print("Removed agent8088 command shim.")
+    os.environ.pop("AGENT8088_CONFIG", None)
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE)
+        winreg.DeleteValue(k, "AGENT8088_CONFIG")
+        winreg.CloseKey(k)
+    except Exception:
+        pass
+    if os.name != "nt":
+        _remove_agent8088_config_exports()
+    print("Done. Open a NEW terminal for PATH to refresh.")
+    return True
 
 
 def _run_update():
@@ -1722,16 +1816,31 @@ def _run_update():
         print(r.stdout.strip() or "Already up to date.")
     print("Code updated. Changes take effect on next launch.")
     print(f"If dependencies changed, reinstall from a fresh terminal:")
-    print(f"  {uv_cmd} pip install --python {venv_python} -e {install_dir}")
+    print(f"  {uv_cmd} pip install --python {venv_python} --reinstall-package agent8088 -e {install_dir}")
 
 
-def _run_setup():
+CUSTOM_PROVIDER_CHOICE = "Custom OpenAI-compatible"
+
+
+def _valid_provider_name(name):
+    return bool(name) and name.replace("_", "").replace("-", "").isalnum()
+
+
+def _reload_model_runtime(config_path, provider="", model=""):
+    A.APP_CONFIG = A.load_simple_config(Path(config_path))
+    A.PROVIDERS = A.load_providers(A.APP_CONFIG, include_builtins=True)
+    A.DEFAULT_PROVIDER = A.APP_CONFIG.get("default_provider", "")
+    if provider:
+        A.activate_model(provider, model)
+
+
+def _run_setup(config_path=None, include_workspace=True, activate_runtime=False, heading="Agent8088 setup"):
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
     from InquirerPy import inquirer
     from agent8088 import providers as provider_registry
     home = _agent8088_home()
-    config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
         print(f"Config not found: {config_path}")
         print("Run the installer first.")
@@ -1745,96 +1854,102 @@ def _run_setup():
         if _re.search(pattern, text, _re.MULTILINE):
             return _re.sub(pattern, lambda _: f"{key}={value}", text, flags=_re.MULTILINE)
         return text + f"\n{key}={value}\n"
-    print("Agent8088 setup\n")
-    cur_paths = _current("allowed_paths") or "~"
-    paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
+    print(f"{heading}\n")
+    if include_workspace:
+        cur_paths = _current("allowed_paths") or "~"
+        paths = inquirer.text(message="Working directory:", default=cur_paths).execute()
+    else:
+        paths = ""
+
     builtin_names = provider_registry.builtin_provider_names()
-    provider_choices = [
-        {"name": provider_registry.builtin_provider_choice_label(name), "value": name}
-        for name in builtin_names
-    ]
-    provider_choices.append({"name": "Custom OpenAI-compatible", "value": "__custom__"})
-    cur_provider = _current("default_provider") or "ollama"
-    provider_choice = inquirer.select(
+    provider_choices = [*builtin_names, CUSTOM_PROVIDER_CHOICE]
+    cur_provider = _current("default_provider") or provider_registry.default_provider_name()
+    provider_choice = inquirer.fuzzy(
         message="Select model provider:",
         choices=provider_choices,
-        default=cur_provider,
         max_height="70%",
     ).execute()
+
     custom_base_url = ""
-    if provider_choice == "__custom__":
+    if provider_choice == CUSTOM_PROVIDER_CHOICE:
         default_name = cur_provider if cur_provider not in builtin_names else "custom"
         provider = inquirer.text(message="Custom provider name:", default=default_name).execute().strip().lower()
-        if not provider.replace("_", "").replace("-", "").isalnum():
+        if not _valid_provider_name(provider):
             print("Custom provider names use letters, numbers, _ or -.")
             return
         custom_base_url = inquirer.text(
             message="OpenAI-compatible URL:",
-            instruction="(required; Enter keeps current if already configured)",
-        ).execute().strip() or _current(f"provider.{provider}.base_url")
+            instruction="(required, e.g. https://host/v1)",
+        ).execute().strip()
+        if not custom_base_url:
+            custom_base_url = _current(f"provider.{provider}.base_url")
         if not custom_base_url:
             print("An OpenAI-compatible URL is required.")
             return
     else:
         provider = provider_choice
-    # API key
+
+    current_model = (
+        _current(f"provider.{provider}.model")
+        or provider_registry.builtin_provider_defaults(provider).get("default_model", "")
+    )
+    current_key = _current(f"provider.{provider}.api_key")
+
+    # API key input is deliberately hidden and has no default, so existing keys are
+    # never echoed back to the terminal. Empty input preserves the existing value.
     key = inquirer.secret(
         message=f"API key for {provider}:",
         instruction="(hidden; Enter keeps existing/skips)",
     ).execute()
     # Fetch models
-    print(f"\nFetching models from {provider}...")
+    print("\nFetching model list...")
     try:
+        from agent8088.providers import list_models
         from openai import OpenAI
-        builtin = provider_registry.builtin_provider_defaults(provider)
-        base_url = custom_base_url or _current(f"provider.{provider}.base_url") or builtin.get("base_url", "")
-        api_key = (
-            key
-            or _current(f"provider.{provider}.api_key")
-            or os.environ.get(builtin.get("api_key_env", ""), "")
-            or builtin.get("api_key", "ollama")
-        )
+        defaults = provider_registry.builtin_provider_defaults(provider)
+        base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
+        api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
         fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
-        models = provider_registry.list_models(provider, client=fetch_client, fallback=False)
+        models = list_models(provider, client=fetch_client, fallback=False)
     except Exception:
         models = []
-    current_model = _current(f"provider.{provider}.model") or provider_registry.builtin_provider_defaults(provider).get("default_model", "")
     if models:
-        model_kwargs = {
+        kwargs = {
             "message": "Select model:",
             "choices": models,
             "max_height": "70%",
         }
         if current_model in models:
-            model_kwargs["default"] = current_model
-        model_name = inquirer.fuzzy(
-            **model_kwargs,
-        ).execute()
+            kwargs["default"] = current_model
+        model_name = inquirer.fuzzy(**kwargs).execute()
     else:
-        model_name = inquirer.text(message="Model name:", default=current_model, instruction="(required)").execute()
+        model_name = inquirer.text(
+            message="Model name:",
+            default=current_model,
+            instruction="(required)",
+        ).execute()
     if not model_name:
         print("A model is required.")
         return
-    model_ref = f"{provider}:{model_name}"
-    # Web search
-    search = inquirer.text(
-        message="Web search URL (SearXNG):",
-        instruction="(Enter keeps current; type none to disable)",
-    ).execute()
-    # Write config — use the format the engine's load_providers() expects:
-    #   default_provider=<name>
-    #   provider.<name>.base_url=<url>
-    #   provider.<name>.model=<model>
-    #   provider.<name>.api_key=<key>
-    content = _set_line(content, "allowed_paths", paths)
+
+    if include_workspace:
+        search = inquirer.text(
+            message="Web search URL (SearXNG):",
+            instruction="(Enter keeps current setting; type none to disable)",
+        ).execute()
+    else:
+        search = ""
+
+    if paths:
+        content = _set_line(content, "allowed_paths", paths)
     content = _set_line(content, "default_provider", provider)
-    # Write provider base_url + model
-    # Look up the built-in base_url from our providers registry
-    builtin = provider_registry.builtin_provider_defaults(provider)
-    base_url = custom_base_url or _current(f"provider.{provider}.base_url") or builtin.get("base_url", "")
+
+    # Write provider base_url + model. Endpoint defaults live in the provider registry.
+    defaults = provider_registry.builtin_provider_defaults(provider)
+    base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
     if base_url:
         content = _set_line(content, f"provider.{provider}.base_url", base_url)
-    if provider_choice == "__custom__":
+    if provider_choice == CUSTOM_PROVIDER_CHOICE:
         content = _set_line(content, f"provider.{provider}.api_mode", "openai")
     content = _set_line(content, f"provider.{provider}.model", model_name)
     if key:
@@ -1844,8 +1959,10 @@ def _run_setup():
     elif search:
         content = _set_line(content, "search_base_url", search)
     config_path.write_text(content, encoding="utf-8")
+    if activate_runtime:
+        _reload_model_runtime(config_path, provider, model_name)
     print(f"\nConfig written to {config_path}")
-    print(f"Active model: {model_ref}")
+    print("Setup complete.")
 
 
 def main():
@@ -1858,28 +1975,14 @@ def main():
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
     parser.add_argument("--edit", action="store_true", help="start in edit mode (no per-action permission prompts)")
-    parser.add_argument("--uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
+    parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     args = parser.parse_args()
 
     if args.uninstall:
-        import shutil
-        home = Path(os.environ.get("AGENT8088_HOME", os.path.join(
-            os.environ.get("LOCALAPPDATA", str(Path.home() / ".local" / "share")), "agent8088")))
-        print(f"Removing {home} ...")
-        if home.exists():
-            shutil.rmtree(home, ignore_errors=True)
-        os.environ.pop("AGENT8088_CONFIG", None)
-        try:
-            import winreg
-            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE)
-            winreg.DeleteValue(k, "AGENT8088_CONFIG")
-            winreg.CloseKey(k)
-        except Exception:
-            pass
-        print("Done. Open a NEW terminal for PATH to refresh.")
+        _run_uninstall()
         return
     if args.update:
         _run_update()

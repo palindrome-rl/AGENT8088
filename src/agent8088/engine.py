@@ -675,6 +675,10 @@ if SKILL_PACKAGES:
 SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
                  + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE))
 
+_last_tool_output = ""
+_last_tool_name = ""
+_last_write_diff = []
+
 
 # ---------------------------------------------------------------------------
 # Subagents — profiles loaded from agents/*.md (frontmatter + body prompt)
@@ -1096,9 +1100,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if _is_sensitive_path(fn):
             return f"Error: Access to sensitive file denied: {fn}"
 
-    # --- Layer 2: Network access control (http_get requires escalation) ---
-    if mode == "http_get":
-        url = _format_with_args(spec.get("url") or "{url}", args)
+    # --- Layer 2: Network access control ---
+    if mode in ("http_get", "http_post"):
+        url = _safe_format(spec.get("url") or "{url}", args)
+        blocked = _ssrf_check(url)
+        if blocked:
+            return blocked
         if not check_permission(mode, url):
             return request_escalation(
                 target_mode="edit",
@@ -1106,7 +1113,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 change_type="network_request",
                 reason=f"Tool '{name}' wants to make an HTTP request to: {url[:200]}",
             )
-        return _exec_shell_command(f'curl -s --max-time {timeout} "{url}"', timeout=timeout)
+        return _exec_http(mode, spec, args, timeout)
 
     # --- Permission gate for write/shell (Layers 1+3) ---
     command = ""
@@ -1176,9 +1183,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if expression:
             expression = _format_with_args(expression, args)
         return str(eval(expression, {"__builtins__": {}}, {}))
-
-    if mode in ("http_get", "http_post"):
-        return _exec_http(mode, spec, args, timeout)
 
     if mode == "shell":
         command = _format_with_args(spec.get("command") or "{command}", args)

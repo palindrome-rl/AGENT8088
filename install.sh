@@ -29,7 +29,7 @@ export UV_NO_CONFIG=1
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/tayyabimam1/AGENT8088.git"
-REPO_BRANCH="development"
+REPO_BRANCH="${AGENT8088_BRANCH:-development}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --skip-setup   Skip interactive setup wizard"
-            echo "  --branch NAME  Git branch to install (default: main)"
+            echo "  --branch NAME  Git branch to install (default: $REPO_BRANCH)"
             echo "  -h, --help      Show this help"
             exit 0
             ;;
@@ -363,13 +363,10 @@ clone_repo() {
             log_info "Local changes detected, stashing before update..."
             git stash push --include-untracked -m "agent8088-install-autostash-$(date -u +%Y%m%d-%H%M%S)" >/dev/null 2>&1 || true
         fi
-        git remote set-branches origin "$BRANCH" 2>/dev/null || true
-        git fetch origin "$BRANCH" >/dev/null 2>&1
-        git checkout "$BRANCH" >/dev/null 2>&1
-        if ! git pull --ff-only origin "$BRANCH" >/dev/null 2>&1; then
-            log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
-            git reset --hard "origin/$BRANCH" >/dev/null 2>&1
-        fi
+        git remote set-url origin "$REPO_URL" 2>/dev/null || true
+        git fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1
+        git checkout -B "$BRANCH" FETCH_HEAD >/dev/null 2>&1
+        git reset --hard FETCH_HEAD >/dev/null 2>&1
     else
         log_info "Cloning Agent8088 repository..."
         rm -rf "$INSTALL_DIR"
@@ -379,7 +376,9 @@ clone_repo() {
         git config core.autocrlf false
         FRESH_INSTALL=true
     fi
-    log_success "Repository ready at $INSTALL_DIR"
+    local installed_commit
+    installed_commit="$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    log_success "Repository ready at $INSTALL_DIR ($BRANCH@$installed_commit)"
 }
 
 # ----------------------------------------------------------------------------
@@ -392,13 +391,13 @@ install_deps() {
         # shellcheck disable=SC1091
         source "$INSTALL_DIR/venv/bin/activate"
         pip install --upgrade pip >/dev/null 2>&1
-        pip install -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
+        pip install --upgrade --force-reinstall -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
     else
         log_info "Creating venv and installing via uv..."
         "$UV_CMD" venv "$INSTALL_DIR/venv" >/dev/null 2>&1
-        "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" -e "$INSTALL_DIR" >/dev/null 2>&1 || {
+        "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
             log_error "uv pip install failed; trying with --all-extras"
-            "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" -e "$INSTALL_DIR" >/dev/null 2>&1 || {
+            "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
                 log_error "Failed to install agent8088"
                 exit 1
             }
@@ -411,7 +410,9 @@ install_deps() {
 # Stage 6: Link the command (shim + shell rc PATH edit)
 # ----------------------------------------------------------------------------
 get_command_link_dir() {
-    if is_termux && [ -n "${PREFIX:-}" ]; then
+    if [ -n "${AGENT8088_LINK_DIR:-}" ]; then
+        echo "$AGENT8088_LINK_DIR"
+    elif is_termux && [ -n "${PREFIX:-}" ]; then
         echo "$PREFIX/bin"
     else
         echo "$HOME/.local/bin"
@@ -756,7 +757,7 @@ verify_install() {
     echo ""
     echo -e "\033[0;32mDone.\033[0m  Run \033[1magent8088\033[0m to start."
     echo "  Config: $AGENT8088_HOME/config.txt"
-    echo "  Update: cd $INSTALL_DIR && git pull && uv pip install --python venv/bin/python -e ."
+    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
 }
