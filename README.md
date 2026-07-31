@@ -240,14 +240,16 @@ The model can call tools by natural names — `bash`→`execute_shell`, `cat`→
 
 ```
 AGENT8088/
-├── src/agent8088/            # Installable package
+├── src/agent8088/            # Installable package — the ONLY place data files live
 │   ├── __init__.py           # Version
 │   ├── engine.py             # Core engine (agent loop, tools, permissions)
 │   ├── cli.py                # Rich CLI (streaming, slash commands, escalation)
-│   └── providers.py          # Multi-model provider registry (13 providers)
-├── config.txt                # Default config (shipped with package)
-├── system.md                 # System prompt / skill document
-├── tools.txt                 # Tool specs
+│   ├── providers.py          # Multi-model provider registry (13 providers)
+│   ├── config.txt            # Shipped default config (see config lookup below)
+│   ├── system.md             # System prompt / skill document
+│   ├── tools.txt             # Tool specs
+│   ├── agents/               # Sub-agent profiles
+│   └── skills_installed/     # Installable skill packages
 ├── install.sh                # One-line installer (macOS/Linux)
 ├── install.ps1               # One-line installer (Windows)
 ├── pyproject.toml            # Package metadata + entry points
@@ -256,6 +258,21 @@ AGENT8088/
 ├── research/                 # Non-runtime: SkillOpt, benchmarks, training
 └── scripts/                  # One-off repo ops
 ```
+
+### Where data files live
+
+`tools.txt`, `system.md`, `config.txt`, `agents/`, and `skills_installed/` live **only**
+under `src/agent8088/`. That is where the engine loads them from (`APP_DIR` is the package
+directory) and the only copy shipped in the wheel. Do not add copies at the repo root —
+they are never read, and edits to them silently do nothing.
+
+Config is resolved in this order, first match wins:
+
+| Order | Location | Purpose |
+|---|---|---|
+| 1 | `$AGENT8088_CONFIG` | Explicit override (used by the test suite) |
+| 2 | `~/.agent8088/config.txt` | **Your** settings — survives `--update` |
+| 3 | `src/agent8088/config.txt` | Shipped defaults / template |
 
 ---
 
