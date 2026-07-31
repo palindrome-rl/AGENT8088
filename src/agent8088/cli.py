@@ -16,7 +16,7 @@ feature is reachable here:
 
 Run:  python agent8088_cli.py
 """
-import sys, os, json, shlex, stat, tempfile, time, threading, select, socket  # noqa: F401
+import sys, os, json, shlex, time, threading, select, socket  # noqa: F401
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -194,13 +194,7 @@ SESSIONS_DIR = Path(os.environ.get(
 
 def _write_private_text(path, content):
     destination = Path(path).expanduser()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=destination.parent,
-                                     delete=False) as stream:
-        stream.write(content)
-        temporary = Path(stream.name)
-    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
-    os.replace(temporary, destination)
+    A._write_private_text(destination, content)
     return destination
 
 
@@ -1507,7 +1501,7 @@ def cmd_history(_):
 
 
 def _write_user_export(path, content):
-    arguments = {"filename": path, "content": content}
+    arguments = {"filename": path, "content": content, "_private": True}
     result = A.run_tool("write_file", arguments)
     if result.startswith("ESCALATION_REQUEST:") and _handle_escalation(result):
         result = A.run_tool("write_file", arguments)

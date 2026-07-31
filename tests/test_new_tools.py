@@ -1,4 +1,5 @@
 from shlex import quote as shlex_quote
+from pathlib import PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,14 @@ def _fake_crontab(calls, current=""):
     return run
 
 
-def test_cron_rejects_bad_schedule(engine, monkeypatch):
+@pytest.fixture
+def posix_cron(engine, monkeypatch):
+    monkeypatch.setattr(engine.sys, "platform", "linux")
+    return engine
+
+
+def test_cron_rejects_bad_schedule(posix_cron, monkeypatch):
+    engine = posix_cron
     calls = []
     monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
     out = engine._exec_cron({"action": "add", "schedule": "not a cron", "task": "hi"})
@@ -21,7 +29,8 @@ def test_cron_rejects_bad_schedule(engine, monkeypatch):
     assert not calls  # crontab never touched
 
 
-def test_cron_add_builds_entry(engine, monkeypatch):
+def test_cron_add_builds_entry(posix_cron, monkeypatch):
+    engine = posix_cron
     calls = []
     monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
     engine._exec_cron({"action": "add", "schedule": "0 9 * * *", "task": "daily report"})
@@ -31,12 +40,14 @@ def test_cron_add_builds_entry(engine, monkeypatch):
     assert all(kwargs["timeout"] == 20 for _, kwargs in calls)
 
 
-def test_cron_add_requires_task(engine, monkeypatch):
+def test_cron_add_requires_task(posix_cron, monkeypatch):
+    engine = posix_cron
     monkeypatch.setattr(engine.subprocess, "run", _fake_crontab([]))
     assert "requires a task" in engine._exec_cron({"action": "add", "schedule": "0 9 * * *"})
 
 
-def test_cron_list_filters_by_marker(engine, monkeypatch):
+def test_cron_list_filters_by_marker(posix_cron, monkeypatch):
+    engine = posix_cron
     calls = []
     current = "0 9 * * * agent8088 # agent8088\n0 10 * * * backup\n"
     monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls, current))
@@ -45,11 +56,13 @@ def test_cron_list_filters_by_marker(engine, monkeypatch):
     assert "backup" not in output
 
 
-def test_cron_unknown_action(engine):
+def test_cron_unknown_action(posix_cron):
+    engine = posix_cron
     assert "Unknown" in engine._exec_cron({"action": "explode"})
 
 
-def test_cron_escapes_quotes_in_task(engine, monkeypatch):
+def test_cron_escapes_quotes_in_task(posix_cron, monkeypatch):
+    engine = posix_cron
     calls = []
     monkeypatch.setattr(engine.subprocess, "run", _fake_crontab(calls))
     task = "it's $(touch /tmp/nope) fine"
@@ -58,7 +71,8 @@ def test_cron_escapes_quotes_in_task(engine, monkeypatch):
     assert shlex_quote(task) in payload
 
 
-def test_cron_remove_matches_the_shell_quoted_task(engine, monkeypatch):
+def test_cron_remove_matches_the_shell_quoted_task(posix_cron, monkeypatch):
+    engine = posix_cron
     calls = []
     task = "it's $(safe) fine"
     current = f"* * * * * agent8088 {shlex_quote(task)} # agent8088\n"
@@ -106,6 +120,7 @@ def test_docker_requires_code(engine, monkeypatch):
 def test_docker_rejects_option_like_image(engine, tmp_path, monkeypatch):
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
     assert "invalid container image" in engine._exec_docker({
         "code": "print(1)", "image": "--privileged",
     })
@@ -154,12 +169,101 @@ def test_docker_refuses_unbounded_sensitive_mounts(engine, tmp_path, monkeypatch
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
     monkeypatch.setattr(
         engine, "_exec_process",
         lambda *_args, **_kwargs: pytest.fail("Docker must not run"),
     )
 
     assert "too many sensitive" in engine._exec_docker({"code": "print(1)"})
+
+
+def test_windows_docker_mounts_use_container_path_separators(engine, tmp_path, monkeypatch):
+    project = PureWindowsPath("C:/workspace")
+    engine.SANDBOX_BACKEND = "docker"
+    monkeypatch.setattr(engine, "PROJECT_ROOT", project)
+    monkeypatch.setattr(engine, "Path", PureWindowsPath)
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(
+        engine.os, "walk",
+        lambda _root: [(str(project), [], [".env"])],
+    )
+    seen = {}
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda command, **_: seen.setdefault("command", command) and "done",
+    )
+
+    assert engine._exec_docker({"code": "print(1)"}) == "done"
+    mounts = [
+        seen["command"][index + 1]
+        for index, value in enumerate(seen["command"][:-1])
+        if value == "--mount"
+    ]
+    assert any("dst=/workspace/.env,readonly" in mount for mount in mounts)
+    assert not any(r"dst=\workspace" in mount for mount in mounts)
+
+
+def test_windows_cron_uses_schtasks_and_private_registry(engine, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
+    monkeypatch.setattr(engine, "_protect_private_file", lambda _path: None)
+    monkeypatch.setattr(engine.shutil, "which", lambda name: name)
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stdout="SUCCESS", stderr="")
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    task = "it's $(Remove-Item *)"
+
+    assert engine._exec_cron({
+        "action": "add", "schedule": "0 9 * * *", "task": task,
+    }) == "Scheduled: 0 9 * * *"
+    create = calls[-1][0]
+    assert create[1:3] == ["/Create", "/TN"]
+    assert create[create.index("/SC") + 1] == "DAILY"
+    assert create[create.index("/ST") + 1] == "09:00"
+    assert create[create.index("/RL") + 1] == "LIMITED"
+    assert "/IT" in create
+    script = next((tmp_path / "agent-home" / "scheduled-tasks").glob("*.ps1"))
+    assert task not in script.read_text(encoding="utf-8")
+    assert task in engine._exec_cron({"action": "list"})
+
+    assert engine._exec_cron({"action": "remove", "task": task}) == "Removed."
+    assert calls[-1][0][1] == "/Delete"
+    assert engine._exec_cron({"action": "list"}) == "No scheduled tasks."
+    assert not script.exists()
+
+
+def test_windows_cron_reports_private_script_write_failure(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_load_windows_schedules", lambda: [])
+
+    def fail_script_write(*_args):
+        raise OSError("access denied")
+
+    monkeypatch.setattr(engine, "_windows_task_script", fail_script_write)
+
+    result = engine._exec_windows_cron(
+        "add", "0 9 * * *", "daily report", ["0", "9", "*", "*", "*"],
+    )
+
+    assert result == "Windows scheduler error: access denied"
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected"),
+    [
+        ("*/15 * * * *", ["/SC", "MINUTE", "/MO", "15", "/ST", "00:00"]),
+        ("30 * * * *", ["/SC", "HOURLY", "/MO", "1", "/ST", "00:30"]),
+        ("0 9 * * 1,5", ["/SC", "WEEKLY", "/D", "MON,FRI", "/ST", "09:00"]),
+        ("0 9 15 * *", ["/SC", "MONTHLY", "/D", "15", "/ST", "09:00"]),
+    ],
+)
+def test_windows_cron_translates_common_schedules(engine, schedule, expected):
+    assert engine._windows_schedule_args(schedule.split()) == expected
 
 
 def test_auto_prefers_native_then_docker(engine, monkeypatch):

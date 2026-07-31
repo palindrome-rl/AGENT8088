@@ -19,6 +19,7 @@ def _fake_install(tmp_path, monkeypatch):
     shim.write_text(f'exec "{install_dir}/venv/bin/python" -m agent8088.cli "$@"\n', encoding="utf-8")
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("AGENT8088_HOME", str(home))
     monkeypatch.setenv("AGENT8088_LINK_DIR", str(link_dir))
     monkeypatch.setenv("AGENT8088_CONFIG", str(home / "config.txt"))

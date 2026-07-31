@@ -68,7 +68,7 @@ agent8088
 | `/tool web_search query="python 3.13"` | clean `• title / url / snippet` list |
 | `/tool web_search` (no arg) | names the missing arg: `pass query=<value>` |
 | `/tool web_search_tavily query="..."` | needs `tavily_api_key`, else a clear message |
-| `/tool schedule_task action=list` | your agent8088 cron entries |
+| `/tool schedule_task action=list` | your Agent8088 schedules |
 | `Tab` after `/agent `, `/tool `, `/model ` | autocompletion |
 
 ### Guardrails worth trying by hand

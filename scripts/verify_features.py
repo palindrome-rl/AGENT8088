@@ -235,27 +235,57 @@ for t in ("git_commit", "git_push", "git_create_pr"):
 section("7. CRON / SCHEDULED TASKS")
 built.clear()
 _orig_run = A.subprocess.run
+_orig_agent_data_dir = A._agent_data_dir
+_orig_protect_private_file = A._protect_private_file
+if A.sys.platform == "win32":
+    A._agent_data_dir = lambda: VERIFY_TMP / "agent-home"
+    A._protect_private_file = lambda _path: None
 
 
 def _capture_crontab(command, **kwargs):
+    built.setdefault("calls", []).append(command)
     if command == ["crontab", "-l"]:
         return type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
     built["cmd"] = kwargs.get("input", "")
     return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
-A.subprocess.run = _capture_crontab
-A._exec_cron({"action": "add", "schedule": "0 9 * * *", "task": "daily report"})
-check("valid schedule builds a crontab entry", "0 9 * * *" in built.get("cmd", ""))
-check("entry is marker-tagged", "# agent8088" in built.get("cmd", ""))
-check("rejects a malformed schedule",
-      "Invalid" in A._exec_cron({"action": "add", "schedule": "every day", "task": "x"}))
-check("requires a task", "requires a task" in A._exec_cron({"action": "add", "schedule": "* * * * *"}))
-check("unknown action handled", "Unknown" in A._exec_cron({"action": "boom"}))
-listing = A._exec_cron({"action": "list"})
-check("list runs against fake crontab",
-      listing == "No scheduled tasks.", listing[:40].replace("\n", " "))
-A.subprocess.run = _orig_run
+try:
+    A.subprocess.run = _capture_crontab
+    add_result = A._exec_cron({
+        "action": "add", "schedule": "0 9 * * *", "task": "daily report",
+    })
+    if A.sys.platform == "win32":
+        create = next(
+            (command for command in built["calls"] if "/Create" in command), [])
+        check("valid schedule builds a Windows scheduled task",
+              add_result.startswith("Scheduled:") and "/SC" in create and "/ST" in create,
+              str(create[:8]))
+        listing = A._exec_cron({"action": "list"})
+        check("entry is marker-tagged", "# agent8088" in listing, listing[:60])
+        check("Windows scheduled task can be removed",
+              A._exec_cron({"action": "remove", "task": "daily report"}) == "Removed.")
+        check("Windows removal invokes schtasks deletion",
+              any("/Delete" in command for command in built["calls"]),
+              str(built["calls"]))
+        listing = A._exec_cron({"action": "list"})
+    else:
+        check("valid schedule builds a crontab entry", "0 9 * * *" in built.get("cmd", ""))
+        check("entry is marker-tagged", "# agent8088" in built.get("cmd", ""))
+        listing = A._exec_cron({"action": "list"})
+    check("rejects a malformed schedule",
+          "Invalid" in A._exec_cron({
+              "action": "add", "schedule": "every day", "task": "x"}))
+    check("requires a task",
+          "requires a task" in A._exec_cron({
+              "action": "add", "schedule": "* * * * *"}))
+    check("unknown action handled", "Unknown" in A._exec_cron({"action": "boom"}))
+    check("list runs against fake scheduler",
+          listing == "No scheduled tasks.", listing[:40].replace("\n", " "))
+finally:
+    A.subprocess.run = _orig_run
+    A._agent_data_dir = _orig_agent_data_dir
+    A._protect_private_file = _orig_protect_private_file
 
 # -------------------------------------------------------------- 8. PROVIDERS
 section("8. MULTI-PROVIDER LLM")
