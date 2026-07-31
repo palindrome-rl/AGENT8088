@@ -2102,6 +2102,192 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     print("Setup complete.")
 
 
+def _run_gateway_setup():
+    """Interactive wizard for configuring Slack + WhatsApp messaging gateways."""
+    import re as _re
+    import subprocess
+    import shutil
+
+    home = _agent8088_home()
+    config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    if not config_path.exists():
+        print(f"Config not found: {config_path}")
+        print("Run `agent8088 --setup` first to create a base config.")
+        return
+    content = config_path.read_text(encoding="utf-8")
+
+    def _current(key):
+        m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    def _set_line(text, key, value):
+        pattern = rf'^{_re.escape(key)}=.*'
+        if _re.search(pattern, text, _re.MULTILINE):
+            return _re.sub(pattern, lambda _: f"{key}={value}", text, flags=_re.MULTILINE)
+        return text + f"\n{key}={value}\n"
+
+    print("Agent8088 Gateway Setup\n")
+    print("Configure messaging platforms so the agent can respond on")
+    print("Slack and WhatsApp. Run `agent8088 --gateway` to start.\n")
+
+    # Show current state
+    slack_on = _current("slack_enabled") in ("1", "true", "True")
+    wa_on = _current("whatsapp_enabled") in ("1", "true", "True")
+
+    # Toggle menu — enable/disable each channel independently
+    while True:
+        slack_label = f"Slack [{'ON' if slack_on else 'OFF'}]"
+        wa_label = f"WhatsApp [{'ON' if wa_on else 'OFF'}]"
+        action = _choice_prompt("Toggle a channel (select to flip), or Done:", [slack_label, wa_label, "Done"])
+        if action == "Done":
+            break
+        if action.startswith("Slack"):
+            slack_on = not slack_on
+        elif action.startswith("WhatsApp"):
+            wa_on = not wa_on
+
+    # Apply enable/disable AFTER token collection below
+
+    # --- Slack configuration (only if enabled) ---
+    if slack_on:
+        print("\n--- Slack ---")
+        print("Create a Slack app at https://api.slack.com/apps:")
+        print("  1. Create New App -> From scratch")
+        print("  2. OAuth & Permissions -> add scopes: chat:write,")
+        print("     app_mentions:read, channels:history, channels:read,")
+        print("     im:history, im:read")
+        print("  3. Socket Mode -> Enable -> create xapp- token")
+        print("  4. Event Subscriptions -> add: message.im,")
+        print("     message.channels, app_mention")
+        print("  5. App Home -> enable Messages Tab")
+        print("  6. Install App -> copy xoxb- token\n")
+
+        bot_token = _custom_prompt("Slack Bot Token (xoxb-...):", secret=True)
+        if bot_token:
+            content = _set_line(content, "slack_bot_token", bot_token)
+        app_token = _custom_prompt("Slack App Token (xapp-...):", secret=True)
+        if app_token:
+            content = _set_line(content, "slack_app_token", app_token)
+        allowed = _custom_prompt("Allowed Slack user IDs (comma-separated):",
+                                 _current("slack_allowed_users"))
+        if allowed:
+            content = _set_line(content, "slack_allowed_users", allowed)
+        if not (bot_token and app_token):
+            content = _set_line(content, "slack_enabled", "0")
+            slack_on = False
+            print("Slack disabled — both bot token and app token required.\n")
+        else:
+            content = _set_line(content, "slack_enabled", "1")
+            print("Slack configured.\n")
+
+    # --- WhatsApp configuration (only if enabled) ---
+    if wa_on:
+        print("\n--- WhatsApp ---")
+        session_dir = _current("whatsapp_session_dir") or str(
+            Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
+        )
+        session_dir = _custom_prompt("WhatsApp session directory:", session_dir)
+        if session_dir:
+            content = _set_line(content, "whatsapp_session_dir", session_dir)
+        allowed = _custom_prompt("Allowed WhatsApp numbers (comma-separated, e.g. +923214567891):",
+                                 _current("whatsapp_allowed_users"))
+        if allowed:
+            content = _set_line(content, "whatsapp_allowed_users", allowed)
+        mode = _choice_prompt("WhatsApp mode:", ["self-chat", "bot"],
+                              _current("whatsapp_mode") or "self-chat")
+        content = _set_line(content, "whatsapp_mode", mode)
+        bridge_port = _custom_prompt("Bridge port:", _current("whatsapp_bridge_port") or "3000")
+        if bridge_port:
+            content = _set_line(content, "whatsapp_bridge_port", bridge_port)
+
+        # Check if already paired (creds.json exists)
+        session_path = Path(session_dir).expanduser()
+        creds = session_path / "creds.json"
+        if creds.exists():
+            re_pair = _custom_prompt("WhatsApp already paired. Re-pair anyway? (destroys session):",
+                                     instruction="(y/N)")
+            if re_pair.strip().lower() in ("y", "yes"):
+                # Wipe the ENTIRE session dir — stale app-state-sync keys and
+                # pre-keys from an old session cause "failed to find key"
+                # errors that block message receipt after re-pairing.
+                import shutil as _shutil
+                _shutil.rmtree(str(session_path), ignore_errors=True)
+                session_path.mkdir(parents=True, exist_ok=True)
+                creds = session_path / "creds.json"
+            else:
+                print("Keeping existing pairing. Skipping QR.")
+                creds = None  # skip pairing below
+
+        if creds is not None and not creds.exists():
+            bridge_dir = Path(__file__).parent / "gateway" / "platforms" / "whatsapp_bridge"
+            bridge_js = bridge_dir / "bridge.js"
+            if not bridge_js.exists():
+                print(f"ERROR: bridge.js not found at {bridge_dir}")
+            elif not shutil.which("node"):
+                print("ERROR: Node.js not found. Install Node.js 18+ first:")
+                print("  https://nodejs.org/")
+            else:
+                # Install npm deps if node_modules missing
+                node_modules = bridge_dir / "node_modules"
+                if not node_modules.exists():
+                    print("\nInstalling WhatsApp bridge npm dependencies...")
+                    try:
+                        subprocess.run(
+                            ["npm", "install", "--silent"],
+                            cwd=str(bridge_dir),
+                            check=True,
+                            timeout=120,
+                        )
+                        print("npm install complete.")
+                    except Exception as e:
+                        print(f"npm install failed: {e}")
+                        print(f"Run manually: cd {bridge_dir} && npm install")
+
+                # Run pairing (prints QR to terminal)
+                print("\nStarting WhatsApp QR pairing...")
+                print("Scan the QR code with WhatsApp:")
+                print("  Phone -> Settings -> Linked Devices -> Link a Device\n")
+                session_path.mkdir(parents=True, exist_ok=True)
+                try:
+                    subprocess.run(
+                        ["node", str(bridge_js), "--pair", "--session", str(session_path)],
+                        cwd=str(bridge_dir),
+                        timeout=120,
+                    )
+                    if creds.exists():
+                        print("\nWhatsApp pairing successful!")
+                    else:
+                        print("\nPairing may not have completed — check the QR was scanned.")
+                        print(f"If needed, re-run: agent8088 --gateway-setup")
+                except subprocess.TimeoutExpired:
+                    print("\nPairing timed out. Re-run `agent8088 --gateway-setup`.")
+                except Exception as e:
+                    print(f"\nPairing failed: {e}")
+                    print(f"Run manually: node {bridge_js} --pair --session {session_path}")
+
+        content = _set_line(content, "whatsapp_enabled", "1")
+        print("WhatsApp configured.\n")
+
+    # Ensure disabled platforms have enabled=0 in config
+    if not slack_on:
+        content = _set_line(content, "slack_enabled", "0")
+    if not wa_on:
+        content = _set_line(content, "whatsapp_enabled", "0")
+
+    # Write config
+    config_path.write_text(content, encoding="utf-8")
+    enabled = []
+    if slack_on: enabled.append("Slack")
+    if wa_on: enabled.append("WhatsApp")
+    if enabled:
+        print(f"Config written to {config_path}")
+        print(f"Enabled: {', '.join(enabled)}")
+        print(f"\nStart the gateway with: agent8088 --gateway")
+    else:
+        print(f"Config written to {config_path}")
+        print("No platforms enabled. Toggle one on with: agent8088 --gateway-setup")
+
+
 def main():
     import argparse
     from agent8088 import __version__
@@ -2117,6 +2303,8 @@ def main():
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
+    parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp) instead of the REPL")
+    parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp messaging gateways, then exit")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -2133,6 +2321,13 @@ def main():
         return
     if args.sandbox_setup:
         print(A.install_native_sandbox())
+        return
+    if args.gateway:
+        from agent8088.gateway import main as gateway_main
+        gateway_main()
+        return
+    if args.gateway_setup:
+        _run_gateway_setup()
         return
     if args.edit:
         A.PERMISSION_MODE = "edit"
