@@ -588,8 +588,18 @@ if E.sys.platform == "win32":
     sid_match = re.search(r'"(S-\d(?:-\d+)+)"', sid_result.stdout)
     acl_result = subprocess.run(
         ["icacls", str(sp)], capture_output=True, text=True, timeout=10)
+    acl_entries = []
+    for acl_line in acl_result.stdout.splitlines():
+        acl_line = acl_line.strip()
+        if acl_line.startswith(str(sp)):
+            acl_line = acl_line[len(str(sp)):].strip()
+        acl_match = re.fullmatch(r"(.+?):((?:\([^)]*\))+)", acl_line)
+        if acl_match and "(DENY)" not in acl_match.group(2):
+            acl_entries.append(acl_match.group(1).lstrip("*"))
+    owner_sid = sid_match.group(1) if sid_match else ""
     ok("settings file has a protected owner ACL",
-       bool(sid_match) and sid_match.group(1) in acl_result.stdout
+       acl_result.returncode == 0 and bool(owner_sid) and bool(acl_entries)
+       and all(principal == owner_sid for principal in acl_entries)
        and "(I)" not in acl_result.stdout,
        acl_result.stdout[:80].replace("\n", " "))
 else:

@@ -265,6 +265,9 @@ try:
         check("entry is marker-tagged", "# agent8088" in listing, listing[:60])
         check("Windows scheduled task can be removed",
               A._exec_cron({"action": "remove", "task": "daily report"}) == "Removed.")
+        check("Windows removal invokes schtasks deletion",
+              any("/Delete" in command for command in built["calls"]),
+              str(built["calls"]))
         listing = A._exec_cron({"action": "list"})
     else:
         check("valid schedule builds a crontab entry", "0 9 * * *" in built.get("cmd", ""))

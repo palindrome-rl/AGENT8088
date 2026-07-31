@@ -238,6 +238,21 @@ def test_windows_cron_uses_schtasks_and_private_registry(engine, tmp_path, monke
     assert not script.exists()
 
 
+def test_windows_cron_reports_private_script_write_failure(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_load_windows_schedules", lambda: [])
+
+    def fail_script_write(*_args):
+        raise OSError("access denied")
+
+    monkeypatch.setattr(engine, "_windows_task_script", fail_script_write)
+
+    result = engine._exec_windows_cron(
+        "add", "0 9 * * *", "daily report", ["0", "9", "*", "*", "*"],
+    )
+
+    assert result == "Windows scheduler error: access denied"
+
+
 @pytest.mark.parametrize(
     ("schedule", "expected"),
     [

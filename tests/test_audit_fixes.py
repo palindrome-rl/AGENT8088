@@ -428,3 +428,19 @@ def test_windows_private_files_use_current_user_sid(engine, tmp_path, monkeypatc
         "icacls", str(private), "/grant:r", "*S-1-5-21-100-200-300-400:(R,W)",
     ]
     assert calls[2][0] == ["icacls", str(private), "/inheritance:r"]
+
+
+def test_private_file_is_protected_before_content_is_written(
+        engine, tmp_path, monkeypatch):
+    private = tmp_path / "private.json"
+    content_seen_during_protection = []
+
+    def fake_protect(path):
+        content_seen_during_protection.append(path.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(engine, "_protect_private_file", fake_protect)
+
+    engine._write_private_text(private, "private content")
+
+    assert content_seen_during_protection == [""]
+    assert private.read_text(encoding="utf-8") == "private content"

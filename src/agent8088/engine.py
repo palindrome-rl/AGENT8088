@@ -57,9 +57,9 @@ def _write_private_text(path: Path, content: str) -> None:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", dir=path.parent, delete=False
         ) as stream:
-            stream.write(content)
             temporary = Path(stream.name)
-        _protect_private_file(temporary)
+            _protect_private_file(temporary)
+            stream.write(content)
         os.replace(temporary, path)
     except Exception:
         if temporary:
@@ -2113,7 +2113,10 @@ def _exec_windows_cron(action: str, schedule: str = "", task: str = "",
             f"{schedule}\0{task}\0{SHELL_CWD}".encode("utf-8")
         ).hexdigest()[:16]
         task_name = f"{_WINDOWS_TASK_PREFIX}{identifier}"
-        script = _windows_task_script(identifier, task)
+        try:
+            script = _windows_task_script(identifier, task)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"Windows scheduler error: {exc}"
         powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or "powershell.exe"
         task_command = (
             f'"{powershell}" -NoProfile -NonInteractive '
