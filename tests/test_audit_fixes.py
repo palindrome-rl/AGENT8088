@@ -22,6 +22,13 @@ def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monk
     assert "not-real" not in result
 
 
+def test_resolve_user_path_accepts_path_objects(engine, tmp_path, monkeypatch):
+    target = tmp_path / "nested" / "file.txt"
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+
+    assert engine.resolve_user_path(target) == target.resolve()
+
+
 @pytest.mark.parametrize("command", [
     "git status",
     "git diff",

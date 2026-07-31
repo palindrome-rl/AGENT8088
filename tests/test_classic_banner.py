@@ -157,7 +157,41 @@ def test_trace_save_exports_full_conversation(tmp_path, monkeypatch):
     exported = json.loads(export_path.read_text())
     assert exported["messages"] == [{"role": "user", "content": "hello"}]
     assert exported["trace"][0]["input"] == "hello"
+    if sys.platform != "win32":
+        assert export_path.stat().st_mode & 0o777 == 0o600
     assert "full conversation trace saved" in output.getvalue()
+
+
+def test_save_export_uses_private_permission_gated_write(tmp_path, monkeypatch):
+    output = io.StringIO()
+    target = tmp_path / "conversation.json"
+    seen = {}
+    real_run_tool = classic.A.run_tool
+    monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
+    monkeypatch.setattr(classic.S, "messages", [{"role": "user", "content": "private"}])
+    monkeypatch.setattr(classic.S, "conversation_trace", [])
+    monkeypatch.setattr(classic.S, "last_trace", None)
+    monkeypatch.setattr(classic.S, "name", "")
+    monkeypatch.setattr(classic.S, "disabled_skills", set())
+    monkeypatch.setattr(classic.A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "PERMISSION_MODE", "readonly")
+
+    def capture_run_tool(name, args, *call_args, **call_kwargs):
+        seen.update(args)
+        return real_run_tool(name, args, *call_args, **call_kwargs)
+
+    monkeypatch.setattr(classic.A, "run_tool", capture_run_tool)
+
+    classic.cmd_save(str(target))
+
+    assert seen["_private"] is True
+    assert json.loads(target.read_text())["messages"] == [
+        {"role": "user", "content": "private"},
+    ]
+    if sys.platform != "win32":
+        assert target.stat().st_mode & 0o777 == 0o600
+    assert "saved" in output.getvalue()
 
 
 def test_trace_save_respects_write_permissions(tmp_path, monkeypatch):

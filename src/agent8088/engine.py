@@ -1204,8 +1204,7 @@ subagent_ui = None
 # Tool execution engine
 # ---------------------------------------------------------------------------
 def resolve_user_path(raw_path: str) -> Path:
-    value = (raw_path or "").replace("~", os.path.expanduser("~"))
-    p = Path(value)
+    p = Path(raw_path or "").expanduser()
     if not p.is_absolute():
         p = PROJECT_ROOT / p
     resolved = p.resolve()
@@ -2411,7 +2410,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             old_content = _read_text_limited(target) if target.exists() else ""
         except ValueError:
             old_content = ""
-        target.write_text(content)
+        if args.get("_private") is True:
+            _write_private_text(target, content)
+        else:
+            target.write_text(content)
         _last_write_diff = _make_diff(old_content, content, str(target))
         return f"Wrote {len(content)} bytes to {target}"
 
