@@ -1,5 +1,6 @@
 import os
 import time
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,24 @@ def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monk
 
 
 @pytest.mark.parametrize("command", [
+    "git status",
+    "git diff",
+    "git log -p",
+    "git show HEAD:.env",
+])
+def test_readonly_local_git_reads_require_approval(engine, monkeypatch, command):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "local")
+    monkeypatch.setattr(
+        engine, "_exec_sandbox_command",
+        lambda *_args, **_kwargs: pytest.fail("unapproved command must not execute"),
+    )
+
+    assert "ESCALATION_REQUEST" in engine.run_tool(
+        "execute_shell", {"command": command})
+
+
+@pytest.mark.parametrize("command", [
     "env git push origin main",
     "command git reset --hard",
     "sudo git branch -D old",
@@ -31,6 +50,12 @@ def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monk
     "bash -lc 'env git push origin main'",
     "echo $(git push origin main)",
     "echo `git reset --hard`",
+    "cat <(git push origin main)",
+    "cat >(git reset --hard)",
+    "git checkout notes.txt",
+    "git checkout --force feature",
+    "git stash drop",
+    "git stash clear",
 ])
 def test_wrapped_destructive_git_is_blocked(engine, command):
     assert engine._hard_blocked_shell(command), command
@@ -113,6 +138,37 @@ def test_git_clone_terminates_options_and_rejects_remote_helpers(engine, monkeyp
     assert seen["argv"] == ["git", "clone", "--", "--upload-pack=touch", "dst"]
     assert "safe repository URL" in engine.run_tool(
         "git_clone", {"url": "ext::sh -c bad", "directory": "dst"})
+    assert engine._structured_tool_argv(
+        "git_clone", {"url": "https://example.test/repo.git"}) == [
+            "git", "clone", "--", "https://example.test/repo.git",
+        ]
+
+
+def test_shell_uses_posix_fallback_when_bash_is_unavailable(engine, tmp_path, monkeypatch):
+    seen = {}
+
+    class FakeProcess:
+        stdout = BytesIO(b"")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(engine, "SHELL_CWD", tmp_path)
+    monkeypatch.setattr(engine.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        engine.subprocess, "Popen",
+        lambda command, **kwargs: seen.update(
+            {"command": command, "kwargs": kwargs}) or FakeProcess(),
+    )
+
+    assert engine._exec_process("echo fake", shell=True) == "Command completed."
+    assert seen["kwargs"]["executable"] == "/bin/sh"
 
 
 class _RetryableError(Exception):
@@ -286,9 +342,13 @@ def test_git_push_uses_one_dedicated_remote_confirmation(engine, monkeypatch):
 
 
 def test_short_configured_secrets_are_redacted(engine, monkeypatch):
-    monkeypatch.setattr(engine, "APP_CONFIG", {"provider.fake.api_key": "tiny"})
+    monkeypatch.setattr(engine, "APP_CONFIG", {
+        "provider.fake.api_key": "tiny",
+        "provider.other.api_key": "x",
+    })
     monkeypatch.setattr(engine, "_SECRET_VALUES", [])
     assert engine._redact_secrets("token=tiny") == "token=[redacted]"
+    assert engine._redact_secrets("value=x") == "value=x"
 
 
 def test_local_execution_grant_does_not_leak_to_later_action(engine, monkeypatch):

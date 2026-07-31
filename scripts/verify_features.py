@@ -4,7 +4,9 @@
 Exercises real code paths (not mocks) wherever the dependency exists, and reports
 SKIP with the reason where it doesn't. Run from the repo root.
 """
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -12,6 +14,7 @@ from pathlib import Path
 # repo root is where agent8088 lives; allow override by argv
 ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 VERIFY_TMP = Path(tempfile.mkdtemp(prefix="a8088_features_")).resolve()
+atexit.register(shutil.rmtree, VERIFY_TMP, ignore_errors=True)
 os.chdir(ROOT)
 
 sys.path.insert(0, str(ROOT / "src"))
@@ -213,10 +216,17 @@ A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = _private, _hosts
 
 # ------------------------------------------------------------------- 6. GIT
 section("6. GIT INTEGRATION")
-st = A.exec_tool("git_status", "{}")
-check("git_status returns real output", "##" in st, st.splitlines()[0][:40] if st else "")
-lg = A.exec_tool("git_log", "{}")
-check("git_log returns real commits", len(lg.splitlines()) > 3, f"{len(lg.splitlines())} lines")
+_git_permission = A.PERMISSION_MODE
+A.PERMISSION_MODE = "edit"
+try:
+    st = A.exec_tool("git_status", "{}")
+    check("approved git_status returns real output",
+          "##" in st, st.splitlines()[0][:40] if st else "")
+    lg = A.exec_tool("git_log", "{}")
+    check("approved git_log returns real commits",
+          len(lg.splitlines()) > 3, f"{len(lg.splitlines())} lines")
+finally:
+    A.PERMISSION_MODE = _git_permission
 for t in ("git_commit", "git_push", "git_create_pr"):
     check(f"{t} declared with intent warning",
           "Only use when the user asked" in A.TOOL_SPECS[t]["description"])
@@ -243,7 +253,8 @@ check("rejects a malformed schedule",
 check("requires a task", "requires a task" in A._exec_cron({"action": "add", "schedule": "* * * * *"}))
 check("unknown action handled", "Unknown" in A._exec_cron({"action": "boom"}))
 listing = A._exec_cron({"action": "list"})
-check("list runs against fake crontab", isinstance(listing, str), listing[:40].replace("\n", " "))
+check("list runs against fake crontab",
+      listing == "No scheduled tasks.", listing[:40].replace("\n", " "))
 A.subprocess.run = _orig_run
 
 # -------------------------------------------------------------- 8. PROVIDERS
@@ -292,7 +303,7 @@ check("remote url passes through", msg2["content"][1]["image_url"]["url"].endswi
 try:
     A.build_image_message("x", [str(VERIFY_TMP / "missing.png")])
     check("missing image rejected", False)
-except Exception as e:
+except ValueError as e:
     check("missing image rejected", "not found" in str(e).lower())
 A.ALLOWED_PATHS = _allowed_paths
 tmp_png.unlink(missing_ok=True)
@@ -317,7 +328,6 @@ check("CORE TOOL CANNOT BE HIJACKED",
       merged["execute_shell"]["command"] == "{command}",
       "execute_shell kept its real definition")
 check("skill tools render into the prompt", "get_weather(" in A.render_tool_docs(merged))
-import shutil
 shutil.rmtree(sk_root, ignore_errors=True)
 
 # --------------------------------------------------------------- 11. PERSONA

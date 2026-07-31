@@ -27,7 +27,10 @@ AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_http_search.py -q # se
 ## 2. Functional verification
 
 ```bash
-AGENT8088_CONFIG=/nonexistent AGENT8088_HOME=/tmp/agent8088-verifier python scripts/verify_features.py
+VERIFY_HOME="$(mktemp -d)"
+trap 'rm -rf -- "$VERIFY_HOME"' EXIT
+AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" \
+  python scripts/verify_features.py
 ```
 
 The isolated command above does not load your personal configuration. It runs Git

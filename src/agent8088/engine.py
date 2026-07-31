@@ -261,7 +261,12 @@ def _dangerous_git_args(tokens: list) -> bool:
         or (action == "branch" and any(flag in ("-d", "-D", "--delete") for flag in flags))
         or (action == "clean" and any("f" in flag.lstrip("-") for flag in flags if flag.startswith("-")))
         or action in ("restore",)
-        or (action == "checkout" and "--" in flags)
+        or (action == "checkout" and (
+            "--" in flags
+            or any(flag in ("-f", "--force") for flag in flags)
+            or any(not flag.startswith("-") for flag in flags)
+        ))
+        or (action == "stash" and any(flag in ("drop", "clear") for flag in flags))
     )
 
 
@@ -279,6 +284,9 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
         substitutions = re.findall(r"\$\(([^()]*)\)|`([^`]*)`", command)
         if any(_hard_blocked_shell(left or right, _depth + 1)
                for left, right in substitutions):
+            return True
+        if any(_hard_blocked_shell(payload, _depth + 1)
+               for payload in re.findall(r"[<>]\(([^()]*)\)", command)):
             return True
         wrappers = {"sh", "bash", "dash", "zsh", "ksh", "fish", "cmd", "powershell", "pwsh"}
         command_flags = {"-c", "-lc", "/c", "-command"}
@@ -337,10 +345,18 @@ def _readonly_shell(command: str) -> bool:
 
 def _local_shell_reads_files(command: str) -> bool:
     parts = _shell_parts(command)
-    return bool(parts) and Path(parts[0]).stem.lower() in _LOCAL_FILE_READ_COMMANDS
+    if not parts:
+        return False
+    executable = Path(parts[0]).stem.lower()
+    return (
+        executable in _LOCAL_FILE_READ_COMMANDS
+        or (executable == "git" and len(parts) > 1
+            and parts[1].lower() in _GIT_READ_COMMANDS)
+    )
 
 
-def check_permission(mode: str, command: str = "", path_zone: str = "default") -> bool:
+def check_permission(mode: str, command: str = "", path_zone: str = "default",
+                     host: bool = False) -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
@@ -355,7 +371,8 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default") -
     if mode == "cron" and command == "list":
         return True
     if mode == "shell" and _readonly_shell(command):
-        if _resolve_sandbox_backend() == "local" and _local_shell_reads_files(command):
+        if ((host or _resolve_sandbox_backend() == "local")
+                and _local_shell_reads_files(command)):
             return False
         return True
     # One-shot grant: allow one blocked tool through, then revert
@@ -1197,7 +1214,7 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     else:
         kwargs["start_new_session"] = True
         if shell:
-            kwargs["executable"] = "/bin/bash"
+            kwargs["executable"] = shutil.which("bash") or "/bin/sh"
     output = bytearray()
     truncated = False
 
@@ -1262,7 +1279,7 @@ def _structured_tool_argv(name: str, args: dict):
             raise ValueError("git clone requires a safe repository URL.")
         if any(char in directory for char in ("\0", "\r", "\n")):
             raise ValueError("git clone requires a safe destination path.")
-        return ["git", "clone", "--", url, directory]
+        return ["git", "clone", "--", url] + ([directory] if directory else [])
     if name == "git_commit":
         return ["git", "commit", "-m", str(args.get("message", ""))]
     if name == "git_push":
@@ -2115,7 +2132,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser")
     if mode in gated_modes and not remote_git_approved and not check_permission(
-            mode, command, path_zone):
+            mode, command, path_zone, bool(spec.get("host"))):
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -2364,7 +2381,7 @@ def collect_secret_values(config: dict) -> list:
             continue
         candidate = os.environ.get(value, "") if key.lower().endswith("api_key_env") else value
         if (any(part in key.lower() for part in ("key", "token", "secret", "password"))
-                and candidate
+                and len(candidate) >= 4
                 and candidate.lower() not in (
                     "none", "ollama", "sk-dummy", "changeme", "your-api-key",
                 )):
