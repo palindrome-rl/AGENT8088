@@ -39,7 +39,7 @@ FALLBACK_MODELS = {
     "copilot":      ["gpt-4o-mini", "gpt-4o", "claude-sonnet-4"],
 }
 
-import hashlib, json, os, time
+import hashlib, json, os, stat, tempfile, time
 from pathlib import Path
 
 _CACHE_FILE = Path(os.environ.get("AGENT8088_HOME", str(Path.home() / ".agent8088"))) / "models_cache.json"
@@ -53,11 +53,22 @@ def _load_disk_cache():
 
 
 def _save_disk_cache(d):
+    temporary = None
     try:
         _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_FILE.write_text(json.dumps(d))
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=_CACHE_FILE.parent, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(d, stream)
+        os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(temporary, _CACHE_FILE)
     except Exception:
-        pass
+        try:
+            if temporary:
+                temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _normalize_model_id(provider_name, model_id):

@@ -87,6 +87,66 @@ def test_openai_compatible_adapter_uses_active_model(engine, monkeypatch):
     assert calls[0]["messages"][-1] == {"role": "user", "content": "hello"}
 
 
+def test_openai_compatible_adapter_round_trip_uses_bearer_key(engine):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    received = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0"))
+            received.update({
+                "path": self.path,
+                "auth": self.headers.get("authorization"),
+                "body": json.loads(self.rfile.read(length)),
+            })
+            payload = json.dumps({
+                "id": "chatcmpl-fake",
+                "object": "chat.completion",
+                "created": 0,
+                "model": received["body"]["model"],
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "local-ok"},
+                    "finish_reason": "stop",
+                }],
+            }).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fake-key",
+        )
+        response = engine.create_completion(
+            client, [{"role": "user", "content": "hello"}], [],
+            model_name="fake-model", provider_name="fake",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.choices[0].message.content == "local-ok"
+    assert received["path"] == "/v1/chat/completions"
+    assert received["auth"] == "Bearer fake-key"
+    assert received["body"]["model"] == "fake-model"
+
+
 def test_get_client_for_litellm_provider_uses_environment_key(engine, monkeypatch):
     monkeypatch.setattr(engine, "PROVIDERS", {
         "claude": {"api_mode": "litellm", "model": "anthropic/claude", "api_key_env": "ANTHROPIC_API_KEY"}})

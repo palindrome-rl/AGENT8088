@@ -2,7 +2,7 @@
 
 Two suites, both runnable with no model backend and no network.
 
-## 1. Unit tests (fast, hermetic — 84 tests)
+## 1. Unit tests (fast and hermetic)
 
 ```bash
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
@@ -24,16 +24,16 @@ AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_new_tools.py -q   # cr
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_http_search.py -q # search/http modes/SSRF allowlist
 ```
 
-## 2. Functional verification (92 checks against real dependencies)
+## 2. Functional verification
 
 ```bash
-python scripts/verify_features.py
+AGENT8088_CONFIG=/nonexistent AGENT8088_HOME=/tmp/agent8088-verifier python scripts/verify_features.py
 ```
 
-Uses your **real** `config.txt`, runs real git commands, launches a real browser,
-and executes in the native sandbox when installed, or Docker when it is up. Anything unavailable is reported
-as `⊘ SKIP` with the reason rather than silently passing. Exit code is non-zero on
-any failure.
+The isolated command above does not load your personal configuration. It runs Git
+checks in temporary repositories, launches a browser when available, and executes
+in an available sandbox. Anything unavailable is reported as `⊘ SKIP` with the
+reason rather than silently passing. Exit code is non-zero on any failure.
 
 For sandbox integration coverage, install the native runtime (preferred) or have Docker running:
 

@@ -158,13 +158,16 @@ ok("config override un-blocks an explicitly allowed file",
    E._is_sensitive_path(".env") is False)
 E.ALLOWED_SENSITIVE_FILES = prev_allow
 
-# read_text tool must refuse a sensitive file
-secret = ROOT / ".env_verify_probe"
+# read_text tool must refuse a fake sensitive file in the verifier temp directory
+secret = TMP / ".env"
 secret.write_text("SECRET=abc123")
+_probe_paths = E.ALLOWED_PATHS
+E.ALLOWED_PATHS = [TMP]
 try:
     out = E.run_tool("read_text", {"filename": str(secret)})
     ok("read_text refuses a sensitive file", "sensitive file denied" in out, out[:60])
 finally:
+    E.ALLOWED_PATHS = _probe_paths
     secret.unlink(missing_ok=True)
 
 # SAFETY: this proves the write-path finding inside TMP only. Never point a write
@@ -505,21 +508,30 @@ section("8c. SANDBOX — real execution")
 E.SANDBOX_BACKEND = prev_backend
 resolved = E._resolve_sandbox_backend()
 if resolved in ("native", "docker"):
-    r = E._exec_docker({"code": "print(6*7)"})
-    ok(f"REAL {resolved} sandbox executes code", r.strip() == "42", r.strip()[:40])
-    r = E._exec_docker({"code": (
-        "import urllib.request\n"
-        "try:\n"
-        "    urllib.request.urlopen('http://example.com', timeout=5)\n"
-        "    print('NET_OK')\n"
-        "except Exception:\n"
-        "    print('NET_BLOCKED')")})
-    ok(f"REAL {resolved} sandbox blocks network egress", "NET_BLOCKED" in r, r.strip()[:40])
-    r = E._exec_docker({"code": "import os; print(os.path.exists('/etc/shadow'))"})
-    ok(f"REAL {resolved} sandbox isolates host /etc", "False" in r or "True" in r, r.strip()[:30])
-    r = E._exec_docker({"code": "print(open('/workspace/config.txt').read()[:20])"})
-    ok("sensitive workspace file is masked in sandbox",
-       "api_key" not in r.lower() or not r.strip(), r.strip()[:40])
+    sandbox_project = TMP / "sandbox-project"
+    sandbox_project.mkdir()
+    (sandbox_project / ".env").write_text("FAKE_TOKEN=not-real")
+    _project_root = E.PROJECT_ROOT
+    E.PROJECT_ROOT = sandbox_project
+    try:
+        r = E._exec_docker({"code": "print(6*7)"})
+        ok(f"REAL {resolved} sandbox executes code", r.strip() == "42", r.strip()[:40])
+        r = E._exec_docker({"code": (
+            "import urllib.request\n"
+            "try:\n"
+            "    urllib.request.urlopen('http://example.com', timeout=5)\n"
+            "    print('NET_OK')\n"
+            "except Exception:\n"
+            "    print('NET_BLOCKED')")})
+        ok(f"REAL {resolved} sandbox blocks network egress", "NET_BLOCKED" in r, r.strip()[:40])
+        r = E._exec_docker({"code": "import os; print(os.path.exists('/etc/shadow'))"})
+        ok(f"REAL {resolved} sandbox isolates host /etc",
+           r.strip() in ("True", "False"), r.strip()[:30])
+        r = E._exec_docker({"code": "print(open('/workspace/.env').read()[:20])"})
+        ok("fake sensitive workspace file is masked in sandbox",
+           "not-real" not in r, r.strip()[:40])
+    finally:
+        E.PROJECT_ROOT = _project_root
 else:
     skip("REAL sandbox execution", f"backend unavailable ({resolved})")
 ok("sandbox requires code", "requires 'code'" in E._exec_docker({}))
@@ -534,8 +546,9 @@ ok("nested sandbox not weakened", data["enableWeakerNestedSandbox"] is False)
 ok("network isolation not weakened", data["enableWeakerNetworkIsolation"] is False)
 ok("apple events denied", data["allowAppleEvents"] is False)
 deny = " ".join(data["filesystem"]["denyRead"])
-for p in (".ssh", ".aws", ".gnupg", ".kube", "config.txt", ".netrc"):
+for p in (".ssh", ".aws", ".gnupg", ".kube", ".netrc"):
     ok(f"denies read of {p}", p in deny)
+ok("denies read of the active config", str(E.CONFIG_PATH.resolve()) in deny)
 ok("workspace is writable", str(E.PROJECT_ROOT) in data["filesystem"]["allowWrite"])
 sp = E._write_sandbox_settings()
 ok("settings file written", sp.exists())
@@ -640,10 +653,11 @@ with with_mode("readonly"):
     E.SSRF_ALLOW_HOSTS = set()   # this config allowlists 127.0.0.1 for local SearXNG
     ok("browse_page enforces SSRF",
        "Blocked" in E.run_tool("browse_page", {"url": "http://127.0.0.1/"}))
-    E.SSRF_ALLOW_HOSTS = _sh
+    E.SSRF_ALLOW_HOSTS = {"127.0.0.1"}
     ok("config allowlist is respected for browse_page",
        "Blocked" not in E.run_tool("browse_page", {"url": "http://127.0.0.1/"}),
-       "127.0.0.1 allowlisted in config.txt")
+       "fake verifier allowlist")
+    E.SSRF_ALLOW_HOSTS = _sh
     ok("http tool enforces SSRF",
        "Blocked" in E.run_tool("get_page_title", {"url": "http://169.254.169.254/"}))
 try:
@@ -728,12 +742,16 @@ with with_mode("edit"):
     if "not configured" in r:
         ok("tavily degrades clearly", "tavily_api_key" in r)
         skip("tavily REAL query", "api key not configured")
+    elif r.startswith("HTTP "):
+        skip("tavily REAL query", r[:80])
     else:
         ok("tavily REAL query returns content", bool(r.strip()), r[:45])
     r = E.run_tool("web_search_exa", {"query": "x"})
     if "not configured" in r:
         ok("exa degrades clearly", "exa_api_key" in r)
         skip("exa REAL query", "api key not configured")
+    elif r.startswith("HTTP "):
+        skip("exa REAL query", r[:80])
     else:
         ok("exa REAL query returns content", bool(r.strip()), r[:45])
     r = E.run_tool("get_page_title", {"url": "https://example.com"})
