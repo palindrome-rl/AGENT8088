@@ -2018,17 +2018,23 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     custom_base_url = ""
     if provider_choice == CUSTOM_PROVIDER_CHOICE:
-        provider = _custom_prompt("Custom provider name:").strip().lower()
-        if not _valid_provider_name(provider):
+        while True:
+            entered_provider = (
+                _custom_prompt("Custom provider name:").strip().lower()
+            )
+            provider = "-".join(entered_provider.split())
+            if _valid_provider_name(provider):
+                break
             print("Custom provider names use letters, numbers, _ or -.")
-            return
-        custom_base_url = _custom_prompt("OpenAI-compatible URL:").strip()
-        custom_base_url = _openai_base_url(custom_base_url)
-        if not custom_base_url:
-            custom_base_url = _current(f"provider.{provider}.base_url")
-        if not custom_base_url:
+        while not custom_base_url:
+            custom_base_url = _openai_base_url(
+                _custom_prompt("OpenAI-compatible URL:").strip()
+            )
+            if not custom_base_url:
+                custom_base_url = _current(f"provider.{provider}.base_url")
+            if custom_base_url:
+                break
             print("An OpenAI-compatible URL is required.")
-            return
     else:
         provider = provider_choice
 
@@ -2064,10 +2070,13 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             current_model if current_model in models else "",
         )
     else:
-        model_name = _custom_prompt("Model name:", current_model, instruction="(required)")
-    if not model_name:
-        print("A model is required.")
-        return
+        model_name = ""
+        while not model_name:
+            model_name = _custom_prompt(
+                "Model name:", current_model, instruction="(required)"
+            ).strip()
+            if not model_name:
+                print("A model is required.")
 
     if include_workspace:
         search = _custom_prompt(

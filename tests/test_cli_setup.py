@@ -157,7 +157,10 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     config = tmp_path / "config.txt"
     config.write_text("allowed_paths=~\ndefault_provider=ollama\n", encoding="utf-8")
     fake = _FakeInquirer({
-        "text": ["~", "localai", "https://llm.example.test/v1/chat/completions", "custom-model", ""],
+        "text": [
+            "~", "invalid/name", "My Local AI", "",
+            "https://llm.example.test/v1/chat/completions", "", "custom-model", "",
+        ],
         "secret": ["secret-key"],
         "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE],
     })
@@ -168,16 +171,51 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     cli._run_setup()
 
     saved = config.read_text(encoding="utf-8")
-    assert "default_provider=localai" in saved
-    assert "provider.localai.api_mode=openai" in saved
-    assert "provider.localai.base_url=https://llm.example.test/v1" in saved
-    assert "provider.localai.model=custom-model" in saved
-    assert "provider.localai.api_key=secret-key" in saved
+    assert "default_provider=my-local-ai" in saved
+    assert "provider.my-local-ai.api_mode=openai" in saved
+    assert "provider.my-local-ai.base_url=https://llm.example.test/v1" in saved
+    assert "provider.my-local-ai.model=custom-model" in saved
+    assert "provider.my-local-ai.api_key=secret-key" in saved
     custom_prompts = [
         kwargs for kind, kwargs in fake.calls
         if kind == "text" and kwargs["message"] in {"Custom provider name:", "OpenAI-compatible URL:"}
     ]
     assert all("default" not in kwargs and "instruction" not in kwargs for kwargs in custom_prompts)
+    assert len([call for call in custom_prompts if call["message"] == "Custom provider name:"]) == 2
+    assert len([call for call in custom_prompts if call["message"] == "OpenAI-compatible URL:"]) == 2
+
+
+def test_model_setup_custom_provider_stays_in_wizard(tmp_path, monkeypatch):
+    config = tmp_path / "config.txt"
+    config.write_text("allowed_paths=~\ndefault_provider=ollama\n", encoding="utf-8")
+    fake = _FakeInquirer({
+        "text": ["My REPL Provider", "https://llm.example.test/v1", "repl-model"],
+        "secret": ["repl-key"],
+        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE],
+    })
+    _install_fake_inquirer(monkeypatch, fake)
+    monkeypatch.setattr(cli.A, "CONFIG_PATH", config)
+    monkeypatch.setattr(providers, "list_models", lambda *_args, **_kwargs: [])
+    activated = {}
+    monkeypatch.setattr(
+        cli,
+        "_reload_model_runtime",
+        lambda path, provider, model: activated.update(
+            path=path, provider=provider, model=model
+        ),
+    )
+    monkeypatch.setattr(cli, "banner", lambda: None)
+
+    cli.cmd_model("setup")
+
+    saved = config.read_text(encoding="utf-8")
+    assert "default_provider=my-repl-provider" in saved
+    assert "provider.my-repl-provider.model=repl-model" in saved
+    assert activated == {
+        "path": config,
+        "provider": "my-repl-provider",
+        "model": "repl-model",
+    }
 
 
 def test_model_setup_works_without_inquirerpy(tmp_path, monkeypatch):
