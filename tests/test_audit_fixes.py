@@ -467,6 +467,23 @@ def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
 
     result = engine.run_tool("run_sandboxed", {"code": "print(1)"})
     assert "ESCALATION_REQUEST" not in result
+    assert "ran:" in result and "print(1)" in result
+
+
+def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    seen = {}
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda argv, **_: seen.setdefault("argv", argv) or f"ran:{argv}",
+    )
+
+    result = engine._exec_sandbox_argv(["git", "status"])
+    assert "ESCALATION_REQUEST" not in result
+    assert seen["argv"] == ["git", "status"]
 
 
 def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):
