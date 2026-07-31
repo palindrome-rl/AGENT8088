@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time  # readline enables input history
+import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid  # readline enables input history
 try:
     import readline  # Unix-only; enables input history/editing
 except ImportError:
@@ -139,6 +139,7 @@ ALLOWED_PATHS = [
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
 _one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
 _local_fallback_grant = False
+_remote_git_grant = False
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -229,6 +230,10 @@ _GIT_BRANCH_FLAGS = frozenset([
     "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
     "--list", "--show-current", "--color", "--no-color",
 ])
+_LOCAL_FILE_READ_COMMANDS = frozenset([
+    "cat", "grep", "head", "tail", "wc", "diff", "type", "findstr",
+])
+_NON_EXEC_GIT_TEXT_COMMANDS = frozenset(["echo", "printf", "grep", "findstr"])
 
 
 def _shell_parts(command: str) -> list:
@@ -238,6 +243,31 @@ def _shell_parts(command: str) -> list:
         return shlex.split(command, posix=sys.platform != "win32")
     except ValueError:
         return []
+
+
+def _dangerous_git_args(tokens: list) -> bool:
+    cursor = 0
+    options_with_value = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+    while cursor < len(tokens) and tokens[cursor].startswith("-"):
+        option = tokens[cursor].split("=", 1)[0]
+        cursor += 2 if option in options_with_value and "=" not in tokens[cursor] else 1
+    if cursor >= len(tokens):
+        return False
+    action = tokens[cursor].lower()
+    flags = [token.lower() for token in tokens[cursor + 1:]]
+    return (
+        action == "push"
+        or (action == "reset" and "--hard" in flags)
+        or (action == "branch" and any(flag in ("-d", "-D", "--delete") for flag in flags))
+        or (action == "clean" and any("f" in flag.lstrip("-") for flag in flags if flag.startswith("-")))
+        or action in ("restore",)
+        or (action == "checkout" and (
+            "--" in flags
+            or any(flag in ("-f", "--force") for flag in flags)
+            or any(not flag.startswith("-") for flag in flags)
+        ))
+        or (action == "stash" and any(flag in ("drop", "clear") for flag in flags))
+    )
 
 
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
@@ -251,6 +281,13 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
         return False
     separators = {";", "&&", "||", "&", "|"}
     if _depth < 8:
+        substitutions = re.findall(r"\$\(([^()]*)\)|`([^`]*)`", command)
+        if any(_hard_blocked_shell(left or right, _depth + 1)
+               for left, right in substitutions):
+            return True
+        if any(_hard_blocked_shell(payload, _depth + 1)
+               for payload in re.findall(r"[<>]\(([^()]*)\)", command)):
+            return True
         wrappers = {"sh", "bash", "dash", "zsh", "ksh", "fish", "cmd", "powershell", "pwsh"}
         command_flags = {"-c", "-lc", "/c", "-command"}
         for index, part in enumerate(parts):
@@ -266,28 +303,20 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
                     if _hard_blocked_shell(payload, _depth + 1):
                         return True
                     break
-    for index, part in enumerate(parts):
-        if Path(part).stem.lower() != "git":
+    start = 0
+    for end in range(len(parts) + 1):
+        if end < len(parts) and parts[end] not in separators:
             continue
-        # Only treat `git` as a command when it sits in COMMAND position — the start
-        # of the string or right after a separator. Otherwise `echo git push` and
-        # `grep git push file` were blocked as if they were real git invocations.
-        if index and parts[index - 1] not in separators:
+        segment = parts[start:end]
+        start = end + 1
+        if not segment:
             continue
-        rest = parts[index + 1:]
-        end = next((i for i, token in enumerate(rest) if token in separators), len(rest))
-        segment = rest[:end]
-        cursor = 0
-        while cursor < len(segment) and segment[cursor].startswith("-"):
-            cursor += 2 if segment[cursor] in ("-C", "-c", "--git-dir", "--work-tree") else 1
-        if cursor >= len(segment):
+        first = Path(segment[0]).stem.lower()
+        if first in _NON_EXEC_GIT_TEXT_COMMANDS:
             continue
-        action = segment[cursor].lower()
-        flags = [token.lower() for token in segment[cursor + 1:]]
-        if (action == "push"
-                or (action == "reset" and "--hard" in flags)
-                or (action == "branch" and any(flag in ("-d", "--delete") for flag in flags))):
-            return True
+        for index, part in enumerate(segment):
+            if Path(part).stem.lower() == "git" and _dangerous_git_args(segment[index + 1:]):
+                return True
     return False
 
 
@@ -314,7 +343,20 @@ def _readonly_shell(command: str) -> bool:
                    for part in rest for flag in unsafe_flags)
 
 
-def check_permission(mode: str, command: str = "", path_zone: str = "default") -> bool:
+def _local_shell_reads_files(command: str) -> bool:
+    parts = _shell_parts(command)
+    if not parts:
+        return False
+    executable = Path(parts[0]).stem.lower()
+    return (
+        executable in _LOCAL_FILE_READ_COMMANDS
+        or (executable == "git" and len(parts) > 1
+            and parts[1].lower() in _GIT_READ_COMMANDS)
+    )
+
+
+def check_permission(mode: str, command: str = "", path_zone: str = "default",
+                     host: bool = False) -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
@@ -329,6 +371,9 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default") -
     if mode == "cron" and command == "list":
         return True
     if mode == "shell" and _readonly_shell(command):
+        if ((host or _resolve_sandbox_backend() == "local")
+                and _local_shell_reads_files(command)):
+            return False
         return True
     # One-shot grant: allow one blocked tool through, then revert
     if _one_shot_grant:
@@ -348,9 +393,15 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
 def grant_escalation(change_type: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
     The user is prompted for every write/mutation - no session-wide grants."""
-    global _one_shot_grant, _local_fallback_grant
+    global _one_shot_grant, _local_fallback_grant, _remote_git_grant
+    if change_type == "git_remote_write":
+        _remote_git_grant = True
+        _one_shot_grant = False
+        _local_fallback_grant = False
+        return
     _one_shot_grant = True
     _local_fallback_grant = change_type == "local_execution"
+    _remote_git_grant = False
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
 
@@ -508,15 +559,62 @@ def activate_model(provider: str = "", model: str = ""):
     return client, MODEL_NAME
 
 
-def _native_tools_enabled(tools) -> bool:
+def _native_tools_enabled(tools, provider_name: str = "") -> bool:
     if not tools:
         return False
-    provider = PROVIDERS.get(ACTIVE_PROVIDER or DEFAULT_PROVIDER, {})
+    provider = PROVIDERS.get(provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER, {})
     value = provider.get("native_tools", False)
     return value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes", "on")
 
 
-def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None, temperature=0.1, on_token=None):
+def _raise_if_interrupted(interrupt_check, stream=None):
+    if not interrupt_check or not interrupt_check():
+        return
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+    raise AgentInterrupted()
+
+
+def _start_interrupt_watcher(stream, interrupt_check):
+    if not interrupt_check:
+        return None, None
+    stop = threading.Event()
+
+    def watch():
+        while not stop.wait(0.05):
+            try:
+                interrupted = interrupt_check()
+            except Exception:
+                return
+            if interrupted:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    return stop, watcher
+
+
+def _finish_interrupt_watcher(stop, watcher):
+    if stop:
+        stop.set()
+    if watcher:
+        watcher.join(timeout=0.2)
+
+
+def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
+                      temperature=0.1, on_token=None, interrupt_check=None,
+                      model_name: str = "", provider_name: str = ""):
+    selected_model = model_name or MODEL_NAME
     full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
     penalties = {}
     if FREQUENCY_PENALTY:
@@ -529,50 +627,146 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         except ImportError as e:
             raise RuntimeError("LiteLLM provider selected; run `pip install litellm`.") from e
         kwargs = {
-            "model": MODEL_NAME, "messages": full_messages, "max_tokens": max_tokens,
+            "model": selected_model, "messages": full_messages, "max_tokens": max_tokens,
             "temperature": temperature, "stream": on_token is not None, **penalties,
         }
-        if _native_tools_enabled(tools):
+        if _native_tools_enabled(tools, provider_name):
             kwargs["tools"] = tools
         if client.get("api_base"):
             kwargs["api_base"] = client["api_base"]
         if client.get("api_key"):
             kwargs["api_key"] = client["api_key"]
+        _raise_if_interrupted(interrupt_check)
         response = completion(**kwargs)
         if on_token is None:
             return response
         collected, tool_chunks = [], {}
-        for chunk in response:
-            delta = chunk.choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                on_token("reasoning", reasoning)
-            if delta.content:
-                on_token("content", delta.content)
-                collected.append(delta.content)
-            _collect_stream_tool_calls(delta, tool_chunks)
+        stop, watcher = _start_interrupt_watcher(response, interrupt_check)
+        try:
+            for chunk in response:
+                _raise_if_interrupted(interrupt_check, response)
+                delta = chunk.choices[0].delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    on_token("reasoning", reasoning)
+                if delta.content:
+                    on_token("content", delta.content)
+                    collected.append(delta.content)
+                _collect_stream_tool_calls(delta, tool_chunks)
+                _raise_if_interrupted(interrupt_check, response)
+            _raise_if_interrupted(interrupt_check, response)
+        except Exception:
+            _raise_if_interrupted(interrupt_check, response)
+            raise
+        finally:
+            _finish_interrupt_watcher(stop, watcher)
         return _build_response("".join(collected), tool_chunks)
     request_options = dict(
-        model=MODEL_NAME, messages=full_messages, max_tokens=max_tokens,
+        model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
     )
-    if _native_tools_enabled(tools):
+    if _native_tools_enabled(tools, provider_name):
         request_options["tools"] = tools
+    _raise_if_interrupted(interrupt_check)
     if on_token is None:
         return client.chat.completions.create(**request_options)
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
     stream = client.chat.completions.create(**request_options, stream=True)
     collected, tool_chunks = [], {}
-    for chunk in stream:
-        delta = chunk.choices[0].delta
-        rc = getattr(delta, "reasoning_content", None)
-        if rc:
-            on_token("reasoning", rc)
-        if delta.content:
-            on_token("content", delta.content)
-            collected.append(delta.content)
-        _collect_stream_tool_calls(delta, tool_chunks)
+    stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
+    try:
+        for chunk in stream:
+            _raise_if_interrupted(interrupt_check, stream)
+            delta = chunk.choices[0].delta
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                on_token("reasoning", rc)
+            if delta.content:
+                on_token("content", delta.content)
+                collected.append(delta.content)
+            _collect_stream_tool_calls(delta, tool_chunks)
+            _raise_if_interrupted(interrupt_check, stream)
+        _raise_if_interrupted(interrupt_check, stream)
+    except Exception:
+        _raise_if_interrupted(interrupt_check, stream)
+        raise
+    finally:
+        _finish_interrupt_watcher(stop, watcher)
     return _build_response("".join(collected), tool_chunks)
+
+
+def _fallback_targets() -> list:
+    targets = []
+    for item in str(APP_CONFIG.get("fallback_models", "")).split(","):
+        provider_name, separator, model_name = item.strip().partition(":")
+        if separator and provider_name in PROVIDERS and model_name.strip():
+            targets.append((provider_name, model_name.strip()))
+    return targets
+
+
+def _retryable_model_error(error: Exception) -> bool:
+    status = getattr(error, "status_code", None)
+    if status == 429 or isinstance(status, int) and status >= 500:
+        return True
+    name = type(error).__name__.lower()
+    text = str(error).lower()
+    retryable = (
+        "timeout", "timed out", "connection", "rate limit", "temporarily unavailable",
+        "service unavailable", "bad gateway", "gateway timeout",
+    )
+    return any(marker in name or marker in text for marker in retryable)
+
+
+def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
+                                     on_token, interrupt_check, trace, turn):
+    emitted = False
+
+    def tracked_token(kind, delta):
+        nonlocal emitted
+        emitted = True
+        if on_token:
+            on_token(kind, delta)
+
+    token_handler = tracked_token if on_token else None
+    try:
+        return create_completion(
+            client, messages, tools, temperature=temperature,
+            system_prompt=system_prompt, on_token=token_handler,
+            interrupt_check=interrupt_check,
+            provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+        )
+    except AgentInterrupted:
+        raise
+    except Exception as primary_error:
+        if emitted or not _retryable_model_error(primary_error):
+            raise
+        last_error = primary_error
+
+    for provider_name, model_name in _fallback_targets():
+        if provider_name == (ACTIVE_PROVIDER or DEFAULT_PROVIDER) and model_name == MODEL_NAME:
+            continue
+        try:
+            fallback_client, _ = get_client(provider_name)
+            if trace is not None:
+                trace.append({
+                    "turn": turn,
+                    "type": "model_fallback",
+                    "provider": provider_name,
+                    "model": model_name,
+                })
+            return create_completion(
+                fallback_client, messages, tools, temperature=temperature,
+                system_prompt=system_prompt, on_token=token_handler,
+                interrupt_check=interrupt_check, model_name=model_name,
+                provider_name=provider_name,
+            )
+        except AgentInterrupted:
+            raise
+        except Exception as fallback_error:
+            last_error = fallback_error
+            if emitted:
+                raise
+    raise last_error
 
 
 def _collect_stream_tool_calls(delta, chunks):
@@ -1015,8 +1209,12 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
         "stderr": subprocess.STDOUT,
         "cwd": str(SHELL_CWD),
     }
-    if shell and sys.platform != "win32":
-        kwargs["executable"] = "/bin/bash"
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+        if shell:
+            kwargs["executable"] = shutil.which("bash") or "/bin/sh"
     output = bytearray()
     truncated = False
 
@@ -1038,9 +1236,22 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
         try:
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            reader.join()
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True, timeout=10,
+                )
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            reader.join(timeout=2)
             return f"Command timed out after {timeout}s."
         reader.join()
     text = output.decode(errors="replace").strip()
@@ -1062,7 +1273,13 @@ def _process_display(argv: list) -> str:
 
 def _structured_tool_argv(name: str, args: dict):
     if name == "git_clone":
-        return ["git", "clone", str(args.get("url", "")), str(args.get("directory", ""))]
+        url = str(args.get("url", ""))
+        directory = str(args.get("directory", ""))
+        if not url or any(char in url for char in ("\0", "\r", "\n")) or "::" in url:
+            raise ValueError("git clone requires a safe repository URL.")
+        if any(char in directory for char in ("\0", "\r", "\n")):
+            raise ValueError("git clone requires a safe destination path.")
+        return ["git", "clone", "--", url] + ([directory] if directory else [])
     if name == "git_commit":
         return ["git", "commit", "-m", str(args.get("message", ""))]
     if name == "git_push":
@@ -1092,6 +1309,50 @@ def _missing_binary_hint(program: str, result: str) -> str:
         return (f"'{program}' is not available where this tool ran. "
                 f"Install {program}, or set host=1 for this tool if it needs host binaries.")
     return result
+
+
+_CALCULATOR_BINARY_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_CALCULATOR_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def _safe_calculate(expression: str):
+    if len(expression) > 1000:
+        raise ValueError("expression is too long")
+    tree = ast.parse(expression, mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > 128:
+        raise ValueError("expression is too complex")
+
+    def evaluate(node):
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            value = node.value
+        elif isinstance(node, ast.UnaryOp) and type(node.op) in _CALCULATOR_UNARY_OPS:
+            value = _CALCULATOR_UNARY_OPS[type(node.op)](evaluate(node.operand))
+        elif isinstance(node, ast.BinOp) and type(node.op) in _CALCULATOR_BINARY_OPS:
+            left, right = evaluate(node.left), evaluate(node.right)
+            if isinstance(node.op, ast.Pow):
+                if abs(right) > 1000:
+                    raise ValueError("exponent is too large")
+                if (type(left) is int and type(right) is int and right >= 0
+                        and abs(left) > 1 and left.bit_length() * right > 4096):
+                    raise ValueError("result is too large")
+            value = _CALCULATOR_BINARY_OPS[type(node.op)](left, right)
+        else:
+            raise ValueError("only arithmetic expressions are allowed")
+        if type(value) is int and value.bit_length() > 4096:
+            raise ValueError("result is too large")
+        if type(value) is float and not math.isfinite(value):
+            raise ValueError("result is not finite")
+        return value
+
+    return evaluate(tree.body)
 
 
 def _format_with_args(template: str, args: dict) -> str:
@@ -1237,6 +1498,18 @@ def _safe_format(template: str, args: dict) -> str:
         template or "")
 
 
+def _http_placeholder_error(spec: dict, url: str):
+    unresolved = _PLACEHOLDER_RE.search(url)
+    if not unresolved:
+        return None
+    key = unresolved.group(1)
+    base = key[:-2] if key.endswith("_q") else key
+    hint = (f"pass {base}=<value> to the tool" if base in (spec.get("args") or [])
+            else f"set {key} in {CONFIG_PATH.name}")
+    return (f"'{spec['name']}' has an unresolved placeholder {{{key}}} in its URL - "
+            f"{hint}.")
+
+
 def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     """SSRF-guarded HTTP GET/POST with optional auth headers and a jq filter.
 
@@ -1257,15 +1530,9 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     # Diagnose an unresolved {placeholder} BEFORE the SSRF guard sees it — otherwise a
     # missing config key or a forgotten argument surfaces as the baffling
     # "Blocked: scheme '' is not allowed" instead of naming what's missing.
-    unresolved = _PLACEHOLDER_RE.search(url)
-    if unresolved:
-        key = unresolved.group(1)
-        base = key[:-2] if key.endswith("_q") else key   # {query_q} -> query
-        tool_args = spec.get("args") or []
-        hint = (f"pass {base}=<value> to the tool" if base in tool_args
-                else f"set {key} in {CONFIG_PATH.name}")
-        return (f"'{spec['name']}' has an unresolved placeholder {{{key}}} in its URL — "
-                f"{hint}.")
+    placeholder_error = _http_placeholder_error(spec, url)
+    if placeholder_error:
+        return placeholder_error
     blocked = _ssrf_check(url)
     if blocked:
         return blocked
@@ -1559,7 +1826,7 @@ def _exec_native_sandbox(command: str, timeout: int) -> str:
 
 
 def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
-    global _local_fallback_grant
+    global _local_fallback_grant, _one_shot_grant
     backend = _resolve_sandbox_backend()
     if backend == "native":
         runtime = _native_sandbox_argv()
@@ -1569,8 +1836,11 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
         )
     if backend == "docker":
         return _exec_docker_command(_process_display(argv), timeout)
-    if backend == "local" or _local_fallback_grant:
+    using_fallback_grant = _local_fallback_grant
+    if backend == "local" or using_fallback_grant:
         _local_fallback_grant = False
+        if using_fallback_grant:
+            _one_shot_grant = False
         return _exec_process(argv, timeout=timeout)
     return _local_execution_request(_process_display(argv))
 
@@ -1581,9 +1851,10 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
     workspace = str(PROJECT_ROOT)
+    container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     container_command = ["python", "-c", command] if python_code else ["sh", "-lc", command]
     argv = [
-        "docker", "run", "--rm", "--network", DOCKER_NETWORK,
+        "docker", "run", "--rm", "--name", container_name, "--network", DOCKER_NETWORK,
         "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--mount", f"type=bind,src={workspace},dst=/workspace",
@@ -1607,7 +1878,16 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                 "--mount", f"type=bind,src={empty},dst={destination},readonly",
             ])
     argv.extend(["-w", "/workspace", selected_image, *container_command])
-    return _exec_process(argv, timeout=timeout)
+    result = _exec_process(argv, timeout=timeout)
+    if "timed out" in result:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return result
 
 
 def _local_execution_request(command: str) -> str:
@@ -1624,7 +1904,7 @@ def _local_execution_request(command: str) -> str:
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
-    global _local_fallback_grant
+    global _local_fallback_grant, _one_shot_grant
     backend = _resolve_sandbox_backend()
     if backend == "native":
         local_command = (
@@ -1634,8 +1914,11 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
         return _exec_native_sandbox(local_command, timeout)
     if backend == "docker":
         return _exec_docker_command(command, timeout, python_code, image)
-    if backend == "local" or _local_fallback_grant:
+    using_fallback_grant = _local_fallback_grant
+    if backend == "local" or using_fallback_grant:
         _local_fallback_grant = False
+        if using_fallback_grant:
+            _one_shot_grant = False
         if python_code:
             return _exec_process([sys.executable, "-c", command], timeout=timeout)
         return _exec_process(command, timeout=timeout, shell=True)
@@ -1721,6 +2004,8 @@ def _exec_cron(args: dict) -> str:
                     "(minute hour day month weekday).")
         if not task:
             return "Error: cron 'add' requires a task."
+        if any(char in task for char in ("\0", "\r", "\n")):
+            return "Error: cron task must be a single line."
         agent = shutil.which("agent8088") or "agent8088"
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
                  f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
@@ -1734,6 +2019,8 @@ def _exec_cron(args: dict) -> str:
         task = str(args.get("task") or "").strip()
         if not task:
             return "Error: cron 'remove' requires the task text to match."
+        if any(char in task for char in ("\0", "\r", "\n")):
+            return "Error: cron task must be a single line."
         quoted_task = shlex.quote(task)
         payload = "\n".join(
             line for line in read_crontab().splitlines()
@@ -1755,6 +2042,7 @@ def _tool_path(spec: dict, args: dict) -> str:
 
 
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
+    global _remote_git_grant
     spec = TOOL_SPECS.get(name)
     if not spec:
         return f"Unknown tool: {name}"
@@ -1775,6 +2063,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # --- Layer 2: Network access control ---
     if mode in ("http_get", "http_post"):
         url = _safe_format(spec.get("url") or "{url}", args)
+        placeholder_error = _http_placeholder_error(spec, url)
+        if placeholder_error:
+            return placeholder_error
         blocked = _ssrf_check(url)
         if blocked:
             return blocked
@@ -1792,7 +2083,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     write_path = ""
     path_zone = "default"
     if mode == "shell":
-        argv = _structured_tool_argv(name, args)
+        try:
+            argv = _structured_tool_argv(name, args)
+        except ValueError as exc:
+            return f"Error: {exc}"
         command = _process_display(argv) if argv else _format_with_args(
             spec.get("command") or "{command}", args)
     elif mode == "write_text":
@@ -1822,11 +2116,23 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if blocked:
             return blocked
 
-    if mode == "shell" and _hard_blocked_shell(command):
+    remote_git_approved = name == "git_push" and _remote_git_grant
+    if name == "git_push" and not remote_git_approved:
+        return request_escalation(
+            target_mode="edit",
+            paths=["origin HEAD"],
+            change_type="git_remote_write",
+            reason="Push the current branch to origin? This changes a remote repository.",
+        )
+    if remote_git_approved:
+        _remote_git_grant = False
+
+    if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         return "Error: This git operation is forbidden by Agent8088's safety policy."
 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser")
-    if mode in gated_modes and not check_permission(mode, command, path_zone):
+    if mode in gated_modes and not remote_git_approved and not check_permission(
+            mode, command, path_zone, bool(spec.get("host"))):
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -1899,7 +2205,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         expression = spec.get("expression") or args.get("expression") or ""
         if expression:
             expression = _format_with_args(expression, args)
-        return str(eval(expression, {"__builtins__": {}}, {}))
+        try:
+            return str(_safe_calculate(expression))
+        except (SyntaxError, TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
+            return f"Error: invalid arithmetic expression: {exc}"
 
     if mode == "shell":
         if _structured_tool_argv(name, args):
@@ -2072,8 +2381,10 @@ def collect_secret_values(config: dict) -> list:
             continue
         candidate = os.environ.get(value, "") if key.lower().endswith("api_key_env") else value
         if (any(part in key.lower() for part in ("key", "token", "secret", "password"))
-                and len(candidate) >= 12
-                and candidate.lower() not in ("ollama", "sk-dummy", "changeme", "your-api-key")):
+                and len(candidate) >= 4
+                and candidate.lower() not in (
+                    "none", "ollama", "sk-dummy", "changeme", "your-api-key",
+                )):
             values.add(candidate)
     return sorted(values, key=len, reverse=True)
 
@@ -2263,9 +2574,10 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
             raise AgentInterrupted()
         try:
             with spin("thinking..."):
-                response = create_completion(
-                    client, messages, tools_def, temperature=temperature,
+                response = _create_completion_with_fallback(
+                    messages, tools_def, temperature=temperature,
                     system_prompt=system_prompt, on_token=on_token,
+                    interrupt_check=interrupt_check, trace=trace, turn=turn,
                 )
         except AgentInterrupted:
             raise

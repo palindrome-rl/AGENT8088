@@ -16,7 +16,7 @@ feature is reachable here:
 
 Run:  python agent8088_cli.py
 """
-import sys, os, json, stat, tempfile, time, threading, select, socket  # noqa: F401
+import sys, os, json, shlex, stat, tempfile, time, threading, select, socket  # noqa: F401
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -794,14 +794,10 @@ def parse_tool_args(raw):
     if raw.startswith("{"):
         return json.loads(raw)
     args = {}
-    for pair in raw.split():
+    for pair in shlex.split(raw):
         if "=" in pair:
             k, v = pair.split("=", 1)
-            v = v.strip()
-            # Strip surrounding quotes: "value" -> value, 'value' -> value
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
-                v = v[1:-1]
-            args[k.strip()] = v
+            args[k.strip()] = v.strip()
     return args
 
 

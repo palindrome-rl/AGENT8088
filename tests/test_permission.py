@@ -19,6 +19,7 @@ def setup_function():
     A.PERMISSION_MODE = "readonly"
     A._one_shot_grant = False
     A._local_fallback_grant = False
+    A._remote_git_grant = False
     A.SANDBOX_BACKEND = "local"
 
 def test_permission_mode_defaults_to_readonly():
@@ -183,9 +184,16 @@ def test_run_tool_allows_safe_shell_in_readonly():
     result = A.run_tool("execute_shell", {"command": "ls"})
     assert "ESCALATION_REQUEST" not in result
 
-def test_readonly_git_allows_only_inspection():
+def test_readonly_git_inspection_depends_on_sandbox(monkeypatch):
+    monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "native")
     for subcommand in ("status", "diff", "log", "show", "branch"):
         assert A.check_permission("shell", f"git {subcommand}") is True
+    monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "local")
+    for subcommand in ("status", "diff", "log", "show"):
+        assert A.check_permission("shell", f"git {subcommand}") is False
+    assert A.check_permission("shell", "git branch") is True
+    monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "docker")
+    assert A.check_permission("shell", "git show HEAD:.env", host=True) is False
     for subcommand in ("clone", "commit", "push", "reset", "checkout"):
         assert A.check_permission("shell", f"git {subcommand}") is False
 

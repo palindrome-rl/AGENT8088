@@ -115,10 +115,10 @@ def test_host_tool_still_permission_gated(engine, monkeypatch):
     assert "ESCALATION_REQUEST" in out
 
 
-def test_host_tool_still_hard_blocked(engine, monkeypatch):
+def test_host_git_push_requires_dedicated_confirmation(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     out = engine.run_tool("git_push", {})
-    assert "forbidden" in out.lower()
+    assert "ESCALATION_REQUEST:edit:git_remote_write:" in out
 
 
 def test_missing_binary_reports_actionably(engine, monkeypatch):
