@@ -1871,7 +1871,7 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     if backend == "docker":
         return _exec_docker_command(_process_display(argv), timeout)
     using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant:
+    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
         _local_fallback_grant = False
         if using_fallback_grant:
             _one_shot_grant = False
@@ -1950,7 +1950,7 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
     if backend == "docker":
         return _exec_docker_command(command, timeout, python_code, image)
     using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant:
+    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
         _local_fallback_grant = False
         if using_fallback_grant:
             _one_shot_grant = False
