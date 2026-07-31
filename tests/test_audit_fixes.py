@@ -61,6 +61,19 @@ def test_wrapped_destructive_git_is_blocked(engine, command):
     assert engine._hard_blocked_shell(command), command
 
 
+def test_windows_quoted_shell_wrappers_are_blocked(engine, monkeypatch):
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+
+    for command in (
+        "sh -c 'git push origin main'",
+        'bash -c "git reset --hard"',
+        'cmd /c "git push"',
+        'powershell -Command "git branch -D old"',
+        'sh -c "sh -c \'git stash clear\'"',
+    ):
+        assert engine._hard_blocked_shell(command), command
+
+
 @pytest.mark.parametrize("command", [
     "echo git push",
     "printf 'git reset --hard'",
@@ -382,3 +395,29 @@ def test_model_cache_is_owner_only(tmp_path, monkeypatch):
     providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
 
     assert cache.stat().st_mode & 0o777 == 0o600
+
+
+def test_windows_private_files_use_current_user_sid(engine, tmp_path, monkeypatch):
+    private = tmp_path / "private.json"
+    private.write_text("{}")
+    calls = []
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[0] == "whoami":
+            return SimpleNamespace(
+                returncode=0,
+                stdout='"FAKE-PC\\\\tester","S-1-5-21-100-200-300-400"\r\n',
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+
+    engine._protect_private_file(private)
+
+    assert calls[1][0] == [
+        "icacls", str(private), "/grant:r", "*S-1-5-21-100-200-300-400:(R,W)",
+    ]
+    assert calls[2][0] == ["icacls", str(private), "/inheritance:r"]

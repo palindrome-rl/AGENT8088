@@ -21,6 +21,52 @@ APP_DIR = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 # Config (simple key=value file)
 # ---------------------------------------------------------------------------
+def _protect_private_file(path: Path) -> None:
+    if sys.platform != "win32":
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        return
+
+    import csv
+
+    identity = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True, text=True, timeout=10,
+    )
+    try:
+        sid = next(csv.reader([identity.stdout]))[1]
+    except (IndexError, StopIteration):
+        sid = ""
+    if identity.returncode or not re.fullmatch(r"S-\d(?:-\d+)+", sid):
+        raise OSError("Could not determine the current Windows user SID.")
+    for acl_args in (
+        ["/grant:r", f"*{sid}:(R,W)"],
+        ["/inheritance:r"],
+    ):
+        result = subprocess.run(
+            ["icacls", str(path), *acl_args],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode:
+            raise OSError(f"Could not protect private file: {path}")
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, delete=False
+        ) as stream:
+            stream.write(content)
+            temporary = Path(stream.name)
+        _protect_private_file(temporary)
+        os.replace(temporary, path)
+    except Exception:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
 def load_simple_config(path: Path) -> dict:
     config = {}
     if not path.exists():
@@ -50,13 +96,7 @@ def update_simple_config(path: Path, values: dict) -> None:
             if content and not content.endswith("\n"):
                 content += "\n"
             content += line + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                     delete=False) as stream:
-        stream.write(content)
-        temporary = Path(stream.name)
-    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
-    os.replace(temporary, path)
+    _write_private_text(path, content)
 
 
 # Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
@@ -299,7 +339,10 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
             )
             for flag_index in range(index + 1, end - 1):
                 if parts[flag_index].lower() in command_flags:
-                    payload = " ".join(parts[flag_index + 1:end])
+                    payload = " ".join(parts[flag_index + 1:end]).strip()
+                    while (len(payload) >= 2 and payload[0] == payload[-1]
+                           and payload[0] in ("'", '"')):
+                        payload = payload[1:-1].strip()
                     if _hard_blocked_shell(payload, _depth + 1):
                         return True
                     break
@@ -1803,15 +1846,7 @@ def _sandbox_settings_data() -> dict:
 
 def _write_sandbox_settings() -> Path:
     path = _agent_data_dir() / "srt-settings.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, delete=False
-    ) as stream:
-        json.dump(_sandbox_settings_data(), stream, indent=2)
-        stream.write("\n")
-        temporary = Path(stream.name)
-    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
-    os.replace(temporary, path)
+    _write_private_text(path, json.dumps(_sandbox_settings_data(), indent=2) + "\n")
     return path
 
 
@@ -1873,7 +1908,8 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             sensitive_mounts += 1
             if sensitive_mounts > 128:
                 return "Error: too many sensitive workspace files to mask safely."
-            destination = Path("/workspace") / path.relative_to(PROJECT_ROOT)
+            relative = path.relative_to(PROJECT_ROOT).as_posix()
+            destination = f"/workspace/{relative}"
             argv.extend([
                 "--mount", f"type=bind,src={empty},dst={destination},readonly",
             ])
@@ -1976,15 +2012,208 @@ def _exec_docker(args: dict) -> str:
 
 _CRON_FIELD_RE = re.compile(r'^[\d\*/,\-]+$')
 _CRON_MARKER = "# agent8088"
+_WINDOWS_TASK_PREFIX = "Agent8088-"
+
+
+def _windows_schedule_args(fields: list) -> list:
+    minute, hour, day, month, weekday = fields
+    if month != "*":
+        raise ValueError("month-specific schedules")
+
+    def number(value, low, high, label):
+        if not value.isdigit() or not low <= int(value) <= high:
+            raise ValueError(label)
+        return int(value)
+
+    if day == "*" and weekday == "*" and hour == "*":
+        if minute == "*":
+            return ["/SC", "MINUTE", "/MO", "1"]
+        if minute.startswith("*/"):
+            interval = number(minute[2:], 1, 59, "minute interval")
+            return ["/SC", "MINUTE", "/MO", str(interval), "/ST", "00:00"]
+        minute_value = number(minute, 0, 59, "minute")
+        return ["/SC", "HOURLY", "/MO", "1", "/ST", f"00:{minute_value:02d}"]
+
+    minute_value = number(minute, 0, 59, "minute")
+    hour_value = number(hour, 0, 23, "hour")
+    start = f"{hour_value:02d}:{minute_value:02d}"
+    if day == "*" and weekday == "*":
+        return ["/SC", "DAILY", "/ST", start]
+    if day != "*" and weekday == "*":
+        day_value = number(day, 1, 31, "day of month")
+        return ["/SC", "MONTHLY", "/D", str(day_value), "/ST", start]
+    if day == "*" and weekday != "*":
+        names = ("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+        values = weekday.split(",")
+        if not values or any(not value.isdigit() or not 0 <= int(value) <= 7
+                             for value in values):
+            raise ValueError("weekday")
+        days = ",".join(dict.fromkeys(names[int(value)] for value in values))
+        return ["/SC", "WEEKLY", "/D", days, "/ST", start]
+    raise ValueError("combined day-of-month and weekday schedules")
+
+
+def _windows_schedule_registry_path() -> Path:
+    return _agent_data_dir() / "scheduled-tasks.json"
+
+
+def _load_windows_schedules() -> list:
+    path = _windows_schedule_registry_path()
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return entries if isinstance(entries, list) else []
+
+
+def _save_windows_schedules(entries: list) -> None:
+    _write_private_text(
+        _windows_schedule_registry_path(),
+        json.dumps(entries, indent=2) + "\n",
+    )
+
+
+def _windows_task_script(identifier: str, task: str) -> Path:
+    import base64
+
+    scripts = _agent_data_dir() / "scheduled-tasks"
+    script = scripts / f"{identifier}.ps1"
+    prompt = base64.b64encode(task.encode("utf-8")).decode("ascii")
+    cwd = str(SHELL_CWD).replace("'", "''")
+    agent = str(shutil.which("agent8088") or "agent8088").replace("'", "''")
+    content = (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"Set-Location -LiteralPath '{cwd}'\n"
+        f"$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{prompt}'))\n"
+        f"$prompt | & '{agent}'\n"
+    )
+    _write_private_text(script, content)
+    return script
+
+
+def _exec_windows_cron(action: str, schedule: str = "", task: str = "",
+                       fields: list = None) -> str:
+    import hashlib
+
+    entries = _load_windows_schedules()
+    if action == "list":
+        lines = [
+            f"{entry.get('schedule', '')} {entry.get('task', '')} {_CRON_MARKER}"
+            for entry in entries
+            if re.fullmatch(r"[0-9a-f]{16}", str(entry.get("id", "")))
+        ]
+        return "\n".join(lines) or "No scheduled tasks."
+
+    scheduler = shutil.which("schtasks.exe") or shutil.which("schtasks") or "schtasks.exe"
+    if action == "add":
+        try:
+            schedule_args = _windows_schedule_args(fields or [])
+        except ValueError as exc:
+            return f"Unsupported Windows schedule ({exc})."
+        identifier = hashlib.sha256(
+            f"{schedule}\0{task}\0{SHELL_CWD}".encode("utf-8")
+        ).hexdigest()[:16]
+        task_name = f"{_WINDOWS_TASK_PREFIX}{identifier}"
+        script = _windows_task_script(identifier, task)
+        powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or "powershell.exe"
+        task_command = (
+            f'"{powershell}" -NoProfile -NonInteractive '
+            f'-ExecutionPolicy Bypass -File "{script}"'
+        )
+        try:
+            result = subprocess.run(
+                [scheduler, "/Create", "/TN", task_name, "/TR", task_command,
+                 *schedule_args, "/RL", "LIMITED", "/IT", "/F"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            script.unlink(missing_ok=True)
+            return f"Windows scheduler error: {exc}"
+        if result.returncode:
+            script.unlink(missing_ok=True)
+            return f"Windows scheduler error: {result.stderr.strip() or result.stdout.strip()}"
+        updated = [entry for entry in entries if entry.get("id") != identifier]
+        updated.append({"id": identifier, "schedule": schedule, "task": task})
+        try:
+            _save_windows_schedules(updated)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            try:
+                subprocess.run(
+                    [scheduler, "/Delete", "/TN", task_name, "/F"],
+                    capture_output=True, text=True, timeout=20,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            script.unlink(missing_ok=True)
+            return f"Windows scheduler error: {exc}"
+        return f"Scheduled: {schedule}"
+
+    matches = [
+        entry for entry in entries
+        if entry.get("task") == task
+        and re.fullmatch(r"[0-9a-f]{16}", str(entry.get("id", "")))
+    ]
+    if not matches:
+        return "No matching scheduled task."
+    failures = []
+    removed_ids = set()
+    for entry in matches:
+        identifier = entry["id"]
+        try:
+            result = subprocess.run(
+                [scheduler, "/Delete", "/TN",
+                 f"{_WINDOWS_TASK_PREFIX}{identifier}", "/F"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failures.append(str(exc))
+            continue
+        if result.returncode:
+            failures.append(result.stderr.strip() or result.stdout.strip())
+            continue
+        removed_ids.add(identifier)
+        (_agent_data_dir() / "scheduled-tasks" / f"{identifier}.ps1").unlink(
+            missing_ok=True)
+    if removed_ids:
+        try:
+            _save_windows_schedules(
+                [entry for entry in entries if entry.get("id") not in removed_ids])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failures.append(f"could not update schedule registry: {exc}")
+    if failures:
+        return f"Windows scheduler error: {'; '.join(filter(None, failures))}"
+    return "Removed."
 
 
 def _exec_cron(args: dict) -> str:
     """Manage scheduled runs of this agent via the user's crontab.
     actions: list | add (schedule, task) | remove (task)."""
     action = str(args.get("action") or "list").strip().lower()
+    if action not in ("list", "add", "remove"):
+        return f"Unknown cron action '{action}'. Use list, add, or remove."
+    schedule = ""
+    task = ""
+    fields = []
+    if action == "add":
+        schedule = str(args.get("schedule") or "").strip()
+        task = str(args.get("task") or "").strip()
+        fields = schedule.split()
+        if len(fields) != 5 or not all(_CRON_FIELD_RE.match(field) for field in fields):
+            return ("Invalid schedule. Use 5 cron fields, e.g. '0 9 * * *' "
+                    "(minute hour day month weekday).")
+        if not task:
+            return "Error: cron 'add' requires a task."
+        if any(char in task for char in ("\0", "\r", "\n")):
+            return "Error: cron task must be a single line."
+    elif action == "remove":
+        task = str(args.get("task") or "").strip()
+        if not task:
+            return "Error: cron 'remove' requires the task text to match."
+        if any(char in task for char in ("\0", "\r", "\n")):
+            return "Error: cron task must be a single line."
 
     if sys.platform == "win32":
-        return "Cron scheduling is not available on Windows."
+        return _exec_windows_cron(action, schedule, task, fields)
 
     def read_crontab():
         result = subprocess.run(
@@ -1996,16 +2225,6 @@ def _exec_cron(args: dict) -> str:
         return "\n".join(entries) or "No scheduled tasks."
 
     if action == "add":
-        schedule = str(args.get("schedule") or "").strip()
-        task = str(args.get("task") or "").strip()
-        fields = schedule.split()
-        if len(fields) != 5 or not all(_CRON_FIELD_RE.match(f) for f in fields):
-            return ("Invalid schedule. Use 5 cron fields, e.g. '0 9 * * *' "
-                    "(minute hour day month weekday).")
-        if not task:
-            return "Error: cron 'add' requires a task."
-        if any(char in task for char in ("\0", "\r", "\n")):
-            return "Error: cron task must be a single line."
         agent = shutil.which("agent8088") or "agent8088"
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
                  f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
@@ -2016,11 +2235,6 @@ def _exec_cron(args: dict) -> str:
         return f"Scheduled: {schedule}" if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     if action == "remove":
-        task = str(args.get("task") or "").strip()
-        if not task:
-            return "Error: cron 'remove' requires the task text to match."
-        if any(char in task for char in ("\0", "\r", "\n")):
-            return "Error: cron task must be a single line."
         quoted_task = shlex.quote(task)
         payload = "\n".join(
             line for line in read_crontab().splitlines()
@@ -2032,7 +2246,7 @@ def _exec_cron(args: dict) -> str:
             ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20)
         return "Removed." if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
-    return f"Unknown cron action '{action}'. Use list, add, or remove."
+    raise AssertionError(f"Unhandled cron action: {action}")
 
 
 def _tool_path(spec: dict, args: dict) -> str:

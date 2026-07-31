@@ -13,7 +13,7 @@ git_clone|Clone a repository into a directory|mode=shell|args=url,directory|comm
 git_commit|Stage all changes and commit with a message. Only use when the user asked you to commit.|mode=shell|args=message|command=git add -A && git commit -m "{message}"|timeout=30|host=1
 git_push|Push the current branch to origin. Only use when the user asked you to push.|mode=shell|command=git push origin HEAD|timeout=120|host=1
 git_create_pr|Open a pull request with the gh CLI. Only use when the user asked for a PR.|mode=shell|args=title,body|command=gh pr create --title "{title}" --body "{body}"|timeout=120|host=1
-schedule_task|Schedule this agent to run a task periodically, or list/remove schedules. action is list, add, or remove; schedule is 5 cron fields (e.g. "0 9 * * *"); task is the query to run.|mode=cron|args=action,schedule,task|timeout=20
+schedule_task|Schedule this agent to run a task periodically, or list/remove schedules. action is list, add, or remove; schedule is 5 cron fields (e.g. "0 9 * * *"); task is the query to run. Windows uses Task Scheduler while the user is signed in and supports common minute, hourly, daily, weekly, and monthly forms.|mode=cron|args=action,schedule,task|timeout=20
 run_sandboxed|Run a Python snippet with native OS isolation and no network, using Docker only as a fallback. Use for untrusted or risky code instead of execute_shell.|mode=docker|args=code|timeout=90
 browse_page|Load a web page in a real headless browser and return its text. Handles JavaScript-rendered pages that curl cannot.|mode=browser|args=url|timeout=60
 # Search fallbacks. Their headers/body/filter live in config.txt (tool_headers.*,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exhaustive inside-out verification of Agent8088 at main (f2e5c4f).
+"""Exhaustive inside-out verification of the current Agent8088 checkout.
 
 Covers every tool, every tool mode, every sub-agent, the permission system,
 sandboxing (all backends), providers, guardrails, limits, the agent loop, and
@@ -9,9 +9,11 @@ are checked through the classifier, never executed.
 
 Run:  PYTHONPATH=src python scripts/verify_everything.py
 """
+import atexit
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -97,6 +99,7 @@ def with_mode(mode):
 
 
 TMP = Path(tempfile.mkdtemp(prefix="a8088_verify_")).resolve()
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 
 # =============================================================== 1. LOADING
 section("1. CONFIG, PATHS, AND LOADING")
@@ -577,8 +580,21 @@ ok("denies read of the active config", str(E.CONFIG_PATH.resolve()) in deny)
 ok("workspace is writable", str(E.PROJECT_ROOT) in data["filesystem"]["allowWrite"])
 sp = E._write_sandbox_settings()
 ok("settings file written", sp.exists())
-ok("settings file is owner-only (0600)", oct(sp.stat().st_mode)[-3:] == "600",
-   oct(sp.stat().st_mode)[-3:])
+if E.sys.platform == "win32":
+    sid_result = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True, text=True, timeout=10,
+    )
+    sid_match = re.search(r'"(S-\d(?:-\d+)+)"', sid_result.stdout)
+    acl_result = subprocess.run(
+        ["icacls", str(sp)], capture_output=True, text=True, timeout=10)
+    ok("settings file has a protected owner ACL",
+       bool(sid_match) and sid_match.group(1) in acl_result.stdout
+       and "(I)" not in acl_result.stdout,
+       acl_result.stdout[:80].replace("\n", " "))
+else:
+    ok("settings file is owner-only (0600)", oct(sp.stat().st_mode)[-3:] == "600",
+       oct(sp.stat().st_mode)[-3:])
 
 section("8e. SANDBOX — local fallback requires consent")
 E.SANDBOX_BACKEND = "docker"
@@ -1021,6 +1037,11 @@ ok("cron unknown action", "Unknown" in E._exec_cron({"action": "explode"}))
 # ["crontab", "-"] directly, so a shell-level mock would let a real write through.
 cron_calls = []
 _real_run = E.subprocess.run
+_real_agent_data_dir = E._agent_data_dir
+_real_protect_private_file = E._protect_private_file
+if E.sys.platform == "win32":
+    E._agent_data_dir = lambda: TMP / "windows-scheduler"
+    E._protect_private_file = lambda _path: None
 
 
 def _fake_run(command, **kwargs):
@@ -1032,18 +1053,37 @@ def _fake_run(command, **kwargs):
 
 E.subprocess.run = _fake_run
 try:
-    E._exec_cron({"action": "add", "schedule": "* * * * *", "task": "it's fine"})
-    payload = cron_calls[-1][1].get("input", "")
-    ok("cron never shells out (uses argv + stdin)",
-       cron_calls[-1][0] == ["crontab", "-"], str(cron_calls[-1][0]))
-    ok("cron quotes the task safely", "it" in payload and "fine" in payload)
-    ok("cron entry is marker-tagged", "# agent8088" in payload)
-    ok("cron schedule preserved", "* * * * *" in payload)
-    cron_calls.clear()
-    E._exec_cron({"action": "remove", "task": "anything"})
-    ok("cron remove goes through crontab argv", any("crontab" in str(c[0]) for c in cron_calls))
+    task = "it's fine"
+    E._exec_cron({"action": "add", "schedule": "* * * * *", "task": task})
+    if E.sys.platform == "win32":
+        create = next((call for call in cron_calls if "/Create" in call[0]), None)
+        script = next((TMP / "windows-scheduler" / "scheduled-tasks").glob("*.ps1"))
+        listing = E._exec_cron({"action": "list"})
+        ok("cron never shells out (uses schtasks argv)",
+           create is not None and create[0][0].lower().endswith("schtasks.exe"),
+           str(create[0][:4]) if create else "no create call")
+        ok("cron stores task text encoded", task not in script.read_text(encoding="utf-8"))
+        ok("cron entry is marker-tagged", "# agent8088" in listing)
+        ok("cron schedule preserved", "* * * * *" in listing)
+        cron_calls.clear()
+        E._exec_cron({"action": "remove", "task": task})
+        ok("cron remove goes through schtasks argv",
+           any("/Delete" in call[0] for call in cron_calls))
+    else:
+        payload = cron_calls[-1][1].get("input", "")
+        ok("cron never shells out (uses argv + stdin)",
+           cron_calls[-1][0] == ["crontab", "-"], str(cron_calls[-1][0]))
+        ok("cron quotes the task safely", "it" in payload and "fine" in payload)
+        ok("cron entry is marker-tagged", "# agent8088" in payload)
+        ok("cron schedule preserved", "* * * * *" in payload)
+        cron_calls.clear()
+        E._exec_cron({"action": "remove", "task": "anything"})
+        ok("cron remove goes through crontab argv",
+           any("crontab" in str(call[0]) for call in cron_calls))
 finally:
     E.subprocess.run = _real_run
+    E._agent_data_dir = _real_agent_data_dir
+    E._protect_private_file = _real_protect_private_file
 ok("real crontab was never modified by this harness", True, "subprocess.run mocked")
 ok("run_agent handles an empty message list",
    isinstance(E._preflight_refusal([]), (str, type(None))))
