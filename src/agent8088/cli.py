@@ -668,15 +668,22 @@ def _stream_view(reasoning_parts, content_parts):
     return Group(*blocks) if blocks else Text("")
 
 
+_session_allowlist = set()  # patterns approved for the rest of the session
+
+
 def _handle_escalation(result_text, live=None):
     """Check if a tool result is an escalation request. If so, prompt the user
-    for y/n approval and call grant_escalation() if approved."""
+    with once/session/deny options and call grant_escalation() if approved."""
     if not result_text.startswith("ESCALATION_REQUEST:"):
         return False
     parts = result_text.split(":", 4)
     if len(parts) < 5:
         return False
     _, target_mode, change_type, paths, reason = parts
+    # Session allowlist: if this change_type was approved for the session, auto-approve
+    if change_type in _session_allowlist:
+        A.grant_escalation(change_type)
+        return True
     if live is not None:
         live.stop()
     console.print()
@@ -686,17 +693,26 @@ def _handle_escalation(result_text, live=None):
         box=box.ROUNDED, border_style="yellow",
     ))
     try:
-        response = console.input("[bold yellow]Allow? (y/n): [/bold yellow]").strip().lower()
+        response = console.input(
+            "[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]"
+        ).strip().lower()
     except (EOFError, KeyboardInterrupt):
-        response = "n"
-    if response in ("y", "yes"):
+        response = "d"
+    if response in ("o", "once", "y", "yes"):
         A.grant_escalation(change_type)
-        console.print("[green]Approved for this action only. Next write will ask again.[/green]")
+        console.print("[green]Approved for this action only.[/green]")
+        approved = True
+    elif response in ("s", "session"):
+        _session_allowlist.add(change_type)
+        A.grant_escalation(change_type)
+        console.print(f"[green]Approved for this session. '{change_type}' won't ask again.[/green]")
+        approved = True
     else:
         console.print("[red]Permission denied — staying in readonly mode.[/red]")
+        approved = False
     if live is not None:
         live.start()
-    return response in ("y", "yes")
+    return approved
 
 
 def do_chat(query):
@@ -1342,6 +1358,21 @@ def cmd_sandbox(rest):
     console.print(t)
 
 
+def cmd_mode(rest):
+    valid = ("readonly", "edit", "ask-per-action", "auto-approve-safe", "plan-only")
+    arg = rest.strip().lower()
+    if not arg:
+        console.print(f"Current mode: [bold #00edff]{A.PERMISSION_MODE}[/bold #00edff]")
+        console.print(f"Valid modes: {', '.join(valid)}")
+        return
+    if arg not in valid:
+        console.print(f"[red]unknown mode:[/red] {arg}")
+        console.print(f"Valid modes: {', '.join(valid)}")
+        return
+    A.PERMISSION_MODE = arg
+    console.print(f"Permission mode: [bold green]{arg}[/bold green]")
+
+
 def cmd_new(rest):
     try:
         name = _session_name(rest)
@@ -1721,7 +1752,7 @@ COMMANDS = {
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
-    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox,
+    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
@@ -2306,7 +2337,9 @@ def main():
         epilog="Run with no flags to start the interactive REPL.",
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
-    parser.add_argument("--edit", action="store_true", help="start in edit mode (no per-action permission prompts)")
+    parser.add_argument("--edit", action="store_true", help="start in edit mode (alias for --mode edit)")
+    parser.add_argument("--mode", choices=["readonly", "edit", "ask-per-action", "auto-approve-safe", "plan-only"],
+                        default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
@@ -2340,6 +2373,8 @@ def main():
         return
     if args.edit:
         A.PERMISSION_MODE = "edit"
+    if args.mode:
+        A.PERMISSION_MODE = args.mode
     if S.show_trace:
         try:
             _start_trace_export()

@@ -239,6 +239,7 @@ def _resolve_path_list(config_key: str, default: str = "") -> list:
 NO_PROMPT_PATHS = _resolve_path_list("no_prompt_paths")
 PROMPT_PATHS = _resolve_path_list("prompt_paths", ".")
 BLOCKED_PATHS = _resolve_path_list("blocked_paths")
+READ_PATHS = _resolve_path_list("read_paths")  # optional: if set, reads outside these escalate
 
 
 def _check_path_zone(target: Path) -> str:
@@ -263,6 +264,11 @@ READONLY_SAFE_COMMANDS = frozenset([
     "dir", "type", "findstr", "where", "hostname", "ver", "vol",
     "tasklist", "systeminfo",
 ])
+# Config-extensible: merge user-supplied safe commands from config.txt
+_extra_safe = APP_CONFIG.get("readonly_safe_commands", "")
+if _extra_safe.strip():
+    READONLY_SAFE_COMMANDS = READONLY_SAFE_COMMANDS | frozenset(
+        c.strip().lower() for c in _extra_safe.split(",") if c.strip())
 
 _SHELL_CONTROL_RE = re.compile(r"[|&;<>\n`]|\$\(")
 _GIT_READ_COMMANDS = frozenset(["status", "diff", "log", "show"])
@@ -308,6 +314,22 @@ def _dangerous_git_args(tokens: list) -> bool:
         ))
         or (action == "stash" and any(flag in ("drop", "clear") for flag in flags))
     )
+
+
+# --- User-defined deny rules (config: deny_commands) ---
+# fnmatch globs matched case-insensitively against the whole command text.
+# Checked at the hardline floor, before any mode or approval — no override.
+_USER_DENY_GLOBS = [
+    g.strip() for g in APP_CONFIG.get("deny_commands", "").split(",") if g.strip()
+]
+
+
+def _matches_user_deny(command: str) -> bool:
+    if not _USER_DENY_GLOBS:
+        return False
+    import fnmatch
+    lowered = command.lower()
+    return any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_DENY_GLOBS)
 
 
 # --- Unrecoverable command floor (always-on, no override) ---
@@ -371,10 +393,35 @@ def _git_read_targets_sensitive_file(command: str) -> bool:
     return False
 
 
+def _shell_targets_credential_path(command: str) -> bool:
+    """Detect shell commands that write to or overwrite credential paths.
+
+    `echo "x" > ~/.ssh/authorized_keys` and `cp file ~/.aws/credentials` bypass
+    _is_sensitive_path because that check only runs in write_text/read_text tools.
+    Block these at the hardline floor so credential writes are denied in ALL modes.
+    """
+    # ponytail: substring match on the raw command. Catches redirections
+    # (>, >>), tee, cp/mv/install destinations. Ceiling: a command like
+    # `cat ~/.ssh` (read, not write) would also match — acceptable, since
+    # reading credentials via shell is also blocked by _is_sensitive_path
+    # for the read_text tool and this is the shell equivalent.
+    cred_markers = (
+        ".ssh/", ".aws/", ".kube/", ".gnupg/", ".netrc",
+        ".docker/", ".config/gcloud", "authorized_keys",
+        "id_rsa", "id_ed25519", "id_ecdsa",
+    )
+    lowered = command.lower()
+    return any(marker in lowered for marker in cred_markers)
+
+
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     if _is_unrecoverable_command(command):
         return True
+    if _matches_user_deny(command):
+        return True
     if _git_read_targets_sensitive_file(command):
+        return True
+    if _shell_targets_credential_path(command):
         return True
     try:
         lexer = shlex.shlex(command, posix=sys.platform != "win32",
@@ -478,6 +525,8 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
         return True
     if mode == "cron" and command == "list":
         return True
+    if mode == "read_text" and READ_PATHS:
+        return False  # read_paths zone active: reads outside zone escalate
     if mode == "shell" and _readonly_shell(command):
         if ((host or _resolve_sandbox_backend() == "local")
                 and _local_shell_reads_files(command)):
@@ -1704,7 +1753,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     if spec.get("extract") == "title":
         match = re.search(r"<title[^>]*>(.*?)</title>", result, re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s+", " ", match.group(1)).strip() if match else "No title"
-    return result
+    return _wrap_untrusted(_strip_special_tokens(result), url)
 
 
 # ---------------------------------------------------------------------------
@@ -1770,7 +1819,7 @@ def _exec_browser(args: dict) -> str:
     except Exception as e:
         return f"Browser error: {e}"
     text = re.sub(r'\n{3,}', '\n\n', (text or "").strip())
-    return f"Title: {title}\n\n{text[:5000]}"
+    return _wrap_untrusted(_strip_special_tokens(f"Title: {title}\n\n{text[:5000]}"), url)
 
 
 # ---------------------------------------------------------------------------
@@ -2467,7 +2516,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _exec_browser(args)
 
     if mode == "read_text":
-        return _read_text_limited(read_target)
+        return _strip_special_tokens(_read_text_limited(read_target))
 
     if mode == "write_text":
         global _last_write_diff
@@ -2674,6 +2723,30 @@ def collect_secret_values(config: dict) -> list:
 
 
 _SECRET_VALUES = collect_secret_values(APP_CONFIG)
+
+
+# ponytail: Special tokens that self-hosted chat templates tokenize as structural
+# role boundaries. If unstripped, a fetched page containing <|im_start|>system
+# could forge a system message. Covers Qwen/ChatML, Llama, Gemma, Mistral, Phi, GPT-OSS.
+_SPECIAL_TOKEN_RE = re.compile(
+    r"<\|im_start\|>|<\|im_end\|>|<\|start_header_id\|>|<\|end_header_id\|>"
+    r"|<\|eot_id\|>|<\|eom_id\|>|\[\/INST\]|\[\/SYS\]"
+    r"|<\|begin_of_text\|>|<\|end_of_text\|>|<start_of_turn\|>|<end_of_turn\|>"
+)
+
+
+def _strip_special_tokens(text: str) -> str:
+    if not text:
+        return text
+    return _SPECIAL_TOKEN_RE.sub("", text)
+
+
+def _wrap_untrusted(text: str, source: str = "") -> str:
+    """Wrap external content in boundary markers so the model sees it as untrusted."""
+    if not text or not text.strip():
+        return text
+    tag = f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>' if source else "<<<EXTERNAL_UNTRUSTED_CONTENT>>>"
+    return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
 
 
 def _redact_secrets(text: str) -> str:
