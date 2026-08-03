@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 ---
 
@@ -30,6 +30,7 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 - **Tool alias resolution** — model can call `bash`/`mkdir`/`cat` naturally
 - **Tool arg transforms** — `mkdir({path:...})` auto-converts to `execute_shell({command:...})`
 - **SkillOpt** — self-improving agent skills via text-space optimization
+- **MCP client** — connect stdio and Streamable HTTP MCP servers as Agent8088 tools
 
 ---
 
@@ -148,6 +149,11 @@ Run with no flags to start the interactive REPL.
 | `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
 | `/model <provider:model>` | Switch provider + model (e.g. `/model cerebras:gpt-oss-120b`); `/model setup` adds/updates a provider |
 | `/models [provider]` | Fuzzy searchable model picker — lists + switches models from active or specified provider |
+| `/mcp` | Show MCP server status and discovered tools |
+| `/mcp reload` | Reconnect MCP servers after editing configuration |
+| `/mcp add <name> stdio <command> [args...] [--project]` | Add a local MCP server |
+| `/mcp add <name> http <url> [--project]` | Add a Streamable HTTP MCP server |
+| `/mcp remove <name> [--project]` | Remove a configured MCP server |
 | `/sandbox [auto\|native\|docker\|local\|setup]` | Show, install, or select command isolation |
 | `/config` | Show active config + config file path |
 | `/system` | Show the full system prompt |
@@ -178,6 +184,36 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
+
+### MCP servers
+
+Agent8088 discovers MCP tools at startup from two JSON files, matching the useful
+Claude/Hermes split: `~/.agent8088/mcp.json` for private servers and
+`.agent8088/mcp.json` at the project root for shared servers. A project definition
+with the same name replaces the user definition. Run `/mcp` to inspect servers and
+`/mcp reload` after editing either file.
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "env": {"LOG_LEVEL": "warn"},
+      "tools": {"include": ["list_directory", "read_file"]}
+    },
+    "company": {
+      "url": "https://mcp.example.com/mcp",
+      "bearer_token_env": "COMPANY_MCP_TOKEN",
+      "tools": {"exclude": ["delete_*"]}
+    }
+  }
+}
+```
+
+MCP tool names are registered as `mcp_<server>_<tool>`. Stdio receives only a
+minimal operating-system environment plus the explicit `env` entries above. Tools
+without the server's `readOnlyHint` require the normal Agent8088 one-shot approval.
 
 ### Environment Variables
 

@@ -890,6 +890,11 @@ def cmd_help(_):
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
         ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
+        ("/mcp", "List MCP servers, connection state, errors, and discovered tools"),
+        ("/mcp reload", "Reconnect MCP servers after changing configuration"),
+        ("/mcp add <name> stdio <command> [args...] [--project]", "Add a local MCP server"),
+        ("/mcp add <name> http <url> [--project]", "Add a Streamable HTTP MCP server"),
+        ("/mcp remove <name> [--project]", "Remove an MCP server from the selected scope"),
         ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
@@ -930,6 +935,50 @@ def cmd_tools(_):
         args = ", ".join(spec.get("args") or []) or "—"
         t.add_row(name, args, spec.get("mode", "?"), spec.get("description", ""))
     console.print(t)
+
+
+def cmd_mcp(rest):
+    """Manage MCP servers without introducing a second configuration format."""
+    parts = shlex.split(rest or "")
+    action = parts.pop(0).lower() if parts else "list"
+    if action == "reload":
+        A.reload_mcp_tools()
+    elif action == "add" and len(parts) >= 3:
+        name, transport, target, *extra = parts
+        project = "--project" in extra
+        extra = [item for item in extra if item != "--project"]
+        config = ({"command": target, "args": extra} if transport == "stdio" else {"url": target} if transport == "http" else None)
+        if config is None:
+            console.print("[red]Usage:[/red] /mcp add <name> stdio <command> [args...] [--project] | http <url> [--project]")
+            return
+        try:
+            A.MCP_RUNTIME.set_server(name, config, project=project)
+            A.reload_mcp_tools()
+        except Exception as exc:
+            console.print(f"[red]MCP add failed:[/red] {exc}")
+            return
+    elif action == "remove" and parts:
+        try:
+            removed = A.MCP_RUNTIME.remove_server(parts[0], project="--project" in parts[1:])
+            A.reload_mcp_tools()
+            console.print("[green]removed[/green]" if removed else "[yellow]server was not configured in that scope[/yellow]")
+            return
+        except Exception as exc:
+            console.print(f"[red]MCP remove failed:[/red] {exc}")
+            return
+    elif action not in {"list", "status"}:
+        console.print("[red]Usage:[/red] /mcp [reload|add|remove]")
+        return
+    table = Table(title="MCP Servers", box=box.SIMPLE, title_style="bold #00edff", header_style="bold #00edff", border_style="#0077B6")
+    table.add_column("Server", style="#237dd7")
+    table.add_column("State", style="#237dd7")
+    table.add_column("Tools", style="#237dd7")
+    for name, status in sorted(A.MCP_RUNTIME.statuses.items()):
+        detail = ", ".join(status.get("tools", [])) or status.get("error", "—")
+        table.add_row(name, status["state"], detail)
+    if not A.MCP_RUNTIME.statuses:
+        table.add_row("none", "—", "Add one: /mcp add <name> stdio <command> [args...]")
+    console.print(table)
 
 
 def cmd_skills(rest):
@@ -1348,6 +1397,8 @@ def cmd_status(_):
     t.add_row("Model", f"{active}:{A.MODEL_NAME}")
     t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
+    connected = sum(item.get("state") == "connected" for item in A.MCP_RUNTIME.statuses.values())
+    t.add_row("MCP", f"{connected} connected · {sum(len(item.get('tools', [])) for item in A.MCP_RUNTIME.statuses.values())} tools")
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['requested']}) · network {sandbox['network']}")
@@ -1826,7 +1877,7 @@ COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "skills": cmd_skills,
-    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
+    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config, "system": cmd_system,
     "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,

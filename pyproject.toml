@@ -6,11 +6,12 @@ build-backend = "hatchling.build"
 name = "agent8088"
 version = "0.2.0"
 description = "Agent8088 - Local AI Assistant"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0.0",
     "rich>=13.0.0",
     "InquirerPy>=0.3.4",
+    "mcp>=1.27,<2",
 ]
 
 [project.optional-dependencies]

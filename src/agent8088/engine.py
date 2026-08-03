@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid  # readline enables input history
+import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
     import readline  # Unix-only; enables input history/editing
 except ImportError:
@@ -14,6 +14,7 @@ except ImportError:
 from contextlib import nullcontext
 from pathlib import Path
 from openai import OpenAI
+from agent8088.mcp import MCPRuntime
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -1248,31 +1249,50 @@ def load_tool_specs(path: Path, config: dict) -> dict:
 def build_tools_def(tool_specs: dict) -> list:
     result = []
     for name, spec in tool_specs.items():
-        props = {}
-        for param in spec["args"]:
-            # Tools can declare a param type via arg_types=<param>:<type> in tools.txt
-            # Default is "string"; execute_plan uses "array" for its steps param.
-            arg_types = spec.get("arg_types", {})
-            props[param] = {"type": arg_types.get(param, "string")}
+        # MCP tools declare their own parameters schema; built-in tools use args + arg_types
+        if "parameters" in spec:
+            params = spec["parameters"]
+        else:
+            props = {}
+            for param in spec["args"]:
+                arg_types = spec.get("arg_types", {})
+                props[param] = {"type": arg_types.get(param, "string")}
+            params = {"type": "object", "properties": props,
+                      "required": list(spec["args"])}
         result.append({
             "type": "function",
             "function": {
                 "name": name,
                 "description": spec["description"],
-                "parameters": {
-                    "type": "object",
-                    "properties": props,
-                    "required": list(spec["args"]),
-                },
+                "parameters": params,
             },
         })
     return result
 
 
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
+MCP_RUNTIME = MCPRuntime(PROJECT_ROOT)
+TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
 TOOLS_DEF = build_tools_def(TOOL_SPECS)
 TOOL_NAMES = set(TOOL_SPECS.keys())
 TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+
+
+def reload_mcp_tools():
+    """Reconnect MCP servers and refresh their registered tools."""
+    global TOOLS_DEF, TOOL_NAMES, TOOL_REQUIRED_PARAMS, SYSTEM_PROMPT
+    for name, spec in list(TOOL_SPECS.items()):
+        if spec.get("mode") == "mcp":
+            TOOL_SPECS.pop(name)
+    TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
+    TOOLS_DEF = build_tools_def(TOOL_SPECS)
+    TOOL_NAMES = set(TOOL_SPECS)
+    TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+    SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS) + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE)
+    return MCP_RUNTIME.statuses
+
+
+atexit.register(MCP_RUNTIME.close)
 
 TOOL_ALIASES = {
     "bash": "execute_shell", "sh": "execute_shell",
@@ -2669,6 +2689,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         blocked = _ssrf_check(command)
         if blocked:
             return blocked
+    elif mode == "mcp":
+        command = f"{spec['mcp_server']}:{spec['mcp_tool']}"
 
     remote_git_approved = name == "git_push" and _remote_git_grant
     if name == "git_push" and not remote_git_approved:
@@ -2684,7 +2706,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         return "Error: This git operation is forbidden by Agent8088's safety policy."
 
-    gated_modes = ("write_text", "shell", "docker", "cron", "browser")
+    gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
+    if mode == "mcp" and spec.get("mcp_read_only"):
+        gated_modes = tuple(item for item in gated_modes if item != "mcp")
     if mode in gated_modes and not remote_git_approved and not check_permission(
             mode, command, path_zone, bool(spec.get("host"))):
         if PERMISSION_MODE == "plan-only" and allow_plan:
@@ -2704,11 +2728,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             paths_str = command
         elif mode == "browser":
             paths_str = command[:120]
+        elif mode == "mcp":
+            paths_str = command
         sandbox_missing = mode in ("shell", "docker") and _resolve_sandbox_backend() == "unavailable"
         change_type = {
             "write_text": "new_file",
             "cron": "scheduled_task",
             "browser": "network_request",
+            "mcp": "mcp_tool",
         }.get(mode, "local_execution" if sandbox_missing else "filesystem_op")
         reason = (
             f"Tool '{name}' needs permission and no sandbox is available. "
@@ -2745,6 +2772,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "browser":
         return _exec_browser(args)
+
+    if mode == "mcp":
+        return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
 
     if mode == "read_text":
         return _strip_special_tokens(_read_text_limited(read_target))
@@ -3004,6 +3034,15 @@ def _redact_secrets(text: str) -> str:
         if v in text:
             text = text.replace(v, "[redacted]")
     return text
+
+
+_MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
+
+
+def _wrap_untrusted(text: str, source: str) -> str:
+    """MCP responses are external data, never instructions for the agent."""
+    text = _MCP_SPECIAL_TOKENS.sub("", text or "")
+    return f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>\n{text}\n<<<END_UNTRUSTED_CONTENT>>>'
 
 
 # Distinctive lines of the base system prompt, used to detect a verbatim leak.
