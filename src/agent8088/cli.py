@@ -1435,6 +1435,8 @@ def cmd_mode(rest):
         console.print(f"Valid modes: {', '.join(valid)}")
         return
     A.PERMISSION_MODE = arg
+    # Clear plan execution grant when leaving plan-only mode
+    A._plan_execution_grant = False
     console.print(f"Permission mode: [bold green]{arg}[/bold green]")
 
 

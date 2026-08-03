@@ -519,8 +519,8 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
-    if _plan_execution_grant and mode in ("write_text", "shell", "docker", "cron", "browser"):
-        return True  # temporary grant for approved plan steps — mode stays plan-only
+    if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser"):
+        return True  # temporary grant for approved plan steps — only in plan-only mode
     if PERMISSION_MODE in ("edit", "full-auto"):
         return True
     if PERMISSION_MODE == "plan-only":
