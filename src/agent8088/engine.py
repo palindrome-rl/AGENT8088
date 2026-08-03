@@ -310,7 +310,72 @@ def _dangerous_git_args(tokens: list) -> bool:
     )
 
 
+# --- Unrecoverable command floor (always-on, no override) ---
+# Catastrophic commands that are blocked in ALL permission modes, including
+# edit mode. These cause irreversible damage: filesystem wipes, disk formats,
+# fork bombs, and remote-code-execution via pipe-to-shell at the root level.
+_UNRECOVERABLE_PATTERNS = [
+    # rm -rf / — wipe filesystem root (any flag order, --no-preserve-root, long/short)
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
+    # rm -rf ~ — wipe home dir
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?~(?:\s|$)"),
+    re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
+    re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
+    # pipe remote content to shell (curl/wget ... | sh|bash)
+    re.compile(r"\b(?:curl|wget)\b[^|;&<>]*\|\s*(?:sh|bash|dash|zsh|ksh)\b"),
+    re.compile(r"\b(?:sh|bash|dash|zsh|ksh)\s*<\s*\(\s*(?:curl|wget)\s+"),
+]
+
+
+def _is_unrecoverable_command(command: str) -> bool:
+    """Return True if the command matches an unrecoverable pattern.
+
+    Checked before _hard_blocked_shell's git/wrapper logic so these patterns
+    are caught even when the command is wrapped (bash -c 'rm -rf /') — the
+    recursive _hard_blocked_shell call re-enters here for wrapped payloads.
+    """
+    for pattern in _UNRECOVERABLE_PATTERNS:
+        if pattern.search(command):
+            return True
+    return False
+
+
+def _git_read_targets_sensitive_file(command: str) -> bool:
+    """Detect git read commands (show/diff/log) that target sensitive files.
+
+    `git show HEAD:.env` and `git diff -- .env` bypass _is_sensitive_path
+    because that check only runs in the read_text tool, not shell commands.
+    Block these at the hardline floor so they're denied in ALL modes.
+    """
+    parts = _shell_parts(command)
+    if not parts or len(parts) < 3:
+        return False
+    if Path(parts[0]).stem.lower() != "git":
+        return False
+    action = parts[1].lower()
+    if action not in _GIT_READ_COMMANDS:
+        return False
+    # ponytail: scan non-flag tokens for sensitive paths.
+    # `git show HEAD:.env` -> tokens after action: ["HEAD:.env"]
+    # `git diff -- .env` -> tokens: ["--", ".env"]
+    for token in parts[2:]:
+        if token.startswith("-"):
+            continue
+        # `git show` uses `<rev>:<path>` form — extract the path part
+        path_candidate = token.split(":", 1)[-1] if ":" in token else token
+        if not path_candidate or path_candidate in ("--",):
+            continue
+        if _is_sensitive_path(path_candidate):
+            return True
+    return False
+
+
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
+    if _is_unrecoverable_command(command):
+        return True
+    if _git_read_targets_sensitive_file(command):
+        return True
     try:
         lexer = shlex.shlex(command, posix=sys.platform != "win32",
                             punctuation_chars=";&|")

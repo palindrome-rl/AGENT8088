@@ -33,7 +33,6 @@ def test_resolve_user_path_accepts_path_objects(engine, tmp_path, monkeypatch):
     "git status",
     "git diff",
     "git log -p",
-    "git show HEAD:.env",
 ])
 def test_readonly_local_git_reads_require_approval(engine, monkeypatch, command):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
@@ -45,6 +44,19 @@ def test_readonly_local_git_reads_require_approval(engine, monkeypatch, command)
 
     assert "ESCALATION_REQUEST" in engine.run_tool(
         "execute_shell", {"command": command})
+
+
+def test_git_read_of_sensitive_file_is_hard_blocked(engine, monkeypatch):
+    """git show/diff targeting a sensitive file (e.g. .env) is hard-blocked
+    at the always-on floor — no escalation possible, denied in ALL modes."""
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+    monkeypatch.setattr(
+        engine, "_exec_sandbox_command",
+        lambda *_args, **_kwargs: pytest.fail("sensitive git read must not execute"),
+    )
+    result = engine.run_tool("execute_shell", {"command": "git show HEAD:.env"})
+    assert "ESCALATION_REQUEST" not in result
+    assert "forbidden" in result.lower() or "denied" in result.lower() or "safety policy" in result.lower()
 
 
 @pytest.mark.parametrize("command", [
