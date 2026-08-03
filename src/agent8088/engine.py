@@ -180,6 +180,9 @@ PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
 _one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
 _local_fallback_grant = False
 _remote_git_grant = False
+_plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
+_plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
+_plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -516,8 +519,20 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
-    if PERMISSION_MODE == "edit":
+    if _plan_execution_grant and mode in ("write_text", "shell", "docker", "cron", "browser"):
+        return True  # temporary grant for approved plan steps — mode stays plan-only
+    if PERMISSION_MODE in ("edit", "full-auto"):
         return True
+    if PERMISSION_MODE == "plan-only":
+        if mode == "plan":
+            return True
+        if mode in ("read_text", "last_output", "python_eval"):
+            return True
+        if mode == "shell" and _readonly_shell(command):
+            return True
+        if mode == "cron" and command == "list":
+            return True
+        return False
     if mode == "write_text" and path_zone == "no_prompt":
         return True
     # readonly mode
@@ -1058,7 +1073,19 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "path_arg": g("path_arg", "tool_path_arg", "filename"),
         "content_arg": g("content_arg", "tool_content_arg", "content"),
         "timeout": int(g("timeout", "tool_timeout", "25")),
+        "arg_types": _parse_arg_types(g("arg_types", "tool_arg_types")),
     }
+
+
+def _parse_arg_types(raw: str) -> dict:
+    """Parse 'steps:array,filename:string' into {'steps': 'array', 'filename': 'string'}."""
+    result = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            result[k.strip()] = v.strip()
+    return result
 
 
 def load_tool_specs(path: Path, config: dict) -> dict:
@@ -1082,18 +1109,27 @@ def load_tool_specs(path: Path, config: dict) -> dict:
 
 
 def build_tools_def(tool_specs: dict) -> list:
-    return [{
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": spec["description"],
-            "parameters": {
-                "type": "object",
-                "properties": {param: {"type": "string"} for param in spec["args"]},
-                "required": list(spec["args"]),
+    result = []
+    for name, spec in tool_specs.items():
+        props = {}
+        for param in spec["args"]:
+            # Tools can declare a param type via arg_types=<param>:<type> in tools.txt
+            # Default is "string"; execute_plan uses "array" for its steps param.
+            arg_types = spec.get("arg_types", {})
+            props[param] = {"type": arg_types.get(param, "string")}
+        result.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["description"],
+                "parameters": {
+                    "type": "object",
+                    "properties": props,
+                    "required": list(spec["args"]),
+                },
             },
-        },
-    } for name, spec in tool_specs.items()]
+        })
+    return result
 
 
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
@@ -1536,9 +1572,45 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             steps = [s.strip(" -") for s in raw.splitlines() if s.strip()]
     if not isinstance(steps, list):
         return "Error: execute_plan requires a list of steps or newline plan text."
+    if not steps:
+        return ("Error: execute_plan requires a non-empty steps array. "
+                'Pass steps as a JSON array, e.g.: [{"tool":"write_file",'
+                '"arguments":{"filename":"C:/tmp/x.txt","content":"hi"}}]')
+
+    total = len(steps)
+
+    # In plan-only mode: show all steps as pending, then get approval BEFORE running.
+    # On approve: set _plan_execution_grant so steps run without per-step prompts,
+    # but PERMISSION_MODE stays plan-only (temporary grant, not a mode switch).
+    global _plan_execution_grant
+    if PERMISSION_MODE == "plan-only" and on_step and on_escalation:
+        pre_parsed = []
+        has_gated = False
+        for idx, step in enumerate(steps, 1):
+            if isinstance(step, dict):
+                step_text = str(step.get("step") or step.get("text") or "")
+                tool_name = str(step.get("tool") or classify_plan_component(step_text))
+            else:
+                step_text = str(step)
+                tool_name = classify_plan_component(step_text)
+            spec = TOOL_SPECS.get(tool_name, {})
+            if spec.get("mode") in ("write_text", "shell", "docker", "cron", "browser"):
+                has_gated = True
+            pre_parsed.append((idx, step_text, tool_name))
+        for idx, step_text, tool_name in pre_parsed:
+            on_step(idx, total, step_text, tool_name, "pending", None)
+        if has_gated:
+            approved = on_escalation(
+                request_escalation(
+                    "edit", ["(plan)"], "plan_approval",
+                    f"Plan has {total} step(s). Review the checklist above and approve to execute."
+                )
+            )
+            if not approved:
+                return "Plan denied — staying in plan-only mode."
+            _plan_execution_grant = True
 
     outputs = []
-    total = len(steps)
     for idx, step in enumerate(steps, 1):
         if isinstance(step, dict):
             step_text = str(step.get("step") or step.get("text") or "")
@@ -1576,6 +1648,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         if on_step:
             on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
+    _plan_execution_grant = False  # clear temporary grant — back to plan-only
     return "\n".join(outputs)
 
 
@@ -2380,6 +2453,20 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     mode = (spec.get("mode") or "").lower()
     timeout = int(spec.get("timeout") or 25)
 
+    # --- Plan-only early gate: block gated tools BEFORE arg validation ---
+    # Without this, write_file() with no args returns "write tool requires a file path"
+    # instead of telling the model to use execute_plan — the model never learns why.
+    # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
+    # to the normal check_permission gate so it escalates properly.
+    if (PERMISSION_MODE == "plan-only"
+            and allow_plan
+            and mode in ("write_text", "shell", "docker", "cron", "browser")):
+        return ("Error: plan-only mode — direct tool execution blocked. "
+                "Call the execute_plan tool with a JSON steps array, e.g.: "
+                'execute_plan(steps=[{"tool":"write_file",'
+                '"arguments":{"filename":"C:/tmp/x.txt","content":"hi"}}]) '
+                "Do NOT describe the plan in prose — call execute_plan as a tool call.")
+
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
     if mode == "read_text":
@@ -2463,6 +2550,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser")
     if mode in gated_modes and not remote_git_approved and not check_permission(
             mode, command, path_zone, bool(spec.get("host"))):
+        if PERMISSION_MODE == "plan-only" and allow_plan:
+            return ("Error: plan-only mode — direct tool execution blocked. "
+                    "Call the execute_plan tool with a JSON steps array, e.g.: "
+                    'execute_plan(steps=[{"tool":"write_file",'
+                    '"arguments":{"filename":"/tmp/x","content":"hi"}}]) '
+                    "Do NOT describe the plan in prose — call execute_plan as a tool call.")
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -2501,7 +2594,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "plan":
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
-        return _exec_plan(args, depth=depth)
+        return _exec_plan(args, on_step=_plan_on_step,
+                          on_escalation=_plan_on_escalation, depth=depth)
 
     if mode == "subagent":
         return _exec_subagent(args, depth=depth)
@@ -2607,8 +2701,11 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
         except Exception:
             pass
     # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}
+    # Greedy match (\{.*\}) captures nested JSON braces — non-greedy (\{.*?\})
+    # stops at the first }, truncating args like {"steps": "[{\"tool\": ...}]"}
+    # and causing the args to fail parsing, falling through to empty-args match.
     if not calls:
-        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*?\})', text, re.DOTALL)
+        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*\})', text, re.DOTALL)
         if m:
             try:
                 resolved = _resolve_tool_name(m.group(1))

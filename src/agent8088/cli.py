@@ -314,8 +314,24 @@ def _active_provider_name():
 
 def _session_system_prompt():
     specs = _active_tool_specs()
-    return (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
-            + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE))
+    prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
+              + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE))
+    # Inject current permission mode so the model knows what it can/can't do right now
+    prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
+    if A.PERMISSION_MODE == "plan-only":
+        prompt += ("You are in plan-only mode RIGHT NOW. Direct writes and mutations "
+                   "are BLOCKED — do NOT call write_file, execute_shell, git_commit, "
+                   "git_push, run_sandboxed, schedule_task, or browse_page directly. "
+                   "Use read_text and safe shell commands (ls, cat, grep, git status, "
+                   "git diff, git log) to gather information, then call execute_plan "
+                   "with a steps array to execute your plan.\n")
+    elif A.PERMISSION_MODE in ("edit", "full-auto"):
+        prompt += ("You are in full-auto mode. All tools are allowed without prompts. "
+                   "Catastrophic commands and credential path writes are still blocked.\n")
+    else:
+        prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
+                   "Writes and mutations require user approval.\n")
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +689,11 @@ _session_allowlist = set()  # patterns approved for the rest of the session
 
 def _handle_escalation(result_text, live=None):
     """Check if a tool result is an escalation request. If so, prompt the user
-    with once/session/deny options and call grant_escalation() if approved."""
+    with once/session/deny options and call grant_escalation() if approved.
+
+    In plan-only mode, offers a mode-switch choice (full-auto/readonly/deny)
+    instead of once/session/deny — matches Claude Code's 'exit plan = pick
+    destination mode' pattern."""
     if not result_text.startswith("ESCALATION_REQUEST:"):
         return False
     parts = result_text.split(":", 4)
@@ -692,24 +712,39 @@ def _handle_escalation(result_text, live=None):
         title="[bold yellow]Permission Escalation Request[/bold yellow]",
         box=box.ROUNDED, border_style="yellow",
     ))
-    try:
-        response = console.input(
-            "[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]"
-        ).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        response = "d"
-    if response in ("o", "once", "y", "yes"):
-        A.grant_escalation(change_type)
-        console.print("[green]Approved for this action only.[/green]")
-        approved = True
-    elif response in ("s", "session"):
-        _session_allowlist.add(change_type)
-        A.grant_escalation(change_type)
-        console.print(f"[green]Approved for this session. '{change_type}' won't ask again.[/green]")
-        approved = True
+    if A.PERMISSION_MODE == "plan-only":
+        try:
+            response = console.input(
+                "[bold yellow]Approve plan? (a=approve / d=deny): [/bold yellow]"
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            response = "d"
+        if response in ("a", "approve", "y", "yes"):
+            A.grant_escalation(change_type)
+            console.print("[green]Plan approved. Steps will run.[/green]")
+            approved = True
+        else:
+            console.print("[red]Plan denied — staying in plan-only mode.[/red]")
+            approved = False
     else:
-        console.print("[red]Permission denied — staying in readonly mode.[/red]")
-        approved = False
+        try:
+            response = console.input(
+                "[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]"
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            response = "d"
+        if response in ("o", "once", "y", "yes"):
+            A.grant_escalation(change_type)
+            console.print("[green]Approved for this action only.[/green]")
+            approved = True
+        elif response in ("s", "session"):
+            _session_allowlist.add(change_type)
+            A.grant_escalation(change_type)
+            console.print(f"[green]Approved for this session. '{change_type}' won't ask again.[/green]")
+            approved = True
+        else:
+            console.print("[red]Permission denied — staying in readonly mode.[/red]")
+            approved = False
     if live is not None:
         live.start()
     return approved
@@ -751,6 +786,31 @@ def do_chat(query):
         def _on_escalation(_name, result):
             return _handle_escalation(result, live)
 
+        # Wire plan execution callbacks so execute_plan tool calls render the
+        # checklist and route write-step escalations to the approval menu.
+        _plan_steps_state = {}
+        _PLAN_ICONS_LOCAL = {"pending": ("○", "#237dd7"), "running": ("◐", "#237dd7"), "done": ("✓", "#237dd7")}
+
+        def _plan_on_step(idx, total, step_text, tool_name, status, result):
+            _plan_steps_state[idx] = (step_text, tool_name, status)
+            rows = []
+            for i in sorted(_plan_steps_state):
+                st_text, st_tool, st_status = _plan_steps_state[i]
+                icon, style = _PLAN_ICONS_LOCAL[st_status]
+                row = Text()
+                row.append(f"{icon} ", style=style)
+                row.append(f"[{i}] ", style="dim")
+                row.append(f"{st_tool}: ", style="bold")
+                row.append(st_text[:70])
+                rows.append(row)
+            live.update(Group(*rows) if rows else Text("planning..."))
+
+        def _plan_on_escalation(escalation_text):
+            return _handle_escalation(escalation_text, live)
+
+        A._plan_on_step = _plan_on_step
+        A._plan_on_escalation = _plan_on_escalation
+
         try:
             answer = A.run_agent(
                 S.messages, max_turns=S.max_turns, temperature=S.temperature,
@@ -766,6 +826,8 @@ def do_chat(query):
             answer = None
         finally:
             A.subagent_ui = None
+            A._plan_on_step = None
+            A._plan_on_escalation = None
 
     elapsed = time.time() - turn_start
     if answer is None:
@@ -1359,8 +1421,11 @@ def cmd_sandbox(rest):
 
 
 def cmd_mode(rest):
-    valid = ("readonly", "edit", "ask-per-action", "auto-approve-safe", "plan-only")
+    valid = ("readonly", "full-auto", "plan-only")
     arg = rest.strip().lower()
+    # Backward-compat: "edit" is an alias for "full-auto"
+    if arg == "edit":
+        arg = "full-auto"
     if not arg:
         console.print(f"Current mode: [bold #00edff]{A.PERMISSION_MODE}[/bold #00edff]")
         console.print(f"Valid modes: {', '.join(valid)}")
@@ -2337,8 +2402,9 @@ def main():
         epilog="Run with no flags to start the interactive REPL.",
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
-    parser.add_argument("--edit", action="store_true", help="start in edit mode (alias for --mode edit)")
-    parser.add_argument("--mode", choices=["readonly", "edit", "ask-per-action", "auto-approve-safe", "plan-only"],
+    parser.add_argument("--edit", action="store_true", help="start in full-auto mode (alias for --mode full-auto)")
+    parser.add_argument("--full-auto", action="store_true", help="start in full-auto mode (no per-action permission prompts)")
+    parser.add_argument("--mode", choices=["readonly", "full-auto", "plan-only"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
@@ -2371,8 +2437,8 @@ def main():
     if args.gateway_setup:
         _run_gateway_setup()
         return
-    if args.edit:
-        A.PERMISSION_MODE = "edit"
+    if args.edit or args.full_auto:
+        A.PERMISSION_MODE = "full-auto"
     if args.mode:
         A.PERMISSION_MODE = args.mode
     if S.show_trace:
