@@ -187,22 +187,29 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 
 ### MCP servers
 
-Agent8088 discovers MCP tools at startup from two JSON files, matching the useful
-Claude/Hermes split: `~/.agent8088/mcp.json` for private servers and
-`.agent8088/mcp.json` at the project root for shared servers. A project definition
-with the same name replaces the user definition. Run `/mcp` to inspect servers and
-`/mcp reload` after editing either file.
+Agent8088 discovers MCP tools at startup from standard `mcp.json` configuration files (using the standard `mcpServers` structure compatible with standard MCP clients):
+- `~/.agent8088/mcp.json` for user-level global servers.
+- `.agent8088/mcp.json` at the project root for project-specific servers.
+
+A project server definition with the same name overrides the user-level definition. Run `/mcp` to inspect configured servers and `/mcp reload` after editing configuration.
 
 ```json
 {
   "mcpServers": {
+    "supabase": {
+      "command": "npx",
+      "args": ["-y", "@supabase/mcp-server-supabase@latest", "--project-ref", "YOUR_PROJECT_REF"],
+      "env": {
+        "SUPABASE_ACCESS_TOKEN": "YOUR_SUPABASE_ACCESS_TOKEN"
+      }
+    },
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/allowed/path"],
       "env": {"LOG_LEVEL": "warn"},
       "tools": {"include": ["list_directory", "read_file"]}
     },
-    "company": {
+    "remote-service": {
       "url": "https://mcp.example.com/mcp",
       "bearer_token_env": "COMPANY_MCP_TOKEN",
       "tools": {"exclude": ["delete_*"]}
@@ -211,9 +218,7 @@ with the same name replaces the user definition. Run `/mcp` to inspect servers a
 }
 ```
 
-MCP tool names are registered as `mcp_<server>_<tool>`. Stdio receives only a
-minimal operating-system environment plus the explicit `env` entries above. Tools
-without the server's `readOnlyHint` require the normal Agent8088 one-shot approval.
+MCP tool names are registered dynamically as `mcp_<server>_<tool>`. Stdio server processes receive a minimal OS environment supplemented by any explicit `env` entries. Tools without the server's `readOnlyHint` require normal Agent8088 one-shot approval.
 
 ### Environment Variables
 
