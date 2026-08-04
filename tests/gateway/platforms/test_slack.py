@@ -38,8 +38,9 @@ def test_markdown_to_slack_code_preserved():
     assert "`inline`" in markdown_to_slack("has `inline` code")
 
 
-def test_slack_adapter_reads_config_dict():
+def test_slack_adapter_reads_config_dict(tmp_path, monkeypatch):
     from agent8088.gateway.platforms.slack import SlackAdapter
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
     config = {
         "slack_bot_token": "xoxb-test",
         "slack_app_token": "xapp-test",

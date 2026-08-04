@@ -32,8 +32,9 @@ def test_markdown_to_discord_code_preserved():
     assert "`inline`" in markdown_to_discord("has `inline` code")
 
 
-def test_discord_adapter_reads_config_dict():
+def test_discord_adapter_reads_config_dict(tmp_path, monkeypatch):
     from agent8088.gateway.platforms.discord import DiscordAdapter
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
     config = {
         "discord_bot_token": "test-token",
         "discord_allowed_users": "123456789",
@@ -42,8 +43,9 @@ def test_discord_adapter_reads_config_dict():
     assert adapter._token == "test-token"
 
 
-def test_discord_make_stream_sink():
+def test_discord_make_stream_sink(tmp_path, monkeypatch):
     from agent8088.gateway.platforms.discord import DiscordAdapter, DiscordStreamSink
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
     config = {"discord_bot_token": "test-token"}
     adapter = DiscordAdapter(config, runner=None)
     sink = adapter.make_stream_sink("123")
@@ -51,8 +53,9 @@ def test_discord_make_stream_sink():
     assert sink.chat_id == "123"
 
 
-def test_discord_adapter_supports_streaming():
+def test_discord_adapter_supports_streaming(tmp_path, monkeypatch):
     from agent8088.gateway.platforms.discord import DiscordAdapter
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
     config = {"discord_bot_token": "test-token"}
     adapter = DiscordAdapter(config, runner=None)
     assert adapter.supports_streaming() is True

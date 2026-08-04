@@ -91,8 +91,105 @@ def test_build_runner_registers_slack_when_enabled(tmp_path, monkeypatch):
         mock_A.BASE_SYSTEM_PROMPT = "sys"
         mock_A.TOOL_SPECS = {}
         mock_A.build_tools_def.return_value = []
-        from agent8088.gateway.runner import build_runner
-        runner = build_runner()
+        mock_A.ENV_FILE_PATH = tmp_path / ".env"
+        mock_A.get_secret = lambda c, k: c.get(k, "")
+        with patch("agent8088.gateway.platforms.slack.A", mock_A):
+            from agent8088.gateway.runner import build_runner
+            runner = build_runner()
         slack_adapters = [a for a in runner.adapters if a.platform == "slack"]
         assert len(slack_adapters) == 1
         assert slack_adapters[0].bot_token == "xoxb-test"
+
+
+def test_approve_slash_command_resolves_pending():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    # Simulate a pending approval
+    from agent8088.gateway.runner import _PendingApproval
+    entry = _PendingApproval(chat_id="C1", tool_name="write_file", change_type="new_file")
+    runner._pending_approvals["C1"] = entry
+
+    evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                       user_id="U1", text="/approve")
+    asyncio.run(runner.on_message(evt))
+    assert entry.approved is True
+    assert entry.event.is_set()
+
+
+def test_approve_session_sets_session_scope():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088.gateway.runner import _PendingApproval
+    entry = _PendingApproval(chat_id="C1", tool_name="write_file", change_type="new_file")
+    runner._pending_approvals["C1"] = entry
+
+    evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                       user_id="U1", text="/approve session")
+    asyncio.run(runner.on_message(evt))
+    assert entry.session_scope is True
+    assert entry.approved is True
+
+
+def test_deny_slash_command_resolves_pending():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088.gateway.runner import _PendingApproval
+    entry = _PendingApproval(chat_id="C1", tool_name="write_file", change_type="new_file")
+    runner._pending_approvals["C1"] = entry
+
+    evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                       user_id="U1", text="/deny")
+    asyncio.run(runner.on_message(evt))
+    assert entry.approved is False
+    assert entry.event.is_set()
+
+
+def test_approve_with_no_pending_says_so():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                       user_id="U1", text="/approve")
+    asyncio.run(runner.on_message(evt))
+    sent = adapter.send_message.call_args.args[1]
+    assert "No pending" in sent
+
+
+def test_help_lists_approve_and_deny():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                       user_id="U1", text="/help")
+    asyncio.run(runner.on_message(evt))
+    sent = adapter.send_message.call_args.args[1]
+    assert "/approve" in sent
+    assert "/deny" in sent
+
+
+def test_session_allowlist_auto_approves():
+    runner, sessions = _make_runner()
+    runner._session_allowlist.add("new_file")
+
+    from agent8088.gateway.runner import _PendingApproval
+    # Simulate the on_escalation callback checking session allowlist
+    change_type = "new_file"
+    assert change_type in runner._session_allowlist

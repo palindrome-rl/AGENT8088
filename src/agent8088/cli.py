@@ -1746,6 +1746,10 @@ def _api_key_from_auth(auth):
 
 
 def _custom_prompt(message, default="", secret=False, instruction=""):
+    if secret and default:
+        masked = A._mask_value(default)
+        instruction = instruction or f"(Enter keeps existing: {masked})"
+        default = ""  # don't pass the actual secret as default to InquirerPy
     try:
         from InquirerPy import inquirer
         prompt = inquirer.secret if secret else inquirer.text
@@ -1756,12 +1760,16 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
             kwargs["instruction"] = instruction
         return prompt(**kwargs).execute()
     except ImportError:
-        suffix = f" [{default}]" if default and not secret else ""
-        if instruction:
+        suffix = ""
+        if secret and instruction:
+            suffix = f" {instruction}"
+        elif default and not secret:
+            suffix = f" [{default}]"
+        if instruction and not secret:
             suffix += f" {instruction}"
         if secret:
             import getpass
-            return getpass.getpass(f"{message}{suffix} ")
+            return getpass.getpass(f"{message}{suffix} ") or ""
         value = input(f"{message}{suffix} ").strip()
         return value or default
 
@@ -2116,20 +2124,23 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     custom_base_url = ""
     if provider_choice == CUSTOM_PROVIDER_CHOICE:
+        _builtin_names = provider_registry.builtin_provider_names()
+        existing_name = _current("default_provider") if _current("default_provider") not in _builtin_names else ""
         while True:
             entered_provider = (
-                _custom_prompt("Custom provider name:").strip().lower()
+                _custom_prompt("Custom provider name:", default=existing_name).strip().lower()
             )
             provider = "-".join(entered_provider.split())
             if _valid_provider_name(provider):
                 break
             print("Custom provider names use letters, numbers, _ or -.")
+        existing_url = _current(f"provider.{provider}.base_url")
         while not custom_base_url:
             custom_base_url = _openai_base_url(
-                _custom_prompt("OpenAI-compatible URL:").strip()
+                _custom_prompt("OpenAI-compatible URL:", default=existing_url).strip()
             )
             if not custom_base_url:
-                custom_base_url = _current(f"provider.{provider}.base_url")
+                custom_base_url = existing_url
             if custom_base_url:
                 break
             print("An OpenAI-compatible URL is required.")
@@ -2140,14 +2151,16 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         _current(f"provider.{provider}.model")
         or provider_registry.builtin_provider_defaults(provider).get("default_model", "")
     )
-    current_key = _current(f"provider.{provider}.api_key")
+    # Read existing key from .env first, then config.txt (legacy)
+    _env_file = A.ENV_FILE_PATH if hasattr(A, "ENV_FILE_PATH") else None
+    _env_vars = A.load_env_file(_env_file) if _env_file else {}
+    env_var_name = f"{provider.upper().replace('-', '_')}_API_KEY"
+    current_key = _env_vars.get(env_var_name, "") or _current(f"provider.{provider}.api_key")
 
-    # API key input is deliberately hidden and has no default, so existing keys are
-    # never echoed back to the terminal. Empty input preserves the existing value.
     key = _custom_prompt(
         f"API key for {provider}:",
+        default=current_key,
         secret=True,
-        instruction="(hidden; Enter keeps existing/skips)",
     )
     # Fetch models
     print("\nFetching model list...")
@@ -2197,7 +2210,10 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         content = _set_line(content, f"provider.{provider}.api_mode", "openai")
     content = _set_line(content, f"provider.{provider}.model", model_name)
     if key:
-        content = _set_line(content, f"provider.{provider}.api_key", key)
+        env_var_name = f"{provider.upper().replace('-', '_')}_API_KEY"
+        A.update_env_file(A.ENV_FILE_PATH, {env_var_name: key})
+        content = _set_line(content, f"provider.{provider}.api_key_env", env_var_name)
+        content = _re.sub(rf'^provider\.{_re.escape(provider)}\.api_key=.*\n?', '', content, flags=_re.MULTILINE)
     if search.strip().lower() == "none":
         content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
     elif search:
@@ -2243,19 +2259,35 @@ def _run_gateway_setup():
     discord_on = _current("discord_enabled") in ("1", "true", "True")
 
     # Toggle menu — enable/disable each channel independently
-    while True:
-        slack_label = f"Slack [{'ON' if slack_on else 'OFF'}]"
-        wa_label = f"WhatsApp [{'ON' if wa_on else 'OFF'}]"
-        discord_label = f"Discord [{'ON' if discord_on else 'OFF'}]"
-        action = _choice_prompt("Toggle a channel (select to flip), or Done:", [slack_label, wa_label, discord_label, "Done"])
-        if action == "Done":
-            break
-        if action.startswith("Slack"):
-            slack_on = not slack_on
-        elif action.startswith("WhatsApp"):
-            wa_on = not wa_on
-        elif action.startswith("Discord"):
-            discord_on = not discord_on
+    # Use checkbox (multi-select) when InquirerPy is available, else single-toggle loop
+    try:
+        from InquirerPy import inquirer
+        choices = [
+            inquirer.Choice("slack", name="Slack", enabled=slack_on),
+            inquirer.Choice("whatsapp", name="WhatsApp", enabled=wa_on),
+            inquirer.Choice("discord", name="Discord", enabled=discord_on),
+        ]
+        selected = inquirer.checkbox(
+            message="Select channels to enable (space to toggle, enter to confirm):",
+            choices=choices,
+        ).execute()
+        slack_on = "slack" in selected
+        wa_on = "whatsapp" in selected
+        discord_on = "discord" in selected
+    except ImportError:
+        while True:
+            slack_label = f"Slack [{'ON' if slack_on else 'OFF'}]"
+            wa_label = f"WhatsApp [{'ON' if wa_on else 'OFF'}]"
+            discord_label = f"Discord [{'ON' if discord_on else 'OFF'}]"
+            action = _choice_prompt("Toggle a channel (select to flip), or Done:", [slack_label, wa_label, discord_label, "Done"])
+            if action == "Done":
+                break
+            if action.startswith("Slack"):
+                slack_on = not slack_on
+            elif action.startswith("WhatsApp"):
+                wa_on = not wa_on
+            elif action.startswith("Discord"):
+                discord_on = not discord_on
 
     # Apply enable/disable AFTER token collection below
 
@@ -2273,12 +2305,17 @@ def _run_gateway_setup():
         print("  5. App Home -> enable Messages Tab")
         print("  6. Install App -> copy xoxb- token\n")
 
-        bot_token = _custom_prompt("Slack Bot Token (xoxb-...):", secret=True)
+        _env_vars = A.load_env_file(A.ENV_FILE_PATH)
+        bot_token = _custom_prompt("Slack Bot Token (xoxb-...):",
+                                    default=_env_vars.get("SLACK_BOT_TOKEN", ""),
+                                    secret=True)
         if bot_token:
-            content = _set_line(content, "slack_bot_token", bot_token)
-        app_token = _custom_prompt("Slack App Token (xapp-...):", secret=True)
+            A.update_env_file(A.ENV_FILE_PATH, {"SLACK_BOT_TOKEN": bot_token})
+        app_token = _custom_prompt("Slack App Token (xapp-...):",
+                                    default=_env_vars.get("SLACK_APP_TOKEN", ""),
+                                    secret=True)
         if app_token:
-            content = _set_line(content, "slack_app_token", app_token)
+            A.update_env_file(A.ENV_FILE_PATH, {"SLACK_APP_TOKEN": app_token})
         allowed = _custom_prompt("Allowed Slack user IDs (comma-separated):",
                                  _current("slack_allowed_users"))
         if allowed:
@@ -2390,9 +2427,12 @@ def _run_gateway_setup():
         print("     -> select 'Send Messages', 'Read Message History'")
         print("     -> use the generated URL to invite the bot to your server\n")
 
-        bot_token = _custom_prompt("Discord Bot Token:", secret=True)
+        _env_vars = A.load_env_file(A.ENV_FILE_PATH)
+        bot_token = _custom_prompt("Discord Bot Token:",
+                                    default=_env_vars.get("DISCORD_BOT_TOKEN", ""),
+                                    secret=True)
         if bot_token:
-            content = _set_line(content, "discord_bot_token", bot_token)
+            A.update_env_file(A.ENV_FILE_PATH, {"DISCORD_BOT_TOKEN": bot_token})
         allowed = _custom_prompt("Allowed Discord user IDs (comma-separated):",
                                  _current("discord_allowed_users"))
         if allowed:
@@ -2414,7 +2454,7 @@ def _run_gateway_setup():
         content = _set_line(content, "discord_enabled", "0")
 
     # Write config
-    config_path.write_text(content, encoding="utf-8")
+    A._write_private_text(config_path, content)
     enabled = []
     if slack_on: enabled.append("Slack")
     if wa_on: enabled.append("WhatsApp")

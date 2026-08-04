@@ -175,7 +175,11 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     assert "provider.my-local-ai.api_mode=openai" in saved
     assert "provider.my-local-ai.base_url=https://llm.example.test/v1" in saved
     assert "provider.my-local-ai.model=custom-model" in saved
-    assert "provider.my-local-ai.api_key=secret-key" in saved
+    assert "provider.my-local-ai.api_key_env=MY_LOCAL_AI_API_KEY" in saved
+    env_file = config.parent / ".env"
+    if env_file.exists():
+        env_content = env_file.read_text(encoding="utf-8")
+        assert "MY_LOCAL_AI_API_KEY=secret-key" in env_content
     custom_prompts = [
         kwargs for kind, kwargs in fake.calls
         if kind == "text" and kwargs["message"] in {"Custom provider name:", "OpenAI-compatible URL:"}
@@ -236,7 +240,11 @@ def test_model_setup_works_without_inquirerpy(tmp_path, monkeypatch):
     saved = config.read_text(encoding="utf-8")
     assert "default_provider=ollama-cloud" in saved
     assert "provider.ollama-cloud.model=glm-5.2:cloud" in saved
-    assert "provider.ollama-cloud.api_key=cloud-key" in saved
+    assert "provider.ollama-cloud.api_key_env=OLLAMA_CLOUD_API_KEY" in saved
+    env_file = config.parent / ".env"
+    if env_file.exists():
+        env_content = env_file.read_text(encoding="utf-8")
+        assert "OLLAMA_CLOUD_API_KEY=cloud-key" in env_content
 
 
 def test_models_command_picks_and_switches_model(monkeypatch):

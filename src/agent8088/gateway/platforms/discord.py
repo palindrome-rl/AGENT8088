@@ -17,6 +17,7 @@ from typing import Optional
 
 import discord
 
+from agent8088 import engine as A
 from agent8088.gateway.platforms.base import (
     BaseChannelAdapter, MessageEvent, SendResult,
 )
@@ -102,7 +103,7 @@ class DiscordAdapter(BaseChannelAdapter):
     def __init__(self, config: dict, runner):
         self.config = config
         self.runner = runner
-        self._token = config.get("discord_bot_token", "")
+        self._token = A.get_secret(config, "discord_bot_token")
         self._client: Optional[discord.Client] = None
         self._running = False
         self._dedup: set = set()

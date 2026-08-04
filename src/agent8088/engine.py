@@ -99,6 +99,123 @@ def update_simple_config(path: Path, values: dict) -> None:
     _write_private_text(path, content)
 
 
+
+# --- .env key store ---
+
+def load_env_file(path: Path = None) -> dict:
+    """Load a .env file into a dict. Same format as load_simple_config."""
+    if path is None:
+        path = ENV_FILE_PATH if 'ENV_FILE_PATH' in globals() else Path.home() / ".agent8088" / ".env"
+    if not path.exists():
+        return {}
+    env = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+    return env
+
+
+def update_env_file(path: Path, values: dict) -> None:
+    """Update key=value settings in a .env file with 0600 perms."""
+    path = Path(path)
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    for key, raw_value in values.items():
+        value = str(raw_value)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", key) or "\n" in value or "\r" in value:
+            raise ValueError(f"Invalid env value for {key!r}")
+        line = f"{key}={value}"
+        pattern = rf"^{re.escape(key)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, lambda _: line, content, flags=re.MULTILINE)
+        else:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += line + "\n"
+    _write_private_text(path, content)
+
+
+def _mask_value(value: str) -> str:
+    """Mask a secret for display: sk-...cdef or (set, too short)."""
+    if not value:
+        return "(not set yet)"
+    if len(value) < 8:
+        return "(set, too short to mask)"
+    return value[:3] + "..." + value[-4:]
+
+
+def get_secret(config: dict, key: str, env_var: str = None) -> str:
+    """Resolve a secret: .env file first, then config, then os.environ.
+    If env_var is not given, derive it from key.upper()."""
+    env_var = env_var or key.upper()
+    _env = load_env_file()
+    if env_var in _env:
+        return _env[env_var]
+    if os.environ.get(env_var):
+        return os.environ[env_var]
+    env_key = f"{key}_env"
+    if env_key in config:
+        env_name = config[env_key]
+        if env_name in _env:
+            return _env[env_name]
+        if os.environ.get(env_name):
+            return os.environ[env_name]
+    return config.get(key, "")
+
+
+def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
+    """One-time migration: move provider.*.api_key and *_token from config.txt to .env.
+    Returns the number of keys migrated."""
+    if env_path.exists():
+        return 0  # already migrated
+    config = load_simple_config(config_path)
+    env_values = {}
+    config_updates = {}
+    migrated = 0
+
+    for key, value in list(config.items()):
+        if key.startswith("provider.") and key.endswith(".api_key") and value:
+            provider_name = key.split(".")[1]
+            env_var = f"{provider_name.upper().replace('-', '_')}_API_KEY"
+            env_values[env_var] = value
+            config_updates[f"provider.{provider_name}.api_key_env"] = env_var
+            config_updates[key] = ""  # clear the literal key
+            migrated += 1
+        elif key.endswith("_bot_token") and value:
+            env_var = key.upper()
+            env_values[env_var] = value
+            config_updates[f"{key}_env"] = env_var
+            config_updates[key] = ""
+            migrated += 1
+        elif key.endswith("_app_token") and value:
+            env_var = key.upper()
+            env_values[env_var] = value
+            config_updates[f"{key}_env"] = env_var
+            config_updates[key] = ""
+            migrated += 1
+
+    if not migrated:
+        return 0
+
+    update_env_file(env_path, env_values)
+    # Remove the literal keys from config.txt
+    content = config_path.read_text(encoding="utf-8")
+    for key in config_updates:
+        if config_updates[key] == "":
+            content = re.sub(rf"^{re.escape(key)}=.*\n?", "", content, flags=re.MULTILINE)
+        else:
+            line = f"{key}={config_updates[key]}"
+            pattern = rf"^{re.escape(key)}=.*$"
+            if re.search(pattern, content, re.MULTILINE):
+                content = re.sub(pattern, lambda _: line, content, flags=re.MULTILINE)
+            else:
+                content += line + "\n"
+    _write_private_text(config_path, content)
+    return migrated
+
+
 # Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
@@ -111,6 +228,19 @@ elif _win_config.exists():
 else:
     CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
+
+# .env key store lives next to config.txt
+ENV_FILE_PATH = Path(str(CONFIG_PATH.parent / ".env"))
+
+# One-time migration: move provider.*.api_key and *_token from config.txt to .env
+try:
+    _migrated_count = _migrate_keys_to_env(CONFIG_PATH, ENV_FILE_PATH)
+    if _migrated_count:
+        print(f"[agent8088] Migrated {_migrated_count} keys to {ENV_FILE_PATH}")
+        APP_CONFIG = load_simple_config(CONFIG_PATH)
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -644,13 +774,17 @@ ACTIVE_PROVIDER = ""
 
 
 def _provider_api_key(provider: dict) -> str:
-    """Resolve a provider key: direct api_key value first, then env var."""
+    """Resolve a provider key: .env file first, then os.environ, then direct api_key."""
+    env_name = provider.get("api_key_env", "").strip()
+    if env_name:
+        _env = load_env_file()
+        if env_name in _env:
+            return _env[env_name]
+        if os.environ.get(env_name):
+            return os.environ[env_name]
     direct = provider.get("api_key", "").strip()
     if direct:
         return direct
-    env_name = provider.get("api_key_env", "").strip()
-    if env_name:
-        return os.environ.get(env_name, "")
     return ""
 
 

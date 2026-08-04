@@ -20,6 +20,7 @@ from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_sdk.web.async_client import AsyncWebClient
 
+from agent8088 import engine as A
 from agent8088.gateway.platforms.base import (
     BaseChannelAdapter, MessageEvent, SendResult,
 )
@@ -113,8 +114,8 @@ class SlackAdapter(BaseChannelAdapter):
     def __init__(self, config: dict, runner):
         self.config = config
         self.runner = runner
-        self.bot_token = config.get("slack_bot_token", "")
-        self.app_token = config.get("slack_app_token", "")
+        self.bot_token = A.get_secret(config, "slack_bot_token")
+        self.app_token = A.get_secret(config, "slack_app_token")
         self.client: Optional[AsyncWebClient] = None
         self.app: Optional[AsyncApp] = None
         self.handler: Optional[AsyncSocketModeHandler] = None
