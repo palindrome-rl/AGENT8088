@@ -2311,11 +2311,15 @@ def _run_gateway_setup():
                                     secret=True)
         if bot_token:
             A.update_env_file(A.ENV_FILE_PATH, {"SLACK_BOT_TOKEN": bot_token})
+        else:
+            bot_token = _env_vars.get("SLACK_BOT_TOKEN", "")
         app_token = _custom_prompt("Slack App Token (xapp-...):",
                                     default=_env_vars.get("SLACK_APP_TOKEN", ""),
                                     secret=True)
         if app_token:
             A.update_env_file(A.ENV_FILE_PATH, {"SLACK_APP_TOKEN": app_token})
+        else:
+            app_token = _env_vars.get("SLACK_APP_TOKEN", "")
         allowed = _custom_prompt("Allowed Slack user IDs (comma-separated):",
                                  _current("slack_allowed_users"))
         if allowed:
@@ -2433,6 +2437,8 @@ def _run_gateway_setup():
                                     secret=True)
         if bot_token:
             A.update_env_file(A.ENV_FILE_PATH, {"DISCORD_BOT_TOKEN": bot_token})
+        else:
+            bot_token = _env_vars.get("DISCORD_BOT_TOKEN", "")
         allowed = _custom_prompt("Allowed Discord user IDs (comma-separated):",
                                  _current("discord_allowed_users"))
         if allowed:
