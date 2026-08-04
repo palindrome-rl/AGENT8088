@@ -2251,48 +2251,48 @@ def _run_gateway_setup():
 
     print("Agent8088 Gateway Setup\n")
     print("Configure messaging platforms so the agent can respond on")
-    print("Slack and WhatsApp. Run `agent8088 --gateway` to start.\n")
+    print("Slack, WhatsApp, and Discord. Run `agent8088 --gateway` to start.\n")
 
     # Show current state
     slack_on = _current("slack_enabled") in ("1", "true", "True")
     wa_on = _current("whatsapp_enabled") in ("1", "true", "True")
     discord_on = _current("discord_enabled") in ("1", "true", "True")
 
-    # Toggle menu — enable/disable each channel independently
-    # Use checkbox (multi-select) when InquirerPy is available, else single-toggle loop
-    try:
-        from InquirerPy import inquirer
-        choices = [
-            inquirer.Choice("slack", name="Slack", enabled=slack_on),
-            inquirer.Choice("whatsapp", name="WhatsApp", enabled=wa_on),
-            inquirer.Choice("discord", name="Discord", enabled=discord_on),
-        ]
-        selected = inquirer.checkbox(
-            message="Select channels to enable (space to toggle, enter to confirm):",
-            choices=choices,
-        ).execute()
-        slack_on = "slack" in selected
-        wa_on = "whatsapp" in selected
-        discord_on = "discord" in selected
-    except ImportError:
-        while True:
-            slack_label = f"Slack [{'ON' if slack_on else 'OFF'}]"
-            wa_label = f"WhatsApp [{'ON' if wa_on else 'OFF'}]"
-            discord_label = f"Discord [{'ON' if discord_on else 'OFF'}]"
-            action = _choice_prompt("Toggle a channel (select to flip), or Done:", [slack_label, wa_label, discord_label, "Done"])
-            if action == "Done":
-                break
-            if action.startswith("Slack"):
-                slack_on = not slack_on
-            elif action.startswith("WhatsApp"):
-                wa_on = not wa_on
-            elif action.startswith("Discord"):
-                discord_on = not discord_on
+    # Only one gateway channel can be active at a time (mutually exclusive).
+    # Single-select picker — choosing one disables the others.
+    current = "None"
+    if slack_on: current = "Slack"
+    elif wa_on: current = "WhatsApp"
+    elif discord_on: current = "Discord"
 
-    # Apply enable/disable AFTER token collection below
+    choices = [
+        "Slack" + (" (current)" if slack_on else ""),
+        "WhatsApp" + (" (current)" if wa_on else ""),
+        "Discord" + (" (current)" if discord_on else ""),
+        "None (disable all)",
+    ]
+    selected = _choice_prompt("Select gateway channel (only one can be active):", choices)
 
-    # --- Slack configuration (only if enabled) ---
-    if slack_on:
+    if selected == "None (disable all)":
+        slack_on = wa_on = discord_on = False
+        newly_enabled = set()
+    elif selected.startswith("Slack"):
+        newly_enabled = set() if slack_on else {"slack"}
+        slack_on = True
+        wa_on = discord_on = False
+    elif selected.startswith("WhatsApp"):
+        newly_enabled = set() if wa_on else {"whatsapp"}
+        wa_on = True
+        slack_on = discord_on = False
+    elif selected.startswith("Discord"):
+        newly_enabled = set() if discord_on else {"discord"}
+        discord_on = True
+        slack_on = wa_on = False
+    else:
+        newly_enabled = set()
+
+    # --- Slack configuration (only if newly enabled) ---
+    if slack_on and "slack" in newly_enabled:
         print("\n--- Slack ---")
         print("Create a Slack app at https://api.slack.com/apps:")
         print("  1. Create New App -> From scratch")
@@ -2328,8 +2328,8 @@ def _run_gateway_setup():
             content = _set_line(content, "slack_enabled", "1")
             print("Slack configured.\n")
 
-    # --- WhatsApp configuration (only if enabled) ---
-    if wa_on:
+    # --- WhatsApp configuration (only if newly enabled) ---
+    if wa_on and "whatsapp" in newly_enabled:
         print("\n--- WhatsApp ---")
         session_dir = _current("whatsapp_session_dir") or str(
             Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
@@ -2416,8 +2416,8 @@ def _run_gateway_setup():
         content = _set_line(content, "whatsapp_enabled", "1")
         print("WhatsApp configured.\n")
 
-    # --- Discord configuration (only if enabled) ---
-    if discord_on:
+    # --- Discord configuration (only if newly enabled) ---
+    if discord_on and "discord" in newly_enabled:
         print("\n--- Discord ---")
         print("Create a Discord bot at https://discord.com/developers/applications:")
         print("  1. New Application -> give it a name")
@@ -2445,27 +2445,26 @@ def _run_gateway_setup():
             content = _set_line(content, "discord_enabled", "1")
             print("Discord configured.\n")
 
-    # Ensure disabled platforms have enabled=0 in config
-    if not slack_on:
-        content = _set_line(content, "slack_enabled", "0")
-    if not wa_on:
-        content = _set_line(content, "whatsapp_enabled", "0")
-    if not discord_on:
-        content = _set_line(content, "discord_enabled", "0")
+    # Mutually exclusive: ensure only the selected channel is enabled
+    content = _set_line(content, "slack_enabled", "1" if slack_on else "0")
+    content = _set_line(content, "whatsapp_enabled", "1" if wa_on else "0")
+    content = _set_line(content, "discord_enabled", "1" if discord_on else "0")
 
     # Write config
     A._write_private_text(config_path, content)
     enabled = []
     if slack_on: enabled.append("Slack")
-    if wa_on: enabled.append("WhatsApp")
-    if discord_on: enabled.append("Discord")
+    elif wa_on: enabled.append("WhatsApp")
+    elif discord_on: enabled.append("Discord")
     if enabled:
         print(f"Config written to {config_path}")
         print(f"Enabled: {', '.join(enabled)}")
+        if newly_enabled:
+            print(f"Newly configured: {', '.join(sorted(newly_enabled))}")
         print(f"\nStart the gateway with: agent8088 --gateway")
     else:
         print(f"Config written to {config_path}")
-        print("No platforms enabled. Toggle one on with: agent8088 --gateway-setup")
+        print("No platform enabled. Run: agent8088 --gateway-setup")
 
 
 def main():
