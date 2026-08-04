@@ -11,6 +11,7 @@ from agent8088.gateway.platforms.base import MessageEvent
 from agent8088.gateway.session import SessionStore, build_session_key
 
 log = logging.getLogger("agent8088.gateway")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 SLASH_COMMANDS = {
     "/new": "Clear the current session",
@@ -83,6 +84,8 @@ class GatewayRunner:
                 log.info("queued message for busy session %s", key)
                 return
             self._active[key] = True
+        log.info("processing message from %s on %s (chat %s): %.80s",
+                 event.user_id, event.platform, event.chat_id, event.text)
         try:
             await self._run_turn(key, event)
         finally:
@@ -94,6 +97,7 @@ class GatewayRunner:
                 if not queued:
                     del self._pending[key]
                 asyncio.create_task(self.on_message(next_evt))
+        log.info("turn complete for chat %s (%s)", event.chat_id, event.platform)
 
     async def _run_turn(self, key: str, event: MessageEvent) -> None:
         adapter = next((a for a in self.adapters if a.platform == event.platform), None)
@@ -132,15 +136,18 @@ class GatewayRunner:
             if len(parts) < 5:
                 return False
             _, target_mode, change_type, paths, reason = parts
+            log.info("escalation: %s wants %s (chat=%s)", name, change_type, event.chat_id)
 
             # Session-scoped auto-approve: if this change_type was already
             # approved for the session, grant without prompting.
             if change_type in self._session_allowlist:
+                log.info("escalation: auto-approved (session scope: %s)", change_type)
                 A.grant_escalation(change_type)
                 return True
 
             entry = _PendingApproval(event.chat_id, name, change_type)
             self._pending_approvals[event.chat_id] = entry
+            log.info("escalation: sent approval prompt to %s, waiting for /approve or /deny", event.chat_id)
 
             # Send the prompt to chat (async, from the agent thread)
             try:
@@ -208,6 +215,7 @@ class GatewayRunner:
             return True
         if cmd == "/approve":
             entry = self._pending_approvals.get(event.chat_id)
+            log.info("/approve from %s — pending: %s", event.chat_id, bool(entry))
             if not entry:
                 if adapter:
                     await adapter.send_message(event.chat_id, "No pending approval.")
@@ -222,6 +230,7 @@ class GatewayRunner:
             return True
         if cmd == "/deny":
             entry = self._pending_approvals.get(event.chat_id)
+            log.info("/deny from %s — pending: %s", event.chat_id, bool(entry))
             if not entry:
                 if adapter:
                     await adapter.send_message(event.chat_id, "No pending approval.")

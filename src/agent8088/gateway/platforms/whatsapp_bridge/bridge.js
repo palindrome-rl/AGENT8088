@@ -218,7 +218,6 @@ async function startSocket() {
   });
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    console.log(`[DEBUG] messages.upsert: type=${type}, count=${messages?.length || 0}`);
     if (type !== 'notify' && type !== 'append') return;
     for (const msg of messages) {
       try {
@@ -229,9 +228,7 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.set', ({ messages, isLatest }) => {
-    console.log(`[DEBUG] messages.set: isLatest=${isLatest}, count=${messages?.length || 0}`);
-  });
+  sock.ev.on('messages.set', () => {});
 }
 
 // --- Normalize WhatsApp JID to bare digits ---
@@ -252,8 +249,6 @@ function handleInboundMessage(msg) {
   const fromMe = msg.key.fromMe;
   const rawSenderId = msg.participant || rawChatId;
 
-  console.log(`[DEBUG] handleInbound: chatId=${rawChatId}, fromMe=${fromMe}, hasContent=${!!msg.message}`);
-
   // Echo prevention: skip messages we just sent
   if (fromMe && recentlySentIds.has(messageId)) {
     recentlySentIds.delete(messageId);
@@ -266,13 +261,9 @@ function handleInboundMessage(msg) {
     const myLid = normalizeWhatsAppId(sock.user?.lid);
     const chatNumber = normalizeWhatsAppId(rawChatId);
 
-    // Check if this chat is our own self-chat (by phone number or LID)
     const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
 
-    console.log(`[DEBUG] self-chat check: myNumber=${myNumber}, chatNumber=${chatNumber}, isSelfChat=${isSelfChat}`);
-
     if (!isSelfChat) {
-      // Not our self-chat — silently drop (security: strangers can't trigger agent)
       return;
     }
   }

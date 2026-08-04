@@ -220,12 +220,21 @@ class WhatsAppAdapter(BaseChannelAdapter):
     async def _poll_messages(self) -> None:
         url = f"{self.bridge_url}/messages"
         consecutive_errors = 0
+        heartbeat = 0
         while self._running:
             try:
                 resp = await self.client.get(url, timeout=30.0)
                 if resp.status_code == 200:
                     consecutive_errors = 0
-                    for msg_data in resp.json():
+                    msgs = resp.json()
+                    if msgs:
+                        logger.info("WhatsApp: received %d message(s)", len(msgs))
+                        heartbeat = 0
+                    else:
+                        heartbeat += 1
+                        if heartbeat % 60 == 0:
+                            logger.info("WhatsApp: alive, no new messages (last %d polls)", heartbeat)
+                    for msg_data in msgs:
                         await self._handle_message(msg_data)
                 else:
                     consecutive_errors += 1

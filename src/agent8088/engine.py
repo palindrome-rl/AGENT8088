@@ -17,6 +17,9 @@ from openai import OpenAI
 
 APP_DIR = Path(__file__).resolve().parent
 
+import logging
+_log = logging.getLogger("agent8088.engine")
+
 
 # ---------------------------------------------------------------------------
 # Config (simple key=value file)
@@ -3202,6 +3205,11 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, allowed_tools)
+        if calls:
+            _log.info("model tool calls (turn %d): %s", turn,
+                      [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
+        else:
+            _log.debug("turn %d: no tool calls — model replied with text", turn)
         if not calls:
             # The model may have *tried* to call a tool that doesn't exist (a common
             # failure — e.g. `current_time`). Rather than leaking the raw ✿FUNCTION✿
