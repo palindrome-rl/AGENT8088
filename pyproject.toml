@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0"]
+gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0", "discord.py>=2.3.0,<3"]
 dev = ["pytest>=7.0.0"]
 
 [project.scripts]

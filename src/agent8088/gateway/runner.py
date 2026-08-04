@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import re
+import threading
+import time
 
 from agent8088 import engine as A
 from agent8088.gateway.agent_bridge import run_turn
@@ -14,7 +16,22 @@ SLASH_COMMANDS = {
     "/new": "Clear the current session",
     "/stop": "Interrupt the running turn (queued messages cancel)",
     "/help": "Show available commands",
+    "/approve": "Approve a pending action (once/session)",
+    "/deny": "Deny a pending action",
 }
+
+APPROVAL_TIMEOUT = 300  # seconds, fail-closed
+
+
+class _PendingApproval:
+    """One pending escalation waiting for a chat reply."""
+    def __init__(self, chat_id: str, tool_name: str, change_type: str):
+        self.chat_id = chat_id
+        self.tool_name = tool_name
+        self.change_type = change_type
+        self.event = threading.Event()
+        self.approved = False
+        self.session_scope = False  # /approve session → True
 
 
 class GatewayRunner:
@@ -30,6 +47,10 @@ class GatewayRunner:
         # regardless of which chat it's from. Concurrent turns from different
         # chats would corrupt each other's state.
         self._turn_lock = asyncio.Lock()
+        # Approval routing: chat_id → _PendingApproval (only one pending per chat)
+        self._pending_approvals: dict[str, _PendingApproval] = {}
+        # Session-scoped approvals: change_types already approved for this session
+        self._session_allowlist: set[str] = set()
 
     def register_adapter(self, adapter) -> None:
         self.adapters.append(adapter)
@@ -99,10 +120,61 @@ class GatewayRunner:
             except Exception as e:
                 log.warning("send_message failed: %s", e)
 
+        # on_escalation runs in the agent thread (sync). It sends the prompt
+        # to chat via the async loop, then blocks on a threading.Event until
+        # the user replies /approve or /deny.
+        loop = asyncio.get_event_loop()
+
+        def _on_escalation(name: str, result: str) -> bool:
+            if not result.startswith("ESCALATION_REQUEST:"):
+                return False
+            parts = result.split(":", 4)
+            if len(parts) < 5:
+                return False
+            _, target_mode, change_type, paths, reason = parts
+
+            # Session-scoped auto-approve: if this change_type was already
+            # approved for the session, grant without prompting.
+            if change_type in self._session_allowlist:
+                A.grant_escalation(change_type)
+                return True
+
+            entry = _PendingApproval(event.chat_id, name, change_type)
+            self._pending_approvals[event.chat_id] = entry
+
+            # Send the prompt to chat (async, from the agent thread)
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    adapter.send_approval_prompt(
+                        event.chat_id, name, reason, paths,
+                    ),
+                    loop,
+                )
+                future.result(timeout=10)
+            except Exception as e:
+                log.warning("send_approval_prompt failed: %s", e)
+                self._pending_approvals.pop(event.chat_id, None)
+                return False
+
+            # Block until user replies or timeout
+            if not entry.event.wait(timeout=APPROVAL_TIMEOUT):
+                log.warning("approval timed out for %s", event.chat_id)
+                self._pending_approvals.pop(event.chat_id, None)
+                return False
+
+            self._pending_approvals.pop(event.chat_id, None)
+            if entry.approved:
+                A.grant_escalation(change_type)
+                if entry.session_scope:
+                    self._session_allowlist.add(change_type)
+                return True
+            return False
+
         try:
             async with self._turn_lock:
                 answer = await asyncio.to_thread(
                     run_turn, key, event.text, self.sessions,
+                    on_escalation=_on_escalation,
                 )
             await _finalize(answer)
         except Exception as e:
@@ -134,6 +206,31 @@ class GatewayRunner:
             if adapter:
                 await adapter.send_message(event.chat_id, "Queued messages cleared.")
             return True
+        if cmd == "/approve":
+            entry = self._pending_approvals.get(event.chat_id)
+            if not entry:
+                if adapter:
+                    await adapter.send_message(event.chat_id, "No pending approval.")
+                return True
+            parts = event.text.split(None, 1)
+            entry.session_scope = len(parts) > 1 and parts[1].strip().lower() == "session"
+            entry.approved = True
+            entry.event.set()
+            if adapter:
+                scope = "session" if entry.session_scope else "once"
+                await adapter.send_message(event.chat_id, f"Approved ({scope}).")
+            return True
+        if cmd == "/deny":
+            entry = self._pending_approvals.get(event.chat_id)
+            if not entry:
+                if adapter:
+                    await adapter.send_message(event.chat_id, "No pending approval.")
+                return True
+            entry.approved = False
+            entry.event.set()
+            if adapter:
+                await adapter.send_message(event.chat_id, "Denied.")
+            return True
         return False
 
     async def run(self) -> None:
@@ -149,8 +246,11 @@ def build_runner() -> GatewayRunner:
     allowlist = Allowlist.from_config(config)
     runner = GatewayRunner(sessions=sessions, allowlist=allowlist)
 
-    # Gateway runs in edit mode — messaging users can't approve y/n prompts
-    A.PERMISSION_MODE = "edit"
+    # Gateway runs in readonly mode — writes/shell escalate to chat prompts.
+    # Users approve via /approve (once/session) or /deny in the chat.
+    # Set gateway_permission_mode=edit in config to disable (full-auto).
+    mode = A.APP_CONFIG.get("gateway_permission_mode", "readonly")
+    A.PERMISSION_MODE = mode
 
     if config.get("slack_enabled", "0") in ("1", "true", "True"):
         try:
@@ -165,5 +265,12 @@ def build_runner() -> GatewayRunner:
             runner.register_adapter(WhatsAppAdapter(config, runner))
         except ImportError:
             log.warning("WhatsApp enabled but httpx not installed. "
+                         "Run: uv pip install -e \".[gateway]\"")
+    if config.get("discord_enabled", "0") in ("1", "true", "True"):
+        try:
+            from agent8088.gateway.platforms.discord import DiscordAdapter
+            runner.register_adapter(DiscordAdapter(config, runner))
+        except ImportError:
+            log.warning("Discord enabled but discord.py not installed. "
                          "Run: uv pip install -e \".[gateway]\"")
     return runner

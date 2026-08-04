@@ -2240,18 +2240,22 @@ def _run_gateway_setup():
     # Show current state
     slack_on = _current("slack_enabled") in ("1", "true", "True")
     wa_on = _current("whatsapp_enabled") in ("1", "true", "True")
+    discord_on = _current("discord_enabled") in ("1", "true", "True")
 
     # Toggle menu — enable/disable each channel independently
     while True:
         slack_label = f"Slack [{'ON' if slack_on else 'OFF'}]"
         wa_label = f"WhatsApp [{'ON' if wa_on else 'OFF'}]"
-        action = _choice_prompt("Toggle a channel (select to flip), or Done:", [slack_label, wa_label, "Done"])
+        discord_label = f"Discord [{'ON' if discord_on else 'OFF'}]"
+        action = _choice_prompt("Toggle a channel (select to flip), or Done:", [slack_label, wa_label, discord_label, "Done"])
         if action == "Done":
             break
         if action.startswith("Slack"):
             slack_on = not slack_on
         elif action.startswith("WhatsApp"):
             wa_on = not wa_on
+        elif action.startswith("Discord"):
+            discord_on = not discord_on
 
     # Apply enable/disable AFTER token collection below
 
@@ -2375,17 +2379,46 @@ def _run_gateway_setup():
         content = _set_line(content, "whatsapp_enabled", "1")
         print("WhatsApp configured.\n")
 
+    # --- Discord configuration (only if enabled) ---
+    if discord_on:
+        print("\n--- Discord ---")
+        print("Create a Discord bot at https://discord.com/developers/applications:")
+        print("  1. New Application -> give it a name")
+        print("  2. Bot -> Add Bot -> copy the token")
+        print("  3. Enable Privileged Gateway Intents: Message Content Intent")
+        print("  4. OAuth2 -> URL Generator -> select 'bot' scope")
+        print("     -> select 'Send Messages', 'Read Message History'")
+        print("     -> use the generated URL to invite the bot to your server\n")
+
+        bot_token = _custom_prompt("Discord Bot Token:", secret=True)
+        if bot_token:
+            content = _set_line(content, "discord_bot_token", bot_token)
+        allowed = _custom_prompt("Allowed Discord user IDs (comma-separated):",
+                                 _current("discord_allowed_users"))
+        if allowed:
+            content = _set_line(content, "discord_allowed_users", allowed)
+        if not bot_token:
+            content = _set_line(content, "discord_enabled", "0")
+            discord_on = False
+            print("Discord disabled — bot token required.\n")
+        else:
+            content = _set_line(content, "discord_enabled", "1")
+            print("Discord configured.\n")
+
     # Ensure disabled platforms have enabled=0 in config
     if not slack_on:
         content = _set_line(content, "slack_enabled", "0")
     if not wa_on:
         content = _set_line(content, "whatsapp_enabled", "0")
+    if not discord_on:
+        content = _set_line(content, "discord_enabled", "0")
 
     # Write config
     config_path.write_text(content, encoding="utf-8")
     enabled = []
     if slack_on: enabled.append("Slack")
     if wa_on: enabled.append("WhatsApp")
+    if discord_on: enabled.append("Discord")
     if enabled:
         print(f"Config written to {config_path}")
         print(f"Enabled: {', '.join(enabled)}")
