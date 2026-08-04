@@ -1142,7 +1142,7 @@ TOOL_ALIASES = {
     "shell": "execute_shell", "run": "execute_shell",
     "search": "web_search", "web": "web_search", "google": "web_search",
     "read": "read_text", "cat": "read_text",
-    "write": "write_file", "create_file": "write_file",
+    "write": "write_file", "create_file": "write_file", "writefile": "write_file",
     "calc": "calculate", "eval": "calculate", "math": "calculate",
     "last": "last_output", "prev_output": "last_output",
 }
@@ -2742,11 +2742,24 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 if m and canonical in allowed:
                     calls.append({"name": canonical, "arguments": {"command": m.group(1).replace('\\"', '"')}})
                     break
+    # 5) <|mask_start|>{"tool": "...", "arguments": {...}}<|mask_end|>
+    if not calls:
+        m = re.search(r'<\|mask_start\|>\s*(\{.*?\})\s*<\|mask_end\|>', text, re.DOTALL)
+        if m:
+            try:
+                d = json.loads(m.group(1).strip())
+                tool_name = d.get("tool", d.get("name", ""))
+                resolved = _resolve_tool_name(tool_name)
+                if resolved in allowed:
+                    calls.append({"name": resolved, "arguments": d.get("arguments", {})})
+            except Exception:
+                pass
     return calls
 
 
 def strip_tool_json(text: str) -> str:
     text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<\|mask_start\|>.*?<\|mask_end\|>', '', text, flags=re.DOTALL)
     text = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', text, flags=re.DOTALL)
     text = re.sub(r'✿FUNCTION✿[^\n]*', '', text)
     text = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', text, flags=re.DOTALL)
