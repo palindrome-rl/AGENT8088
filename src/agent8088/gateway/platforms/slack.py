@@ -188,6 +188,9 @@ class SlackAdapter(BaseChannelAdapter):
         body = event.get("text", "")
         if not body:
             return
+        channel_type = event.get("channel_type", "")
+        if channel_type != "im" and self.bot_user_id not in body:
+            return
         body = re.sub(r"<@" + re.escape(self.bot_user_id) + r">", "", body).strip()
         if not body:
             return
