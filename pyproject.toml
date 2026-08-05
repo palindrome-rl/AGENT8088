@@ -6,12 +6,17 @@ build-backend = "hatchling.build"
 name = "agent8088"
 version = "0.2.0"
 description = "Agent8088 - Local AI Assistant"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0.0",
     "rich>=13.0.0",
     "InquirerPy>=0.3.4",
+    "mcp>=1.27,<2",
 ]
+
+[project.optional-dependencies]
+gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0", "discord.py>=2.3.0,<3"]
+dev = ["pytest>=7.0.0"]
 
 [project.scripts]
 agent8088 = "agent8088.cli:main"
@@ -21,3 +26,5 @@ packages = ["src/agent8088"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "assets/palindrome-research-labs.png" = "agent8088/assets/palindrome-research-labs.png"
+"src/agent8088/gateway/platforms/whatsapp_bridge/bridge.js" = "agent8088/gateway/platforms/whatsapp_bridge/bridge.js"
+"src/agent8088/gateway/platforms/whatsapp_bridge/package.json" = "agent8088/gateway/platforms/whatsapp_bridge/package.json"

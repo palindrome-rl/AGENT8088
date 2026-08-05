@@ -1,0 +1,22 @@
+import asyncio
+import logging
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    from agent8088.gateway.runner import build_runner
+    runner = build_runner()
+    if not runner.adapters:
+        logging.error("No messaging platforms enabled. Set slack_enabled=1 or whatsapp_enabled=1 in config.txt.")
+        return
+    try:
+        asyncio.run(runner.run())
+    except KeyboardInterrupt:
+        logging.info("Gateway stopped.")
+
+
+if __name__ == "__main__":
+    main()

@@ -44,3 +44,6 @@ graphify-out/
 # Config snapshots (may contain secrets - never commit)
 backup.txt
 opencode.json
+
+# WhatsApp bridge npm deps
+src/agent8088/gateway/platforms/whatsapp_bridge/node_modules/

@@ -33,7 +33,6 @@ def test_resolve_user_path_accepts_path_objects(engine, tmp_path, monkeypatch):
     "git status",
     "git diff",
     "git log -p",
-    "git show HEAD:.env",
 ])
 def test_readonly_local_git_reads_require_approval(engine, monkeypatch, command):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
@@ -45,6 +44,19 @@ def test_readonly_local_git_reads_require_approval(engine, monkeypatch, command)
 
     assert "ESCALATION_REQUEST" in engine.run_tool(
         "execute_shell", {"command": command})
+
+
+def test_git_read_of_sensitive_file_is_hard_blocked(engine, monkeypatch):
+    """git show/diff targeting a sensitive file (e.g. .env) is hard-blocked
+    at the always-on floor — no escalation possible, denied in ALL modes."""
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+    monkeypatch.setattr(
+        engine, "_exec_sandbox_command",
+        lambda *_args, **_kwargs: pytest.fail("sensitive git read must not execute"),
+    )
+    result = engine.run_tool("execute_shell", {"command": "git show HEAD:.env"})
+    assert "ESCALATION_REQUEST" not in result
+    assert "forbidden" in result.lower() or "denied" in result.lower() or "safety policy" in result.lower()
 
 
 @pytest.mark.parametrize("command", [
@@ -444,3 +456,54 @@ def test_private_file_is_protected_before_content_is_written(
 
     assert content_seen_during_protection == [""]
     assert private.read_text(encoding="utf-8") == "private content"
+
+
+def test_edit_mode_runs_shell_without_sandbox_consent(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
+
+    result = engine._exec_sandbox_command("echo hi")
+    assert "ESCALATION_REQUEST" not in result
+    assert "ran:echo hi" in result
+
+
+def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
+
+    result = engine.run_tool("run_sandboxed", {"code": "print(1)"})
+    assert "ESCALATION_REQUEST" not in result
+    assert "ran:" in result and "print(1)" in result
+
+
+def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    seen = {}
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda argv, **_: seen.setdefault("argv", argv) or f"ran:{argv}",
+    )
+
+    result = engine._exec_sandbox_argv(["git", "status"])
+    assert "ESCALATION_REQUEST" not in result
+    assert seen["argv"] == ["git", "status"]
+
+
+def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: pytest.fail("must not run"))
+
+    result = engine._exec_sandbox_command("mkdir x")
+    assert result.startswith("ESCALATION_REQUEST")

@@ -7,7 +7,7 @@
 ---
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 ---
 
@@ -22,14 +22,18 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 - **Interactive model picker** — fuzzy searchable provider + model selection (InquirerPy)
 - **Fallback chains** — automatically switches to backup provider on 429/503 errors
 - **Fine-tuned tool calling** — 95% accuracy on function selection
-- **Permission layer** — readonly by default, per-action y/n escalation for writes
-- **Security layers** — sensitive file protection, network gating, path-based zones
+- **3 permission modes** — readonly (default), full-auto, plan-only — switchable at runtime via `/mode`
+- **Security layers** — sensitive file protection, network gating, path-based zones, credential blocklist
 - **Free native sandbox** — OS isolation on macOS, Linux, and Windows; Docker fallback
 - **Cross-platform** — Windows (cmd.exe) and Linux/macOS (bash)
 - **Rich CLI UI** — live token streaming, ESC interrupt, tool diffs, slash commands
 - **Tool alias resolution** — model can call `bash`/`mkdir`/`cat` naturally
 - **Tool arg transforms** — `mkdir({path:...})` auto-converts to `execute_shell({command:...})`
 - **SkillOpt** — self-improving agent skills via text-space optimization
+- **MCP client** — connect stdio and Streamable HTTP MCP servers as Agent8088 tools
+- **Messaging gateway** — Slack, WhatsApp, and Discord adapters with DM + @mention support
+- **Chat-based approvals** — `/approve` + `/deny` in chat; Discord gets interactive ✅/❌ buttons
+- **Separate .env key store** — API keys and tokens stored in `~/.agent8088/.env` (0600), not in config.txt
 
 ---
 
@@ -119,18 +123,23 @@ You'll see the banner with model info, tool count, and the prompt. Type a questi
 ## CLI Flags
 
 ```
-usage: agent8088 [--version] [-h] [--edit] [--uninstall] [--update] [--setup] [--sandbox-setup]
+usage: agent8088 [--version] [-h] [--mode MODE] [--edit] [--gateway] [--gateway-setup]
+                 [--model-setup] [--uninstall] [--update] [--setup] [--sandbox-setup]
 
 Agent8088 - Local AI Assistant
 
 options:
-  -h, --help     show this help and exit
-  --version, -V  show version and exit
-  --edit         start in edit mode (no per-action permission prompts)
-  --uninstall    remove agent8088 install dir + env vars, then exit
-  --update       pull latest code + reinstall, then exit
-  --setup        run interactive config wizard, then exit
-  --sandbox-setup install the free native sandbox runtime
+  -h, --help        show this help and exit
+  --version, -V     show version and exit
+  --mode MODE        set permission mode: readonly (default), full-auto, or plan-only
+  --edit            alias for --mode full-auto (no per-action permission prompts)
+  --gateway         run the messaging gateway (Slack/WhatsApp/Discord) instead of REPL
+  --gateway-setup   configure gateway channels interactively, then exit
+  --model-setup     configure model provider + API key, then exit
+  --uninstall       remove agent8088 install dir + env vars, then exit
+  --update          pull latest code + reinstall, then exit
+  --setup           run interactive config wizard, then exit
+  --sandbox-setup   install the free native sandbox runtime
 
 Run with no flags to start the interactive REPL.
 ```
@@ -148,6 +157,12 @@ Run with no flags to start the interactive REPL.
 | `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
 | `/model <provider:model>` | Switch provider + model (e.g. `/model cerebras:gpt-oss-120b`); `/model setup` adds/updates a provider |
 | `/models [provider]` | Fuzzy searchable model picker — lists + switches models from active or specified provider |
+| `/mode [readonly\|full-auto\|plan-only]` | Show or switch permission mode at runtime |
+| `/mcp` | Show MCP server status and discovered tools |
+| `/mcp reload` | Reconnect MCP servers after editing configuration |
+| `/mcp add <name> stdio <command> [args...] [--project]` | Add a local MCP server |
+| `/mcp add <name> http <url> [--project]` | Add a Streamable HTTP MCP server |
+| `/mcp remove <name> [--project]` | Remove a configured MCP server |
 | `/sandbox [auto\|native\|docker\|local\|setup]` | Show, install, or select command isolation |
 | `/config` | Show active config + config file path |
 | `/system` | Show the full system prompt |
@@ -178,6 +193,47 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
+| `gateway_permission_mode` | `readonly` | Gateway permission mode: `readonly` (approvals in chat) or `edit` (full-auto) |
+| `disabled_tools` | (empty) | Comma-separated built-in tool names to disable (e.g. `browse_page` when MCP Playwright is connected) |
+
+### API Key Storage
+
+API keys and gateway tokens are stored in `~/.agent8088/.env` (file permissions 0600), not in `config.txt`. Config keys like `provider.<name>.api_key_env=OPENROUTER_API_KEY` point to env var names in the `.env` file. On first startup, existing keys in `config.txt` are automatically migrated to `.env`.
+
+### MCP servers
+
+Agent8088 discovers MCP tools at startup from standard `mcp.json` configuration files (using the standard `mcpServers` structure compatible with standard MCP clients):
+- `~/.agent8088/mcp.json` for user-level global servers.
+- `.agent8088/mcp.json` at the project root for project-specific servers.
+
+A project server definition with the same name overrides the user-level definition. Run `/mcp` to inspect configured servers and `/mcp reload` after editing configuration.
+
+```json
+{
+  "mcpServers": {
+    "supabase": {
+      "command": "npx",
+      "args": ["-y", "@supabase/mcp-server-supabase@latest", "--project-ref", "YOUR_PROJECT_REF"],
+      "env": {
+        "SUPABASE_ACCESS_TOKEN": "YOUR_SUPABASE_ACCESS_TOKEN"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/allowed/path"],
+      "env": {"LOG_LEVEL": "warn"},
+      "tools": {"include": ["list_directory", "read_file"]}
+    },
+    "remote-service": {
+      "url": "https://mcp.example.com/mcp",
+      "bearer_token_env": "COMPANY_MCP_TOKEN",
+      "tools": {"exclude": ["delete_*"]}
+    }
+  }
+}
+```
+
+MCP tool names are registered dynamically as `mcp_<server>_<tool>`. Stdio server processes receive a minimal OS environment supplemented by any explicit `env` entries. Tools without the server's `readOnlyHint` require normal Agent8088 one-shot approval.
 
 ### Environment Variables
 
@@ -194,8 +250,18 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 
 ### Permission Modes
 
-- **readonly** (default) — read files, run inspection-only shell commands (`ls`, `cat`, `git status`). Every write/mutation prompts y/n.
-- **edit** (`--edit` flag) — everything readonly allows, plus writes within `allowed_paths`. Still forbidden: `git push`, `git reset --hard`, branch deletion.
+- **readonly** (default) — read files, run inspection-only shell commands (`ls`, `cat`, `git status`). Every write/mutation prompts y/n. Gateway sends approval prompts to chat (`/approve`, `/deny`).
+- **full-auto** (`--edit` or `--mode full-auto`) — everything readonly allows, plus writes within `allowed_paths`. Still forbidden: `git push`, `git reset --hard`, branch deletion, credential paths.
+- **plan-only** (`--mode plan-only`) — only `execute_plan` runs; direct tools blocked. Forces the model to plan first, user approves the plan, then steps run with a temporary grant.
+
+Switch modes at runtime with `/mode readonly`, `/mode full-auto`, or `/mode plan-only`.
+
+### Chat-Based Approvals (Gateway)
+
+When the gateway runs in readonly mode, write/shell tools trigger an approval prompt in chat:
+- **Discord** — interactive ✅/❌ buttons (Approve Once, Approve Session, Deny)
+- **Slack/WhatsApp** — text commands `/approve` (once), `/approve session`, `/deny`
+- 300s timeout, fail-closed (auto-deny on timeout)
 
 ### Security Layer 1: Sensitive File Protection
 
@@ -226,9 +292,24 @@ When neither backend is available, Agent8088 asks before running locally.
 | `write_file` | write_text | Write content to a file |
 | `read_text` | read_text | Read text from a file |
 | `web_search` | http_get | Search the web (SearXNG) |
+| `web_search_tavily` | http_post | Search via Tavily (agent-optimized) |
+| `web_search_exa` | http_post | Search via Exa (semantic/neural) |
 | `get_page_title` | shell | Fetch a webpage title (cross-platform) |
+| `browse_page` | browser | Load a web page in a headless browser |
 | `calculate` | python_eval | Evaluate a math expression |
 | `last_output` | last_output | Get full output from the last tool call |
+| `execute_plan` | plan | Execute a multi-step plan (plan-only mode) |
+| `spawn_subagent` | subagent | Delegate a task to an independent sub-agent |
+| `run_sandboxed` | docker | Run Python with OS isolation |
+| `schedule_task` | cron | Schedule periodic tasks (cron) |
+| `git_status` | shell | Show git status and branch |
+| `git_diff` | shell | Show git diff |
+| `git_log` | shell | Show recent commits |
+| `git_clone` | shell | Clone a repository |
+| `git_commit` | shell | Stage and commit changes |
+| `git_push` | shell | Push current branch to origin |
+| `git_create_pr` | shell | Open a pull request via `gh` |
+| MCP tools (dynamic) | mcp | Discovered from connected MCP servers, registered as `mcp_<server>_<tool>` |
 
 ### Tool Aliases
 
@@ -242,19 +323,37 @@ The model can call tools by natural names — `bash`→`execute_shell`, `cat`→
 AGENT8088/
 ├── src/agent8088/            # Installable package — the ONLY place data files live
 │   ├── __init__.py           # Version
-│   ├── engine.py             # Core engine (agent loop, tools, permissions)
-│   ├── cli.py                # Rich CLI (streaming, slash commands, escalation)
+│   ├── engine.py             # Core engine (agent loop, tools, permissions, MCP)
+│   ├── cli.py                # Rich CLI (streaming, slash commands, escalation, gateway setup)
 │   ├── providers.py          # Multi-model provider registry (13 providers)
+│   ├── mcp.py                # MCP client runtime (connects to external MCP servers)
 │   ├── config.txt            # Shipped default config (see config lookup below)
 │   ├── system.md             # System prompt / skill document
 │   ├── tools.txt             # Tool specs
 │   ├── agents/               # Sub-agent profiles
-│   └── skills_installed/     # Installable skill packages
+│   ├── skills_installed/     # Installable skill packages
+│   └── gateway/              # Messaging gateway (Slack, WhatsApp, Discord)
+│       ├── runner.py          # Gateway runner (session, approvals, slash commands)
+│       ├── agent_bridge.py    # Bridge between gateway and engine
+│       ├── auth.py            # Allowlist + WhatsApp LID resolution
+│       ├── session.py         # Per-chat JSON session store
+│       └── platforms/        # Channel adapters
+│           ├── base.py        # BaseChannelAdapter ABC
+│           ├── slack.py       # Slack adapter (Socket Mode)
+│           ├── discord.py     # Discord adapter (discord.py + approval buttons)
+│           └── whatsapp.py    # WhatsApp adapter (Baileys bridge)
+├── tests/                    # Test suite
+│   ├── test_permission.py    # Permission layer tests
+│   ├── test_cli_setup.py     # CLI setup wizard tests
+│   ├── test_env_key_store.py # .env key store tests
+│   ├── test_mcp.py           # MCP client tests
+│   └── gateway/              # Gateway adapter tests
+├── .agent8088/               # Project-scoped MCP config (mcp.json)
 ├── install.sh                # One-line installer (macOS/Linux)
 ├── install.ps1               # One-line installer (Windows)
 ├── pyproject.toml            # Package metadata + entry points
-├── tests/                    # Permission layer tests
-├── docs/                     # Architecture docs + multi-model providers + roadmap
+├── MCP_FEATURES.md           # MCP client documentation
+├── docs/                     # Architecture docs + specs + capability comparison
 ├── research/                 # Non-runtime: SkillOpt, benchmarks, training
 └── scripts/                  # One-off repo ops
 ```
@@ -351,6 +450,22 @@ agent8088 --update
 
 **Git login prompt during install**
 - The installer suppresses credential prompts (`GIT_TERMINAL_PROMPT=0`). If you still see one, ensure the repo URL in the script points to the public repo.
+
+**MCP server not connecting**
+- Run `/mcp` to see per-server connection state and errors.
+- After editing `mcp.json`, run `/mcp reload`.
+- Ensure the stdio server command is installed and on PATH (e.g. `npx` needs Node.js 18+).
+- For HTTP servers, ensure the `bearer_token_env` environment variable is set.
+
+**Gateway not starting**
+- Run `agent8088 --gateway-setup` to enable a channel (only one channel active at a time).
+- Check that tokens are in `~/.agent8088/.env` (not config.txt).
+- Run `/mcp` and `/tools` to verify tools are discovered.
+
+**Gateway approval not working**
+- The gateway runs in readonly mode by default. Set `gateway_permission_mode=edit` in config.txt to disable approvals.
+- For chat-based approvals: send `/approve` (once), `/approve session`, or `/deny` in the chat.
+- Discord gets interactive ✅/❌ buttons.
 
 ---
 

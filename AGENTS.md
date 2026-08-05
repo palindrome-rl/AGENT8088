@@ -42,3 +42,25 @@ Rules:
 - Mark deliberate simplifications that cut a real corner with a known ceiling (global lock, O(n²) scan, naive heuristic) with a `ponytail:` comment naming the ceiling and upgrade path.
 
 Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks (an assert-based demo/self-check or one small test file; no frameworks, no fixtures). Trivial one-liners need no test.
+
+## engineering
+
+From `docs/Practical-Software-Engineering-Field-Guide (2).md` — follow these on every change.
+
+**Done** means: code works for the intended case and the obvious edge cases; tests exist that would fail if someone broke this in six months; CI is green (lint, types, tests); the change is reviewed; anything a future reader needs is written down; it has been observed working somewhere other than the author's laptop; nothing left commented-out, no debug prints, no `TODO: fix later` without a linked issue.
+
+**Commits** — one logical change per commit that leaves the repo working. Conventional shape: `<type>: <imperative summary, <=50 chars>`; body explains *why*, not what the diff already shows. Run `git status` and `git diff --staged` before every commit.
+
+**History** — never rewrite history or `push --force` on a branch other people have pulled; use `--force-with-lease`. Rewriting history is only safe on branches only you have.
+
+**PRs** — a PR is a unit of review, not a unit of work; keep changes small (<400 lines) and split large ones. Diff contains only what the task required (read the full file list). Description says what, why, how to verify, and what you are unsure about. No secrets, keys, or real user data anywhere in the diff.
+
+**Scope** — unrelated issues spotted while working get written down (open an issue, note in the PR), never fixed in the same PR.
+
+**Security** — never commit secrets; if one leaks, rotate it immediately and report it. Validate model output before acting on it — never pass it raw to `eval`, a shell, SQL, or a file path. Least privilege on tools; never combine private data + untrusted input + an outbound channel in one agent.
+
+**Tests** — test contracts, not implementation. Name states the behaviour; one behaviour per test; independent and order-free; deterministic. A new test must fail when the code is broken — verify by breaking it deliberately. Fix or delete flaky tests; never ignore them.
+
+**AI specifics** — prompts are source code: own files, versioned, reviewed. Pin exact model versions, never `-latest`. Instrument every model call (input/output/cached tokens, cost, latency, `stop_reason`, model id). Bound `max_tokens`; alert on `stop_reason == max_tokens`, output-parse failure, and cost spikes.
+
+**Reviewing agent code** — check for plausible-but-wrong APIs, silently swallowed errors, tests that mock the thing under test, scope creep, confidently invented config, and duplicated logic where an existing helper fits.

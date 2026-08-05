@@ -314,8 +314,24 @@ def _active_provider_name():
 
 def _session_system_prompt():
     specs = _active_tool_specs()
-    return (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
-            + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE))
+    prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
+              + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE))
+    # Inject current permission mode so the model knows what it can/can't do right now
+    prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
+    if A.PERMISSION_MODE == "plan-only":
+        prompt += ("You are in plan-only mode RIGHT NOW. Direct writes and mutations "
+                   "are BLOCKED — do NOT call write_file, execute_shell, git_commit, "
+                   "git_push, run_sandboxed, schedule_task, or browse_page directly. "
+                   "Use read_text and safe shell commands (ls, cat, grep, git status, "
+                   "git diff, git log) to gather information, then call execute_plan "
+                   "with a steps array to execute your plan.\n")
+    elif A.PERMISSION_MODE in ("edit", "full-auto"):
+        prompt += ("You are in full-auto mode. All tools are allowed without prompts. "
+                   "Catastrophic commands and credential path writes are still blocked.\n")
+    else:
+        prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
+                   "Writes and mutations require user approval.\n")
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -668,15 +684,26 @@ def _stream_view(reasoning_parts, content_parts):
     return Group(*blocks) if blocks else Text("")
 
 
+_session_allowlist = set()  # patterns approved for the rest of the session
+
+
 def _handle_escalation(result_text, live=None):
     """Check if a tool result is an escalation request. If so, prompt the user
-    for y/n approval and call grant_escalation() if approved."""
+    with once/session/deny options and call grant_escalation() if approved.
+
+    In plan-only mode, offers a mode-switch choice (full-auto/readonly/deny)
+    instead of once/session/deny — matches Claude Code's 'exit plan = pick
+    destination mode' pattern."""
     if not result_text.startswith("ESCALATION_REQUEST:"):
         return False
     parts = result_text.split(":", 4)
     if len(parts) < 5:
         return False
     _, target_mode, change_type, paths, reason = parts
+    # Session allowlist: if this change_type was approved for the session, auto-approve
+    if change_type in _session_allowlist:
+        A.grant_escalation(change_type)
+        return True
     if live is not None:
         live.stop()
     console.print()
@@ -685,18 +712,42 @@ def _handle_escalation(result_text, live=None):
         title="[bold yellow]Permission Escalation Request[/bold yellow]",
         box=box.ROUNDED, border_style="yellow",
     ))
-    try:
-        response = console.input("[bold yellow]Allow? (y/n): [/bold yellow]").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        response = "n"
-    if response in ("y", "yes"):
-        A.grant_escalation(change_type)
-        console.print("[green]Approved for this action only. Next write will ask again.[/green]")
+    if A.PERMISSION_MODE == "plan-only":
+        try:
+            response = console.input(
+                "[bold yellow]Approve plan? (a=approve / d=deny): [/bold yellow]"
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            response = "d"
+        if response in ("a", "approve", "y", "yes"):
+            A.grant_escalation(change_type)
+            console.print("[green]Plan approved. Steps will run.[/green]")
+            approved = True
+        else:
+            console.print("[red]Plan denied — staying in plan-only mode.[/red]")
+            approved = False
     else:
-        console.print("[red]Permission denied — staying in readonly mode.[/red]")
+        try:
+            response = console.input(
+                "[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]"
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            response = "d"
+        if response in ("o", "once", "y", "yes"):
+            A.grant_escalation(change_type)
+            console.print("[green]Approved for this action only.[/green]")
+            approved = True
+        elif response in ("s", "session"):
+            _session_allowlist.add(change_type)
+            A.grant_escalation(change_type)
+            console.print(f"[green]Approved for this session. '{change_type}' won't ask again.[/green]")
+            approved = True
+        else:
+            console.print("[red]Permission denied — staying in readonly mode.[/red]")
+            approved = False
     if live is not None:
         live.start()
-    return response in ("y", "yes")
+    return approved
 
 
 def do_chat(query):
@@ -735,6 +786,31 @@ def do_chat(query):
         def _on_escalation(_name, result):
             return _handle_escalation(result, live)
 
+        # Wire plan execution callbacks so execute_plan tool calls render the
+        # checklist and route write-step escalations to the approval menu.
+        _plan_steps_state = {}
+        _PLAN_ICONS_LOCAL = {"pending": ("○", "#237dd7"), "running": ("◐", "#237dd7"), "done": ("✓", "#237dd7")}
+
+        def _plan_on_step(idx, total, step_text, tool_name, status, result):
+            _plan_steps_state[idx] = (step_text, tool_name, status)
+            rows = []
+            for i in sorted(_plan_steps_state):
+                st_text, st_tool, st_status = _plan_steps_state[i]
+                icon, style = _PLAN_ICONS_LOCAL[st_status]
+                row = Text()
+                row.append(f"{icon} ", style=style)
+                row.append(f"[{i}] ", style="dim")
+                row.append(f"{st_tool}: ", style="bold")
+                row.append(st_text[:70])
+                rows.append(row)
+            live.update(Group(*rows) if rows else Text("planning..."))
+
+        def _plan_on_escalation(escalation_text):
+            return _handle_escalation(escalation_text, live)
+
+        A._plan_on_step = _plan_on_step
+        A._plan_on_escalation = _plan_on_escalation
+
         try:
             answer = A.run_agent(
                 S.messages, max_turns=S.max_turns, temperature=S.temperature,
@@ -750,6 +826,8 @@ def do_chat(query):
             answer = None
         finally:
             A.subagent_ui = None
+            A._plan_on_step = None
+            A._plan_on_escalation = None
 
     elapsed = time.time() - turn_start
     if answer is None:
@@ -812,6 +890,11 @@ def cmd_help(_):
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
         ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
+        ("/mcp", "List MCP servers, connection state, errors, and discovered tools"),
+        ("/mcp reload", "Reconnect MCP servers after changing configuration"),
+        ("/mcp add <name> stdio <command> [args...] [--project]", "Add a local MCP server"),
+        ("/mcp add <name> http <url> [--project]", "Add a Streamable HTTP MCP server"),
+        ("/mcp remove <name> [--project]", "Remove an MCP server from the selected scope"),
         ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
@@ -852,6 +935,50 @@ def cmd_tools(_):
         args = ", ".join(spec.get("args") or []) or "—"
         t.add_row(name, args, spec.get("mode", "?"), spec.get("description", ""))
     console.print(t)
+
+
+def cmd_mcp(rest):
+    """Manage MCP servers without introducing a second configuration format."""
+    parts = shlex.split(rest or "")
+    action = parts.pop(0).lower() if parts else "list"
+    if action == "reload":
+        A.reload_mcp_tools()
+    elif action == "add" and len(parts) >= 3:
+        name, transport, target, *extra = parts
+        project = "--project" in extra
+        extra = [item for item in extra if item != "--project"]
+        config = ({"command": target, "args": extra} if transport == "stdio" else {"url": target} if transport == "http" else None)
+        if config is None:
+            console.print("[red]Usage:[/red] /mcp add <name> stdio <command> [args...] [--project] | http <url> [--project]")
+            return
+        try:
+            A.MCP_RUNTIME.set_server(name, config, project=project)
+            A.reload_mcp_tools()
+        except Exception as exc:
+            console.print(f"[red]MCP add failed:[/red] {exc}")
+            return
+    elif action == "remove" and parts:
+        try:
+            removed = A.MCP_RUNTIME.remove_server(parts[0], project="--project" in parts[1:])
+            A.reload_mcp_tools()
+            console.print("[green]removed[/green]" if removed else "[yellow]server was not configured in that scope[/yellow]")
+            return
+        except Exception as exc:
+            console.print(f"[red]MCP remove failed:[/red] {exc}")
+            return
+    elif action not in {"list", "status"}:
+        console.print("[red]Usage:[/red] /mcp [reload|add|remove]")
+        return
+    table = Table(title="MCP Servers", box=box.SIMPLE, title_style="bold #00edff", header_style="bold #00edff", border_style="#0077B6")
+    table.add_column("Server", style="#237dd7")
+    table.add_column("State", style="#237dd7")
+    table.add_column("Tools", style="#237dd7")
+    for name, status in sorted(A.MCP_RUNTIME.statuses.items()):
+        detail = ", ".join(status.get("tools", [])) or status.get("error", "—")
+        table.add_row(name, status["state"], detail)
+    if not A.MCP_RUNTIME.statuses:
+        table.add_row("none", "—", "Add one: /mcp add <name> stdio <command> [args...]")
+    console.print(table)
 
 
 def cmd_skills(rest):
@@ -1270,6 +1397,8 @@ def cmd_status(_):
     t.add_row("Model", f"{active}:{A.MODEL_NAME}")
     t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
+    connected = sum(item.get("state") == "connected" for item in A.MCP_RUNTIME.statuses.values())
+    t.add_row("MCP", f"{connected} connected · {sum(len(item.get('tools', [])) for item in A.MCP_RUNTIME.statuses.values())} tools")
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['requested']}) · network {sandbox['network']}")
@@ -1340,6 +1469,26 @@ def cmd_sandbox(rest):
     t.add_row("Network", status["network"])
     t.add_row("Runtime", status["runtime_version"])
     console.print(t)
+
+
+def cmd_mode(rest):
+    valid = ("readonly", "full-auto", "plan-only")
+    arg = rest.strip().lower()
+    # Backward-compat: "edit" is an alias for "full-auto"
+    if arg == "edit":
+        arg = "full-auto"
+    if not arg:
+        console.print(f"Current mode: [bold #00edff]{A.PERMISSION_MODE}[/bold #00edff]")
+        console.print(f"Valid modes: {', '.join(valid)}")
+        return
+    if arg not in valid:
+        console.print(f"[red]unknown mode:[/red] {arg}")
+        console.print(f"Valid modes: {', '.join(valid)}")
+        return
+    A.PERMISSION_MODE = arg
+    # Clear plan execution grant when leaving plan-only mode
+    A._plan_execution_grant = False
+    console.print(f"Permission mode: [bold green]{arg}[/bold green]")
 
 
 def cmd_new(rest):
@@ -1648,6 +1797,10 @@ def _api_key_from_auth(auth):
 
 
 def _custom_prompt(message, default="", secret=False, instruction=""):
+    if secret and default:
+        masked = A._mask_value(default)
+        instruction = instruction or f"(Enter keeps existing: {masked})"
+        default = ""  # don't pass the actual secret as default to InquirerPy
     try:
         from InquirerPy import inquirer
         prompt = inquirer.secret if secret else inquirer.text
@@ -1658,12 +1811,16 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
             kwargs["instruction"] = instruction
         return prompt(**kwargs).execute()
     except ImportError:
-        suffix = f" [{default}]" if default and not secret else ""
-        if instruction:
+        suffix = ""
+        if secret and instruction:
+            suffix = f" {instruction}"
+        elif default and not secret:
+            suffix = f" [{default}]"
+        if instruction and not secret:
             suffix += f" {instruction}"
         if secret:
             import getpass
-            return getpass.getpass(f"{message}{suffix} ")
+            return getpass.getpass(f"{message}{suffix} ") or ""
         value = input(f"{message}{suffix} ").strip()
         return value or default
 
@@ -1720,8 +1877,8 @@ COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "skills": cmd_skills,
-    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "config": cmd_config, "system": cmd_system,
-    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox,
+    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config, "system": cmd_system,
+    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
@@ -2018,20 +2175,23 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     custom_base_url = ""
     if provider_choice == CUSTOM_PROVIDER_CHOICE:
+        _builtin_names = provider_registry.builtin_provider_names()
+        existing_name = _current("default_provider") if _current("default_provider") not in _builtin_names else ""
         while True:
             entered_provider = (
-                _custom_prompt("Custom provider name:").strip().lower()
+                _custom_prompt("Custom provider name:", default=existing_name).strip().lower()
             )
             provider = "-".join(entered_provider.split())
             if _valid_provider_name(provider):
                 break
             print("Custom provider names use letters, numbers, _ or -.")
+        existing_url = _current(f"provider.{provider}.base_url")
         while not custom_base_url:
             custom_base_url = _openai_base_url(
-                _custom_prompt("OpenAI-compatible URL:").strip()
+                _custom_prompt("OpenAI-compatible URL:", default=existing_url).strip()
             )
             if not custom_base_url:
-                custom_base_url = _current(f"provider.{provider}.base_url")
+                custom_base_url = existing_url
             if custom_base_url:
                 break
             print("An OpenAI-compatible URL is required.")
@@ -2042,14 +2202,16 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         _current(f"provider.{provider}.model")
         or provider_registry.builtin_provider_defaults(provider).get("default_model", "")
     )
-    current_key = _current(f"provider.{provider}.api_key")
+    # Read existing key from .env first, then config.txt (legacy)
+    _env_file = A.ENV_FILE_PATH if hasattr(A, "ENV_FILE_PATH") else None
+    _env_vars = A.load_env_file(_env_file) if _env_file else {}
+    env_var_name = f"{provider.upper().replace('-', '_')}_API_KEY"
+    current_key = _env_vars.get(env_var_name, "") or _current(f"provider.{provider}.api_key")
 
-    # API key input is deliberately hidden and has no default, so existing keys are
-    # never echoed back to the terminal. Empty input preserves the existing value.
     key = _custom_prompt(
         f"API key for {provider}:",
+        default=current_key,
         secret=True,
-        instruction="(hidden; Enter keeps existing/skips)",
     )
     # Fetch models
     print("\nFetching model list...")
@@ -2099,7 +2261,10 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         content = _set_line(content, f"provider.{provider}.api_mode", "openai")
     content = _set_line(content, f"provider.{provider}.model", model_name)
     if key:
-        content = _set_line(content, f"provider.{provider}.api_key", key)
+        env_var_name = f"{provider.upper().replace('-', '_')}_API_KEY"
+        A.update_env_file(A.ENV_FILE_PATH, {env_var_name: key})
+        content = _set_line(content, f"provider.{provider}.api_key_env", env_var_name)
+        content = _re.sub(rf'^provider\.{_re.escape(provider)}\.api_key=.*\n?', '', content, flags=_re.MULTILINE)
     if search.strip().lower() == "none":
         content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
     elif search:
@@ -2111,6 +2276,254 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     print("Setup complete.")
 
 
+def _run_gateway_setup():
+    """Interactive wizard for configuring Slack + WhatsApp messaging gateways."""
+    import re as _re
+    import subprocess
+    import shutil
+
+    home = _agent8088_home()
+    config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    if not config_path.exists():
+        print(f"Config not found: {config_path}")
+        print("Run `agent8088 --setup` first to create a base config.")
+        return
+    content = config_path.read_text(encoding="utf-8")
+
+    def _current(key):
+        m = _re.search(rf'^{key}=(.*)$', content, _re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    def _set_line(text, key, value):
+        pattern = rf'^{_re.escape(key)}=.*'
+        if _re.search(pattern, text, _re.MULTILINE):
+            return _re.sub(pattern, lambda _: f"{key}={value}", text, flags=_re.MULTILINE)
+        return text + f"\n{key}={value}\n"
+
+    print("Agent8088 Gateway Setup\n")
+    print("Configure messaging platforms so the agent can respond on")
+    print("Slack, WhatsApp, and Discord. Run `agent8088 --gateway` to start.\n")
+
+    # Show current state
+    slack_on = _current("slack_enabled") in ("1", "true", "True")
+    wa_on = _current("whatsapp_enabled") in ("1", "true", "True")
+    discord_on = _current("discord_enabled") in ("1", "true", "True")
+
+    # Only one gateway channel can be active at a time (mutually exclusive).
+    # Single-select picker — choosing one disables the others.
+    current = "None"
+    if slack_on: current = "Slack"
+    elif wa_on: current = "WhatsApp"
+    elif discord_on: current = "Discord"
+
+    choices = [
+        "Slack" + (" (current)" if slack_on else ""),
+        "WhatsApp" + (" (current)" if wa_on else ""),
+        "Discord" + (" (current)" if discord_on else ""),
+        "None (disable all)",
+    ]
+    selected = _choice_prompt("Select gateway channel (only one can be active):", choices)
+
+    if selected == "None (disable all)":
+        slack_on = wa_on = discord_on = False
+        newly_enabled = set()
+    elif selected.startswith("Slack"):
+        newly_enabled = set() if slack_on else {"slack"}
+        slack_on = True
+        wa_on = discord_on = False
+    elif selected.startswith("WhatsApp"):
+        newly_enabled = set() if wa_on else {"whatsapp"}
+        wa_on = True
+        slack_on = discord_on = False
+    elif selected.startswith("Discord"):
+        newly_enabled = set() if discord_on else {"discord"}
+        discord_on = True
+        slack_on = wa_on = False
+    else:
+        newly_enabled = set()
+
+    # --- Slack configuration (only if newly enabled) ---
+    if slack_on and "slack" in newly_enabled:
+        print("\n--- Slack ---")
+        print("Create a Slack app at https://api.slack.com/apps:")
+        print("  1. Create New App -> From scratch")
+        print("  2. OAuth & Permissions -> add scopes: chat:write,")
+        print("     app_mentions:read, channels:history, channels:read,")
+        print("     im:history, im:read")
+        print("  3. Socket Mode -> Enable -> create xapp- token")
+        print("  4. Event Subscriptions -> add: message.im,")
+        print("     message.channels, app_mention")
+        print("  5. App Home -> enable Messages Tab")
+        print("  6. Install App -> copy xoxb- token\n")
+
+        _env_vars = A.load_env_file(A.ENV_FILE_PATH)
+        bot_token = _custom_prompt("Slack Bot Token (xoxb-...):",
+                                    default=_env_vars.get("SLACK_BOT_TOKEN", ""),
+                                    secret=True)
+        if bot_token:
+            A.update_env_file(A.ENV_FILE_PATH, {"SLACK_BOT_TOKEN": bot_token})
+        else:
+            bot_token = _env_vars.get("SLACK_BOT_TOKEN", "")
+        app_token = _custom_prompt("Slack App Token (xapp-...):",
+                                    default=_env_vars.get("SLACK_APP_TOKEN", ""),
+                                    secret=True)
+        if app_token:
+            A.update_env_file(A.ENV_FILE_PATH, {"SLACK_APP_TOKEN": app_token})
+        else:
+            app_token = _env_vars.get("SLACK_APP_TOKEN", "")
+        allowed = _custom_prompt("Allowed Slack user IDs (comma-separated):",
+                                 _current("slack_allowed_users"))
+        if allowed:
+            content = _set_line(content, "slack_allowed_users", allowed)
+        if not (bot_token and app_token):
+            content = _set_line(content, "slack_enabled", "0")
+            slack_on = False
+            print("Slack disabled — both bot token and app token required.\n")
+        else:
+            content = _set_line(content, "slack_enabled", "1")
+            print("Slack configured.\n")
+
+    # --- WhatsApp configuration (only if newly enabled) ---
+    if wa_on and "whatsapp" in newly_enabled:
+        print("\n--- WhatsApp ---")
+        session_dir = _current("whatsapp_session_dir") or str(
+            Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
+        )
+        session_dir = _custom_prompt("WhatsApp session directory:", session_dir)
+        if session_dir:
+            content = _set_line(content, "whatsapp_session_dir", session_dir)
+        allowed = _custom_prompt("Allowed WhatsApp numbers (comma-separated, e.g. +923214567891):",
+                                 _current("whatsapp_allowed_users"))
+        if allowed:
+            content = _set_line(content, "whatsapp_allowed_users", allowed)
+        mode = _choice_prompt("WhatsApp mode:", ["self-chat", "bot"],
+                              _current("whatsapp_mode") or "self-chat")
+        content = _set_line(content, "whatsapp_mode", mode)
+        bridge_port = _custom_prompt("Bridge port:", _current("whatsapp_bridge_port") or "3000")
+        if bridge_port:
+            content = _set_line(content, "whatsapp_bridge_port", bridge_port)
+
+        # Check if already paired (creds.json exists)
+        session_path = Path(session_dir).expanduser()
+        creds = session_path / "creds.json"
+        if creds.exists():
+            re_pair = _custom_prompt("WhatsApp already paired. Re-pair anyway? (destroys session):",
+                                     instruction="(y/N)")
+            if re_pair.strip().lower() in ("y", "yes"):
+                # Wipe the ENTIRE session dir — stale app-state-sync keys and
+                # pre-keys from an old session cause "failed to find key"
+                # errors that block message receipt after re-pairing.
+                import shutil as _shutil
+                _shutil.rmtree(str(session_path), ignore_errors=True)
+                session_path.mkdir(parents=True, exist_ok=True)
+                creds = session_path / "creds.json"
+            else:
+                print("Keeping existing pairing. Skipping QR.")
+                creds = None  # skip pairing below
+
+        if creds is not None and not creds.exists():
+            bridge_dir = Path(__file__).parent / "gateway" / "platforms" / "whatsapp_bridge"
+            bridge_js = bridge_dir / "bridge.js"
+            if not bridge_js.exists():
+                print(f"ERROR: bridge.js not found at {bridge_dir}")
+            elif not shutil.which("node"):
+                print("ERROR: Node.js not found. Install Node.js 18+ first:")
+                print("  https://nodejs.org/")
+            else:
+                # Install npm deps if node_modules missing
+                node_modules = bridge_dir / "node_modules"
+                if not node_modules.exists():
+                    print("\nInstalling WhatsApp bridge npm dependencies...")
+                    try:
+                        subprocess.run(
+                            ["npm", "install", "--silent"],
+                            cwd=str(bridge_dir),
+                            check=True,
+                            timeout=120,
+                        )
+                        print("npm install complete.")
+                    except Exception as e:
+                        print(f"npm install failed: {e}")
+                        print(f"Run manually: cd {bridge_dir} && npm install")
+
+                # Run pairing (prints QR to terminal)
+                print("\nStarting WhatsApp QR pairing...")
+                print("Scan the QR code with WhatsApp:")
+                print("  Phone -> Settings -> Linked Devices -> Link a Device\n")
+                session_path.mkdir(parents=True, exist_ok=True)
+                try:
+                    subprocess.run(
+                        ["node", str(bridge_js), "--pair", "--session", str(session_path)],
+                        cwd=str(bridge_dir),
+                        timeout=120,
+                    )
+                    if creds.exists():
+                        print("\nWhatsApp pairing successful!")
+                    else:
+                        print("\nPairing may not have completed — check the QR was scanned.")
+                        print(f"If needed, re-run: agent8088 --gateway-setup")
+                except subprocess.TimeoutExpired:
+                    print("\nPairing timed out. Re-run `agent8088 --gateway-setup`.")
+                except Exception as e:
+                    print(f"\nPairing failed: {e}")
+                    print(f"Run manually: node {bridge_js} --pair --session {session_path}")
+
+        content = _set_line(content, "whatsapp_enabled", "1")
+        print("WhatsApp configured.\n")
+
+    # --- Discord configuration (only if newly enabled) ---
+    if discord_on and "discord" in newly_enabled:
+        print("\n--- Discord ---")
+        print("Create a Discord bot at https://discord.com/developers/applications:")
+        print("  1. New Application -> give it a name")
+        print("  2. Bot -> Add Bot -> copy the token")
+        print("  3. Enable Privileged Gateway Intents: Message Content Intent")
+        print("  4. OAuth2 -> URL Generator -> select 'bot' scope")
+        print("     -> select 'Send Messages', 'Read Message History'")
+        print("     -> use the generated URL to invite the bot to your server\n")
+
+        _env_vars = A.load_env_file(A.ENV_FILE_PATH)
+        bot_token = _custom_prompt("Discord Bot Token:",
+                                    default=_env_vars.get("DISCORD_BOT_TOKEN", ""),
+                                    secret=True)
+        if bot_token:
+            A.update_env_file(A.ENV_FILE_PATH, {"DISCORD_BOT_TOKEN": bot_token})
+        else:
+            bot_token = _env_vars.get("DISCORD_BOT_TOKEN", "")
+        allowed = _custom_prompt("Allowed Discord user IDs (comma-separated):",
+                                 _current("discord_allowed_users"))
+        if allowed:
+            content = _set_line(content, "discord_allowed_users", allowed)
+        if not bot_token:
+            content = _set_line(content, "discord_enabled", "0")
+            discord_on = False
+            print("Discord disabled — bot token required.\n")
+        else:
+            content = _set_line(content, "discord_enabled", "1")
+            print("Discord configured.\n")
+
+    # Mutually exclusive: ensure only the selected channel is enabled
+    content = _set_line(content, "slack_enabled", "1" if slack_on else "0")
+    content = _set_line(content, "whatsapp_enabled", "1" if wa_on else "0")
+    content = _set_line(content, "discord_enabled", "1" if discord_on else "0")
+
+    # Write config
+    A._write_private_text(config_path, content)
+    enabled = []
+    if slack_on: enabled.append("Slack")
+    elif wa_on: enabled.append("WhatsApp")
+    elif discord_on: enabled.append("Discord")
+    if enabled:
+        print(f"Config written to {config_path}")
+        print(f"Enabled: {', '.join(enabled)}")
+        if newly_enabled:
+            print(f"Newly configured: {', '.join(sorted(newly_enabled))}")
+        print(f"\nStart the gateway with: agent8088 --gateway")
+    else:
+        print(f"Config written to {config_path}")
+        print("No platform enabled. Run: agent8088 --gateway-setup")
+
+
 def main():
     import argparse
     from agent8088 import __version__
@@ -2120,12 +2533,17 @@ def main():
         epilog="Run with no flags to start the interactive REPL.",
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
-    parser.add_argument("--edit", action="store_true", help="start in edit mode (no per-action permission prompts)")
+    parser.add_argument("--edit", action="store_true", help="start in full-auto mode (alias for --mode full-auto)")
+    parser.add_argument("--full-auto", action="store_true", help="start in full-auto mode (no per-action permission prompts)")
+    parser.add_argument("--mode", choices=["readonly", "full-auto", "plan-only"],
+                        default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
+    parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp) instead of the REPL")
+    parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp messaging gateways, then exit")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -2143,8 +2561,17 @@ def main():
     if args.sandbox_setup:
         print(A.install_native_sandbox())
         return
-    if args.edit:
-        A.PERMISSION_MODE = "edit"
+    if args.gateway:
+        from agent8088.gateway import main as gateway_main
+        gateway_main()
+        return
+    if args.gateway_setup:
+        _run_gateway_setup()
+        return
+    if args.edit or args.full_auto:
+        A.PERMISSION_MODE = "full-auto"
+    if args.mode:
+        A.PERMISSION_MODE = args.mode
     if S.show_trace:
         try:
             _start_trace_export()

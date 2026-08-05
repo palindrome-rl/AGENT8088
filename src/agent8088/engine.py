@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid  # readline enables input history
+import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
     import readline  # Unix-only; enables input history/editing
 except ImportError:
@@ -14,8 +14,12 @@ except ImportError:
 from contextlib import nullcontext
 from pathlib import Path
 from openai import OpenAI
+from agent8088.mcp import MCPRuntime
 
 APP_DIR = Path(__file__).resolve().parent
+
+import logging
+_log = logging.getLogger("agent8088.engine")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +103,123 @@ def update_simple_config(path: Path, values: dict) -> None:
     _write_private_text(path, content)
 
 
+
+# --- .env key store ---
+
+def load_env_file(path: Path = None) -> dict:
+    """Load a .env file into a dict. Same format as load_simple_config."""
+    if path is None:
+        path = ENV_FILE_PATH if 'ENV_FILE_PATH' in globals() else Path.home() / ".agent8088" / ".env"
+    if not path.exists():
+        return {}
+    env = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+    return env
+
+
+def update_env_file(path: Path, values: dict) -> None:
+    """Update key=value settings in a .env file with 0600 perms."""
+    path = Path(path)
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    for key, raw_value in values.items():
+        value = str(raw_value)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", key) or "\n" in value or "\r" in value:
+            raise ValueError(f"Invalid env value for {key!r}")
+        line = f"{key}={value}"
+        pattern = rf"^{re.escape(key)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, lambda _: line, content, flags=re.MULTILINE)
+        else:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += line + "\n"
+    _write_private_text(path, content)
+
+
+def _mask_value(value: str) -> str:
+    """Mask a secret for display: sk-...cdef or (set, too short)."""
+    if not value:
+        return "(not set yet)"
+    if len(value) < 8:
+        return "(set, too short to mask)"
+    return value[:3] + "..." + value[-4:]
+
+
+def get_secret(config: dict, key: str, env_var: str = None) -> str:
+    """Resolve a secret: .env file first, then config, then os.environ.
+    If env_var is not given, derive it from key.upper()."""
+    env_var = env_var or key.upper()
+    _env = load_env_file()
+    if env_var in _env:
+        return _env[env_var]
+    if os.environ.get(env_var):
+        return os.environ[env_var]
+    env_key = f"{key}_env"
+    if env_key in config:
+        env_name = config[env_key]
+        if env_name in _env:
+            return _env[env_name]
+        if os.environ.get(env_name):
+            return os.environ[env_name]
+    return config.get(key, "")
+
+
+def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
+    """One-time migration: move provider.*.api_key and *_token from config.txt to .env.
+    Returns the number of keys migrated."""
+    if env_path.exists():
+        return 0  # already migrated
+    config = load_simple_config(config_path)
+    env_values = {}
+    config_updates = {}
+    migrated = 0
+
+    for key, value in list(config.items()):
+        if key.startswith("provider.") and key.endswith(".api_key") and value:
+            provider_name = key.split(".")[1]
+            env_var = f"{provider_name.upper().replace('-', '_')}_API_KEY"
+            env_values[env_var] = value
+            config_updates[f"provider.{provider_name}.api_key_env"] = env_var
+            config_updates[key] = ""  # clear the literal key
+            migrated += 1
+        elif key.endswith("_bot_token") and value:
+            env_var = key.upper()
+            env_values[env_var] = value
+            config_updates[f"{key}_env"] = env_var
+            config_updates[key] = ""
+            migrated += 1
+        elif key.endswith("_app_token") and value:
+            env_var = key.upper()
+            env_values[env_var] = value
+            config_updates[f"{key}_env"] = env_var
+            config_updates[key] = ""
+            migrated += 1
+
+    if not migrated:
+        return 0
+
+    update_env_file(env_path, env_values)
+    # Remove the literal keys from config.txt
+    content = config_path.read_text(encoding="utf-8")
+    for key in config_updates:
+        if config_updates[key] == "":
+            content = re.sub(rf"^{re.escape(key)}=.*\n?", "", content, flags=re.MULTILINE)
+        else:
+            line = f"{key}={config_updates[key]}"
+            pattern = rf"^{re.escape(key)}=.*$"
+            if re.search(pattern, content, re.MULTILINE):
+                content = re.sub(pattern, lambda _: line, content, flags=re.MULTILINE)
+            else:
+                content += line + "\n"
+    _write_private_text(config_path, content)
+    return migrated
+
+
 # Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
@@ -111,6 +232,19 @@ elif _win_config.exists():
 else:
     CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
+
+# .env key store lives next to config.txt
+ENV_FILE_PATH = Path(str(CONFIG_PATH.parent / ".env"))
+
+# One-time migration: move provider.*.api_key and *_token from config.txt to .env
+try:
+    _migrated_count = _migrate_keys_to_env(CONFIG_PATH, ENV_FILE_PATH)
+    if _migrated_count:
+        print(f"[agent8088] Migrated {_migrated_count} keys to {ENV_FILE_PATH}")
+        APP_CONFIG = load_simple_config(CONFIG_PATH)
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -180,6 +314,9 @@ PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
 _one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
 _local_fallback_grant = False
 _remote_git_grant = False
+_plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
+_plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
+_plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -239,6 +376,7 @@ def _resolve_path_list(config_key: str, default: str = "") -> list:
 NO_PROMPT_PATHS = _resolve_path_list("no_prompt_paths")
 PROMPT_PATHS = _resolve_path_list("prompt_paths", ".")
 BLOCKED_PATHS = _resolve_path_list("blocked_paths")
+READ_PATHS = _resolve_path_list("read_paths")  # optional: if set, reads outside these escalate
 
 
 def _check_path_zone(target: Path) -> str:
@@ -263,6 +401,11 @@ READONLY_SAFE_COMMANDS = frozenset([
     "dir", "type", "findstr", "where", "hostname", "ver", "vol",
     "tasklist", "systeminfo",
 ])
+# Config-extensible: merge user-supplied safe commands from config.txt
+_extra_safe = APP_CONFIG.get("readonly_safe_commands", "")
+if _extra_safe.strip():
+    READONLY_SAFE_COMMANDS = READONLY_SAFE_COMMANDS | frozenset(
+        c.strip().lower() for c in _extra_safe.split(",") if c.strip())
 
 _SHELL_CONTROL_RE = re.compile(r"[|&;<>\n`]|\$\(")
 _GIT_READ_COMMANDS = frozenset(["status", "diff", "log", "show"])
@@ -310,7 +453,113 @@ def _dangerous_git_args(tokens: list) -> bool:
     )
 
 
+# --- User-defined deny rules (config: deny_commands) ---
+# fnmatch globs matched case-insensitively against the whole command text.
+# Checked at the hardline floor, before any mode or approval — no override.
+_USER_DENY_GLOBS = [
+    g.strip() for g in APP_CONFIG.get("deny_commands", "").split(",") if g.strip()
+]
+
+
+def _matches_user_deny(command: str) -> bool:
+    if not _USER_DENY_GLOBS:
+        return False
+    import fnmatch
+    lowered = command.lower()
+    return any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_DENY_GLOBS)
+
+
+# --- Unrecoverable command floor (always-on, no override) ---
+# Catastrophic commands that are blocked in ALL permission modes, including
+# edit mode. These cause irreversible damage: filesystem wipes, disk formats,
+# fork bombs, and remote-code-execution via pipe-to-shell at the root level.
+_UNRECOVERABLE_PATTERNS = [
+    # rm -rf / — wipe filesystem root (any flag order, --no-preserve-root, long/short)
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
+    # rm -rf ~ — wipe home dir
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?~(?:\s|$)"),
+    re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
+    re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
+    # pipe remote content to shell (curl/wget ... | sh|bash)
+    re.compile(r"\b(?:curl|wget)\b[^|;&<>]*\|\s*(?:sh|bash|dash|zsh|ksh)\b"),
+    re.compile(r"\b(?:sh|bash|dash|zsh|ksh)\s*<\s*\(\s*(?:curl|wget)\s+"),
+]
+
+
+def _is_unrecoverable_command(command: str) -> bool:
+    """Return True if the command matches an unrecoverable pattern.
+
+    Checked before _hard_blocked_shell's git/wrapper logic so these patterns
+    are caught even when the command is wrapped (bash -c 'rm -rf /') — the
+    recursive _hard_blocked_shell call re-enters here for wrapped payloads.
+    """
+    for pattern in _UNRECOVERABLE_PATTERNS:
+        if pattern.search(command):
+            return True
+    return False
+
+
+def _git_read_targets_sensitive_file(command: str) -> bool:
+    """Detect git read commands (show/diff/log) that target sensitive files.
+
+    `git show HEAD:.env` and `git diff -- .env` bypass _is_sensitive_path
+    because that check only runs in the read_text tool, not shell commands.
+    Block these at the hardline floor so they're denied in ALL modes.
+    """
+    parts = _shell_parts(command)
+    if not parts or len(parts) < 3:
+        return False
+    if Path(parts[0]).stem.lower() != "git":
+        return False
+    action = parts[1].lower()
+    if action not in _GIT_READ_COMMANDS:
+        return False
+    # ponytail: scan non-flag tokens for sensitive paths.
+    # `git show HEAD:.env` -> tokens after action: ["HEAD:.env"]
+    # `git diff -- .env` -> tokens: ["--", ".env"]
+    for token in parts[2:]:
+        if token.startswith("-"):
+            continue
+        # `git show` uses `<rev>:<path>` form — extract the path part
+        path_candidate = token.split(":", 1)[-1] if ":" in token else token
+        if not path_candidate or path_candidate in ("--",):
+            continue
+        if _is_sensitive_path(path_candidate):
+            return True
+    return False
+
+
+def _shell_targets_credential_path(command: str) -> bool:
+    """Detect shell commands that write to or overwrite credential paths.
+
+    `echo "x" > ~/.ssh/authorized_keys` and `cp file ~/.aws/credentials` bypass
+    _is_sensitive_path because that check only runs in write_text/read_text tools.
+    Block these at the hardline floor so credential writes are denied in ALL modes.
+    """
+    # ponytail: substring match on the raw command. Catches redirections
+    # (>, >>), tee, cp/mv/install destinations. Ceiling: a command like
+    # `cat ~/.ssh` (read, not write) would also match — acceptable, since
+    # reading credentials via shell is also blocked by _is_sensitive_path
+    # for the read_text tool and this is the shell equivalent.
+    cred_markers = (
+        ".ssh/", ".aws/", ".kube/", ".gnupg/", ".netrc",
+        ".docker/", ".config/gcloud", "authorized_keys",
+        "id_rsa", "id_ed25519", "id_ecdsa",
+    )
+    lowered = command.lower()
+    return any(marker in lowered for marker in cred_markers)
+
+
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
+    if _is_unrecoverable_command(command):
+        return True
+    if _matches_user_deny(command):
+        return True
+    if _git_read_targets_sensitive_file(command):
+        return True
+    if _shell_targets_credential_path(command):
+        return True
     try:
         lexer = shlex.shlex(command, posix=sys.platform != "win32",
                             punctuation_chars=";&|")
@@ -404,8 +653,20 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
-    if PERMISSION_MODE == "edit":
+    if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser"):
+        return True  # temporary grant for approved plan steps — only in plan-only mode
+    if PERMISSION_MODE in ("edit", "full-auto"):
         return True
+    if PERMISSION_MODE == "plan-only":
+        if mode == "plan":
+            return True
+        if mode in ("read_text", "last_output", "python_eval"):
+            return True
+        if mode == "shell" and _readonly_shell(command):
+            return True
+        if mode == "cron" and command == "list":
+            return True
+        return False
     if mode == "write_text" and path_zone == "no_prompt":
         return True
     # readonly mode
@@ -413,6 +674,8 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
         return True
     if mode == "cron" and command == "list":
         return True
+    if mode == "read_text" and READ_PATHS:
+        return False  # read_paths zone active: reads outside zone escalate
     if mode == "shell" and _readonly_shell(command):
         if ((host or _resolve_sandbox_backend() == "local")
                 and _local_shell_reads_files(command)):
@@ -515,13 +778,17 @@ ACTIVE_PROVIDER = ""
 
 
 def _provider_api_key(provider: dict) -> str:
-    """Resolve a provider key: direct api_key value first, then env var."""
+    """Resolve a provider key: .env file first, then os.environ, then direct api_key."""
+    env_name = provider.get("api_key_env", "").strip()
+    if env_name:
+        _env = load_env_file()
+        if env_name in _env:
+            return _env[env_name]
+        if os.environ.get(env_name):
+            return os.environ[env_name]
     direct = provider.get("api_key", "").strip()
     if direct:
         return direct
-    env_name = provider.get("api_key_env", "").strip()
-    if env_name:
-        return os.environ.get(env_name, "")
     return ""
 
 
@@ -944,7 +1211,19 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "path_arg": g("path_arg", "tool_path_arg", "filename"),
         "content_arg": g("content_arg", "tool_content_arg", "content"),
         "timeout": int(g("timeout", "tool_timeout", "25")),
+        "arg_types": _parse_arg_types(g("arg_types", "tool_arg_types")),
     }
+
+
+def _parse_arg_types(raw: str) -> dict:
+    """Parse 'steps:array,filename:string' into {'steps': 'array', 'filename': 'string'}."""
+    result = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            result[k.strip()] = v.strip()
+    return result
 
 
 def load_tool_specs(path: Path, config: dict) -> dict:
@@ -968,31 +1247,59 @@ def load_tool_specs(path: Path, config: dict) -> dict:
 
 
 def build_tools_def(tool_specs: dict) -> list:
-    return [{
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": spec["description"],
-            "parameters": {
-                "type": "object",
-                "properties": {param: {"type": "string"} for param in spec["args"]},
-                "required": list(spec["args"]),
+    result = []
+    for name, spec in tool_specs.items():
+        # MCP tools declare their own parameters schema; built-in tools use args + arg_types
+        if "parameters" in spec:
+            params = spec["parameters"]
+        else:
+            props = {}
+            for param in spec["args"]:
+                arg_types = spec.get("arg_types", {})
+                props[param] = {"type": arg_types.get(param, "string")}
+            params = {"type": "object", "properties": props,
+                      "required": list(spec["args"])}
+        result.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["description"],
+                "parameters": params,
             },
-        },
-    } for name, spec in tool_specs.items()]
+        })
+    return result
 
 
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
+MCP_RUNTIME = MCPRuntime(PROJECT_ROOT)
+TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
 TOOLS_DEF = build_tools_def(TOOL_SPECS)
 TOOL_NAMES = set(TOOL_SPECS.keys())
 TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+
+
+def reload_mcp_tools():
+    """Reconnect MCP servers and refresh their registered tools."""
+    global TOOLS_DEF, TOOL_NAMES, TOOL_REQUIRED_PARAMS, SYSTEM_PROMPT
+    for name, spec in list(TOOL_SPECS.items()):
+        if spec.get("mode") == "mcp":
+            TOOL_SPECS.pop(name)
+    TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
+    TOOLS_DEF = build_tools_def(TOOL_SPECS)
+    TOOL_NAMES = set(TOOL_SPECS)
+    TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+    SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS) + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE)
+    return MCP_RUNTIME.statuses
+
+
+atexit.register(MCP_RUNTIME.close)
 
 TOOL_ALIASES = {
     "bash": "execute_shell", "sh": "execute_shell",
     "shell": "execute_shell", "run": "execute_shell",
     "search": "web_search", "web": "web_search", "google": "web_search",
     "read": "read_text", "cat": "read_text",
-    "write": "write_file", "create_file": "write_file",
+    "write": "write_file", "create_file": "write_file", "writefile": "write_file",
     "calc": "calculate", "eval": "calculate", "math": "calculate",
     "last": "last_output", "prev_output": "last_output",
 }
@@ -1422,9 +1729,45 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             steps = [s.strip(" -") for s in raw.splitlines() if s.strip()]
     if not isinstance(steps, list):
         return "Error: execute_plan requires a list of steps or newline plan text."
+    if not steps:
+        return ("Error: execute_plan requires a non-empty steps array. "
+                'Pass steps as a JSON array, e.g.: [{"tool":"write_file",'
+                '"arguments":{"filename":"C:/tmp/x.txt","content":"hi"}}]')
+
+    total = len(steps)
+
+    # In plan-only mode: show all steps as pending, then get approval BEFORE running.
+    # On approve: set _plan_execution_grant so steps run without per-step prompts,
+    # but PERMISSION_MODE stays plan-only (temporary grant, not a mode switch).
+    global _plan_execution_grant
+    if PERMISSION_MODE == "plan-only" and on_step and on_escalation:
+        pre_parsed = []
+        has_gated = False
+        for idx, step in enumerate(steps, 1):
+            if isinstance(step, dict):
+                step_text = str(step.get("step") or step.get("text") or "")
+                tool_name = str(step.get("tool") or classify_plan_component(step_text))
+            else:
+                step_text = str(step)
+                tool_name = classify_plan_component(step_text)
+            spec = TOOL_SPECS.get(tool_name, {})
+            if spec.get("mode") in ("write_text", "shell", "docker", "cron", "browser"):
+                has_gated = True
+            pre_parsed.append((idx, step_text, tool_name))
+        for idx, step_text, tool_name in pre_parsed:
+            on_step(idx, total, step_text, tool_name, "pending", None)
+        if has_gated:
+            approved = on_escalation(
+                request_escalation(
+                    "edit", ["(plan)"], "plan_approval",
+                    f"Plan has {total} step(s). Review the checklist above and approve to execute."
+                )
+            )
+            if not approved:
+                return "Plan denied — staying in plan-only mode."
+            _plan_execution_grant = True
 
     outputs = []
-    total = len(steps)
     for idx, step in enumerate(steps, 1):
         if isinstance(step, dict):
             step_text = str(step.get("step") or step.get("text") or "")
@@ -1462,6 +1805,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         if on_step:
             on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
+    _plan_execution_grant = False  # clear temporary grant — back to plan-only
     return "\n".join(outputs)
 
 
@@ -1639,7 +1983,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     if spec.get("extract") == "title":
         match = re.search(r"<title[^>]*>(.*?)</title>", result, re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s+", " ", match.group(1)).strip() if match else "No title"
-    return result
+    return _wrap_untrusted(_strip_special_tokens(result), url)
 
 
 # ---------------------------------------------------------------------------
@@ -1705,7 +2049,7 @@ def _exec_browser(args: dict) -> str:
     except Exception as e:
         return f"Browser error: {e}"
     text = re.sub(r'\n{3,}', '\n\n', (text or "").strip())
-    return f"Title: {title}\n\n{text[:5000]}"
+    return _wrap_untrusted(_strip_special_tokens(f"Title: {title}\n\n{text[:5000]}"), url)
 
 
 # ---------------------------------------------------------------------------
@@ -1871,7 +2215,7 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     if backend == "docker":
         return _exec_docker_command(_process_display(argv), timeout)
     using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant:
+    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
         _local_fallback_grant = False
         if using_fallback_grant:
             _one_shot_grant = False
@@ -1950,7 +2294,7 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
     if backend == "docker":
         return _exec_docker_command(command, timeout, python_code, image)
     using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant:
+    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
         _local_fallback_grant = False
         if using_fallback_grant:
             _one_shot_grant = False
@@ -2266,6 +2610,20 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     mode = (spec.get("mode") or "").lower()
     timeout = int(spec.get("timeout") or 25)
 
+    # --- Plan-only early gate: block gated tools BEFORE arg validation ---
+    # Without this, write_file() with no args returns "write tool requires a file path"
+    # instead of telling the model to use execute_plan — the model never learns why.
+    # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
+    # to the normal check_permission gate so it escalates properly.
+    if (PERMISSION_MODE == "plan-only"
+            and allow_plan
+            and mode in ("write_text", "shell", "docker", "cron", "browser")):
+        return ("Error: plan-only mode — direct tool execution blocked. "
+                "Call the execute_plan tool with a JSON steps array, e.g.: "
+                'execute_plan(steps=[{"tool":"write_file",'
+                '"arguments":{"filename":"C:/tmp/x.txt","content":"hi"}}]) '
+                "Do NOT describe the plan in prose — call execute_plan as a tool call.")
+
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
     if mode == "read_text":
@@ -2331,6 +2689,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         blocked = _ssrf_check(command)
         if blocked:
             return blocked
+    elif mode == "mcp":
+        command = f"{spec['mcp_server']}:{spec['mcp_tool']}"
 
     remote_git_approved = name == "git_push" and _remote_git_grant
     if name == "git_push" and not remote_git_approved:
@@ -2346,9 +2706,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         return "Error: This git operation is forbidden by Agent8088's safety policy."
 
-    gated_modes = ("write_text", "shell", "docker", "cron", "browser")
+    gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
+    if mode == "mcp" and spec.get("mcp_read_only"):
+        gated_modes = tuple(item for item in gated_modes if item != "mcp")
     if mode in gated_modes and not remote_git_approved and not check_permission(
             mode, command, path_zone, bool(spec.get("host"))):
+        if PERMISSION_MODE == "plan-only" and allow_plan:
+            return ("Error: plan-only mode — direct tool execution blocked. "
+                    "Call the execute_plan tool with a JSON steps array, e.g.: "
+                    'execute_plan(steps=[{"tool":"write_file",'
+                    '"arguments":{"filename":"/tmp/x","content":"hi"}}]) '
+                    "Do NOT describe the plan in prose — call execute_plan as a tool call.")
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -2360,11 +2728,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             paths_str = command
         elif mode == "browser":
             paths_str = command[:120]
+        elif mode == "mcp":
+            paths_str = command
         sandbox_missing = mode in ("shell", "docker") and _resolve_sandbox_backend() == "unavailable"
         change_type = {
             "write_text": "new_file",
             "cron": "scheduled_task",
             "browser": "network_request",
+            "mcp": "mcp_tool",
         }.get(mode, "local_execution" if sandbox_missing else "filesystem_op")
         reason = (
             f"Tool '{name}' needs permission and no sandbox is available. "
@@ -2387,7 +2758,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "plan":
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
-        return _exec_plan(args, depth=depth)
+        return _exec_plan(args, on_step=_plan_on_step,
+                          on_escalation=_plan_on_escalation, depth=depth)
 
     if mode == "subagent":
         return _exec_subagent(args, depth=depth)
@@ -2401,8 +2773,11 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "browser":
         return _exec_browser(args)
 
+    if mode == "mcp":
+        return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
+
     if mode == "read_text":
-        return _read_text_limited(read_target)
+        return _strip_special_tokens(_read_text_limited(read_target))
 
     if mode == "write_text":
         global _last_write_diff
@@ -2493,8 +2868,11 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
         except Exception:
             pass
     # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}
+    # Greedy match (\{.*\}) captures nested JSON braces — non-greedy (\{.*?\})
+    # stops at the first }, truncating args like {"steps": "[{\"tool\": ...}]"}
+    # and causing the args to fail parsing, falling through to empty-args match.
     if not calls:
-        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*?\})', text, re.DOTALL)
+        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*\})', text, re.DOTALL)
         if m:
             try:
                 resolved = _resolve_tool_name(m.group(1))
@@ -2531,11 +2909,24 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 if m and canonical in allowed:
                     calls.append({"name": canonical, "arguments": {"command": m.group(1).replace('\\"', '"')}})
                     break
+    # 5) <|mask_start|>{"tool": "...", "arguments": {...}}<|mask_end|>
+    if not calls:
+        m = re.search(r'<\|mask_start\|>\s*(\{.*?\})\s*<\|mask_end\|>', text, re.DOTALL)
+        if m:
+            try:
+                d = json.loads(m.group(1).strip())
+                tool_name = d.get("tool", d.get("name", ""))
+                resolved = _resolve_tool_name(tool_name)
+                if resolved in allowed:
+                    calls.append({"name": resolved, "arguments": d.get("arguments", {})})
+            except Exception:
+                pass
     return calls
 
 
 def strip_tool_json(text: str) -> str:
     text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<\|mask_start\|>.*?<\|mask_end\|>', '', text, flags=re.DOTALL)
     text = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', text, flags=re.DOTALL)
     text = re.sub(r'✿FUNCTION✿[^\n]*', '', text)
     text = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', text, flags=re.DOTALL)
@@ -2611,6 +3002,30 @@ def collect_secret_values(config: dict) -> list:
 _SECRET_VALUES = collect_secret_values(APP_CONFIG)
 
 
+# ponytail: Special tokens that self-hosted chat templates tokenize as structural
+# role boundaries. If unstripped, a fetched page containing <|im_start|>system
+# could forge a system message. Covers Qwen/ChatML, Llama, Gemma, Mistral, Phi, GPT-OSS.
+_SPECIAL_TOKEN_RE = re.compile(
+    r"<\|im_start\|>|<\|im_end\|>|<\|start_header_id\|>|<\|end_header_id\|>"
+    r"|<\|eot_id\|>|<\|eom_id\|>|\[\/INST\]|\[\/SYS\]"
+    r"|<\|begin_of_text\|>|<\|end_of_text\|>|<start_of_turn\|>|<end_of_turn\|>"
+)
+
+
+def _strip_special_tokens(text: str) -> str:
+    if not text:
+        return text
+    return _SPECIAL_TOKEN_RE.sub("", text)
+
+
+def _wrap_untrusted(text: str, source: str = "") -> str:
+    """Wrap external content in boundary markers so the model sees it as untrusted."""
+    if not text or not text.strip():
+        return text
+    tag = f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>' if source else "<<<EXTERNAL_UNTRUSTED_CONTENT>>>"
+    return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
+
+
 def _redact_secrets(text: str) -> str:
     if not text:
         return text
@@ -2619,6 +3034,15 @@ def _redact_secrets(text: str) -> str:
         if v in text:
             text = text.replace(v, "[redacted]")
     return text
+
+
+_MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
+
+
+def _wrap_untrusted(text: str, source: str) -> str:
+    """MCP responses are external data, never instructions for the agent."""
+    text = _MCP_SPECIAL_TOKENS.sub("", text or "")
+    return f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>\n{text}\n<<<END_UNTRUSTED_CONTENT>>>'
 
 
 # Distinctive lines of the base system prompt, used to detect a verbatim leak.
@@ -2820,6 +3244,11 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, allowed_tools)
+        if calls:
+            _log.info("model tool calls (turn %d): %s", turn,
+                      [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
+        else:
+            _log.debug("turn %d: no tool calls — model replied with text", turn)
         if not calls:
             # The model may have *tried* to call a tool that doesn't exist (a common
             # failure — e.g. `current_time`). Rather than leaking the raw ✿FUNCTION✿
