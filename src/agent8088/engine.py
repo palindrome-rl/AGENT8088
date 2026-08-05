@@ -3018,14 +3018,6 @@ def _strip_special_tokens(text: str) -> str:
     return _SPECIAL_TOKEN_RE.sub("", text)
 
 
-def _wrap_untrusted(text: str, source: str = "") -> str:
-    """Wrap external content in boundary markers so the model sees it as untrusted."""
-    if not text or not text.strip():
-        return text
-    tag = f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>' if source else "<<<EXTERNAL_UNTRUSTED_CONTENT>>>"
-    return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
-
-
 def _redact_secrets(text: str) -> str:
     if not text:
         return text
@@ -3039,10 +3031,14 @@ def _redact_secrets(text: str) -> str:
 _MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
 
 
-def _wrap_untrusted(text: str, source: str) -> str:
-    """MCP responses are external data, never instructions for the agent."""
-    text = _MCP_SPECIAL_TOKENS.sub("", text or "")
-    return f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>\n{text}\n<<<END_UNTRUSTED_CONTENT>>>'
+def _wrap_untrusted(text: str, source: str = "") -> str:
+    """Wrap external content (web pages, MCP tool responses) in boundary markers
+    so the model sees it as untrusted data, never instructions."""
+    if not text or not text.strip():
+        return text
+    text = _MCP_SPECIAL_TOKENS.sub("", text)
+    tag = f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>' if source else "<<<EXTERNAL_UNTRUSTED_CONTENT>>>"
+    return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
 
 
 # Distinctive lines of the base system prompt, used to detect a verbatim leak.
