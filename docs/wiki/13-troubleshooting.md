@@ -1,0 +1,267 @@
+# Troubleshooting
+
+[← Wiki index](README.md)
+
+Symptom-first. Run `/doctor` in the REPL for an automated health check.
+
+## Install & startup
+
+### `No module named pytest` / `No module named slack_bolt`
+
+The optional extras aren't installed. They're separate on purpose so a plain CLI
+install stays small:
+
+```sh
+pip install -e ".[gateway,dev]"
+```
+
+If a venv was rebuilt (e.g. `uv sync`), extras are dropped and need reinstalling.
+
+### ~19 gateway test failures that look catastrophic
+
+`ModuleNotFoundError` at import in `tests/gateway/platforms/`. It's the missing
+`gateway` extra, not broken code — those tests error instead of skipping. Install
+the extra and re-run.
+
+### `[agent8088] Migrated N keys to .../.env` appeared unexpectedly
+
+Expected and harmless — the one-time key migration. Keys moved from
+`config.txt` into `.env` (mode `0600`), with `api_key_env` pointers left behind.
+It's idempotent and lossless.
+
+It runs on *any* invocation, including `--help`, so it fires if you run the CLI
+without an isolated `HOME` during testing. See
+[Testing](12-testing-and-verification.md#isolation-rules-for-anything-you-write).
+
+### `Config not found` from a setup wizard
+
+`--gateway-setup` and friends need a base config first:
+
+```sh
+agent8088 --setup
+```
+
+## Model & providers
+
+### `'anthropic' is not a known provider`
+
+There is no `anthropic` built-in — the README's "13 providers … Anthropic" is
+inaccurate. Use OpenRouter or litellm mode; see
+[Model Providers](05-model-providers.md#reaching-anthropic--claude).
+
+### Wrong API key being used
+
+Resolution order is `.env` → explicit `api_key` in config → `os.environ`.
+`os.environ` is **last**, so a shell export can't override configured settings.
+If you expected the env var to win, that's why.
+
+Check which sources exist:
+
+```sh
+grep -n "api_key" ~/.agent8088/config.txt        # pointers, not secrets
+grep -o "^[A-Z_]*=" ~/.agent8088/.env            # names only
+```
+
+### `not configured: set <name>_api_key in config.txt`
+
+A tool URL/header has an unresolved `{placeholder}`. The message names the exact
+missing key — add it to config, or use a different search tool.
+
+### Provider silently missing from `/models`
+
+A provider needs **both** `base_url` and `model` to load; incomplete profiles
+are dropped rather than half-registered. `api_mode=litellm` is the one exception
+(no base URL needed).
+
+### Fallback chain not firing
+
+Only **retryable** errors trigger it: HTTP 429, 503, connection errors. A 401 or
+400 is deterministic — retrying elsewhere would just waste a call.
+
+## Permissions
+
+### Every write asks for approval
+
+That's `readonly`, the default. Options: approve per action, `/mode full-auto`,
+or add the directory to `no_prompt_paths`.
+
+### `Writing to sensitive file denied` and I meant it
+
+Hitting the always-on floor. Credential files (`.env`, `.ssh`, `*.pem`,
+`*_TOKEN*`) and shell startup files (`.zshrc`, `.bashrc`, `.profile`) are refused
+in **every** mode, including full-auto, and no escalation grant unlocks them.
+
+For credential files there's an escape hatch:
+
+```ini
+allowed_sensitive_files=.env.example
+```
+
+Shell startup files have no override by design — writing one is code execution on
+your next shell launch. Edit it yourself.
+
+### `plan-only mode — direct tool execution blocked`
+
+Working as intended. Either use `execute_plan` / `/plan`, or switch with
+`/mode readonly`.
+
+### full-auto still won't `git push`
+
+Correct. Destructive git (`push`, `reset --hard`, `branch -D`) is on the
+always-on floor. Run it yourself.
+
+### Approving once didn't stick
+
+An escalation grant covers **exactly one** action and is then consumed. That's
+deliberate — approving one write must not silently become full-auto.
+
+## Network & search
+
+### `Blocked: '127.0.0.1' resolves to internal address`
+
+SSRF protection. To reach a genuinely local service, allowlist that host only:
+
+```ini
+ssrf_allow_hosts=127.0.0.1,localhost
+```
+
+Prefer this over `ssrf_allow_private=1`, which opens the whole private network.
+
+### `web_search` returns nothing / connection refused
+
+The default `search_base_url` points at a local SearXNG on `127.0.0.1:8888`
+that probably isn't running. Either run one, or use `web_search_tavily` /
+`web_search_exa` with a key. Note SearXNG ships with **JSON output disabled** —
+enable it or every request 403s:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+### Search worked, then stopped after a redirect
+
+Redirect targets are re-checked against SSRF. A public URL that 302s to a
+private address is blocked at the redirect — by design.
+
+## MCP
+
+### An MCP server shows `error` in `/mcp`
+
+`/mcp` prints the reason per server. Common causes: `command` not on `PATH`;
+both or neither of `command`/`url` set; `bearer_token_env` naming an unset
+variable; a server name with illegal characters. One bad server doesn't stop the
+others.
+
+### MCP tool needs approval every time
+
+Tools without the server's `readOnlyHint` annotation are treated as mutating and
+gated normally. That's the server's annotation to fix, not a config setting.
+
+### `write_file` missing over `--mcp-serve`
+
+Intentional — the MCP tool surface is read-only by default because MCP has no
+approval channel. Opt in:
+
+```ini
+mcp_server_allow_writes=1
+```
+
+Narrow `allowed_paths` and set `blocked_paths` first; writes are unattended.
+
+### MCP HTTP server reachable by others
+
+There's **no authentication** on the HTTP transport. It binds `127.0.0.1` by
+default — only use `--mcp-host 0.0.0.0` on a trusted network.
+
+## Gateway
+
+### Bot silently ignores someone
+
+Almost always the allowlist. Empty means nobody (fail-closed). Check the log for
+`disallowed user dropped: <id> (<platform>)`.
+
+If you see `allowing <id> on discord, but it is configured under
+slack_allowed_users` — the id is on the wrong config line. It still works, but
+move it.
+
+### Slack bot answers nothing in channels
+
+By design: it responds only to **DMs and @mentions**, not all channel traffic.
+Confirm the `app_mention` event subscription and the Messages tab are enabled.
+
+### WhatsApp: "failed to find key" after re-pairing
+
+Stale app-state-sync keys. Re-pairing wipes the **entire** session directory for
+this reason — if you restored a partial backup, delete
+`whatsapp_session_dir` and pair again.
+
+### Discord bot sees no message text
+
+The **Message Content** intent isn't enabled in the developer portal. It's
+required.
+
+### Gateway approvals never arrive
+
+Check `gateway_permission_mode`. Under `edit` there are no prompts at all.
+
+## Sandbox
+
+### `REAL native sandbox — missing: sandbox-runtime`
+
+Not installed:
+
+```sh
+agent8088 --sandbox-setup
+```
+
+Needs Node.js 20.11+; Linux also needs `bubblewrap`, `socat`, `ripgrep`.
+
+### Asked to run a command "without isolation"
+
+Neither backend is available. Install the native runtime or Docker; `local`
+means no isolation at all.
+
+### Sandboxed command can't reach the network
+
+Correct by default. Allowlist what it needs:
+
+```ini
+sandbox_allowed_domains=pypi.org,api.example.com
+```
+
+Note this is separate from `ssrf_allow_hosts`, which governs the HTTP *tools*.
+
+## Development
+
+### A test passes alone but fails in the suite (or vice versa)
+
+`tests/test_cli_setup.py` has known cross-test fixture dependence — 3 cases fail
+in isolation but pass in the full suite. Pre-existing; run the full suite to
+judge.
+
+### Duplicate function silently ignored
+
+Python keeps only the last definition — no error. Run:
+
+```sh
+python scripts/check_duplicate_defs.py
+```
+
+Don't rely on ruff `F811`; it has verifiably missed this in this codebase.
+
+### CI checks failing instantly
+
+GitHub Actions is blocked by a billing issue on this account, so jobs fail in
+~3s without starting. Not a code problem — run the suites locally.
+
+## Still stuck
+
+```
+/doctor      # environment health
+/config      # active config + path
+/status      # model, mode, tools, skills
+/trace on    # capture full JSON trace, then /save trace.json
+```

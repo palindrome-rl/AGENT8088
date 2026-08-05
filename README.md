@@ -15,10 +15,14 @@
 
 Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, designed for reliable tool calling, multi-turn context retention, and seamless CLI integration. It runs entirely on your machine via Ollama or any OpenAI-compatible endpoint.
 
+> 📖 **[Full documentation → `docs/wiki/`](docs/wiki/README.md)** — 15 pages covering
+> configuration, the permission model, every tool, MCP in both directions, the
+> messaging gateway, architecture, testing and troubleshooting.
+
 ### Key Features
 
 - **One-line install** — install on macOS, Linux, and Windows
-- **13 model providers** — Ollama, OpenRouter, OpenAI, Anthropic, Gemini, Cerebras, DeepSeek, Groq, Mistral, Moonshot, Qwen, Ollama Cloud, GitHub Copilot
+- **12 model providers** — Ollama, Ollama Cloud, OpenRouter, OpenAI, Gemini, Cerebras, DeepSeek, Groq, Mistral, Moonshot, Qwen, GitHub Copilot — plus custom OpenAI-compatible endpoints and `api_mode=litellm` (which covers Anthropic/Claude directly)
 - **Interactive model picker** — fuzzy searchable provider + model selection (InquirerPy)
 - **Fallback chains** — automatically switches to backup provider on 429/503 errors
 - **Fine-tuned tool calling** — 95% accuracy on function selection
@@ -88,7 +92,7 @@ agent8088 --setup
 
 The wizard prompts for:
 1. **Working directory** — where the agent can read/write files (default: `~`)
-2. **Provider** — fuzzy search through 13 built-in providers, plus **Custom OpenAI-compatible**
+2. **Provider** — fuzzy search through 12 built-in providers, plus **Custom OpenAI-compatible**
 3. **API key** — hidden input for the selected provider
 4. **Model** — fetches the provider's available models via `/v1/models` and shows them in a fuzzy picker; custom providers ask for URL, model, and auth/API key
 5. **Web search URL** — optional SearXNG endpoint
