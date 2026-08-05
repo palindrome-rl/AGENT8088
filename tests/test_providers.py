@@ -42,21 +42,50 @@ def test_get_client_for_named_provider(engine, monkeypatch):
     assert "acme.test" in str(client.base_url)
 
 
-@pytest.mark.xfail(
-    reason="Genuine precedence disagreement, not a stale test: "
-    "_provider_api_key's docstring says '.env file first, then os.environ, then "
-    "direct api_key', but this test asserts the opposite (configured api_key wins "
-    "over an env var). Needs a product decision on which should win before either "
-    "the code or this test is changed. See PR discussion.",
-    strict=False,
-)
 def test_configured_api_key_wins_over_adapter_environment_key(engine, monkeypatch):
+    """An explicitly configured key beats an ambient os.environ value, so a
+    stray shell export cannot silently redirect a configured provider."""
     monkeypatch.setenv("ACME_API_KEY", "environment-key")
 
     assert engine._provider_api_key({
         "api_key": "configured-key",
         "api_key_env": "ACME_API_KEY",
     }) == "configured-key"
+
+
+def test_env_key_store_wins_over_configured_api_key(engine, monkeypatch, tmp_path):
+    """The .env key store is the canonical location migration writes to, so it
+    outranks a leftover plaintext api_key in config.txt."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("ACME_API_KEY=from-key-store\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "ENV_FILE_PATH", env_path)
+
+    assert engine._provider_api_key({
+        "api_key": "stale-plaintext-key",
+        "api_key_env": "ACME_API_KEY",
+    }) == "from-key-store"
+
+
+def test_environ_used_when_nothing_else_is_configured(engine, monkeypatch):
+    monkeypatch.setenv("ACME_API_KEY", "environment-key")
+    assert engine._provider_api_key({"api_key_env": "ACME_API_KEY"}) == "environment-key"
+
+
+def test_provider_api_key_precedence_is_fully_ordered(engine, monkeypatch, tmp_path):
+    """.env key store > explicit config api_key > ambient os.environ."""
+    env_path = tmp_path / ".env"
+    env_path.write_text("ACME_API_KEY=store\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "ENV_FILE_PATH", env_path)
+    monkeypatch.setenv("ACME_API_KEY", "ambient")
+    spec = {"api_key": "explicit", "api_key_env": "ACME_API_KEY"}
+
+    assert engine._provider_api_key(spec) == "store"
+
+    env_path.write_text("", encoding="utf-8")
+    assert engine._provider_api_key(spec) == "explicit"
+
+    assert engine._provider_api_key({"api_key_env": "ACME_API_KEY"}) == "ambient"
+    assert engine._provider_api_key({}) == ""
 
 
 def test_all_builtin_adapters_accept_configured_api_keys(engine, monkeypatch):

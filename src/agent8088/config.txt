@@ -69,3 +69,11 @@ sandbox_runtime_version=0.0.67
 # --- search (SearXNG) ---
 # Leave commented to disable web_search.
 # search_base_url=http://localhost:8888/search?q=
+
+# --- MCP server mode (agent8088 --mcp-serve) ---
+# The tools exposed to external MCP clients are read-only by default, because
+# MCP has no approval channel: a write would run unattended with no prompt.
+# Set to 1 to also expose write_file. Narrow allowed_paths and set
+# blocked_paths first. Sensitive files and shell startup files (.zshrc etc.)
+# are refused regardless of this setting.
+# mcp_server_allow_writes=0

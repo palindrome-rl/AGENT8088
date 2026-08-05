@@ -329,6 +329,23 @@ SENSITIVE_FILE_EXTENSIONS = frozenset([".pem", ".key", ".rsa", ".p12"])
 SENSITIVE_FILE_GLOBS = ["*_KEY*", "*_SECRET*", "*_TOKEN*", "*_PASSWORD*",
                         "*_key*", "*_secret*", "*_token*", "*_password*"]
 
+# Shell startup files: writing one is arbitrary code execution on the user's
+# next shell launch, so writes are refused at the always-on floor — even in
+# full-auto and even after an approved one-shot escalation. Reads stay allowed
+# (matched on exact filename, so "profile.json" and ".editorconfig" are
+# unaffected) because inspecting a dotfile is a normal, safe request.
+SHELL_STARTUP_FILES = frozenset([
+    ".bashrc", ".bash_profile", ".bash_login", ".bash_logout",
+    ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",
+    ".profile", ".login", ".cshrc", ".tcshrc", ".kshrc",
+    "config.fish", "fish.config",
+])
+
+
+def _is_shell_startup_file(filepath: str) -> bool:
+    """True if the path's filename is a shell startup file (write-blocked)."""
+    return Path(filepath).name.lower() in SHELL_STARTUP_FILES
+
 ALLOWED_SENSITIVE_FILES = set(
     p.strip() for p in APP_CONFIG.get("allowed_sensitive_files", "").split(",") if p.strip()
 )
@@ -778,17 +795,25 @@ ACTIVE_PROVIDER = ""
 
 
 def _provider_api_key(provider: dict) -> str:
-    """Resolve a provider key: .env file first, then os.environ, then direct api_key."""
+    """Resolve a provider key, most explicit source first:
+
+      1. the .env key store — where _migrate_keys_to_env puts secrets, so it is
+         the canonical location and outranks a leftover plaintext api_key
+      2. an explicit api_key in config.txt
+      3. os.environ — ambient, so it is the LAST resort: a stray shell export
+         (e.g. OPENAI_API_KEY set for another tool) must not silently redirect
+         an explicitly configured provider
+    """
     env_name = provider.get("api_key_env", "").strip()
     if env_name:
         _env = load_env_file()
         if env_name in _env:
             return _env[env_name]
-        if os.environ.get(env_name):
-            return os.environ[env_name]
     direct = provider.get("api_key", "").strip()
     if direct:
         return direct
+    if env_name and os.environ.get(env_name):
+        return os.environ[env_name]
     return ""
 
 
@@ -2677,6 +2702,11 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # overwritten even though reading it is denied.
         if _is_sensitive_path(str(target)):
             return f"Error: Writing to sensitive file denied: {target}"
+        # Writing a shell startup file is code execution on the next shell
+        # launch. Refused unconditionally — no mode and no grant unlocks it.
+        if _is_shell_startup_file(str(target)):
+            return (f"Error: Writing to sensitive file denied: {target} "
+                    f"(shell startup file — this would execute code on the next shell launch)")
         path_zone = _check_path_zone(target)
         if path_zone == "blocked":
             return f"Error: Write path is blocked: {target}"
@@ -2980,16 +3010,28 @@ def _strip_reasoning(text: str) -> str:
     return text.strip()
 
 
-def collect_secret_values(config: dict) -> list:
+def collect_secret_values(config: dict, env_values: dict = None) -> list:
     """Secret values from config (api keys / tokens, including per-provider ones)
     — redacted from any tool output or answer so `cat config.txt` / `env` etc.
     can't be used to exfiltrate them. Longest first, so overlapping values mask
-    completely rather than leaving a suffix behind."""
+    completely rather than leaving a suffix behind.
+
+    Any key ending in `_env` holds the NAME of an environment variable, not the
+    secret itself — resolve it before redacting. Check the .env key store first
+    (that is where _migrate_keys_to_env puts migrated secrets, and nothing
+    exports it into os.environ), then the process environment. This covers both
+    `provider.<name>.api_key_env` and the `*_bot_token_env` / `*_app_token_env`
+    pointers migration writes for gateway tokens."""
+    if env_values is None:
+        env_values = load_env_file(ENV_FILE_PATH) if "ENV_FILE_PATH" in globals() else {}
     values = set()
     for key, value in config.items():
         if not isinstance(value, str):
             continue
-        candidate = os.environ.get(value, "") if key.lower().endswith("api_key_env") else value
+        if key.lower().endswith("_env"):
+            candidate = env_values.get(value) or os.environ.get(value, "")
+        else:
+            candidate = value
         if (any(part in key.lower() for part in ("key", "token", "secret", "password"))
                 and len(candidate) >= 4
                 and candidate.lower() not in (

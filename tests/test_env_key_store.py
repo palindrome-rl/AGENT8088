@@ -135,3 +135,77 @@ def test_provider_api_key_fallback_to_direct(tmp_path, monkeypatch):
     monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", env_path)
     provider = {"api_key": "sk-direct", "api_key_env": "NONEXISTENT"}
     assert _provider_api_key(provider) == "sk-direct"
+
+# --- Regression: secrets stored in .env must still be redacted from output ---
+# The key store moved secrets out of config.txt into .env, but
+# collect_secret_values() resolved *_env pointers via os.environ only. Nothing
+# exports .env into os.environ, so migrated keys silently stopped being
+# redacted from model-visible tool output.
+
+def test_collect_secret_values_resolves_env_file_pointers(tmp_path):
+    from agent8088.engine import collect_secret_values
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("ACME_API_KEY=sk-canary-in-env-file\n", encoding="utf-8")
+    config = {"provider.acme.api_key_env": "ACME_API_KEY"}
+
+    values = collect_secret_values(config, env_values={"ACME_API_KEY": "sk-canary-in-env-file"})
+
+    assert "sk-canary-in-env-file" in values
+
+
+def test_collect_secret_values_resolves_token_env_pointers(tmp_path):
+    """Migration writes slack_bot_token_env=SLACK_BOT_TOKEN — a key ending in
+    _env but NOT api_key_env. The old code treated the variable NAME as the
+    secret, so it redacted the harmless name and missed the real token."""
+    from agent8088.engine import collect_secret_values
+
+    config = {"slack_bot_token_env": "SLACK_BOT_TOKEN"}
+    values = collect_secret_values(config, env_values={"SLACK_BOT_TOKEN": "xoxb-real-secret-value"})
+
+    assert "xoxb-real-secret-value" in values
+    assert "SLACK_BOT_TOKEN" not in values, "the env var NAME is not a secret"
+
+
+def test_collect_secret_values_prefers_env_file_over_environ(tmp_path, monkeypatch):
+    from agent8088.engine import collect_secret_values
+
+    monkeypatch.setenv("ACME_API_KEY", "from-environ")
+    values = collect_secret_values(
+        {"provider.acme.api_key_env": "ACME_API_KEY"},
+        env_values={"ACME_API_KEY": "from-env-file"},
+    )
+    assert "from-env-file" in values
+
+
+def test_collect_secret_values_falls_back_to_environ(monkeypatch):
+    from agent8088.engine import collect_secret_values
+
+    monkeypatch.setenv("ONLY_IN_ENVIRON_API_KEY", "sk-from-environ-only")
+    values = collect_secret_values(
+        {"provider.x.api_key_env": "ONLY_IN_ENVIRON_API_KEY"}, env_values={})
+    assert "sk-from-environ-only" in values
+
+
+def test_collect_secret_values_ignores_unresolvable_pointer():
+    from agent8088.engine import collect_secret_values
+
+    values = collect_secret_values(
+        {"provider.x.api_key_env": "NOT_SET_ANYWHERE_AT_ALL"}, env_values={})
+    assert "NOT_SET_ANYWHERE_AT_ALL" not in values
+
+
+def test_redact_secrets_masks_key_stored_in_env_file(tmp_path, monkeypatch):
+    """End-to-end: a key living only in .env must not leak through output."""
+    from agent8088 import engine as A
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("LEAKY_API_KEY=sk-must-not-leak-9999\n", encoding="utf-8")
+    monkeypatch.setattr(A, "ENV_FILE_PATH", env_path)
+    monkeypatch.setattr(A, "APP_CONFIG", {"provider.leaky.api_key_env": "LEAKY_API_KEY"})
+    monkeypatch.setattr(A, "_SECRET_VALUES", [])
+
+    out = A._redact_secrets("the token is sk-must-not-leak-9999 ok")
+
+    assert "sk-must-not-leak-9999" not in out
+    assert "[redacted]" in out

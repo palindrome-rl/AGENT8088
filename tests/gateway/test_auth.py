@@ -67,3 +67,63 @@ def test_allowlist_wildcard():
     al = Allowlist(["*"])
     assert al.is_allowed("923221540961")
     assert al.is_allowed("anyone")
+
+# --- Regression: from_config pooled every platform into one flat set ---
+# is_allowed() took no platform, so an id listed under slack_allowed_users was
+# also accepted on discord/whatsapp. Ids are now scoped to their platform.
+
+def test_from_config_scopes_ids_to_their_platform():
+    al = Allowlist.from_config({
+        "slack_allowed_users": "U_SLACK",
+        "discord_allowed_users": "123456789",
+        "whatsapp_allowed_users": "+15551234567",
+    })
+    assert al.is_allowed("U_SLACK", platform="slack")
+    assert not al.is_allowed("U_SLACK", platform="discord")
+    assert not al.is_allowed("U_SLACK", platform="whatsapp")
+
+    assert al.is_allowed("123456789", platform="discord")
+    assert not al.is_allowed("123456789", platform="slack")
+
+    assert al.is_allowed("+15551234567", platform="whatsapp")
+    assert not al.is_allowed("+15551234567", platform="slack")
+
+
+def test_platform_omitted_keeps_union_behaviour():
+    """Callers that don't pass a platform keep the old permissive union so
+    nothing silently breaks."""
+    al = Allowlist.from_config({"slack_allowed_users": "U_SLACK"})
+    assert al.is_allowed("U_SLACK")
+    assert "U_SLACK" in al
+
+
+def test_wildcard_still_allows_any_platform():
+    al = Allowlist.from_config({"slack_allowed_users": "*"})
+    assert al.is_allowed("anyone", platform="slack")
+
+
+def test_unknown_platform_denied_when_scoped():
+    al = Allowlist.from_config({"slack_allowed_users": "U_SLACK"})
+    assert not al.is_allowed("U_SLACK", platform="signal")
+
+
+def test_manually_added_ids_apply_to_all_platforms():
+    """Allowlist(list) with no platform mapping (and .add()) stays global."""
+    al = Allowlist(["U1"])
+    al.add("U2")
+    assert al.is_allowed("U1", platform="slack")
+    assert al.is_allowed("U2", platform="discord")
+
+
+def test_whatsapp_bare_number_matching_still_works_per_platform():
+    al = Allowlist.from_config({"whatsapp_allowed_users": "+15551234567"})
+    assert al.is_allowed("15551234567", platform="whatsapp")
+    assert not al.is_allowed("15551234567", platform="slack")
+
+
+def test_runner_passes_platform_to_allowlist():
+    """The gate in GatewayRunner.on_message must scope by event.platform."""
+    import inspect
+    from agent8088.gateway import runner as R
+    source = inspect.getsource(R.GatewayRunner.on_message)
+    assert "event.platform" in source, "on_message does not scope the allowlist by platform"

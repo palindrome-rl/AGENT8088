@@ -283,7 +283,6 @@ MCP client config (HTTP):
 | Tool | Description |
 |---|---|
 | `read_text` | Read a file |
-| `write_file` | Write a file (respects `allowed_paths` and `blocked_paths`) |
 | `calculate` | Evaluate a math expression |
 | `web_search` | Search the web (SearXNG) |
 | `web_search_tavily` | Search via Tavily |
@@ -291,7 +290,17 @@ MCP client config (HTTP):
 | `get_page_title` | Fetch a webpage title |
 | `last_output` | Get previous tool output |
 
-Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP binds to localhost by default; use `--mcp-host 0.0.0.0` to expose to the network. The external agent's own approval system (e.g. Claude Code's permission prompts) handles any additional safety.
+**File writes are opt-in.** MCP has no approval channel — an escalation prompt
+would just be an error string the client cannot answer — so the server runs in
+full-auto and the default surface above is deliberately read-only. To expose
+`write_file`, set `mcp_server_allow_writes=1` in `config.txt`. Writes then run
+unattended with no prompt, so narrow `allowed_paths` and set `blocked_paths`
+first. The always-on floor still applies either way: sensitive files (`.env`,
+`.ssh`, key files) and shell startup files (`.zshrc`, `.bashrc`, `.profile`, …)
+are refused regardless of mode, since writing one is code execution on the
+user's next shell launch.
+
+Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP binds to localhost by default; use `--mcp-host 0.0.0.0` to expose to the network — note there is no authentication on the HTTP transport, so only do this on a trusted network. The external agent's own approval system (e.g. Claude Code's permission prompts) handles any additional safety.
 
 ### Environment Variables
 

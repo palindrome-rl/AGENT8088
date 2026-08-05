@@ -104,7 +104,9 @@ atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 # =============================================================== 1. LOADING
 section("1. CONFIG, PATHS, AND LOADING")
 ok("engine imports", E is not None)
-ok("tools loaded", len(E.TOOL_NAMES) == 20, f"{len(E.TOOL_NAMES)} tools")
+# Smoke check for the "0 tools loaded" regression this was written for —
+# a floor, not an exact count, so adding a tool doesn't fail the run.
+ok("tools loaded", len(E.TOOL_NAMES) >= 20, f"{len(E.TOOL_NAMES)} tools")
 ok("sub-agents loaded", len(E.SUBAGENT_SPECS) == 4, ", ".join(sorted(E.SUBAGENT_SPECS)))
 ok("skills loaded", len(E.SKILL_PACKAGES) == 5, ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
@@ -273,25 +275,32 @@ ok("blocked wins over others", E._check_path_zone(TMP / "blocked") == "blocked")
 E.BLOCKED_PATHS, E.NO_PROMPT_PATHS, E.PROMPT_PATHS = prev
 
 # ==================================================== 5. EVERY TOOL: SPECS
-section("5. TOOL INVENTORY — spec integrity for all 20")
+section("5. TOOL INVENTORY — spec integrity")
+# Keep this dict as the single source of truth for the expected inventory:
+# the count assertions below derive from it, so adding a tool means editing
+# one place instead of three hardcoded numbers.
 expected_tools = {
     "execute_shell": "shell", "write_file": "write_text", "read_text": "read_text",
     "web_search": "http_get", "get_page_title": "http_get", "calculate": "python_eval",
     "last_output": "last_output", "spawn_subagent": "subagent",
+    "execute_plan": "plan",
     "git_status": "shell", "git_diff": "shell", "git_log": "shell",
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
     "browse_page": "browser", "web_search_tavily": "http_post",
     "web_search_exa": "http_post",
 }
-ok("exactly the expected 20 tools", set(E.TOOL_NAMES) == set(expected_tools),
+ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")
 for name, mode in sorted(expected_tools.items()):
     spec = E.TOOL_SPECS.get(name, {})
     ok(f"{name}: mode={mode}, has description",
        spec.get("mode") == mode and len(spec.get("description", "")) > 5,
        f"args={','.join(spec.get('args') or []) or '-'}")
-ok("every tool appears in TOOLS_DEF", len(E.TOOLS_DEF) == 20)
+# Assert the real invariant (every spec is exposed to the model), not a count.
+_def_names = {d["function"]["name"] for d in E.TOOLS_DEF}
+ok("every tool appears in TOOLS_DEF", _def_names == set(E.TOOL_NAMES),
+   str(_def_names ^ set(E.TOOL_NAMES)) if _def_names != set(E.TOOL_NAMES) else "")
 ok("every tool rendered into prompt",
    all(f"{n}(" in E.SYSTEM_PROMPT for n in E.TOOL_NAMES))
 ok("unknown tool handled", E.run_tool("no_such_tool", {}) == "Unknown tool: no_such_tool")
