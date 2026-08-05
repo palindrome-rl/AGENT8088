@@ -1,6 +1,9 @@
 import json
+import logging
 import re
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9@.+\-]+$")
 
@@ -52,15 +55,25 @@ class Allowlist:
     Ids added without a platform (the `Allowlist([...])` constructor, `.add()`)
     are global, and `is_allowed()` called without a platform falls back to the
     union — so existing callers keep working.
+
+    A misplaced id — one that IS listed, just on another platform's line — is
+    still allowed, with a one-time warning naming the line to move it to. Ids
+    cannot realistically collide across platforms (`U123ABC` vs a Discord
+    snowflake vs a phone number), so hard-denying one only produces a
+    confusing outage where the bot silently stops replying. Set
+    `strict_platform_allowlist=1` to refuse them instead.
     """
 
-    def __init__(self, allowed: list, session_dir: Path = None, by_platform: dict = None):
+    def __init__(self, allowed: list, session_dir: Path = None, by_platform: dict = None,
+                 strict: bool = False):
         self._set = {u.strip() for u in (allowed or []) if u.strip()}
         self._bare = {u.lstrip("+") for u in self._set if u.startswith("+")}
         self._session_dir = session_dir
         # platform -> set of ids scoped to it. Ids in self._set that are not in
         # any platform bucket are global.
         self._by_platform = {p: set(ids) for p, ids in (by_platform or {}).items()}
+        self.strict = bool(strict)
+        self._warned_misplaced = set()
 
     def _candidates(self, platform: str = None) -> set:
         """Ids valid for this platform: its own scoped ids plus global ones."""
@@ -70,22 +83,52 @@ class Allowlist:
         globals_ = self._set - scoped
         return self._by_platform.get(platform, set()) | globals_
 
-    def is_allowed(self, user_id: str, platform: str = None) -> bool:
-        allowed = self._candidates(platform)
-        if "*" in allowed:
-            return True
-        if user_id in allowed:
+    def _matches(self, user_id: str, allowed: set) -> bool:
+        """True if user_id is covered by this set of allowed ids."""
+        if "*" in allowed or user_id in allowed:
             return True
         bare_allowed = {u.lstrip("+") for u in allowed if u.startswith("+")}
-        bare = user_id.lstrip("+")
-        if bare in bare_allowed:
+        if user_id.lstrip("+") in bare_allowed:
             return True
         if self._session_dir and self._session_dir.exists():
-            aliases = expand_whatsapp_aliases(user_id, self._session_dir)
-            for alias in aliases:
+            for alias in expand_whatsapp_aliases(user_id, self._session_dir):
                 if alias in allowed or alias.lstrip("+") in bare_allowed:
                     return True
         return False
+
+    def _listed_under(self, user_id: str, platform: str) -> str:
+        """Name of another platform whose list covers user_id, or ""."""
+        for other, ids in self._by_platform.items():
+            if other != platform and self._matches(user_id, ids):
+                return other
+        return ""
+
+    def is_allowed(self, user_id: str, platform: str = None) -> bool:
+        if self._matches(user_id, self._candidates(platform)):
+            return True
+        if platform is None:
+            return False
+        # Listed, but on another platform's line. Deny only in strict mode;
+        # otherwise allow and say exactly how to fix the config.
+        other = self._listed_under(user_id, platform)
+        if not other:
+            return False
+        if self.strict:
+            log.warning(
+                "denied %s on %s: it is listed under %s_allowed_users, not "
+                "%s_allowed_users (strict_platform_allowlist is on)",
+                user_id, platform, other, platform,
+            )
+            return False
+        if user_id not in self._warned_misplaced:
+            self._warned_misplaced.add(user_id)
+            log.warning(
+                "allowing %s on %s, but it is configured under "
+                "%s_allowed_users — move it to %s_allowed_users. This grace "
+                "will be removed; set strict_platform_allowlist=1 to enforce now.",
+                user_id, platform, other, platform,
+            )
+        return True
 
     def add(self, user_id: str) -> None:
         self._set.add(user_id)
@@ -117,4 +160,6 @@ class Allowlist:
         whatsapp_session = config.get("whatsapp_session_dir", "") or ""
         if whatsapp_session:
             session_dir = Path(whatsapp_session).expanduser()
-        return cls(users, session_dir=session_dir, by_platform=by_platform)
+        strict = str(config.get("strict_platform_allowlist", "")).strip().lower() in (
+            "1", "true", "yes", "on")
+        return cls(users, session_dir=session_dir, by_platform=by_platform, strict=strict)

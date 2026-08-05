@@ -198,6 +198,8 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
 | `gateway_permission_mode` | `readonly` | Gateway permission mode: `readonly` (approvals in chat) or `edit` (full-auto) |
+| `strict_platform_allowlist` | `0` | Refuse a user id listed under another platform's `*_allowed_users` line instead of allowing it with a warning |
+| `mcp_server_allow_writes` | `0` | Expose `write_file` over `--mcp-serve`. Writes are unattended (MCP has no approval channel) |
 | `disabled_tools` | (empty) | Comma-separated built-in tool names to disable (e.g. `browse_page` when MCP Playwright is connected) |
 
 ### API Key Storage

@@ -70,6 +70,14 @@ sandbox_runtime_version=0.0.67
 # Leave commented to disable web_search.
 # search_base_url=http://localhost:8888/search?q=
 
+# --- gateway allowlist scoping ---
+# User ids are scoped to the platform whose *_allowed_users line they appear
+# on. An id found on another platform's line is still allowed, with a warning
+# naming the line to move it to — ids cannot realistically collide across
+# platforms, and a silent lockout is worse than a warning. Set to 1 to refuse
+# them instead.
+# strict_platform_allowlist=0
+
 # --- MCP server mode (agent8088 --mcp-serve) ---
 # The tools exposed to external MCP clients are read-only by default, because
 # MCP has no approval channel: a write would run unattended with no prompt.
