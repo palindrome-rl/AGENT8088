@@ -1,0 +1,118 @@
+# Tools
+
+[← Wiki index](README.md)
+
+21 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+is what the permission layer gates on — see
+[Permissions & Security](03-permissions-and-security.md).
+
+## Full inventory
+
+| Tool | Mode | Args | readonly? | What it does |
+|---|---|---|---|---|
+| `read_text` | `read_text` | `filename` | ✅ | Read a file. Refuses credential files. |
+| `write_file` | `write_text` | `filename`, `content` | prompt | Write a file. Path-zone + sensitive + shell-rc checked. |
+| `execute_shell` | `shell` | `command` | safe list only | Run a shell command. |
+| `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
+| `last_output` | `last_output` | — | ✅ | Re-read the previous tool's output without re-running it. |
+| `web_search` | `http_get` | `query` | prompt | Search via SearXNG (`search_base_url`). |
+| `web_search_tavily` | `http_post` | `query` | prompt | Search via Tavily (needs key). |
+| `web_search_exa` | `http_post` | `query` | prompt | Semantic search via Exa (needs key). |
+| `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
+| `browse_page` | `browser` | `url` | prompt | Headless browser — renders JS that curl can't. |
+| `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
+| `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
+| `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
+| `execute_plan` | `plan` | `steps` | ✅ | Run a multi-step plan (the plan-only path). |
+| `git_status` | `shell` | — | depends | `git status`. |
+| `git_diff` | `shell` | — | depends | `git diff`. |
+| `git_log` | `shell` | — | depends | `git log`. |
+| `git_clone` | `shell` | `url`, `directory` | prompt | Clone a repo. |
+| `git_commit` | `shell` | `message` | prompt | Commit staged changes. |
+| `git_push` | `shell` | — | **blocked** | Refused at the always-on floor. |
+| `git_create_pr` | `shell` | `title`, `body` | prompt | Open a PR via `gh`. |
+
+> `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
+> without a prompt under the native sandbox, escalated under `local`, because
+> reading a repo unsandboxed can surface credential content.
+
+## Aliases
+
+The model can call tools by natural names; they resolve to the canonical tool:
+
+| Says | Runs |
+|---|---|
+| `bash`, `sh`, `shell`, `run` | `execute_shell` |
+| `search`, `web`, `google` | `web_search` |
+| `read`, `cat` | `read_text` |
+| `write`, `create_file` | `write_file` |
+| `calc`, `eval`, `math` | `calculate` |
+
+## Argument transforms
+
+Some plausible-but-wrong shapes are rewritten rather than rejected — e.g.
+`mkdir({path: "x"})` becomes `execute_shell({command: "mkdir x"})`. This is why
+the agent recovers instead of looping when the model invents a tool that
+*sounds* right.
+
+## Tool modes explained
+
+`mode` is the contract between a tool and the permission layer. Adding a tool to
+`tools.txt` with an existing mode inherits that mode's gating automatically.
+
+| Mode | Gated as |
+|---|---|
+| `read_text` | read — allowed in readonly |
+| `write_text` | write — path zones, sensitive + shell-rc floor |
+| `shell` | command classifier + sandbox |
+| `http_get` / `http_post` | network + SSRF + content wrapping |
+| `browser` | network + SSRF |
+| `docker` | sandbox |
+| `cron` | scheduled side effect |
+| `subagent` | recursion-depth guarded |
+| `python_eval` | pure computation — allowed in readonly |
+| `last_output` | pure recall — allowed in readonly |
+| `plan` | the plan-only entry point |
+| `mcp` | external MCP tool — see [MCP](07-mcp.md) |
+
+## Adding a tool
+
+`tools.txt` is pipe-delimited:
+
+```
+name|description|mode=<mode>|args=a,b|timeout=25
+```
+
+HTTP tools take extra fields:
+
+```
+url=https://api.example.com/search
+headers=Authorization: Bearer {my_api_key};;Content-Type: application/json
+body={"q": "{query}"}
+filter=.results[]        # jq expression applied to the response
+extract=title            # or: return only the page <title>
+```
+
+Notes that save time:
+
+- `{placeholders}` interpolate from config *and* tool args. `{query_q}` is the
+  URL-encoded variant of `{query}`.
+- Headers are split on `;;`, then on the first `:` — so a `User-Agent`
+  containing semicolons works fine.
+- An unresolved `{placeholder}` produces a message naming the missing key,
+  rather than a confusing SSRF error.
+- Everything stays behind the SSRF guard, which is exactly why HTTP is a *mode*
+  rather than something you'd shell out to `curl` for.
+
+Disable a built-in without editing the file:
+
+```ini
+disabled_tools=browse_page
+```
+
+## Inspecting tools at runtime
+
+```
+/tools                        # list all with mode, args, description
+/tool read_text {"filename": "README.md"}   # invoke one directly
+```
