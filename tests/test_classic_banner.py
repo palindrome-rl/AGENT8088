@@ -72,10 +72,10 @@ def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
 def test_command_suggestions_cover_slash_and_bare_prefixes():
     assert "/help" in classic._command_matches("/")
     assert "/quit" in classic._command_matches("/")
-    assert classic._command_matches("m", slash=False) == ["maxturns", "mcp", "model", "models"]
+    assert classic._command_matches("m", slash=False) == ["maxturns", "mcp", "mode", "model", "models"]
     assert classic._live_matches("/")[1] == classic._command_matches("/")
-    assert classic._live_matches("/m")[1] == ["/maxturns", "/mcp", "/model", "/models"]
-    assert classic._live_matches("m") == ("m", ["maxturns", "mcp", "model", "models"])
+    assert classic._live_matches("/m")[1] == ["/maxturns", "/mcp", "/mode", "/model", "/models"]
+    assert classic._live_matches("m") == ("m", ["maxturns", "mcp", "mode", "model", "models"])
 
 
 def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):

@@ -57,7 +57,9 @@ def test_http_get_applies_jq_filter(engine, monkeypatch):
     spec = {"name": "t", "mode": "http_get", "url": "https://example.com/api",
             "filter": ".results[]", "headers": "", "body": ""}
     out = engine._exec_http("http_get", spec, {}, 10)
-    assert out == "filtered"
+    # http_get results (unlike extract=title) are wrapped as untrusted external
+    # content — see _wrap_untrusted.
+    assert out == engine._wrap_untrusted("filtered", "https://example.com/api")
     assert seen["jq"] == ["jq", "-r", ".results[]"]
     assert seen["request"].full_url == "https://example.com/api"
 
