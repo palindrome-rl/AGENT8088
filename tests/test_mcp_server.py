@@ -9,12 +9,16 @@ def test_mcp_server_imports():
 
 
 def test_exposed_tools_is_curated_subset():
-    from agent8088.mcp_server import EXPOSED_TOOLS
+    from agent8088.mcp_server import EXPOSED_TOOLS, WRITE_TOOLS
     assert "read_text" in EXPOSED_TOOLS
-    assert "write_file" in EXPOSED_TOOLS
     assert "calculate" in EXPOSED_TOOLS
     assert "web_search" in EXPOSED_TOOLS
     assert "last_output" in EXPOSED_TOOLS
+    # write_file deliberately moved OUT of the always-on set: the server runs
+    # in full-auto (MCP has no approval channel), so an exposed write ran
+    # unattended with no prompt. It is now opt-in via mcp_server_allow_writes.
+    assert "write_file" not in EXPOSED_TOOLS
+    assert "write_file" in WRITE_TOOLS
 
 
 def test_dangerous_tools_not_exposed():
@@ -127,3 +131,64 @@ def test_create_mcp_server_http_configures_endpoint():
         assert server is not None
     except ImportError:
         pytest.skip("MCP package not installed")
+
+# --- Regression: write_file was exposed while the server forced full-auto ---
+# An external MCP client could write anywhere under allowed_paths with no
+# approval prompt (there is no approval channel over MCP). Writes are now
+# opt-in; the default surface is non-mutating.
+
+SAFE_MODES = {"read_text", "python_eval", "http_get", "http_post", "last_output"}
+
+
+def test_write_file_not_exposed_by_default():
+    from agent8088.mcp_server import exposed_tool_names
+    assert "write_file" not in exposed_tool_names({})
+
+
+def test_write_file_exposed_only_when_explicitly_opted_in():
+    from agent8088.mcp_server import exposed_tool_names
+    assert "write_file" in exposed_tool_names({"mcp_server_allow_writes": "1"})
+    assert "write_file" in exposed_tool_names({"mcp_server_allow_writes": "true"})
+    assert "write_file" not in exposed_tool_names({"mcp_server_allow_writes": "0"})
+    assert "write_file" not in exposed_tool_names({"mcp_server_allow_writes": ""})
+
+
+def test_default_exposed_tools_are_all_non_mutating():
+    """Guard against a future mutating tool being added to the default set
+    while the server still runs in full-auto."""
+    from agent8088 import engine as A
+    from agent8088.mcp_server import exposed_tool_names
+
+    for name in exposed_tool_names({}):
+        mode = A.TOOL_SPECS.get(name, {}).get("mode")
+        assert mode in SAFE_MODES, f"{name} has mutating mode {mode!r} in the default MCP surface"
+
+
+def test_dangerous_tools_never_exposed_even_with_writes_enabled():
+    from agent8088.mcp_server import exposed_tool_names
+    names = set(exposed_tool_names({"mcp_server_allow_writes": "1"}))
+    for tool in ("execute_shell", "run_sandboxed", "git_push", "git_commit",
+                 "git_clone", "git_create_pr", "schedule_task", "browse_page",
+                 "spawn_subagent", "execute_plan"):
+        assert tool not in names
+
+
+def test_server_registers_only_the_effective_tool_set():
+    import asyncio
+    from agent8088 import mcp_server as M
+
+    server = M.create_mcp_server()
+    registered = {t.name for t in asyncio.run(server.list_tools())}
+    assert registered == set(M.exposed_tool_names({}))
+    assert "write_file" not in registered
+
+
+def test_server_registers_write_file_when_opted_in(monkeypatch):
+    import asyncio
+    from agent8088 import engine as A
+    from agent8088 import mcp_server as M
+
+    monkeypatch.setattr(A, "APP_CONFIG", {**A.APP_CONFIG, "mcp_server_allow_writes": "1"})
+    server = M.create_mcp_server()
+    registered = {t.name for t in asyncio.run(server.list_tools())}
+    assert "write_file" in registered

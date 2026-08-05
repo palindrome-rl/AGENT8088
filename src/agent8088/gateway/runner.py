@@ -57,8 +57,10 @@ class GatewayRunner:
         self.adapters.append(adapter)
 
     async def on_message(self, event: MessageEvent) -> None:
-        if not self.allowlist.is_allowed(event.user_id):
-            log.warning("disallowed user dropped: %s", event.user_id)
+        # Scope by platform: an id listed under slack_allowed_users must not
+        # grant access on discord or whatsapp.
+        if not self.allowlist.is_allowed(event.user_id, platform=event.platform):
+            log.warning("disallowed user dropped: %s (%s)", event.user_id, event.platform)
             return
         if event.text.startswith("/"):
             parts = event.text.split(None, 1)
