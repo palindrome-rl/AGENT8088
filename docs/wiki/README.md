@@ -7,6 +7,12 @@ directions, and messaging gateways.
 Everything here was verified against the code in this repository rather than
 copied from the README. Where the two disagree, the wiki notes it explicitly.
 
+> **This directory is the source of truth.** It is versioned with the code and
+> reviewed in PRs. The [GitHub Wiki tab](https://github.com/tayyabimam1/AGENT8088/wiki)
+> is a generated mirror — run `python scripts/sync_wiki.py` after changing a
+> page here to republish it. Edits made in the wiki UI are overwritten by the
+> next sync.
+
 ## Start here
 
 | If you want to… | Read |
