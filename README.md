@@ -135,6 +135,10 @@ options:
   --edit            alias for --mode full-auto (no per-action permission prompts)
   --gateway         run the messaging gateway (Slack/WhatsApp/Discord) instead of REPL
   --gateway-setup   configure gateway channels interactively, then exit
+  --mcp-serve      run Agent8088 as an MCP server (expose tools to external AI agents)
+  --mcp-http       use HTTP transport for MCP server (with --mcp-serve, default: stdio)
+  --mcp-port PORT  MCP server HTTP port (default 8931, with --mcp-http)
+  --mcp-host HOST  MCP server bind host (default 127.0.0.1, with --mcp-http)
   --model-setup     configure model provider + API key, then exit
   --uninstall       remove agent8088 install dir + env vars, then exit
   --update          pull latest code + reinstall, then exit
@@ -234,6 +238,60 @@ A project server definition with the same name overrides the user-level definiti
 ```
 
 MCP tool names are registered dynamically as `mcp_<server>_<tool>`. Stdio server processes receive a minimal OS environment supplemented by any explicit `env` entries. Tools without the server's `readOnlyHint` require normal Agent8088 one-shot approval.
+
+### MCP server mode (expose Agent8088 tools to external agents)
+
+Agent8088 can also act as an MCP **server**, exposing its safe built-in tools to external AI agents like Claude Code, Codex, or Cursor.
+
+**stdio mode** (default — local use):
+```bash
+agent8088 --mcp-serve
+```
+
+MCP client config (e.g. for Claude Code's `.claude/settings.json`):
+```json
+{
+  "mcpServers": {
+    "agent8088": {
+      "command": "agent8088",
+      "args": ["--mcp-serve"]
+    }
+  }
+}
+```
+
+**HTTP mode** (remote use, multi-client):
+```bash
+agent8088 --mcp-serve --mcp-http --mcp-port 8931
+# Bind to all interfaces:
+agent8088 --mcp-serve --mcp-http --mcp-host 0.0.0.0 --mcp-port 8931
+```
+
+MCP client config (HTTP):
+```json
+{
+  "mcpServers": {
+    "agent8088": {
+      "url": "http://localhost:8931/mcp"
+    }
+  }
+}
+```
+
+**Exposed tools** (curated safe subset — dangerous tools like `execute_shell` and `git_push` are NOT exposed):
+
+| Tool | Description |
+|---|---|
+| `read_text` | Read a file |
+| `write_file` | Write a file (respects `allowed_paths` and `blocked_paths`) |
+| `calculate` | Evaluate a math expression |
+| `web_search` | Search the web (SearXNG) |
+| `web_search_tavily` | Search via Tavily |
+| `web_search_exa` | Search via Exa (semantic) |
+| `get_page_title` | Fetch a webpage title |
+| `last_output` | Get previous tool output |
+
+Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP binds to localhost by default; use `--mcp-host 0.0.0.0` to expose to the network. The external agent's own approval system (e.g. Claude Code's permission prompts) handles any additional safety.
 
 ### Environment Variables
 
