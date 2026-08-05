@@ -2544,6 +2544,10 @@ def main():
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
     parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp) instead of the REPL")
     parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp messaging gateways, then exit")
+    parser.add_argument("--mcp-serve", action="store_true", help="run Agent8088 as an MCP server (expose tools to external AI agents)")
+    parser.add_argument("--mcp-http", action="store_true", help="use HTTP transport for MCP server (with --mcp-serve)")
+    parser.add_argument("--mcp-port", type=int, default=8931, help="MCP server HTTP port (default 8931)")
+    parser.add_argument("--mcp-host", default="127.0.0.1", help="MCP server bind host (default localhost)")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -2567,6 +2571,13 @@ def main():
         return
     if args.gateway_setup:
         _run_gateway_setup()
+        return
+    if args.mcp_serve:
+        from agent8088.mcp_server import run_mcp_server
+        if args.mcp_http:
+            run_mcp_server(transport="streamable-http", host=args.mcp_host, port=args.mcp_port)
+        else:
+            run_mcp_server(transport="stdio")
         return
     if args.edit or args.full_auto:
         A.PERMISSION_MODE = "full-auto"
