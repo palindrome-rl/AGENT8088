@@ -132,6 +132,25 @@ did not catch it here. Run the AST check.
 - Design records go in `docs/superpowers/specs/`.
 - Update the relevant wiki page in the same PR as the code change.
 
+### Publishing to the GitHub Wiki tab
+
+`docs/wiki/` is the source of truth. The Wiki tab is a **separate git
+repository** (`<repo>.wiki.git`) and a generated mirror — never edit it
+directly, since the next sync overwrites it.
+
+```sh
+python scripts/sync_wiki.py --dry-run   # verify link rewriting
+python scripts/sync_wiki.py             # convert, commit, push
+```
+
+The script handles the conversion the wiki requires: `README.md` → `Home.md`,
+numeric prefixes dropped, internal `[x](04-tools.md)` links rewritten to
+`[x](Tools)`, and a generated `_Sidebar.md`. It fails rather than publishing if
+any internal link would end up broken.
+
+Adding or renaming a page means updating the `PAGES` list in the script — that
+list also defines sidebar order.
+
 ## Project layout
 
 See [Architecture](11-architecture.md) for the module map and the reason every
