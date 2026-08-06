@@ -35,7 +35,8 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 - **Tool arg transforms** — `mkdir({path:...})` auto-converts to `execute_shell({command:...})`
 - **SkillOpt** — self-improving agent skills via text-space optimization
 - **MCP client** — connect stdio and Streamable HTTP MCP servers as Agent8088 tools
-- **Messaging gateway** — Slack, WhatsApp, and Discord adapters with DM + @mention support
+- **MCP server** — expose Agent8088's tools to external AI agents (Claude Code, Codex, Cursor) via stdio or HTTP
+- **Messaging gateway** — Slack, WhatsApp, Discord, and Email adapters with allowlist + approval prompts
 - **Chat-based approvals** — `/approve` + `/deny` in chat; Discord gets interactive ✅/❌ buttons
 - **Separate .env key store** — API keys and tokens stored in `~/.agent8088/.env` (0600), not in config.txt
 
@@ -137,7 +138,7 @@ options:
   --version, -V     show version and exit
   --mode MODE        set permission mode: readonly (default), full-auto, or plan-only
   --edit            alias for --mode full-auto (no per-action permission prompts)
-  --gateway         run the messaging gateway (Slack/WhatsApp/Discord) instead of REPL
+  --gateway         run the messaging gateway (Slack/WhatsApp/Discord/Email) instead of REPL
   --gateway-setup   configure gateway channels interactively, then exit
   --mcp-serve      run Agent8088 as an MCP server (expose tools to external AI agents)
   --mcp-http       use HTTP transport for MCP server (with --mcp-serve, default: stdio)
@@ -405,7 +406,7 @@ AGENT8088/
 │   ├── tools.txt             # Tool specs
 │   ├── agents/               # Sub-agent profiles
 │   ├── skills_installed/     # Installable skill packages
-│   └── gateway/              # Messaging gateway (Slack, WhatsApp, Discord)
+│   └── gateway/              # Messaging gateway (Slack, WhatsApp, Discord, Email)
 │       ├── runner.py          # Gateway runner (session, approvals, slash commands)
 │       ├── agent_bridge.py    # Bridge between gateway and engine
 │       ├── auth.py            # Allowlist + WhatsApp LID resolution
@@ -414,7 +415,8 @@ AGENT8088/
 │           ├── base.py        # BaseChannelAdapter ABC
 │           ├── slack.py       # Slack adapter (Socket Mode)
 │           ├── discord.py     # Discord adapter (discord.py + approval buttons)
-│           └── whatsapp.py    # WhatsApp adapter (Baileys bridge)
+│           ├── whatsapp.py    # WhatsApp adapter (Baileys bridge)
+│           └── email.py       # Email adapter (IMAP/SMTP, stdlib only)
 ├── tests/                    # Test suite
 │   ├── test_permission.py    # Permission layer tests
 │   ├── test_cli_setup.py     # CLI setup wizard tests
@@ -539,6 +541,14 @@ agent8088 --update
 - The gateway runs in readonly mode by default. Set `gateway_permission_mode=edit` in config.txt to disable approvals.
 - For chat-based approvals: send `/approve` (once), `/approve session`, or `/deny` in the chat.
 - Discord gets interactive ✅/❌ buttons.
+
+**Email adapter not receiving messages**
+- Run `agent8088 --gateway-setup` and select Email to configure.
+- Ensure `EMAIL_ADDRESS`, `EMAIL_PASSWORD`, `EMAIL_SMTP_HOST`, and `EMAIL_IMAP_HOST` are set in `~/.agent8088/.env`.
+- For Gmail: enable 2FA and create an App Password (not your regular password).
+- Only emails from `email_allowed_users` addresses are processed — all others are silently dropped.
+- IMAP host should start with `imap.` (e.g. `imap.gmail.com`), not `smtp.`.
+- Set `email_verify_sender=1` in config.txt to enable SPF/DKIM/DMARC verification (fail-closed).
 
 ---
 
