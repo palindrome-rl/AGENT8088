@@ -623,6 +623,54 @@ def _shell_targets_credential_path(command: str) -> bool:
     return any(marker in lowered for marker in cred_markers)
 
 
+# Beyond this length a command is not something a person is reasonably asking
+# for, and lexing quote-storms gets expensive. Past the limit the command is
+# treated as dangerous rather than skipped — see _command_parser_limit_exceeded.
+MAX_COMMAND_CHARS = int(APP_CONFIG.get("max_command_chars", "16384"))
+
+
+def _command_parser_limit_exceeded(command: str) -> bool:
+    """True if the command is too large or too quote-dense to analyse reliably.
+
+    Detection that gives up must refuse, not allow: a command nobody can parse
+    is exactly the shape an evasion attempt takes.
+    """
+    if len(command or "") > MAX_COMMAND_CHARS:
+        return True
+    return (command or "").count('"') + (command or "").count("'") > 256
+
+
+def _command_detection_variants(command: str):
+    """Yield forms of `command` to run detection against.
+
+    Every lexer-based check below depends on shlex succeeding. A single
+    unbalanced quote made shlex raise, and the whole git/wrapper analysis was
+    skipped — `git push origin main "` executed in a mode where `git push` is
+    always refused. Detection must not depend on the input being well-formed,
+    so a de-quoted variant is tried as well.
+
+    The variant is used ONLY to re-run detection; nothing is executed from it,
+    and `echo`/`printf` stay on the non-exec list, so `echo "git push"` does not
+    become a push.
+    """
+    yield command
+    dequoted = (command or "").replace('"', " ").replace("'", " ")
+    if dequoted != command:
+        yield dequoted
+
+
+def _lex_command(command: str):
+    """Lex a command into parts, or None if it cannot be lexed."""
+    try:
+        lexer = shlex.shlex(command, posix=sys.platform != "win32",
+                            punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     if _is_unrecoverable_command(command):
         return True
@@ -636,14 +684,19 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
         return True
     if _shell_targets_credential_path(command):
         return True
-    try:
-        lexer = shlex.shlex(command, posix=sys.platform != "win32",
-                            punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        parts = list(lexer)
-    except ValueError:
-        return False
+    if _command_parser_limit_exceeded(command):
+        return True
+    # Run the lexer-based analysis on the first variant that parses. If none do,
+    # refuse: previously this returned False and skipped every check below.
+    parts = None
+    for variant in _command_detection_variants(command):
+        parts = _lex_command(variant)
+        if parts is not None:
+            if variant != command and _hard_blocked_shell(variant, _depth + 1):
+                return True
+            break
+    if parts is None:
+        return True
     separators = {";", "&&", "||", "&", "|"}
     if _depth < 8:
         substitutions = re.findall(r"\$\(([^()]*)\)|`([^`]*)`", command)
