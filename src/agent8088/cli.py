@@ -938,6 +938,24 @@ def cmd_tools(_):
     console.print(t)
 
 
+def _confirm_destructive(what: str, detail: str = "") -> bool:
+    """Ask before an action that discards state the user cannot get back.
+
+    Mirrors Hermes' destructive_slash_confirm / mcp_reload_confirm. A mistyped
+    /reset in the middle of a long session loses the whole conversation, and the
+    only signal beforehand was the four characters you just typed.
+
+    Returns True to proceed. Non-interactive sessions proceed without asking —
+    there is nobody to ask, and blocking would break scripted use.
+    """
+    if not A.DESTRUCTIVE_CONFIRM or not sys.stdin.isatty():
+        return True
+    suffix = f" {detail}" if detail else ""
+    answer = console.input(
+        f"[#f5a623]{what}{suffix}[/#f5a623] — this cannot be undone. Continue? [y/N] ")
+    return answer.strip().lower() in ("y", "yes")
+
+
 def cmd_capabilities(_):
     """Print the same self-report the agent gets from describe_capabilities.
 
@@ -954,6 +972,10 @@ def cmd_mcp(rest):
     parts = shlex.split(rest or "")
     action = parts.pop(0).lower() if parts else "list"
     if action == "reload":
+        if A.MCP_RELOAD_CONFIRM and not _confirm_destructive(
+                "Reload MCP servers", "(drops the tool cache and reconnects)"):
+            console.print("[#237dd7]kept[/#237dd7]")
+            return
         A.reload_mcp_tools()
     elif action == "add" and len(parts) >= 3:
         name, transport, target, *extra = parts
@@ -1585,6 +1607,10 @@ def cmd_resume(rest):
 
 
 def cmd_reset(_):
+    if S.messages and not _confirm_destructive(
+            "Discard the conversation", f"({len(S.messages)} messages)"):
+        console.print("[#237dd7]kept[/#237dd7]")
+        return
     S.messages.clear()
     S.last_trace = None
     S.conversation_trace.clear()

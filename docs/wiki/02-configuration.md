@@ -58,6 +58,7 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `ssrf_allow_private` | `0` | `1` opens the entire private network. Prefer the allowlist. |
 | `allowed_domains` | (empty) | If set, the **only** public hosts the agent may reach. Empty means all are reachable. |
 | `blocked_domains` | (empty) | Public hosts the agent may never reach. Wins over `allowed_domains`. |
+| `max_command_chars` | `16384` | Commands longer than this are refused rather than analysed. |
 | `audit_log` | `0` | `1` appends one redacted JSON line per gated tool decision. Turn this on for any gateway deployment. |
 | `audit_log_path` | `<data dir>/audit.jsonl` | Where the audit trail is written (mode 0600). |
 | `audit_max_detail` | `512` | Truncation length for the audit `detail` field. |
@@ -68,6 +69,26 @@ Domain matching is dot-anchored, so `allowed_domains=example.com` permits
 Both domain lists are checked *before* the SSRF DNS lookup: a host the policy
 already rejects is never resolved, so the attempt does not reach that domain's
 nameserver.
+
+## Approvals
+
+Agent8088's flattened form of Hermes' `approvals:` block.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `denial_breaker_threshold` | `3` | Consecutive denials before the request stops and reports instead of retrying. `0` disables. |
+| `cron_mode` | `deny` | What an **unattended** run does at an approval gate. `deny` refuses and tells the model to report it; `approve` treats the gate as granted. Neither touches the always-on floor. |
+| `destructive_slash_confirm` | `1` | `/reset` and `/clear` ask before discarding a conversation. |
+| `mcp_reload_confirm` | `1` | `/mcp reload` asks before dropping the tool cache. |
+
+There is deliberately no separate "approval mode" setting.
+[`--mode` / `permission_mode`](03-permissions-and-security.md#the-three-permission-modes)
+already decides what is gated; a second axis that could also wave a gate through
+would mean `readonly` plus one other key silently behaves like `full-auto`.
+
+Scheduled runs created by `schedule_task` set `AGENT8088_UNATTENDED=1` themselves,
+so `cron_mode` applies without extra setup. The variable is read once at startup,
+not per call.
 
 ## Sandbox
 

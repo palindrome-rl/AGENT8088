@@ -287,6 +287,34 @@ COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
 MAX_WRITES_PER_TURN = int(APP_CONFIG.get("max_writes_per_turn", "0"))
 MAX_WRITE_BYTES = int(APP_CONFIG.get("max_write_bytes", "0"))
 
+# --- Approval policy ---
+# There is deliberately no separate "approval mode" axis: PERMISSION_MODE already
+# decides what is gated, and a second setting that could also wave a gate through
+# meant `PERMISSION_MODE=readonly` plus one other key silently became full-auto.
+# Use PERMISSION_MODE for that.
+
+# Denial circuit breaker: after this many consecutive denials the model is told to
+# stop and report instead of retrying the same blocked action until max_turns.
+# 0 disables. A single approval resets the count.
+DENIAL_BREAKER_THRESHOLD = int(APP_CONFIG.get("denial_breaker_threshold", "3"))
+
+# Unattended runs (cron / scheduled) have no operator to answer a prompt.
+#   deny     refuse the gated action and tell the model why (fail closed)
+#   approve  treat the gate as granted — the always-on floor still applies
+CRON_MODE = str(APP_CONFIG.get("cron_mode", "deny")).strip().lower()
+if CRON_MODE not in ("deny", "approve"):
+    CRON_MODE = "deny"
+# Set by the CLI for a non-interactive invocation (a scheduled task, a piped
+# prompt). Env var is read once at import: reading it per call would let anything
+# running inside the process flip it mid-turn, the same escalation path Hermes
+# closes by freezing HERMES_YOLO_MODE at import.
+UNATTENDED = os.environ.get("AGENT8088_UNATTENDED", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Confirm before a slash command discards conversation state (/reset, /clear,
+# /new, /compact) or invalidates the MCP tool cache (/mcp reload).
+DESTRUCTIVE_CONFIRM = APP_CONFIG.get("destructive_slash_confirm", "1") != "0"
+MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
+
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
@@ -340,6 +368,7 @@ _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach
 _plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
 _active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
 _turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
+_consecutive_denials = 0  # denial circuit breaker (see DENIAL_BREAKER_THRESHOLD)
 
 
 def reset_turn_counters() -> None:
@@ -347,6 +376,46 @@ def reset_turn_counters() -> None:
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes
     _turn_writes = 0
+
+
+# ---------------------------------------------------------------------------
+# Denial circuit breaker
+# ---------------------------------------------------------------------------
+def reset_approval_state() -> None:
+    """Clear the consecutive-denial count."""
+    global _consecutive_denials
+    _consecutive_denials = 0
+
+
+def note_denial() -> bool:
+    """Record a denied escalation. Returns True once the breaker has tripped."""
+    global _consecutive_denials
+    _consecutive_denials += 1
+    return breaker_tripped()
+
+
+def note_approval() -> None:
+    """Record a granted escalation — the operator is engaged, so start over."""
+    reset_approval_state()
+
+
+def breaker_tripped() -> bool:
+    return bool(DENIAL_BREAKER_THRESHOLD) and _consecutive_denials >= DENIAL_BREAKER_THRESHOLD
+
+
+def breaker_message() -> str:
+    """What the model is told once the breaker opens.
+
+    Without this the model re-proposes the same blocked action until max_turns,
+    which reads to the user as the agent ignoring them.
+    """
+    return (
+        f"You have been denied {_consecutive_denials} times in a row. Stop "
+        f"attempting this action. Tell the user plainly what you could not do "
+        f"and why, and do not call another tool for it. "
+        f"(denial_breaker_threshold={DENIAL_BREAKER_THRESHOLD}; set it to 0 in "
+        f"config.txt to disable this limit.)"
+    )
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -623,6 +692,54 @@ def _shell_targets_credential_path(command: str) -> bool:
     return any(marker in lowered for marker in cred_markers)
 
 
+# Beyond this length a command is not something a person is reasonably asking
+# for, and lexing quote-storms gets expensive. Past the limit the command is
+# treated as dangerous rather than skipped — see _command_parser_limit_exceeded.
+MAX_COMMAND_CHARS = int(APP_CONFIG.get("max_command_chars", "16384"))
+
+
+def _command_parser_limit_exceeded(command: str) -> bool:
+    """True if the command is too large or too quote-dense to analyse reliably.
+
+    Detection that gives up must refuse, not allow: a command nobody can parse
+    is exactly the shape an evasion attempt takes.
+    """
+    if len(command or "") > MAX_COMMAND_CHARS:
+        return True
+    return (command or "").count('"') + (command or "").count("'") > 256
+
+
+def _command_detection_variants(command: str):
+    """Yield forms of `command` to run detection against.
+
+    Every lexer-based check below depends on shlex succeeding. A single
+    unbalanced quote made shlex raise, and the whole git/wrapper analysis was
+    skipped — `git push origin main "` executed in a mode where `git push` is
+    always refused. Detection must not depend on the input being well-formed,
+    so a de-quoted variant is tried as well.
+
+    The variant is used ONLY to re-run detection; nothing is executed from it,
+    and `echo`/`printf` stay on the non-exec list, so `echo "git push"` does not
+    become a push.
+    """
+    yield command
+    dequoted = (command or "").replace('"', " ").replace("'", " ")
+    if dequoted != command:
+        yield dequoted
+
+
+def _lex_command(command: str):
+    """Lex a command into parts, or None if it cannot be lexed."""
+    try:
+        lexer = shlex.shlex(command, posix=sys.platform != "win32",
+                            punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     if _is_unrecoverable_command(command):
         return True
@@ -636,14 +753,19 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
         return True
     if _shell_targets_credential_path(command):
         return True
-    try:
-        lexer = shlex.shlex(command, posix=sys.platform != "win32",
-                            punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        parts = list(lexer)
-    except ValueError:
-        return False
+    if _command_parser_limit_exceeded(command):
+        return True
+    # Run the lexer-based analysis on the first variant that parses. If none do,
+    # refuse: previously this returned False and skipped every check below.
+    parts = None
+    for variant in _command_detection_variants(command):
+        parts = _lex_command(variant)
+        if parts is not None:
+            if variant != command and _hard_blocked_shell(variant, _depth + 1):
+                return True
+            break
+    if parts is None:
+        return True
     separators = {";", "&&", "||", "&", "|"}
     if _depth < 8:
         substitutions = re.findall(r"\$\(([^()]*)\)|`([^`]*)`", command)
@@ -2549,6 +2671,8 @@ def _windows_task_script(identifier: str, task: str) -> Path:
     content = (
         "$ErrorActionPreference = 'Stop'\n"
         f"Set-Location -LiteralPath '{cwd}'\n"
+        # No operator is present for a scheduled run — see cron_mode.
+        "$env:AGENT8088_UNATTENDED = '1'\n"
         f"$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{prompt}'))\n"
         f"$prompt | & '{agent}'\n"
     )
@@ -2694,7 +2818,11 @@ def _exec_cron(args: dict) -> str:
 
     if action == "add":
         agent = shutil.which("agent8088") or "agent8088"
+        # AGENT8088_UNATTENDED tells the engine there is no operator to answer an
+        # approval prompt, so gated actions resolve from cron_mode instead of
+        # emitting an ESCALATION_REQUEST nobody will ever see.
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
+                 f"AGENT8088_UNATTENDED=1 "
                  f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
         current = read_crontab()
         payload = current + ("" if not current or current.endswith("\n") else "\n") + entry + "\n"
@@ -2918,14 +3046,31 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             if sandbox_missing else
             f"Tool '{name}' requires {mode} access, which is blocked in readonly mode."
         )
-        _audit("escalation_requested", tool=name, mode=mode, decision="blocked",
-               detail=paths_str, change_type=change_type)
-        return request_escalation(
-            target_mode="edit",
-            paths=[paths_str],
-            change_type=change_type,
-            reason=reason,
-        )
+        # Unattended run: there is no operator to answer the prompt, so an
+        # ESCALATION_REQUEST would just sit there until the turn dies. Resolve it
+        # from policy instead of pretending someone is watching.
+        if UNATTENDED:
+            if CRON_MODE == "deny":
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=paths_str, reason="unattended_deny")
+                return (
+                    f"Error: '{name}' needs approval, but this is an unattended run "
+                    f"with no one to ask, so it was refused. Report this to the user "
+                    f"in your answer. (cron_mode=deny; set cron_mode=approve in "
+                    f"config.txt to let scheduled runs proceed past this gate — the "
+                    f"always-on floor still applies either way.)"
+                )
+            _audit("tool_call", tool=name, mode=mode, decision="allowed",
+                   detail=paths_str, reason="unattended_approve")
+        else:
+            _audit("escalation_requested", tool=name, mode=mode, decision="blocked",
+                   detail=paths_str, change_type=change_type)
+            return request_escalation(
+                target_mode="edit",
+                paths=[paths_str],
+                change_type=change_type,
+                reason=reason,
+            )
 
     # Past every gate: this call is going to run. Recorded here rather than at
     # each execution branch so no mode can be added later without an audit line.
@@ -3617,6 +3762,9 @@ def describe_capabilities() -> str:
     # --- Guardrails. Reporting what is OFF is as useful as what is on. ---
     lines += [
         "## Active guardrails",
+        f"- Unattended run: {'yes' if UNATTENDED else 'no'}"
+        + (f", cron_mode={CRON_MODE}" if UNATTENDED else ""),
+        f"- Denial circuit breaker: {_on_off(DENIAL_BREAKER_THRESHOLD, ' denials')}",
         f"- Turn token budget: {_on_off(MAX_TURN_TOKENS, ' tokens')}",
         f"- Turn wall-clock budget: {_on_off(MAX_TURN_SECONDS, 's')}",
         f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
@@ -3631,6 +3779,7 @@ def describe_capabilities() -> str:
         "",
         "## Always-on protections (no mode or approval disables these)",
         "- Unrecoverable commands refused (rm -rf /, mkfs, dd to a device, fork bombs, curl | sh)",
+        "- Commands too long or too quote-dense to analyse are refused, not skipped",
         "- Sensitive files refused for read and write (.env, SSH/GPG/AWS keys, *.pem)",
         "- Shell startup files refused for write (would execute code on next shell launch)",
         "- SSRF: requests to private, loopback, link-local, and cloud-metadata addresses refused",
@@ -3731,6 +3880,7 @@ def run_agent(messages, *, budget=None, **kwargs):
     # must not hand itself a fresh write budget, same reasoning as the token one.
     if previous is None:
         reset_turn_counters()
+        reset_approval_state()
     try:
         return _run_agent_loop(messages, budget=budget, **kwargs)
     finally:
@@ -3915,13 +4065,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             if blocked and on_escalation:
                 if on_escalation(name, result):
+                    note_approval()
                     messages.append({"role": "user", "content":
                         "Permission granted. Retry the EXACT same tool call that was blocked. "
                         "Do not ask for permission again. Do not explain. Just call the tool again now."})
-                else:
-                    messages.append({"role": "user", "content":
-                        "Permission denied by the user. You remain in readonly mode. "
-                        "Tell the user what you could not do and why the task cannot be completed."})
+                    continue
+                # Denied. The breaker stops a model that would otherwise re-propose
+                # the same blocked action until max_turns — which reads to the user
+                # as the agent ignoring them.
+                if note_denial():
+                    answer = _guard_answer(breaker_message())
+                    if on_answer:
+                        on_answer(answer)
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "denial_breaker",
+                                      "content": answer})
+                    return answer
+                messages.append({"role": "user", "content":
+                    "Permission denied by the user. You remain in readonly mode. "
+                    "Tell the user what you could not do and why the task cannot be completed."})
                 continue
 
             if turn_tools is not None:
