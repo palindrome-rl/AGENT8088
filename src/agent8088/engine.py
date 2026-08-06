@@ -2705,6 +2705,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         except ValueError as exc:
             return f"Error: {exc}"
         if _is_sensitive_path(str(read_target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(read_target), reason="sensitive_path")
             return f"Error: Access to sensitive file denied: {read_target}"
 
     # --- Layer 2: Network access control ---
@@ -2715,20 +2717,29 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return placeholder_error
         blocked = _egress_check(url) or _ssrf_check(url)
         if blocked:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=url[:200], reason="egress_policy")
             return blocked
         # Hard floor, checked before the permission gate: a credential in an
         # outbound URL or body is never legitimate, so it is not escalatable.
         leak = (_outbound_secret_check(url)
                 or _outbound_secret_check(json.dumps(args, default=str)))
         if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=url[:200], reason="outbound_secret")
             return leak
         if not check_permission(mode, url):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=url[:200],
+                   change_type="network_request")
             return request_escalation(
                 target_mode="edit",
                 paths=[url[:120]],
                 change_type="network_request",
                 reason=f"Tool '{name}' wants to make an HTTP request to: {url[:200]}",
             )
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=url[:200])
         return _exec_http(mode, spec, args, timeout)
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
@@ -2755,14 +2766,20 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
         # overwritten even though reading it is denied.
         if _is_sensitive_path(str(target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="sensitive_path")
             return f"Error: Writing to sensitive file denied: {target}"
         # Writing a shell startup file is code execution on the next shell
         # launch. Refused unconditionally — no mode and no grant unlocks it.
         if _is_shell_startup_file(str(target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="shell_startup_file")
             return (f"Error: Writing to sensitive file denied: {target} "
                     f"(shell startup file — this would execute code on the next shell launch)")
         path_zone = _check_path_zone(target)
         if path_zone == "blocked":
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="blocked_path")
             return f"Error: Write path is blocked: {target}"
     elif mode == "cron":
         command = str(args.get("action") or "list").strip().lower()
@@ -2772,9 +2789,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return "Error: browser tool requires 'url'."
         blocked = _egress_check(command) or _ssrf_check(command)
         if blocked:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="egress_policy")
             return blocked
         leak = _outbound_secret_check(command)
         if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="outbound_secret")
             return leak
     elif mode == "mcp":
         command = f"{spec['mcp_server']}:{spec['mcp_tool']}"
@@ -2791,6 +2812,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         _remote_git_grant = False
 
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
+        _audit("tool_call", tool=name, mode=mode, decision="denied",
+               detail=command[:200], reason="hard_blocked_shell")
         return "Error: This git operation is forbidden by Agent8088's safety policy."
 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
@@ -2830,12 +2853,20 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             if sandbox_missing else
             f"Tool '{name}' requires {mode} access, which is blocked in readonly mode."
         )
+        _audit("escalation_requested", tool=name, mode=mode, decision="blocked",
+               detail=paths_str, change_type=change_type)
         return request_escalation(
             target_mode="edit",
             paths=[paths_str],
             change_type=change_type,
             reason=reason,
         )
+
+    # Past every gate: this call is going to run. Recorded here rather than at
+    # each execution branch so no mode can be added later without an audit line.
+    if mode in ("write_text", "shell", "docker", "cron", "browser", "mcp"):
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=str(target) if mode == "write_text" else command[:200])
 
     if mode == "last_output":
         if not _last_tool_output:
@@ -3205,6 +3236,47 @@ def _outbound_secret_check(payload):
                     "configuration. Sending secrets to an external service is never "
                     "permitted, in any permission mode.")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Append-only audit trail
+# ---------------------------------------------------------------------------
+# _log goes to a logger with no configured sink; this is the durable record of
+# what the agent was permitted to do. Off by default (a single-user CLI does not
+# need it); turn it on for any gateway deployment.
+AUDIT_ENABLED = APP_CONFIG.get("audit_log", "0") == "1"
+AUDIT_LOG_PATH = Path(APP_CONFIG.get(
+    "audit_log_path", str(_agent_data_dir() / "audit.jsonl"))).expanduser()
+AUDIT_MAX_DETAIL = int(APP_CONFIG.get("audit_max_detail", "512"))
+
+
+def _audit(event: str, **fields) -> None:
+    """Append one redacted JSON line to the audit log.
+
+    Never raises: this is a record, not a gate, so a broken or unwritable sink
+    must not break the agent turn. Every field value is passed through
+    _redact_secrets, so a blocked exfiltration attempt is recorded without
+    writing the credential to disk.
+    """
+    if not AUDIT_ENABLED:
+        return
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "permission_mode": PERMISSION_MODE,
+        }
+        for key, value in fields.items():
+            text = _redact_secrets(str(value))
+            entry[key] = text[:AUDIT_MAX_DETAIL] if key == "detail" else text
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existed = AUDIT_LOG_PATH.exists()
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+        if not existed:
+            _protect_private_file(AUDIT_LOG_PATH)
+    except Exception as exc:  # noqa: BLE001 — audit must never break a turn
+        _log.debug("audit write failed: %s", exc)
 
 
 _MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
