@@ -467,10 +467,16 @@ def _smart_approves(name: str, mode: str, detail: str) -> bool:
     request = _wrap_untrusted(
         f"tool: {name}\nmode: {mode}\naction: {detail}", "agent tool call")
     try:
-        response = _create_completion_with_fallback(
-            [{"role": "user", "content": request}], [],
-            temperature=0.0, system_prompt=system,
-            model_name=SMART_APPROVAL_MODEL or "",
+        # create_completion, not _create_completion_with_fallback: the fallback
+        # wrapper is bound to the conversation's model/trace/streaming context,
+        # and the guardian is a separate one-shot call that may run on its own
+        # model. `provider:model` in smart_approval_model selects a provider too.
+        provider, _, override = (SMART_APPROVAL_MODEL or "").rpartition(":")
+        client, active_model = get_client(provider or None)
+        response = create_completion(
+            client, [{"role": "user", "content": request}], [],
+            max_tokens=64, system_prompt=system, temperature=0.0,
+            model_name=override or active_model,
         )
         verdict = response.choices[0].message.content or ""
     except Exception as exc:  # noqa: BLE001 — any guardian failure means "ask the human"

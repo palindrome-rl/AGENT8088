@@ -23,12 +23,23 @@ def smart(engine, monkeypatch):
 
 
 def _verdict(engine, monkeypatch, text):
-    """Stub the guardian's model call with a fixed reply."""
+    """Stub the guardian's model call with a fixed reply.
+
+    Deliberately stubs with `create_autospec`, which enforces the REAL signature
+    of `create_completion`. An earlier version of this fixture used a permissive
+    `**kw` stub, and every test passed while the guardian was calling a function
+    that did not accept its arguments — `smart` mode threw TypeError on every
+    call and silently degraded to `manual`. A stub that accepts anything cannot
+    catch that; one bound to the real signature does.
+    """
+    from unittest.mock import create_autospec
+
     seen = {}
 
-    def _fake(messages, tools, **kw):
+    def _side_effect(client, messages, tools, **kw):
         seen["messages"] = messages
         seen["system"] = kw.get("system_prompt", "")
+        seen["model_name"] = kw.get("model_name", "")
         return type("R", (), {
             "usage": None,
             "choices": [type("C", (), {
@@ -37,8 +48,69 @@ def _verdict(engine, monkeypatch, text):
             })()],
         })()
 
-    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    stub = create_autospec(engine.create_completion, side_effect=_side_effect)
+    monkeypatch.setattr(engine, "create_completion", stub)
+    monkeypatch.setattr(engine, "get_client", lambda provider=None: (object(), "stub-model"))
+    seen["stub"] = stub
     return seen
+
+
+def test_guardian_calls_the_model_api_correctly(engine, monkeypatch):
+    """Regression: the guardian used to call a function that rejected its args.
+
+    Binds the guardian's real call against the real signature, so a future
+    signature change here fails loudly instead of degrading to manual.
+    """
+    import inspect
+
+    monkeypatch.setattr(engine, "APPROVAL_MODE", "smart")
+    seen = _verdict(engine, monkeypatch, "APPROVE")
+    assert engine._smart_approves("execute_shell", "shell", "mkdir build") is True
+    assert seen["stub"].called
+    # The recorded call must be valid against the genuine signature.
+    call = seen["stub"].call_args
+    inspect.signature(engine.create_completion).bind(*call.args, **call.kwargs)
+
+
+def test_guardian_does_not_swallow_a_real_call_error_silently(engine, monkeypatch, caplog):
+    """A broken guardian must be visible in the log, not just quietly escalate."""
+    import logging
+
+    monkeypatch.setattr(engine, "APPROVAL_MODE", "smart")
+
+    def _boom(*a, **kw):
+        raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr(engine, "create_completion", _boom)
+    monkeypatch.setattr(engine, "get_client", lambda provider=None: (object(), "m"))
+    with caplog.at_level(logging.WARNING):
+        assert engine._smart_approves("execute_shell", "shell", "x") is False
+    assert any("smart approval unavailable" in r.message for r in caplog.records)
+
+
+def test_smart_approval_model_selects_provider_and_model(engine, monkeypatch):
+    monkeypatch.setattr(engine, "APPROVAL_MODE", "smart")
+    monkeypatch.setattr(engine, "SMART_APPROVAL_MODEL", "cerebras:gpt-oss-120b")
+    picked = {}
+    monkeypatch.setattr(engine, "get_client",
+                        lambda provider=None: (picked.setdefault("provider", provider), "active"))
+    from unittest.mock import create_autospec
+    stub = create_autospec(engine.create_completion, side_effect=lambda *a, **kw: type(
+        "R", (), {"usage": None, "choices": [type("C", (), {
+            "message": type("M", (), {"content": "APPROVE"})(),
+            "finish_reason": "stop"})()]})())
+    monkeypatch.setattr(engine, "create_completion", stub)
+    engine._smart_approves("execute_shell", "shell", "x")
+    assert picked["provider"] == "cerebras"
+    assert stub.call_args.kwargs["model_name"] == "gpt-oss-120b"
+
+
+def test_bare_smart_approval_model_uses_the_active_provider(engine, monkeypatch):
+    monkeypatch.setattr(engine, "APPROVAL_MODE", "smart")
+    monkeypatch.setattr(engine, "SMART_APPROVAL_MODEL", "")
+    seen = _verdict(engine, monkeypatch, "APPROVE")
+    engine._smart_approves("execute_shell", "shell", "x")
+    assert seen["model_name"] == "stub-model"
 
 
 # --- The verdict parser ----------------------------------------------------
