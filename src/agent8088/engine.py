@@ -12,6 +12,7 @@ try:
 except ImportError:
     pass
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
@@ -266,6 +267,17 @@ MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
+
+# --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
+# max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
+# burn unbounded tokens and wall-clock inside a small number of rounds.
+MAX_TURN_SECONDS = int(APP_CONFIG.get("max_turn_seconds", "0"))
+MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
+# USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
+MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
+COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
+COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
+
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
@@ -317,6 +329,7 @@ _remote_git_grant = False
 _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
 _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
 _plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
+_active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -1876,6 +1889,9 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             spin=ui.get("spin"), on_calls=ui.get("on_calls"),
             on_tool=ui.get("on_tool"), on_result=ui.get("on_result"),
             on_escalation=ui.get("on_escalation"),
+            # Share the parent's ceiling. A fresh budget here would be a free
+            # bypass: delegate to a subagent and the limit starts over.
+            budget=_active_budget,
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
@@ -3297,13 +3313,101 @@ def _mask_system_content(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Turn budget — resource ceiling for one run_agent() call
+# ---------------------------------------------------------------------------
+class _TurnBudget:
+    """Resource ceiling for one run_agent() call.
+
+    max_turns bounds how many ROUNDS the loop takes; this bounds what those
+    rounds may consume. Any limit set to 0 is disabled, so the default config
+    behaves exactly as before.
+    """
+
+    def __init__(self, max_seconds=0, max_tokens=0, max_cost=0.0,
+                 cost_in=0.0, cost_out=0.0):
+        self.max_seconds = max_seconds
+        self.max_tokens = max_tokens
+        self.max_cost = max_cost
+        self.cost_in = cost_in
+        self.cost_out = cost_out
+        self.started = time.monotonic()
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def add_tokens(self, prompt: int, completion: int) -> None:
+        self.input_tokens += int(prompt or 0)
+        self.output_tokens += int(completion or 0)
+
+    def add_usage(self, response, text: str = "") -> None:
+        """Record one model call. Streaming responses come from _build_response
+        and carry no usage object — fall back to a chars/4 estimate so a
+        streaming session is still bounded, just less precisely."""
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.add_tokens(getattr(usage, "prompt_tokens", 0),
+                            getattr(usage, "completion_tokens", 0))
+            return
+        if text:
+            self.add_tokens(0, len(text) // 4)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    @property
+    def cost_usd(self) -> float:
+        return ((self.input_tokens / 1000.0) * self.cost_in
+                + (self.output_tokens / 1000.0) * self.cost_out)
+
+    def exceeded(self):
+        """Return a human-readable reason string, or None if within budget."""
+        if self.max_seconds:
+            elapsed = time.monotonic() - self.started
+            if elapsed > self.max_seconds:
+                return (f"Turn budget exceeded: {elapsed:.0f} seconds elapsed "
+                        f"(limit {self.max_seconds}). Raise max_turn_seconds in "
+                        f"config.txt or split the task into smaller requests.")
+        if self.max_tokens and self.total_tokens >= self.max_tokens:
+            return (f"Turn budget exceeded: {self.total_tokens} tokens used "
+                    f"(limit {self.max_tokens}). Raise max_turn_tokens in config.txt.")
+        if self.max_cost and self.cost_usd >= self.max_cost:
+            return (f"Turn budget exceeded: ${self.cost_usd:.4f} spent "
+                    f"(limit ${self.max_cost:.4f}). Raise max_turn_cost_usd in config.txt.")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
-def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
-              on_calls=None, on_tool=None, on_result=None, on_answer=None,
-              on_escalation=None,
-              on_token=None, interrupt_check=None, trace=None,
-              system_prompt=None, tools_def=None, allowed_tools=None, depth=0):
+def run_agent(messages, *, budget=None, **kwargs):
+    """Run one agent turn under a resource budget. See _run_agent_loop for the
+    full hook documentation — every keyword is forwarded to it unchanged.
+
+    This thin wrapper exists so `_active_budget` is published for the duration
+    of the turn (subagents and plan steps read it, since there is no way to
+    thread a parameter through run_tool) and is always restored afterwards,
+    including on an exception or an AgentInterrupted.
+    """
+    global _active_budget
+    if budget is None:
+        budget = _TurnBudget(
+            max_seconds=MAX_TURN_SECONDS, max_tokens=MAX_TURN_TOKENS,
+            max_cost=MAX_TURN_COST_USD,
+            cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
+        )
+    previous, _active_budget = _active_budget, budget
+    try:
+        return _run_agent_loop(messages, budget=budget, **kwargs)
+    finally:
+        _active_budget = previous
+
+
+def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
+                    on_calls=None, on_tool=None, on_result=None, on_answer=None,
+                    on_escalation=None,
+                    on_token=None, interrupt_check=None, trace=None,
+                    system_prompt=None, tools_def=None, allowed_tools=None,
+                    depth=0, budget=None):
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -3339,6 +3443,19 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     for turn in range(max_turns):
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
+        # Resource ceiling. Checked before the model call so an exhausted budget
+        # costs nothing, and the partial result is returned rather than discarded.
+        over = budget.exceeded() if budget else None
+        if over:
+            _log.warning("turn budget hit at turn %d: %s", turn, over)
+            answer = _guard_answer(
+                f"{over}\n\nPartial result so far:\n"
+                f"{_last_tool_output[:1000] if _last_tool_output else '(none)'}")
+            if on_answer:
+                on_answer(answer)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
+            return answer
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
@@ -3361,6 +3478,8 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         # context window (the usual cause of the "loops in the reasoning block" crash)
         # and out of the user-facing answer.
         message = response.choices[0].message
+        if budget:
+            budget.add_usage(response, text=(message.content or ""))
         content = _strip_reasoning(message.content or "")
         native_text = _native_tool_text(message)
         if native_text:
