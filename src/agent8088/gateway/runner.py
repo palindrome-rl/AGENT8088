@@ -17,6 +17,7 @@ SLASH_COMMANDS = {
     "/new": "Clear the current session",
     "/stop": "Interrupt the running turn (queued messages cancel)",
     "/help": "Show available commands",
+    "/capabilities": "Show tools, MCP servers, skills, limits, and active guardrails",
     "/approve": "Approve a pending action (once/session)",
     "/deny": "Deny a pending action",
 }
@@ -250,6 +251,10 @@ class GatewayRunner:
             lines = [f"{c} - {desc}" for c, desc in SLASH_COMMANDS.items()]
             if adapter:
                 await adapter.send_message(event.chat_id, "\n".join(lines))
+            return True
+        if cmd == "/capabilities":
+            if adapter:
+                await adapter.send_message(event.chat_id, A.describe_capabilities())
             return True
         if cmd == "/stop":
             key = build_session_key(event.platform, event.chat_type, event.chat_id, event.thread_id)

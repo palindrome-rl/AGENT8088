@@ -736,7 +736,7 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     if PERMISSION_MODE == "plan-only":
         if mode == "plan":
             return True
-        if mode in ("read_text", "last_output", "python_eval"):
+        if mode in ("read_text", "last_output", "python_eval", "introspect"):
             return True
         if mode == "shell" and _readonly_shell(command):
             return True
@@ -746,7 +746,10 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     if mode == "write_text" and path_zone == "no_prompt":
         return True
     # readonly mode
-    if mode in ("read_text", "last_output", "python_eval", "plan"):
+    # `introspect` reports the agent's own tool list and limits — no filesystem,
+    # network, or process access, so it is safe in every mode. An agent that
+    # cannot say what it can do is worse than useless in the restrictive modes.
+    if mode in ("read_text", "last_output", "python_eval", "plan", "introspect"):
         return True
     if mode == "cron" and command == "list":
         return True
@@ -2930,6 +2933,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=str(target) if mode == "write_text" else command[:200])
 
+    if mode == "introspect":
+        return describe_capabilities()
+
     if mode == "last_output":
         if not _last_tool_output:
             return "No tool has been run yet."
@@ -3382,9 +3388,16 @@ def _guard_answer(answer: str) -> str:
 
 # Requests that target the agent's own internals — refused instantly (no model
 # round-trip) rather than looping for 3k tokens before arriving at the same refusal.
+# `config`/`configuration` is deliberately NOT in this list. "what is your
+# configuration?" is an ordinary capability question, and refusing it made the
+# agent unable to describe itself — a worse outcome than the disclosure the
+# pattern was guarding, since the actual secrets are covered by
+# _is_sensitive_path, _redact_secrets, and _is_system_leak regardless. Asking
+# for config.txt by name is still refused; asking what the setup IS now routes
+# to describe_capabilities.
 _PROTECTED_TARGET_RE = re.compile(
-    r'\b(system\.md|config\.txt|system\s*(prompt|instructions|message)|'
-    r'your\s+(system\s*)?(prompt|instructions|rules|config|configuration|guidelines)|'
+    r'\b(system\.md|config\.txt|configb\.txt|system\s*(prompt|instructions|message)|'
+    r'your\s+(system\s*)?(prompt|instructions|rules|guidelines)|'
     r'initial\s+prompt|developer\s+(prompt|message)|the\s+prompt\s+you\s+were\s+given)\b',
     re.IGNORECASE)
 
@@ -3533,6 +3546,101 @@ def _mask_system_content(text: str) -> str:
         if fp in text:
             text = text.replace(fp, "[internal instructions hidden]")
     return text
+
+
+# ---------------------------------------------------------------------------
+# Capability self-introspection
+# ---------------------------------------------------------------------------
+def _on_off(value, unit: str = "") -> str:
+    """Render a 0-means-disabled limit for the capability report."""
+    if not value:
+        return "not set"
+    return f"{value}{unit}"
+
+
+def describe_capabilities() -> str:
+    """Human-readable report of what this agent can actually do right now.
+
+    Built from live state — TOOL_SPECS, MCP_RUNTIME.statuses, the permission
+    mode, the resolved sandbox backend — so it cannot drift from reality the way
+    a hand-maintained list in the system prompt would.
+
+    Exposed as the `describe_capabilities` tool so the model can answer "what
+    tools / MCP servers / features do you have?" from fact instead of guessing,
+    and as `/capabilities` in the CLI. Passed through _redact_secrets because it
+    reads config, and deliberately reports no prompt text — this is a capability
+    channel, not a system-prompt disclosure channel.
+    """
+    lines = ["# Agent8088 capabilities", ""]
+
+    lines += [f"Model: {MODEL_NAME}",
+              f"Permission mode: {PERMISSION_MODE}",
+              f"Sandbox backend: {_resolve_sandbox_backend()}",
+              f"Max turns per request: {APP_CONFIG.get('max_turns', '10')}",
+              ""]
+
+    # --- Tools, grouped by what kind of access they need ---
+    by_mode = {}
+    for tool_name, spec in sorted(TOOL_SPECS.items()):
+        by_mode.setdefault((spec.get("mode") or "other").lower(), []).append(
+            (tool_name, spec.get("description") or default_tool_description(tool_name)))
+    lines.append(f"## Tools ({len(TOOL_SPECS)})")
+    for mode in sorted(by_mode):
+        lines.append(f"\n### {mode}")
+        for tool_name, description in by_mode[mode]:
+            lines.append(f"- {tool_name}: {description}")
+    lines.append("")
+
+    # --- MCP servers ---
+    statuses = getattr(MCP_RUNTIME, "statuses", {}) or {}
+    lines.append("## MCP servers")
+    if not statuses:
+        lines.append("- none configured")
+    else:
+        for server, info in sorted(statuses.items()):
+            state = info.get("state", "unknown")
+            tools = info.get("tools") or []
+            detail = f" — {info['error']}" if info.get("error") else ""
+            lines.append(f"- {server}: {state}, {len(tools)} tool(s){detail}")
+            for mcp_tool in tools:
+                lines.append(f"    - {mcp_tool}")
+    lines.append("")
+
+    # --- Skills and subagents ---
+    lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
+    lines += [f"- {s}" for s in sorted(SKILL_PACKAGES)] or ["- none installed"]
+    lines.append("")
+    lines.append(f"## Subagents ({len(SUBAGENT_SPECS)})")
+    lines += [f"- {a}" for a in sorted(SUBAGENT_SPECS)] or ["- none configured"]
+    lines.append("")
+
+    # --- Guardrails. Reporting what is OFF is as useful as what is on. ---
+    lines += [
+        "## Active guardrails",
+        f"- Turn token budget: {_on_off(MAX_TURN_TOKENS, ' tokens')}",
+        f"- Turn wall-clock budget: {_on_off(MAX_TURN_SECONDS, 's')}",
+        f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
+        f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
+        f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
+        f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
+        f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
+        f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
+        f"- Shell denylist: {', '.join(_USER_DENY_GLOBS) or 'not set'}",
+        f"- Audit log: {'on — ' + str(AUDIT_LOG_PATH) if AUDIT_ENABLED else 'off'}",
+        f"- Subagent max depth: {SUBAGENT_MAX_DEPTH}",
+        "",
+        "## Always-on protections (no mode or approval disables these)",
+        "- Unrecoverable commands refused (rm -rf /, mkfs, dd to a device, fork bombs, curl | sh)",
+        "- Sensitive files refused for read and write (.env, SSH/GPG/AWS keys, *.pem)",
+        "- Shell startup files refused for write (would execute code on next shell launch)",
+        "- SSRF: requests to private, loopback, link-local, and cloud-metadata addresses refused",
+        "- Outbound requests carrying a configured credential refused",
+        "- Secrets redacted from all tool output and answers",
+        "- System prompt never disclosed",
+        "- External page and MCP content wrapped as untrusted, chat-template tokens stripped",
+    ]
+
+    return _redact_secrets("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

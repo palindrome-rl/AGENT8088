@@ -137,7 +137,10 @@ def test_create_mcp_server_http_configures_endpoint():
 # approval prompt (there is no approval channel over MCP). Writes are now
 # opt-in; the default surface is non-mutating.
 
-SAFE_MODES = {"read_text", "python_eval", "http_get", "http_post", "last_output"}
+# `introspect` reads only Agent8088's own in-memory tool/limit tables — no
+# filesystem, no network, no process — and its output is redacted like any other.
+SAFE_MODES = {"read_text", "python_eval", "http_get", "http_post", "last_output",
+              "introspect"}
 
 
 def test_write_file_not_exposed_by_default():

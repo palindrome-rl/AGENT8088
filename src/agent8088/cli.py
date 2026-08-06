@@ -881,6 +881,7 @@ def cmd_help(_):
     rows = [
         ("<text>", "Chat — run the full agent loop on your message"),
         ("/tools", "List every tool with its args, mode, and description"),
+        ("/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails"),
         ("/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)"),
         ("/agents", "List available sub-agent profiles"),
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
@@ -935,6 +936,17 @@ def cmd_tools(_):
         args = ", ".join(spec.get("args") or []) or "—"
         t.add_row(name, args, spec.get("mode", "?"), spec.get("description", ""))
     console.print(t)
+
+
+def cmd_capabilities(_):
+    """Print the same self-report the agent gets from describe_capabilities.
+
+    /tools, /skills, /mcp and /status each show one slice; this is the whole
+    picture in one place — tools, MCP servers, skills, subagents, limits, and
+    which guardrails are active. Same source as the tool, so the human and the
+    model always see the same answer.
+    """
+    console.print(A.describe_capabilities())
 
 
 def cmd_mcp(rest):
@@ -1875,6 +1887,7 @@ def _configure_custom_models_endpoint():
 
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
+    "capabilities": cmd_capabilities,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config, "system": cmd_system,
