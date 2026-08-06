@@ -1174,7 +1174,7 @@ def build_image_message(text: str, images: list) -> dict:
     for ref in images or []:
         ref = str(ref).strip()
         if ref.startswith(("http://", "https://")):
-            blocked = _ssrf_check(ref)
+            blocked = _egress_check(ref) or _ssrf_check(ref)
             if blocked:
                 raise ValueError(blocked)
             parts.append({"type": "image_url", "image_url": {"url": ref}})
@@ -1960,7 +1960,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     placeholder_error = _http_placeholder_error(spec, url)
     if placeholder_error:
         return placeholder_error
-    blocked = _ssrf_check(url)
+    blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
 
@@ -1986,7 +1986,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 
     class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, response_headers, new_url):
-            redirect_blocked = _ssrf_check(new_url)
+            redirect_blocked = _egress_check(new_url) or _ssrf_check(new_url)
             if redirect_blocked:
                 raise urllib.error.URLError(redirect_blocked)
             return super().redirect_request(
@@ -2048,7 +2048,7 @@ def _exec_browser(args: dict) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
-    blocked = _ssrf_check(url)
+    blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
     if not _playwright_available():
@@ -2069,7 +2069,7 @@ def _exec_browser(args: dict) -> str:
                     if request_url.startswith(("data:", "blob:", "about:")):
                         route.continue_()
                         return
-                    reason = _ssrf_check(request_url)
+                    reason = _egress_check(request_url) or _ssrf_check(request_url)
                     if reason:
                         blocked_requests.append(reason)
                         route.abort()
@@ -2713,7 +2713,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         placeholder_error = _http_placeholder_error(spec, url)
         if placeholder_error:
             return placeholder_error
-        blocked = _ssrf_check(url)
+        blocked = _egress_check(url) or _ssrf_check(url)
         if blocked:
             return blocked
         if not check_permission(mode, url):
@@ -2764,7 +2764,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         command = str(args.get("url") or "").strip()
         if not command:
             return "Error: browser tool requires 'url'."
-        blocked = _ssrf_check(command)
+        blocked = _egress_check(command) or _ssrf_check(command)
         if blocked:
             return blocked
     elif mode == "mcp":
@@ -3247,6 +3247,17 @@ SSRF_ALLOW_HOSTS = {h.strip().lower()
                     for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
                     if h.strip()}
 
+# --- Egress domain policy ---
+# _ssrf_check blocks INTERNAL addresses; this bounds which PUBLIC hosts the
+# agent may reach. Empty allowlist = allow all (unchanged default). The
+# blocklist is always enforced, allowlist or not.
+EGRESS_ALLOWED_DOMAINS = [d.strip().lower()
+                          for d in APP_CONFIG.get("allowed_domains", "").split(",")
+                          if d.strip()]
+EGRESS_BLOCKED_DOMAINS = [d.strip().lower()
+                          for d in APP_CONFIG.get("blocked_domains", "").split(",")
+                          if d.strip()]
+
 
 def _ssrf_check(url: str):
     """Return None if the URL is safe to fetch, else an error string.
@@ -3296,6 +3307,48 @@ def _ssrf_check(url: str):
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             return (f"Blocked: '{host}' resolves to internal address {ip}. "
                     "Requests to private/loopback/link-local networks are not allowed.")
+    return None
+
+
+def _host_matches(host: str, domain: str) -> bool:
+    """True if host is `domain` or a subdomain of it.
+
+    Suffix comparison must be dot-anchored: `evilpastebin.com` is not a
+    subdomain of `pastebin.com`, and a plain endswith() would say it is.
+    """
+    return host == domain or host.endswith("." + domain)
+
+
+def _egress_check(url: str):
+    """Return None if the URL's host is permitted by the egress policy, else
+    an error string. Runs alongside _ssrf_check, which handles internal
+    addresses — this one bounds which PUBLIC hosts are reachable.
+
+    blocked_domains=host,...   never reachable (checked first, wins over allow)
+    allowed_domains=host,...   if non-empty, ONLY these hosts are reachable
+
+    Deliberately ordered BEFORE _ssrf_check at every call site: this is a pure
+    string check, while _ssrf_check calls getaddrinfo. Resolving a host the
+    policy already rejects would leak the attempt to that domain's nameserver —
+    an outbound signal from a request that never should have started.
+    """
+    if not EGRESS_ALLOWED_DOMAINS and not EGRESS_BLOCKED_DOMAINS:
+        return None
+    import urllib.parse
+    try:
+        host = (urllib.parse.urlparse((url or "").strip()).hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return "Blocked: malformed URL — egress policy requires a resolvable host."
+    for domain in EGRESS_BLOCKED_DOMAINS:
+        if _host_matches(host, domain):
+            return (f"Blocked: '{host}' matches blocked_domains entry '{domain}'. "
+                    "Remove it from blocked_domains in config.txt to allow this.")
+    if EGRESS_ALLOWED_DOMAINS:
+        if not any(_host_matches(host, d) for d in EGRESS_ALLOWED_DOMAINS):
+            return (f"Blocked: '{host}' is not in allowed_domains. "
+                    "Add it to allowed_domains in config.txt to allow this request.")
     return None
 
 
