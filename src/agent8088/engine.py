@@ -2716,6 +2716,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         blocked = _egress_check(url) or _ssrf_check(url)
         if blocked:
             return blocked
+        # Hard floor, checked before the permission gate: a credential in an
+        # outbound URL or body is never legitimate, so it is not escalatable.
+        leak = (_outbound_secret_check(url)
+                or _outbound_secret_check(json.dumps(args, default=str)))
+        if leak:
+            return leak
         if not check_permission(mode, url):
             return request_escalation(
                 target_mode="edit",
@@ -2767,6 +2773,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         blocked = _egress_check(command) or _ssrf_check(command)
         if blocked:
             return blocked
+        leak = _outbound_secret_check(command)
+        if leak:
+            return leak
     elif mode == "mcp":
         command = f"{spec['mcp_server']}:{spec['mcp_tool']}"
 
@@ -3170,6 +3179,32 @@ def _redact_secrets(text: str) -> str:
         if v in text:
             text = text.replace(v, "[redacted]")
     return text
+
+
+# Below this length a "secret" is too generic to match on without constant
+# false positives (a 4-char config value would flag half of all payloads).
+_MIN_EXFIL_SECRET_LEN = 12
+
+
+def _outbound_secret_check(payload):
+    """Return an error string if `payload` carries a known secret value, else None.
+
+    _redact_secrets protects what comes BACK from a tool. This protects what
+    goes OUT: an http_post body, a browser URL. This is a hard refusal — a
+    secret in an outbound payload is never legitimate, so there is no
+    escalation path and no permission mode unlocks it, not even full-auto.
+
+    The reason string deliberately does not quote the matched value.
+    """
+    if not payload:
+        return None
+    text = str(payload)
+    for value in _SECRET_VALUES:
+        if len(value) >= _MIN_EXFIL_SECRET_LEN and value in text:
+            return ("Error: Blocked — this request contains a credential from your "
+                    "configuration. Sending secrets to an external service is never "
+                    "permitted, in any permission mode.")
+    return None
 
 
 _MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
