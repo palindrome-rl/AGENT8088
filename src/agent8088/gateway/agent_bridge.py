@@ -1,4 +1,5 @@
 from agent8088 import engine as A
+from agent8088.engine import _strip_special_tokens
 from agent8088.gateway.session import SessionStore
 
 
@@ -28,7 +29,21 @@ def run_turn(session_key: str, user_text: str, session_store: SessionStore,
     agent thread) and should block until the user responds.
     """
     messages = session_store.load(session_key)
-    messages.append({"role": "user", "content": user_text})
+    # Inbound platform text is sanitized before it ever reaches the model. A
+    # message containing `<|im_start|>system` is tokenized as a real role
+    # boundary by self-hosted ChatML/Llama chat templates, so a plain WhatsApp
+    # or Slack message could forge a system turn and grant itself a new
+    # permission mode. The engine already strips these from fetched pages and
+    # MCP responses; gateway text was the one untreated path in.
+    #
+    # Deliberately NOT _wrap_untrusted: the sender is allowlisted and is the
+    # principal here, so demoting their whole message to "data, never
+    # instructions" would stop the gateway from doing anything at all. Sanitize
+    # the structure, keep the authority.
+    #
+    # Imported directly rather than reached through `A` so that patching the
+    # engine module in a test cannot silently disable the sanitizer.
+    messages.append({"role": "user", "content": _strip_special_tokens(user_text)})
 
     answer = A.run_agent(
         messages,

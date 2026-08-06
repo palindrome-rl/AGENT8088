@@ -283,6 +283,7 @@ expected_tools = {
     "execute_shell": "shell", "write_file": "write_text", "read_text": "read_text",
     "web_search": "http_get", "get_page_title": "http_get", "calculate": "python_eval",
     "last_output": "last_output", "spawn_subagent": "subagent",
+    "describe_capabilities": "introspect",
     "execute_plan": "plan",
     "git_status": "shell", "git_diff": "shell", "git_log": "shell",
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",

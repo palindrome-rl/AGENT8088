@@ -114,7 +114,7 @@ Client config:
 
 ### What's exposed
 
-Read-only by default — 7 tools:
+Read-only by default — 8 tools:
 
 | Tool | |
 |---|---|
@@ -125,6 +125,13 @@ Read-only by default — 7 tools:
 | `web_search_exa` | Exa semantic search |
 | `get_page_title` | fetch a page title |
 | `last_output` | previous tool output |
+| `describe_capabilities` | what this server can do, and its active limits and guardrails |
+
+`describe_capabilities` lets a host agent ask what this server actually offers
+instead of hardcoding assumptions about it. It reads only Agent8088's own
+in-memory tool and limit tables — no file, socket, or process — and its output is
+redacted like any other result. A test enforces that every tool in the default
+surface has a non-mutating mode, so adding one here has to be justified.
 
 Never exposed, in any configuration: `execute_shell`, `run_sandboxed`, all
 mutating git tools, `schedule_task`, `browse_page`, `spawn_subagent`,

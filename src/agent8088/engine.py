@@ -12,6 +12,7 @@ try:
 except ImportError:
     pass
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
@@ -266,6 +267,26 @@ MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
+
+# --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
+# max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
+# burn unbounded tokens and wall-clock inside a small number of rounds.
+MAX_TURN_SECONDS = int(APP_CONFIG.get("max_turn_seconds", "0"))
+MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
+# USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
+MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
+COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
+COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
+
+# --- Write blast radius: bounds how much damage one turn can do ---
+# The permission layer decides WHETHER a write is allowed; these bound HOW MANY
+# and HOW BIG. A model looping on write_file inside an approved turn, or one
+# emitting a multi-megabyte file by mistake, is a plausible accident rather than
+# an attack — which is exactly why the permission gate does not catch it.
+# 0 disables either check.
+MAX_WRITES_PER_TURN = int(APP_CONFIG.get("max_writes_per_turn", "0"))
+MAX_WRITE_BYTES = int(APP_CONFIG.get("max_write_bytes", "0"))
+
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
@@ -317,6 +338,15 @@ _remote_git_grant = False
 _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
 _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
 _plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
+_active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
+_turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
+
+
+def reset_turn_counters() -> None:
+    """Clear the per-turn blast-radius counters. Called by run_agent at the start
+    of each turn; exposed so an embedder driving run_tool directly can reset too."""
+    global _turn_writes
+    _turn_writes = 0
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -486,6 +516,31 @@ def _matches_user_deny(command: str) -> bool:
     return any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_DENY_GLOBS)
 
 
+# --- User-defined allow rules (config: allow_commands) ---
+# The positive counterpart to deny_commands: a denylist only stops what you
+# thought of, an allowlist stops everything you did not. When non-empty, a shell
+# command must match one of these globs or it is refused at the hardline floor —
+# so it is not escalatable, the same as a deny rule. Empty (the default) means
+# no allowlist is in force and behaviour is unchanged.
+#
+# deny_commands still wins: a command on both lists is refused, because deny is
+# the more specific statement of intent. And neither list can re-enable the
+# unrecoverable floor (rm -rf /, mkfs, curl | sh) — allow_commands=* does not
+# unlock those.
+_USER_ALLOW_GLOBS = [
+    g.strip() for g in APP_CONFIG.get("allow_commands", "").split(",") if g.strip()
+]
+
+
+def _outside_user_allowlist(command: str) -> bool:
+    """True if an allowlist is in force and this command is not on it."""
+    if not _USER_ALLOW_GLOBS:
+        return False
+    import fnmatch
+    lowered = command.lower().strip()
+    return not any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_ALLOW_GLOBS)
+
+
 # --- Unrecoverable command floor (always-on, no override) ---
 # Catastrophic commands that are blocked in ALL permission modes, including
 # edit mode. These cause irreversible damage: filesystem wipes, disk formats,
@@ -572,6 +627,10 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     if _is_unrecoverable_command(command):
         return True
     if _matches_user_deny(command):
+        return True
+    # Checked after deny so deny_commands wins on a command listed in both, and
+    # after the unrecoverable floor so allow_commands=* cannot unlock rm -rf /.
+    if _outside_user_allowlist(command):
         return True
     if _git_read_targets_sensitive_file(command):
         return True
@@ -677,7 +736,7 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     if PERMISSION_MODE == "plan-only":
         if mode == "plan":
             return True
-        if mode in ("read_text", "last_output", "python_eval"):
+        if mode in ("read_text", "last_output", "python_eval", "introspect"):
             return True
         if mode == "shell" and _readonly_shell(command):
             return True
@@ -687,7 +746,10 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     if mode == "write_text" and path_zone == "no_prompt":
         return True
     # readonly mode
-    if mode in ("read_text", "last_output", "python_eval", "plan"):
+    # `introspect` reports the agent's own tool list and limits — no filesystem,
+    # network, or process access, so it is safe in every mode. An agent that
+    # cannot say what it can do is worse than useless in the restrictive modes.
+    if mode in ("read_text", "last_output", "python_eval", "plan", "introspect"):
         return True
     if mode == "cron" and command == "list":
         return True
@@ -1161,7 +1223,7 @@ def build_image_message(text: str, images: list) -> dict:
     for ref in images or []:
         ref = str(ref).strip()
         if ref.startswith(("http://", "https://")):
-            blocked = _ssrf_check(ref)
+            blocked = _egress_check(ref) or _ssrf_check(ref)
             if blocked:
                 raise ValueError(blocked)
             parts.append({"type": "image_url", "image_url": {"url": ref}})
@@ -1876,6 +1938,9 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             spin=ui.get("spin"), on_calls=ui.get("on_calls"),
             on_tool=ui.get("on_tool"), on_result=ui.get("on_result"),
             on_escalation=ui.get("on_escalation"),
+            # Share the parent's ceiling. A fresh budget here would be a free
+            # bypass: delegate to a subagent and the limit starts over.
+            budget=_active_budget,
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
@@ -1944,7 +2009,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     placeholder_error = _http_placeholder_error(spec, url)
     if placeholder_error:
         return placeholder_error
-    blocked = _ssrf_check(url)
+    blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
 
@@ -1970,7 +2035,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 
     class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, response_headers, new_url):
-            redirect_blocked = _ssrf_check(new_url)
+            redirect_blocked = _egress_check(new_url) or _ssrf_check(new_url)
             if redirect_blocked:
                 raise urllib.error.URLError(redirect_blocked)
             return super().redirect_request(
@@ -2032,7 +2097,7 @@ def _exec_browser(args: dict) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
-    blocked = _ssrf_check(url)
+    blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
     if not _playwright_available():
@@ -2053,7 +2118,7 @@ def _exec_browser(args: dict) -> str:
                     if request_url.startswith(("data:", "blob:", "about:")):
                         route.continue_()
                         return
-                    reason = _ssrf_check(request_url)
+                    reason = _egress_check(request_url) or _ssrf_check(request_url)
                     if reason:
                         blocked_requests.append(reason)
                         route.abort()
@@ -2659,7 +2724,7 @@ def _tool_path(spec: dict, args: dict) -> str:
 
 
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
-    global _remote_git_grant
+    global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
     if not spec:
         return f"Unknown tool: {name}"
@@ -2689,6 +2754,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         except ValueError as exc:
             return f"Error: {exc}"
         if _is_sensitive_path(str(read_target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(read_target), reason="sensitive_path")
             return f"Error: Access to sensitive file denied: {read_target}"
 
     # --- Layer 2: Network access control ---
@@ -2697,16 +2764,31 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         placeholder_error = _http_placeholder_error(spec, url)
         if placeholder_error:
             return placeholder_error
-        blocked = _ssrf_check(url)
+        blocked = _egress_check(url) or _ssrf_check(url)
         if blocked:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=url[:200], reason="egress_policy")
             return blocked
+        # Hard floor, checked before the permission gate: a credential in an
+        # outbound URL or body is never legitimate, so it is not escalatable.
+        leak = (_outbound_secret_check(url)
+                or _outbound_secret_check(json.dumps(args, default=str)))
+        if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=url[:200], reason="outbound_secret")
+            return leak
         if not check_permission(mode, url):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=url[:200],
+                   change_type="network_request")
             return request_escalation(
                 target_mode="edit",
                 paths=[url[:120]],
                 change_type="network_request",
                 reason=f"Tool '{name}' wants to make an HTTP request to: {url[:200]}",
             )
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=url[:200])
         return _exec_http(mode, spec, args, timeout)
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
@@ -2733,24 +2815,53 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
         # overwritten even though reading it is denied.
         if _is_sensitive_path(str(target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="sensitive_path")
             return f"Error: Writing to sensitive file denied: {target}"
         # Writing a shell startup file is code execution on the next shell
         # launch. Refused unconditionally — no mode and no grant unlocks it.
         if _is_shell_startup_file(str(target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="shell_startup_file")
             return (f"Error: Writing to sensitive file denied: {target} "
                     f"(shell startup file — this would execute code on the next shell launch)")
         path_zone = _check_path_zone(target)
         if path_zone == "blocked":
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="blocked_path")
             return f"Error: Write path is blocked: {target}"
+        # Blast radius. Checked here — before the permission gate — so an
+        # approved turn cannot be talked into writing 500 files, and so the
+        # refusal is not something the user can wave through by mistake.
+        if MAX_WRITES_PER_TURN and _turn_writes >= MAX_WRITES_PER_TURN:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="max_writes_per_turn")
+            return (f"Error: this turn has already written {_turn_writes} files, "
+                    f"the max_writes_per_turn limit. Stop writing and report what "
+                    f"you have done, or raise max_writes_per_turn in config.txt.")
+        write_size = len(str(args.get(spec.get("content_arg") or "content", "")))
+        if MAX_WRITE_BYTES and write_size > MAX_WRITE_BYTES:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="max_write_bytes")
+            return (f"Error: refusing to write {write_size} bytes to {target} — "
+                    f"over the max_write_bytes limit of {MAX_WRITE_BYTES}. Write a "
+                    f"smaller file or raise max_write_bytes in config.txt.")
     elif mode == "cron":
         command = str(args.get("action") or "list").strip().lower()
     elif mode == "browser":
         command = str(args.get("url") or "").strip()
         if not command:
             return "Error: browser tool requires 'url'."
-        blocked = _ssrf_check(command)
+        blocked = _egress_check(command) or _ssrf_check(command)
         if blocked:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="egress_policy")
             return blocked
+        leak = _outbound_secret_check(command)
+        if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="outbound_secret")
+            return leak
     elif mode == "mcp":
         command = f"{spec['mcp_server']}:{spec['mcp_tool']}"
 
@@ -2766,6 +2877,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         _remote_git_grant = False
 
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
+        _audit("tool_call", tool=name, mode=mode, decision="denied",
+               detail=command[:200], reason="hard_blocked_shell")
         return "Error: This git operation is forbidden by Agent8088's safety policy."
 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
@@ -2805,12 +2918,23 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             if sandbox_missing else
             f"Tool '{name}' requires {mode} access, which is blocked in readonly mode."
         )
+        _audit("escalation_requested", tool=name, mode=mode, decision="blocked",
+               detail=paths_str, change_type=change_type)
         return request_escalation(
             target_mode="edit",
             paths=[paths_str],
             change_type=change_type,
             reason=reason,
         )
+
+    # Past every gate: this call is going to run. Recorded here rather than at
+    # each execution branch so no mode can be added later without an audit line.
+    if mode in ("write_text", "shell", "docker", "cron", "browser", "mcp"):
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=str(target) if mode == "write_text" else command[:200])
+
+    if mode == "introspect":
+        return describe_capabilities()
 
     if mode == "last_output":
         if not _last_tool_output:
@@ -2845,6 +2969,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
         content = str(args.get(content_arg, ""))
+        _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             old_content = _read_text_limited(target) if target.exists() else ""
@@ -3156,6 +3281,73 @@ def _redact_secrets(text: str) -> str:
     return text
 
 
+# Below this length a "secret" is too generic to match on without constant
+# false positives (a 4-char config value would flag half of all payloads).
+_MIN_EXFIL_SECRET_LEN = 12
+
+
+def _outbound_secret_check(payload):
+    """Return an error string if `payload` carries a known secret value, else None.
+
+    _redact_secrets protects what comes BACK from a tool. This protects what
+    goes OUT: an http_post body, a browser URL. This is a hard refusal — a
+    secret in an outbound payload is never legitimate, so there is no
+    escalation path and no permission mode unlocks it, not even full-auto.
+
+    The reason string deliberately does not quote the matched value.
+    """
+    if not payload:
+        return None
+    text = str(payload)
+    for value in _SECRET_VALUES:
+        if len(value) >= _MIN_EXFIL_SECRET_LEN and value in text:
+            return ("Error: Blocked — this request contains a credential from your "
+                    "configuration. Sending secrets to an external service is never "
+                    "permitted, in any permission mode.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Append-only audit trail
+# ---------------------------------------------------------------------------
+# _log goes to a logger with no configured sink; this is the durable record of
+# what the agent was permitted to do. Off by default (a single-user CLI does not
+# need it); turn it on for any gateway deployment.
+AUDIT_ENABLED = APP_CONFIG.get("audit_log", "0") == "1"
+AUDIT_LOG_PATH = Path(APP_CONFIG.get(
+    "audit_log_path", str(_agent_data_dir() / "audit.jsonl"))).expanduser()
+AUDIT_MAX_DETAIL = int(APP_CONFIG.get("audit_max_detail", "512"))
+
+
+def _audit(event: str, **fields) -> None:
+    """Append one redacted JSON line to the audit log.
+
+    Never raises: this is a record, not a gate, so a broken or unwritable sink
+    must not break the agent turn. Every field value is passed through
+    _redact_secrets, so a blocked exfiltration attempt is recorded without
+    writing the credential to disk.
+    """
+    if not AUDIT_ENABLED:
+        return
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "permission_mode": PERMISSION_MODE,
+        }
+        for key, value in fields.items():
+            text = _redact_secrets(str(value))
+            entry[key] = text[:AUDIT_MAX_DETAIL] if key == "detail" else text
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        existed = AUDIT_LOG_PATH.exists()
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+        if not existed:
+            _protect_private_file(AUDIT_LOG_PATH)
+    except Exception as exc:  # noqa: BLE001 — audit must never break a turn
+        _log.debug("audit write failed: %s", exc)
+
+
 _MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
 
 
@@ -3196,9 +3388,16 @@ def _guard_answer(answer: str) -> str:
 
 # Requests that target the agent's own internals — refused instantly (no model
 # round-trip) rather than looping for 3k tokens before arriving at the same refusal.
+# `config`/`configuration` is deliberately NOT in this list. "what is your
+# configuration?" is an ordinary capability question, and refusing it made the
+# agent unable to describe itself — a worse outcome than the disclosure the
+# pattern was guarding, since the actual secrets are covered by
+# _is_sensitive_path, _redact_secrets, and _is_system_leak regardless. Asking
+# for config.txt by name is still refused; asking what the setup IS now routes
+# to describe_capabilities.
 _PROTECTED_TARGET_RE = re.compile(
-    r'\b(system\.md|config\.txt|system\s*(prompt|instructions|message)|'
-    r'your\s+(system\s*)?(prompt|instructions|rules|config|configuration|guidelines)|'
+    r'\b(system\.md|config\.txt|configb\.txt|system\s*(prompt|instructions|message)|'
+    r'your\s+(system\s*)?(prompt|instructions|rules|guidelines)|'
     r'initial\s+prompt|developer\s+(prompt|message)|the\s+prompt\s+you\s+were\s+given)\b',
     re.IGNORECASE)
 
@@ -3230,6 +3429,17 @@ SSRF_ALLOW_PRIVATE = APP_CONFIG.get("ssrf_allow_private", "0") == "1"
 SSRF_ALLOW_HOSTS = {h.strip().lower()
                     for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
                     if h.strip()}
+
+# --- Egress domain policy ---
+# _ssrf_check blocks INTERNAL addresses; this bounds which PUBLIC hosts the
+# agent may reach. Empty allowlist = allow all (unchanged default). The
+# blocklist is always enforced, allowlist or not.
+EGRESS_ALLOWED_DOMAINS = [d.strip().lower()
+                          for d in APP_CONFIG.get("allowed_domains", "").split(",")
+                          if d.strip()]
+EGRESS_BLOCKED_DOMAINS = [d.strip().lower()
+                          for d in APP_CONFIG.get("blocked_domains", "").split(",")
+                          if d.strip()]
 
 
 def _ssrf_check(url: str):
@@ -3283,6 +3493,48 @@ def _ssrf_check(url: str):
     return None
 
 
+def _host_matches(host: str, domain: str) -> bool:
+    """True if host is `domain` or a subdomain of it.
+
+    Suffix comparison must be dot-anchored: `evilpastebin.com` is not a
+    subdomain of `pastebin.com`, and a plain endswith() would say it is.
+    """
+    return host == domain or host.endswith("." + domain)
+
+
+def _egress_check(url: str):
+    """Return None if the URL's host is permitted by the egress policy, else
+    an error string. Runs alongside _ssrf_check, which handles internal
+    addresses — this one bounds which PUBLIC hosts are reachable.
+
+    blocked_domains=host,...   never reachable (checked first, wins over allow)
+    allowed_domains=host,...   if non-empty, ONLY these hosts are reachable
+
+    Deliberately ordered BEFORE _ssrf_check at every call site: this is a pure
+    string check, while _ssrf_check calls getaddrinfo. Resolving a host the
+    policy already rejects would leak the attempt to that domain's nameserver —
+    an outbound signal from a request that never should have started.
+    """
+    if not EGRESS_ALLOWED_DOMAINS and not EGRESS_BLOCKED_DOMAINS:
+        return None
+    import urllib.parse
+    try:
+        host = (urllib.parse.urlparse((url or "").strip()).hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return "Blocked: malformed URL — egress policy requires a resolvable host."
+    for domain in EGRESS_BLOCKED_DOMAINS:
+        if _host_matches(host, domain):
+            return (f"Blocked: '{host}' matches blocked_domains entry '{domain}'. "
+                    "Remove it from blocked_domains in config.txt to allow this.")
+    if EGRESS_ALLOWED_DOMAINS:
+        if not any(_host_matches(host, d) for d in EGRESS_ALLOWED_DOMAINS):
+            return (f"Blocked: '{host}' is not in allowed_domains. "
+                    "Add it to allowed_domains in config.txt to allow this request.")
+    return None
+
+
 def _mask_system_content(text: str) -> str:
     """Sanitize text that will be SHOWN to the user (e.g. a reasoning preview):
     redact secrets and blank out any verbatim system-prompt lines. Chain-of-thought
@@ -3297,13 +3549,200 @@ def _mask_system_content(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Capability self-introspection
+# ---------------------------------------------------------------------------
+def _on_off(value, unit: str = "") -> str:
+    """Render a 0-means-disabled limit for the capability report."""
+    if not value:
+        return "not set"
+    return f"{value}{unit}"
+
+
+def describe_capabilities() -> str:
+    """Human-readable report of what this agent can actually do right now.
+
+    Built from live state — TOOL_SPECS, MCP_RUNTIME.statuses, the permission
+    mode, the resolved sandbox backend — so it cannot drift from reality the way
+    a hand-maintained list in the system prompt would.
+
+    Exposed as the `describe_capabilities` tool so the model can answer "what
+    tools / MCP servers / features do you have?" from fact instead of guessing,
+    and as `/capabilities` in the CLI. Passed through _redact_secrets because it
+    reads config, and deliberately reports no prompt text — this is a capability
+    channel, not a system-prompt disclosure channel.
+    """
+    lines = ["# Agent8088 capabilities", ""]
+
+    lines += [f"Model: {MODEL_NAME}",
+              f"Permission mode: {PERMISSION_MODE}",
+              f"Sandbox backend: {_resolve_sandbox_backend()}",
+              f"Max turns per request: {APP_CONFIG.get('max_turns', '10')}",
+              ""]
+
+    # --- Tools, grouped by what kind of access they need ---
+    by_mode = {}
+    for tool_name, spec in sorted(TOOL_SPECS.items()):
+        by_mode.setdefault((spec.get("mode") or "other").lower(), []).append(
+            (tool_name, spec.get("description") or default_tool_description(tool_name)))
+    lines.append(f"## Tools ({len(TOOL_SPECS)})")
+    for mode in sorted(by_mode):
+        lines.append(f"\n### {mode}")
+        for tool_name, description in by_mode[mode]:
+            lines.append(f"- {tool_name}: {description}")
+    lines.append("")
+
+    # --- MCP servers ---
+    statuses = getattr(MCP_RUNTIME, "statuses", {}) or {}
+    lines.append("## MCP servers")
+    if not statuses:
+        lines.append("- none configured")
+    else:
+        for server, info in sorted(statuses.items()):
+            state = info.get("state", "unknown")
+            tools = info.get("tools") or []
+            detail = f" — {info['error']}" if info.get("error") else ""
+            lines.append(f"- {server}: {state}, {len(tools)} tool(s){detail}")
+            for mcp_tool in tools:
+                lines.append(f"    - {mcp_tool}")
+    lines.append("")
+
+    # --- Skills and subagents ---
+    lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
+    lines += [f"- {s}" for s in sorted(SKILL_PACKAGES)] or ["- none installed"]
+    lines.append("")
+    lines.append(f"## Subagents ({len(SUBAGENT_SPECS)})")
+    lines += [f"- {a}" for a in sorted(SUBAGENT_SPECS)] or ["- none configured"]
+    lines.append("")
+
+    # --- Guardrails. Reporting what is OFF is as useful as what is on. ---
+    lines += [
+        "## Active guardrails",
+        f"- Turn token budget: {_on_off(MAX_TURN_TOKENS, ' tokens')}",
+        f"- Turn wall-clock budget: {_on_off(MAX_TURN_SECONDS, 's')}",
+        f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
+        f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
+        f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
+        f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
+        f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
+        f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
+        f"- Shell denylist: {', '.join(_USER_DENY_GLOBS) or 'not set'}",
+        f"- Audit log: {'on — ' + str(AUDIT_LOG_PATH) if AUDIT_ENABLED else 'off'}",
+        f"- Subagent max depth: {SUBAGENT_MAX_DEPTH}",
+        "",
+        "## Always-on protections (no mode or approval disables these)",
+        "- Unrecoverable commands refused (rm -rf /, mkfs, dd to a device, fork bombs, curl | sh)",
+        "- Sensitive files refused for read and write (.env, SSH/GPG/AWS keys, *.pem)",
+        "- Shell startup files refused for write (would execute code on next shell launch)",
+        "- SSRF: requests to private, loopback, link-local, and cloud-metadata addresses refused",
+        "- Outbound requests carrying a configured credential refused",
+        "- Secrets redacted from all tool output and answers",
+        "- System prompt never disclosed",
+        "- External page and MCP content wrapped as untrusted, chat-template tokens stripped",
+    ]
+
+    return _redact_secrets("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Turn budget — resource ceiling for one run_agent() call
+# ---------------------------------------------------------------------------
+class _TurnBudget:
+    """Resource ceiling for one run_agent() call.
+
+    max_turns bounds how many ROUNDS the loop takes; this bounds what those
+    rounds may consume. Any limit set to 0 is disabled, so the default config
+    behaves exactly as before.
+    """
+
+    def __init__(self, max_seconds=0, max_tokens=0, max_cost=0.0,
+                 cost_in=0.0, cost_out=0.0):
+        self.max_seconds = max_seconds
+        self.max_tokens = max_tokens
+        self.max_cost = max_cost
+        self.cost_in = cost_in
+        self.cost_out = cost_out
+        self.started = time.monotonic()
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def add_tokens(self, prompt: int, completion: int) -> None:
+        self.input_tokens += int(prompt or 0)
+        self.output_tokens += int(completion or 0)
+
+    def add_usage(self, response, text: str = "") -> None:
+        """Record one model call. Streaming responses come from _build_response
+        and carry no usage object — fall back to a chars/4 estimate so a
+        streaming session is still bounded, just less precisely."""
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.add_tokens(getattr(usage, "prompt_tokens", 0),
+                            getattr(usage, "completion_tokens", 0))
+            return
+        if text:
+            self.add_tokens(0, len(text) // 4)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    @property
+    def cost_usd(self) -> float:
+        return ((self.input_tokens / 1000.0) * self.cost_in
+                + (self.output_tokens / 1000.0) * self.cost_out)
+
+    def exceeded(self):
+        """Return a human-readable reason string, or None if within budget."""
+        if self.max_seconds:
+            elapsed = time.monotonic() - self.started
+            if elapsed > self.max_seconds:
+                return (f"Turn budget exceeded: {elapsed:.0f} seconds elapsed "
+                        f"(limit {self.max_seconds}). Raise max_turn_seconds in "
+                        f"config.txt or split the task into smaller requests.")
+        if self.max_tokens and self.total_tokens >= self.max_tokens:
+            return (f"Turn budget exceeded: {self.total_tokens} tokens used "
+                    f"(limit {self.max_tokens}). Raise max_turn_tokens in config.txt.")
+        if self.max_cost and self.cost_usd >= self.max_cost:
+            return (f"Turn budget exceeded: ${self.cost_usd:.4f} spent "
+                    f"(limit ${self.max_cost:.4f}). Raise max_turn_cost_usd in config.txt.")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
-def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
-              on_calls=None, on_tool=None, on_result=None, on_answer=None,
-              on_escalation=None,
-              on_token=None, interrupt_check=None, trace=None,
-              system_prompt=None, tools_def=None, allowed_tools=None, depth=0):
+def run_agent(messages, *, budget=None, **kwargs):
+    """Run one agent turn under a resource budget. See _run_agent_loop for the
+    full hook documentation — every keyword is forwarded to it unchanged.
+
+    This thin wrapper exists so `_active_budget` is published for the duration
+    of the turn (subagents and plan steps read it, since there is no way to
+    thread a parameter through run_tool) and is always restored afterwards,
+    including on an exception or an AgentInterrupted.
+    """
+    global _active_budget
+    if budget is None:
+        budget = _TurnBudget(
+            max_seconds=MAX_TURN_SECONDS, max_tokens=MAX_TURN_TOKENS,
+            max_cost=MAX_TURN_COST_USD,
+            cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
+        )
+    previous, _active_budget = _active_budget, budget
+    # Only the outermost run_agent resets the blast-radius counters: a subagent
+    # must not hand itself a fresh write budget, same reasoning as the token one.
+    if previous is None:
+        reset_turn_counters()
+    try:
+        return _run_agent_loop(messages, budget=budget, **kwargs)
+    finally:
+        _active_budget = previous
+
+
+def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
+                    on_calls=None, on_tool=None, on_result=None, on_answer=None,
+                    on_escalation=None,
+                    on_token=None, interrupt_check=None, trace=None,
+                    system_prompt=None, tools_def=None, allowed_tools=None,
+                    depth=0, budget=None):
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -3339,6 +3778,19 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     for turn in range(max_turns):
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
+        # Resource ceiling. Checked before the model call so an exhausted budget
+        # costs nothing, and the partial result is returned rather than discarded.
+        over = budget.exceeded() if budget else None
+        if over:
+            _log.warning("turn budget hit at turn %d: %s", turn, over)
+            answer = _guard_answer(
+                f"{over}\n\nPartial result so far:\n"
+                f"{_last_tool_output[:1000] if _last_tool_output else '(none)'}")
+            if on_answer:
+                on_answer(answer)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
+            return answer
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
@@ -3361,6 +3813,8 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         # context window (the usual cause of the "loops in the reasoning block" crash)
         # and out of the user-facing answer.
         message = response.choices[0].message
+        if budget:
+            budget.add_usage(response, text=(message.content or ""))
         content = _strip_reasoning(message.content or "")
         native_text = _native_tool_text(message)
         if native_text:

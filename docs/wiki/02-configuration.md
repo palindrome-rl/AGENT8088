@@ -51,10 +51,23 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | Key | Default | Purpose |
 |---|---|---|
 | `allowed_sensitive_files` | (empty) | Escape hatch — comma-separated names to exempt from the sensitive-file blocklist. |
-| `deny_commands` | (empty) | Extra shell commands to refuse. |
+| `deny_commands` | (empty) | Shell commands to refuse (fnmatch globs). Refused in every mode. |
+| `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
 | `ssrf_allow_hosts` | `127.0.0.1,localhost` | Internal hosts the agent may reach (e.g. a local SearXNG). |
 | `ssrf_allow_private` | `0` | `1` opens the entire private network. Prefer the allowlist. |
+| `allowed_domains` | (empty) | If set, the **only** public hosts the agent may reach. Empty means all are reachable. |
+| `blocked_domains` | (empty) | Public hosts the agent may never reach. Wins over `allowed_domains`. |
+| `audit_log` | `0` | `1` appends one redacted JSON line per gated tool decision. Turn this on for any gateway deployment. |
+| `audit_log_path` | `<data dir>/audit.jsonl` | Where the audit trail is written (mode 0600). |
+| `audit_max_detail` | `512` | Truncation length for the audit `detail` field. |
+
+Domain matching is dot-anchored, so `allowed_domains=example.com` permits
+`docs.example.com` but **not** `evilexample.com`.
+
+Both domain lists are checked *before* the SSRF DNS lookup: a host the policy
+already rejects is never resolved, so the attempt does not reach that domain's
+nameserver.
 
 ## Sandbox
 
@@ -73,6 +86,7 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `slack_allowed_users` etc. | (empty) | Comma-separated user ids permitted per platform. **Empty means nobody** — fail-closed. |
 | `strict_platform_allowlist` | `0` | `1` refuses an id listed under a *different* platform's line instead of allowing it with a warning. |
 | `gateway_permission_mode` | `readonly` | `readonly` routes writes to chat approval; `edit` disables prompts. |
+| `gateway_rate_limit_per_min` | `20` | Per-user messages per minute, slash commands included. `0` disables. |
 | `whatsapp_mode` | `self-chat` | `self-chat` or `bot`. |
 | `whatsapp_session_dir` | | Baileys session directory. |
 | `whatsapp_bridge_port` | `3000` | Local bridge port. |
@@ -97,6 +111,47 @@ MCP *servers you connect to* are configured in `mcp.json`, not here. See
 | `max_tool_output_bytes` | Cap on tool output fed back to the model. |
 | `max_image_bytes` | Cap on an image attachment. |
 | `browser_timeout_ms` | `browse_page` timeout. |
+
+### Turn budget
+
+`max_turns` bounds how many *rounds* a request takes. These bound what those
+rounds may consume — a plan or subagent chain can burn a lot inside a small
+number of rounds. All default to `0`, meaning disabled.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
+| `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
+| `max_turn_cost_usd` | `0` | USD ceiling. Needs the two price keys below. |
+| `cost_per_1k_input` | `0` | Input token price, for the cost ceiling. |
+| `cost_per_1k_output` | `0` | Output token price, for the cost ceiling. |
+
+When a budget trips, the request stops at the start of the next round — before
+the model call, so an exhausted budget costs nothing — and returns the partial
+result along with the name of the key to raise.
+
+Subagents inherit the parent's budget. A fresh budget per subagent would be a
+free bypass: delegate, and the limit starts over.
+
+On streaming responses the provider returns no usage object, so tokens are
+estimated at roughly 4 characters each. That still bounds a runaway loop; it is
+just less precise than the non-streaming path.
+
+### Write blast radius
+
+The permission layer decides *whether* a write is allowed. These bound *how many*
+and *how big* — a model looping on `write_file` inside an already-approved turn
+is a plausible accident that the permission gate does not catch. Both default to
+`0` (disabled).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_writes_per_turn` | `0` | Files one request may write. |
+| `max_write_bytes` | `0` | Bytes a single write may contain. |
+
+Checked *before* the permission gate, so the refusal is not something a user can
+wave through by mistake, and reset only by the outermost request so a subagent
+cannot hand itself a fresh write budget.
 
 ## Extension points
 

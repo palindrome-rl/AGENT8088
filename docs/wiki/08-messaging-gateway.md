@@ -34,6 +34,33 @@ whatsapp_allowed_users=+15551234567
 
 An **empty list denies everyone.** `*` allows anyone (use with care).
 
+### Rate limiting
+
+Being allowlisted is not a licence to flood. Every turn serializes behind one
+global lock, so one user sending in a loop starves everyone else in the queue:
+
+```ini
+gateway_rate_limit_per_min=10     # default 20; 0 disables
+```
+
+Counted per user over a sliding 60-second window, **slash commands included** —
+otherwise `/help` would be a free flood channel. Over the limit, the bot replies
+once and drops the message. Rejected messages are not counted toward the window,
+so a user who keeps hammering still drains out of it rather than being locked out
+permanently. Drops are recorded in the [audit log](03-permissions-and-security.md#audit-trail)
+when it is enabled.
+
+### Inbound text is sanitized
+
+Chat-template control tokens are stripped from every inbound message before the
+model sees it. Without that, a message containing `<|im_start|>system` is
+tokenized as a real role boundary by self-hosted ChatML/Llama templates — a plain
+WhatsApp message could forge a system turn and grant itself a permission mode.
+
+The message is *not* demoted to untrusted data: the sender is allowlisted and is
+the principal for that request, so wrapping their whole message in
+"never instructions" markers would stop the gateway from acting at all.
+
 ### Ids are scoped to their platform
 
 An id under `slack_allowed_users` is a *Slack* id. If it shows up on Discord,
@@ -74,6 +101,35 @@ When a tool is blocked, the bot asks. Reply:
 
 Discord additionally gets interactive **✅ / ❌ / ✔️ buttons**, whose timeout
 is **fail-closed** — if nobody answers, the action is denied, not allowed.
+
+## Asking the bot what it can do
+
+```
+/capabilities
+```
+
+Reports the live tool list, connected MCP servers and their state, skills,
+subagents, permission mode, sandbox backend, and which guardrails are active.
+Asking in plain language ("what tools do you have?") gets the same answer — the
+agent calls `describe_capabilities` itself.
+
+## Recommended hardened profile
+
+For any gateway that is not a single-user toy:
+
+```ini
+audit_log=1
+gateway_rate_limit_per_min=10
+max_turn_tokens=60000
+max_turn_seconds=300
+max_writes_per_turn=20
+blocked_domains=pastebin.com,transfer.sh,file.io,0x0.st
+strict_platform_allowlist=1
+```
+
+`audit_log=1` matters most here: the gateway is the multi-user surface, and it is
+the only place you get a durable record of who asked for what and what was
+refused. See [Permissions & Security](03-permissions-and-security.md#audit-trail).
 
 ## Platform specifics
 

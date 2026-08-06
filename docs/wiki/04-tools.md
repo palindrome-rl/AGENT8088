@@ -15,6 +15,7 @@ is what the permission layer gates on — see
 | `execute_shell` | `shell` | `command` | safe list only | Run a shell command. |
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | — | ✅ | Re-read the previous tool's output without re-running it. |
+| `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails. |
 | `web_search` | `http_get` | `query` | prompt | Search via SearXNG (`search_base_url`). |
 | `web_search_tavily` | `http_post` | `query` | prompt | Search via Tavily (needs key). |
 | `web_search_exa` | `http_post` | `query` | prompt | Semantic search via Exa (needs key). |
@@ -73,6 +74,7 @@ the agent recovers instead of looping when the model invents a tool that
 | `python_eval` | pure computation — allowed in readonly |
 | `last_output` | pure recall — allowed in readonly |
 | `plan` | the plan-only entry point |
+| `introspect` | self-report — allowed in **every** mode; touches no file, socket, or process |
 | `mcp` | external MCP tool — see [MCP](07-mcp.md) |
 
 ## Adding a tool
@@ -110,9 +112,40 @@ Disable a built-in without editing the file:
 disabled_tools=browse_page
 ```
 
+## `describe_capabilities`
+
+Ask the agent what it can do and it answers from fact, not from its own reading
+of the prompt:
+
+> **you:** what tools and MCP servers do you have?
+> **agent:** *(calls `describe_capabilities`)* …
+
+The report is generated from live state — `TOOL_SPECS` grouped by access mode,
+`MCP_RUNTIME.statuses` with per-server connection state and tool lists, installed
+skills, configured subagents, the resolved sandbox backend, every limit including
+the ones **not** set, and the always-on floor. Because it is generated rather
+than hand-maintained, it cannot drift from what the agent actually has.
+
+Available on every surface, all from the same function, so a human and the model
+never get different answers:
+
+| Surface | How |
+|---|---|
+| Model | the `describe_capabilities` tool |
+| CLI | `/capabilities` |
+| Gateway chat | `/capabilities` |
+| MCP client | exposed in the default non-mutating server surface |
+
+It is permitted in **every** permission mode, including `readonly` and
+`plan-only`: an agent that cannot say what it can do is least useful exactly when
+it is most restricted. Safe to allow because it opens no file, makes no request,
+and starts no process — and its output goes through the same secret redaction as
+any other tool result, with no system-prompt text in it.
+
 ## Inspecting tools at runtime
 
 ```
 /tools                        # list all with mode, args, description
+/capabilities                 # tools + MCP + skills + limits + guardrails
 /tool read_text {"filename": "README.md"}   # invoke one directly
 ```

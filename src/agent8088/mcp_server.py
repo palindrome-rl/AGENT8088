@@ -63,6 +63,10 @@ EXPOSED_TOOLS = (
     "web_search_exa",
     "get_page_title",
     "last_output",
+    # Lets a host agent ask what this server can actually do — tools, limits, and
+    # guardrails — instead of hardcoding assumptions about it. Reads no files and
+    # makes no requests, and the report is redacted like any other output.
+    "describe_capabilities",
 )
 
 # Mutating tools, exposed only when the operator explicitly opts in with

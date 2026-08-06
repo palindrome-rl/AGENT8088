@@ -90,6 +90,7 @@ You may use `headers` for additional static HTTP headers.
 | `/mcp add ... --project` | Write the server to the project configuration instead |
 | `/mcp remove <name> [--project]` | Remove a server from the selected scope |
 | `/tools` | Show MCP tools alongside built-in tools |
+| `/capabilities` | Server-by-server connection state and tool lists, plus everything else the agent has |
 
 For example:
 
@@ -105,6 +106,14 @@ MCP tools run through Agent8088's existing permission layer. A server tool
 declared as read-only by MCP may run in readonly mode. Other MCP tools request
 the normal one-action approval before they execute. MCP responses are marked as
 external, untrusted content before they are added to the agent context.
+
+## Asking the agent which servers it has
+
+The agent can report its own MCP surface — call the `describe_capabilities` tool,
+or ask in plain language ("what MCP servers are connected?"). It lists each
+server with its connection state, tool count, individual tool names, and the
+error text for any server that failed to start. Same data as `/mcp`, from the
+same source, so the model and the human never disagree about what is connected.
 
 ## Troubleshooting
 

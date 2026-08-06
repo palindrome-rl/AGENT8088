@@ -26,6 +26,13 @@ Per area:
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_permission.py -q      # permission modes + floors
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_security_fixes.py -q  # shell/git hard blocks
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_ssrf.py -q            # SSRF
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_egress.py -q          # allowed_domains / blocked_domains
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_exfil_guard.py -q     # outbound secret refusal
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_turn_budget.py -q     # token / cost / wall-clock ceilings
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_command_allowlist.py -q  # allow_commands + write blast radius
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_audit_log.py -q       # audit trail
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_capabilities.py -q    # capability self-report
+AGENT8088_CONFIG=/nonexistent python -m pytest tests/gateway/test_rate_limit.py -q  # gateway rate limiting
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_mcp.py -q             # MCP client
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_mcp_server.py -q      # MCP server
 AGENT8088_CONFIG=/nonexistent python -m pytest tests/gateway/ -q                # all 3 platforms
