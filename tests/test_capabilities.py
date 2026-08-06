@@ -177,11 +177,6 @@ def test_exposed_over_mcp_server():
 
 # --- Approval policy appears in the report ---------------------------------
 
-def test_report_states_the_approval_mode(engine, monkeypatch):
-    monkeypatch.setattr(engine, "APPROVAL_MODE", "smart")
-    assert "smart" in engine.describe_capabilities()
-
-
 def test_report_states_the_denial_breaker(engine, monkeypatch):
     monkeypatch.setattr(engine, "DENIAL_BREAKER_THRESHOLD", 3)
     assert "3 denials" in engine.describe_capabilities()

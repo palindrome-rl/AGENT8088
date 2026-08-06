@@ -246,45 +246,22 @@ something a user can wave through by mistake.
 
 Full key reference in [Configuration](02-configuration.md#turn-budget).
 
-## Approval modes
+## Why there is no separate "approval mode"
 
-`permission_mode` decides *what is gated*. `approval_mode` decides *who answers
-the gate*.
+Hermes exposes `approvals.mode: smart | manual | off`, where `smart` has an
+auxiliary model auto-approve low-risk actions. Agent8088 deliberately does not
+mirror it.
 
-| Mode | Behaviour |
-|---|---|
-| `manual` *(default)* | Every gated action prompts the operator. |
-| `smart` | An auxiliary model reviews the action, auto-approving low-risk ones and escalating the rest. |
-| `off` | No gate. Trusted, sandboxed environments only. |
+`permission_mode` already decides what is gated. A second setting that can also
+wave a gate through creates a contradiction: `permission_mode=readonly` plus
+`approval_mode=off` runs gated commands with no prompt — a second, less obvious
+route to `full-auto` via a key that never says "full-auto". If you want actions to
+run without prompting, say so directly with `--mode full-auto`.
 
-`smart` mode adds a model call per gated action, so it is opt-in rather than
-inherited by an existing config.
-
-```ini
-approval_mode=smart
-smart_approval_model=cerebras:gpt-oss-120b        # optional; defaults to the active model
-smart_approval_policy=This box is a scratch VM; tolerate rm under /tmp.
-```
-
-**What the guardian can and cannot do.** It runs *after* the always-on floor, so:
-
-- it is never consulted for an action the floor already refused (no wasted call)
-- an `APPROVE` on `rm -rf /`, a sensitive-file write, or an outbound credential
-  changes nothing
-- it can only skip a prompt the operator would have answered — it can never widen
-  what is reachable
-
-It fails closed everywhere it can: an empty, ambiguous, or unparseable verdict
-escalates, and so does an unreachable or erroring model. Only a first line
-starting with `APPROVE` counts.
-
-The action text is written by the model under review, so the guardian receives it
-wrapped in the same untrusted-content markers as a fetched web page, and is told
-to ignore any instructions or claims of prior authorisation inside it.
-
-This is a convenience heuristic, not a boundary. Hermes' own `SECURITY.md` puts it
-plainly: the only real boundary against an adversarial model is the operating
-system — see [Sandboxing](06-sandboxing.md).
+`manual` and `off` therefore have exact equivalents already (`readonly` and
+`full-auto`), and an LLM reviewing another LLM's output is a heuristic, not a
+boundary — Hermes' own `SECURITY.md` says as much. The boundary is the OS; see
+[Sandboxing](06-sandboxing.md).
 
 ## Denial circuit breaker
 

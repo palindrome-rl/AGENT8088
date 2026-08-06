@@ -1,17 +1,22 @@
-"""Approval policy: denial circuit breaker, cron mode, and approval modes.
+"""Approval policy: denial circuit breaker, cron mode, destructive confirmations.
 
-Mirrors Hermes' `approvals:` config block (website/docs/user-guide/security.md):
+Mirrors the parts of Hermes' `approvals:` block that Agent8088 did not already
+have (website/docs/user-guide/security.md):
 
     approvals:
-      mode: smart | manual | off
-      timeout: 300
       cron_mode: deny | approve
       denial_breaker_threshold: 3
       mcp_reload_confirm: true
       destructive_slash_confirm: true
 
-Agent8088 keys are flat: approval_mode, cron_mode, denial_breaker_threshold, etc.
-Defaults keep existing behaviour: `manual` mode, breaker on at 3, cron denies.
+Hermes' `mode: smart | manual | off` is deliberately NOT mirrored. `PERMISSION_MODE`
+already decides what is gated, so a second axis that can also wave a gate through
+would mean `PERMISSION_MODE=readonly` plus one other key silently behaves like
+`full-auto`. `manual` and `off` already have exact equivalents in `readonly` and
+`full-auto`.
+
+Agent8088 keys are flat. Defaults keep existing behaviour: breaker on at 3, cron
+denies, confirmations on.
 """
 import pytest
 
@@ -167,28 +172,6 @@ def test_unattended_denial_is_audited(engine, monkeypatch, tmp_path):
     assert any(e.get("reason") == "unattended_deny" for e in entries)
 
 
-# --- Approval modes --------------------------------------------------------
-
-def test_approval_mode_defaults_to_manual(engine):
-    """smart adds a paid model call per gated command — opt in, don't inherit."""
-    assert engine.APPROVAL_MODE == "manual"
-
-
-def test_off_mode_requires_explicit_opt_in(engine):
-    assert engine.APPROVAL_MODE != "off"
-
-
-def test_invalid_approval_mode_falls_back_to_manual(engine, monkeypatch):
-    monkeypatch.setitem(engine.APP_CONFIG, "approval_mode", "nonsense")
-    assert engine._resolve_approval_mode() == "manual"
-
-
-@pytest.mark.parametrize("mode", ["smart", "manual", "off"])
-def test_valid_approval_modes_are_accepted(engine, monkeypatch, mode):
-    monkeypatch.setitem(engine.APP_CONFIG, "approval_mode", mode)
-    assert engine._resolve_approval_mode() == mode
-
-
 # --- Unattended entry points must mark themselves ---------------------------
 
 def test_cron_entry_sets_the_unattended_env_var(engine, monkeypatch):
@@ -289,3 +272,26 @@ def test_mcp_reload_asks_before_dropping_the_tool_cache(monkeypatch):
 
     monkeypatch.setattr(cli.A, "reload_mcp_tools", _must_not_reload)
     cli.cmd_mcp("reload")
+
+
+# --- The removed axis must stay removed -------------------------------------
+
+def test_there_is_no_second_axis_that_can_wave_a_gate_through(engine):
+    """Regression guard for the readonly-becomes-full-auto footgun.
+
+    An earlier version added approval_mode=smart|manual|off. `off` meant
+    PERMISSION_MODE=readonly still ran gated commands with no prompt — a second,
+    less obvious route to full-auto. PERMISSION_MODE is the only axis now.
+    """
+    for gone in ("APPROVAL_MODE", "SMART_APPROVAL_MODEL", "SMART_APPROVAL_POLICY",
+                 "_smart_approves", "_parse_guardian_verdict",
+                 "GUARDIAN_SYSTEM_PROMPT", "_resolve_approval_mode"):
+        assert not hasattr(engine, gone), f"{gone} is back — see this test's docstring"
+
+
+def test_readonly_always_gates_a_mutating_command(engine, monkeypatch):
+    """No config key may turn readonly into full-auto."""
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(engine, "UNATTENDED", False)
+    result = engine.run_tool("execute_shell", {"command": "rm -rf build"})
+    assert result.startswith("ESCALATION_REQUEST:")

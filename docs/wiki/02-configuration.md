@@ -76,19 +76,15 @@ Agent8088's flattened form of Hermes' `approvals:` block.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `approval_mode` | `manual` | `manual` asks the operator for every gated action. `smart` lets an auxiliary model auto-approve low-risk ones. `off` removes the gate — trusted sandboxes only. An unrecognised value falls back to `manual`. |
-| `smart_approval_model` | (active model) | Model to use as the guardian in `smart` mode. |
-| `smart_approval_policy` | (empty) | Extra instructions appended to the guardian's prompt, e.g. `This box is a scratch VM; tolerate rm under /tmp`. |
 | `denial_breaker_threshold` | `3` | Consecutive denials before the request stops and reports instead of retrying. `0` disables. |
 | `cron_mode` | `deny` | What an **unattended** run does at an approval gate. `deny` refuses and tells the model to report it; `approve` treats the gate as granted. Neither touches the always-on floor. |
 | `destructive_slash_confirm` | `1` | `/reset` and `/clear` ask before discarding a conversation. |
 | `mcp_reload_confirm` | `1` | `/mcp reload` asks before dropping the tool cache. |
 
-`smart` mode adds a model call per gated action, which is why the default is
-`manual` — the cost and latency are opt-in. The guardian can only ever *skip a
-prompt*; it cannot widen what is reachable, and it is not consulted for actions
-the always-on floor already refused. See
-[Permissions & Security](03-permissions-and-security.md#approval-modes).
+There is deliberately no separate "approval mode" setting.
+[`--mode` / `permission_mode`](03-permissions-and-security.md#the-three-permission-modes)
+already decides what is gated; a second axis that could also wave a gate through
+would mean `readonly` plus one other key silently behaves like `full-auto`.
 
 Scheduled runs created by `schedule_task` set `AGENT8088_UNATTENDED=1` themselves,
 so `cron_mode` applies without extra setup. The variable is read once at startup,

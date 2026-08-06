@@ -266,19 +266,14 @@ Adopts Hermes' two mechanisms (`tools/approval.py`):
 - `_command_detection_variants` — detection re-runs on a de-quoted variant, so it
   no longer depends on well-formed input
 
-### Approval modes (`approval_mode`)
-- `manual` (default), `smart`, `off`; an unrecognised value falls back to `manual`
-- `smart` consults an auxiliary guardian model, with `smart_approval_policy`
-  appended to its prompt for environment-specific judgement
-- Runs after the always-on floor, so it is never consulted for a floor-refused
-  action and an `APPROVE` cannot unlock one
-- Fails closed on an empty, ambiguous, or unparseable verdict, and on an
-  unreachable or erroring model
-- The reviewed action is model-authored, so it reaches the guardian wrapped in
-  untrusted-content markers with instructions to ignore anything inside it
-- Not consulted for already-permitted actions, or on unattended runs
-- Default is `manual`, not `smart`: a paid model call in the security path is
-  opt-in rather than inherited
+### Deliberately not mirrored: Hermes' `approvals.mode`
+
+Hermes has `smart | manual | off`, where `smart` uses an auxiliary guardian model.
+Not adopted: `PERMISSION_MODE` already decides what is gated, so a second axis that
+can also wave a gate through means `PERMISSION_MODE=readonly` plus one other key
+silently behaves like `full-auto` — a second, less obvious route to full-auto via a
+key that never says "full-auto". `manual` and `off` already have exact equivalents
+(`readonly`, `full-auto`).
 
 ### Denial circuit breaker (`denial_breaker_threshold`, default 3)
 - A denied action left the model free to re-propose it every round until
@@ -310,6 +305,5 @@ Adopts Hermes' two mechanisms (`tools/approval.py`):
 - Skipped when there is nothing to lose, and when stdin is not a tty
 
 ### Tests added
-`tests/test_shell_parser_failclosed.py` (29), `tests/test_approvals.py` (29),
-`tests/test_smart_approval.py` (29), `tests/test_mcp_breaker.py` (9),
-plus 3 capability-report tests.
+`tests/test_shell_parser_failclosed.py` (29), `tests/test_approvals.py` (25),
+`tests/test_mcp_breaker.py` (9), plus 2 capability-report tests.
