@@ -28,6 +28,13 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 - **Fine-tuned tool calling** — 95% accuracy on function selection
 - **3 permission modes** — readonly (default), full-auto, plan-only — switchable at runtime via `/mode`
 - **Security layers** — sensitive file protection, network gating, path-based zones, credential blocklist
+- **Egress policy** — `allowed_domains` / `blocked_domains` bound which public hosts are reachable, on top of SSRF
+- **Outbound secret guard** — a request carrying a configured credential is refused in every mode, including full-auto
+- **Resource budgets** — per-request token, cost, and wall-clock ceilings; per-turn write count and size caps
+- **Command allowlist** — `allow_commands` restricts shell to an approved set; `deny_commands` still wins
+- **Audit trail** — one redacted JSON line per gated decision (`audit_log=1`)
+- **Gateway rate limiting** — per-user sliding window so one chat user can't starve the queue
+- **Capability self-report** — ask the agent what tools, MCP servers, and guardrails it has; `/capabilities`
 - **Free native sandbox** — OS isolation on macOS, Linux, and Windows; Docker fallback
 - **Cross-platform** — Windows (cmd.exe) and Linux/macOS (bash)
 - **Rich CLI UI** — live token streaming, ESC interrupt, tool diffs, slash commands
@@ -160,6 +167,7 @@ Run with no flags to start the interactive REPL.
 |---|---|
 | `/help` | List all commands |
 | `/tools` | List loaded tools with args/mode/description |
+| `/capabilities` | Full self-report: tools, MCP servers, skills, subagents, limits, active guardrails |
 | `/tool <name> <args>` | Invoke one tool directly |
 | `/plan <steps>` | Run the plan-executor (multi-step) |
 | `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
@@ -295,6 +303,7 @@ MCP client config (HTTP):
 | `web_search_exa` | Search via Exa (semantic) |
 | `get_page_title` | Fetch a webpage title |
 | `last_output` | Get previous tool output |
+| `describe_capabilities` | What this server can do, and its active limits and guardrails |
 
 **File writes are opt-in.** MCP has no approval channel — an escalation prompt
 would just be an error string the client cannot answer — so the server runs in
@@ -344,9 +353,71 @@ Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`,
 
 `web_search` and `get_page_title` prompt y/n on every request. No config needed.
 
+SSRF protection refuses private, loopback, link-local, and cloud-metadata
+addresses on every outbound path, including redirects.
+
+On top of that, the egress policy bounds which **public** hosts are reachable:
+
+```ini
+blocked_domains=pastebin.com,transfer.sh   # never reachable; wins over allow
+allowed_domains=api.github.com             # if set, the ONLY reachable hosts
+```
+
+Matching is dot-anchored, so `example.com` covers `docs.example.com` but not
+`evilexample.com`. The policy is checked before the SSRF DNS lookup, so a
+rejected host is never even resolved.
+
 ### Security Layer 3: Path-Based Write Zones
 
 Three-tier zone system: `no_prompt_paths` (auto-approved), `prompt_paths` (y/n), `blocked_paths` (always denied).
+
+### Security Layer 4: Outbound Secret Guard
+
+Every outbound URL and argument set is scanned for configured secret values. A
+match is refused outright — **no permission mode unlocks this, including
+full-auto**, and there is no escalation prompt. Secret redaction protects what
+comes back from a tool; this protects what goes out.
+
+### Security Layer 5: Resource Budgets and Blast Radius
+
+`max_turns` bounds how many *rounds* a request takes. These bound what those
+rounds may consume. All default to `0` (disabled):
+
+```ini
+max_turn_tokens=60000        # tokens per request (input + output)
+max_turn_seconds=300         # wall clock per request
+max_turn_cost_usd=0.50       # spend per request (needs cost_per_1k_* keys)
+max_writes_per_turn=20       # files one request may write
+max_write_bytes=5242880      # bytes per single write
+```
+
+Subagents inherit the parent's budget — a fresh one per subagent would be a free
+bypass. When a budget trips, the request returns its partial result plus the name
+of the key to raise.
+
+### Security Layer 6: Command Allowlist
+
+`deny_commands` only stops what you thought of; `allow_commands` stops everything
+you did not:
+
+```ini
+allow_commands=git status,git diff,ls*,pytest*
+```
+
+Enforced at the always-on floor, so an unlisted command is not escalatable.
+`deny_commands` wins over `allow_commands`, and neither can re-enable the
+unrecoverable floor (`rm -rf /`, `mkfs`, `curl | sh`).
+
+### Security Layer 7: Audit Trail
+
+```ini
+audit_log=1
+```
+
+Appends one redacted JSON line per gated decision (`allowed` / `blocked` /
+`denied`) at mode 0600. Recommended for any gateway deployment — it is the only
+durable record of who asked for what and what was refused. Rotation is external;
+point `audit_log_path` at a file your `logrotate` handles.
 
 ### Command Sandbox
 
@@ -371,6 +442,7 @@ When neither backend is available, Agent8088 asks before running locally.
 | `browse_page` | browser | Load a web page in a headless browser |
 | `calculate` | python_eval | Evaluate a math expression |
 | `last_output` | last_output | Get full output from the last tool call |
+| `describe_capabilities` | introspect | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails |
 | `execute_plan` | plan | Execute a multi-step plan (plan-only mode) |
 | `spawn_subagent` | subagent | Delegate a task to an independent sub-agent |
 | `run_sandboxed` | docker | Run Python with OS isolation |

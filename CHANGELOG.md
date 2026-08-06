@@ -158,3 +158,87 @@ Model called `mkdir({"path": "testing"})` instead of `execute_shell({"command": 
 - Graph refreshed after every code change (`graphify update .`)
 - 307 nodes, 375 edges, 32 communities (latest)
 - Gemini-powered semantic extraction (38,690 + 35,064 tokens across 2 runs)
+---
+
+## Guardrails (2026-08-06)
+
+Seven guardrails closing gaps found by auditing the existing safety layer against
+the OpenClaw and Hermes harnesses. **Every one defaults to off or permissive, so
+an existing `config.txt` behaves exactly as before.**
+
+### Turn budget — tokens, cost, wall clock
+- `create_completion` never read `response.usage`; there was no spend accounting anywhere
+- `max_turns` bounded *rounds*, not resources — a plan or subagent chain was unbounded inside a few rounds
+- `_TurnBudget` checked at the top of each round, *before* the model call, so an exhausted budget costs nothing
+- Returns the partial result plus the name of the key to raise, rather than discarding work
+- Subagents inherit the parent budget via `_active_budget` — a fresh budget would be a free bypass
+- Streaming responses carry no usage object, so tokens fall back to a chars/4 estimate
+- Keys: `max_turn_seconds`, `max_turn_tokens`, `max_turn_cost_usd`, `cost_per_1k_input`, `cost_per_1k_output`
+
+### Egress domain policy
+- `_ssrf_check` covered internal addresses only; every public host was reachable and `http_post` could send anywhere
+- `SANDBOX_ALLOWED_DOMAINS` existed but was sandbox-scoped, not applied to the agent's own tools
+- `_egress_check` wired into all seven outbound paths, including HTTP redirects and in-browser subresource requests
+- Host matching is dot-anchored, so `evilpastebin.com` does not match `pastebin.com`
+- Ordered *before* `_ssrf_check`: the policy is a pure string check while SSRF calls `getaddrinfo`, and resolving a rejected host leaks the attempt to that domain's nameserver
+- Keys: `allowed_domains`, `blocked_domains`
+
+### Outbound secret guard
+- `_redact_secrets` protected tool *output*; nothing stopped the model putting a credential into an `http_post` body or URL
+- With unrestricted egress this was the full lethal trifecta: private data, untrusted content, outbound channel
+- `_outbound_secret_check` is a hard floor before the permission gate — no mode unlocks it, including `full-auto`, and there is no escalation path
+- The error never echoes the matched value; a 12-char minimum avoids false positives on short config values
+
+### Append-only audit log
+- `_log.info` went to a logger with no configured sink — no durable record of what ran or what was refused
+- `_audit` writes one redacted JSON line per gated decision (`allowed` / `blocked` / `denied`) at mode 0600
+- Every field passes through `_redact_secrets`, so a blocked exfiltration attempt is recorded without writing the credential to disk
+- Never raises: an unwritable sink is a lost record, not a failed turn
+- Keys: `audit_log`, `audit_log_path`, `audit_max_detail`
+
+### Gateway rate limiting
+- No throttling existed at all; every turn serializes behind one global lock, so one user in a loop starved the queue
+- `_RateLimiter` is a per-user sliding window applied before slash-command handling — otherwise `/help` is a free flood channel
+- Rejected hits are not recorded, so a user who keeps hammering drains out of the window rather than being locked out
+- Key: `gateway_rate_limit_per_min` (default 20, `0` disables)
+
+### Shell command allowlist
+- `deny_commands` only stops what you thought of; `allow_commands` stops everything you did not (Hermes-style approval patterns)
+- Enforced at the hardline floor, so an unlisted command is not escalatable
+- Precedence: unrecoverable floor > `deny_commands` > `allow_commands`. `allow_commands=*` cannot re-enable `rm -rf /`
+- Covers wrapped payloads (`bash -c '<unlisted>'`) via the existing `_hard_blocked_shell` recursion
+- Key: `allow_commands`
+
+### Write blast radius
+- The permission layer decided *whether* a write was allowed; nothing bounded how many or how big
+- Checked before the permission gate, so the refusal is not something a user can wave through by mistake
+- Reset only by the outermost `run_agent`, so a subagent cannot hand itself a fresh write budget
+- Keys: `max_writes_per_turn`, `max_write_bytes`
+
+### Inbound gateway text sanitizing
+- Gateway text reached `run_agent` raw, so `<|im_start|>system` in a chat message was tokenized as a real role boundary by self-hosted ChatML/Llama templates — a plain message could forge a system turn
+- The engine already stripped these from fetched pages and MCP responses; gateway text was the one untreated path in
+- Deliberately *not* `_wrap_untrusted`: the allowlisted sender is the principal, so demoting their whole message to "data, never instructions" would stop the gateway acting at all
+- Imported directly rather than through the `A` module so patching the engine in a test cannot silently disable the sanitizer
+
+---
+
+## Capability Self-Introspection (2026-08-06)
+
+- "What tools do you have?" got a guess from the model's reading of the prompt; "what is your configuration?" got a flat refusal, because `_PROTECTED_TARGET_RE` matched `your config`
+- `describe_capabilities()` builds the answer from live state: `TOOL_SPECS` grouped by access mode, `MCP_RUNTIME.statuses` with per-server state and tool lists, skills, subagents, resolved sandbox backend, every limit (including which are **not** set), and the always-on floor
+- Generated rather than hand-maintained, so it cannot drift from what the agent actually has
+- New `introspect` tool mode, permitted in **every** permission mode — it opens no file, socket, or process, and an agent that cannot say what it can do is least useful exactly when most restricted
+- Output goes through `_redact_secrets` and contains no system-prompt text
+- Same function on every surface, so the human and the model never see different answers:
+  - `describe_capabilities` tool (model)
+  - `/capabilities` (CLI)
+  - `/capabilities` (gateway chat)
+  - default non-mutating MCP server surface
+- Narrowed `_PROTECTED_TARGET_RE` to drop `config`/`configuration`: refusing an ordinary capability question was worse than the disclosure it guarded, since the real secrets are covered by `_is_sensitive_path`, `_redact_secrets`, and `_is_system_leak` regardless. Asking for `config.txt` or the system prompt by name is still refused — tests cover both directions.
+
+### Tests added
+`tests/test_turn_budget.py` (12), `tests/test_egress.py` (12), `tests/test_exfil_guard.py` (8),
+`tests/test_audit_log.py` (11), `tests/test_command_allowlist.py` (15),
+`tests/test_capabilities.py` (32), `tests/gateway/test_rate_limit.py` (11),
+plus 2 inbound-sanitizing tests in `tests/gateway/test_agent_bridge.py`.

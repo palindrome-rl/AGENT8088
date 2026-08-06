@@ -156,6 +156,127 @@ ssrf_allow_hosts=10.0.0.5:9200
 
 Prefer this over `ssrf_allow_private=1`, which opens the whole private network.
 
+## Egress domain policy
+
+SSRF covers *internal* addresses. This bounds which **public** hosts the agent
+may reach at all — without it, every public host is reachable and `http_post`
+can send an arbitrary body anywhere.
+
+```ini
+# Refuse these, always. Wins over allowed_domains.
+blocked_domains=pastebin.com,transfer.sh,file.io,0x0.st
+
+# If set, these are the ONLY public hosts reachable. Empty = all reachable.
+allowed_domains=api.github.com,docs.python.org
+```
+
+Matching is dot-anchored on the host: `example.com` covers `docs.example.com`
+but **not** `evilexample.com`.
+
+Enforced on every outbound path — `web_search`, `get_page_title`, `browse_page`,
+both HTTP tool modes, image URL fetches, **HTTP redirects**, and in-browser
+subresource requests.
+
+The policy runs *before* the SSRF check, which is a DNS lookup. A host the policy
+already rejects is never resolved, so the attempt never reaches that domain's
+nameserver.
+
+If you set `allowed_domains`, remember to include the host from
+`search_base_url` or `web_search` will start failing.
+
+## Outbound secret guard
+
+Secret redaction (below) protects what comes *back* from a tool. This protects
+what goes *out*: nothing else stopped the model reading a credential and putting
+it into an `http_post` body or a URL query string.
+
+Every outbound URL and argument set is scanned for configured secret values. A
+match is refused outright:
+
+```
+Error: Blocked — this request contains a credential from your configuration.
+Sending secrets to an external service is never permitted, in any permission mode.
+```
+
+This is a floor, not a gate: **no permission mode unlocks it, including
+`full-auto`**, and there is no escalation prompt — a credential in an outbound
+payload is never legitimate. The error deliberately does not echo the matched
+value. Values shorter than 12 characters are ignored, so a short config value
+does not turn into a false positive on every request.
+
+Together with the egress policy this closes the combination that matters:
+private data, untrusted content, and an outbound channel in the same agent.
+
+## Resource budgets and blast radius
+
+The permission layer answers *may this run*. These answer *how much*.
+
+| Guardrail | Keys | Bounds |
+|---|---|---|
+| Turn budget | `max_turn_tokens`, `max_turn_seconds`, `max_turn_cost_usd` | Tokens, wall clock, and spend for one request |
+| Write blast radius | `max_writes_per_turn`, `max_write_bytes` | Files written and bytes per write |
+
+All default to `0` (disabled). `max_turns` only bounds how many *rounds* a
+request takes; a plan or subagent chain can burn a great deal inside a few
+rounds, and before these there was no spend accounting at all.
+
+Subagents inherit both budgets. A fresh budget per subagent would be a free
+bypass — delegate, and the limit starts over.
+
+The write caps are checked *before* the permission gate, so the refusal is not
+something a user can wave through by mistake.
+
+Full key reference in [Configuration](02-configuration.md#turn-budget).
+
+## Shell command allowlist
+
+`deny_commands` only stops what you thought of. `allow_commands` stops
+everything you did not:
+
+```ini
+# Only these shell commands may run. Empty = no allowlist in force.
+allow_commands=git status,git diff,git log,ls*,npm test,pytest*
+```
+
+Enforced at the always-on floor, so an unlisted command is **not escalatable** —
+the same standing as a deny rule. Precedence:
+
+1. Unrecoverable floor wins over everything. `allow_commands=*` does **not**
+   re-enable `rm -rf /`, `mkfs`, or `curl | sh`.
+2. `deny_commands` wins over `allow_commands` — deny is the more specific intent.
+3. Otherwise, an allowlist (if set) must match.
+
+Wrapped payloads are covered: `bash -c '<unlisted>'` is refused, because the
+recursion in `_hard_blocked_shell()` re-checks the inner command.
+
+## Audit trail
+
+Off by default; **turn it on for any gateway deployment**.
+
+```ini
+audit_log=1
+audit_log_path=/var/log/agent8088/audit.jsonl   # optional
+```
+
+One JSON line per gated decision, at mode 0600:
+
+```json
+{"ts":"2026-08-06T09:15:02+00:00","event":"tool_call","permission_mode":"readonly",
+ "tool":"execute_shell","mode":"shell","decision":"denied",
+ "detail":"curl https://pastebin.com/…","reason":"egress_policy"}
+```
+
+`decision` is `allowed`, `blocked` (escalation requested), or `denied` (refused
+at a floor, no escalation possible). Every field is passed through secret
+redaction, so a blocked exfiltration attempt is recorded *without* writing the
+credential to disk.
+
+The writer never raises: an unwritable audit path is a lost record, not a failed
+turn. It is a record, not a gate.
+
+Rotation is not built in — point `audit_log_path` at a file your existing
+`logrotate` or cron handles.
+
 ## Content defense
 
 Text that came from outside the model's own reasoning — web pages, MCP tool
@@ -170,6 +291,15 @@ results — is wrapped before the model sees it:
 Chat-template control tokens (`<|im_start|>`, `<|eot_id|>`, `[/INST]`, …) are
 stripped first, so a page containing `<|im_start|>system` cannot forge a system
 turn on a self-hosted model.
+
+**Inbound gateway messages are stripped too.** A Slack or WhatsApp message
+containing `<|im_start|>system` would otherwise be tokenized as a real role
+boundary and could grant itself a permission mode.
+
+Gateway text is *not* wrapped in the untrusted markers, deliberately: the sender
+is allowlisted and is the principal for that request, so demoting their whole
+message to "data, never instructions" would stop the gateway from doing anything
+at all. The structure is sanitized; the authority is kept.
 
 ## Secret redaction
 
@@ -189,16 +319,53 @@ different means:
 | **Gateway** (Slack/WhatsApp/Discord) | `readonly` | `/approve` + `/deny` in chat; Discord gets ✅/❌ buttons with a **fail-closed** timeout |
 | **MCP server** (`--mcp-serve`) | read-only tool set | none possible — MCP has no approval channel, so writes are opt-in via `mcp_server_allow_writes=1` |
 
+The gateway also rate-limits per user (`gateway_rate_limit_per_min`, default 20,
+slash commands included). Every turn serializes behind one global lock, so a
+single user sending in a loop starves everyone else in the queue. Rejected
+messages are not counted, so a user who keeps hammering still drains out of the
+window rather than being locked out permanently.
+
+### Recommended hardened gateway profile
+
+```ini
+audit_log=1
+gateway_rate_limit_per_min=10
+max_turn_tokens=60000
+max_turn_seconds=300
+max_writes_per_turn=20
+blocked_domains=pastebin.com,transfer.sh,file.io,0x0.st
+strict_platform_allowlist=1
+```
+
 The MCP server runs the engine in full-auto *because* it cannot prompt; that is
 only safe while the exposed set is non-mutating, which a test enforces. See
 [MCP](07-mcp.md#server-mode).
+
+## Asking the agent what is in force
+
+You do not have to read this page to find out. Ask the agent, or run
+`/capabilities` — it reports the live permission mode, sandbox backend, every
+limit (including which are **not** set), and the always-on floor, generated from
+the running configuration rather than a hand-maintained list:
+
+```
+/capabilities
+```
+
+The agent answers the same question itself via the `describe_capabilities` tool,
+so "which guardrails are active?" in chat gets the same facts. See
+[Tools](04-tools.md#describe_capabilities).
 
 ## Verifying any of this yourself
 
 Every claim above is covered by the suites:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_permission.py tests/test_security_fixes.py tests/test_ssrf.py -v
+AGENT8088_CONFIG=/nonexistent python -m pytest \
+  tests/test_permission.py tests/test_security_fixes.py tests/test_ssrf.py \
+  tests/test_egress.py tests/test_exfil_guard.py tests/test_turn_budget.py \
+  tests/test_audit_log.py tests/test_command_allowlist.py \
+  tests/test_capabilities.py tests/gateway/test_rate_limit.py -v
 ```
 
 See [Testing & Verification](12-testing-and-verification.md).

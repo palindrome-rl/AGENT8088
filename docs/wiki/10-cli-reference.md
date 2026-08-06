@@ -78,6 +78,7 @@ Run with no flags for the interactive REPL.
 | Command | Does |
 |---|---|
 | `/tools` | List tools with mode, args, description |
+| `/capabilities` | Full self-report: tools, MCP servers, skills, subagents, limits, active guardrails |
 | `/tool <name> <json>` | Invoke one tool directly |
 | `/plan <steps>` | Run the multi-step plan executor |
 | `/image <path>` | Attach an image to the next prompt |
@@ -107,6 +108,7 @@ Run with no flags for the interactive REPL.
 | Command | Does |
 |---|---|
 | `/config` | Active config + file path |
+| `/capabilities` | What the agent can do and which guardrails are in force |
 | `/system` | Full system prompt |
 | `/doctor` | Environment health check |
 | `/trace [on\|off]` | Toggle JSON trace capture |
@@ -118,10 +120,17 @@ Inside Slack / WhatsApp / Discord:
 
 | Command | Does |
 |---|---|
-| `/approve` | Approve the pending action |
+| `/new` | Clear the current session |
+| `/stop` | Cancel queued messages for this chat |
+| `/help` | List available commands |
+| `/capabilities` | Tools, MCP servers, skills, limits, active guardrails |
+| `/approve` | Approve the pending action (add `session` to hold for the session) |
 | `/deny` | Refuse it |
 
 Discord also offers ✅ / ❌ buttons with a fail-closed timeout.
+
+Gateway commands count against `gateway_rate_limit_per_min` like any other
+message — otherwise `/help` would be a free channel for flooding the gateway.
 
 ## Keyboard
 
