@@ -2368,11 +2368,43 @@ def install_native_sandbox() -> str:
     return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed."
 
 
+def _tool_arg_parse_error(name: str, raw: str) -> str:
+    """Message for an argument block that arrived but could not be parsed.
+
+    Distinct from "the argument is missing" on purpose: telling the model an
+    argument is absent when it did send one sends it chasing the wrong problem.
+    """
+    return (f"Error: could not parse the arguments for '{name}'. Send valid "
+            f"JSON with newlines escaped as \\n, e.g. "
+            f'{{"code": "a = 1\\nprint(a)"}}. Received: {raw[:200]}')
+
+
+_CODE_ARG_ALIASES = ("code", "script", "python", "source", "snippet", "command")
+_FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_+-]*\s*\n(.*?)\n?\s*```\s*$", re.DOTALL)
+
+
+def _strip_code_fences(code: str) -> str:
+    """Drop a surrounding ```lang ... ``` fence, which models often add."""
+    match = _FENCE_RE.match(code)
+    return match.group(1) if match else code
+
+
 def _exec_docker(args: dict) -> str:
     """Run a Python snippet through the configured sandbox backend."""
-    code = str(args.get("code") or "").strip()
+    if args.get("__parse_error__"):
+        return _tool_arg_parse_error("run_sandboxed", args["__parse_error__"])
+    # Accept the obvious synonyms — the model frequently names this argument
+    # 'script' or 'python'. 'code' wins when more than one is present.
+    code = ""
+    for alias in _CODE_ARG_ALIASES:
+        value = str(args.get(alias) or "").strip()
+        if value:
+            code = value
+            break
+    code = _strip_code_fences(code).strip()
     if not code:
-        return "Error: sandboxed execution requires 'code'."
+        return ("Error: sandboxed execution requires 'code'. Pass the Python "
+                "source as code=\"...\" (newlines escaped as \\n).")
     image = str(args.get("image") or DOCKER_IMAGE)
     timeout = int(args.get("timeout") or 60)
     return _exec_sandbox_command(code, timeout=timeout, python_code=True, image=image)
@@ -2883,13 +2915,62 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
 # ---------------------------------------------------------------------------
 # Parsing model output for tool calls
 # ---------------------------------------------------------------------------
+_JSON_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _escape_control_chars_in_strings(raw: str) -> str:
+    """Escape literal newlines/tabs that appear inside JSON string values.
+
+    Models routinely emit real newlines inside an argument value when the value
+    is code or file content:
+
+        ✿ARGS✿: {"code": "a = 1
+        print(a)"}
+
+    That is invalid JSON, so json.loads raises. Rather than lose the call, walk
+    the text and escape control characters found inside string literals. Tracks
+    escape state so an already-escaped `\\n` is left alone and a literal
+    backslash is not mistaken for an escape of the following quote.
+    """
+    out = []
+    in_string = False
+    escaped = False
+    for char in raw:
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+            continue
+        out.append(_JSON_CONTROL_ESCAPES.get(char, char) if in_string else char)
+    return "".join(out)
+
+
+def _loads_tool_args(raw: str):
+    """json.loads for model-emitted arguments, tolerant of unescaped newlines.
+
+    Raises the original JSONDecodeError if the text is broken beyond escaping,
+    so callers can distinguish "unparseable" from "no arguments given".
+    """
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return json.loads(_escape_control_chars_in_strings(raw))
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
         try:
-            d = json.loads(m.group(1).strip())
+            d = _loads_tool_args(m.group(1).strip())
             resolved = _resolve_tool_name(d.get("name", ""))
             if resolved in allowed:
                 d["name"] = resolved
@@ -2904,13 +2985,18 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
     if not calls:
         m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*\})', text, re.DOTALL)
         if m:
-            try:
-                resolved = _resolve_tool_name(m.group(1))
-                if resolved in allowed:
-                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
-            except Exception:
-                pass
-        if not calls:  # loose ✿FUNCTION✿ line with no args
+            resolved = _resolve_tool_name(m.group(1))
+            if resolved in allowed:
+                try:
+                    calls.append({"name": resolved, "arguments": _loads_tool_args(m.group(2))})
+                except Exception:
+                    # An ARGS block was sent but is unparseable. Surfacing empty
+                    # args here would make the tool report the argument as
+                    # missing, which sends the model chasing the wrong problem.
+                    # Flag the parse failure instead.
+                    calls.append({"name": resolved,
+                                  "arguments": {"__parse_error__": m.group(2)[:400]}})
+        if not calls and "✿ARGS✿" not in text:  # loose ✿FUNCTION✿ line, genuinely no args
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
                 resolved = _resolve_tool_name(m2.group(1))
