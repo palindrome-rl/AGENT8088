@@ -173,3 +173,23 @@ def test_gateway_slash_command_replies_with_the_report():
 def test_exposed_over_mcp_server():
     from agent8088 import mcp_server
     assert "describe_capabilities" in mcp_server.exposed_tool_names({})
+
+
+# --- Approval policy appears in the report ---------------------------------
+
+def test_report_states_the_approval_mode(engine, monkeypatch):
+    monkeypatch.setattr(engine, "APPROVAL_MODE", "smart")
+    assert "smart" in engine.describe_capabilities()
+
+
+def test_report_states_the_denial_breaker(engine, monkeypatch):
+    monkeypatch.setattr(engine, "DENIAL_BREAKER_THRESHOLD", 3)
+    assert "3 denials" in engine.describe_capabilities()
+
+
+def test_report_flags_an_unattended_run(engine, monkeypatch):
+    monkeypatch.setattr(engine, "UNATTENDED", True)
+    monkeypatch.setattr(engine, "CRON_MODE", "deny")
+    report = engine.describe_capabilities()
+    assert "Unattended run: yes" in report
+    assert "cron_mode=deny" in report

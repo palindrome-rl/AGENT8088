@@ -106,6 +106,24 @@ config.fish  fish.config
 Matched on **exact filename**, so `profile.json` and `.editorconfig` are
 unaffected. **Reads stay allowed** — "help me fix my PATH" is a normal request.
 
+### 2b. Commands that cannot be analysed
+
+Detection must not depend on the command being well-formed. `_hard_blocked_shell`
+lexes the command to find dangerous git operations and wrapper payloads; when the
+lexer failed it used to return "not blocked", so appending a single unbalanced
+quote skipped every check below it:
+
+```sh
+git push origin main       # refused
+git push origin main "     # used to execute
+```
+
+Now a command too long (`max_command_chars`, default 16384) or too quote-dense to
+analyse is **refused**, and detection re-runs on a de-quoted variant so it no
+longer depends on well-formed input. The variant is only used for detection and is
+never executed, and `echo`/`printf` stay on the non-exec list, so
+`echo "git push"` does not become a push.
+
 ### 3. Destructive git
 
 `git push`, `git reset --hard`, `git branch -D` and friends are refused even in
@@ -227,6 +245,98 @@ The write caps are checked *before* the permission gate, so the refusal is not
 something a user can wave through by mistake.
 
 Full key reference in [Configuration](02-configuration.md#turn-budget).
+
+## Approval modes
+
+`permission_mode` decides *what is gated*. `approval_mode` decides *who answers
+the gate*.
+
+| Mode | Behaviour |
+|---|---|
+| `manual` *(default)* | Every gated action prompts the operator. |
+| `smart` | An auxiliary model reviews the action, auto-approving low-risk ones and escalating the rest. |
+| `off` | No gate. Trusted, sandboxed environments only. |
+
+`smart` mode adds a model call per gated action, so it is opt-in rather than
+inherited by an existing config.
+
+```ini
+approval_mode=smart
+smart_approval_model=cerebras:gpt-oss-120b        # optional; defaults to the active model
+smart_approval_policy=This box is a scratch VM; tolerate rm under /tmp.
+```
+
+**What the guardian can and cannot do.** It runs *after* the always-on floor, so:
+
+- it is never consulted for an action the floor already refused (no wasted call)
+- an `APPROVE` on `rm -rf /`, a sensitive-file write, or an outbound credential
+  changes nothing
+- it can only skip a prompt the operator would have answered — it can never widen
+  what is reachable
+
+It fails closed everywhere it can: an empty, ambiguous, or unparseable verdict
+escalates, and so does an unreachable or erroring model. Only a first line
+starting with `APPROVE` counts.
+
+The action text is written by the model under review, so the guardian receives it
+wrapped in the same untrusted-content markers as a fetched web page, and is told
+to ignore any instructions or claims of prior authorisation inside it.
+
+This is a convenience heuristic, not a boundary. Hermes' own `SECURITY.md` puts it
+plainly: the only real boundary against an adversarial model is the operating
+system — see [Sandboxing](06-sandboxing.md).
+
+## Denial circuit breaker
+
+```ini
+denial_breaker_threshold=3     # 0 disables
+```
+
+A denied action used to leave the model free to re-propose it every round until
+`max_turns`. That reads to the user as the agent ignoring them, and it spends a
+whole turn budget to arrive at the same no. After N consecutive denials the request
+ends with the model told to stop and report. One approval resets the count, and the
+count resets per request.
+
+## Unattended runs
+
+A scheduled run has no operator, so an approval prompt there was emitted to nobody
+and sat until the turn died.
+
+```ini
+cron_mode=deny      # deny (default) | approve
+```
+
+`deny` refuses the gated action and tells the model to report it in its answer.
+`approve` treats the gate as granted. **Neither unlocks the always-on floor** — a
+scheduled run still cannot `rm -rf /`.
+
+Entries created by `schedule_task` (crontab and Windows Task Scheduler alike) set
+`AGENT8088_UNATTENDED=1`, so this applies without extra setup. The variable is read
+once at startup rather than per call: an env-var check on the hot path would let
+anything running inside the process flip it mid-turn, which is why Hermes freezes
+its equivalent at import too.
+
+## Destructive command confirmation
+
+```ini
+destructive_slash_confirm=1     # /reset, /clear
+mcp_reload_confirm=1            # /mcp reload
+```
+
+A mistyped `/reset` mid-session used to discard the whole conversation with no
+signal beforehand. Skipped when there is nothing to lose, and when stdin is not a
+tty — a scripted run has nobody to ask.
+
+## MCP server circuit breaker
+
+Three consecutive failures from one MCP server open a breaker for 60 seconds. While
+it is open, calls to that server's tools return an error that explicitly tells the
+model **not** to retry yet and how long is left. A success resets it.
+
+Breakers are per server, so one dead server does not silence a healthy one. Without
+this, the model retried a dead server every round and spent the whole request on
+something that was not coming back.
 
 ## Shell command allowlist
 

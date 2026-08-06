@@ -125,6 +125,7 @@ max_turn_seconds=300
 max_writes_per_turn=20
 blocked_domains=pastebin.com,transfer.sh,file.io,0x0.st
 strict_platform_allowlist=1
+denial_breaker_threshold=3
 ```
 
 `audit_log=1` matters most here: the gateway is the multi-user surface, and it is

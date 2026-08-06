@@ -93,6 +93,17 @@ These are the parts worth knowing before you connect a third-party server:
 
 ---
 
+## Circuit breaker
+
+Three consecutive failures from one server open a breaker for 60 seconds. While it
+is open, calls to that server's tools return an error that tells the model **not**
+to retry yet and how long is left; a success resets it. Breakers are per server, so
+one dead server does not silence a healthy one.
+
+Without this the model retried a dead server every round and spent the whole
+request on something that was not coming back. `/mcp` still shows the real
+connection state.
+
 ## Server mode
 
 Expose Agent8088's tools to another agent.

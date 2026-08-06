@@ -242,3 +242,74 @@ an existing `config.txt` behaves exactly as before.**
 `tests/test_audit_log.py` (11), `tests/test_command_allowlist.py` (15),
 `tests/test_capabilities.py` (32), `tests/gateway/test_rate_limit.py` (11),
 plus 2 inbound-sanitizing tests in `tests/gateway/test_agent_bridge.py`.
+
+---
+
+## Hermes-Parity Guardrails (2026-08-06)
+
+Sourced from the live Hermes Agent documentation via the Context7 MCP server
+(`/nousresearch/hermes-agent`), then checked against Agent8088's actual code.
+
+### Fixed: unbalanced quote bypassed the always-on git floor
+
+`_hard_blocked_shell` lexes the command to find dangerous git operations and
+wrapper payloads. On a `ValueError` it returned `False`, so every lexer-based check
+below it silently passed — a remote-push command was refused as written, but
+appending one unbalanced double-quote made it execute. Same trick worked for
+`reset --hard`, `clean -fd`, `branch -D`, `checkout --`, `stash drop`, and inside a
+`bash -c` payload. It held in `edit` and `full-auto`, where the floor is the only
+thing left.
+
+Adopts Hermes' two mechanisms (`tools/approval.py`):
+- `_command_parser_limit_exceeded` — a command too long (`max_command_chars`) or
+  too quote-dense to analyse is treated as dangerous rather than skipped
+- `_command_detection_variants` — detection re-runs on a de-quoted variant, so it
+  no longer depends on well-formed input
+
+### Approval modes (`approval_mode`)
+- `manual` (default), `smart`, `off`; an unrecognised value falls back to `manual`
+- `smart` consults an auxiliary guardian model, with `smart_approval_policy`
+  appended to its prompt for environment-specific judgement
+- Runs after the always-on floor, so it is never consulted for a floor-refused
+  action and an `APPROVE` cannot unlock one
+- Fails closed on an empty, ambiguous, or unparseable verdict, and on an
+  unreachable or erroring model
+- The reviewed action is model-authored, so it reaches the guardian wrapped in
+  untrusted-content markers with instructions to ignore anything inside it
+- Not consulted for already-permitted actions, or on unattended runs
+- Default is `manual`, not `smart`: a paid model call in the security path is
+  opt-in rather than inherited
+
+### Denial circuit breaker (`denial_breaker_threshold`, default 3)
+- A denied action left the model free to re-propose it every round until
+  `max_turns` — reads as the agent ignoring the user, and spends a whole turn
+  budget to reach the same no
+- After N consecutive denials the request ends with the model told to stop and
+  report. One approval resets the count; the count resets per request
+
+### Unattended-run policy (`cron_mode`, default `deny`)
+- A scheduled run has no operator, so an `ESCALATION_REQUEST` was emitted to nobody
+  and sat until the turn died
+- `deny` refuses and tells the model to report it; `approve` treats the gate as
+  granted. Neither touches the always-on floor
+- Crontab entries and Windows task scripts set `AGENT8088_UNATTENDED=1`
+- Read once at import, not per call — an env-var check on the hot path is a
+  prompt-injection escalation route, which is why Hermes freezes its equivalent
+
+### MCP server circuit breaker
+- 3 consecutive failures open a per-server breaker for a 60s cooldown; while open,
+  the error explicitly tells the model not to retry and how long is left
+- Success resets it; breakers are per server, so one dead server does not silence a
+  healthy one
+
+### Destructive command confirmation
+- `destructive_slash_confirm` (default on): `/reset` and `/clear` ask before
+  discarding a conversation
+- `mcp_reload_confirm` (default on): `/mcp reload` asks before dropping the tool
+  cache
+- Skipped when there is nothing to lose, and when stdin is not a tty
+
+### Tests added
+`tests/test_shell_parser_failclosed.py` (29), `tests/test_approvals.py` (29),
+`tests/test_smart_approval.py` (29), `tests/test_mcp_breaker.py` (9),
+plus 3 capability-report tests.

@@ -91,6 +91,7 @@ Run with no flags for the interactive REPL.
 | Command | Does |
 |---|---|
 | `/mode [readonly\|full-auto\|plan-only]` | Show or switch permission mode |
+| `/reset`, `/clear` | Discard the conversation — asks first unless `destructive_slash_confirm=0` |
 | `/sandbox [auto\|native\|docker\|local\|setup]` | Show, select or install isolation |
 
 ### MCP
@@ -98,7 +99,7 @@ Run with no flags for the interactive REPL.
 | Command | Does |
 |---|---|
 | `/mcp` | Server status + discovered tools |
-| `/mcp reload` | Reconnect after editing `mcp.json` |
+| `/mcp reload` | Reconnect after editing `mcp.json` — asks first unless `mcp_reload_confirm=0` |
 | `/mcp add <name> stdio <cmd> [args...] [--project]` | Add a stdio server |
 | `/mcp add <name> http <url> [--project]` | Add an HTTP server |
 | `/mcp remove <name> [--project]` | Remove a server |

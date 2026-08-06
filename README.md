@@ -33,6 +33,10 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 - **Resource budgets** — per-request token, cost, and wall-clock ceilings; per-turn write count and size caps
 - **Command allowlist** — `allow_commands` restricts shell to an approved set; `deny_commands` still wins
 - **Audit trail** — one redacted JSON line per gated decision (`audit_log=1`)
+- **Approval modes** — `manual` (default), `smart` (auxiliary guardian model), or `off`
+- **Denial circuit breaker** — stops the agent re-proposing a denied action every round
+- **Unattended-run policy** — `cron_mode` resolves approval gates for scheduled runs with no operator
+- **MCP circuit breaker** — a dead MCP server is not retried every round
 - **Gateway rate limiting** — per-user sliding window so one chat user can't starve the queue
 - **Capability self-report** — ask the agent what tools, MCP servers, and guardrails it has; `/capabilities`
 - **Free native sandbox** — OS isolation on macOS, Linux, and Windows; Docker fallback
@@ -409,7 +413,25 @@ Enforced at the always-on floor, so an unlisted command is not escalatable.
 `deny_commands` wins over `allow_commands`, and neither can re-enable the
 unrecoverable floor (`rm -rf /`, `mkfs`, `curl | sh`).
 
-### Security Layer 7: Audit Trail
+### Security Layer 7: Approval Modes
+
+`permission_mode` decides what is gated; `approval_mode` decides who answers:
+
+```ini
+approval_mode=smart                # manual (default) | smart | off
+smart_approval_policy=Scratch VM; tolerate rm under /tmp.
+denial_breaker_threshold=3         # stop after N consecutive denials; 0 disables
+cron_mode=deny                     # unattended runs: deny (default) | approve
+destructive_slash_confirm=1        # /reset and /clear ask first
+mcp_reload_confirm=1               # /mcp reload asks first
+```
+
+`smart` adds a model call per gated action, so it is opt-in. The guardian runs
+*after* the always-on floor and can only skip a prompt — an `APPROVE` on
+`rm -rf /`, a sensitive-file write, or an outbound credential changes nothing. It
+fails closed on an ambiguous verdict or an unreachable model.
+
+### Security Layer 8: Audit Trail
 
 ```ini
 audit_log=1

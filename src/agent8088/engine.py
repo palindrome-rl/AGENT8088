@@ -3857,6 +3857,12 @@ def describe_capabilities() -> str:
     # --- Guardrails. Reporting what is OFF is as useful as what is on. ---
     lines += [
         "## Active guardrails",
+        f"- Approval mode: {APPROVAL_MODE}"
+        + (f" (guardian model: {SMART_APPROVAL_MODEL or 'default'})"
+           if APPROVAL_MODE == "smart" else ""),
+        f"- Unattended run: {'yes' if UNATTENDED else 'no'}"
+        + (f", cron_mode={CRON_MODE}" if UNATTENDED else ""),
+        f"- Denial circuit breaker: {_on_off(DENIAL_BREAKER_THRESHOLD, ' denials')}",
         f"- Turn token budget: {_on_off(MAX_TURN_TOKENS, ' tokens')}",
         f"- Turn wall-clock budget: {_on_off(MAX_TURN_SECONDS, 's')}",
         f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
@@ -3871,6 +3877,7 @@ def describe_capabilities() -> str:
         "",
         "## Always-on protections (no mode or approval disables these)",
         "- Unrecoverable commands refused (rm -rf /, mkfs, dd to a device, fork bombs, curl | sh)",
+        "- Commands too long or too quote-dense to analyse are refused, not skipped",
         "- Sensitive files refused for read and write (.env, SSH/GPG/AWS keys, *.pem)",
         "- Shell startup files refused for write (would execute code on next shell launch)",
         "- SSRF: requests to private, loopback, link-local, and cloud-metadata addresses refused",
