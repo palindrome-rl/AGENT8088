@@ -284,4 +284,11 @@ def build_runner() -> GatewayRunner:
         except ImportError:
             log.warning("Discord enabled but discord.py not installed. "
                          "Run: uv pip install -e \".[gateway]\"")
+    if config.get("email_enabled", "0") in ("1", "true", "True"):
+        try:
+            from agent8088.gateway.platforms.email import EmailAdapter
+            runner.register_adapter(EmailAdapter(config, runner))
+        except ImportError:
+            log.warning("Email enabled but failed to import. "
+                         "Email uses stdlib only — check config.")
     return runner

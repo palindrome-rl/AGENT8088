@@ -2302,12 +2302,13 @@ def _run_gateway_setup():
 
     print("Agent8088 Gateway Setup\n")
     print("Configure messaging platforms so the agent can respond on")
-    print("Slack, WhatsApp, and Discord. Run `agent8088 --gateway` to start.\n")
+    print("Slack, WhatsApp, Discord, and Email. Run `agent8088 --gateway` to start.\n")
 
     # Show current state
     slack_on = _current("slack_enabled") in ("1", "true", "True")
     wa_on = _current("whatsapp_enabled") in ("1", "true", "True")
     discord_on = _current("discord_enabled") in ("1", "true", "True")
+    email_on = _current("email_enabled") in ("1", "true", "True")
 
     # Only one gateway channel can be active at a time (mutually exclusive).
     # Single-select picker — choosing one disables the others.
@@ -2315,30 +2316,36 @@ def _run_gateway_setup():
     if slack_on: current = "Slack"
     elif wa_on: current = "WhatsApp"
     elif discord_on: current = "Discord"
+    elif email_on: current = "Email"
 
     choices = [
         "Slack" + (" (current)" if slack_on else ""),
         "WhatsApp" + (" (current)" if wa_on else ""),
         "Discord" + (" (current)" if discord_on else ""),
+        "Email" + (" (current)" if email_on else ""),
         "None (disable all)",
     ]
     selected = _choice_prompt("Select gateway channel (only one can be active):", choices)
 
     if selected == "None (disable all)":
-        slack_on = wa_on = discord_on = False
+        slack_on = wa_on = discord_on = email_on = False
         newly_enabled = set()
     elif selected.startswith("Slack"):
         newly_enabled = set() if slack_on else {"slack"}
         slack_on = True
-        wa_on = discord_on = False
+        wa_on = discord_on = email_on = False
     elif selected.startswith("WhatsApp"):
         newly_enabled = set() if wa_on else {"whatsapp"}
         wa_on = True
-        slack_on = discord_on = False
+        slack_on = discord_on = email_on = False
     elif selected.startswith("Discord"):
         newly_enabled = set() if discord_on else {"discord"}
         discord_on = True
-        slack_on = wa_on = False
+        slack_on = wa_on = email_on = False
+    elif selected.startswith("Email"):
+        newly_enabled = set() if email_on else {"email"}
+        email_on = True
+        slack_on = wa_on = discord_on = False
     else:
         newly_enabled = set()
 
@@ -2502,10 +2509,64 @@ def _run_gateway_setup():
             content = _set_line(content, "discord_enabled", "1")
             print("Discord configured.\n")
 
+    # --- Email configuration (only if newly enabled) ---
+    if email_on and "email" in newly_enabled:
+        print("\n--- Email ---")
+        print("Email uses Python stdlib (imaplib/smtplib) — no extra deps needed.\n")
+        print("For Gmail: enable 2FA and create an App Password at")
+        print("  https://myaccount.google.com/apppasswords\n")
+
+        _env_vars = A.load_env_file(A.ENV_FILE_PATH)
+        email_addr = _custom_prompt("Email address:",
+                                     default=_env_vars.get("EMAIL_ADDRESS", ""))
+        if email_addr:
+            A.update_env_file(A.ENV_FILE_PATH, {"EMAIL_ADDRESS": email_addr})
+        else:
+            email_addr = _env_vars.get("EMAIL_ADDRESS", "")
+
+        email_pass = _custom_prompt("Email password (app password for Gmail):",
+                                     default=_env_vars.get("EMAIL_PASSWORD", ""),
+                                     secret=True)
+        if email_pass:
+            A.update_env_file(A.ENV_FILE_PATH, {"EMAIL_PASSWORD": email_pass})
+        else:
+            email_pass = _env_vars.get("EMAIL_PASSWORD", "")
+
+        smtp_host = _custom_prompt("SMTP host (e.g. smtp.gmail.com):",
+                                    default=_env_vars.get("EMAIL_SMTP_HOST", ""))
+        if smtp_host:
+            A.update_env_file(A.ENV_FILE_PATH, {"EMAIL_SMTP_HOST": smtp_host})
+        else:
+            smtp_host = _env_vars.get("EMAIL_SMTP_HOST", "")
+
+        imap_host = _custom_prompt("IMAP host (e.g. imap.gmail.com):",
+                                    default=_env_vars.get("EMAIL_IMAP_HOST", ""))
+        if imap_host and "smtp" in imap_host.lower():
+            print("Warning: IMAP host usually starts with 'imap.' not 'smtp.'")
+            print("         For Gmail: imap.gmail.com")
+        if imap_host:
+            A.update_env_file(A.ENV_FILE_PATH, {"EMAIL_IMAP_HOST": imap_host})
+        else:
+            imap_host = _env_vars.get("EMAIL_IMAP_HOST", "")
+
+        allowed = _custom_prompt("Allowed email addresses (comma-separated):",
+                                 _current("email_allowed_users"))
+        if allowed:
+            content = _set_line(content, "email_allowed_users", allowed)
+
+        if not (email_addr and email_pass and smtp_host and imap_host):
+            content = _set_line(content, "email_enabled", "0")
+            email_on = False
+            print("Email disabled — address, password, SMTP host, and IMAP host all required.\n")
+        else:
+            content = _set_line(content, "email_enabled", "1")
+            print("Email configured.\n")
+
     # Mutually exclusive: ensure only the selected channel is enabled
     content = _set_line(content, "slack_enabled", "1" if slack_on else "0")
     content = _set_line(content, "whatsapp_enabled", "1" if wa_on else "0")
     content = _set_line(content, "discord_enabled", "1" if discord_on else "0")
+    content = _set_line(content, "email_enabled", "1" if email_on else "0")
 
     # Write config
     A._write_private_text(config_path, content)
@@ -2513,6 +2574,7 @@ def _run_gateway_setup():
     if slack_on: enabled.append("Slack")
     elif wa_on: enabled.append("WhatsApp")
     elif discord_on: enabled.append("Discord")
+    elif email_on: enabled.append("Email")
     if enabled:
         print(f"Config written to {config_path}")
         print(f"Enabled: {', '.join(enabled)}")

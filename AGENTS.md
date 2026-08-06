@@ -64,3 +64,73 @@ From `docs/Practical-Software-Engineering-Field-Guide (2).md` — follow these o
 **AI specifics** — prompts are source code: own files, versioned, reviewed. Pin exact model versions, never `-latest`. Instrument every model call (input/output/cached tokens, cost, latency, `stop_reason`, model id). Bound `max_tokens`; alert on `stop_reason == max_tokens`, output-parse failure, and cost spikes.
 
 **Reviewing agent code** — check for plausible-but-wrong APIs, silently swallowed errors, tests that mock the thing under test, scope creep, confidently invented config, and duplicated logic where an existing helper fits.
+
+## testing
+
+Every code change must have tests that would fail if the logic broke. The test suite lives in `tests/` and uses pytest.
+
+**Test structure:**
+
+| Directory | What it covers |
+|---|---|
+| `tests/gateway/platforms/` | Per-adapter unit tests (Slack, WhatsApp, Discord, Email) |
+| `tests/gateway/` | Gateway runner, auth, session store, agent bridge |
+| `tests/test_mcp.py` | MCP client (connecting to external servers) |
+| `tests/test_mcp_server.py` | MCP server mode (exposing tools to external agents) |
+| `tests/test_env_key_store.py` | `.env` key store, migration, masking, secret resolution |
+| `tests/test_permission.py` | Permission modes, escalation, grants, path zones |
+| `tests/test_audit_fixes.py` | Security hardening, shell guards, git blocks, calculator safety |
+| `tests/test_cli_setup.py` | Setup wizard, model picker, custom provider config |
+| `tests/test_subagents.py` | Subagent specs, tool-call parsing, reasoning strip, secret redaction |
+| `tests/test_providers.py` | Multi-model provider registry, API key precedence, model switching |
+| `tests/test_security_fixes.py` | Sensitive file blocks, host shell gating, git mutation blocks |
+| `tests/test_ssrf.py` | SSRF guard, IP validation, redirect re-checking |
+| `tests/test_http_search.py` | HTTP tools, template formatting, search tool declarations |
+| `tests/test_new_tools.py` | Cron, Docker sandbox, browser, native sandbox, structured git |
+| `tests/test_skills.py` | Skill package loading, tool merging, core-tool protection |
+| `tests/test_persona.py` | Persona rendering, frontmatter stripping |
+| `tests/test_images.py` | Image message building, MIME inference, sensitive symlink block |
+
+**What to test for each type of change:**
+
+| Change type | What to test |
+|---|---|
+| **New adapter** (Slack/Discord/WhatsApp/Email) | Imports, config reading, markdown conversion, send/edit, streaming support, allowlist integration, automated-sender handling |
+| **Gateway runner change** | Slash commands (`/approve`, `/deny`, `/new`, `/help`), session queueing, turn lock, adapter registration in `build_runner()` |
+| **Permission/security change** | `check_permission()` for each mode, escalation flow, grant lifecycle, hard-blocked commands, path zones, sensitive files |
+| **MCP change** | Tool registration, curated subset (dangerous tools excluded), handler signature synthesis, transport config, tool dispatch via `run_tool()` |
+| **Config/env change** | `.env` load/update, migration, masking, secret resolution precedence, allowlist from config |
+| **Engine change** | `find_tool_calls()` parsing (all formats including `<\|mask_start\|>`), `run_tool()` dispatch, `run_agent()` loop, escalation retry, unknown-tool recovery |
+| **CLI change** | Setup wizard flow, provider picker, gateway setup, `--mcp-serve` flag, `--mode` flag |
+
+**Test rules:**
+
+1. **Unit test every function with non-trivial logic** — branches, loops, parsers, permission gates, format converters. One-liners that pass through to stdlib need no test.
+2. **End-to-end pipeline test for each feature** — e.g. email adapter: IMAP poll → parse → allowlist check → dispatch to runner → agent processes → SMTP reply. Mock external services, test the full chain.
+3. **Test contracts, not implementation** — assert behavior, not internal variable names. If you refactor, tests should still pass.
+4. **One behavior per test** — test name states the behavior: `test_email_process_message_drops_unauthorized_sender`, not `test_email_1`.
+5. **Independent and order-free** — no test depends on another test's side effects. Use `tmp_path` for filesystem, `monkeypatch` for env/config.
+6. **Deterministic** — no `time.sleep`, no network calls, no random without a seed. Mock `asyncio.to_thread`, `imaplib.IMAP4_SSL`, `smtplib.SMTP`.
+7. **Verify the test fails when code is broken** — break the code deliberately, run the test, confirm it goes red. Then fix the code and confirm it goes green.
+8. **Mock external services, not the code under test** — mock `imaplib`/`smtplib` for email, `httpx` for WhatsApp, `discord.Client` for Discord. Never mock the function you're testing.
+9. **Test edge cases** — empty input, missing config, unauthorized sender, connection failure, timeout, large message, special characters in paths.
+10. **Run before committing** — `pytest tests/ -q` must pass. Pre-existing Windows failures (2 tests) are documented and excluded.
+
+**How to run tests:**
+
+```bash
+# Full suite
+.venv\Scripts\python.exe -m pytest tests/ -q
+
+# Gateway only
+.venv\Scripts\python.exe -m pytest tests/gateway/ -q
+
+# Single adapter
+.venv\Scripts\python.exe -m pytest tests/gateway/platforms/test_email.py -v
+
+# MCP server + client
+.venv\Scripts\python.exe -m pytest tests/test_mcp_server.py tests/test_mcp.py -v
+
+# Permission + security
+.venv\Scripts\python.exe -m pytest tests/test_permission.py tests/test_security_fixes.py -q
+```
