@@ -24,6 +24,34 @@ SLASH_COMMANDS = {
 APPROVAL_TIMEOUT = 300  # seconds, fail-closed
 
 
+class _RateLimiter:
+    """Sliding-window per-user message limit. per_minute=0 disables it.
+
+    The gateway serializes every turn behind a single global lock, so a user who
+    floods does not just spend their own budget — they starve every other user
+    in the queue. Rejected hits are deliberately NOT recorded, so a user who
+    keeps hammering still drains out of the window instead of being locked out
+    forever.
+    """
+
+    def __init__(self, per_minute: int, now=time.monotonic):
+        self.per_minute = int(per_minute or 0)
+        self._now = now
+        self._hits: dict = {}
+
+    def allow(self, user_id: str) -> bool:
+        if self.per_minute <= 0:
+            return True
+        current = self._now()
+        window = [t for t in self._hits.get(user_id, []) if current - t < 60.0]
+        if len(window) >= self.per_minute:
+            self._hits[user_id] = window
+            return False
+        window.append(current)
+        self._hits[user_id] = window
+        return True
+
+
 class _PendingApproval:
     """One pending escalation waiting for a chat reply."""
     def __init__(self, chat_id: str, tool_name: str, change_type: str):
@@ -52,6 +80,8 @@ class GatewayRunner:
         self._pending_approvals: dict[str, _PendingApproval] = {}
         # Session-scoped approvals: change_types already approved for this session
         self._session_allowlist: set[str] = set()
+        self._rate_limiter = _RateLimiter(
+            int(A.APP_CONFIG.get("gateway_rate_limit_per_min", "20")))
 
     def register_adapter(self, adapter) -> None:
         self.adapters.append(adapter)
@@ -61,6 +91,18 @@ class GatewayRunner:
         # grant access on discord or whatsapp.
         if not self.allowlist.is_allowed(event.user_id, platform=event.platform):
             log.warning("disallowed user dropped: %s (%s)", event.user_id, event.platform)
+            return
+        # Applies to slash commands too — otherwise /help is a free flood channel.
+        if not self._rate_limiter.allow(event.user_id):
+            log.warning("rate limited: %s (%s)", event.user_id, event.platform)
+            A._audit("gateway_rate_limited", tool="gateway", decision="blocked",
+                     detail=f"{event.platform}:{event.user_id}")
+            adapter = next(
+                (a for a in self.adapters if a.platform == event.platform), None)
+            if adapter:
+                await adapter.send_message(
+                    event.chat_id,
+                    "Rate limit reached — wait a minute and try again.")
             return
         if event.text.startswith("/"):
             parts = event.text.split(None, 1)
