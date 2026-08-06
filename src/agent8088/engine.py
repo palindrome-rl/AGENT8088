@@ -278,6 +278,15 @@ MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
 COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
 COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
 
+# --- Write blast radius: bounds how much damage one turn can do ---
+# The permission layer decides WHETHER a write is allowed; these bound HOW MANY
+# and HOW BIG. A model looping on write_file inside an approved turn, or one
+# emitting a multi-megabyte file by mistake, is a plausible accident rather than
+# an attack — which is exactly why the permission gate does not catch it.
+# 0 disables either check.
+MAX_WRITES_PER_TURN = int(APP_CONFIG.get("max_writes_per_turn", "0"))
+MAX_WRITE_BYTES = int(APP_CONFIG.get("max_write_bytes", "0"))
+
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
@@ -330,6 +339,14 @@ _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the ch
 _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
 _plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
 _active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
+_turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
+
+
+def reset_turn_counters() -> None:
+    """Clear the per-turn blast-radius counters. Called by run_agent at the start
+    of each turn; exposed so an embedder driving run_tool directly can reset too."""
+    global _turn_writes
+    _turn_writes = 0
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -499,6 +516,31 @@ def _matches_user_deny(command: str) -> bool:
     return any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_DENY_GLOBS)
 
 
+# --- User-defined allow rules (config: allow_commands) ---
+# The positive counterpart to deny_commands: a denylist only stops what you
+# thought of, an allowlist stops everything you did not. When non-empty, a shell
+# command must match one of these globs or it is refused at the hardline floor —
+# so it is not escalatable, the same as a deny rule. Empty (the default) means
+# no allowlist is in force and behaviour is unchanged.
+#
+# deny_commands still wins: a command on both lists is refused, because deny is
+# the more specific statement of intent. And neither list can re-enable the
+# unrecoverable floor (rm -rf /, mkfs, curl | sh) — allow_commands=* does not
+# unlock those.
+_USER_ALLOW_GLOBS = [
+    g.strip() for g in APP_CONFIG.get("allow_commands", "").split(",") if g.strip()
+]
+
+
+def _outside_user_allowlist(command: str) -> bool:
+    """True if an allowlist is in force and this command is not on it."""
+    if not _USER_ALLOW_GLOBS:
+        return False
+    import fnmatch
+    lowered = command.lower().strip()
+    return not any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_ALLOW_GLOBS)
+
+
 # --- Unrecoverable command floor (always-on, no override) ---
 # Catastrophic commands that are blocked in ALL permission modes, including
 # edit mode. These cause irreversible damage: filesystem wipes, disk formats,
@@ -585,6 +627,10 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     if _is_unrecoverable_command(command):
         return True
     if _matches_user_deny(command):
+        return True
+    # Checked after deny so deny_commands wins on a command listed in both, and
+    # after the unrecoverable floor so allow_commands=* cannot unlock rm -rf /.
+    if _outside_user_allowlist(command):
         return True
     if _git_read_targets_sensitive_file(command):
         return True
@@ -2675,7 +2721,7 @@ def _tool_path(spec: dict, args: dict) -> str:
 
 
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
-    global _remote_git_grant
+    global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
     if not spec:
         return f"Unknown tool: {name}"
@@ -2781,6 +2827,22 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="blocked_path")
             return f"Error: Write path is blocked: {target}"
+        # Blast radius. Checked here — before the permission gate — so an
+        # approved turn cannot be talked into writing 500 files, and so the
+        # refusal is not something the user can wave through by mistake.
+        if MAX_WRITES_PER_TURN and _turn_writes >= MAX_WRITES_PER_TURN:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="max_writes_per_turn")
+            return (f"Error: this turn has already written {_turn_writes} files, "
+                    f"the max_writes_per_turn limit. Stop writing and report what "
+                    f"you have done, or raise max_writes_per_turn in config.txt.")
+        write_size = len(str(args.get(spec.get("content_arg") or "content", "")))
+        if MAX_WRITE_BYTES and write_size > MAX_WRITE_BYTES:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="max_write_bytes")
+            return (f"Error: refusing to write {write_size} bytes to {target} — "
+                    f"over the max_write_bytes limit of {MAX_WRITE_BYTES}. Write a "
+                    f"smaller file or raise max_write_bytes in config.txt.")
     elif mode == "cron":
         command = str(args.get("action") or "list").strip().lower()
     elif mode == "browser":
@@ -2901,6 +2963,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
         content = str(args.get(content_arg, ""))
+        _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             old_content = _read_text_limited(target) if target.exists() else ""
@@ -3556,6 +3619,10 @@ def run_agent(messages, *, budget=None, **kwargs):
             cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
         )
     previous, _active_budget = _active_budget, budget
+    # Only the outermost run_agent resets the blast-radius counters: a subagent
+    # must not hand itself a fresh write budget, same reasoning as the token one.
+    if previous is None:
+        reset_turn_counters()
     try:
         return _run_agent_loop(messages, budget=budget, **kwargs)
     finally:
