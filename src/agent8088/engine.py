@@ -325,6 +325,10 @@ if CRON_MODE not in ("deny", "approve"):
 # closes by freezing HERMES_YOLO_MODE at import.
 UNATTENDED = os.environ.get("AGENT8088_UNATTENDED", "").strip().lower() in (
     "1", "true", "yes", "on")
+# Confirm before a slash command discards conversation state (/reset, /clear,
+# /new, /compact) or invalidates the MCP tool cache (/mcp reload).
+DESTRUCTIVE_CONFIRM = APP_CONFIG.get("destructive_slash_confirm", "1") != "0"
+MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
 
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 
@@ -27,6 +28,14 @@ def _matches(name, patterns):
 
 class MCPRuntime:
     """Own MCP sessions for this Agent8088 process and expose normal tool specs."""
+
+    # Per-server circuit breaker. Without it a dead server is retried on every
+    # call, so the model spends its whole turn budget on something that is not
+    # coming back inside this request — and a bare "failed" gives it no reason to
+    # stop. 0 disables.
+    BREAKER_THRESHOLD = 3
+    BREAKER_COOLDOWN_SEC = 60.0
+
     def __init__(self, project_root):
         self.project_root = Path(project_root)
         self._loop = None
@@ -34,6 +43,35 @@ class MCPRuntime:
         self._sessions = {}
         self._tools = {}
         self.statuses = {}
+        self._server_errors = {}      # server -> consecutive failure count
+        self._breaker_opened_at = {}  # server -> monotonic time the breaker opened
+
+    @staticmethod
+    def _now():
+        return time.monotonic()
+
+    def _breaker_remaining(self, server):
+        """Seconds left on an open breaker, or 0 if it is closed."""
+        if not self.BREAKER_THRESHOLD:
+            return 0
+        if self._server_errors.get(server, 0) < self.BREAKER_THRESHOLD:
+            return 0
+        age = self._now() - self._breaker_opened_at.get(server, 0.0)
+        if age >= self.BREAKER_COOLDOWN_SEC:
+            # Cooldown elapsed — let the next call through to probe the server.
+            self._server_errors[server] = 0
+            self._breaker_opened_at.pop(server, None)
+            return 0
+        return max(1, int(self.BREAKER_COOLDOWN_SEC - age))
+
+    def _note_failure(self, server):
+        self._server_errors[server] = self._server_errors.get(server, 0) + 1
+        if self.BREAKER_THRESHOLD and self._server_errors[server] >= self.BREAKER_THRESHOLD:
+            self._breaker_opened_at[server] = self._now()
+
+    def _note_success(self, server):
+        self._server_errors.pop(server, None)
+        self._breaker_opened_at.pop(server, None)
 
     @property
     def config_paths(self):
@@ -183,12 +221,25 @@ class MCPRuntime:
     def call(self, registered, arguments):
         if registered not in self._tools:
             return "Error: MCP tool is not available; run /mcp reload."
+        server = self._tools[registered]["mcp_server"]
+        remaining = self._breaker_remaining(server)
+        if remaining:
+            # Tell the model explicitly not to retry. Left to itself it will call
+            # the same dead tool every round until the turn runs out.
+            return (
+                f"Error: MCP server '{server}' is unreachable after "
+                f"{self._server_errors.get(server, 0)} consecutive failures. "
+                f"Auto-retry available in ~{remaining}s. Do NOT retry this tool "
+                f"yet — use another approach, or tell the user to check the server."
+            )
         try:
             result = self._run(self._call(registered, arguments), self._tools[registered].get("timeout", 30))
             data = result.model_dump(by_alias=True) if hasattr(result, "model_dump") else result
+            self._note_success(server)
             return json.dumps(data, default=str, ensure_ascii=False)
         except Exception as exc:
-            return f"Error: MCP {self._tools[registered]['mcp_server']} failed: {exc}"
+            self._note_failure(server)
+            return f"Error: MCP {server} failed: {exc}"
 
     def close(self):
         if self._sessions:

@@ -219,3 +219,73 @@ def test_unattended_is_frozen_at_import(engine, monkeypatch):
     """
     monkeypatch.setenv("AGENT8088_UNATTENDED", "1")
     assert engine.UNATTENDED is False   # still the import-time value
+
+
+# --- Destructive-command confirmation (Hermes destructive_slash_confirm) -----
+
+def test_destructive_confirm_defaults_on(engine):
+    assert engine.DESTRUCTIVE_CONFIRM is True
+    assert engine.MCP_RELOAD_CONFIRM is True
+
+
+def test_reset_asks_before_discarding_a_conversation(monkeypatch):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "DESTRUCTIVE_CONFIRM", True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.console, "input", lambda *a, **kw: "n")
+    cli.S.messages[:] = [{"role": "user", "content": "keep me"}]
+    cli.cmd_reset("")
+    assert cli.S.messages == [{"role": "user", "content": "keep me"}]
+
+
+def test_reset_proceeds_when_confirmed(monkeypatch):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "DESTRUCTIVE_CONFIRM", True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.console, "input", lambda *a, **kw: "y")
+    cli.S.messages[:] = [{"role": "user", "content": "bye"}]
+    cli.cmd_reset("")
+    assert cli.S.messages == []
+
+
+def test_reset_does_not_ask_on_an_empty_conversation(monkeypatch):
+    """Nothing to lose, so no prompt."""
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "DESTRUCTIVE_CONFIRM", True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+
+    def _must_not_ask(*a, **kw):
+        raise AssertionError("prompted with an empty conversation")
+
+    monkeypatch.setattr(cli.console, "input", _must_not_ask)
+    cli.S.messages[:] = []
+    cli.cmd_reset("")
+
+
+def test_confirmation_is_skipped_when_not_interactive(monkeypatch):
+    """A piped or scheduled run has nobody to ask; blocking would break scripts."""
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "DESTRUCTIVE_CONFIRM", True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    assert cli._confirm_destructive("Anything") is True
+
+
+def test_confirmation_can_be_turned_off(monkeypatch):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "DESTRUCTIVE_CONFIRM", False)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    assert cli._confirm_destructive("Anything") is True
+
+
+def test_mcp_reload_asks_before_dropping_the_tool_cache(monkeypatch):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "MCP_RELOAD_CONFIRM", True)
+    monkeypatch.setattr(cli.A, "DESTRUCTIVE_CONFIRM", True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.console, "input", lambda *a, **kw: "n")
+
+    def _must_not_reload():
+        raise AssertionError("reloaded without confirmation")
+
+    monkeypatch.setattr(cli.A, "reload_mcp_tools", _must_not_reload)
+    cli.cmd_mcp("reload")
