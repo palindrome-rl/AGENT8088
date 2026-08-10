@@ -288,6 +288,53 @@ def test_search_allows_a_non_sensitive_password_topic(engine):
 
 def test_system_prompt_directs_proactive_web_search(engine):
     assert "Proactively call web_search" in engine.BASE_SYSTEM_PROMPT
+    assert "current leaders or roles" in engine.BASE_SYSTEM_PROMPT
+    assert "Never use execute_shell for web research" in engine.BASE_SYSTEM_PROMPT
+
+
+def test_tool_descriptions_prefer_search_over_browser_or_shell(engine):
+    assert "Always use it before answering about current leaders" in (
+        engine.TOOL_SPECS["web_search"]["description"])
+    assert "user-supplied web page" in (
+        engine.TOOL_SPECS["browse_page"]["description"])
+    assert "Never use it for web research" in (
+        engine.TOOL_SPECS["execute_shell"]["description"])
+
+
+def test_search_results_block_unsolicited_browser_followup(engine, monkeypatch):
+    from tests.conftest import ScriptedModel
+
+    browser_runs = []
+    monkeypatch.setattr(engine, "run_tool", lambda name, args, **_: (
+        browser_runs.append((name, args)) if name == "browse_page" else "search results"
+    ))
+    engine.create_completion = ScriptedModel([
+        '✿FUNCTION✿: web_search ✿ARGS✿: {"query": "next F1 race"}',
+        '✿FUNCTION✿: browse_page ✿ARGS✿: {"url": "https://example.com/race"}',
+        "The search results answer the question.",
+    ])
+
+    assert engine.run_agent([{"role": "user", "content": "When is the next Formula 1 race?"}]) == (
+        "The search results answer the question.")
+    assert browser_runs == []
+
+
+def test_search_allows_browser_for_user_supplied_url(engine, monkeypatch):
+    from tests.conftest import ScriptedModel
+
+    browser_runs = []
+    monkeypatch.setattr(engine, "run_tool", lambda name, args, **_: (
+        browser_runs.append((name, args)) or "page loaded" if name == "browse_page" else "search results"
+    ))
+    url = "https://example.com/race"
+    engine.create_completion = ScriptedModel([
+        '✿FUNCTION✿: web_search ✿ARGS✿: {"query": "next F1 race"}',
+        f'✿FUNCTION✿: browse_page ✿ARGS✿: {{"url": "{url}"}}',
+        "The page confirms it.",
+    ])
+
+    assert engine.run_agent([{"role": "user", "content": f"Check {url}"}]) == "The page confirms it."
+    assert browser_runs == [("browse_page", {"url": url})]
 
 
 # ---------------------------------------------------------------------------

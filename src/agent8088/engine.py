@@ -4243,6 +4243,14 @@ def run_agent(messages, *, budget=None, **kwargs):
         _active_budget = previous
 
 
+def _user_supplied_url(messages, url: object) -> bool:
+    """Whether the exact page URL came from the user's request."""
+    return (isinstance(url, str) and bool(url) and any(
+        message.get("role") == "user" and url in str(message.get("content", ""))
+        for message in messages
+    ))
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -4271,6 +4279,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    searched = False     # prevents speculative page browsing after search results
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -4396,6 +4405,19 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
 
+            if (searched and name in {"browse_page", "get_page_title"}
+                    and not _user_supplied_url(messages, args.get("url"))):
+                result = ("Browser follow-up was not run. Use the web_search results, "
+                          "or ask the user for a specific page URL.")
+                tool_outputs.append(result)
+                if on_result:
+                    on_result(name, result)
+                if turn_tools is not None:
+                    turn_tools.append({"name": name, "arguments": args,
+                                       "result": result, "blocked": True})
+                messages.append({"role": "user", "content": f"Tool result ({name}):\n{result}"})
+                continue
+
             if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
                           if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
@@ -4412,6 +4434,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
             tool_outputs.append(result)
+            searched = searched or name == "web_search"
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.
