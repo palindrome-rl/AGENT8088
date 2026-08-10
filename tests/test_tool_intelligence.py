@@ -8,7 +8,12 @@ Deliberately narrow: only fetch-shaped calls are gated. After a search the
 agent may still legitimately install a package or read a file, and blocking
 that would be a worse bug than the redundant fetch.
 """
+from datetime import datetime
+
 import pytest
+
+from tests.data.tool_intelligence_cases import DATE_CASES as CASES_WITH_DATES
+from tests.data.tool_intelligence_cases import SEARCH_MONTH
 
 
 def _user(text):
@@ -132,8 +137,8 @@ def test_fetch_shaped_mcp_tool_after_a_search_is_refused(engine, monkeypatch,
 def test_unrelated_mcp_tool_after_a_search_still_runs(engine, monkeypatch,
                                                       scripted, register_tool):
     """Gating by name must not catch MCP tools that do something else entirely."""
-    register_tool("github_create_issue", mode="mcp", mcp_server="github",
-                  mcp_tool="create_issue", args="title")
+    spec = register_tool("github_create_issue", mode="mcp", args="title")
+    spec.update({"mcp_server": "github", "mcp_tool": "create_issue"})
     executed = _search_and_record_tools(engine, monkeypatch)
     _drive(engine, monkeypatch, scripted, [
         '✿FUNCTION✿: web_search ✿ARGS✿: {"query": "latest python release"}',
@@ -142,3 +147,96 @@ def test_unrelated_mcp_tool_after_a_search_still_runs(engine, monkeypatch,
     ])
 
     assert "github_create_issue" in executed
+
+
+# --- the scenario table, checked deterministically -----------------------
+
+@pytest.mark.parametrize("prompt,expectation", CASES_WITH_DATES)
+def test_scenario_table_queries_come_out_date_qualified(engine, monkeypatch,
+                                                        prompt, expectation):
+    """Every "as of now" case in the table must leave with a date attached.
+
+    Model *choice* isn't asserted here — a scripted model has no judgement to
+    test. That is what the live harness is for. This pins the half that can be
+    made deterministic.
+    """
+    sent = {}
+    monkeypatch.setattr(engine.web_search, "run_search",
+                        lambda q, *a, **k: sent.setdefault("query", q) or "1. result")
+    monkeypatch.setattr(engine, "_local_searxng_no_prompt_enabled", lambda: True)
+
+    engine.run_tool("web_search", {"query": prompt})
+
+    moment = datetime.now().astimezone()
+    if expectation == SEARCH_MONTH:
+        assert sent["query"].endswith(moment.strftime("%B %Y")), sent["query"]
+    else:
+        assert sent["query"].endswith(str(moment.year)), sent["query"]
+
+
+# --- the live harness's scoring logic ------------------------------------
+#
+# The harness itself needs a real model and real tokens, but how it grades an
+# answer is ordinary code — and a scorer that quietly passes everything would
+# make the whole exercise worthless.
+
+def _judge(*args):
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "verify_tool_intelligence", root / "scripts" / "verify_tool_intelligence.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._judge(*args)
+
+
+NOW = datetime(2026, 8, 10).astimezone()
+
+
+def test_judge_passes_a_no_tool_case_with_no_calls():
+    passed, _note = _judge("no_tool", [], NOW)
+    assert passed
+
+
+def test_judge_fails_a_no_tool_case_that_called_something():
+    passed, note = _judge("no_tool", [("web_search", {"query": "x"})], NOW)
+    assert not passed
+    assert "web_search" in note
+
+
+def test_judge_fails_a_search_case_that_did_not_search():
+    passed, _note = _judge("web_search", [], NOW)
+    assert not passed
+
+
+def test_judge_fails_a_search_that_piled_on_a_fetch():
+    """The redundancy this whole change is about must not score as a pass."""
+    calls = [("web_search", {"query": "latest python 2026"}),
+             ("browse_page", {"url": "https://python.org"})]
+
+    passed, note = _judge("web_search+year", calls, NOW)
+
+    assert not passed
+    assert "piled" in note
+
+
+def test_judge_requires_the_year_when_expected():
+    calls = [("web_search", {"query": "latest python release"})]
+
+    passed, note = _judge("web_search+year", calls, NOW)
+
+    assert not passed
+    assert "year" in note
+
+
+def test_judge_accepts_a_properly_dated_query():
+    calls = [("web_search", {"query": "latest python release 2026"})]
+
+    assert _judge("web_search+year", calls, NOW)[0]
+
+
+def test_judge_checks_the_named_tool_for_specific_cases():
+    assert _judge("calculate", [("calculate", {"expression": "1+1"})], NOW)[0]
+    assert not _judge("calculate", [("execute_shell", {"command": "python -c ..."})], NOW)[0]
