@@ -91,11 +91,12 @@ def test_normal_writes_are_utf8_and_preserve_newlines(engine, tmp_path, monkeypa
 
 # ----------------------------------------------------------- 2. HOST TOOLS
 def test_git_tools_declared_host(engine):
-    """Only mutating/credentialed git tools may bypass the sandbox."""
+    """Read-only git tools stay sandboxed with a Git-capable image."""
     for name in ("git_clone", "git_commit", "git_push", "git_create_pr"):
         assert engine.TOOL_SPECS[name].get("host"), f"{name} should be host=1"
     for name in ("git_status", "git_diff", "git_log"):
         assert not engine.TOOL_SPECS[name].get("host"), f"{name} should be sandboxed"
+        assert engine.TOOL_SPECS[name].get("sandbox_image") == "alpine/git:v2.47.2"
 
 
 def test_execute_shell_stays_sandboxed(engine):

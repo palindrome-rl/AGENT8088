@@ -38,6 +38,8 @@ def main() -> None:
         # The verifier discovers the installed native runtime, then isolates its
         # own child process and temporary home before executing sandbox probes.
         _run("uv", "run", "python", "scripts/verify_native_sandbox.py")
+        _run("uv", "run", "--extra", "dev", "--extra", "gateway",
+             "python", "scripts/verify_features.py", env=isolated)
 
         with tempfile.TemporaryDirectory(prefix="agent8088-release-build-") as build_dir:
             build = Path(build_dir)
