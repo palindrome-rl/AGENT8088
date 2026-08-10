@@ -153,7 +153,7 @@ These are normal on a clean machine and not failures:
 |---|---|
 | `REAL browser page load` | `playwright` not installed |
 | `web_search REAL query` | all backends failed, or ddgs rate limited |
-| `configured search backend reachable` | no local SearXNG on `127.0.0.1:8888` |
+| `configured search backend reachable` | the temporary LAN SearXNG at `127.0.0.1:8888` is unreachable from this machine |
 | `REAL native sandbox` | sandbox runtime not installed |
 
 ## Current state

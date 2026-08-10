@@ -215,9 +215,10 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `model_telemetry` | `0` | Append local, metadata-only model-call health records |
 | `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local path for model telemetry (mode 0600) |
-| `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
-| `web_search_provider` | (unset) | Pin a backend: `searxng`, `tavily`, `exa`, `ddgs`. Unset auto-selects with fallback |
+| `search_base_url` | `http://127.0.0.1:8888/search?q=` | Temporary LAN SearXNG URL for web_search; replace before public distribution |
+| `web_search_provider` | `searxng` | Temporary LAN deployment pin; replace before public distribution |
 | `web_search_results` | `5` | Results per search (max 20) |
+| `web_search_no_prompt` | `1` | Temporary LAN opt-in to no-prompt search; replace before public distribution |
 | `gateway_permission_mode` | `readonly` | Gateway permission mode: `readonly` (approvals in chat) or `edit` (full-auto) |
 | `strict_platform_allowlist` | `1` | Refuse a user id listed under another platform's `*_allowed_users` line |
 | `mcp_server_allow_writes` | `0` | Expose `write_file` over `--mcp-serve`. Writes are unattended (MCP has no approval channel) |
@@ -356,7 +357,12 @@ Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`,
 
 ### Security Layer 2: Network Access Control
 
-`web_search` and `get_page_title` prompt y/n on every request. No config needed.
+`get_page_title` prompts y/n on every request. `web_search` does too by default.
+Set `web_search_no_prompt=1` only with `web_search_provider=searxng` and a
+loopback or explicitly allowlisted private-LAN `search_base_url` (including an
+SSH tunnel). This cannot fall back to a public provider, and credentials,
+private keys, direct personal identifiers, and queries over 500 characters
+remain blocked.
 
 Every web search backend runs the same egress/SSRF/outbound-secret checks before
 each request. That includes `ddgs`, whose library owns its own HTTP client: its

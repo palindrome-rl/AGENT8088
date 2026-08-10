@@ -26,6 +26,14 @@ def test_web_search_is_the_only_search_tool(engine):
     assert search_tools == ["web_search"]
 
 
+def test_packaged_config_enables_the_temporary_lan_search_profile(engine):
+    config = engine.load_simple_config(engine.APP_DIR / "config.txt")
+    assert config["search_base_url"] == "http://127.0.0.1:8888/search?q="
+    assert config["web_search_provider"] == "searxng"
+    assert config["web_search_no_prompt"] == "1"
+    assert "127.0.0.1:8888" in config["ssrf_allow_hosts"]
+
+
 # ---------------------------------------------------------------------------
 # Guard injection
 # ---------------------------------------------------------------------------
@@ -209,7 +217,16 @@ def test_search_allows_a_clean_query(engine, monkeypatch):
     assert engine.run_tool("web_search", {"query": "weather"}) == "OK"
 
 
-def test_search_requires_permission_in_readonly(engine, monkeypatch):
+def _enable_local_searxng_without_prompt(engine):
+    engine.SEARCH_BASE_URL_CONFIGURED = True
+    engine.APP_CONFIG.update({
+        "search_base_url": "http://127.0.0.1:8888/search?q=",
+        "web_search_provider": "searxng",
+        "web_search_no_prompt": "1",
+    })
+
+
+def test_search_requires_permission_in_readonly_without_local_opt_in(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine.web_search, "run_search",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
@@ -217,12 +234,60 @@ def test_search_requires_permission_in_readonly(engine, monkeypatch):
     assert "ESCALATION" in out.upper()
 
 
-def test_search_is_denied_in_plan_only(engine, monkeypatch):
+def test_local_searxng_search_runs_without_permission_in_readonly(engine, monkeypatch):
+    _enable_local_searxng_without_prompt(engine)
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
+    assert engine.run_tool("web_search", {"query": "hi"}) == "OK"
+
+
+def test_local_searxng_search_runs_without_permission_in_plan_only(engine, monkeypatch):
+    _enable_local_searxng_without_prompt(engine)
     monkeypatch.setattr(engine, "PERMISSION_MODE", "plan-only")
+    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
+    assert engine.run_tool("web_search", {"query": "hi"}) == "OK"
+
+
+def test_allowlisted_private_lan_searxng_runs_without_permission(engine):
+    engine.SEARCH_BASE_URL_CONFIGURED = True
+    engine.APP_CONFIG.update({
+        "search_base_url": "http://127.0.0.1:8888/search?q=",
+        "web_search_provider": "searxng",
+        "web_search_no_prompt": "1",
+        "ssrf_allow_hosts": "127.0.0.1,localhost,127.0.0.1:8888",
+    })
+    assert engine._local_searxng_no_prompt_enabled() is True
+
+
+def test_no_prompt_search_cannot_use_a_nonlocal_or_unpinned_provider(engine):
+    engine.SEARCH_BASE_URL_CONFIGURED = True
+    engine.APP_CONFIG.update({
+        "search_base_url": "https://search.example.com/search?q=",
+        "web_search_provider": "searxng",
+        "web_search_no_prompt": "1",
+    })
+    assert engine._local_searxng_no_prompt_enabled() is False
+    engine.APP_CONFIG["search_base_url"] = "http://127.0.0.1:8888/search?q="
+    engine.APP_CONFIG["web_search_provider"] = "ddgs"
+    assert engine._local_searxng_no_prompt_enabled() is False
+
+
+def test_search_blocks_sensitive_query_data_before_calling_provider(engine, monkeypatch):
+    _enable_local_searxng_without_prompt(engine)
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine.web_search, "run_search",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
-    out = engine.run_tool("web_search", {"query": "hi"})
-    assert "ESCALATION" in out.upper() or "plan" in out.lower()
+    for query in ("alice@example.com", "password=correct-horse-battery-staple",
+                  "AKIAIOSFODNN7EXAMPLE", "555-555-1234"):
+        assert "Blocked" in engine.run_tool("web_search", {"query": query})
+
+
+def test_search_allows_a_non_sensitive_password_topic(engine):
+    assert engine._web_search_query_guard("how to reset a password") is None
+
+
+def test_system_prompt_directs_proactive_web_search(engine):
+    assert "Proactively call web_search" in engine.BASE_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------

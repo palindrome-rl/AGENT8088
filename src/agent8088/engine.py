@@ -2926,9 +2926,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # instead of telling the model to use execute_plan — the model never learns why.
     # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
     # to the normal check_permission gate so it escalates properly.
-    if (PERMISSION_MODE == "plan-only"
-            and allow_plan
-            and mode in ("write_text", "shell", "docker", "cron", "browser", "search")):
+    plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
+    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled())
+    if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return ("Error: plan-only mode — direct tool execution blocked. "
                 "Call the execute_plan tool with a JSON steps array, e.g.: "
                 'execute_plan(steps=[{"tool":"write_file",'
@@ -2990,6 +2990,11 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         query = str(args.get("query") or "").strip()
         if not query:
             return "Error: web_search requires 'query'."
+        sensitive = _web_search_query_guard(query)
+        if sensitive:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=query[:120], reason="sensitive_query")
+            return sensitive
         # Hard floor, checked before the permission gate: a search query is an
         # outbound channel, so a credential in it is never legitimate and is not
         # escalatable. The http path applies this to the URL and body; here the
@@ -3002,8 +3007,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=query[:120], reason="outbound_secret")
             return leak
-        if not check_permission(mode, f"web_search: {query[:80]}",
-                                approval_key=approval_key):
+        if (not _local_searxng_no_prompt_enabled()
+                and not check_permission(mode, f"web_search: {query[:80]}",
+                                         approval_key=approval_key)):
             _audit("escalation_requested", tool=name, mode=mode,
                    decision="blocked", detail=query[:120],
                    change_type="network_request")
@@ -3894,6 +3900,77 @@ def _web_search_limit() -> int:
         return max(1, min(int(APP_CONFIG.get("web_search_results", "5")), 20))
     except (TypeError, ValueError):
         return 5
+
+
+_WEB_SEARCH_MAX_QUERY_CHARS = 500
+_WEB_SEARCH_SENSITIVE_PATTERNS = (
+    (re.compile(r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----", re.IGNORECASE),
+     "private-key material"),
+    (re.compile(r"\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
+                r"authorization|bearer|password|passwd|secret)\s*[:=]\s*"
+                r"(?:['\"])?\S{8,}", re.IGNORECASE), "credential-like value"),
+    (re.compile(r"\b(?:sk|rk|ghp|github_pat|xox[baprs]|AKIA)[-_]?"
+                r"[A-Za-z0-9_=-]{12,}\b"), "credential-like token"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
+                r"[A-Za-z0-9_-]{10,}\b"), "authentication token"),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+     "email address"),
+    (re.compile(r"(?<!\d)(?:\+?\d[\s().-]?){8,}\d(?!\d)"),
+     "phone number or identifier"),
+    (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "payment-card-like number"),
+)
+
+
+def _web_search_query_guard(query: str) -> str | None:
+    """Refuse sensitive data in any outbound search query.
+
+    This runs before a query reaches even a trusted local SearXNG. It is a
+    hard floor rather than an approval decision: users can search for topics
+    such as password recovery, but no model-generated query may include an
+    actual credential or direct personal identifier.
+    """
+    if len(query) > _WEB_SEARCH_MAX_QUERY_CHARS:
+        return ("Error: Blocked — web search queries are limited to "
+                f"{_WEB_SEARCH_MAX_QUERY_CHARS} characters.")
+    for pattern, label in _WEB_SEARCH_SENSITIVE_PATTERNS:
+        if pattern.search(query):
+            return ("Error: Blocked — web search queries cannot include "
+                    f"{label}.")
+    return None
+
+
+def _local_searxng_no_prompt_enabled() -> bool:
+    """Whether the operator explicitly opted into a private SearXNG search.
+
+    The opt-in accepts loopback or an explicitly allowlisted private-LAN
+    SearXNG endpoint. It cannot silently switch to ddgs, an API-key provider,
+    or a public host, which would send model-derived queries to a third party
+    without a per-query approval.
+    """
+    if APP_CONFIG.get("web_search_no_prompt", "0") != "1":
+        return False
+    config = _search_config()
+    if config.get("web_search_provider") != "searxng":
+        return False
+    base_url = str(config.get("search_base_url") or "")
+    try:
+        import ipaddress
+        import urllib.parse
+        parts = urllib.parse.urlparse(base_url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme not in _ALLOWED_URL_SCHEMES or parts.path.rstrip("/") != "/search":
+            return False
+        if host == "localhost":
+            return True
+        address = ipaddress.ip_address(host)
+        if address.is_loopback:
+            return True
+        allowed_hosts = {value.strip().lower() for value in
+                         APP_CONFIG.get("ssrf_allow_hosts", "").split(",") if value.strip()}
+        return (address.is_private and (host in allowed_hosts
+                or f"{host}:{parts.port}" in allowed_hosts))
+    except ValueError:
+        return False
 
 
 def _search_config() -> dict:

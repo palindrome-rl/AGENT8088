@@ -1,7 +1,7 @@
 execute_shell|Execute a shell command and return output|mode=shell|args=command|command={command}|timeout=25
 write_file|Write content to a file|mode=write_text|args=filename,content|path_arg=filename|content_arg=content|timeout=10
 read_text|Read text from a file|mode=read_text|args=filename|path_arg=filename|timeout=10
-web_search|Search the web. Routes to the configured backend (SearXNG by default, Tavily or Exa when an API key is set, keyless ddgs as fallback) and falls back automatically when one is unavailable.|mode=search|args=query|timeout=30
+web_search|Search the web for fresh information. Call it automatically when needed to answer the prompt. Routes to the configured backend (SearXNG by default, Tavily or Exa when an API key is set, keyless ddgs as fallback) and falls back automatically when one is unavailable.|mode=search|args=query|timeout=30
 get_page_title|Fetch a webpage and extract its title|mode=http_get|args=url|url={url}|extract=title|timeout=20
 calculate|Evaluate a mathematical expression|mode=python_eval|args=expression|expression={expression}|timeout=10
 last_output|Get full output from the last tool call|mode=last_output

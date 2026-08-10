@@ -22,11 +22,13 @@ allowed_paths=.
 # allowed_sensitive_files=.env,secrets.yaml
 
 # --- Permission Layer 2: Network access control ---
-# web_search and get_page_title prompt the user (y/n) on every request.
+# get_page_title prompts the user (y/n) on every request. web_search does too
+# unless the narrow local-SearXNG opt-in below is enabled.
 
 # --- SSRF protection ---
-# Allow these internal hosts (for local SearXNG etc.):
-ssrf_allow_hosts=127.0.0.1,localhost
+# TEMPORARY LAN DEPLOYMENT: bundled installs use the shared SearXNG at
+# 127.0.0.1. Replace these four search settings before public distribution.
+ssrf_allow_hosts=127.0.0.1,localhost,127.0.0.1:8888
 
 # --- Permission Layer 3: Path-based write restrictions ---
 # Writes to these paths run without a prompt (auto-approved):
@@ -87,13 +89,16 @@ sandbox_runtime_version=0.0.67
 # see the live chain and `/search doctor` to diagnose.
 #
 # Pin one backend (skips auto-selection AND the fallback chain):
-# web_search_provider=searxng
+web_search_provider=searxng
 #
-# SearXNG instance. `/search setup` writes this for you. A remote instance must
-# use https:// — plaintext http:// is only accepted for loopback/private hosts.
-# The host must also appear in ssrf_allow_hosts above, or requests to it are
-# blocked as internal.
-# search_base_url=http://127.0.0.1:8888/search?q=
+# SearXNG instance. A remote instance must use https:// — plaintext http:// is
+# accepted only for loopback/private hosts. The host must appear in
+# ssrf_allow_hosts above, or requests to it are blocked as internal.
+search_base_url=http://127.0.0.1:8888/search?q=
+# Skip approval only for explicitly pinned loopback or explicitly allowlisted
+# private-LAN SearXNG. It never permits a fallback to a public provider.
+# Credentials and direct personal identifiers in search queries remain blocked.
+web_search_no_prompt=1
 #
 # Results per search (default 5, max 20):
 # web_search_results=5
