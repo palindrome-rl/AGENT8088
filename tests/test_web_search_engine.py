@@ -248,7 +248,7 @@ def test_local_searxng_search_runs_without_permission_in_plan_only(engine, monke
     assert engine.run_tool("web_search", {"query": "hi"}) == "OK"
 
 
-def test_allowlisted_private_lan_searxng_runs_without_permission(engine):
+def test_allowlisted_private_lan_searxng_runs_without_permission(engine, monkeypatch):
     engine.SEARCH_BASE_URL_CONFIGURED = True
     engine.APP_CONFIG.update({
         "search_base_url": "http://127.0.0.1:8888/search?q=",
@@ -256,7 +256,10 @@ def test_allowlisted_private_lan_searxng_runs_without_permission(engine):
         "web_search_no_prompt": "1",
         "ssrf_allow_hosts": "127.0.0.1,localhost,127.0.0.1:8888",
     })
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
     assert engine._local_searxng_no_prompt_enabled() is True
+    assert engine.run_tool("web_search", {"query": "Pakistan public holidays"}) == "OK"
 
 
 def test_no_prompt_search_cannot_use_a_nonlocal_or_unpinned_provider(engine):
