@@ -76,7 +76,7 @@ def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys
     fake = _FakeInquirer({
         "text": ["~", ""],
         "secret": [""],
-        "fuzzy": ["openai", "gpt-live"],
+        "fuzzy": ["openai", "gpt-live", "Keep current setting"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setenv("AGENT8088_CONFIG", str(config))
@@ -131,7 +131,7 @@ def test_setup_fetch_failure_asks_for_model_without_fallback_choices(tmp_path, m
     fake = _FakeInquirer({
         "text": ["~", "typed-model", ""],
         "secret": [""],
-        "fuzzy": ["openai"],
+        "fuzzy": ["openai", "None (disable web search)"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setenv("AGENT8088_CONFIG", str(config))
@@ -143,7 +143,8 @@ def test_setup_fetch_failure_asks_for_model_without_fallback_choices(tmp_path, m
 
     cli._run_setup()
 
-    fuzzy_calls = [kwargs for kind, kwargs in fake.calls if kind == "fuzzy"]
+    fuzzy_calls = [kwargs for kind, kwargs in fake.calls if kind == "fuzzy"
+                   and not str(kwargs.get("message", "")).startswith("Web search")]
     assert len(fuzzy_calls) == 1
     model_prompts = [
         kwargs for kind, kwargs in fake.calls
@@ -162,7 +163,7 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
             "https://llm.example.test/v1/chat/completions", "", "custom-model", "",
         ],
         "secret": ["secret-key"],
-        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE],
+        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE, "None (disable web search)"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setenv("AGENT8088_CONFIG", str(config))
@@ -195,7 +196,7 @@ def test_model_setup_custom_provider_stays_in_wizard(tmp_path, monkeypatch):
     fake = _FakeInquirer({
         "text": ["My REPL Provider", "https://llm.example.test/v1", "repl-model"],
         "secret": ["repl-key"],
-        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE],
+        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE, "None (disable web search)"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setattr(cli.A, "CONFIG_PATH", config)
@@ -251,7 +252,7 @@ def test_models_command_picks_and_switches_model(monkeypatch):
     fake = _FakeInquirer({
         "text": [],
         "secret": [],
-        "fuzzy": ["openai", "gpt-new"],
+        "fuzzy": ["openai", "gpt-new", "None (disable web search)"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setattr(cli.A, "PROVIDERS", {"openai": {"model": "gpt-old", "base_url": "https://api.openai.com/v1"}})
