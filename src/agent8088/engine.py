@@ -1184,7 +1184,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = ""):
     selected_model = model_name or MODEL_NAME
-    full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
+    full_messages = [{"role": "system", "content": system_prompt or current_system_prompt()}, *messages]
     penalties = {}
     if FREQUENCY_PENALTY:
         penalties["frequency_penalty"] = FREQUENCY_PENALTY
@@ -1573,6 +1573,42 @@ def _resolve_tool_name(name):
     return TOOL_ALIASES.get(name, name)
 
 
+RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
+
+
+def render_runtime_context(now=None) -> str:
+    """Tell the model what day it is.
+
+    Without this it has no clock — only a training cutoff — so "the next
+    election" silently means whatever was next while it was trained, and a
+    page from years ago reads as current. Every date-aware behaviour in the
+    search path depends on this block being present.
+
+    Rendered per turn rather than at import: a gateway or cron process runs
+    for days and would otherwise keep answering with the date it booted on.
+    """
+    moment = now or datetime.now().astimezone()
+    return (
+        f"{RUNTIME_CONTEXT_HEADING}"
+        f"- Today is {moment.strftime('%A, %d %B %Y')}.\n"
+        f"- Current year: {moment.year}. Current month: {moment.strftime('%B %Y')}.\n"
+        "- Your training data is older than today. For anything current, "
+        "time-sensitive, or scheduled, search rather than answering from memory.\n"
+    )
+
+
+def current_system_prompt() -> str:
+    """The default system prompt, carrying today's date rather than import day's.
+
+    SYSTEM_PROMPT is built once at module import. That is fine for a one-shot
+    CLI invocation and wrong for the gateway and cron, which stay up long
+    enough for the date to move underneath them. Splitting on the heading
+    keeps repeated calls from stacking context blocks.
+    """
+    base = SYSTEM_PROMPT.split(RUNTIME_CONTEXT_HEADING)[0]
+    return base + render_runtime_context()
+
+
 def render_tool_docs(specs: dict) -> str:
     """Generate the tool section of the system prompt from TOOL_SPECS, so the
     prompt can never drift from tools.txt. Required because the Ollama backend
@@ -1713,7 +1749,8 @@ if SKILL_PACKAGES:
 
 
 SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
-                 + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE))
+                 + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE)
+                 + render_runtime_context())
 
 _last_tool_output = ""
 _last_tool_name = ""
