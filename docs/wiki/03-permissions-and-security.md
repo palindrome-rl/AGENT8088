@@ -466,7 +466,7 @@ so "which guardrails are active?" in chat gets the same facts. See
 Every claim above is covered by the suites:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent python -m pytest \
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest \
   tests/test_permission.py tests/test_security_fixes.py tests/test_ssrf.py \
   tests/test_egress.py tests/test_exfil_guard.py tests/test_turn_budget.py \
   tests/test_audit_log.py tests/test_command_allowlist.py \

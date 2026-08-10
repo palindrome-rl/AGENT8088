@@ -4062,6 +4062,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     seen = set()      # (name, args) signatures already run -> breaks loops
+    tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
@@ -4190,7 +4191,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
 
-            if sig in seen:  # exact repeat -> feed cached output instead of re-running
+            if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
                           if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
@@ -4198,12 +4199,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
 
-            seen.add(sig)
+            if "__parse_error__" not in args:
+                seen.add(sig)
             if on_tool:
                 on_tool(name)
             with spin(f"running {name}..."):
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
+            tool_outputs.append(result)
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.
@@ -4264,7 +4267,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
 
     # Max turns reached or forced stop: return the best answer we have.
-    fallback = _guard_answer(_last_tool_output[:1000] if _last_tool_output else "Could not complete the task.")
+    fallback_source = "\n\n".join(tool_outputs) or _last_tool_output
+    fallback = _guard_answer(fallback_source[:3000] if fallback_source else "Could not complete the task.")
     if on_answer:
         on_answer(fallback)
     if trace is not None:

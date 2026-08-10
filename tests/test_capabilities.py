@@ -84,6 +84,10 @@ def test_tool_is_registered(engine):
     assert "describe_capabilities" in engine.TOOL_SPECS
 
 
+def test_model_tool_schemas_match_registered_tools(engine):
+    assert {tool["function"]["name"] for tool in engine.TOOLS_DEF} == set(engine.TOOL_SPECS)
+
+
 def test_tool_works_in_readonly_mode(engine, monkeypatch):
     """The most restrictive mode must still be able to answer the question."""
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")

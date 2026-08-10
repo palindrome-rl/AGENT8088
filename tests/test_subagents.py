@@ -175,6 +175,28 @@ def test_run_agent_nudges_on_reasoning_only_turn(engine):
     assert answer == "Here is my answer."
 
 
+def test_malformed_tool_call_is_not_repeat_cached(engine):
+    malformed = '✿FUNCTION✿: write_file ✿ARGS✿: {"filename": "x", "content": }'
+    fake = ScriptedModel([malformed, malformed, "I could not write the file."])
+    engine.create_completion = fake
+
+    assert engine.run_agent([{"role": "user", "content": "write x"}], max_turns=3) == "I could not write the file."
+    assert "already ran" not in fake.calls[2]["messages"][-1]["content"]
+
+
+def test_loop_fallback_preserves_completed_tool_outputs(engine):
+    engine.create_completion = ScriptedModel([
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "1"}',
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "2"}',
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "2"}',
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "2"}',
+    ])
+
+    answer = engine.run_agent([{"role": "user", "content": "calculate"}], max_turns=4)
+    assert "1" in answer
+    assert "2" in answer
+
+
 def test_guard_blocks_system_prompt_leak(engine):
     # Feed back the actual base system prompt as if the model leaked it.
     leak = engine.BASE_SYSTEM_PROMPT

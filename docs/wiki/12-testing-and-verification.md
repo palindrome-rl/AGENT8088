@@ -6,14 +6,14 @@ Three layers, all runnable offline with no model backend.
 
 | Layer | Command | Scale |
 |---|---|---|
-| Unit tests | `pytest tests/` | 604 tests, ~10s |
+| Unit tests | `uv run python -m pytest tests/` | 627 tests, ~10s |
 | Feature verification | `scripts/verify_features.py` | 89 checks, 13 sections |
 | Exhaustive verification | `scripts/verify_everything.py` | 450 checks, 20 sections |
 
 ## 1. Unit tests
 
 ```sh
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
 ```
 
 **`AGENT8088_CONFIG=/nonexistent` is not optional.** It forces packaged-default
@@ -23,22 +23,22 @@ test run can pick up and mutate your live configuration.
 Per area:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_permission.py -q      # permission modes + floors
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_security_fixes.py -q  # shell/git hard blocks
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_ssrf.py -q            # SSRF
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_egress.py -q          # allowed_domains / blocked_domains
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_exfil_guard.py -q     # outbound secret refusal
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_turn_budget.py -q     # token / cost / wall-clock ceilings
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_command_allowlist.py -q  # allow_commands + write blast radius
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_audit_log.py -q       # audit trail
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_capabilities.py -q    # capability self-report
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/gateway/test_rate_limit.py -q  # gateway rate limiting
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_mcp.py -q             # MCP client
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_mcp_server.py -q      # MCP server
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/gateway/ -q                # all 3 platforms
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_env_key_store.py -q   # .env store + redaction
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_providers.py -q       # providers + key precedence
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/test_subagents.py -q       # sub-agents + guardrails
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_permission.py -q      # permission modes + floors
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_security_fixes.py -q  # shell/git hard blocks
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_ssrf.py -q            # SSRF
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_egress.py -q          # allowed_domains / blocked_domains
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_exfil_guard.py -q     # outbound secret refusal
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_turn_budget.py -q     # token / cost / wall-clock ceilings
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_command_allowlist.py -q  # allow_commands + write blast radius
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_audit_log.py -q       # audit trail
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_capabilities.py -q    # capability self-report
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/test_rate_limit.py -q  # gateway rate limiting
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp.py -q             # MCP client
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp_server.py -q      # MCP server
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/ -q                # all 3 platforms
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_env_key_store.py -q   # .env store + redaction
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_providers.py -q       # providers + key precedence
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_subagents.py -q       # sub-agents + guardrails
 ```
 
 ### Gateway extras are required
@@ -48,7 +48,7 @@ roughly 19 failures that look like real breakage but are a missing optional
 dependency:
 
 ```sh
-pip install -e ".[gateway]"
+uv sync --all-extras --locked
 ```
 
 ## 2. Feature verification
@@ -57,7 +57,7 @@ pip install -e ".[gateway]"
 VERIFY_HOME="$(mktemp -d)"
 trap 'rm -rf -- "$VERIFY_HOME"' EXIT
 AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" \
-  python scripts/verify_features.py
+  uv run python scripts/verify_features.py
 ```
 
 Runs real behaviour — git operations in temp repos, a real browser if available,
@@ -72,7 +72,7 @@ pass.** Exit code is non-zero on any real failure.
 ```sh
 VERIFY_HOME="$(mktemp -d)"
 AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" \
-  python scripts/verify_everything.py
+  uv run python scripts/verify_everything.py
 rm -rf -- "$VERIFY_HOME"
 ```
 
@@ -82,7 +82,7 @@ hard-block matrix, adversarial/edge cases, and the CLI surface.
 ## 4. Duplicate-definition check
 
 ```sh
-python scripts/check_duplicate_defs.py
+uv run python scripts/check_duplicate_defs.py
 ```
 
 Fails if a module defines the same top-level function or class twice. This
@@ -102,7 +102,7 @@ Non-negotiable, because violating them has caused a real incident in this repo:
    real `~/.agent8088/config.txt`.
 
    ```sh
-   HOME="$(mktemp -d)" AGENT8088_CONFIG=/nonexistent python -m agent8088.cli --help
+   HOME="$(mktemp -d)" AGENT8088_CONFIG=/nonexistent uv run python -m agent8088.cli --help
    ```
 
 2. **Always set `AGENT8088_CONFIG=/nonexistent`** for tests.
@@ -163,7 +163,7 @@ Verified on the tree this wiki documents:
 
 | Suite | Result |
 |---|---|
-| Unit tests | 624 passed, 0 failed |
+| Unit tests | 627 passed, 0 failed |
 | `verify_features.py` | 89 passed, 0 failed, 4 skipped |
 | `verify_everything.py` | 450 passed, 0 failed, 4 skipped |
 | Duplicate-def check | clean |

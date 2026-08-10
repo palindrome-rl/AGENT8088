@@ -433,17 +433,17 @@ Available modes for package tools: `shell`, `http_get`, `read_text`, `write_text
 
 ## 21. Test + verification suites
 
-**84 unit tests** (hermetic — no model backend, no network):
+**627 unit tests** (hermetic — no model backend, no network):
 
 ```bash
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
 ```
 
-**92 functional checks** against real dependencies (real git, real browser, real
+**89 functional checks** against real dependencies (real git, real browser, real
 containers). Reports `⊘ SKIP` with a reason rather than silently passing:
 
 ```bash
-python scripts/verify_features.py
+uv run python scripts/verify_features.py
 ```
 
 Full testing guide, including manual CLI checks and guardrail prompts to try by hand:

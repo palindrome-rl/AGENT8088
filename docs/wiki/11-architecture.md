@@ -74,9 +74,9 @@ correct permissions automatically — no new security code, and no way to
 accidentally add a tool that bypasses the gate.
 
 `TOOL_SPECS` (name → spec) and `TOOLS_DEF` (the JSON schema list sent to the
-model) are derived from it, and an invariant enforced by the test suite says
-those two sets must match exactly — so a registered tool can never be invisible
-to the model, or vice versa.
+model) are built together from it. The test suite verifies their names match
+exactly, so a registered tool can never be invisible to the model, or vice
+versa.
 
 ## Security layering
 
