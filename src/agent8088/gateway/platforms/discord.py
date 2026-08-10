@@ -239,11 +239,27 @@ class _ApprovalView(discord.ui.View):
         self.runner = runner
         self.chat_id = chat_id
 
+    def _lookup(self):
+        # _pending_approvals is keyed by (platform, chat_id), not chat_id alone —
+        # a bare .get(chat_id) always returns None, so buttons never resolve.
+        return self.runner._pending_approvals.get(("discord", self.chat_id))
+
+    def _check_clicker(self, entry, interaction):
+        # Only the user who triggered the escalation may approve/deny it —
+        # matches the slash-command check at runner.py /approve. Returns True if allowed.
+        if entry.user_id and entry.user_id != str(interaction.user.id):
+            asyncio.create_task(interaction.response.send_message(
+                "Only the requester may approve this action.", ephemeral=True))
+            return False
+        return True
+
     @discord.ui.button(label="Approve", emoji="✅", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if not entry:
             await interaction.response.send_message("No pending approval.", ephemeral=True)
+            return
+        if not self._check_clicker(entry, interaction):
             return
         entry.approved = True
         entry.event.set()
@@ -252,9 +268,11 @@ class _ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Approve (session)", emoji="✔️", style=discord.ButtonStyle.primary)
     async def approve_session(self, interaction: discord.Interaction, button: discord.ui.Button):
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if not entry:
             await interaction.response.send_message("No pending approval.", ephemeral=True)
+            return
+        if not self._check_clicker(entry, interaction):
             return
         entry.approved = True
         entry.session_scope = True
@@ -264,9 +282,11 @@ class _ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if not entry:
             await interaction.response.send_message("No pending approval.", ephemeral=True)
+            return
+        if not self._check_clicker(entry, interaction):
             return
         entry.approved = False
         entry.event.set()
@@ -279,7 +299,7 @@ class _ApprovalView(discord.ui.View):
 
     async def on_timeout(self):
         """Fail-closed: mark as denied when buttons expire."""
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if entry and not entry.event.is_set():
             entry.approved = False
             entry.event.set()
