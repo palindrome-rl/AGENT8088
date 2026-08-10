@@ -439,7 +439,8 @@ def test_windows_model_cache_uses_private_acl(tmp_path, monkeypatch):
 
     def fake_run(command, **kwargs):
         calls.append(command)
-        if command[0] == "whoami":
+        # Resolved absolutely so Git Bash's coreutils whoami cannot shadow it.
+        if command[0].lower().endswith("whoami.exe") or command[0] == "whoami":
             return SimpleNamespace(returncode=0, stdout='"PC\\\\user","S-1-5-21-1"\r\n')
         return SimpleNamespace(returncode=0, stdout="")
 
@@ -457,7 +458,8 @@ def test_windows_private_files_use_current_user_sid(engine, tmp_path, monkeypatc
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
-        if command[0] == "whoami":
+        # Resolved absolutely so Git Bash's coreutils whoami cannot shadow it.
+        if command[0].lower().endswith("whoami.exe") or command[0] == "whoami":
             return SimpleNamespace(
                 returncode=0,
                 stdout='"FAKE-PC\\\\tester","S-1-5-21-100-200-300-400"\r\n',

@@ -34,8 +34,15 @@ def _protect_private_file(path: Path) -> None:
 
     import csv
 
+    # Absolute path on purpose. Under Git Bash / MSYS, PATH resolves `whoami` to
+    # the coreutils build, which rejects /user and exits non-zero — so every
+    # private-file write (the .env key store, telemetry, sandbox settings) fails
+    # with "Could not determine the current Windows user SID" for anyone running
+    # Agent8088 from that shell.
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    whoami = Path(system_root) / "System32" / "whoami.exe"
     identity = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"],
+        [str(whoami) if whoami.is_file() else "whoami", "/user", "/fo", "csv", "/nh"],
         capture_output=True, text=True, timeout=10,
     )
     try:

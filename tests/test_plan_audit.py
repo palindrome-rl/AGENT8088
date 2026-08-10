@@ -5,6 +5,7 @@ though it had. The plan tests stop the cascade; the floor tests make the auditor
 that catches it structurally incapable of changing what it is inspecting.
 """
 import json
+from types import SimpleNamespace
 
 from tests.conftest import ScriptedModel
 
@@ -163,6 +164,33 @@ def test_audit_is_skipped_when_the_turn_budget_is_spent(engine, tmp_path, monkey
     assert spawned == [], "no audit call once the shared budget is exhausted"
     assert "budget spent" in result
     assert "halted" not in result
+
+
+def test_private_file_protection_does_not_use_a_shadowable_whoami(engine, tmp_path,
+                                                                  monkeypatch):
+    """Git Bash's coreutils `whoami` shadows Windows' and rejects /user.
+
+    Resolving it off PATH made every private-file write fail for anyone running
+    from that shell, so the call must name whoami.exe by absolute path.
+    """
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    seen = {}
+
+    def _fake_run(command, **_kwargs):
+        seen.setdefault("first", command)
+        if command[0].endswith("whoami.exe") or command[0] == "whoami":
+            return SimpleNamespace(returncode=0, stdout='"PC\\\\u","S-1-5-21-1"\r\n')
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(engine.subprocess, "run", _fake_run)
+    target = tmp_path / "private.txt"
+    target.write_text("x", encoding="utf-8")
+    engine._protect_private_file(target)
+
+    invoked = seen["first"][0]
+    assert invoked.lower().endswith("system32\\whoami.exe"), (
+        f"whoami must be resolved absolutely, not off PATH: {invoked!r}")
 
 
 def _floor_probe(engine, name="floor-probe"):
