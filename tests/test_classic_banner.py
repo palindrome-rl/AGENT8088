@@ -29,6 +29,19 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     assert classic._catalog(["delta", "alpha"], columns=1) == "alpha\ndelta"
 
 
+def test_web_search_call_hides_the_query_in_the_cli(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(classic, "console", Console(file=output, width=180, color_system=None))
+    monkeypatch.setattr(classic.S, "verbose", "on")
+
+    classic.on_calls([{"name": "web_search", "arguments": {"query": "private search terms"}}])
+
+    rendered = output.getvalue()
+    assert "Searching the web" in rendered
+    assert "private search terms" not in rendered
+    assert "web_search(" not in rendered
+
+
 def test_palindrome_logo_falls_back_when_asset_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
 

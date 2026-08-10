@@ -514,6 +514,9 @@ def on_calls(calls):
     if S.verbose == "off":
         return
     for call in calls:
+        if call["name"] == "web_search":
+            console.print(Text("⏺ Searching the web…", style="#237dd7"))
+            continue
         line = Text()
         line.append("⏺ ", style="#237dd7")
         line.append(call["name"], style="bold")
