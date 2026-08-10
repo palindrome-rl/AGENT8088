@@ -214,6 +214,8 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
 | `docker_pull_seconds` | `300` | Budget for pulling a missing container image, separate from any tool's own timeout |
 | `plan_audit` | `0` | Verify every mutating `execute_plan` step with the readonly `auditor` sub-agent; a failed verification halts the plan |
+| `plan_audit_revert` | `1` | Restore a write that failed verification to its exact pre-step bytes, so only verified state persists |
+| `plan_audit_revert_max_bytes` | `1048576` | Files above this are not snapshotted, so they are not reverted (reported, never implied) |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `model_telemetry` | `0` | Append local, metadata-only model-call health records |
 | `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local path for model telemetry (mode 0600) |

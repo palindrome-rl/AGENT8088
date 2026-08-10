@@ -60,9 +60,13 @@ def test_model_telemetry_is_private_metadata_only(engine, monkeypatch, tmp_path)
     )
 
     [entry] = _entries(path)
+    # Exhaustive on purpose: this is the assertion that catches a field carrying
+    # user content into the telemetry file. `role` is one of "main" or
+    # "subagent:<type>" — it names which agent spent the tokens, never what for.
     assert entry == {
         "ts": entry["ts"], "event": "model_call", "provider": "safe-provider",
         "model": "safe-model", "attempt": "direct", "outcome": "success",
+        "role": "main",
         "latency_ms": entry["latency_ms"], "max_tokens": 2000,
         "token_source": "provider", "input_tokens": 7, "output_tokens": 3,
         "cost_usd": 0.013, "finish_reason": "stop", "error_type": None,

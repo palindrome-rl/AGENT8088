@@ -82,6 +82,14 @@ sandbox_runtime_version=0.0.67
 # itself. Worth enabling for unattended runs (gateway, cron) where no operator
 # is watching, which is exactly where a silently half-done plan does damage.
 # plan_audit=0
+# With auditing on, a write that FAILS verification is restored to its exact
+# pre-step bytes: only verified state persists. Nothing outside the failed step
+# is touched, and tools with no undo (shell, docker, cron) say so instead of
+# implying a rollback that did not happen.
+# plan_audit_revert=1
+# Files larger than this are not snapshotted, so they are not reverted — the plan
+# output says so rather than implying otherwise.
+# plan_audit_revert_max_bytes=1048576
 
 # --- local model telemetry ---
 # Writes metadata only (provider/model, timing, token/cost estimates, outcome).

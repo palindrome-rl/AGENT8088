@@ -383,6 +383,11 @@ _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the ch
 _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
 _plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
 _active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
+# Which role is spending right now: "main", or "subagent:<type>". Verification is
+# not free — published figures put auditors at 19-38% of harness tokens — and a
+# cost you cannot see is a cost you cannot decide about. Both the turn budget and
+# the telemetry line attribute spend to whichever role incurred it.
+_active_role = "main"
 _turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
 _consecutive_denials = 0  # denial circuit breaker (see DENIAL_BREAKER_THRESHOLD)
 
@@ -2003,14 +2008,72 @@ def _plan_step_failed(result: str) -> bool:
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
-# Only steps that changed something are worth verifying. Auditing a read tells
-# you the read returned what it returned.
-_AUDITED_MODES = ("write_text", "shell", "docker", "cron", "browser")
+PLAN_AUDIT_REVERT = APP_CONFIG.get("plan_audit_revert", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+PLAN_REVERT_MAX_BYTES = int(APP_CONFIG.get("plan_audit_revert_max_bytes", str(1 << 20)))
+# Modes whose effect leaves something durable to inspect afterwards. `browser` is
+# deliberately absent: a rendered page closes over nothing, so auditing it buys an
+# inconclusive verdict at the price of a model call. Reads are absent for the
+# obvious reason — auditing a read tells you the read returned what it returned.
+_CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
 
+def _plan_step_is_auditable(tool_name: str, acceptance: str) -> bool:
+    """Whether this step has an inspectable closure worth spending an audit on.
+
+    A declared `acceptance` always qualifies: the step's author has named what
+    done means, which is the strongest thing an auditor can be handed. Otherwise
+    fall back to modes that leave a durable trace.
+    """
+    if acceptance:
+        return True
+    return TOOL_SPECS.get(tool_name, {}).get("mode") in _CLOSURE_MODES
+
+
+def _capture_write_state(tool_name: str, tool_args: dict):
+    """Snapshot what a write step is about to overwrite, so a failed audit can
+    put it back. Returns (path, prior_bytes) with prior_bytes None when the file
+    did not exist, or None when no snapshot can be taken.
+
+    Bounded by plan_audit_revert_max_bytes: holding an arbitrarily large file in
+    memory to enable a maybe-revert is a worse trade than declining to revert and
+    saying so.
+    """
+    spec = TOOL_SPECS.get(tool_name, {})
+    if spec.get("mode") != "write_text":
+        return None
+    try:
+        path = resolve_user_path(_tool_path(spec, tool_args))
+    except Exception:
+        return None
+    try:
+        if not path.exists():
+            return (path, None)
+        if path.stat().st_size > PLAN_REVERT_MAX_BYTES:
+            return None
+        return (path, path.read_bytes())
+    except OSError:
+        return None
+
+
+def _revert_plan_write(snapshot) -> str:
+    """Undo one write step, returning the file to its exact pre-step bytes."""
+    path, prior = snapshot
+    try:
+        if prior is None:
+            if path.exists():
+                path.unlink()
+            return f"reverted — removed {path.name}"
+        path.write_bytes(prior)
+        return f"reverted — restored the previous contents of {path.name}"
+    except OSError as exc:
+        return f"REVERT FAILED for {path.name} ({exc}) — inspect this file by hand"
+
+
 def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
-                     result: str, depth: int) -> tuple:
+                     result: str, depth: int,
+                     acceptance: str = "", evidence: str = "") -> tuple:
     """Check a completed step against the environment. Returns (halt_reason, note).
 
     Off unless `plan_audit=1`. A step that reports success has only told us the
@@ -2032,9 +2095,15 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
         f"Step: {step_text or tool_name}\n"
         f"Tool: {tool_name}\n"
         f"Arguments: {json.dumps(tool_args, default=str)[:500]}\n"
-        f"Reported result: {result[:500]}\n\n"
-        "Reply with a single VERDICT line as instructed."
+        f"Reported result: {result[:500]}\n"
     )
+    # A stated criterion beats the auditor inventing one. Without it the auditor
+    # has to guess what "worked" means and grades against its own guess.
+    if acceptance:
+        task += f"\nAcceptance criteria (the step is done only if this holds): {acceptance}\n"
+    if evidence:
+        task += f"Evidence to collect: {evidence}\n"
+    task += "\nReply with a single VERDICT line as instructed."
     answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
     verdict = _VERDICT_RE.search(answer or "")
     if verdict is None:
@@ -2102,10 +2171,13 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             tool_name = str(step.get("tool") or classify_plan_component(step_text))
             given = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
             tool_args = _infer_step_args(tool_name, step_text, given)
+            acceptance = str(step.get("acceptance") or step.get("acceptance_criteria") or "")
+            evidence = str(step.get("evidence") or "")
         else:
             step_text = str(step)
             tool_name = classify_plan_component(step_text)
             tool_args = _infer_step_args(tool_name, step_text, {})
+            acceptance = evidence = ""
         if tool_name not in TOOL_SPECS:
             outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
             halted, stopped_at = f"unknown tool '{tool_name}'", idx
@@ -2122,6 +2194,12 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             break
         if on_step:
             on_step(idx, total, step_text, tool_name, "running", None)
+        # Taken before the step runs: once it has written, the previous state is
+        # the one thing that cannot be reconstructed.
+        snapshot = None
+        will_audit = PLAN_AUDIT and _plan_step_is_auditable(tool_name, acceptance)
+        if will_audit and PLAN_AUDIT_REVERT:
+            snapshot = _capture_write_state(tool_name, tool_args)
         try:
             result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
         except Exception as exc:
@@ -2143,14 +2221,31 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         if _plan_step_failed(result):
             halted, stopped_at = f"{tool_name} did not complete", idx
             break
-        if PLAN_AUDIT and TOOL_SPECS[tool_name].get("mode") in _AUDITED_MODES:
-            reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth)
+        if will_audit:
+            reason, note = _audit_plan_step(step_text, tool_name, tool_args, result,
+                                            depth, acceptance, evidence)
             if note:
                 outputs.append(f"[{idx}] audit: {note}")
             if reason:
+                # Only verified state persists. A write that failed verification
+                # is put back exactly as it was, so the plan leaves behind what
+                # it proved rather than what it attempted. Nothing outside this
+                # step is touched, and a step with no snapshot says so instead of
+                # implying a rollback that did not happen.
+                if snapshot is not None:
+                    outputs.append(f"[{idx}] {_revert_plan_write(snapshot)}")
+                elif PLAN_AUDIT_REVERT and TOOL_SPECS[tool_name].get("mode") != "write_text":
+                    outputs.append(f"[{idx}] not reverted — {tool_name} has no undo; "
+                                   "inspect the effect by hand")
                 halted, stopped_at = reason, idx
                 break
     _plan_execution_grant = False  # clear temporary grant — back to plan-only
+    if PLAN_AUDIT and _active_budget is not None:
+        share = _active_budget.audit_share()
+        if share:
+            outputs.append(f"Verification cost this turn: {share * 100:.0f}% of tokens "
+                           f"({_active_budget.role_total('subagent:auditor')} of "
+                           f"{_active_budget.total_tokens}).")
     if halted:
         skipped = total - stopped_at
         outputs.append(
@@ -2167,7 +2262,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
     global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
-    global _local_fallback_grant, _remote_git_grant
+    global _local_fallback_grant, _remote_git_grant, _active_role
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -2218,6 +2313,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
 
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
+    saved_role, _active_role = _active_role, f"subagent:{type_name}"
     try:
         answer = run_agent(
             [{"role": "user", "content": task}],
@@ -2235,6 +2331,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         answer = f"Sub-agent failed: {e}"
     finally:
         _last_tool_output, _last_tool_name, _last_write_diff = saved
+        _active_role = saved_role
         if saved_permission is not None:
             (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
              _local_fallback_grant, _remote_git_grant) = saved_permission
@@ -3835,6 +3932,7 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
             "provider": _redact_secrets(str(provider)),
             "model": _redact_secrets(str(model)),
             "attempt": attempt,
+            "role": _active_role,
             "outcome": "error" if error else "success",
             "latency_ms": round((time.monotonic() - started) * 1000),
             "max_tokens": max_tokens,
@@ -4317,10 +4415,30 @@ class _TurnBudget:
         self.started = time.monotonic()
         self.input_tokens = 0
         self.output_tokens = 0
+        # role -> [input, output]. Lets a caller answer "what did verification
+        # cost me" from its own workload instead of from a published average.
+        self.role_tokens = {}
 
     def add_tokens(self, prompt: int, completion: int) -> None:
-        self.input_tokens += int(prompt or 0)
-        self.output_tokens += int(completion or 0)
+        prompt, completion = int(prompt or 0), int(completion or 0)
+        self.input_tokens += prompt
+        self.output_tokens += completion
+        slot = self.role_tokens.setdefault(_active_role, [0, 0])
+        slot[0] += prompt
+        slot[1] += completion
+
+    def role_total(self, role: str) -> int:
+        spent = self.role_tokens.get(role)
+        return sum(spent) if spent else 0
+
+    def audit_share(self) -> float:
+        """Fraction of this turn's tokens spent on verification (0.0-1.0)."""
+        total = self.total_tokens
+        if not total:
+            return 0.0
+        audited = sum(sum(v) for k, v in self.role_tokens.items()
+                      if k.startswith("subagent:auditor"))
+        return audited / total
 
     def add_usage(self, response, text: str = "") -> None:
         """Record one model call. Streaming responses come from _build_response

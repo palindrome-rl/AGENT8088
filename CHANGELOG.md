@@ -23,6 +23,47 @@ recorded as though it had, with every later step built on top of it.
   half-executed plan cannot be mistaken for a finished one.
 - Not a rollback: steps that already ran stay run.
 
+### Only verified state persists (`plan_audit_revert`, default on with auditing)
+
+Verification previously stopped the *next* step but left the failed one on disk,
+so a plan committed what it attempted rather than what it proved.
+
+- A `write_file` step that fails verification is now restored to its exact
+  pre-step bytes: created files are removed, overwritten files are put back. The
+  snapshot is taken before the step runs, because afterwards the prior state is
+  the one thing that cannot be reconstructed.
+- Bounded on purpose, and each boundary is reported rather than implied: only the
+  failed step is reverted (verified steps stay committed); only `write_file` has
+  an inverse, so shell/docker/cron steps report `not reverted — no undo`; files
+  over `plan_audit_revert_max_bytes` are not snapshotted and say so.
+- Worst case is bounded by construction — a revert restores the bytes that were
+  there before the step, so a wrong `fail` verdict costs the step, never data
+  predating it.
+
+### Acceptance criteria and evidence per step
+
+- A plan step may declare `acceptance` (what must be true for it to count as
+  done) and `evidence` (what to inspect). Both are passed to the auditor, which
+  otherwise has to invent a criterion and then grade against its own guess.
+- Audit scope is now closure-based rather than permission-based. A declared
+  `acceptance` always qualifies a step; otherwise only modes leaving a durable
+  trace are audited. `browse_page` dropped out: a rendered page closes over
+  nothing, so auditing it bought an inconclusive verdict for the price of a model
+  call.
+- `execute_plan`'s tool description advertises both fields, or the model would
+  never emit them.
+
+### Verification cost is measured, not assumed
+
+- `_TurnBudget` attributes tokens to the spending role (`main`,
+  `subagent:<type>`), and each model-telemetry line carries the same `role`.
+- An audited plan reports its share: `Verification cost this turn: 22% of tokens
+  (4400 of 20000)`.
+- Published figures put auditors at roughly a fifth to a third of harness tokens.
+  Whether that holds for a given workload is now measurable locally instead of
+  taken on faith — which is what makes `plan_audit` a decision rather than a
+  guess.
+
 ### Opt-in per-step verification (`plan_audit=1`)
 
 - Each *mutating* plan step is verified by the readonly `auditor` sub-agent

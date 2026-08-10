@@ -103,6 +103,39 @@ Off by default: it costs one model call per mutating step. The case for turning
 it on is the unattended paths — gateway and cron — where nobody is watching and
 a half-done plan reported as finished is the expensive failure.
 
+### Only verified state persists
+
+A step *proposes* a change; verification is what *commits* it. With
+`plan_audit_revert=1` (the default when auditing is on), a `write_file` step that
+fails verification is restored to its exact pre-step bytes — created files are
+removed, overwritten files are put back.
+
+The boundaries are deliberate and worth knowing before you rely on it:
+
+- **Only the failed step is reverted.** Steps that already passed verification
+  stay committed; a failed audit is not a transaction rollback across the plan.
+- **Only `write_file` can be undone.** `execute_shell`, `run_sandboxed` and
+  `schedule_task` have no inverse. Those steps report `not reverted — no undo`
+  rather than implying a rollback that did not happen.
+- **Large files are not snapshotted.** Above `plan_audit_revert_max_bytes` the
+  prior contents are not held in memory, so the write stands and the output says
+  so. Declining to revert is acceptable; silently failing to revert is not.
+
+The worst case is bounded by construction: a revert restores the exact bytes that
+were there before the step, so a wrong `fail` verdict costs you the step, never
+data that predates it.
+
+### What verification costs
+
+`_TurnBudget` attributes tokens to the role that spent them (`main`, or
+`subagent:<type>`), and each model-telemetry line carries the same `role` field.
+After an audited plan the result reports the share, e.g.
+`Verification cost this turn: 22% of tokens (4400 of 20000)`.
+
+This exists so the decision to run auditing is made from your own numbers.
+Published figures put auditors at roughly a fifth to a third of harness tokens;
+whether that holds for your workload is measurable rather than assumed.
+
 ## Tools are data
 
 `tools.txt` is a pipe-delimited registry, not Python. A tool declares a `mode`,
