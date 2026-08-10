@@ -4390,6 +4390,64 @@ def _user_supplied_url(messages, url: object) -> bool:
     ))
 
 
+# Phrases that mean the user asked for this class of tool themselves. Kept
+# literal on purpose: the gates below only fire on tools the model reached for
+# unprompted, and wrongly reading "the user asked" is far safer than refusing
+# something they explicitly requested.
+_EXPLICIT_TOOL_PHRASES = {
+    "execute_shell": ("run ", "execute ", "shell", "command", "terminal", "`"),
+    "browse_page": ("browse", "open the page", "visit", "inspect the page"),
+    "get_page_title": ("title of", "browse", "visit"),
+}
+
+
+def _user_requested_tool(messages, name: str) -> bool:
+    """Whether the user asked for this tool, by name or in plain language.
+
+    Only user turns count. The model must not be able to authorise its own
+    tool call by narrating it first.
+    """
+    phrases = (name, *_EXPLICIT_TOOL_PHRASES.get(name, ()))
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content", "")).lower()
+        if any(phrase in text for phrase in phrases):
+            return True
+    return False
+
+
+# Web fetching wearing a shell command as a disguise.
+_WEB_FETCH_SHELL = re.compile(r"\b(?:curl|wget|httpie|http|https|lynx|w3m)\b",
+                              re.IGNORECASE)
+
+# MCP tools whose name says they fetch. Name-based because MCP specs carry no
+# capability metadata to key off — see the docstring in _is_fetch_followup.
+_MCP_FETCH_NAME = re.compile(r"(?:search|fetch|browse|web|http|scrape)", re.IGNORECASE)
+
+
+def _is_fetch_followup(messages, name: str, args: dict) -> bool:
+    """Whether this call is an unsolicited fetch after a search already worked.
+
+    Narrow by design. The brief asks that shell and MCP not be used as
+    redundant follow-ups, but blocking them broadly is unsafe: after searching
+    for a library version the agent may legitimately need to install it, and
+    refusing that is a worse bug than one wasted fetch. So only fetch-shaped
+    calls qualify, and an explicit user request overrides all of it.
+    """
+    if name in {"browse_page", "get_page_title"}:
+        return not (_user_supplied_url(messages, args.get("url"))
+                    or _user_requested_tool(messages, name))
+    if name == "execute_shell":
+        command = str(args.get("command") or "")
+        return bool(_WEB_FETCH_SHELL.search(command)) and not _user_requested_tool(
+            messages, "execute_shell")
+    if (TOOL_SPECS.get(name) or {}).get("mode") == "mcp":
+        return bool(_MCP_FETCH_NAME.search(name)) and not _user_requested_tool(
+            messages, name)
+    return False
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -4545,10 +4603,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
 
-            if (searched and name in {"browse_page", "get_page_title"}
-                    and not _user_supplied_url(messages, args.get("url"))):
-                result = ("Browser follow-up was not run. Use the web_search results, "
-                          "or ask the user for a specific page URL.")
+            if searched and _is_fetch_followup(messages, name, args):
+                result = ("Follow-up fetch was not run — the search already "
+                          "answered this. Use the web_search results, or ask the "
+                          "user for a specific page URL.")
                 tool_outputs.append(result)
                 if on_result:
                     on_result(name, result)
