@@ -283,6 +283,7 @@ def test_native_sandbox_writes_private_policy(engine, tmp_path, monkeypatch):
     path = engine._write_sandbox_settings()
     settings = engine.json.loads(path.read_text())
     assert settings["network"]["allowedDomains"] == []
+    assert settings["network"]["strictAllowlist"] is True
     assert str(engine.PROJECT_ROOT) in settings["filesystem"]["allowWrite"]
     if engine.sys.platform != "win32":
         assert str(engine.Path("/tmp").resolve()) in settings["filesystem"]["allowWrite"]
@@ -311,6 +312,29 @@ def test_approved_local_fallback_runs_once(engine, monkeypatch):
     assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
     engine.grant_escalation("local_execution")
     assert engine._exec_sandbox_command("pwd") == "ran locally"
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+
+
+@pytest.mark.parametrize("mode", ["readonly", "edit", "full-auto"])
+def test_explicit_local_backend_requires_a_one_shot_grant(engine, monkeypatch, mode):
+    engine.SANDBOX_BACKEND = "local"
+    engine.PERMISSION_MODE = mode
+    monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "ran locally")
+
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+    engine.grant_escalation("local_execution")
+    assert engine._exec_sandbox_command("pwd") == "ran locally"
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+
+
+@pytest.mark.parametrize("mode", ["edit", "full-auto"])
+def test_unsandboxed_execution_requires_an_explicit_one_shot_grant(engine, monkeypatch, mode):
+    engine.SANDBOX_BACKEND = "auto"
+    engine.PERMISSION_MODE = mode
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "ran locally")
+
     assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
 
 

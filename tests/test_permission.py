@@ -59,6 +59,24 @@ def test_escalation_grants_one_blocked_action():
     assert A.check_permission("write_text") is True
     assert A.check_permission("write_text") is False
 
+
+def test_escalation_grant_is_bound_to_the_blocked_call():
+    approved = A._tool_call_key("write_file", {"filename": "approved.txt", "content": "ok"})
+    other = A._tool_call_key("write_file", {"filename": "other.txt", "content": "no"})
+    A._remember_escalation("write_file", {"filename": "approved.txt", "content": "ok"},
+                           "ESCALATION_REQUEST:edit:new_file:approved.txt:blocked")
+    A.grant_escalation()
+
+    assert A.check_permission("write_text", approval_key=other) is False
+    assert A.check_permission("write_text", approval_key=approved) is True
+    assert A.check_permission("write_text", approval_key=approved) is False
+
+
+def test_new_turn_drops_an_unspent_escalation_grant():
+    A.grant_escalation()
+    A.reset_turn_approval_state()
+    assert A.check_permission("write_text") is False
+
 def test_safe_action_does_not_consume_one_shot_grant():
     A.grant_escalation()
     assert A.check_permission("read_text") is True
@@ -75,14 +93,24 @@ def test_run_tool_blocks_write_in_readonly(tmp_path, monkeypatch):
     assert "ESCALATION_REQUEST" in result
 
 
+def test_parse_error_never_performs_a_write(tmp_path, monkeypatch):
+    A.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+
+    result = A.run_tool("write_file", {"__parse_error__": '{"filename": bad}'})
+
+    assert "could not parse" in result.lower()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_run_agent_retries_an_approved_write(engine, tmp_path, monkeypatch):
     from tests.conftest import ScriptedModel
 
     target = tmp_path / "approved.txt"
     monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
     monkeypatch.setattr(engine, "create_completion", ScriptedModel([
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
         "Done.",
     ]))
     approvals = []
@@ -179,8 +207,10 @@ def test_run_tool_blocks_dangerous_shell_in_readonly():
     result = A.run_tool("execute_shell", {"command": "rm -rf /tmp/nonexistent_perm_test"})
     assert "ESCALATION_REQUEST" in result
 
-def test_run_tool_allows_safe_shell_in_readonly():
+def test_run_tool_allows_safe_shell_in_readonly(monkeypatch):
     A.PERMISSION_MODE = "readonly"
+    A.SANDBOX_BACKEND = "native"
+    monkeypatch.setattr(A, "_exec_shell_command", lambda *_, **__: "ok")
     result = A.run_tool("execute_shell", {"command": "ls"})
     assert "ESCALATION_REQUEST" not in result
 
@@ -304,6 +334,7 @@ def test_system_prompt_contains_security_instructions():
     sp = (PKG / 'system.md').read_text(encoding='utf-8')
     assert "Never try to fetch internal or private addresses" in sp
     assert "Security & Confidentiality" in sp
+    assert "demonstrate a tool merely because it is available" in sp
     assert "request_permission_escalation" not in sp
 
 def test_escalation_message_format():

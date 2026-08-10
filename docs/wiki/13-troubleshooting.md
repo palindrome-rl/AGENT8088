@@ -129,10 +129,19 @@ Prefer this over `ssrf_allow_private=1`, which opens the whole private network.
 
 ### `web_search` returns nothing / connection refused
 
-The default `search_base_url` points at a local SearXNG on `127.0.0.1:8888`
-that probably isn't running. Either run one, or use `web_search_tavily` /
-`web_search_exa` with a key. Note SearXNG ships with **JSON output disabled** —
-enable it or every request 403s:
+Run `/search doctor`. It reports the container state, the active backend chain,
+whether `ddgs` is importable, and whether a configured host is actually covered
+by `ssrf_allow_hosts`.
+
+Web search should not fail outright: the keyless `ddgs` backend ships with
+agent8088, so an unreachable SearXNG falls through to it. If you get an error
+instead of results, the chain is pinned (`web_search_provider=`) or a guard
+denied the request — a guard denial deliberately does **not** fall through.
+
+### SearXNG returns HTML instead of JSON
+
+SearXNG ships with **JSON output disabled**. `/search setup` writes this for
+you; a hand-rolled instance needs it in `settings.yml`:
 
 ```yaml
 search:
@@ -140,6 +149,28 @@ search:
     - html
     - json
 ```
+
+### SearXNG returns HTTP 403 or 429
+
+The bot limiter is on. For a loopback instance used as an API, turn it off:
+
+```yaml
+server:
+  limiter: false
+```
+
+### `ddgs is rate limited`
+
+DuckDuckGo throttled the request. `ddgs` scrapes rather than using an API, so it
+is the least reliable backend under sustained use — that is why it is last in
+the chain. Provision SearXNG (`/search setup`) or add a `TAVILY_API_KEY` /
+`EXA_API_KEY` for heavier use.
+
+### A remote SearXNG is refused
+
+Plaintext `http://` is only accepted for loopback and private hosts; a public
+instance must use `https://`. Its host must also be in `ssrf_allow_hosts` if it
+resolves to an internal address.
 
 ### Search worked, then stopped after a redirect
 
@@ -174,7 +205,8 @@ Narrow `allowed_paths` and set `blocked_paths` first; writes are unattended.
 ### MCP HTTP server reachable by others
 
 There's **no authentication** on the HTTP transport. It binds `127.0.0.1` by
-default — only use `--mcp-host 0.0.0.0` on a trusted network.
+default. Remote binds are intentionally rejected because the bundled HTTP
+transport has no authentication.
 
 ## Gateway
 

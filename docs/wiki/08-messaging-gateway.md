@@ -64,21 +64,20 @@ the principal for that request, so wrapping their whole message in
 ### Ids are scoped to their platform
 
 An id under `slack_allowed_users` is a *Slack* id. If it shows up on Discord,
-the bot allows it but logs a one-time warning naming the fix:
+the bot denies it. This prevents a user permitted on one platform from gaining
+access through another platform's gateway.
 
 ```
-allowing 99887766 on discord, but it is configured under slack_allowed_users —
-move it to discord_allowed_users. This grace will be removed; set
-strict_platform_allowlist=1 to enforce now.
+denied 99887766 on discord: it is listed under slack_allowed_users, not
+discord_allowed_users (strict_platform_allowlist is on)
 ```
 
-The grace exists because ids can't realistically collide across platforms (a
-Slack `U123ABC` vs a Discord snowflake vs a phone number), so hard-denying a
-misconfigured-but-listed user would cause a silent outage for no security gain.
-Unlisted ids are still denied. To enforce strictly now:
+For a short migration only, set the compatibility option below. It permits a
+misplaced id and logs the configuration line to correct; remove it after moving
+the id to its platform-specific allowlist:
 
 ```ini
-strict_platform_allowlist=1
+strict_platform_allowlist=0
 ```
 
 ## Permission mode

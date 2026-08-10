@@ -49,18 +49,53 @@ def test_sensitive_write_override_respected(engine, tmp_path, monkeypatch):
     target = tmp_path / ".env"
     monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
-    monkeypatch.setattr(engine, "ALLOWED_SENSITIVE_FILES", [".env"])
+    monkeypatch.setattr(engine, "ALLOWED_SENSITIVE_FILES", [str(target)])
     out = engine.run_tool("write_file", {"filename": str(target), "content": "K=v"})
     assert "denied" not in out.lower(), out
     assert target.read_text() == "K=v"
 
 
+def test_sensitive_write_override_does_not_match_a_subtree(engine, tmp_path, monkeypatch):
+    target = tmp_path / "tests" / ".ssh" / "id_rsa"
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+    monkeypatch.setattr(engine, "ALLOWED_SENSITIVE_FILES", ["test"])
+
+    out = engine.run_tool("write_file", {"filename": str(target), "content": "PWNED"})
+
+    assert "sensitive" in out.lower()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("command", [
+    "cat ~/.agent8088/.env",
+    "cat cert.pem",
+    "printf x >> ~/.bashrc",
+    "true; git show HEAD:.env",
+    "git -c core.pager=cat show HEAD:.env",
+    r"type %USERPROFILE%\\.aws\\credentials",
+])
+def test_shell_protected_paths_are_hard_blocked(engine, command):
+    assert engine._hard_blocked_shell(command) is True
+
+
+def test_normal_writes_are_utf8_and_preserve_newlines(engine, tmp_path, monkeypatch):
+    target = tmp_path / "notes.txt"
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
+
+    assert "Wrote" in engine.run_tool("write_file", {
+        "filename": str(target), "content": "emoji: 😀\nnext\n"})
+    assert target.read_bytes() == "emoji: 😀\nnext\n".encode()
+
+
 # ----------------------------------------------------------- 2. HOST TOOLS
 def test_git_tools_declared_host(engine):
-    """Curated git tools must run on the host, not inside the sandbox."""
-    for name in ("git_status", "git_diff", "git_log", "git_clone",
-                 "git_commit", "git_push", "git_create_pr"):
+    """Only mutating/credentialed git tools may bypass the sandbox."""
+    for name in ("git_clone", "git_commit", "git_push", "git_create_pr"):
         assert engine.TOOL_SPECS[name].get("host"), f"{name} should be host=1"
+    for name in ("git_status", "git_diff", "git_log"):
+        assert not engine.TOOL_SPECS[name].get("host"), f"{name} should be sandboxed"
 
 
 def test_execute_shell_stays_sandboxed(engine):
@@ -73,11 +108,11 @@ def test_host_shell_tool_bypasses_sandbox(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "_exec_process",
                         lambda cmd, timeout=25, shell=False: seen.setdefault("host", cmd) or "ok")
-    monkeypatch.setattr(engine, "_exec_sandbox_command",
+    monkeypatch.setattr(engine, "_exec_sandbox_argv",
                         lambda *a, **k: seen.setdefault("sandbox", True) or "sandboxed")
-    engine.run_tool("git_status", {})
-    assert "host" in seen, "git_status must run on the host"
-    assert "sandbox" not in seen, "git_status must not go through the sandbox"
+    engine.run_tool("git_clone", {"url": "https://example.com/repo.git", "directory": "repo"})
+    assert "host" in seen, "git_clone must run on the host"
+    assert "sandbox" not in seen, "git_clone must not go through the sandbox"
 
 
 def test_structured_host_tool_bypasses_sandbox(engine, monkeypatch):
@@ -123,7 +158,7 @@ def test_host_git_push_requires_dedicated_confirmation(engine, monkeypatch):
 
 def test_missing_binary_reports_actionably(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
-    monkeypatch.setattr(engine, "_exec_process",
+    monkeypatch.setattr(engine, "_exec_sandbox_command",
                         lambda *a, **k: "sh: 1: git: not found\nCommand exited with status 127.")
     out = engine.run_tool("git_status", {})
     assert "not available" in out.lower() or "not found" in out.lower()

@@ -106,7 +106,7 @@ The wizard prompts for:
 2. **Provider** — fuzzy search through 12 built-in providers, plus **Custom OpenAI-compatible**
 3. **API key** — hidden input for the selected provider
 4. **Model** — fetches the provider's available models via `/v1/models` and shows them in a fuzzy picker; custom providers ask for URL, model, and auth/API key
-5. **Web search URL** — optional SearXNG endpoint
+5. **Web search** — pick a backend: SearXNG (auto-provisioned when Docker is present), the bundled keyless `ddgs` fallback, an existing instance URL, or an optional Tavily/Exa API key
 
 Or edit the config file directly:
 - **macOS/Linux:** `~/.agent8088/config.txt`
@@ -184,6 +184,7 @@ Run with no flags to start the interactive REPL.
 | `/mcp add <name> http <url> [--project]` | Add a Streamable HTTP MCP server |
 | `/mcp remove <name> [--project]` | Remove a configured MCP server |
 | `/sandbox [auto\|native\|docker\|local\|setup]` | Show, install, or select command isolation |
+| `/search [status\|setup\|stop\|doctor\|use <backend>]` | Show, provision, or pin a web search backend |
 | `/config` | Show active config + config file path |
 | `/system` | Show the full system prompt |
 | `/history` | Show conversation history |
@@ -207,14 +208,18 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `provider.<name>.base_url` | (built-in) | Override a provider's endpoint URL |
 | `fallback_models` | (empty) | Comma-separated fallback chain (e.g. `groq:llama-3.3-70b-versatile,gemini:gemini-2.0-flash`) |
 | `timeout_seconds` | `120` | Request timeout |
-| `allowed_paths` | `~` | Paths the agent can read/write |
+| `allowed_paths` | `.` | Paths the agent can read/write; `.` is the launch workspace |
 | `prompt_paths` | `~` | Writes here show y/n escalation |
 | `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
+| `model_telemetry` | `0` | Append local, metadata-only model-call health records |
+| `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local path for model telemetry (mode 0600) |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
+| `web_search_provider` | (unset) | Pin a backend: `searxng`, `tavily`, `exa`, `ddgs`. Unset auto-selects with fallback |
+| `web_search_results` | `5` | Results per search (max 20) |
 | `gateway_permission_mode` | `readonly` | Gateway permission mode: `readonly` (approvals in chat) or `edit` (full-auto) |
-| `strict_platform_allowlist` | `0` | Refuse a user id listed under another platform's `*_allowed_users` line instead of allowing it with a warning |
+| `strict_platform_allowlist` | `1` | Refuse a user id listed under another platform's `*_allowed_users` line |
 | `mcp_server_allow_writes` | `0` | Expose `write_file` over `--mcp-serve`. Writes are unattended (MCP has no approval channel) |
 | `disabled_tools` | (empty) | Comma-separated built-in tool names to disable (e.g. `browse_page` when MCP Playwright is connected) |
 
@@ -278,11 +283,9 @@ MCP client config (e.g. for Claude Code's `.claude/settings.json`):
 }
 ```
 
-**HTTP mode** (remote use, multi-client):
+**HTTP mode** (localhost only):
 ```bash
 agent8088 --mcp-serve --mcp-http --mcp-port 8931
-# Bind to all interfaces:
-agent8088 --mcp-serve --mcp-http --mcp-host 0.0.0.0 --mcp-port 8931
 ```
 
 MCP client config (HTTP):
@@ -302,9 +305,7 @@ MCP client config (HTTP):
 |---|---|
 | `read_text` | Read a file |
 | `calculate` | Evaluate a math expression |
-| `web_search` | Search the web (SearXNG) |
-| `web_search_tavily` | Search via Tavily |
-| `web_search_exa` | Search via Exa (semantic) |
+| `web_search` | Search the web — SearXNG by default, Tavily/Exa with a key, keyless `ddgs` fallback |
 | `get_page_title` | Fetch a webpage title |
 | `last_output` | Get previous tool output |
 | `describe_capabilities` | What this server can do, and its active limits and guardrails |
@@ -319,7 +320,7 @@ first. The always-on floor still applies either way: sensitive files (`.env`,
 are refused regardless of mode, since writing one is code execution on the
 user's next shell launch.
 
-Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP binds to localhost by default; use `--mcp-host 0.0.0.0` to expose to the network — note there is no authentication on the HTTP transport, so only do this on a trusted network. The external agent's own approval system (e.g. Claude Code's permission prompts) handles any additional safety.
+Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP is restricted to localhost because this server has no authentication. Use a local client or stdio; remote MCP requires an authenticated proxy that is not included here.
 
 ### Environment Variables
 
@@ -351,11 +352,18 @@ When the gateway runs in readonly mode, write/shell tools trigger an approval pr
 
 ### Security Layer 1: Sensitive File Protection
 
-Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`, `*_SECRET*`, `*_TOKEN*`. Override with `allowed_sensitive_files=` in config.
+Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`, `*_SECRET*`, `*_TOKEN*`. `allowed_sensitive_files=` exempts only exact paths (relative paths resolve from the workspace).
 
 ### Security Layer 2: Network Access Control
 
 `web_search` and `get_page_title` prompt y/n on every request. No config needed.
+
+Every web search backend runs the same egress/SSRF/outbound-secret checks before
+each request. That includes `ddgs`, whose library owns its own HTTP client: its
+fixed upstream hosts are checked against the egress policy *before* the library
+is invoked, and it **fails closed** rather than bypassing an `allowed_domains`
+policy. A guard denial never falls through to another backend — that would route
+around a policy decision rather than an outage.
 
 SSRF protection refuses private, loopback, link-local, and cloud-metadata
 addresses on every outbound path, including redirects.
@@ -436,6 +444,17 @@ Appends one redacted JSON line per gated decision (`allowed` / `blocked` /
 durable record of who asked for what and what was refused. Rotation is external;
 point `audit_log_path` at a file your `logrotate` handles.
 
+### Local model telemetry
+
+```ini
+model_telemetry=1
+```
+
+Writes local JSONL metadata for each model call: provider/model, latency, token
+and cost estimates, finish reason, and sanitized error status. It never records
+prompts, responses, tool arguments, paths, or credentials; it sends nothing to
+an external service. The default path is mode 0600 under Agent8088's data dir.
+
 ### Command Sandbox
 
 Shell tools, structured Git tools, sandboxed Python, and subagent tool calls use
@@ -452,9 +471,7 @@ When neither backend is available, Agent8088 asks before running locally.
 | `execute_shell` | shell | Run a shell command |
 | `write_file` | write_text | Write content to a file |
 | `read_text` | read_text | Read text from a file |
-| `web_search` | http_get | Search the web (SearXNG) |
-| `web_search_tavily` | http_post | Search via Tavily (agent-optimized) |
-| `web_search_exa` | http_post | Search via Exa (semantic/neural) |
+| `web_search` | search | Routes to the configured backend (SearXNG / Tavily / Exa / ddgs) with automatic fallback |
 | `get_page_title` | shell | Fetch a webpage title (cross-platform) |
 | `browse_page` | browser | Load a web page in a headless browser |
 | `calculate` | python_eval | Evaluate a math expression |
@@ -636,7 +653,7 @@ agent8088 --update
 - For Gmail: enable 2FA and create an App Password (not your regular password).
 - Only emails from `email_allowed_users` addresses are processed — all others are silently dropped.
 - IMAP host should start with `imap.` (e.g. `imap.gmail.com`), not `smtp.`.
-- Set `email_verify_sender=1` in config.txt to enable SPF/DKIM/DMARC verification (fail-closed).
+- SPF/DKIM/DMARC verification is enabled by default and fails closed. Set `email_verify_sender=0` only for a trusted relay that does not provide authentication results.
 
 ---
 

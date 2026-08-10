@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from agent8088.gateway.session import SessionStore
 from agent8088.gateway.agent_bridge import run_turn
 

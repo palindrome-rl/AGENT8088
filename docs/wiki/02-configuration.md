@@ -18,7 +18,7 @@ Secrets do **not** belong here — see [API keys](#api-keys-and-the-env-store).
 
 | Key | Default | Purpose |
 |---|---|---|
-| `allowed_paths` | `~` | Roots the agent may touch at all. Anything outside is refused before any other check. |
+| `allowed_paths` | `.` | Roots the agent may touch at all; `.` is the launch workspace. Anything outside is refused before any other check. |
 | `project_root` | cwd | Base for relative paths. |
 | `shell_cwd` | cwd | Working directory for shell commands. |
 | `no_prompt_paths` | (empty) | Writes here are auto-approved, no prompt. |
@@ -50,11 +50,14 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 
 | Key | Default | Purpose |
 |---|---|---|
-| `allowed_sensitive_files` | (empty) | Escape hatch — comma-separated names to exempt from the sensitive-file blocklist. |
+| `allowed_sensitive_files` | (empty) | Escape hatch — comma-separated exact paths to exempt; relative paths resolve from the workspace. |
 | `deny_commands` | (empty) | Shell commands to refuse (fnmatch globs). Refused in every mode. |
 | `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
 | `ssrf_allow_hosts` | `127.0.0.1,localhost` | Internal hosts the agent may reach (e.g. a local SearXNG). |
+| `web_search_provider` | (unset) | Pin one backend: `searxng`, `tavily`, `exa`, or `ddgs`. Unset auto-selects and allows fallback. |
+| `search_base_url` | (commented) | SearXNG instance, ending at `q=`. `https://` required for public hosts. |
+| `web_search_results` | `5` | Results per search (max 20). |
 | `ssrf_allow_private` | `0` | `1` opens the entire private network. Prefer the allowlist. |
 | `allowed_domains` | (empty) | If set, the **only** public hosts the agent may reach. Empty means all are reachable. |
 | `blocked_domains` | (empty) | Public hosts the agent may never reach. Wins over `allowed_domains`. |
@@ -62,6 +65,8 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `audit_log` | `0` | `1` appends one redacted JSON line per gated tool decision. Turn this on for any gateway deployment. |
 | `audit_log_path` | `<data dir>/audit.jsonl` | Where the audit trail is written (mode 0600). |
 | `audit_max_detail` | `512` | Truncation length for the audit `detail` field. |
+| `model_telemetry` | `0` | `1` records local metadata-only model-call health events. |
+| `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local telemetry path (mode 0600). |
 
 Domain matching is dot-anchored, so `allowed_domains=example.com` permits
 `docs.example.com` but **not** `evilexample.com`.
@@ -105,7 +110,7 @@ not per call.
 |---|---|---|
 | `slack_enabled` / `whatsapp_enabled` / `discord_enabled` | `0` | Enable a channel. Only one at a time via the wizard. |
 | `slack_allowed_users` etc. | (empty) | Comma-separated user ids permitted per platform. **Empty means nobody** — fail-closed. |
-| `strict_platform_allowlist` | `0` | `1` refuses an id listed under a *different* platform's line instead of allowing it with a warning. |
+| `strict_platform_allowlist` | `1` | Refuses an id listed under a *different* platform's line. Set `0` only as a temporary migration aid. |
 | `gateway_permission_mode` | `readonly` | `readonly` routes writes to chat approval; `edit` disables prompts. |
 | `gateway_rate_limit_per_min` | `20` | Per-user messages per minute, slash commands included. `0` disables. |
 | `whatsapp_mode` | `self-chat` | `self-chat` or `bot`. |

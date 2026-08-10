@@ -1,5 +1,5 @@
 """Tests for the Email adapter."""
-import pytest
+import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 
 
@@ -102,7 +102,6 @@ def test_email_send_message_no_smtp_host():
     from agent8088 import engine as A
     with patch.object(A, "get_secret", return_value=""):
         adapter = EmailAdapter({}, runner=None)
-    import asyncio
     result = asyncio.run(adapter.send_message("user@example.com", "test"))
     assert result == "0"
 
@@ -127,12 +126,12 @@ def test_email_connect_missing_config():
     assert adapter._running is False
 
 
-def test_email_verify_sender_enabled_default_false():
+def test_email_verify_sender_enabled_default_true():
     from agent8088.gateway.platforms.email import EmailAdapter
     from agent8088 import engine as A
     with patch.object(A, "get_secret", return_value=""):
         adapter = EmailAdapter({}, runner=None)
-    assert adapter._verify_sender_enabled is False
+    assert adapter._verify_sender_enabled is True
 
 
 def test_email_verify_sender_enabled_from_config():
@@ -143,11 +142,18 @@ def test_email_verify_sender_enabled_from_config():
     assert adapter._verify_sender_enabled is True
 
 
+def test_email_sender_verification_can_be_disabled_for_a_trusted_relay():
+    from agent8088.gateway.platforms.email import EmailAdapter
+    from agent8088 import engine as A
+    with patch.object(A, "get_secret", return_value=""):
+        adapter = EmailAdapter({"email_verify_sender": "0"}, runner=None)
+    assert adapter._verify_sender_enabled is False
+
+
 def test_email_process_message_drops_unauthorized_sender():
     from agent8088.gateway.platforms.email import EmailAdapter
     from agent8088 import engine as A
     import email as email_lib
-    import asyncio
 
     allowlist = MagicMock()
     allowlist.is_allowed = MagicMock(return_value=False)
@@ -159,6 +165,7 @@ def test_email_process_message_drops_unauthorized_sender():
 
     msg = email_lib.message.Message()
     msg["From"] = "stranger@evil.com"
+    msg["Authentication-Results"] = "example.com; dmarc=pass"
     msg["Subject"] = "Test"
     msg.set_payload("Hello")
     msg.set_type("text/plain")
@@ -183,9 +190,30 @@ def test_email_process_message_accepts_authorized_sender():
 
     msg = email_lib.message.Message()
     msg["From"] = "friend@example.com"
+    msg["Authentication-Results"] = "example.com; dmarc=pass"
     msg["Subject"] = "Hello"
     msg.set_payload("Hi there!")
     msg.set_type("text/plain")
 
     adapter._process_message(msg)
     allowlist.is_allowed.assert_called_once_with("friend@example.com", "email")
+    runner.on_message.assert_not_called()
+
+
+def test_email_rejects_unverified_sender_before_allowlist():
+    from agent8088.gateway.platforms.email import EmailAdapter
+    from agent8088 import engine as A
+    import email as email_lib
+
+    allowlist = MagicMock()
+    runner = MagicMock(allowlist=allowlist)
+    with patch.object(A, "get_secret", return_value=""):
+        adapter = EmailAdapter({}, runner=runner)
+    msg = email_lib.message.Message()
+    msg["From"] = "spoofed@example.com"
+    msg.set_payload("hello")
+    msg.set_type("text/plain")
+
+    adapter._process_message(msg)
+
+    allowlist.is_allowed.assert_not_called()

@@ -44,7 +44,9 @@ def test_short_values_are_never_treated_as_secrets(monkeypatch):
 
 # --- Integration: the guard must be reachable from the real tool paths ---
 
-def test_http_post_carrying_a_secret_is_refused(engine, monkeypatch):
+def test_http_post_carrying_a_secret_is_refused(engine, monkeypatch, register_tool):
+    register_tool("probe_post", mode="http_post", args="query",
+                  url="https://api.tavily.com/search?q={query_q}")
     monkeypatch.setattr(engine, "_SECRET_VALUES", [FAKE_SECRET])
     monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
 
@@ -52,7 +54,7 @@ def test_http_post_carrying_a_secret_is_refused(engine, monkeypatch):
         raise AssertionError("_exec_http must not be reached with a secret payload")
 
     monkeypatch.setattr(engine, "_exec_http", _must_not_run)
-    result = engine.run_tool("web_search_tavily", {"query": FAKE_SECRET})
+    result = engine.run_tool("probe_post", {"query": FAKE_SECRET})
     assert "credential" in result.lower()
 
 
@@ -67,8 +69,10 @@ def test_full_auto_does_not_unlock_exfiltration(engine, monkeypatch):
         assert "credential" in result.lower(), f"not blocked in {mode} mode"
 
 
-def test_clean_http_post_still_works(engine, monkeypatch):
+def test_clean_http_post_still_works(engine, monkeypatch, register_tool):
+    register_tool("probe_post", mode="http_post", args="query",
+                  url="https://api.tavily.com/search?q={query_q}")
     monkeypatch.setattr(engine, "_SECRET_VALUES", [FAKE_SECRET])
     monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
     monkeypatch.setattr(engine, "_exec_http", lambda *a, **kw: "OK")
-    assert engine.run_tool("web_search_tavily", {"query": "weather"}) == "OK"
+    assert engine.run_tool("probe_post", {"query": "weather"}) == "OK"

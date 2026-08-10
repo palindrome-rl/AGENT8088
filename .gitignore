@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 *.egg-info/
+dist/
 .DS_Store
 
 # Environment
@@ -27,6 +28,8 @@ qwen-tooluse-lora/
 
 # Logs
 *.log
+model-telemetry/
+*.model-telemetry.jsonl
 
 # Generated reports
 output/pdf/

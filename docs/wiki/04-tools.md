@@ -2,7 +2,7 @@
 
 [← Wiki index](README.md)
 
-21 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+22 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
 is what the permission layer gates on — see
 [Permissions & Security](03-permissions-and-security.md).
 
@@ -16,9 +16,7 @@ is what the permission layer gates on — see
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | — | ✅ | Re-read the previous tool's output without re-running it. |
 | `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails. |
-| `web_search` | `http_get` | `query` | prompt | Search via SearXNG (`search_base_url`). |
-| `web_search_tavily` | `http_post` | `query` | prompt | Search via Tavily (needs key). |
-| `web_search_exa` | `http_post` | `query` | prompt | Semantic search via Exa (needs key). |
+| `web_search` | `search` | `query` | prompt | Routes to the configured backend and falls back automatically. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url` | prompt | Headless browser — renders JS that curl can't. |
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
@@ -149,3 +147,26 @@ any other tool result, with no system-prompt text in it.
 /capabilities                 # tools + MCP + skills + limits + guardrails
 /tool read_text {"filename": "README.md"}   # invoke one directly
 ```
+
+
+## Web search backends
+
+`web_search` is one tool with four interchangeable backends, chosen by
+configuration rather than by the model picking a per-vendor tool:
+
+| Backend | Role | Requires |
+|---|---|---|
+| `searxng` | **default** | Docker (`/search setup` provisions it) or an instance URL |
+| `tavily` | optional | `TAVILY_API_KEY` in the `.env` store |
+| `exa` | optional | `EXA_API_KEY` in the `.env` store |
+| `ddgs` | **fallback** | nothing — ships with agent8088 |
+
+Selection order is `web_search_provider` (explicit pin), then the first
+available of `searxng -> tavily -> exa -> ddgs`. If the chosen backend fails at
+call time — instance stopped, rate limited — the next available one serves the
+request, so a broken primary does not mean "no web search". The result always
+names which backend served it, so a silent fallback is visible.
+
+Because `ddgs` needs no key, no hosting, and no setup, web search works on a
+fresh install. Run `/search status` for the live chain, `/search doctor` to
+diagnose, and `/search use <backend>` to pin one.

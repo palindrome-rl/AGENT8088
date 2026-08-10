@@ -18,7 +18,7 @@ def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monk
 
     result = engine.run_tool("execute_shell", {"command": f"cat {fake_secret}"})
 
-    assert "ESCALATION_REQUEST" in result
+    assert "forbidden" in result.lower()
     assert "not-real" not in result
 
 
@@ -395,10 +395,14 @@ def test_local_execution_grant_does_not_leak_to_later_action(engine, monkeypatch
     assert engine._local_fallback_grant is False
 
 
-def test_missing_http_argument_is_reported_before_ssrf(engine, monkeypatch):
+def test_missing_http_argument_is_reported_before_ssrf(engine, monkeypatch, register_tool):
+    # web_search is mode=search now, so this uses a test-local http tool to keep
+    # exercising _http_placeholder_error ahead of the SSRF guard.
+    register_tool("probe_get", mode="http_get", args="query",
+                  url="http://127.0.0.1:8888/search?q={query_q}")
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SSRF_ALLOW_HOSTS", set())
-    result = engine.run_tool("web_search", {})
+    result = engine.run_tool("probe_get", {})
     assert "unresolved placeholder" in result
     assert "pass query=" in result
 
@@ -414,6 +418,26 @@ def test_model_cache_is_owner_only(tmp_path, monkeypatch):
     providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
 
     assert cache.stat().st_mode & 0o777 == 0o600
+
+
+def test_windows_model_cache_uses_private_acl(tmp_path, monkeypatch):
+    from agent8088 import providers
+
+    cache = tmp_path / "models_cache.json"
+    calls = []
+    monkeypatch.setattr(providers, "_CACHE_FILE", cache)
+    monkeypatch.setattr(providers.sys, "platform", "win32")
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[0] == "whoami":
+            return SimpleNamespace(returncode=0, stdout='"PC\\\\user","S-1-5-21-1"\r\n')
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+    providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
+
+    assert any(command[0] == "icacls" for command in calls)
 
 
 def test_windows_private_files_use_current_user_sid(engine, tmp_path, monkeypatch):
@@ -458,7 +482,7 @@ def test_private_file_is_protected_before_content_is_written(
     assert private.read_text(encoding="utf-8") == "private content"
 
 
-def test_edit_mode_runs_shell_without_sandbox_consent(engine, monkeypatch):
+def test_edit_mode_escalates_shell_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -466,11 +490,10 @@ def test_edit_mode_runs_shell_without_sandbox_consent(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine._exec_sandbox_command("echo hi")
-    assert "ESCALATION_REQUEST" not in result
-    assert "ran:echo hi" in result
+    assert result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
+def test_edit_mode_escalates_sandboxed_code_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -478,11 +501,10 @@ def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine.run_tool("run_sandboxed", {"code": "print(1)"})
-    assert "ESCALATION_REQUEST" not in result
-    assert "ran:" in result and "print(1)" in result
+    assert result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
+def test_edit_mode_escalates_sandbox_argv_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -494,8 +516,8 @@ def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
     )
 
     result = engine._exec_sandbox_argv(["git", "status"])
-    assert "ESCALATION_REQUEST" not in result
-    assert seen["argv"] == ["git", "status"]
+    assert result.startswith("ESCALATION_REQUEST")
+    assert seen == {}
 
 
 def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):

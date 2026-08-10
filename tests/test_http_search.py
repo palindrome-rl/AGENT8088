@@ -1,6 +1,5 @@
 """Tests for the http_get/http_post modes, jq filters, and the SSRF allowlist."""
 from types import SimpleNamespace
-import urllib.error
 
 
 class _Response:
@@ -144,18 +143,31 @@ def test_ssrf_allowlist_supports_host_port(engine, monkeypatch):
 
 
 def test_search_tools_declared(engine):
-    for name in ("web_search", "web_search_tavily", "web_search_exa"):
-        assert name in engine.TOOL_NAMES
-    assert engine.TOOL_SPECS["web_search"]["mode"] == "http_get"
-    assert engine.TOOL_SPECS["web_search_tavily"]["mode"] == "http_post"
+    """One web_search tool now; Tavily/Exa are BACKENDS behind it, not tools.
+
+    See tests/test_web_search.py for the registry and tests/test_web_search_engine.py
+    for the mode=search wiring.
+    """
+    assert "web_search" in engine.TOOL_NAMES
+    assert engine.TOOL_SPECS["web_search"]["mode"] == "search"
+    for gone in ("web_search_tavily", "web_search_exa"):
+        assert gone not in engine.TOOL_NAMES
+    # get_page_title is the remaining shipped http tool.
+    assert engine.TOOL_SPECS["get_page_title"]["mode"] == "http_get"
 
 
-def test_config_defaults_are_visible_to_templates(engine):
+def test_config_defaults_are_visible_to_templates(engine, register_tool):
     # Regression: tool URL templates interpolate from APP_CONFIG, so engine
     # defaults must be seeded there. Otherwise {search_base_url} stayed literal
-    # and web_search failed with "Blocked: scheme '' is not allowed".
+    # and the tool failed with "Blocked: scheme '' is not allowed".
+    #
+    # web_search no longer carries a URL template (it routes through the provider
+    # registry), so this uses a test-local tool to keep the interpolation
+    # mechanism itself under test.
     assert "search_base_url" in engine.APP_CONFIG
-    url = engine._safe_format(engine.TOOL_SPECS["web_search"]["url"], {"query": "x"})
+    spec = register_tool("probe_get", mode="http_get", args="query",
+                         url="{search_base_url}{query_q}&format=json")
+    url = engine._safe_format(spec["url"], {"query": "x"})
     assert url.startswith(("http://", "https://")), url
     assert "{" not in url, f"unresolved placeholder in {url}"
 

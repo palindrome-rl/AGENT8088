@@ -19,6 +19,14 @@ def test_find_tool_calls_alias_then_restrict(engine):
     assert engine.find_tool_calls(text, allowed={"read_text"}) == []
 
 
+def test_fenced_tool_example_is_not_called_or_stripped(engine):
+    text = ('Use this syntax:\n```text\n✿FUNCTION✿: execute_shell '
+            '✿ARGS✿: {"command": "pwd"}\n```')
+
+    assert engine.find_tool_calls(text) == []
+    assert "✿FUNCTION✿" in engine.strip_tool_json(text)
+
+
 def test_run_agent_uses_custom_system_prompt_and_depth(engine):
     fake = ScriptedModel(["Hello from the sub-agent."])
     engine.create_completion = fake  # monkeypatch module global
@@ -88,8 +96,8 @@ def test_subagent_retries_an_approved_write(engine, tmp_path, monkeypatch):
         "writer": {"tools": ["write_file"], "max_turns": 3, "system_prompt": "Write the file."},
     })
     monkeypatch.setattr(engine, "create_completion", ScriptedModel([
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
         "Done.",
     ]))
 
@@ -165,6 +173,28 @@ def test_run_agent_nudges_on_reasoning_only_turn(engine):
     ])
     answer = engine.run_agent([{"role": "user", "content": "hi"}], max_turns=4)
     assert answer == "Here is my answer."
+
+
+def test_malformed_tool_call_is_not_repeat_cached(engine):
+    malformed = '✿FUNCTION✿: write_file ✿ARGS✿: {"filename": "x", "content": }'
+    fake = ScriptedModel([malformed, malformed, "I could not write the file."])
+    engine.create_completion = fake
+
+    assert engine.run_agent([{"role": "user", "content": "write x"}], max_turns=3) == "I could not write the file."
+    assert "already ran" not in fake.calls[2]["messages"][-1]["content"]
+
+
+def test_loop_fallback_preserves_completed_tool_outputs(engine):
+    engine.create_completion = ScriptedModel([
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "1"}',
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "2"}',
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "2"}',
+        '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "2"}',
+    ])
+
+    answer = engine.run_agent([{"role": "user", "content": "calculate"}], max_turns=4)
+    assert "1" in answer
+    assert "2" in answer
 
 
 def test_guard_blocks_system_prompt_leak(engine):

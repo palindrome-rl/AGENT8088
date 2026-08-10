@@ -8,7 +8,7 @@ A single shared agent loop (run_agent) drives both modes:
 """
 import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
-    import readline  # Unix-only; enables input history/editing
+    import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
     pass
 from contextlib import nullcontext
@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
+from agent8088 import web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -76,7 +77,7 @@ def load_simple_config(path: Path) -> dict:
     config = {}
     if not path.exists():
         return config
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -253,6 +254,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
 # {query} here would produce a doubled placeholder in the final URL.)
 SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/search?q=")
+# Whether the user actually SET a search URL, captured before the default is
+# injected into APP_CONFIG below. The web search registry needs the distinction:
+# a defaulted value would make the SearXNG backend claim to be configured on
+# every machine, so a host with no instance running would try (and fail) a
+# loopback request before reaching the keyless fallback, and /capabilities would
+# report a backend that isn't there.
+SEARCH_BASE_URL_CONFIGURED = bool(str(APP_CONFIG.get("search_base_url", "")).strip())
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
 SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
@@ -360,7 +368,8 @@ ALLOWED_PATHS = [
 # Permission layer ÔÇö readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
-_one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
+_one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
+_pending_approval_key = ""
 _local_fallback_grant = False
 _remote_git_grant = False
 _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
@@ -385,6 +394,23 @@ def reset_approval_state() -> None:
     """Clear the consecutive-denial count."""
     global _consecutive_denials
     _consecutive_denials = 0
+
+
+def reset_turn_approval_state() -> None:
+    """Drop unspent grants before a new agent turn can use them."""
+    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
+    _pending_approval_key = ""
+
+
+def _tool_call_key(name: str, args: dict) -> str:
+    return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+
+
+def _remember_escalation(name: str, args: dict, result: str) -> None:
+    global _pending_approval_key
+    if result.startswith("ESCALATION_REQUEST:"):
+        _pending_approval_key = _tool_call_key(name, args)
 
 
 def note_denial() -> bool:
@@ -455,9 +481,15 @@ def _is_sensitive_path(filepath: str) -> bool:
     fn = Path(filepath).name.lower()
     fp = str(filepath).lower()
 
-    # Config override ÔÇö user explicitly allowed this file
+    # Config override: only the exact declared path is allowed. A substring
+    # match here could turn `allowed_sensitive_files=test` into a broad bypass.
+    try:
+        path = Path(filepath)
+        resolved = path.expanduser().resolve() if hasattr(path, "expanduser") else path
+    except OSError:
+        resolved = Path(filepath).expanduser()
     for allowed in ALLOWED_SENSITIVE_FILES:
-        if allowed.lower() in fn or allowed.lower() in fp:
+        if _resolve_allowed_path(allowed) == resolved:
             return False
 
     # Exact filename match
@@ -672,24 +704,17 @@ def _git_read_targets_sensitive_file(command: str) -> bool:
 
 
 def _shell_targets_credential_path(command: str) -> bool:
-    """Detect shell commands that write to or overwrite credential paths.
+    """Refuse shell access to the same protected paths as file tools.
 
-    `echo "x" > ~/.ssh/authorized_keys` and `cp file ~/.aws/credentials` bypass
-    _is_sensitive_path because that check only runs in write_text/read_text tools.
-    Block these at the hardline floor so credential writes are denied in ALL modes.
+    Shell tokenisation is intentionally conservative: an `echo` mentioning a
+    protected path is refused too, because a model cannot safely distinguish a
+    display from a read/write use across shell wrappers and substitutions.
     """
-    # ponytail: substring match on the raw command. Catches redirections
-    # (>, >>), tee, cp/mv/install destinations. Ceiling: a command like
-    # `cat ~/.ssh` (read, not write) would also match — acceptable, since
-    # reading credentials via shell is also blocked by _is_sensitive_path
-    # for the read_text tool and this is the shell equivalent.
-    cred_markers = (
-        ".ssh/", ".aws/", ".kube/", ".gnupg/", ".netrc",
-        ".docker/", ".config/gcloud", "authorized_keys",
-        "id_rsa", "id_ed25519", "id_ecdsa",
+    tokens = re.split(r"[\s;&|<>`$()'\"=]+", command.replace("\\", "/"))
+    return any(
+        token and (_is_sensitive_path(token) or _is_shell_startup_file(token))
+        for token in tokens
     )
-    lowered = command.lower()
-    return any(marker in lowered for marker in cred_markers)
 
 
 # Beyond this length a command is not something a person is reasonably asking
@@ -846,12 +871,12 @@ def _local_shell_reads_files(command: str) -> bool:
 
 
 def check_permission(mode: str, command: str = "", path_zone: str = "default",
-                     host: bool = False) -> bool:
+                     host: bool = False, approval_key: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
-    if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser"):
+    if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser", "search"):
         return True  # temporary grant for approved plan steps — only in plan-only mode
     if PERMISSION_MODE in ("edit", "full-auto"):
         return True
@@ -883,7 +908,7 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
             return False
         return True
     # One-shot grant: allow one blocked tool through, then revert
-    if _one_shot_grant:
+    if _one_shot_grant is True or _one_shot_grant == approval_key:
         _one_shot_grant = False
         return True
     return False
@@ -900,13 +925,15 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
 def grant_escalation(change_type: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
     The user is prompted for every write/mutation - no session-wide grants."""
-    global _one_shot_grant, _local_fallback_grant, _remote_git_grant
+    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
     if change_type == "git_remote_write":
         _remote_git_grant = True
         _one_shot_grant = False
         _local_fallback_grant = False
+        _pending_approval_key = ""
         return
-    _one_shot_grant = True
+    _one_shot_grant = _pending_approval_key or True
+    _pending_approval_key = ""
     _local_fallback_grant = change_type == "local_execution"
     _remote_git_grant = False
 
@@ -1132,7 +1159,30 @@ def _finish_interrupt_watcher(stop, watcher):
 
 def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                       temperature=0.1, on_token=None, interrupt_check=None,
-                      model_name: str = "", provider_name: str = ""):
+                      model_name: str = "", provider_name: str = "",
+                      telemetry_attempt: str = "direct"):
+    """Create one model response and record metadata-only local telemetry."""
+    started = time.monotonic()
+    selected_model = model_name or MODEL_NAME
+    provider = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    try:
+        response = _create_completion(
+            client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
+            temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
+            model_name=selected_model, provider_name=provider,
+        )
+    except Exception as exc:
+        _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
+                                max_tokens=max_tokens, error=exc)
+        raise
+    _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
+                            max_tokens=max_tokens, response=response)
+    return response
+
+
+def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
+                       temperature=0.1, on_token=None, interrupt_check=None,
+                       model_name: str = "", provider_name: str = ""):
     selected_model = model_name or MODEL_NAME
     full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
     penalties = {}
@@ -1253,6 +1303,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+            telemetry_attempt="primary",
         )
     except AgentInterrupted:
         raise
@@ -1277,7 +1328,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 fallback_client, messages, tools, temperature=temperature,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
-                provider_name=provider_name,
+                provider_name=provider_name, telemetry_attempt="fallback",
             )
         except AgentInterrupted:
             raise
@@ -2005,6 +2056,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
         except Exception as exc:
             result = f"Error: {exc}"
+        _remember_escalation(tool_name, tool_args, result)
         if result.startswith("ESCALATION_REQUEST:") and callable(on_escalation):
             if on_escalation(result):
                 try:
@@ -2385,6 +2437,7 @@ def _sandbox_settings_data() -> dict:
         "network": {
             "allowedDomains": SANDBOX_ALLOWED_DOMAINS,
             "deniedDomains": [],
+            "strictAllowlist": True,
             "allowLocalBinding": False,
         },
         "filesystem": {
@@ -2427,7 +2480,7 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     if backend == "docker":
         return _exec_docker_command(_process_display(argv), timeout)
     using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
+    if using_fallback_grant:
         _local_fallback_grant = False
         if using_fallback_grant:
             _one_shot_grant = False
@@ -2506,7 +2559,7 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
     if backend == "docker":
         return _exec_docker_command(command, timeout, python_code, image)
     using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
+    if using_fallback_grant:
         _local_fallback_grant = False
         if using_fallback_grant:
             _one_shot_grant = False
@@ -2859,6 +2912,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     mode = (spec.get("mode") or "").lower()
     timeout = int(spec.get("timeout") or 25)
+    if args.get("__parse_error__"):
+        return _tool_arg_parse_error(name, str(args["__parse_error__"]))
+    approval_key = _tool_call_key(name, args)
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"
@@ -2867,7 +2923,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # to the normal check_permission gate so it escalates properly.
     if (PERMISSION_MODE == "plan-only"
             and allow_plan
-            and mode in ("write_text", "shell", "docker", "cron", "browser")):
+            and mode in ("write_text", "shell", "docker", "cron", "browser", "search")):
         return ("Error: plan-only mode — direct tool execution blocked. "
                 "Call the execute_plan tool with a JSON steps array, e.g.: "
                 'execute_plan(steps=[{"tool":"write_file",'
@@ -2905,7 +2961,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=url[:200], reason="outbound_secret")
             return leak
-        if not check_permission(mode, url):
+        if not check_permission(mode, url, approval_key=approval_key):
             _audit("escalation_requested", tool=name, mode=mode,
                    decision="blocked", detail=url[:200],
                    change_type="network_request")
@@ -2918,6 +2974,45 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=url[:200])
         return _exec_http(mode, spec, args, timeout)
+
+    # --- Layer 2b: web search (mode=search) ---
+    # Its own block rather than a branch of http_get: the destination URL is not
+    # known until the provider chain is resolved, and a fallback may contact a
+    # different host entirely. The egress/SSRF/secret guards are therefore
+    # applied per attempt INSIDE each provider, via the check_url injected by
+    # _search_context() — see web_search.SearchContext.
+    if mode == "search":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "Error: web_search requires 'query'."
+        # Hard floor, checked before the permission gate: a search query is an
+        # outbound channel, so a credential in it is never legitimate and is not
+        # escalatable. The http path applies this to the URL and body; here the
+        # query is what leaves the machine — for ddgs/Tavily/Exa it never appears
+        # in a URL that check_url would see, so guarding the destination alone
+        # would leave the query itself as an exfiltration path.
+        leak = (_outbound_secret_check(query)
+                or _outbound_secret_check(json.dumps(args, default=str)))
+        if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=query[:120], reason="outbound_secret")
+            return leak
+        if not check_permission(mode, f"web_search: {query[:80]}",
+                                approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=query[:120],
+                   change_type="network_request")
+            return request_escalation(
+                target_mode="edit",
+                paths=[f"web_search: {query[:100]}"],
+                change_type="network_request",
+                reason=f"Tool '{name}' wants to search the web for: {query[:160]}",
+            )
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=query[:200])
+        return web_search.run_search(
+            query, _web_search_limit(), WEB_SEARCH_REGISTRY, _search_config(),
+            _search_context())
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
@@ -3007,13 +3102,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         _audit("tool_call", tool=name, mode=mode, decision="denied",
                detail=command[:200], reason="hard_blocked_shell")
-        return "Error: This git operation is forbidden by Agent8088's safety policy."
+        return "Error: This shell operation is forbidden by Agent8088's safety policy."
 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
     if mode == "mcp" and spec.get("mcp_read_only"):
         gated_modes = tuple(item for item in gated_modes if item != "mcp")
     if mode in gated_modes and not remote_git_approved and not check_permission(
-            mode, command, path_zone, bool(spec.get("host"))):
+            mode, command, path_zone, bool(spec.get("host")), approval_key):
         if PERMISSION_MODE == "plan-only" and allow_plan:
             return ("Error: plan-only mode — direct tool execution blocked. "
                     "Call the execute_plan tool with a JSON steps array, e.g.: "
@@ -3123,7 +3218,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if args.get("_private") is True:
             _write_private_text(target, content)
         else:
-            target.write_text(content)
+            target.write_text(content, encoding="utf-8", newline="")
         _last_write_diff = _make_diff(old_content, content, str(target))
         return f"Wrote {len(content)} bytes to {target}"
 
@@ -3141,10 +3236,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return _exec_structured_tool(name, args, timeout)
         command = _format_with_args(spec.get("command") or "{command}", args)
         if spec.get("host"):
-            return _missing_binary_hint(
+            result = _missing_binary_hint(
                 command.split()[0] if command.split() else "",
                 _exec_process(command, timeout=timeout, shell=True))
-        return _exec_shell_command(command, timeout=timeout)
+        else:
+            result = _exec_shell_command(command, timeout=timeout)
+        return _wrap_untrusted(str(result), f"shell command: {_redact_secrets(command[:160])}")
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
@@ -3173,6 +3270,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
         result = "Command timed out"
     except Exception as e:
         result = f"Error: {e}"
+
+    _remember_escalation(name, args, result)
 
     # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
     result = _redact_secrets(result)
@@ -3222,6 +3321,31 @@ def _escape_control_chars_in_strings(raw: str) -> str:
     return "".join(out)
 
 
+def _escape_invalid_backslashes(raw: str) -> str:
+    """Preserve Windows paths that models emit without JSON escaping."""
+    out = []
+    in_string = False
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+        elif char == "\\" and in_string:
+            following = raw[index + 1:index + 2]
+            unicode_escape = (following == "u" and index + 5 < len(raw)
+                              and all(c in "0123456789abcdefABCDEF"
+                                      for c in raw[index + 2:index + 6]))
+            if following in '"\\/bfnrt' or unicode_escape:
+                out.append(char)
+            else:
+                out.append("\\\\")
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _loads_tool_args(raw: str):
     """json.loads for model-emitted arguments, tolerant of unescaped newlines.
 
@@ -3231,11 +3355,21 @@ def _loads_tool_args(raw: str):
     try:
         return json.loads(raw)
     except ValueError:
-        return json.loads(_escape_control_chars_in_strings(raw))
+        return json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+
+
+_MARKDOWN_FENCE_RE = re.compile(r"(^```[^\n]*\n.*?^```[ \t]*$)", re.MULTILINE | re.DOTALL)
+
+
+def _outside_fenced_code(text: str) -> str:
+    """Return only prose, so a tool-call example cannot execute itself."""
+    return "".join(part for index, part in enumerate(_MARKDOWN_FENCE_RE.split(text))
+                   if index % 2 == 0)
 
 
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
+    text = _outside_fenced_code(text)
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
@@ -3311,15 +3445,18 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
 
 
 def strip_tool_json(text: str) -> str:
-    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<\|mask_start\|>.*?<\|mask_end\|>', '', text, flags=re.DOTALL)
-    text = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', text, flags=re.DOTALL)
-    text = re.sub(r'✿FUNCTION✿[^\n]*', '', text)
-    text = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', text, flags=re.DOTALL)
-    # Hard sanitize: strip any leftover ✿…✿ fragments and stray sentinels so raw
-    # tool-call markup can NEVER leak into a user-facing answer.
-    text = re.sub(r'✿[^✿\n]*✿', '', text)
-    text = text.replace('✿', '')
+    parts = _MARKDOWN_FENCE_RE.split(text)
+    for index in range(0, len(parts), 2):
+        part = parts[index]
+        part = re.sub(r'<tool_call>.*?</tool_call>', '', part, flags=re.DOTALL)
+        part = re.sub(r'<\|mask_start\|>.*?<\|mask_end\|>', '', part, flags=re.DOTALL)
+        part = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', part, flags=re.DOTALL)
+        part = re.sub(r'✿FUNCTION✿[^\n]*', '', part)
+        part = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', part, flags=re.DOTALL)
+        # Hard sanitize: strip any leftover ✿…✿ fragments and stray sentinels so raw
+        # tool-call markup can NEVER leak into a user-facing answer.
+        parts[index] = re.sub(r'✿[^✿\n]*✿', '', part).replace('✿', '')
+    text = "".join(parts)
     # Tidy whitespace WITHOUT flattening newlines, so multi-line answers survive.
     text = re.sub(r'[ \t]+\n', '\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
@@ -3462,6 +3599,19 @@ AUDIT_ENABLED = APP_CONFIG.get("audit_log", "0") == "1"
 AUDIT_LOG_PATH = Path(APP_CONFIG.get(
     "audit_log_path", str(_agent_data_dir() / "audit.jsonl"))).expanduser()
 AUDIT_MAX_DETAIL = int(APP_CONFIG.get("audit_max_detail", "512"))
+MODEL_TELEMETRY_ENABLED = APP_CONFIG.get("model_telemetry", "0") == "1"
+MODEL_TELEMETRY_PATH = Path(APP_CONFIG.get(
+    "model_telemetry_path", str(_agent_data_dir() / "model-telemetry.jsonl"))).expanduser()
+
+
+def _append_private_jsonl(path: Path, entry: dict) -> None:
+    """Append a local structured record without weakening the caller on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+    if not existed:
+        _protect_private_file(path)
 
 
 def _audit(event: str, **fields) -> None:
@@ -3483,14 +3633,61 @@ def _audit(event: str, **fields) -> None:
         for key, value in fields.items():
             text = _redact_secrets(str(value))
             entry[key] = text[:AUDIT_MAX_DETAIL] if key == "detail" else text
-        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        existed = AUDIT_LOG_PATH.exists()
-        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry) + "\n")
-        if not existed:
-            _protect_private_file(AUDIT_LOG_PATH)
+        _append_private_jsonl(AUDIT_LOG_PATH, entry)
     except Exception as exc:  # noqa: BLE001 — audit must never break a turn
         _log.debug("audit write failed: %s", exc)
+
+
+def _model_usage(response) -> tuple[dict, str]:
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        return {
+            "input_tokens": getattr(usage, "prompt_tokens", None),
+            "output_tokens": getattr(usage, "completion_tokens", None),
+        }, "provider"
+    choices = getattr(response, "choices", ()) or ()
+    message = getattr(choices[0], "message", None) if choices else None
+    content = getattr(message, "content", "") or ""
+    return {"input_tokens": None, "output_tokens": len(content) // 4}, "output_estimate"
+
+
+def _record_model_telemetry(provider: str, model: str, attempt: str, started: float,
+                            *, max_tokens: int, response=None, error=None) -> None:
+    """Write local model-call health metadata; prompts and responses never leave memory."""
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        usage, token_source = _model_usage(response) if response is not None else (
+            {"input_tokens": None, "output_tokens": None}, "unavailable")
+        input_tokens = usage["input_tokens"] or 0
+        output_tokens = usage["output_tokens"] or 0
+        cost = None
+        if COST_PER_1K_INPUT or COST_PER_1K_OUTPUT:
+            cost = round((input_tokens / 1000) * COST_PER_1K_INPUT
+                         + (output_tokens / 1000) * COST_PER_1K_OUTPUT, 8)
+        choices = getattr(response, "choices", ()) or ()
+        finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
+        status = getattr(error, "status_code", None)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "model_call",
+            "provider": _redact_secrets(str(provider)),
+            "model": _redact_secrets(str(model)),
+            "attempt": attempt,
+            "outcome": "error" if error else "success",
+            "latency_ms": round((time.monotonic() - started) * 1000),
+            "max_tokens": max_tokens,
+            "token_source": token_source,
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "cost_usd": cost,
+            "finish_reason": finish_reason,
+            "error_type": type(error).__name__ if error else None,
+            "error_status": status if isinstance(status, int) else None,
+        }
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, entry)
+    except Exception as exc:  # telemetry must never affect a model call
+        _log.debug("model telemetry write failed: %s", exc)
 
 
 _MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
@@ -3680,6 +3877,80 @@ def _egress_check(url: str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Web search — provider registry wiring (mode=search)
+# ---------------------------------------------------------------------------
+WEB_SEARCH_REGISTRY = web_search.default_registry()
+
+
+def _web_search_limit() -> int:
+    try:
+        return max(1, min(int(APP_CONFIG.get("web_search_results", "5")), 20))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _search_config() -> dict:
+    """APP_CONFIG as the search registry should see it.
+
+    Strips the DEFAULTED search_base_url (see SEARCH_BASE_URL_CONFIGURED): the
+    default exists so tool URL templates always interpolate, but treating it as
+    user intent would mean the SearXNG backend claims availability everywhere.
+    """
+    config = dict(APP_CONFIG)
+    if not SEARCH_BASE_URL_CONFIGURED:
+        config.pop("search_base_url", None)
+    return config
+
+
+def _search_context():
+    """Build the guard bundle handed to every web search provider.
+
+    Providers live in web_search.py, which must not import this module (the
+    import would be circular). Passing the guards in keeps _egress_check /
+    _ssrf_check / _outbound_secret_check as the single enforcement point, so a
+    provider cannot accidentally skip them — including the ddgs backend, whose
+    library owns its own HTTP client and would otherwise sit outside the
+    egress policy entirely.
+
+    Credentials are read from the .env key store, never config.txt, matching
+    the migration at import time. The file is read once per call rather than
+    once per lookup.
+    """
+    try:
+        env_values = load_env_file(ENV_FILE_PATH)
+    except Exception:  # noqa: BLE001 — a missing/unreadable .env must not break search
+        env_values = {}
+
+    def check_url(url: str):
+        return (_egress_check(url) or _ssrf_check(url)
+                or _outbound_secret_check(url))
+
+    def get_secret(key_name: str) -> str:
+        return str(env_values.get(key_name) or os.environ.get(key_name, "") or "").strip()
+
+    return web_search.SearchContext(
+        config=_search_config(),
+        get_secret=get_secret,
+        check_url=check_url,
+        wrap=_wrap_untrusted,
+    )
+
+
+def _search_chain_summary() -> str:
+    """Which backends would serve web_search right now, in order.
+
+    Read from live state so /capabilities cannot drift from reality.
+    """
+    try:
+        chain = WEB_SEARCH_REGISTRY.chain(_search_config(), _search_context())
+    except Exception:  # noqa: BLE001 — /capabilities must never fail on a backend probe
+        return "unavailable"
+    if not chain:
+        return "none configured (run /search setup)"
+    return " -> ".join(provider.name for provider in chain)
+
+
 def _mask_system_content(text: str) -> str:
     """Sanitize text that will be SHOWN to the user (e.g. a reasoning preview):
     redact secrets and blank out any verbatim system-prompt lines. Chain-of-thought
@@ -3770,6 +4041,7 @@ def describe_capabilities() -> str:
         f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
+        f"- Web search: {_search_chain_summary()}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
         f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
@@ -3881,6 +4153,7 @@ def run_agent(messages, *, budget=None, **kwargs):
     if previous is None:
         reset_turn_counters()
         reset_approval_state()
+        reset_turn_approval_state()
     try:
         return _run_agent_loop(messages, budget=budget, **kwargs)
     finally:
@@ -3911,6 +4184,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     seen = set()      # (name, args) signatures already run -> breaks loops
+    tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
@@ -4039,7 +4313,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
 
-            if sig in seen:  # exact repeat -> feed cached output instead of re-running
+            if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
                           if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
@@ -4047,12 +4321,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
 
-            seen.add(sig)
+            if "__parse_error__" not in args:
+                seen.add(sig)
             if on_tool:
                 on_tool(name)
             with spin(f"running {name}..."):
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
+            tool_outputs.append(result)
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.
@@ -4113,7 +4389,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
 
     # Max turns reached or forced stop: return the best answer we have.
-    fallback = _guard_answer(_last_tool_output[:1000] if _last_tool_output else "Could not complete the task.")
+    fallback_source = "\n\n".join(tool_outputs) or _last_tool_output
+    fallback = _guard_answer(fallback_source[:3000] if fallback_source else "Could not complete the task.")
     if on_answer:
         on_answer(fallback)
     if trace is not None:

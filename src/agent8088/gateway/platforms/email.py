@@ -21,9 +21,6 @@ import asyncio
 import email as email_lib
 import logging
 import smtplib
-import ssl
-import socket
-import time
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -31,7 +28,7 @@ from typing import Optional
 
 from agent8088 import engine as A
 from agent8088.gateway.platforms.base import (
-    BaseChannelAdapter, MessageEvent, SendResult,
+    BaseChannelAdapter, MessageEvent,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,9 +138,10 @@ class EmailAdapter(BaseChannelAdapter):
         self._seen_uids: set = set()
         self._thread_context: dict = {}  # sender → {subject, message_id}
         self._poll_task = None
+        self._dispatch_futures: set = set()
         self._loop = None  # main event loop, captured in connect()
         self._verify_sender_enabled = str(
-            config.get("email_verify_sender", "")
+            config.get("email_verify_sender", "1")
         ).strip().lower() in ("1", "true", "yes", "on")
 
     async def connect(self) -> None:
@@ -157,6 +155,8 @@ class EmailAdapter(BaseChannelAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
+        for future in tuple(self._dispatch_futures):
+            future.cancel()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -218,17 +218,15 @@ class EmailAdapter(BaseChannelAdapter):
         if _is_automated_sender(from_addr, msg):
             return
 
-        # Allowlist check — before any logging or dispatch.
-        # Unauthorized emails are silently dropped.
-        if self.runner and hasattr(self.runner, "allowlist"):
-            if not self.runner.allowlist.is_allowed(from_addr, "email"):
-                return
-
-        # Optional sender verification (SPF/DKIM/DMARC) — fail-closed.
-        # Enable with email_verify_sender=1 in config.txt.
+        # Authentication must precede the spoofable From-header allowlist.
         if self._verify_sender_enabled and not _verify_sender(msg):
             logger.warning("Email: rejected unverified sender %s (SPF/DKIM/DMARC failed)", from_addr)
             return
+
+        # Allowlist check — before any dispatch. Unauthorized emails are silent.
+        if self.runner and hasattr(self.runner, "allowlist"):
+            if not self.runner.allowlist.is_allowed(from_addr, "email"):
+                return
 
         subject = _decode_header_value(msg.get("Subject", ""))
         message_id = msg.get("Message-ID", "")
@@ -246,10 +244,23 @@ class EmailAdapter(BaseChannelAdapter):
             raw={"email": {"from": from_header, "subject": subject, "message_id": message_id}},
         )
         logger.info("Email: received message from %s (%d chars)", from_addr, len(text))
+        if self._loop is None:
+            logger.warning("Email: cannot dispatch message before connect()")
+            return
         try:
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self.runner.on_message(event), self._loop
             )
+            self._dispatch_futures.add(future)
+
+            def report_dispatch(future):
+                self._dispatch_futures.discard(future)
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("Email: agent turn failed for %s", from_addr)
+
+            future.add_done_callback(report_dispatch)
         except Exception as e:
             logger.warning("Email: failed to dispatch message from %s: %s", from_addr, e)
 

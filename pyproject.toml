@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,15 +8,21 @@ version = "0.2.0"
 description = "Agent8088 - Local AI Assistant"
 requires-python = ">=3.10"
 dependencies = [
-    "openai>=1.0.0",
-    "rich>=13.0.0",
-    "InquirerPy>=0.3.4",
+    "openai>=1.0.0,<3",
+    "rich>=13.0.0,<16",
+    "InquirerPy>=0.3.4,<1",
     "mcp>=1.27,<2",
+    # Keyless web search fallback. A hard dependency on purpose: web_search must
+    # always have a backend that needs no Docker, no API key, and no setup step,
+    # so a stopped or unreachable SearXNG still returns results instead of an
+    # error. Reached only through web_search.DdgsProvider, which enforces the
+    # egress policy on its fixed upstream hosts before the library runs.
+    "ddgs>=9,<10",
 ]
 
 [project.optional-dependencies]
-gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0", "discord.py>=2.3.0,<3"]
-dev = ["pytest>=7.0.0"]
+gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3"]
+dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
 
 [project.scripts]
 agent8088 = "agent8088.cli:main"
@@ -28,3 +34,4 @@ packages = ["src/agent8088"]
 "assets/palindrome-research-labs.png" = "agent8088/assets/palindrome-research-labs.png"
 "src/agent8088/gateway/platforms/whatsapp_bridge/bridge.js" = "agent8088/gateway/platforms/whatsapp_bridge/bridge.js"
 "src/agent8088/gateway/platforms/whatsapp_bridge/package.json" = "agent8088/gateway/platforms/whatsapp_bridge/package.json"
+"src/agent8088/gateway/platforms/whatsapp_bridge/package-lock.json" = "agent8088/gateway/platforms/whatsapp_bridge/package-lock.json"

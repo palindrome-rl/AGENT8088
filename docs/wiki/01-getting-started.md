@@ -70,7 +70,10 @@ The wizard asks for:
    never in `config.txt`
 4. **Model** — fetched live from the provider's `/v1/models` where supported,
    otherwise typed
-5. **Search URL** — optional SearXNG endpoint
+5. **Web search** — pick a backend. SearXNG is offered first when Docker is
+   available (the wizard provisions it); otherwise the bundled keyless `ddgs`
+   fallback is already active and needs nothing. Tavily and Exa are optional
+   API-key backends. Re-running setup offers **Keep current setting**.
 
 Re-running the wizard pre-fills what you already have, so pressing Enter keeps
 the existing value instead of clearing it.

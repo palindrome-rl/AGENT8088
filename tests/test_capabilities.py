@@ -7,8 +7,6 @@ so it cannot drift from what the agent can actually do.
 """
 import pytest
 
-from agent8088 import engine as A
-
 
 # --- The report ------------------------------------------------------------
 
@@ -84,6 +82,10 @@ def test_report_does_not_leak_the_system_prompt(engine):
 
 def test_tool_is_registered(engine):
     assert "describe_capabilities" in engine.TOOL_SPECS
+
+
+def test_model_tool_schemas_match_registered_tools(engine):
+    assert {tool["function"]["name"] for tool in engine.TOOLS_DEF} == set(engine.TOOL_SPECS)
 
 
 def test_tool_works_in_readonly_mode(engine, monkeypatch):

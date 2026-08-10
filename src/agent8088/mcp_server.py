@@ -14,7 +14,7 @@ allowed_paths / set blocked_paths first.
 
 Usage:
     agent8088 --mcp-serve              # stdio (local, default)
-    agent8088 --mcp-serve --mcp-http   # HTTP (remote, multi-client)
+    agent8088 --mcp-serve --mcp-http   # HTTP (localhost only)
 
 MCP client config (stdio):
     {
@@ -51,16 +51,14 @@ except ImportError:
 # Following Hermes/OpenClaw pattern: only expose tools that don't require
 # live agent-loop context or dangerous capabilities.
 #
-# Everything here is NON-MUTATING. That matters because run_mcp_server() puts
-# the process in full-auto: MCP has no approval channel, so an escalation
-# prompt would just be an error string the client cannot answer. Non-mutating
-# tools make full-auto safe; a mutating one would silently lose its prompt.
+# Everything here is NON-MUTATING by default. MCP has no approval channel, so
+# the handler applies its temporary policy only while one request dispatches.
 EXPOSED_TOOLS = (
     "read_text",
     "calculate",
+    # Routes to whichever backend is configured (SearXNG / Tavily / Exa / ddgs)
+    # via the provider registry — one tool, no per-vendor surface to expose.
     "web_search",
-    "web_search_tavily",
-    "web_search_exa",
     "get_page_title",
     "last_output",
     # Lets a host agent ask what this server can actually do — tools, limits, and
@@ -77,6 +75,7 @@ EXPOSED_TOOLS = (
 WRITE_TOOLS = ("write_file",)
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
 def exposed_tool_names(config=None) -> tuple:
@@ -154,7 +153,12 @@ def _make_handler(tool_name: str, args_list: list, engine_module):
 
     async def handler(**kwargs):
         args = {k: v for k, v in kwargs.items() if v is not None}
-        result = engine_module.run_tool(tool_name, args)
+        previous = engine_module.PERMISSION_MODE
+        engine_module.PERMISSION_MODE = "full-auto"
+        try:
+            result = engine_module.run_tool(tool_name, args)
+        finally:
+            engine_module.PERMISSION_MODE = previous
         if result is None:
             return ""
         return str(result)
@@ -168,7 +172,7 @@ def _make_handler(tool_name: str, args_list: list, engine_module):
 def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
     """Start the Agent8088 MCP server.
 
-    transport: "stdio" (default, local) or "streamable-http" (remote/multi-client).
+    transport: "stdio" (default, local) or "streamable-http" (localhost only).
     host/port: only used when transport is "streamable-http".
     """
     if not _MCP_AVAILABLE:
@@ -182,19 +186,19 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
     from agent8088 import engine as A
-    # Run in full-auto so the exposed read-only tools (web_search,
-    # get_page_title) don't escalate: MCP has no approval channel, so an
-    # ESCALATION_REQUEST would just be an error string the client cannot
-    # answer. This is only safe because the default surface is non-mutating —
-    # see EXPOSED_TOOLS. Writes are opt-in (mcp_server_allow_writes) and even
-    # then the always-on floor still refuses sensitive and shell startup files.
-    A.PERMISSION_MODE = "full-auto"
     if exposed_tool_names(A.APP_CONFIG) != EXPOSED_TOOLS:
         print("Agent8088 MCP server: writes ENABLED (mcp_server_allow_writes) — "
               "unattended, no approval prompt. Narrow allowed_paths/blocked_paths.",
               file=sys.stderr)
-    # Allow loopback for configured search endpoints (SearXNG on localhost).
-    if A.APP_CONFIG.get("search_base_url", ""):
+    # Allow loopback for a configured search endpoint (SearXNG on localhost).
+    #
+    # Gated on SEARCH_BASE_URL_CONFIGURED, not on the key being present: engine
+    # seeds a DEFAULT search_base_url into APP_CONFIG so tool templates always
+    # interpolate, so `.get("search_base_url")` is truthy even when the operator
+    # never configured an instance. Widening the SSRF allowlist off that default
+    # granted every MCP run loopback access it had no use for — in a process that
+    # deliberately runs unattended in full-auto.
+    if getattr(A, "SEARCH_BASE_URL_CONFIGURED", False) and A.APP_CONFIG.get("search_base_url", ""):
         import urllib.parse as _up
         parsed = _up.urlparse(A.APP_CONFIG["search_base_url"])
         if parsed.hostname:
@@ -202,6 +206,8 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
             A.SSRF_ALLOW_HOSTS.add(f"{parsed.hostname}:{parsed.port or 80}")
 
     if transport == "streamable-http":
+        if host.lower() not in _LOOPBACK_HOSTS:
+            raise ValueError("HTTP MCP must bind to localhost; remote MCP requires authentication, which is not configured.")
         server = create_mcp_server(host=host, port=port)
         print(f"Agent8088 MCP server (HTTP) on http://{host}:{port}/mcp", file=sys.stderr)
         server.run(transport="streamable-http")

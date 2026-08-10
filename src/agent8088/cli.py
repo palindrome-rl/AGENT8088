@@ -150,6 +150,7 @@ class _SubStatusLine:
 # Load the real Agent8088 engine
 # ---------------------------------------------------------------------------
 from agent8088 import engine as A
+from agent8088 import searxng_provision
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +326,15 @@ def _session_system_prompt():
                    "Use read_text and safe shell commands (ls, cat, grep, git status, "
                    "git diff, git log) to gather information, then call execute_plan "
                    "with a steps array to execute your plan.\n")
-    elif A.PERMISSION_MODE in ("edit", "full-auto"):
-        prompt += ("You are in full-auto mode. All tools are allowed without prompts. "
-                   "Catastrophic commands and credential path writes are still blocked.\n")
+    elif A.PERMISSION_MODE == "full-auto":
+        prompt += ("You are in full-auto mode. Permission-gated tools are allowed without "
+                   "prompts when sandboxed. Unisolated local execution still needs a one-shot "
+                   "grant. Catastrophic commands and credential path writes are always blocked.\n")
+    elif A.PERMISSION_MODE == "edit":
+        prompt += ("You are in edit mode. Permission-gated tools are allowed when sandboxed. "
+                   "Use a tool only when it is necessary; unisolated local execution still "
+                   "needs a one-shot grant. Catastrophic commands and credential path writes "
+                   "are always blocked.\n")
     else:
         prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
                    "Writes and mutations require user approval.\n")
@@ -1361,7 +1368,7 @@ def cmd_models(rest):
     if not provider:
         choices = sorted(A.PROVIDERS)
         if not choices:
-            console.print(f"[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
+            console.print("[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
             return
         active = _active_provider_name()
         provider = _choice_prompt("Select provider:", choices, active if active in choices else "")
@@ -1503,6 +1510,157 @@ def cmd_sandbox(rest):
     t.add_row("Network", status["network"])
     t.add_row("Runtime", status["runtime_version"])
     console.print(t)
+
+
+def _search_setup_options():
+    """Web search choices, ordered so the best available one is first.
+
+    Docker-aware: SearXNG leads when a container can actually be provisioned,
+    otherwise the bundled keyless fallback does. Rendered from each backend's
+    setup_schema() so the wording lives with the provider, not here.
+    """
+    registry = A.WEB_SEARCH_REGISTRY
+    options = []
+    if A._docker_available():
+        options.append("SearXNG (recommended — provision locally with Docker)")
+        options.append("ddgs (keyless fallback — already active, nothing to do)")
+    else:
+        options.append("ddgs (keyless fallback — already active, nothing to do)")
+    options.append("Existing SearXNG / remote instance URL")
+    for name in ("tavily", "exa"):
+        provider = registry.get(name)
+        if provider:
+            schema = provider.setup_schema()
+            options.append(f"{schema['name']} (optional — API key)")
+    options.append("None (disable web search)")
+    return options
+
+
+def _search_provider_rows():
+    """(name, badge, available, hint) per backend, in preference order."""
+    ctx = A._search_context()
+    rows = []
+    for provider in A.WEB_SEARCH_REGISTRY.all():
+        schema = provider.setup_schema()
+        try:
+            available = provider.is_available(ctx)
+        except Exception:  # noqa: BLE001 — /search status must list every backend regardless
+            available = False
+        keys = ", ".join(v["key"] for v in schema.get("env_vars") or [])
+        hint = keys or schema.get("tag", "")
+        rows.append((provider.name, schema.get("badge", ""), available, hint))
+    return rows
+
+
+def cmd_search(rest):
+    """Inspect and configure web search backends."""
+    parts = rest.strip().split()
+    action = (parts[0].lower() if parts else "status")
+    argument = parts[1].lower() if len(parts) > 1 else ""
+
+    if action == "use":
+        known = A.web_search.PREFERENCE
+        if argument not in known:
+            console.print(f"[red]Unknown provider '{argument}'.[/red] "
+                          f"Choose one of: {', '.join(known)}")
+            return
+        A.update_simple_config(A.CONFIG_PATH, {"web_search_provider": argument})
+        A.APP_CONFIG["web_search_provider"] = argument
+        console.print(f"Pinned web search to [#237dd7]{argument}[/#237dd7].")
+        provider = A.WEB_SEARCH_REGISTRY.get(argument)
+        if provider and not provider.is_available(A._search_context()):
+            # Persisted anyway: pinning tavily before pasting the key should not
+            # be a dead end, but say so rather than letting searches fail quietly.
+            console.print(f"[yellow]Note:[/yellow] {argument} is not currently "
+                          f"available — {provider.setup_hint()}")
+        return
+
+    if action == "stop":
+        result = searxng_provision.stop()
+        console.print(result["detail"] or ("stopped" if result["ok"] else "failed"))
+        return
+
+    if action == "setup":
+        if not A._docker_available():
+            console.print(
+                "Docker is not available, so a local SearXNG cannot be provisioned.\n"
+                "The keyless [#237dd7]ddgs[/#237dd7] backend ships with agent8088 and "
+                "is already handling web_search — nothing to install.\n"
+                "For better results: point [#237dd7]search_base_url[/#237dd7] at a "
+                "remote SearXNG (https:// required for public hosts), or add a "
+                "TAVILY_API_KEY / EXA_API_KEY to the .env store.")
+            cmd_search("status")
+            return
+        with status_cm("starting SearXNG container..."):
+            started = searxng_provision.start(_agent8088_home())
+        console.print(started["detail"])
+        if not started["ok"]:
+            return
+        with status_cm("waiting for the SearXNG JSON API..."):
+            ready = searxng_provision.wait_ready()
+        console.print(ready["detail"])
+        if not ready["ok"]:
+            # Do not record a backend that cannot answer — the chain would try it
+            # first on every search and fail before reaching the fallback.
+            console.print("[yellow]Not saved to config.[/yellow] Fix the instance, "
+                          "then re-run `/search setup`.")
+            return
+        base_url = started.get("base_url") or searxng_provision.BASE_URL
+        A.update_simple_config(A.CONFIG_PATH, {
+            "search_base_url": base_url,
+            "web_search_provider": "searxng",
+        })
+        A.APP_CONFIG["search_base_url"] = base_url
+        A.SEARCH_BASE_URL_CONFIGURED = True
+        console.print(f"Saved [#237dd7]search_base_url={base_url}[/#237dd7]")
+        cmd_search("status")
+        return
+
+    if action == "doctor":
+        container = searxng_provision.status()
+        t = Table(title="Web search diagnosis", box=box.SIMPLE,
+                  title_style="bold #00edff", header_style="bold #00edff")
+        t.add_column("Check", style="#00edff")
+        t.add_column("Result", style="#237dd7")
+        t.add_row("Container", container["detail"])
+        t.add_row("Active chain", A._search_chain_summary())
+        base_url = str(A.APP_CONFIG.get("search_base_url") or "")
+        configured = getattr(A, "SEARCH_BASE_URL_CONFIGURED", False)
+        t.add_row("search_base_url", base_url if configured else "not set (using fallback)")
+        if configured and base_url:
+            import urllib.parse as _up
+            host = (_up.urlparse(base_url).hostname or "").lower()
+            covered = host in A.SSRF_ALLOW_HOSTS or A.SSRF_ALLOW_PRIVATE
+            t.add_row("SSRF allowlist",
+                      f"{host} allowed" if covered
+                      else f"[red]{host} NOT in ssrf_allow_hosts[/red] — internal "
+                           f"requests to it will be blocked")
+        else:
+            t.add_row("SSRF allowlist",
+                      f"ssrf_allow_hosts={', '.join(sorted(A.SSRF_ALLOW_HOSTS)) or 'not set'}")
+        t.add_row("ddgs importable",
+                  "yes" if A.web_search._ddgs_installed() else "[red]no[/red]")
+        console.print(t)
+        cmd_search("status")
+        return
+
+    if action not in ("status", ""):
+        console.print(f"[red]Unknown action '{action}'.[/red] "
+                      "Use: status, setup, stop, doctor, use <provider>")
+        return
+
+    t = Table(title="Web search backends", box=box.SIMPLE,
+              title_style="bold #00edff", header_style="bold #00edff")
+    t.add_column("Backend", style="#237dd7")
+    t.add_column("Role", style="#237dd7")
+    t.add_column("Ready", style="#237dd7")
+    t.add_column("Enable with", style="#237dd7")
+    for name, badge, available, hint in _search_provider_rows():
+        t.add_row(name, badge, "yes" if available else "no", hint)
+    console.print(t)
+    console.print(f"Active chain: [#237dd7]{A._search_chain_summary()}[/#237dd7]  ·  "
+                  f"pin one with [#237dd7]/search use <backend>[/#237dd7]  ·  "
+                  f"provision SearXNG with [#237dd7]/search setup[/#237dd7]")
 
 
 def cmd_mode(rest):
@@ -1918,6 +2076,7 @@ COMMANDS = {
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config, "system": cmd_system,
     "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
+    "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
@@ -2209,7 +2368,6 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     builtin_names = provider_registry.builtin_provider_names()
     provider_choices = [*builtin_names, CUSTOM_PROVIDER_CHOICE]
-    cur_provider = _current("default_provider") or provider_registry.default_provider_name()
     provider_choice = _choice_prompt("Select model provider:", provider_choices)
 
     custom_base_url = ""
@@ -2279,13 +2437,60 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             if not model_name:
                 print("A model is required.")
 
+    search = ""
+    search_provider = ""
+    search_keys = {}
     if include_workspace:
-        search = _custom_prompt(
-            "Web search URL (SearXNG):",
-            instruction="(Enter keeps current setting; type none to disable)",
-        )
-    else:
-        search = ""
+        # A choice rather than a bare URL field: most users do not have a SearXNG
+        # URL to type, and the old prompt gave no hint that a keyless fallback
+        # and API-key backends exist.
+        options = _search_setup_options()
+        # Re-running setup must not force a re-pick: the old text prompt
+        # documented "Enter keeps current setting", so an already-configured
+        # instance keeps that escape hatch as the default choice.
+        if _current("search_base_url"):
+            options.insert(0, "Keep current setting")
+        choice = _choice_prompt("Web search:", options, options[0]).lower()
+        if choice.startswith("keep current"):
+            pass  # leave search_base_url / web_search_provider untouched
+        elif choice.startswith("searxng ("):
+            provisioned = searxng_provision.start(_agent8088_home())
+            print(provisioned["detail"])
+            if provisioned["ok"]:
+                ready = searxng_provision.wait_ready()
+                print(ready["detail"])
+                if ready["ok"]:
+                    search = provisioned.get("base_url") or searxng_provision.BASE_URL
+                    search_provider = "searxng"
+                else:
+                    print("Leaving web search on the bundled ddgs fallback.")
+        elif choice.startswith("existing"):
+            search = _custom_prompt(
+                "SearXNG URL (must end with /search?q=):",
+                instruction="(https:// required for a public host; Enter to skip)",
+            ).strip()
+            if search:
+                search_provider = "searxng"
+        elif choice.startswith("ddgs"):
+            search_provider = "ddgs"
+            print("Using the bundled keyless ddgs backend — nothing to install.")
+        elif choice.startswith("none"):
+            search = "none"
+        else:
+            for name in ("tavily", "exa"):
+                provider = A.WEB_SEARCH_REGISTRY.get(name)
+                if not provider or not choice.startswith(name):
+                    continue
+                schema = provider.setup_schema()
+                for env_var in schema.get("env_vars") or []:
+                    entered = _custom_prompt(
+                        f"{env_var['prompt']} ({env_var.get('url', '')}):",
+                        secret=True).strip()
+                    if entered:
+                        # Keys go to the .env store, never config.txt.
+                        search_keys[env_var["key"]] = entered
+                if search_keys:
+                    search_provider = name
 
     if paths:
         content = _set_line(content, "allowed_paths", paths)
@@ -2306,8 +2511,13 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         content = _re.sub(rf'^provider\.{_re.escape(provider)}\.api_key=.*\n?', '', content, flags=_re.MULTILINE)
     if search.strip().lower() == "none":
         content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
+        content = _re.sub(r'^#?\s*web_search_provider=.*\n?', '', content, flags=_re.MULTILINE)
     elif search:
         content = _set_line(content, "search_base_url", search)
+    if search_keys:
+        A.update_env_file(A.ENV_FILE_PATH, search_keys)
+    if search_provider:
+        content = _set_line(content, "web_search_provider", search_provider)
     _write_private_text(config_path, content)
     if activate_runtime:
         _reload_model_runtime(config_path, provider, model_name)
@@ -2351,12 +2561,6 @@ def _run_gateway_setup():
 
     # Only one gateway channel can be active at a time (mutually exclusive).
     # Single-select picker — choosing one disables the others.
-    current = "None"
-    if slack_on: current = "Slack"
-    elif wa_on: current = "WhatsApp"
-    elif discord_on: current = "Discord"
-    elif email_on: current = "Email"
-
     choices = [
         "Slack" + (" (current)" if slack_on else ""),
         "WhatsApp" + (" (current)" if wa_on else ""),
@@ -2507,7 +2711,7 @@ def _run_gateway_setup():
                         print("\nWhatsApp pairing successful!")
                     else:
                         print("\nPairing may not have completed — check the QR was scanned.")
-                        print(f"If needed, re-run: agent8088 --gateway-setup")
+                        print("If needed, re-run: agent8088 --gateway-setup")
                 except subprocess.TimeoutExpired:
                     print("\nPairing timed out. Re-run `agent8088 --gateway-setup`.")
                 except Exception as e:
@@ -2619,7 +2823,7 @@ def _run_gateway_setup():
         print(f"Enabled: {', '.join(enabled)}")
         if newly_enabled:
             print(f"Newly configured: {', '.join(sorted(newly_enabled))}")
-        print(f"\nStart the gateway with: agent8088 --gateway")
+        print("\nStart the gateway with: agent8088 --gateway")
     else:
         print(f"Config written to {config_path}")
         print("No platform enabled. Run: agent8088 --gateway-setup")

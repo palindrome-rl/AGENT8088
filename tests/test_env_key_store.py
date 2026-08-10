@@ -1,8 +1,4 @@
 """Tests for the .env key store: load, update, migrate, mask, get_secret."""
-import os
-import tempfile
-from pathlib import Path
-from unittest.mock import patch
 
 
 def test_load_env_file_missing_returns_empty(tmp_path):
@@ -56,7 +52,7 @@ def test_mask_value_empty():
 
 
 def test_get_secret_from_env_file(tmp_path, monkeypatch):
-    from agent8088.engine import get_secret, load_env_file, ENV_FILE_PATH
+    from agent8088.engine import get_secret
     env_path = tmp_path / ".env"
     env_path.write_text("DISCORD_BOT_TOKEN=test-token-12345\n")
     config = {"discord_bot_token_env": "DISCORD_BOT_TOKEN"}
@@ -120,7 +116,7 @@ def test_migrate_keys_to_env_skips_if_env_exists(tmp_path):
 
 
 def test_provider_api_key_reads_from_env_file(tmp_path, monkeypatch):
-    from agent8088.engine import _provider_api_key, ENV_FILE_PATH
+    from agent8088.engine import _provider_api_key
     env_path = tmp_path / ".env"
     env_path.write_text("OPENROUTER_API_KEY=sk-from-env\n")
     monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", env_path)
@@ -129,7 +125,7 @@ def test_provider_api_key_reads_from_env_file(tmp_path, monkeypatch):
 
 
 def test_provider_api_key_fallback_to_direct(tmp_path, monkeypatch):
-    from agent8088.engine import _provider_api_key, ENV_FILE_PATH
+    from agent8088.engine import _provider_api_key
     env_path = tmp_path / ".env"
     env_path.write_text("")
     monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", env_path)

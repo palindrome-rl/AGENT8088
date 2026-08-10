@@ -13,10 +13,12 @@
 # system_file=system.md (defaults to APP_DIR/system.md)
 
 # write_file / read_file are restricted to these paths.
-# Use ~ for the user's home directory (full access to user files), or a specific path.
-allowed_paths=~
+# Defaults to the launch workspace. Add `~` only when the agent truly needs
+# full access to user files, or name a specific additional path.
+allowed_paths=.
 
 # --- Permission Layer 1: Sensitive file read protection ---
+# Exact paths only; relative paths resolve from the workspace.
 # allowed_sensitive_files=.env,secrets.yaml
 
 # --- Permission Layer 2: Network access control ---
@@ -66,17 +68,51 @@ sandbox_backend=auto
 sandbox_runtime_version=0.0.67
 # sandbox_allowed_domains=api.example.com
 
-# --- search (SearXNG) ---
-# Leave commented to disable web_search.
-# search_base_url=http://localhost:8888/search?q=
+# --- local model telemetry ---
+# Writes metadata only (provider/model, timing, token/cost estimates, outcome).
+# Prompts, responses, paths, tool arguments, and credentials are never recorded.
+# model_telemetry=0
+# model_telemetry_path=~/.agent8088/model-telemetry.jsonl
+
+# --- web search ---
+# One web_search tool, four interchangeable backends. With nothing set below,
+# the agent picks the first available: searxng -> tavily -> exa -> ddgs.
+#   searxng  default   self-hosted, no key   (`/search setup` provisions it)
+#   tavily   optional  needs TAVILY_API_KEY
+#   exa      optional  needs EXA_API_KEY
+#   ddgs     fallback  keyless, bundled — always available, needs no setup
+#
+# If the active backend fails (instance down, rate limited) the next available
+# one serves the request, so web search keeps working. Run `/search status` to
+# see the live chain and `/search doctor` to diagnose.
+#
+# Pin one backend (skips auto-selection AND the fallback chain):
+# web_search_provider=searxng
+#
+# SearXNG instance. `/search setup` writes this for you. A remote instance must
+# use https:// — plaintext http:// is only accepted for loopback/private hosts.
+# The host must also appear in ssrf_allow_hosts above, or requests to it are
+# blocked as internal.
+# search_base_url=http://127.0.0.1:8888/search?q=
+#
+# Results per search (default 5, max 20):
+# web_search_results=5
+#
+# Optional backends. Add a key and they join the chain automatically; leave them
+# unset and they stay out of it entirely. Keys live in the .env store next to
+# this file, NEVER here:
+#   TAVILY_API_KEY   agent-optimized results with citations  (https://tavily.com)
+#   EXA_API_KEY      semantic/neural search                  (https://exa.ai)
+#
+# The keyless ddgs fallback needs nothing: it ships with agent8088 and is used
+# automatically whenever SearXNG is unset, unreachable, or failing.
 
 # --- gateway allowlist scoping ---
 # User ids are scoped to the platform whose *_allowed_users line they appear
-# on. An id found on another platform's line is still allowed, with a warning
-# naming the line to move it to — ids cannot realistically collide across
-# platforms, and a silent lockout is worse than a warning. Set to 1 to refuse
-# them instead.
-# strict_platform_allowlist=0
+# on. An id found on another platform's line is denied by default. Set to 0
+# only for a temporary migration after confirming the identity cannot exist on
+# another platform; it logs a warning that names the line to fix.
+# strict_platform_allowlist=1
 
 # --- MCP server mode (agent8088 --mcp-serve) ---
 # The tools exposed to external MCP clients are read-only by default, because
