@@ -4428,6 +4428,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             if "__parse_error__" not in args:
                 seen.add(sig)
+            # The user may have hit ESC while this response was still streaming.
+            # Without a check here the tool they just cancelled runs anyway, and
+            # the interrupt is only noticed at the top of the next turn — after
+            # the write has already landed.
+            _raise_if_interrupted(interrupt_check)
             if on_tool:
                 on_tool(name)
             with spin(f"running {name}..."):

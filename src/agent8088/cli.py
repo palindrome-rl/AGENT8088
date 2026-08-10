@@ -21,7 +21,7 @@ try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
     pass
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -104,6 +104,45 @@ class EscListener:
         except Exception:
             pass
         return False
+
+    @contextmanager
+    def paused(self):
+        """Hand the terminal back to a blocking prompt for the duration.
+
+        Only one thing can own stdin. `_watch` reads and discards every byte it
+        sees, so leaving it running during an approval prompt ate the very
+        keystrokes the prompt was waiting for, and cbreak mode meant no line
+        editing either. Stop the watcher and restore canonical mode, then take
+        stdin back afterwards.
+
+        `triggered` survives the pause: an ESC pressed a moment before the
+        prompt appeared still aborts the turn.
+        """
+        if not self._active:
+            yield
+            return
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.2)
+            self._thread = None
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_settings)
+        except Exception:
+            pass
+        try:
+            yield
+        finally:
+            try:
+                self._old_settings = termios.tcgetattr(sys.stdin.fileno())
+                tty.setcbreak(sys.stdin.fileno())
+            except Exception:
+                # Terminal is gone (prompt closed the tty, or stdin was
+                # replaced). Stay inactive rather than half-owning stdin.
+                self._active = False
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._watch, daemon=True)
+            self._thread.start()
 
 
 class _StatusLine:
@@ -697,13 +736,47 @@ def _stream_view(reasoning_parts, content_parts):
 _session_allowlist = set()  # patterns approved for the rest of the session
 
 
-def _handle_escalation(result_text, live=None):
+def _permission_choice(question, options, typed_prompt, typed_map, default):
+    """Ask the user to pick one of `options` — a list of (value, label).
+
+    Returns the chosen value, or None when the user pressed ESC, meaning "abort
+    the task". Ctrl+C is never caught here: it ends agent8088, so it has to
+    travel all the way out.
+
+    An arrow-key picker on an interactive tty, falling back to the original
+    typed prompt when InquirerPy is missing or stdin is not a terminal. The
+    fallback keeps the old contract exactly, `default` included, so piped runs
+    and the test suite are unaffected.
+    """
+    if sys.stdin.isatty():
+        try:
+            from InquirerPy import inquirer
+            from InquirerPy.base.control import Choice
+        except ImportError:
+            pass
+        else:
+            return inquirer.select(
+                message=question,
+                choices=[Choice(value, name=label) for value, label in options],
+                default=default,
+                mandatory=False,           # ESC is allowed to decline entirely
+                keybindings={"skip": [{"key": "escape"}]},
+                instruction="↑↓ select · Enter confirm · Esc abort task",
+            ).execute()
+    response = console.input(typed_prompt).strip().lower()
+    return typed_map.get(response, default)
+
+
+def _handle_escalation(result_text, live=None, esc=None):
     """Check if a tool result is an escalation request. If so, prompt the user
     with once/session/deny options and call grant_escalation() if approved.
 
-    In plan-only mode, offers a mode-switch choice (full-auto/readonly/deny)
-    instead of once/session/deny — matches Claude Code's 'exit plan = pick
-    destination mode' pattern."""
+    In plan-only mode, offers approve/deny instead of once/session/deny.
+
+    `esc` is the turn's EscListener, paused while the prompt is up so it stops
+    swallowing the keystrokes meant for the picker. Absent for the direct
+    `/tool` and export paths, where no listener is running.
+    """
     if not result_text.startswith("ESCALATION_REQUEST:"):
         return False
     parts = result_text.split(":", 4)
@@ -722,32 +795,55 @@ def _handle_escalation(result_text, live=None):
         title="[bold yellow]Permission Escalation Request[/bold yellow]",
         box=box.ROUNDED, border_style="yellow",
     ))
-    if A.PERMISSION_MODE == "plan-only":
+    plan_only = A.PERMISSION_MODE == "plan-only"
+    try:
         try:
-            response = console.input(
-                "[bold yellow]Approve plan? (a=approve / d=deny): [/bold yellow]"
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            response = "d"
-        if response in ("a", "approve", "y", "yes"):
-            A.grant_escalation(change_type)
-            console.print("[green]Plan approved. Steps will run.[/green]")
-            approved = True
-        else:
-            console.print("[red]Plan denied — staying in plan-only mode.[/red]")
-            approved = False
-    else:
-        try:
-            response = console.input(
-                "[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]"
-            ).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            response = "d"
-        if response in ("o", "once", "y", "yes"):
+            with (esc.paused() if esc is not None else nullcontext()):
+                if plan_only:
+                    choice = _permission_choice(
+                        "Approve plan?",
+                        [("approve", "Approve — run the plan's steps"),
+                         ("deny", "Deny — stay in plan-only mode")],
+                        "[bold yellow]Approve plan? (a=approve / d=deny): [/bold yellow]",
+                        {"a": "approve", "approve": "approve", "y": "approve", "yes": "approve"},
+                        default="deny",
+                    )
+                else:
+                    choice = _permission_choice(
+                        "Allow this action?",
+                        [("once", "Once — allow just this action"),
+                         ("session", f"Session — stop asking about '{change_type}'"),
+                         ("deny", "Deny — block this action")],
+                        "[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]",
+                        {"o": "once", "once": "once", "y": "once", "yes": "once",
+                         "s": "session", "session": "session"},
+                        default="deny",
+                    )
+        # EOF is not a decision. Fail closed, but don't take the process down
+        # with it the way Ctrl+C does.
+        except EOFError:
+            choice = "deny"
+
+        # ESC: abandon the task, keep the session. Raised rather than returned
+        # so the whole turn unwinds instead of the model being told "denied"
+        # and carrying on with something else.
+        if choice is None:
+            console.print("[dim]⏹ task aborted[/dim]")
+            raise A.AgentInterrupted()
+
+        if plan_only:
+            if choice == "approve":
+                A.grant_escalation(change_type)
+                console.print("[green]Plan approved. Steps will run.[/green]")
+                approved = True
+            else:
+                console.print("[red]Plan denied — staying in plan-only mode.[/red]")
+                approved = False
+        elif choice == "once":
             A.grant_escalation(change_type)
             console.print("[green]Approved for this action only.[/green]")
             approved = True
-        elif response in ("s", "session"):
+        elif choice == "session":
             _session_allowlist.add(change_type)
             A.grant_escalation(change_type)
             console.print(f"[green]Approved for this session. '{change_type}' won't ask again.[/green]")
@@ -755,8 +851,9 @@ def _handle_escalation(result_text, live=None):
         else:
             console.print("[red]Permission denied — staying in readonly mode.[/red]")
             approved = False
-    if live is not None:
-        live.start()
+    finally:
+        if live is not None:
+            live.start()
     return approved
 
 
@@ -794,7 +891,7 @@ def do_chat(query):
             on_result(name, result)
 
         def _on_escalation(_name, result):
-            return _handle_escalation(result, live)
+            return _handle_escalation(result, live, esc)
 
         # Wire plan execution callbacks so execute_plan tool calls render the
         # checklist and route write-step escalations to the approval menu.
@@ -816,7 +913,7 @@ def do_chat(query):
             live.update(Group(*rows) if rows else Text("planning..."))
 
         def _plan_on_escalation(escalation_text):
-            return _handle_escalation(escalation_text, live)
+            return _handle_escalation(escalation_text, live, esc)
 
         A._plan_on_step = _plan_on_step
         A._plan_on_escalation = _plan_on_escalation
@@ -2934,7 +3031,11 @@ def main():
         try:
             do_chat(line)
         except KeyboardInterrupt:
-            console.print("\n[dim]interrupted[/dim]")
+            # Ctrl+C ends agent8088. ESC is the key that cancels just the task
+            # in flight — do_chat catches AgentInterrupted for that and returns
+            # normally, so reaching here means the user asked to quit.
+            console.print("\n[dim]bye[/dim]")
+            break
         except Exception as e:
             console.print(f"[red]error:[/red] {e}")
 
