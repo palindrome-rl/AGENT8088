@@ -1995,6 +1995,48 @@ def _plan_step_failed(result: str) -> bool:
     return (result or "").lstrip().startswith(("Error:", "ESCALATION_REQUEST:"))
 
 
+PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
+# Only steps that changed something are worth verifying. Auditing a read tells
+# you the read returned what it returned.
+_AUDITED_MODES = ("write_text", "shell", "docker", "cron", "browser")
+_VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
+
+
+def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
+                     result: str, depth: int) -> tuple:
+    """Check a completed step against the environment. Returns (halt_reason, note).
+
+    Off unless `plan_audit=1`. A step that reports success has only told us the
+    tool did not raise; the auditor looks at what is actually on disk. It runs
+    under the readonly floor its profile declares, so it cannot alter what it is
+    inspecting.
+
+    Skipped when the shared turn budget is already spent — the auditor spends the
+    parent's budget by design, and burning the remainder on verification would
+    starve the work being verified. A `fail` verdict halts the plan; anything
+    else is recorded but never halts, because an auditor that cannot run must not
+    be able to stop work on its own.
+    """
+    if _active_budget is not None and _active_budget.exceeded():
+        return "", "audit skipped — turn budget spent"
+    task = (
+        "Verify that the following step actually took effect. Inspect the real "
+        "environment; do not trust the reported output.\n\n"
+        f"Step: {step_text or tool_name}\n"
+        f"Tool: {tool_name}\n"
+        f"Arguments: {json.dumps(tool_args, default=str)[:500]}\n"
+        f"Reported result: {result[:500]}\n\n"
+        "Reply with a single VERDICT line as instructed."
+    )
+    answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
+    verdict = _VERDICT_RE.search(answer or "")
+    if verdict is None:
+        return "", f"audit inconclusive — no verdict returned ({(answer or '')[:120]})"
+    if verdict.group(1).lower() == "fail":
+        return f"{tool_name} failed verification", answer.strip()[:300]
+    return "", ""
+
+
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
@@ -2094,6 +2136,13 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         if _plan_step_failed(result):
             halted, stopped_at = f"{tool_name} did not complete", idx
             break
+        if PLAN_AUDIT and TOOL_SPECS[tool_name].get("mode") in _AUDITED_MODES:
+            reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth)
+            if note:
+                outputs.append(f"[{idx}] audit: {note}")
+            if reason:
+                halted, stopped_at = reason, idx
+                break
     _plan_execution_grant = False  # clear temporary grant — back to plan-only
     if halted:
         skipped = total - stopped_at
@@ -2550,11 +2599,43 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     return _local_execution_request(_process_display(argv))
 
 
+DOCKER_PULL_TIMEOUT = int(APP_CONFIG.get("docker_pull_seconds", "300"))
+_docker_images_present = set()
+
+
+def _ensure_docker_image(image: str) -> str:
+    """Pull `image` if it is not already local. Returns "" or an error string.
+
+    `docker run` pulls a missing image itself, but it does so inside whatever
+    timeout the *tool* declared — 20s for the read-only git tools. On any machine
+    that does not already hold the image, the first call therefore dies with a
+    bare "Command timed out after 20s" that names neither Docker nor the pull.
+    Pull explicitly instead, on its own budget, so a slow download is slow rather
+    than fatal and a genuine pull failure says so.
+    """
+    if image in _docker_images_present:
+        return ""
+    probe = _exec_process(["docker", "image", "inspect", "--format", "present", image],
+                          timeout=30)
+    if "present" in probe and "exited with status" not in probe:
+        _docker_images_present.add(image)
+        return ""
+    pulled = _exec_process(["docker", "pull", image], timeout=DOCKER_PULL_TIMEOUT)
+    if "exited with status" in pulled or "timed out" in pulled:
+        return (f"Error: container image {image} is missing and could not be pulled. "
+                f"Run `docker pull {image}` and retry. Details: {pulled[:200]}")
+    _docker_images_present.add(image)
+    return ""
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "") -> str:
     selected_image = image or DOCKER_IMAGE
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
+    unavailable = _ensure_docker_image(selected_image)
+    if unavailable:
+        return unavailable
     workspace = str(PROJECT_ROOT)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     git_image = selected_image.startswith("alpine/git:")

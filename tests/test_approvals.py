@@ -18,6 +18,9 @@ would mean `PERMISSION_MODE=readonly` plus one other key silently behaves like
 Agent8088 keys are flat. Defaults keep existing behaviour: breaker on at 3, cron
 denies, confirmations on.
 """
+import sys
+
+import pytest
 
 # --- Denial circuit breaker ------------------------------------------------
 
@@ -170,6 +173,9 @@ def test_unattended_denial_is_audited(engine, monkeypatch, tmp_path):
 
 # --- Unattended entry points must mark themselves ---------------------------
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="crontab path; Windows uses Task Scheduler — covered by "
+                           "test_windows_task_script_sets_the_unattended_env_var")
 def test_cron_entry_sets_the_unattended_env_var(engine, monkeypatch):
     """A scheduled run must announce that no operator is present."""
     captured = {}

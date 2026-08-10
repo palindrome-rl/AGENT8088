@@ -82,6 +82,27 @@ other line.
 A halted plan is not a rollback — steps that already ran stay run. The caller is
 expected to fix the cause and issue a new plan for the remaining work.
 
+### Verifying a step actually landed
+
+A step that reports success has only told you the tool did not raise. Setting
+`plan_audit=1` sends each *mutating* step to the readonly `auditor` sub-agent,
+which inspects the real environment before the plan continues. A `fail` verdict
+halts the plan on the same path as any other failure.
+
+Two deliberate asymmetries:
+
+- A failed verification halts; an auditor that could not run does not. An
+  inconclusive result is recorded in the output and the plan proceeds — a
+  verifier that cannot reach the model must not be able to stop all work on its
+  own.
+- Auditing is skipped once the shared turn budget is spent. The auditor draws on
+  the same `_TurnBudget` as the work it checks (a fresh budget would be a free
+  bypass), so it yields rather than starving the task it exists to protect.
+
+Off by default: it costs one model call per mutating step. The case for turning
+it on is the unattended paths — gateway and cron — where nobody is watching and
+a half-done plan reported as finished is the expensive failure.
+
 ## Tools are data
 
 `tools.txt` is a pipe-delimited registry, not Python. A tool declares a `mode`,

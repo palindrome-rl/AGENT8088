@@ -2,6 +2,8 @@ import os, sys, json
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
+
 # Data files live inside the package (that is what the engine loads and what ships
 # in the wheel) — never at the repo root.
 PKG = Path(__file__).resolve().parent.parent / "src" / "agent8088"
@@ -196,7 +198,10 @@ def test_read_text_rejects_sensitive_symlink(tmp_path, monkeypatch):
     secret = tmp_path / ".env"
     secret.write_text("API_KEY=secret")
     link = tmp_path / "notes.txt"
-    link.symlink_to(secret)
+    try:
+        link.symlink_to(secret)
+    except OSError:  # Windows needs Developer Mode or elevation to symlink
+        pytest.skip("symlink creation not permitted in this environment")
     monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
 
     result = A.run_tool("read_text", {"filename": str(link)})

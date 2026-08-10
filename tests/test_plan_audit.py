@@ -76,6 +76,95 @@ def test_plan_step_failed_recognises_errors_and_unanswered_escalations(engine):
 # Sub-agent permission floor
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-step auditing (opt-in via plan_audit=1)
+# ---------------------------------------------------------------------------
+
+def _audited_plan(engine, tmp_path, verdict, monkeypatch):
+    """Run a one-write plan with auditing on and a stubbed auditor verdict."""
+    engine.ALLOWED_PATHS = [tmp_path]
+    engine.PERMISSION_MODE = "full-auto"
+    engine.PLAN_AUDIT = True
+    spawned = []
+    monkeypatch.setattr(engine, "_exec_subagent",
+                        lambda args, depth=0: spawned.append(args) or verdict)
+    result = engine._exec_plan({"steps": json.dumps([
+        {"tool": "write_file",
+         "arguments": {"filename": str(tmp_path / "s.txt"), "content": "x"}},
+        {"tool": "write_file",
+         "arguments": {"filename": str(tmp_path / "second.txt"), "content": "y"}},
+    ])})
+    return result, spawned
+
+
+def test_auditing_is_off_by_default(engine, tmp_path, monkeypatch):
+    engine.ALLOWED_PATHS = [tmp_path]
+    engine.PERMISSION_MODE = "full-auto"
+    spawned = []
+    monkeypatch.setattr(engine, "_exec_subagent",
+                        lambda args, depth=0: spawned.append(args) or "VERDICT: pass")
+    engine._exec_plan({"steps": json.dumps([
+        {"tool": "write_file", "arguments": {"filename": str(tmp_path / "a"), "content": "x"}},
+    ])})
+    assert engine.PLAN_AUDIT is False
+    assert spawned == [], "no auditor may run unless plan_audit is enabled"
+
+
+def test_passing_audit_lets_the_plan_continue(engine, tmp_path, monkeypatch):
+    result, spawned = _audited_plan(engine, tmp_path, "VERDICT: pass — file is there", monkeypatch)
+    assert len(spawned) == 2, "each mutating step is audited"
+    assert all(a["agent_type"] == "auditor" for a in spawned)
+    assert "halted" not in result
+    assert (tmp_path / "second.txt").exists()
+
+
+def test_failing_audit_halts_the_plan(engine, tmp_path, monkeypatch):
+    result, _ = _audited_plan(engine, tmp_path, "VERDICT: fail — file is empty", monkeypatch)
+    assert "failed verification" in result
+    assert "halted at step 1/2" in result
+    assert not (tmp_path / "second.txt").exists(), "later steps must not run"
+
+
+def test_inconclusive_audit_is_recorded_but_does_not_halt(engine, tmp_path, monkeypatch):
+    """An auditor that cannot run must not be able to stop work by itself."""
+    result, _ = _audited_plan(engine, tmp_path, "Sub-agent failed: no model configured", monkeypatch)
+    assert "audit inconclusive" in result
+    assert "halted" not in result
+    assert (tmp_path / "second.txt").exists()
+
+
+def test_reads_are_not_audited(engine, tmp_path, monkeypatch):
+    engine.ALLOWED_PATHS = [tmp_path]
+    engine.PERMISSION_MODE = "full-auto"
+    engine.PLAN_AUDIT = True
+    (tmp_path / "r.txt").write_text("hi", encoding="utf-8")
+    spawned = []
+    monkeypatch.setattr(engine, "_exec_subagent",
+                        lambda args, depth=0: spawned.append(args) or "VERDICT: pass")
+    engine._exec_plan({"steps": json.dumps([
+        {"tool": "read_text", "arguments": {"filename": str(tmp_path / "r.txt")}},
+    ])})
+    assert spawned == [], "auditing a read verifies nothing"
+
+
+def test_audit_is_skipped_when_the_turn_budget_is_spent(engine, tmp_path, monkeypatch):
+    """The auditor spends the parent's budget, so it must yield when it is gone."""
+    engine.ALLOWED_PATHS = [tmp_path]
+    engine.PERMISSION_MODE = "full-auto"
+    engine.PLAN_AUDIT = True
+    engine._active_budget = engine._TurnBudget(max_tokens=10)
+    engine._active_budget.add_tokens(50, 50)  # already over
+    spawned = []
+    monkeypatch.setattr(engine, "_exec_subagent",
+                        lambda args, depth=0: spawned.append(args) or "VERDICT: fail")
+    result = engine._exec_plan({"steps": json.dumps([
+        {"tool": "write_file", "arguments": {"filename": str(tmp_path / "b"), "content": "x"}},
+    ])})
+    assert spawned == [], "no audit call once the shared budget is exhausted"
+    assert "budget spent" in result
+    assert "halted" not in result
+
+
 def _floor_probe(engine, name="floor-probe"):
     """Register a profile that CAN call write_file but declares a readonly floor.
 

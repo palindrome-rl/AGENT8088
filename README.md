@@ -212,6 +212,8 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `prompt_paths` | `~` | Writes here show y/n escalation |
 | `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
+| `docker_pull_seconds` | `300` | Budget for pulling a missing container image, separate from any tool's own timeout |
+| `plan_audit` | `0` | Verify every mutating `execute_plan` step with the readonly `auditor` sub-agent; a failed verification halts the plan |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `model_telemetry` | `0` | Append local, metadata-only model-call health records |
 | `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local path for model telemetry (mode 0600) |

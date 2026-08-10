@@ -1,9 +1,12 @@
 import os
+import sys
 import time
 from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+
+from tests.conftest import assert_owner_only
 
 
 def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monkeypatch):
@@ -141,6 +144,10 @@ def test_docker_timeout_forces_named_container_cleanup(engine, tmp_path, monkeyp
     seen = {}
 
     def fake_exec(argv, timeout=25, shell=False):
+        # The image-presence probe runs before the container does; report the
+        # image as local so this stays a test of the timeout cleanup path.
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return "present"
         seen["argv"] = argv
         return f"Command timed out after {timeout}s."
 
@@ -176,6 +183,8 @@ def test_git_clone_terminates_options_and_rejects_remote_helpers(engine, monkeyp
         ]
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="/bin/sh fallback is POSIX-only; Windows uses cmd.exe")
 def test_shell_uses_posix_fallback_when_bash_is_unavailable(engine, tmp_path, monkeypatch):
     seen = {}
 
@@ -417,7 +426,7 @@ def test_model_cache_is_owner_only(tmp_path, monkeypatch):
 
     providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
 
-    assert cache.stat().st_mode & 0o777 == 0o600
+    assert_owner_only(cache)
 
 
 def test_windows_model_cache_uses_private_acl(tmp_path, monkeypatch):

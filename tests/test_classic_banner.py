@@ -10,7 +10,13 @@ import agent8088.cli as classic
 
 def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     output = io.StringIO()
-    monkeypatch.setattr(classic, "console", Console(file=output, width=180, color_system=None))
+    # legacy_windows=False pins which logo variant is under test. Left to the
+    # ambient console, this asserts the block logo on Linux and the ASCII one on
+    # a Windows terminal, so the same test passes or fails by platform rather
+    # than by behaviour. The ASCII branch has its own test below.
+    monkeypatch.setattr(classic, "console",
+                        Console(file=output, width=180, color_system=None,
+                                legacy_windows=False))
 
     classic.banner()
 
@@ -27,6 +33,16 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     assert "Available Tools" in rendered
     assert "Available Skills" in rendered
     assert classic._catalog(["delta", "alpha"], columns=1) == "alpha\ndelta"
+
+
+def test_logo_falls_back_to_ascii_on_a_legacy_console(monkeypatch):
+    """A console that cannot render block characters must not emit them."""
+    monkeypatch.setattr(classic, "console",
+                        Console(file=io.StringIO(), width=180, color_system=None,
+                                legacy_windows=True))
+    logo = classic._palindrome_logo().plain
+    assert "▀" not in logo and "▄" not in logo
+    assert "#" in logo
 
 
 def test_web_search_call_hides_the_query_in_the_cli(monkeypatch):

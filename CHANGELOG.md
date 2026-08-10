@@ -23,6 +23,63 @@ recorded as though it had, with every later step built on top of it.
   half-executed plan cannot be mistaken for a finished one.
 - Not a rollback: steps that already ran stay run.
 
+### Opt-in per-step verification (`plan_audit=1`)
+
+- Each *mutating* plan step is verified by the readonly `auditor` sub-agent
+  before the plan continues; a `fail` verdict halts the plan on the same path as
+  any other failure. Reads are not audited — auditing a read tells you the read
+  returned what it returned.
+- An auditor that cannot run does **not** halt: an inconclusive result is
+  recorded in the output and the plan proceeds. A verifier that cannot reach the
+  model must not be able to stop all work by itself.
+- Auditing is skipped once the shared `_TurnBudget` is spent. The auditor draws
+  on the same budget as the work it checks, so it yields rather than starving the
+  task it exists to protect.
+- Off by default: one extra model call per mutating step. The case for enabling
+  it is the unattended paths (gateway, cron) where nobody is watching.
+
+### Container images are provisioned before a tool's timeout applies
+
+- `_exec_docker_command()` now ensures the image is local before starting a
+  container. `docker run` pulls a missing image itself, but inside the *tool's*
+  timeout — 20s for the read-only git tools — so the first `git_status` on any
+  machine without `alpine/git` died with a bare "Command timed out after 20s"
+  naming neither Docker nor the pull. This was the long-standing
+  `approved git_status returns real output` failure in `verify_features.py`.
+- New `docker_pull_seconds` (default 300) budgets the pull separately. A failed
+  pull now names the image and the `docker pull` command that fixes it.
+- Presence is cached per image, so the probe costs one `docker image inspect`
+  per image per process.
+
+### Windows: suite green, and a real gap closed
+
+- The suite now passes on Windows (previously 7 failures, documented as 2).
+  `assert_owner_only()` in `tests/conftest.py` asserts mode 0600 on POSIX and the
+  actual ACL on Windows, where `st_mode` reads 0666 on a correctly locked file.
+- **`searxng_provision.write_settings()` used `chmod(0o600)`**, which on Windows
+  protects nothing — the generated `settings.yml` holds a `secret_key` and kept
+  its inherited SYSTEM/Administrators ACL. It now writes through
+  `_write_private_text()` like every other private file.
+- Genuinely POSIX-only tests (crontab, `/bin/sh` fallback, shell-rc cleanup) are
+  now `skipif`-marked with the Windows counterpart named; the symlink test skips
+  when the OS denies symlink creation.
+- `tests/test_searxng_provision.py` patched `sp.subprocess.run` — the *shared*
+  stdlib module — which leaked a docker fake into every other module. It now
+  patches the module's own `_run` seam.
+
+### Verification scripts
+
+- `verify_everything.py` read the developer's real `~/.agent8088/config.txt`, so
+  whether in-repo checks passed depended on someone's setup wizard. It now pins
+  `AGENT8088_CONFIG` to the packaged default.
+- Its git checks asserted "runs after explicit host approval" without ever
+  granting `local_execution`, so they asserted on an `ESCALATION_REQUEST` string
+  — the gate working correctly, reported as the tool failing.
+- Its Windows ACL check compared `icacls` output against a raw SID, but icacls
+  resolves a granted SID to `DOMAIN\user`, so it could never match.
+- Both scripts hardcoded `len(SUBAGENT_SPECS) == 4`; they now assert the bundled
+  set is present, so adding a profile does not fail the gate.
+
 ### Sub-agent permission floor + `auditor` profile
 
 - Sub-agent profiles accept `permission: readonly` in frontmatter. The sub-run is

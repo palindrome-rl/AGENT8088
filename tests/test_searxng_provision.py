@@ -4,10 +4,10 @@ Never runs docker, never reaches the network, and never writes outside
 tmp_path — the repo convention is that tests and verify scripts do not touch
 real user state.
 """
-import stat
 from types import SimpleNamespace
 
 from agent8088 import searxng_provision as sp
+from tests.conftest import assert_owner_only
 
 
 def _ok(stdout="true"):
@@ -35,8 +35,7 @@ def test_settings_secret_key_is_random_and_not_the_upstream_placeholder(tmp_path
 
 
 def test_settings_file_is_owner_only(tmp_path):
-    path = sp.write_settings(tmp_path)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert_owner_only(sp.write_settings(tmp_path))
 
 
 def test_write_settings_is_idempotent_and_preserves_secret(tmp_path):
@@ -54,7 +53,7 @@ def test_start_binds_loopback_only(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
     monkeypatch.setattr(sp, "status", lambda: {"running": False, "detail": "container does not exist"})
-    monkeypatch.setattr(sp.subprocess, "run",
+    monkeypatch.setattr(sp, "_run",
                         lambda argv, **kw: seen.setdefault("argv", argv) and _ok() or _ok())
     sp.start(tmp_path)
     argv = seen["argv"]
@@ -67,7 +66,7 @@ def test_start_mounts_the_generated_settings_dir(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
     monkeypatch.setattr(sp, "status", lambda: {"running": False, "detail": "container does not exist"})
-    monkeypatch.setattr(sp.subprocess, "run",
+    monkeypatch.setattr(sp, "_run",
                         lambda argv, **kw: seen.setdefault("argv", argv) and _ok() or _ok())
     sp.start(tmp_path)
     mount = seen["argv"][seen["argv"].index("-v") + 1]
@@ -85,7 +84,7 @@ def test_start_is_a_noop_when_already_running(tmp_path, monkeypatch):
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
     monkeypatch.setattr(sp, "status", lambda: {"running": True, "detail": "running"})
     called = []
-    monkeypatch.setattr(sp.subprocess, "run", lambda argv, **kw: called.append(argv) or _ok())
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: called.append(argv) or _ok())
     result = sp.start(tmp_path)
     assert result["ok"] is True and "already running" in result["detail"]
     assert called == []  # no docker run
@@ -98,7 +97,7 @@ def test_start_removes_a_stopped_leftover_before_running(tmp_path, monkeypatch):
     monkeypatch.setattr(sp, "status",
                         lambda: {"running": False,
                                  "detail": "container exists but is stopped"})
-    monkeypatch.setattr(sp.subprocess, "run", lambda argv, **kw: argvs.append(argv) or _ok())
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: argvs.append(argv) or _ok())
     sp.start(tmp_path)
     assert any("rm" in a for a in argvs) and any("run" in a for a in argvs)
 
@@ -106,7 +105,7 @@ def test_start_removes_a_stopped_leftover_before_running(tmp_path, monkeypatch):
 def test_start_surfaces_docker_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
     monkeypatch.setattr(sp, "status", lambda: {"running": False, "detail": "container does not exist"})
-    monkeypatch.setattr(sp.subprocess, "run",
+    monkeypatch.setattr(sp, "_run",
                         lambda argv, **kw: _fail("port is already allocated"))
     result = sp.start(tmp_path)
     assert result["ok"] is False and "already allocated" in result["detail"]
@@ -114,27 +113,27 @@ def test_start_surfaces_docker_failure(tmp_path, monkeypatch):
 
 def test_status_reports_not_running_when_inspect_fails(monkeypatch):
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
-    monkeypatch.setattr(sp.subprocess, "run", lambda argv, **kw: _fail())
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: _fail())
     assert sp.status()["running"] is False
 
 
 def test_status_reports_running(monkeypatch):
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
-    monkeypatch.setattr(sp.subprocess, "run", lambda argv, **kw: _ok("true\n"))
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: _ok("true\n"))
     assert sp.status()["running"] is True
 
 
 def test_status_without_docker_does_not_shell_out(monkeypatch):
     called = []
     monkeypatch.setattr(sp.shutil, "which", lambda n: None)
-    monkeypatch.setattr(sp.subprocess, "run", lambda argv, **kw: called.append(argv) or _ok())
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: called.append(argv) or _ok())
     assert sp.status()["running"] is False and called == []
 
 
 def test_stop_uses_container_name(monkeypatch):
     seen = {}
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
-    monkeypatch.setattr(sp.subprocess, "run",
+    monkeypatch.setattr(sp, "_run",
                         lambda argv, **kw: seen.setdefault("argv", argv) and _ok() or _ok())
     sp.stop()
     assert sp.CONTAINER_NAME in seen["argv"]

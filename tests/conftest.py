@@ -1,10 +1,34 @@
 """Shared fixtures: load the agent8088 engine as a module."""
 import importlib
 import os
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+
+def assert_owner_only(path):
+    """Assert `path` is readable and writable by its owner and nobody else.
+
+    POSIX states this as mode 0600. Windows cannot: NTFS ACLs do not map onto
+    mode bits, and `st_mode` reads 0o666 on a correctly locked-down file — which
+    is why asserting 0600 everywhere reports a false failure on Windows rather
+    than a real one. The equivalent Windows claim is that the ACL names exactly
+    one principal, the current user: `_protect_private_file` grants that SID and
+    strips inheritance, so SYSTEM, Administrators and OWNER RIGHTS are removed.
+    """
+    if sys.platform != "win32":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        return
+    listing = subprocess.run(["icacls", str(path)], capture_output=True,
+                             text=True, timeout=20).stdout
+    entries = [line for line in listing.splitlines() if ":(" in line]
+    assert len(entries) == 1, f"expected exactly one ACL entry, got: {entries}"
+    user = os.environ.get("USERNAME", "")
+    assert user and user.lower() in entries[0].lower(), (
+        f"sole ACL entry should belong to {user!r}: {entries[0]!r}")
 
 ROOT = Path(__file__).resolve().parent.parent
 # Test collection imports CLI and gateway modules before fixtures run. Keep those
@@ -24,6 +48,20 @@ def _load_engine():
 def engine():
     """Fresh engine module per test (module globals are mutable in tests)."""
     return _load_engine()
+
+
+@pytest.fixture
+def docker_image_present(engine):
+    """Treat the default sandbox image as already pulled.
+
+    `_exec_docker_command` probes for the image before starting a container, so a
+    test that stubs `_exec_process` and inspects the argv would otherwise capture
+    the probe rather than the container run. Provisioning has its own coverage in
+    test_docker_image_pull.py; these tests are about what gets run, not whether
+    the image is local.
+    """
+    engine._docker_images_present.add(engine.DOCKER_IMAGE)
+    return engine
 
 
 @pytest.fixture
