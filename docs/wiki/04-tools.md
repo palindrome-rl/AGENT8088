@@ -16,7 +16,7 @@ is what the permission layer gates on — see
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | — | ✅ | Re-read the previous tool's output without re-running it. |
 | `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails. |
-| `web_search` | `search` | `query` | prompt | Routes to the configured backend and falls back automatically. See [Web search backends](#web-search-backends). |
+| `web_search` | `search` | `query` | prompt by default | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url` | prompt | Headless browser — renders JS that curl can't. |
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
