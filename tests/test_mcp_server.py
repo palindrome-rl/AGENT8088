@@ -156,8 +156,10 @@ def test_http_mcp_refuses_a_non_loopback_bind():
 
 # `introspect` reads only Agent8088's own in-memory tool/limit tables — no
 # filesystem, no network, no process — and its output is redacted like any other.
+# `search` routes web_search to a search backend and returns results: it reads
+# over the network and mutates nothing, same standing as http_get.
 SAFE_MODES = {"read_text", "python_eval", "http_get", "http_post", "last_output",
-              "introspect"}
+              "introspect", "search"}
 
 
 def test_write_file_not_exposed_by_default():

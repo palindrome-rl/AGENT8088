@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
+from agent8088 import web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -253,6 +254,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
 # {query} here would produce a doubled placeholder in the final URL.)
 SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/search?q=")
+# Whether the user actually SET a search URL, captured before the default is
+# injected into APP_CONFIG below. The web search registry needs the distinction:
+# a defaulted value would make the SearXNG backend claim to be configured on
+# every machine, so a host with no instance running would try (and fail) a
+# loopback request before reaching the keyless fallback, and /capabilities would
+# report a backend that isn't there.
+SEARCH_BASE_URL_CONFIGURED = bool(str(APP_CONFIG.get("search_base_url", "")).strip())
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
 SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
@@ -868,7 +876,7 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
-    if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser"):
+    if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser", "search"):
         return True  # temporary grant for approved plan steps — only in plan-only mode
     if PERMISSION_MODE in ("edit", "full-auto"):
         return True
@@ -2915,7 +2923,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # to the normal check_permission gate so it escalates properly.
     if (PERMISSION_MODE == "plan-only"
             and allow_plan
-            and mode in ("write_text", "shell", "docker", "cron", "browser")):
+            and mode in ("write_text", "shell", "docker", "cron", "browser", "search")):
         return ("Error: plan-only mode — direct tool execution blocked. "
                 "Call the execute_plan tool with a JSON steps array, e.g.: "
                 'execute_plan(steps=[{"tool":"write_file",'
@@ -2966,6 +2974,33 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=url[:200])
         return _exec_http(mode, spec, args, timeout)
+
+    # --- Layer 2b: web search (mode=search) ---
+    # Its own block rather than a branch of http_get: the destination URL is not
+    # known until the provider chain is resolved, and a fallback may contact a
+    # different host entirely. The egress/SSRF/secret guards are therefore
+    # applied per attempt INSIDE each provider, via the check_url injected by
+    # _search_context() — see web_search.SearchContext.
+    if mode == "search":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "Error: web_search requires 'query'."
+        if not check_permission(mode, f"web_search: {query[:80]}",
+                                approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=query[:120],
+                   change_type="network_request")
+            return request_escalation(
+                target_mode="edit",
+                paths=[f"web_search: {query[:100]}"],
+                change_type="network_request",
+                reason=f"Tool '{name}' wants to search the web for: {query[:160]}",
+            )
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=query[:200])
+        return web_search.run_search(
+            query, _web_search_limit(), WEB_SEARCH_REGISTRY, _search_config(),
+            _search_context())
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
@@ -3830,6 +3865,80 @@ def _egress_check(url: str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Web search — provider registry wiring (mode=search)
+# ---------------------------------------------------------------------------
+WEB_SEARCH_REGISTRY = web_search.default_registry()
+
+
+def _web_search_limit() -> int:
+    try:
+        return max(1, min(int(APP_CONFIG.get("web_search_results", "5")), 20))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _search_config() -> dict:
+    """APP_CONFIG as the search registry should see it.
+
+    Strips the DEFAULTED search_base_url (see SEARCH_BASE_URL_CONFIGURED): the
+    default exists so tool URL templates always interpolate, but treating it as
+    user intent would mean the SearXNG backend claims availability everywhere.
+    """
+    config = dict(APP_CONFIG)
+    if not SEARCH_BASE_URL_CONFIGURED:
+        config.pop("search_base_url", None)
+    return config
+
+
+def _search_context():
+    """Build the guard bundle handed to every web search provider.
+
+    Providers live in web_search.py, which must not import this module (the
+    import would be circular). Passing the guards in keeps _egress_check /
+    _ssrf_check / _outbound_secret_check as the single enforcement point, so a
+    provider cannot accidentally skip them — including the ddgs backend, whose
+    library owns its own HTTP client and would otherwise sit outside the
+    egress policy entirely.
+
+    Credentials are read from the .env key store, never config.txt, matching
+    the migration at import time. The file is read once per call rather than
+    once per lookup.
+    """
+    try:
+        env_values = load_env_file(ENV_FILE_PATH)
+    except Exception:  # a missing or unreadable .env is not an error here
+        env_values = {}
+
+    def check_url(url: str):
+        return (_egress_check(url) or _ssrf_check(url)
+                or _outbound_secret_check(url))
+
+    def get_secret(key_name: str) -> str:
+        return str(env_values.get(key_name) or os.environ.get(key_name, "") or "").strip()
+
+    return web_search.SearchContext(
+        config=_search_config(),
+        get_secret=get_secret,
+        check_url=check_url,
+        wrap=_wrap_untrusted,
+    )
+
+
+def _search_chain_summary() -> str:
+    """Which backends would serve web_search right now, in order.
+
+    Read from live state so /capabilities cannot drift from reality.
+    """
+    try:
+        chain = WEB_SEARCH_REGISTRY.chain(_search_config(), _search_context())
+    except Exception:
+        return "unavailable"
+    if not chain:
+        return "none configured (run /search setup)"
+    return " -> ".join(provider.name for provider in chain)
+
+
 def _mask_system_content(text: str) -> str:
     """Sanitize text that will be SHOWN to the user (e.g. a reasoning preview):
     redact secrets and blank out any verbatim system-prompt lines. Chain-of-thought
@@ -3920,6 +4029,7 @@ def describe_capabilities() -> str:
         f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
+        f"- Web search: {_search_chain_summary()}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
         f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",

@@ -56,9 +56,9 @@ except ImportError:
 EXPOSED_TOOLS = (
     "read_text",
     "calculate",
+    # Routes to whichever backend is configured (SearXNG / Tavily / Exa / ddgs)
+    # via the provider registry — one tool, no per-vendor surface to expose.
     "web_search",
-    "web_search_tavily",
-    "web_search_exa",
     "get_page_title",
     "last_output",
     # Lets a host agent ask what this server can actually do — tools, limits, and
