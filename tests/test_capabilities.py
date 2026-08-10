@@ -7,8 +7,6 @@ so it cannot drift from what the agent can actually do.
 """
 import pytest
 
-from agent8088 import engine as A
-
 
 # --- The report ------------------------------------------------------------
 

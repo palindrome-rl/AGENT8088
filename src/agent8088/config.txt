@@ -18,6 +18,7 @@
 allowed_paths=.
 
 # --- Permission Layer 1: Sensitive file read protection ---
+# Exact paths only; relative paths resolve from the workspace.
 # allowed_sensitive_files=.env,secrets.yaml
 
 # --- Permission Layer 2: Network access control ---
@@ -66,6 +67,12 @@ timeout_seconds=120
 sandbox_backend=auto
 sandbox_runtime_version=0.0.67
 # sandbox_allowed_domains=api.example.com
+
+# --- local model telemetry ---
+# Writes metadata only (provider/model, timing, token/cost estimates, outcome).
+# Prompts, responses, paths, tool arguments, and credentials are never recorded.
+# model_telemetry=0
+# model_telemetry_path=~/.agent8088/model-telemetry.jsonl
 
 # --- search (SearXNG) ---
 # Leave commented to disable web_search.

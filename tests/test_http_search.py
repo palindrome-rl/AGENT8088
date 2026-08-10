@@ -1,6 +1,5 @@
 """Tests for the http_get/http_post modes, jq filters, and the SSRF allowlist."""
 from types import SimpleNamespace
-import urllib.error
 
 
 class _Response:

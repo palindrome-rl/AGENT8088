@@ -325,9 +325,15 @@ def _session_system_prompt():
                    "Use read_text and safe shell commands (ls, cat, grep, git status, "
                    "git diff, git log) to gather information, then call execute_plan "
                    "with a steps array to execute your plan.\n")
-    elif A.PERMISSION_MODE in ("edit", "full-auto"):
-        prompt += ("You are in full-auto mode. All tools are allowed without prompts. "
-                   "Catastrophic commands and credential path writes are still blocked.\n")
+    elif A.PERMISSION_MODE == "full-auto":
+        prompt += ("You are in full-auto mode. Permission-gated tools are allowed without "
+                   "prompts when sandboxed. Unisolated local execution still needs a one-shot "
+                   "grant. Catastrophic commands and credential path writes are always blocked.\n")
+    elif A.PERMISSION_MODE == "edit":
+        prompt += ("You are in edit mode. Permission-gated tools are allowed when sandboxed. "
+                   "Use a tool only when it is necessary; unisolated local execution still "
+                   "needs a one-shot grant. Catastrophic commands and credential path writes "
+                   "are always blocked.\n")
     else:
         prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
                    "Writes and mutations require user approval.\n")
@@ -1361,7 +1367,7 @@ def cmd_models(rest):
     if not provider:
         choices = sorted(A.PROVIDERS)
         if not choices:
-            console.print(f"[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
+            console.print("[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
             return
         active = _active_provider_name()
         provider = _choice_prompt("Select provider:", choices, active if active in choices else "")
@@ -2209,7 +2215,6 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     builtin_names = provider_registry.builtin_provider_names()
     provider_choices = [*builtin_names, CUSTOM_PROVIDER_CHOICE]
-    cur_provider = _current("default_provider") or provider_registry.default_provider_name()
     provider_choice = _choice_prompt("Select model provider:", provider_choices)
 
     custom_base_url = ""
@@ -2351,12 +2356,6 @@ def _run_gateway_setup():
 
     # Only one gateway channel can be active at a time (mutually exclusive).
     # Single-select picker — choosing one disables the others.
-    current = "None"
-    if slack_on: current = "Slack"
-    elif wa_on: current = "WhatsApp"
-    elif discord_on: current = "Discord"
-    elif email_on: current = "Email"
-
     choices = [
         "Slack" + (" (current)" if slack_on else ""),
         "WhatsApp" + (" (current)" if wa_on else ""),
@@ -2507,7 +2506,7 @@ def _run_gateway_setup():
                         print("\nWhatsApp pairing successful!")
                     else:
                         print("\nPairing may not have completed — check the QR was scanned.")
-                        print(f"If needed, re-run: agent8088 --gateway-setup")
+                        print("If needed, re-run: agent8088 --gateway-setup")
                 except subprocess.TimeoutExpired:
                     print("\nPairing timed out. Re-run `agent8088 --gateway-setup`.")
                 except Exception as e:
@@ -2619,7 +2618,7 @@ def _run_gateway_setup():
         print(f"Enabled: {', '.join(enabled)}")
         if newly_enabled:
             print(f"Newly configured: {', '.join(sorted(newly_enabled))}")
-        print(f"\nStart the gateway with: agent8088 --gateway")
+        print("\nStart the gateway with: agent8088 --gateway")
     else:
         print(f"Config written to {config_path}")
         print("No platform enabled. Run: agent8088 --gateway-setup")

@@ -78,10 +78,10 @@ Run this command locally without isolation? ls -la
 The command shown is passed through secret redaction first, so a command
 containing a key doesn't print it back at you.
 
-`--edit` / full-auto mode bypasses this consent prompt for shell execution,
-since you've already declared you don't want per-action prompts. The always-on
-floor still applies: catastrophic commands and destructive git are refused
-regardless of backend or mode.
+Permission mode never bypasses missing isolation. Under `local` — or when
+`auto` has neither native nor Docker available — each local command needs an
+explicit one-shot escalation. The always-on floor still applies: catastrophic
+commands and destructive git are refused regardless of backend or mode.
 
 ## What sandboxing does *not* cover
 

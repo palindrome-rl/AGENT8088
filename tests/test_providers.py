@@ -1,5 +1,3 @@
-import pytest
-
 
 def test_load_providers_from_config(engine):
     cfg = {
@@ -280,6 +278,7 @@ def test_builtin_provider_catalog_skips_anthropic():
     ]
     assert "anthropic" not in names
     assert providers.builtin_provider_defaults("copilot")["default_model"] == "gpt-4o-mini"
+    assert providers.builtin_provider_defaults("mistral")["default_model"] == "mistral-small-2603"
 
 
 def test_load_providers_can_seed_builtins(engine):

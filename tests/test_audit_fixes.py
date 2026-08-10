@@ -18,7 +18,7 @@ def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monk
 
     result = engine.run_tool("execute_shell", {"command": f"cat {fake_secret}"})
 
-    assert "ESCALATION_REQUEST" in result
+    assert "forbidden" in result.lower()
     assert "not-real" not in result
 
 
@@ -414,6 +414,26 @@ def test_model_cache_is_owner_only(tmp_path, monkeypatch):
     providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
 
     assert cache.stat().st_mode & 0o777 == 0o600
+
+
+def test_windows_model_cache_uses_private_acl(tmp_path, monkeypatch):
+    from agent8088 import providers
+
+    cache = tmp_path / "models_cache.json"
+    calls = []
+    monkeypatch.setattr(providers, "_CACHE_FILE", cache)
+    monkeypatch.setattr(providers.sys, "platform", "win32")
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[0] == "whoami":
+            return SimpleNamespace(returncode=0, stdout='"PC\\\\user","S-1-5-21-1"\r\n')
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+    providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
+
+    assert any(command[0] == "icacls" for command in calls)
 
 
 def test_windows_private_files_use_current_user_sid(engine, tmp_path, monkeypatch):

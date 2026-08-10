@@ -48,6 +48,12 @@ def test_already_escaped_newlines_still_work(engine):
     assert args and args["code"] == "a=1\nb=2"
 
 
+def test_unescaped_windows_path_is_repaired(engine):
+    args = _call(engine, f'{FUNC}: write_file {ARGS}: '
+                 '{"filename": "C:\\Users\\Admin\\out.txt", "content": "ok"}')
+    assert args and args["filename"] == r"C:\Users\Admin\out.txt"
+
+
 def test_escaped_quote_inside_multiline_string(engine):
     args = _call(engine, f'{FUNC}: run_sandboxed {ARGS}: {{"code": "print(\\"hi\\")\nprint(2)"}}')
     assert args and 'print("hi")' in args["code"]
@@ -90,26 +96,30 @@ def test_no_args_block_still_falls_through_to_empty(engine):
 
 # --- run_sandboxed argument aliases ----------------------------------------
 
-def test_run_sandboxed_accepts_common_arg_aliases(engine):
+def test_run_sandboxed_accepts_common_arg_aliases(engine, monkeypatch):
     engine.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(engine, "_exec_sandbox_command", lambda code, **_: code)
     for alias in ("script", "python", "source", "snippet", "command"):
         out = engine.run_tool("run_sandboxed", {alias: "print(4 + 9999995)"})
-        assert "9999999" in out, f"alias {alias!r} not accepted: {out[:120]}"
+        assert out == "print(4 + 9999995)", f"alias {alias!r} not accepted: {out[:120]}"
 
 
-def test_run_sandboxed_strips_markdown_fences(engine):
+def test_run_sandboxed_strips_markdown_fences(engine, monkeypatch):
     engine.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(engine, "_exec_sandbox_command", lambda code, **_: code)
     out = engine.run_tool("run_sandboxed", {"code": "```python\nprint(4 + 9999995)\n```"})
-    assert "9999999" in out, out[:200]
+    assert out == "print(4 + 9999995)"
 
 
-def test_run_sandboxed_strips_bare_fences(engine):
+def test_run_sandboxed_strips_bare_fences(engine, monkeypatch):
     engine.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(engine, "_exec_sandbox_command", lambda code, **_: code)
     out = engine.run_tool("run_sandboxed", {"code": "```\nprint(1 + 1)\n```"})
-    assert "2" in out, out[:200]
+    assert out == "print(1 + 1)"
 
 
-def test_code_takes_precedence_over_aliases(engine):
+def test_code_takes_precedence_over_aliases(engine, monkeypatch):
     engine.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(engine, "_exec_sandbox_command", lambda code, **_: code)
     out = engine.run_tool("run_sandboxed", {"code": "print(111)", "script": "print(222)"})
     assert "111" in out and "222" not in out

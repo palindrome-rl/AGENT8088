@@ -6,7 +6,7 @@ Three layers, all runnable offline with no model backend.
 
 | Layer | Command | Scale |
 |---|---|---|
-| Unit tests | `pytest tests/` | ~395 tests, ~8s |
+| Unit tests | `pytest tests/` | 604 tests, ~10s |
 | Feature verification | `scripts/verify_features.py` | 89 checks, 13 sections |
 | Exhaustive verification | `scripts/verify_everything.py` | 450 checks, 20 sections |
 
@@ -125,6 +125,26 @@ The `pr-check` skill (`.claude/skills/pr-check/`) automates this:
 6. Report pre-existing vs new vs fixed failures separately — and never silently
    pick a side on a test whose *expectation* changed.
 
+## Public-release gate
+
+Before publishing, run the strict local gate (there is no hosted CI):
+
+```sh
+uv run python scripts/release_check.py
+```
+
+It requires a fresh lockfile, all Python tests, a focused lint baseline,
+duplicate-definition check, Python and WhatsApp-bridge dependency audits, a
+wheel install smoke test, and a real native-sandbox proof. It fails rather than
+skipping when native sandbox prerequisites are absent.
+
+Run it after `agent8088 --sandbox-setup` on macOS, Linux, and Windows. Windows
+needs the one-time restricted-account setup accepted during that command.
+
+Manual release evidence remains required for WhatsApp, Slack, Discord, and
+email: authenticate a staging account, send and receive one authorized message,
+confirm an unauthorized sender is refused, and verify disconnect/reconnect.
+
 ## Interpreting expected skips
 
 These are normal on a clean machine and not failures:
@@ -143,7 +163,7 @@ Verified on the tree this wiki documents:
 
 | Suite | Result |
 |---|---|
-| Unit tests | 395 passed, 0 failed |
+| Unit tests | 624 passed, 0 failed |
 | `verify_features.py` | 89 passed, 0 failed, 4 skipped |
 | `verify_everything.py` | 450 passed, 0 failed, 4 skipped |
 | Duplicate-def check | clean |

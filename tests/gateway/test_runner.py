@@ -65,7 +65,6 @@ def test_build_runner_no_adapters_when_disabled(tmp_path, monkeypatch):
 
 
 def test_build_runner_registers_slack_when_enabled(tmp_path, monkeypatch):
-    import importlib
     import sys
 
     # Create a stub slack module if the real one isn't installed yet

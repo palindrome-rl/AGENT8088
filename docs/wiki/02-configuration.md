@@ -50,7 +50,7 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 
 | Key | Default | Purpose |
 |---|---|---|
-| `allowed_sensitive_files` | (empty) | Escape hatch — comma-separated names to exempt from the sensitive-file blocklist. |
+| `allowed_sensitive_files` | (empty) | Escape hatch — comma-separated exact paths to exempt; relative paths resolve from the workspace. |
 | `deny_commands` | (empty) | Shell commands to refuse (fnmatch globs). Refused in every mode. |
 | `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
@@ -62,6 +62,8 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `audit_log` | `0` | `1` appends one redacted JSON line per gated tool decision. Turn this on for any gateway deployment. |
 | `audit_log_path` | `<data dir>/audit.jsonl` | Where the audit trail is written (mode 0600). |
 | `audit_max_detail` | `512` | Truncation length for the audit `detail` field. |
+| `model_telemetry` | `0` | `1` records local metadata-only model-call health events. |
+| `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local telemetry path (mode 0600). |
 
 Domain matching is dot-anchored, so `allowed_domains=example.com` permits
 `docs.example.com` but **not** `evilexample.com`.

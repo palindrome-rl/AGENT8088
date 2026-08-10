@@ -51,10 +51,8 @@ except ImportError:
 # Following Hermes/OpenClaw pattern: only expose tools that don't require
 # live agent-loop context or dangerous capabilities.
 #
-# Everything here is NON-MUTATING. That matters because run_mcp_server() puts
-# the process in full-auto: MCP has no approval channel, so an escalation
-# prompt would just be an error string the client cannot answer. Non-mutating
-# tools make full-auto safe; a mutating one would silently lose its prompt.
+# Everything here is NON-MUTATING by default. MCP has no approval channel, so
+# the handler applies its temporary policy only while one request dispatches.
 EXPOSED_TOOLS = (
     "read_text",
     "calculate",
@@ -155,7 +153,12 @@ def _make_handler(tool_name: str, args_list: list, engine_module):
 
     async def handler(**kwargs):
         args = {k: v for k, v in kwargs.items() if v is not None}
-        result = engine_module.run_tool(tool_name, args)
+        previous = engine_module.PERMISSION_MODE
+        engine_module.PERMISSION_MODE = "full-auto"
+        try:
+            result = engine_module.run_tool(tool_name, args)
+        finally:
+            engine_module.PERMISSION_MODE = previous
         if result is None:
             return ""
         return str(result)
@@ -183,13 +186,6 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 
     from agent8088 import engine as A
-    # Run in full-auto so the exposed read-only tools (web_search,
-    # get_page_title) don't escalate: MCP has no approval channel, so an
-    # ESCALATION_REQUEST would just be an error string the client cannot
-    # answer. This is only safe because the default surface is non-mutating —
-    # see EXPOSED_TOOLS. Writes are opt-in (mcp_server_allow_writes) and even
-    # then the always-on floor still refuses sensitive and shell startup files.
-    A.PERMISSION_MODE = "full-auto"
     if exposed_tool_names(A.APP_CONFIG) != EXPOSED_TOOLS:
         print("Agent8088 MCP server: writes ENABLED (mcp_server_allow_writes) — "
               "unattended, no approval prompt. Narrow allowed_paths/blocked_paths.",

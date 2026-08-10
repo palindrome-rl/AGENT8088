@@ -2,7 +2,7 @@
 
 [← Wiki index](README.md)
 
-21 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+22 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
 is what the permission layer gates on — see
 [Permissions & Security](03-permissions-and-security.md).
 

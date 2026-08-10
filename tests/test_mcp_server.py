@@ -3,7 +3,7 @@ import pytest
 
 
 def test_mcp_server_imports():
-    from agent8088.mcp_server import EXPOSED_TOOLS, create_mcp_server, run_mcp_server
+    from agent8088.mcp_server import create_mcp_server, run_mcp_server
     assert callable(create_mcp_server)
     assert callable(run_mcp_server)
 
@@ -70,6 +70,17 @@ def test_handler_returns_string():
     result = asyncio.run(handler(expression="2 + 2"))
     assert isinstance(result, str)
     assert "4" in result
+
+
+def test_handler_restores_the_callers_permission_mode():
+    from agent8088.mcp_server import _make_handler
+    from agent8088 import engine as A
+    import asyncio
+
+    A.PERMISSION_MODE = "readonly"
+    handler = _make_handler("calculate", ["expression"], A)
+    assert "4" in asyncio.run(handler(expression="2 + 2"))
+    assert A.PERMISSION_MODE == "readonly"
 
 
 def test_handler_has_proper_signature():

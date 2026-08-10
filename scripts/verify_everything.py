@@ -580,6 +580,7 @@ if E._native_sandbox_missing_requirements():
 section("8d. SANDBOX — settings file hardening")
 data = E._sandbox_settings_data()
 ok("network isolation configured", data["network"]["allowLocalBinding"] is False)
+ok("network allowlist is enforced", data["network"]["strictAllowlist"] is True)
 ok("nested sandbox not weakened", data["enableWeakerNestedSandbox"] is False)
 ok("network isolation not weakened", data["enableWeakerNetworkIsolation"] is False)
 ok("apple events denied", data["allowAppleEvents"] is False)

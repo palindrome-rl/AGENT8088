@@ -50,7 +50,7 @@ matching the first word.
 
 ### Escalation is one action, not a mode change
 
-Approving a prompt grants **exactly one** blocked action:
+Approving a prompt grants **exactly one, exact blocked call**:
 
 ```python
 grant_escalation()
@@ -58,8 +58,9 @@ check_permission("write_text")   # True  — consumes the grant
 check_permission("write_text")   # False — gone
 ```
 
-Safe actions don't consume it. The mode itself never changes, so approving one
-write does not put you in full-auto.
+Safe actions don't consume it, and a different blocked call cannot spend it.
+The mode itself never changes, so approving one write does not put you in
+full-auto.
 
 ### plan-only
 
@@ -89,9 +90,10 @@ This covers indirect routes too: symlinks are resolved before the check, and
 `git show HEAD:.env` / `git diff -- .env` are blocked explicitly because they'd
 otherwise read a credential without touching the file tool.
 
-`allowed_sensitive_files` is the escape hatch if you genuinely need one.
+`allowed_sensitive_files` is the escape hatch if you genuinely need one; each
+entry is an exact path (relative to the workspace when not absolute).
 
-### 2. Shell startup files — **writes only**
+### 2. Shell startup files
 
 Writing one of these is arbitrary code execution on your next shell launch, so
 writes are refused unconditionally:
@@ -104,7 +106,8 @@ config.fish  fish.config
 ```
 
 Matched on **exact filename**, so `profile.json` and `.editorconfig` are
-unaffected. **Reads stay allowed** — "help me fix my PATH" is a normal request.
+unaffected. The file tool may still read them for normal PATH support; shell
+commands touching protected paths are refused as an always-on floor.
 
 ### 2b. Commands that cannot be analysed
 
@@ -363,6 +366,21 @@ turn. It is a record, not a gate.
 
 Rotation is not built in — point `audit_log_path` at a file your existing
 `logrotate` or cron handles.
+
+## Local model telemetry
+
+Enable it only when you need durable local operational data:
+
+```ini
+model_telemetry=1
+model_telemetry_path=~/.agent8088/model-telemetry.jsonl
+```
+
+Each mode-0600 JSONL entry has only provider/model, attempt outcome, latency,
+token and cost estimates, finish reason, and sanitized error class/status.
+Prompts, model responses, tool arguments, paths, and credentials are excluded.
+Telemetry never sends data to a remote service and never interrupts an agent
+turn if its local file cannot be written.
 
 ## Content defense
 

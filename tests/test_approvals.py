@@ -18,10 +18,6 @@ would mean `PERMISSION_MODE=readonly` plus one other key silently behaves like
 Agent8088 keys are flat. Defaults keep existing behaviour: breaker on at 3, cron
 denies, confirmations on.
 """
-import pytest
-
-from agent8088 import engine as A
-
 
 # --- Denial circuit breaker ------------------------------------------------
 

@@ -212,6 +212,8 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
+| `model_telemetry` | `0` | Append local, metadata-only model-call health records |
+| `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local path for model telemetry (mode 0600) |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
 | `gateway_permission_mode` | `readonly` | Gateway permission mode: `readonly` (approvals in chat) or `edit` (full-auto) |
 | `strict_platform_allowlist` | `1` | Refuse a user id listed under another platform's `*_allowed_users` line |
@@ -349,7 +351,7 @@ When the gateway runs in readonly mode, write/shell tools trigger an approval pr
 
 ### Security Layer 1: Sensitive File Protection
 
-Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`, `*_SECRET*`, `*_TOKEN*`. Override with `allowed_sensitive_files=` in config.
+Hardcoded blocklist: `.env`, `config.txt`, `id_rsa`, `*.pem`, `*.key`, `*_KEY*`, `*_SECRET*`, `*_TOKEN*`. `allowed_sensitive_files=` exempts only exact paths (relative paths resolve from the workspace).
 
 ### Security Layer 2: Network Access Control
 
@@ -433,6 +435,17 @@ Appends one redacted JSON line per gated decision (`allowed` / `blocked` /
 `denied`) at mode 0600. Recommended for any gateway deployment — it is the only
 durable record of who asked for what and what was refused. Rotation is external;
 point `audit_log_path` at a file your `logrotate` handles.
+
+### Local model telemetry
+
+```ini
+model_telemetry=1
+```
+
+Writes local JSONL metadata for each model call: provider/model, latency, token
+and cost estimates, finish reason, and sanitized error status. It never records
+prompts, responses, tool arguments, paths, or credentials; it sends nothing to
+an external service. The default path is mode 0600 under Agent8088's data dir.
 
 ### Command Sandbox
 
@@ -634,7 +647,7 @@ agent8088 --update
 - For Gmail: enable 2FA and create an App Password (not your regular password).
 - Only emails from `email_allowed_users` addresses are processed — all others are silently dropped.
 - IMAP host should start with `imap.` (e.g. `imap.gmail.com`), not `smtp.`.
-- Set `email_verify_sender=1` in config.txt to enable SPF/DKIM/DMARC verification (fail-closed).
+- SPF/DKIM/DMARC verification is enabled by default and fails closed. Set `email_verify_sender=0` only for a trusted relay that does not provide authentication results.
 
 ---
 

@@ -19,6 +19,14 @@ def test_find_tool_calls_alias_then_restrict(engine):
     assert engine.find_tool_calls(text, allowed={"read_text"}) == []
 
 
+def test_fenced_tool_example_is_not_called_or_stripped(engine):
+    text = ('Use this syntax:\n```text\n✿FUNCTION✿: execute_shell '
+            '✿ARGS✿: {"command": "pwd"}\n```')
+
+    assert engine.find_tool_calls(text) == []
+    assert "✿FUNCTION✿" in engine.strip_tool_json(text)
+
+
 def test_run_agent_uses_custom_system_prompt_and_depth(engine):
     fake = ScriptedModel(["Hello from the sub-agent."])
     engine.create_completion = fake  # monkeypatch module global
@@ -88,8 +96,8 @@ def test_subagent_retries_an_approved_write(engine, tmp_path, monkeypatch):
         "writer": {"tools": ["write_file"], "max_turns": 3, "system_prompt": "Write the file."},
     })
     monkeypatch.setattr(engine, "create_completion", ScriptedModel([
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
         "Done.",
     ]))
 
