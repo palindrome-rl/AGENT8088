@@ -27,8 +27,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
-from tests.data.tool_intelligence_cases import (  # noqa: E402
-    CASES, NO_TOOL, SEARCH, SEARCH_MONTH, SEARCH_YEAR,
+from tests.data.tool_intelligence_cases import (
+    CASES,
+    NO_TOOL,
+    SEARCH,
+    SEARCH_MONTH,
+    SEARCH_YEAR,
 )
 
 THRESHOLD = float(os.environ.get("A8088_TOOL_THRESHOLD", "0.8"))

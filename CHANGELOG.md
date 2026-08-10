@@ -4,6 +4,33 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Tool-Use Intelligence
+
+### Runtime date context
+- `render_runtime_context()` puts the current date in every system prompt (CLI, gateway, engine default). The model previously had only a training cutoff, so it could not date-qualify a search or tell a stale result from a current one
+- `current_system_prompt()` rebuilds the default prompt per call — `SYSTEM_PROMPT` is computed at import, which froze the date for long-running gateway and cron processes
+
+### Date-aware search
+- `_augment_relative_time_query()` appends the current year, or the month for "today"/"this week" questions, to queries that mean "as of now" and carry no year of their own. Never rewrites a query that already names a year, which also makes it idempotent. Disable with `search_date_augmentation=0`
+- Augmentation runs **before** the length and credential guards, so they inspect what actually leaves the machine
+- `_frame_search_results()` stamps results with their retrieval date; the prompt tells the model to check each result's own date before calling anything current, latest, or upcoming
+
+### Redundant-call prevention
+- `_search_signature()` collapses a query to sorted, filler-stripped tokens, so rewording or reordering no longer re-runs the same search. A repeat is answered with the first search's results
+- A failed or empty search stays retryable (`_search_was_usable()`)
+- `_is_fetch_followup()` extends the post-search gate from the browser to web-fetch shell commands (`curl`, `wget`, `httpie`, `lynx`, `w3m`) and fetch-shaped MCP tools. Narrow by design — ordinary shell work after a search still runs
+- `_user_requested_tool()` bypasses every gate for an explicit user request; only user turns count, so the model cannot authorise its own call
+
+### Prompt policy
+- Smallest-appropriate-tool rule, an explicit no-tool list (summarizing, translating, reasoning about readable code, writing), MCP tool-selection guidance, and a rule that a direct instruction outranks all of it
+
+### Testing
+- `artifacts/` for generated test files, with a session guard that fails the run if anything is written to the repo root
+- Permission matrix across modes, path zones, and tool kinds, including the always-on floors under `full-auto`
+- `scripts/verify_tool_intelligence.py` — opt-in live-model scoring of tool choice (`A8088_LIVE_MODEL=1`), reports to `artifacts/`
+
+---
+
 ## Permission Layer
 
 ### readonly → edit Escalation (commits `2f2a3e6`, `e720b88`, `0a7339e`)

@@ -76,7 +76,7 @@ def test_web_fetch_shell_after_a_search_is_refused(engine, monkeypatch, scripted
     executed = _search_and_record_tools(engine, monkeypatch)
     _drive(engine, monkeypatch, scripted, [
         '✿FUNCTION✿: web_search ✿ARGS✿: {"query": "latest python release"}',
-        '✿FUNCTION✿: execute_shell ✿ARGS✿: {"command": "%s"}' % command,
+        f'✿FUNCTION✿: execute_shell ✿ARGS✿: {{"command": "{command}"}}',
         "Python 3.14.",
     ])
 

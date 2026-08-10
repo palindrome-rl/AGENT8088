@@ -25,8 +25,8 @@ CASES = [
     ("summarize this in one line: the cat sat on the mat and then slept", NO_TOOL),
     ("translate 'good morning' into French", NO_TOOL),
     ("what is a python list comprehension", NO_TOOL),
-    ("rewrite this to be shorter: we regret to inform you that the meeting "
-     "has unfortunately been cancelled", NO_TOOL),
+    (("rewrite this to be shorter: we regret to inform you that the meeting "
+      "has unfortunately been cancelled"), NO_TOOL),
     ("who wrote Pride and Prejudice", NO_TOOL),
     ("explain the difference between a list and a tuple", NO_TOOL),
     ("my API key is abc123 — what format is that", NO_TOOL),

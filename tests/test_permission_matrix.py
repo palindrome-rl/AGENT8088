@@ -96,8 +96,9 @@ def test_a_credential_in_a_query_is_blocked_in_every_mode(engine, monkeypatch, m
 
 def test_the_raw_query_is_not_shown_in_the_call_line():
     """The UI announces that a search happened, never what was searched for."""
-    from rich.console import Console
     import io
+
+    from rich.console import Console
 
     from agent8088 import cli
 

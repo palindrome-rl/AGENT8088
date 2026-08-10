@@ -108,9 +108,33 @@ Non-negotiable, because violating them has caused a real incident in this repo:
 2. **Always set `AGENT8088_CONFIG=/nonexistent`** for tests.
 3. **Use `AGENT8088_HOME`** for verification scripts.
 4. **Mock `subprocess.run`** rather than executing real mutating commands.
+5. **Write generated files to `artifacts/`, never the repo root.** Use the
+   `artifacts_dir` fixture. A session-scoped guard in `tests/conftest.py`
+   fails the run if anything new appears beside `pyproject.toml`, so this one
+   enforces itself.
 
 A `PreToolUse` hook in `.claude/hooks/guard-agent8088-cli.sh` blocks bare
 invocations as a backstop, but the discipline is the actual protection.
+
+## 5. Live-model tool-choice scoring (opt-in)
+
+The suite can prove a search query leaves with the year attached. It cannot
+prove the model decides to search in the first place, or resists searching for
+something it already knows — that is judgement, and only a real model has any.
+
+```sh
+A8088_LIVE_MODEL=1 AGENT8088_HOME="$(mktemp -d)" \
+  uv run --extra dev python scripts/verify_tool_intelligence.py
+```
+
+It runs the shared scenario table in `tests/data/tool_intelligence_cases.py`
+against the configured provider and scores tool choice, writing a report to
+`artifacts/`. It refuses to start without `A8088_LIVE_MODEL=1` and refuses to
+run against a real `~/.agent8088`.
+
+Not part of the default suite: it costs tokens and is not deterministic. Set
+the pass threshold with `A8088_TOOL_THRESHOLD` (default `0.8`) — establish the
+real baseline on your provider before treating that number as a gate.
 
 ## Pre-PR checklist
 
