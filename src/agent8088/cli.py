@@ -9,7 +9,7 @@ feature is reachable here:
   • Chat            — plain text runs the full agent loop (tool-calling, reasoning,
                       multi-turn context, loop-breaking) with live tool output.
   • /tool           — invoke any single tool directly, to test each in isolation.
-  • /plan           — exercise the plan-executor (multi-step decomposition).
+  • /plan           — run one natural-language task through plan-only mode.
   • /raw            — one raw model call, showing reasoning + tool_calls fields.
   • /model          — switch backend (Ornith  <->  Gemma fallback).
   • /config /system /tools /history /trace /temp /maxturns /save /clear ...
@@ -896,7 +896,7 @@ def cmd_help(_):
         ("/agents", "List available sub-agent profiles"),
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
         ("/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session"),
-        ("/plan <steps>", "Test the plan-executor (newline- or JSON-separated steps)"),
+        ("/plan <task>", "Run one task in plan-only mode"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
@@ -1213,42 +1213,17 @@ def cmd_tool(rest):
                         box=box.ROUNDED, border_style="#0077B6"))
 
 
-_PLAN_ICONS = {"pending": ("○", "#237dd7"), "running": ("◐", "#237dd7"), "done": ("✓", "#237dd7")}
-
-
 def cmd_plan(rest):
     if not rest.strip():
-        console.print("[red]usage:[/red] /plan <step1\\n step2 ...>  or  /plan [\"step1\",\"step2\"]")
+        console.print("[red]usage:[/red] /plan <task>")
         return
-
-    steps_state = {}
-
-    def render_checklist():
-        rows = []
-        for idx in sorted(steps_state):
-            step_text, tool_name, status = steps_state[idx]
-            icon, style = _PLAN_ICONS[status]
-            row = Text()
-            row.append(f"{icon} ", style=style)
-            row.append(f"[{idx}] ", style="dim")
-            row.append(f"{tool_name}: ", style="bold")
-            row.append(step_text[:70])
-            rows.append(row)
-        return Group(*rows) if rows else Text("planning...")
-
-    def on_step(idx, total, step_text, tool_name, status, result):
-        steps_state[idx] = (step_text, tool_name, status)
-        live.update(render_checklist())
-
-    with Live(console=console, refresh_per_second=10, transient=False) as live:
-        result = A._exec_plan(
-            {"steps": rest},
-            on_step=on_step,
-            on_escalation=lambda request: _handle_escalation(request, live),
-        )
-
-    console.print(Panel(Text(result), title="[#237dd7]plan result[/#237dd7]",
-                        box=box.ROUNDED, border_style="#0077B6"))
+    previous_mode = A.PERMISSION_MODE
+    A.PERMISSION_MODE = "plan-only"
+    try:
+        do_chat(rest)
+    finally:
+        A.PERMISSION_MODE = previous_mode
+        A._plan_execution_grant = False
 
 
 def cmd_raw(rest):

@@ -3,6 +3,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import pytest
 from rich.console import Console
 
 import agent8088.cli as classic
@@ -117,6 +118,42 @@ def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):
     monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
     classic.cmd_status("")
     assert "Session Status" in output.getvalue()
+
+
+def test_plan_runs_task_in_temporary_plan_only_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(classic.A, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(classic, "do_chat",
+                        lambda task: calls.append((task, classic.A.PERMISSION_MODE)))
+
+    classic.cmd_plan("create release notes")
+
+    assert calls == [("create release notes", "plan-only")]
+    assert classic.A.PERMISSION_MODE == "full-auto"
+
+
+def test_plan_restores_mode_when_chat_fails(monkeypatch):
+    monkeypatch.setattr(classic.A, "PERMISSION_MODE", "readonly")
+
+    def fail(_task):
+        assert classic.A.PERMISSION_MODE == "plan-only"
+        raise RuntimeError("model failed")
+
+    monkeypatch.setattr(classic, "do_chat", fail)
+
+    with pytest.raises(RuntimeError, match="model failed"):
+        classic.cmd_plan("create release notes")
+
+    assert classic.A.PERMISSION_MODE == "readonly"
+
+
+def test_plan_requires_a_natural_language_task(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
+
+    classic.cmd_plan("   ")
+
+    assert "/plan <task>" in output.getvalue()
 
 
 def test_named_session_round_trips_skill_state(tmp_path, monkeypatch):
