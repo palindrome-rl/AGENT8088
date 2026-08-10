@@ -4000,6 +4000,47 @@ def _augment_relative_time_query(query: str, now=None) -> str:
     return f"{query} {suffix}"
 
 
+# Words carrying no search intent. Dropping them stops a reworded repeat from
+# reading as a fresh query.
+_SEARCH_FILLER = frozenset({
+    "the", "a", "an", "of", "in", "on", "at", "for", "to", "is", "are", "was",
+    "were", "what", "whats", "who", "whos", "when", "where", "which", "how",
+    "do", "does", "did", "tell", "me", "about", "please", "current",
+    "currently", "latest", "newest", "recent", "now",
+})
+
+
+_SEARCH_STAMP_PREFIX = "[Retrieved "
+
+
+def _search_signature(query: str) -> tuple:
+    """Reduce a query to its meaning-bearing tokens, order-independent.
+
+    The loop's existing guard compares json.dumps(args), so a single changed
+    character reads as a brand-new call — and a model that rephrases when it
+    dislikes an answer can spend its whole turn budget on one question.
+    Sorting the tokens catches word-order variants too.
+    """
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    return tuple(sorted(w for w in words if w not in _SEARCH_FILLER))
+
+
+def _search_was_usable(result: str) -> bool:
+    """Whether a completed search is worth reusing instead of re-running.
+
+    An error or an empty result is not an answer; trapping the agent with it
+    would be worse than letting it try once more.
+    """
+    stripped = (result or "").strip()
+    if not stripped or stripped.startswith("Error:"):
+        return False
+    # Framed results carry a stamp line; a stamp with nothing under it is empty.
+    if stripped.startswith(_SEARCH_STAMP_PREFIX):
+        _stamp, _, body = stripped.partition("]")
+        return bool(body.strip())
+    return True
+
+
 def _frame_search_results(results: str, now=None) -> str:
     """Stamp results with when they were fetched.
 
@@ -4009,10 +4050,12 @@ def _frame_search_results(results: str, now=None) -> str:
     otherwise lacks, so "the next launch" gets checked against today rather
     than against training.
     """
-    if results.startswith("Error:"):
+    # An error or an empty result set is not something to stamp — the stamp
+    # would be the only content, and would read as a result that has none.
+    if not results.strip() or results.startswith("Error:"):
         return results
     moment = now or datetime.now().astimezone()
-    return (f"[Retrieved {moment:%Y-%m-%d}. Check each result's own date before "
+    return (f"{_SEARCH_STAMP_PREFIX}{moment:%Y-%m-%d}. Check each result's own date before "
             f"calling anything current, latest, or upcoming — search results "
             f"routinely include older pages.]\n\n{results}")
 
@@ -4376,6 +4419,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     searched = False     # prevents speculative page browsing after search results
+    search_results = {}  # query signature -> that search's output, for reuse
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -4514,6 +4558,27 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 messages.append({"role": "user", "content": f"Tool result ({name}):\n{result}"})
                 continue
 
+            # Equivalent-query guard. `sig` above is byte-exact, so rewording
+            # or reordering the same question slipped straight past it and the
+            # search ran again. A failed or empty first attempt stays
+            # retryable — trapping the agent with a dud result would be worse
+            # than one extra call.
+            if name == "web_search":
+                query_sig = _search_signature(str(args.get("query") or ""))
+                earlier = search_results.get(query_sig)
+                if earlier is not None and _search_was_usable(earlier):
+                    result = ("This search already ran. Answer from these results "
+                              f"instead of searching again:\n\n{earlier}")
+                    tool_outputs.append(result)
+                    if on_result:
+                        on_result(name, result)
+                    if turn_tools is not None:
+                        turn_tools.append({"name": name, "arguments": args,
+                                           "result": "(duplicate search)", "cached": True})
+                    messages.append({"role": "user",
+                                     "content": f"Tool result ({name}):\n{result}"})
+                    continue
+
             if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
                           if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
@@ -4535,7 +4600,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
             tool_outputs.append(result)
-            searched = searched or name == "web_search"
+            if name == "web_search" and not result.startswith("ESCALATION_REQUEST:"):
+                # Remember what this query returned so a reworded repeat can be
+                # answered from it. An escalation is not a result — recording it
+                # would make the approved retry look like a duplicate.
+                search_results[_search_signature(str(args.get("query") or ""))] = result
+                if not _search_was_usable(result):
+                    # An errored or empty search must stay retryable, and the
+                    # byte-exact `seen` guard above would otherwise block the
+                    # identical retry before the equivalence check runs. Same
+                    # discard the escalation path uses.
+                    seen.discard(sig)
+            searched = searched or (name == "web_search" and _search_was_usable(result))
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.
