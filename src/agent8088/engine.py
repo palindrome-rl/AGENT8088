@@ -1453,6 +1453,7 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "args": parse_csv(g("args", "tool_params")),
         "keywords": set(parse_csv(g("keywords", "tool_keywords"))),
         "command": g("command", "tool_command"),
+        "sandbox_image": g("sandbox_image", "tool_sandbox_image"),
         "url": g("url", "tool_url"),
         # http_get/http_post extras. jq filters and JSON bodies are pipe- and
         # comma-heavy, which collides with tools.txt's '|' field separator — so
@@ -1872,8 +1873,8 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     return text or "Command completed."
 
 
-def _exec_shell_command(command: str, timeout: int = 25) -> str:
-    return _exec_sandbox_command(command, timeout=timeout)
+def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str:
+    return _exec_sandbox_command(command, timeout=timeout, image=image)
 
 
 def _process_display(argv: list) -> str:
@@ -2495,7 +2496,9 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
         return f"Error: invalid container image name: {selected_image}"
     workspace = str(PROJECT_ROOT)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-    container_command = ["python", "-c", command] if python_code else ["sh", "-lc", command]
+    git_image = selected_image.startswith("alpine/git:")
+    container_command = (["python", "-c", command] if python_code else
+                         (["-lc", command] if git_image else ["sh", "-lc", command]))
     argv = [
         "docker", "run", "--rm", "--name", container_name, "--network", DOCKER_NETWORK,
         "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
@@ -2521,6 +2524,8 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             argv.extend([
                 "--mount", f"type=bind,src={empty},dst={destination},readonly",
             ])
+    if git_image:
+        argv.extend(["--entrypoint", "/bin/sh"])
     argv.extend(["-w", "/workspace", selected_image, *container_command])
     result = _exec_process(argv, timeout=timeout)
     if "timed out" in result:
@@ -3240,7 +3245,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 command.split()[0] if command.split() else "",
                 _exec_process(command, timeout=timeout, shell=True))
         else:
-            result = _exec_shell_command(command, timeout=timeout)
+            result = _exec_shell_command(
+                command, timeout=timeout, image=spec.get("sandbox_image", ""))
         return _wrap_untrusted(str(result), f"shell command: {_redact_secrets(command[:160])}")
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
