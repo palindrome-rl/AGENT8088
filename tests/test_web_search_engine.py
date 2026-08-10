@@ -161,6 +161,54 @@ def test_search_rejects_an_empty_query_before_any_provider(engine, monkeypatch):
     assert "query" in out.lower()
 
 
+def test_search_refuses_a_query_carrying_a_credential(engine, monkeypatch):
+    """A search query is an outbound channel, so it gets the same hard floor the
+    http path applies to a URL or body.
+
+    Regression: the http_get path checked _outbound_secret_check on the URL and
+    args. mode=search only guards the destination URL, and for ddgs/Tavily/Exa
+    the query never appears in a URL the guard sees — so without this the query
+    itself became an exfiltration path.
+    """
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "_SECRET_VALUES", ["sk-verysecret123"])
+    monkeypatch.setattr(engine.web_search, "run_search",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("no backend may see the secret")))
+    out = engine.run_tool("web_search", {"query": "sk-verysecret123"})
+    assert "credential" in out.lower()
+
+
+def test_search_refuses_a_credential_in_any_argument(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "_SECRET_VALUES", ["sk-verysecret123"])
+    monkeypatch.setattr(engine.web_search, "run_search",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("no backend may see the secret")))
+    out = engine.run_tool("web_search", {"query": "ok", "extra": "sk-verysecret123"})
+    assert "credential" in out.lower()
+
+
+def test_search_secret_floor_holds_in_every_permission_mode(engine, monkeypatch):
+    """Not escalatable: no mode grants sending a credential outbound."""
+    monkeypatch.setattr(engine, "_SECRET_VALUES", ["sk-verysecret123"])
+    monkeypatch.setattr(engine.web_search, "run_search",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("no backend may see the secret")))
+    for mode in ("readonly", "edit", "full-auto"):
+        monkeypatch.setattr(engine, "PERMISSION_MODE", mode)
+        out = engine.run_tool("web_search", {"query": "sk-verysecret123"})
+        assert "credential" in out.lower(), f"not blocked in {mode}"
+
+
+def test_search_allows_a_clean_query(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "_SECRET_VALUES", ["sk-verysecret123"])
+    monkeypatch.setattr(engine.web_search, "run_search",
+                        lambda q, limit, registry, config, ctx: "OK")
+    assert engine.run_tool("web_search", {"query": "weather"}) == "OK"
+
+
 def test_search_requires_permission_in_readonly(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine.web_search, "run_search",

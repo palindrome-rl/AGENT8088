@@ -2985,6 +2985,18 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         query = str(args.get("query") or "").strip()
         if not query:
             return "Error: web_search requires 'query'."
+        # Hard floor, checked before the permission gate: a search query is an
+        # outbound channel, so a credential in it is never legitimate and is not
+        # escalatable. The http path applies this to the URL and body; here the
+        # query is what leaves the machine — for ddgs/Tavily/Exa it never appears
+        # in a URL that check_url would see, so guarding the destination alone
+        # would leave the query itself as an exfiltration path.
+        leak = (_outbound_secret_check(query)
+                or _outbound_secret_check(json.dumps(args, default=str)))
+        if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=query[:120], reason="outbound_secret")
+            return leak
         if not check_permission(mode, f"web_search: {query[:80]}",
                                 approval_key=approval_key):
             _audit("escalation_requested", tool=name, mode=mode,
