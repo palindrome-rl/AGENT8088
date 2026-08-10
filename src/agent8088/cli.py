@@ -16,7 +16,7 @@ feature is reachable here:
 
 Run:  python agent8088_cli.py
 """
-import sys, os, json, shlex, time, threading, select, socket  # noqa: F401
+import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -2335,6 +2335,57 @@ def _valid_provider_name(name):
     return bool(name) and name.replace("_", "").replace("-", "").isalnum()
 
 
+# A leading "." glued straight onto an absolute path: the wizard pre-fills the
+# current value, so pasting a path without clearing the default produces
+# ".C:\Users\..." — one nonsense entry rather than two paths.
+_GLUED_DEFAULT_RE = re.compile(r"^\.(?=[A-Za-z]:[\\/]|[\\/]|~)")
+
+WORKSPACE_PROMPT_ATTEMPTS = 3
+
+
+def _invalid_workspace_paths(raw: str) -> list:
+    """Return the comma-separated entries that are not existing directories.
+
+    `.` is always valid — it means the launch directory, which is resolved later.
+    """
+    bad = []
+    for entry in [p.strip() for p in str(raw).split(",") if p.strip()]:
+        if entry == ".":
+            continue
+        try:
+            if not Path(entry).expanduser().is_dir():
+                bad.append(entry)
+        except (OSError, ValueError):
+            bad.append(entry)
+    return bad
+
+
+def _prompt_workspace_paths(current: str) -> str:
+    """Ask for the working directory, refusing paths that do not exist.
+
+    An unusable value here does not fail at setup time; it fails much later as a
+    bare "Path not allowed" on the first write, with nothing pointing back to the
+    wizard. Catching it at the point of entry is the only place the user still
+    has the context to fix it.
+    """
+    paths = current
+    for remaining in range(WORKSPACE_PROMPT_ATTEMPTS - 1, -1, -1):
+        paths = _custom_prompt("Working directory:", paths)
+        bad = _invalid_workspace_paths(paths)
+        if not bad:
+            return paths
+        for entry in bad:
+            print(f"  Not a directory: {entry}")
+            if _GLUED_DEFAULT_RE.match(entry):
+                print(f"  The default '.' is still in front of it — did you mean "
+                      f"{entry[1:]} ?")
+        if remaining:
+            print("  Enter one or more existing directories, comma-separated.\n")
+    print("  Keeping that value. Writes outside it will be refused with "
+          "'Path not allowed' until the directory exists.\n")
+    return paths
+
+
 def _reload_model_runtime(config_path, provider="", model=""):
     A.APP_CONFIG = A.load_simple_config(Path(config_path))
     A.PROVIDERS = A.load_providers(A.APP_CONFIG, include_builtins=True)
@@ -2365,7 +2416,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     print(f"{heading}\n")
     if include_workspace:
         cur_paths = _current("allowed_paths") or "~"
-        paths = _custom_prompt("Working directory:", cur_paths)
+        paths = _prompt_workspace_paths(cur_paths)
     else:
         paths = ""
 
