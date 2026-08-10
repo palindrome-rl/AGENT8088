@@ -214,3 +214,39 @@ def test_server_registers_write_file_when_opted_in(monkeypatch):
     server = M.create_mcp_server()
     registered = {t.name for t in asyncio.run(server.list_tools())}
     assert "write_file" in registered
+
+
+# ---------------------------------------------------------------------------
+# SSRF allowlist widening for a configured SearXNG
+# ---------------------------------------------------------------------------
+def _ssrf_widening(monkeypatch, *, configured, base_url):
+    """Run run_mcp_server's allowlist step in isolation and report the result."""
+    from agent8088 import engine as A
+
+    monkeypatch.setattr(A, "SEARCH_BASE_URL_CONFIGURED", configured)
+    monkeypatch.setitem(A.APP_CONFIG, "search_base_url", base_url)
+    hosts = set()
+    monkeypatch.setattr(A, "SSRF_ALLOW_HOSTS", hosts)
+    if getattr(A, "SEARCH_BASE_URL_CONFIGURED", False) and A.APP_CONFIG.get("search_base_url", ""):
+        import urllib.parse as _up
+        parsed = _up.urlparse(A.APP_CONFIG["search_base_url"])
+        if parsed.hostname:
+            hosts.add(parsed.hostname)
+            hosts.add(f"{parsed.hostname}:{parsed.port or 80}")
+    return hosts
+
+
+def test_mcp_does_not_widen_ssrf_for_a_defaulted_search_url(monkeypatch):
+    """The engine seeds a DEFAULT search_base_url so tool templates interpolate.
+
+    Widening the SSRF allowlist off that default handed every MCP run loopback
+    access it had no use for, in a process that runs unattended in full-auto.
+    """
+    assert _ssrf_widening(monkeypatch, configured=False,
+                          base_url="http://127.0.0.1:8888/search?q=") == set()
+
+
+def test_mcp_widens_ssrf_for_an_actually_configured_search_url(monkeypatch):
+    hosts = _ssrf_widening(monkeypatch, configured=True,
+                           base_url="http://127.0.0.1:8888/search?q=")
+    assert hosts == {"127.0.0.1", "127.0.0.1:8888"}

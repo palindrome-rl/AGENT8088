@@ -190,8 +190,15 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
         print("Agent8088 MCP server: writes ENABLED (mcp_server_allow_writes) — "
               "unattended, no approval prompt. Narrow allowed_paths/blocked_paths.",
               file=sys.stderr)
-    # Allow loopback for configured search endpoints (SearXNG on localhost).
-    if A.APP_CONFIG.get("search_base_url", ""):
+    # Allow loopback for a configured search endpoint (SearXNG on localhost).
+    #
+    # Gated on SEARCH_BASE_URL_CONFIGURED, not on the key being present: engine
+    # seeds a DEFAULT search_base_url into APP_CONFIG so tool templates always
+    # interpolate, so `.get("search_base_url")` is truthy even when the operator
+    # never configured an instance. Widening the SSRF allowlist off that default
+    # granted every MCP run loopback access it had no use for — in a process that
+    # deliberately runs unattended in full-auto.
+    if getattr(A, "SEARCH_BASE_URL_CONFIGURED", False) and A.APP_CONFIG.get("search_base_url", ""):
         import urllib.parse as _up
         parsed = _up.urlparse(A.APP_CONFIG["search_base_url"])
         if parsed.hostname:
