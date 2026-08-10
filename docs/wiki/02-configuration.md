@@ -18,7 +18,7 @@ Secrets do **not** belong here — see [API keys](#api-keys-and-the-env-store).
 
 | Key | Default | Purpose |
 |---|---|---|
-| `allowed_paths` | `~` | Roots the agent may touch at all. Anything outside is refused before any other check. |
+| `allowed_paths` | `.` | Roots the agent may touch at all; `.` is the launch workspace. Anything outside is refused before any other check. |
 | `project_root` | cwd | Base for relative paths. |
 | `shell_cwd` | cwd | Working directory for shell commands. |
 | `no_prompt_paths` | (empty) | Writes here are auto-approved, no prompt. |
@@ -105,7 +105,7 @@ not per call.
 |---|---|---|
 | `slack_enabled` / `whatsapp_enabled` / `discord_enabled` | `0` | Enable a channel. Only one at a time via the wizard. |
 | `slack_allowed_users` etc. | (empty) | Comma-separated user ids permitted per platform. **Empty means nobody** — fail-closed. |
-| `strict_platform_allowlist` | `0` | `1` refuses an id listed under a *different* platform's line instead of allowing it with a warning. |
+| `strict_platform_allowlist` | `1` | Refuses an id listed under a *different* platform's line. Set `0` only as a temporary migration aid. |
 | `gateway_permission_mode` | `readonly` | `readonly` routes writes to chat approval; `edit` disables prompts. |
 | `gateway_rate_limit_per_min` | `20` | Per-user messages per minute, slash commands included. `0` disables. |
 | `whatsapp_mode` | `self-chat` | `self-chat` or `bot`. |

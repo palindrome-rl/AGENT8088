@@ -56,16 +56,13 @@ class Allowlist:
     are global, and `is_allowed()` called without a platform falls back to the
     union — so existing callers keep working.
 
-    A misplaced id — one that IS listed, just on another platform's line — is
-    still allowed, with a one-time warning naming the line to move it to. Ids
-    cannot realistically collide across platforms (`U123ABC` vs a Discord
-    snowflake vs a phone number), so hard-denying one only produces a
-    confusing outage where the bot silently stops replying. Set
-    `strict_platform_allowlist=1` to refuse them instead.
+    A misplaced id is denied by default. Set `strict_platform_allowlist=0`
+    only as a temporary migration aid; it allows the misplaced id with a
+    one-time warning that names the correct configuration line.
     """
 
     def __init__(self, allowed: list, session_dir: Path = None, by_platform: dict = None,
-                 strict: bool = False):
+                 strict: bool = True):
         self._set = {u.strip() for u in (allowed or []) if u.strip()}
         self._bare = {u.lstrip("+") for u in self._set if u.startswith("+")}
         self._session_dir = session_dir
@@ -108,8 +105,8 @@ class Allowlist:
             return True
         if platform is None:
             return False
-        # Listed, but on another platform's line. Deny only in strict mode;
-        # otherwise allow and say exactly how to fix the config.
+        # Listed, but on another platform's line. Deny by default: platform
+        # identities are an authorization boundary, not a migration hint.
         other = self._listed_under(user_id, platform)
         if not other:
             return False
@@ -124,8 +121,8 @@ class Allowlist:
             self._warned_misplaced.add(user_id)
             log.warning(
                 "allowing %s on %s, but it is configured under "
-                "%s_allowed_users — move it to %s_allowed_users. This grace "
-                "will be removed; set strict_platform_allowlist=1 to enforce now.",
+                "%s_allowed_users — move it to %s_allowed_users, then remove "
+                "strict_platform_allowlist=0.",
                 user_id, platform, other, platform,
             )
         return True
@@ -160,6 +157,6 @@ class Allowlist:
         whatsapp_session = config.get("whatsapp_session_dir", "") or ""
         if whatsapp_session:
             session_dir = Path(whatsapp_session).expanduser()
-        strict = str(config.get("strict_platform_allowlist", "")).strip().lower() in (
+        strict = str(config.get("strict_platform_allowlist", "1")).strip().lower() in (
             "1", "true", "yes", "on")
         return cls(users, session_dir=session_dir, by_platform=by_platform, strict=strict)

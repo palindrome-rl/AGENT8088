@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+# Test collection imports CLI and gateway modules before fixtures run. Keep those
+# imports independent of a developer's real ~/.agent8088/config.txt.
+os.environ["AGENT8088_CONFIG"] = str(ROOT / "_no_such_config.txt")
 
 
 def _load_engine():

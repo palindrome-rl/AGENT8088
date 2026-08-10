@@ -140,14 +140,14 @@ def test_runner_passes_platform_to_allowlist():
 # phone number), so hard-denying an id that IS listed — just on the wrong
 # config line — only produces a confusing outage. Allow it and say so.
 
-def test_misplaced_id_is_still_allowed_by_default():
+def test_misplaced_id_is_denied_by_default():
     al = Allowlist.from_config({"slack_allowed_users": "99887766"})
-    assert al.is_allowed("99887766", platform="discord")
+    assert not al.is_allowed("99887766", platform="discord")
 
 
-def test_misplaced_id_logs_an_actionable_warning(caplog):
+def test_misplaced_id_logs_an_actionable_warning_when_compatibility_mode_is_enabled(caplog):
     import logging
-    al = Allowlist.from_config({"slack_allowed_users": "99887766"})
+    al = Allowlist.from_config({"slack_allowed_users": "99887766", "strict_platform_allowlist": "0"})
     with caplog.at_level(logging.WARNING, logger="agent8088.gateway.auth"):
         assert al.is_allowed("99887766", platform="discord")
     message = caplog.text
@@ -158,7 +158,7 @@ def test_misplaced_id_logs_an_actionable_warning(caplog):
 
 def test_misplaced_warning_is_logged_once_per_user(caplog):
     import logging
-    al = Allowlist.from_config({"slack_allowed_users": "99887766"})
+    al = Allowlist.from_config({"slack_allowed_users": "99887766", "strict_platform_allowlist": "0"})
     with caplog.at_level(logging.WARNING, logger="agent8088.gateway.auth"):
         for _ in range(5):
             al.is_allowed("99887766", platform="discord")
@@ -189,14 +189,14 @@ def test_strict_mode_hard_denies_misplaced_ids():
     assert al.is_allowed("99887766", platform="slack")
 
 
-def test_strict_mode_off_by_default():
+def test_strict_mode_on_by_default():
     al = Allowlist.from_config({"slack_allowed_users": "99887766"})
-    assert al.strict is False
+    assert al.strict is True
 
 
-def test_misplaced_whatsapp_number_also_gets_grace(caplog):
+def test_misplaced_whatsapp_number_gets_grace_only_in_compatibility_mode(caplog):
     import logging
-    al = Allowlist.from_config({"slack_allowed_users": "+15551234567"})
+    al = Allowlist.from_config({"slack_allowed_users": "+15551234567", "strict_platform_allowlist": "0"})
     with caplog.at_level(logging.WARNING, logger="agent8088.gateway.auth"):
         assert al.is_allowed("15551234567", platform="whatsapp")
     assert "whatsapp_allowed_users" in caplog.text

@@ -77,6 +77,7 @@ def test_build_runner_registers_slack_when_enabled(tmp_path, monkeypatch):
                 self.bot_token = config.get("slack_bot_token", "")
                 self.app_token = config.get("slack_app_token", "")
         stub.SlackAdapter = _StubAdapter
+        stub.A = None
         sys.modules["agent8088.gateway.platforms.slack"] = stub
 
     monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "nonexistent.txt"))
@@ -111,7 +112,7 @@ def test_approve_slash_command_resolves_pending():
     # Simulate a pending approval
     from agent8088.gateway.runner import _PendingApproval
     entry = _PendingApproval(chat_id="C1", tool_name="write_file", change_type="new_file")
-    runner._pending_approvals["C1"] = entry
+    runner._pending_approvals[("discord", "C1")] = entry
 
     evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
                        user_id="U1", text="/approve")
@@ -129,7 +130,7 @@ def test_approve_session_sets_session_scope():
 
     from agent8088.gateway.runner import _PendingApproval
     entry = _PendingApproval(chat_id="C1", tool_name="write_file", change_type="new_file")
-    runner._pending_approvals["C1"] = entry
+    runner._pending_approvals[("discord", "C1")] = entry
 
     evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
                        user_id="U1", text="/approve session")
@@ -147,7 +148,7 @@ def test_deny_slash_command_resolves_pending():
 
     from agent8088.gateway.runner import _PendingApproval
     entry = _PendingApproval(chat_id="C1", tool_name="write_file", change_type="new_file")
-    runner._pending_approvals["C1"] = entry
+    runner._pending_approvals[("discord", "C1")] = entry
 
     evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
                        user_id="U1", text="/deny")
@@ -185,11 +186,28 @@ def test_help_lists_approve_and_deny():
     assert "/deny" in sent
 
 
-def test_session_allowlist_auto_approves():
+def test_session_allowlist_is_scoped_to_session_user_and_change_type():
     runner, sessions = _make_runner()
-    runner._session_allowlist.add("new_file")
+    runner._session_allowlist.add(("agent:main:discord:channel:C1", "U1", "new_file"))
 
+    assert ("agent:main:discord:channel:C1", "U1", "new_file") in runner._session_allowlist
+    assert ("agent:main:discord:channel:C2", "U1", "new_file") not in runner._session_allowlist
+    assert ("agent:main:discord:channel:C1", "U2", "new_file") not in runner._session_allowlist
+
+
+def test_approval_requires_the_requesting_user():
+    runner, _ = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
     from agent8088.gateway.runner import _PendingApproval
-    # Simulate the on_escalation callback checking session allowlist
-    change_type = "new_file"
-    assert change_type in runner._session_allowlist
+    entry = _PendingApproval("C1", "write_file", "new_file", "session", "U1", "discord")
+    runner._pending_approvals[("discord", "C1")] = entry
+
+    event = MessageEvent("discord", "C1", "channel", "U2", "/approve")
+    asyncio.run(runner.on_message(event))
+
+    assert not entry.event.is_set()
+    assert entry.approved is False
+    assert "Only the requester" in adapter.send_message.call_args.args[1]

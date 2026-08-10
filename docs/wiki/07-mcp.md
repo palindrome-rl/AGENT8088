@@ -111,7 +111,6 @@ Expose Agent8088's tools to another agent.
 ```sh
 agent8088 --mcp-serve                                   # stdio (local)
 agent8088 --mcp-serve --mcp-http --mcp-port 8931        # Streamable HTTP
-agent8088 --mcp-serve --mcp-http --mcp-host 0.0.0.0     # bind all interfaces
 ```
 
 Client config:
@@ -173,9 +172,8 @@ endpoint.
 
 ### HTTP transport caveat
 
-Binds to `127.0.0.1` by default. **There is no authentication.** Anything that
-can reach the port can use the tools, so only use `--mcp-host 0.0.0.0` on a
-trusted network — and think twice if `mcp_server_allow_writes=1`.
+Binds to `127.0.0.1` by default and is restricted to localhost. Remote MCP
+needs an authenticated proxy that is not included in Agent8088.
 
 ---
 

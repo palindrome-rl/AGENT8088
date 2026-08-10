@@ -14,7 +14,7 @@ allowed_paths / set blocked_paths first.
 
 Usage:
     agent8088 --mcp-serve              # stdio (local, default)
-    agent8088 --mcp-serve --mcp-http   # HTTP (remote, multi-client)
+    agent8088 --mcp-serve --mcp-http   # HTTP (localhost only)
 
 MCP client config (stdio):
     {
@@ -77,6 +77,7 @@ EXPOSED_TOOLS = (
 WRITE_TOOLS = ("write_file",)
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
 def exposed_tool_names(config=None) -> tuple:
@@ -168,7 +169,7 @@ def _make_handler(tool_name: str, args_list: list, engine_module):
 def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
     """Start the Agent8088 MCP server.
 
-    transport: "stdio" (default, local) or "streamable-http" (remote/multi-client).
+    transport: "stdio" (default, local) or "streamable-http" (localhost only).
     host/port: only used when transport is "streamable-http".
     """
     if not _MCP_AVAILABLE:
@@ -202,6 +203,8 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
             A.SSRF_ALLOW_HOSTS.add(f"{parsed.hostname}:{parsed.port or 80}")
 
     if transport == "streamable-http":
+        if host.lower() not in _LOOPBACK_HOSTS:
+            raise ValueError("HTTP MCP must bind to localhost; remote MCP requires authentication, which is not configured.")
         server = create_mcp_server(host=host, port=port)
         print(f"Agent8088 MCP server (HTTP) on http://{host}:{port}/mcp", file=sys.stderr)
         server.run(transport="streamable-http")

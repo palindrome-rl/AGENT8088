@@ -314,6 +314,17 @@ def test_approved_local_fallback_runs_once(engine, monkeypatch):
     assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
 
 
+@pytest.mark.parametrize("mode", ["edit", "full-auto"])
+def test_unsandboxed_execution_requires_an_explicit_one_shot_grant(engine, monkeypatch, mode):
+    engine.SANDBOX_BACKEND = "auto"
+    engine.PERMISSION_MODE = mode
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "ran locally")
+
+    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+
+
 def test_sandbox_backend_setting_persists(engine, tmp_path, monkeypatch):
     config = tmp_path / "config.txt"
     monkeypatch.setattr(engine, "CONFIG_PATH", config)

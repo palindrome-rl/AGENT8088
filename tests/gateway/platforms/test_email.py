@@ -189,3 +189,4 @@ def test_email_process_message_accepts_authorized_sender():
 
     adapter._process_message(msg)
     allowlist.is_allowed.assert_called_once_with("friend@example.com", "email")
+    runner.on_message.assert_not_called()

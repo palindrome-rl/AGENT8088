@@ -174,7 +174,8 @@ Narrow `allowed_paths` and set `blocked_paths` first; writes are unattended.
 ### MCP HTTP server reachable by others
 
 There's **no authentication** on the HTTP transport. It binds `127.0.0.1` by
-default — only use `--mcp-host 0.0.0.0` on a trusted network.
+default. Remote binds are intentionally rejected because the bundled HTTP
+transport has no authentication.
 
 ## Gateway
 

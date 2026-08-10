@@ -207,14 +207,14 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `provider.<name>.base_url` | (built-in) | Override a provider's endpoint URL |
 | `fallback_models` | (empty) | Comma-separated fallback chain (e.g. `groq:llama-3.3-70b-versatile,gemini:gemini-2.0-flash`) |
 | `timeout_seconds` | `120` | Request timeout |
-| `allowed_paths` | `~` | Paths the agent can read/write |
+| `allowed_paths` | `.` | Paths the agent can read/write; `.` is the launch workspace |
 | `prompt_paths` | `~` | Writes here show y/n escalation |
 | `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `search_base_url` | (commented) | SearXNG URL for web_search (ends at `q=`) |
 | `gateway_permission_mode` | `readonly` | Gateway permission mode: `readonly` (approvals in chat) or `edit` (full-auto) |
-| `strict_platform_allowlist` | `0` | Refuse a user id listed under another platform's `*_allowed_users` line instead of allowing it with a warning |
+| `strict_platform_allowlist` | `1` | Refuse a user id listed under another platform's `*_allowed_users` line |
 | `mcp_server_allow_writes` | `0` | Expose `write_file` over `--mcp-serve`. Writes are unattended (MCP has no approval channel) |
 | `disabled_tools` | (empty) | Comma-separated built-in tool names to disable (e.g. `browse_page` when MCP Playwright is connected) |
 
@@ -278,11 +278,9 @@ MCP client config (e.g. for Claude Code's `.claude/settings.json`):
 }
 ```
 
-**HTTP mode** (remote use, multi-client):
+**HTTP mode** (localhost only):
 ```bash
 agent8088 --mcp-serve --mcp-http --mcp-port 8931
-# Bind to all interfaces:
-agent8088 --mcp-serve --mcp-http --mcp-host 0.0.0.0 --mcp-port 8931
 ```
 
 MCP client config (HTTP):
@@ -319,7 +317,7 @@ first. The always-on floor still applies either way: sensitive files (`.env`,
 are refused regardless of mode, since writing one is code execution on the
 user's next shell launch.
 
-Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP binds to localhost by default; use `--mcp-host 0.0.0.0` to expose to the network — note there is no authentication on the HTTP transport, so only do this on a trusted network. The external agent's own approval system (e.g. Claude Code's permission prompts) handles any additional safety.
+Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP is restricted to localhost because this server has no authentication. Use a local client or stdio; remote MCP requires an authenticated proxy that is not included here.
 
 ### Environment Variables
 

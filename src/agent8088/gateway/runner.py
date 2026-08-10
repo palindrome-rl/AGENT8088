@@ -55,10 +55,14 @@ class _RateLimiter:
 
 class _PendingApproval:
     """One pending escalation waiting for a chat reply."""
-    def __init__(self, chat_id: str, tool_name: str, change_type: str):
+    def __init__(self, chat_id: str, tool_name: str, change_type: str,
+                 session_key: str = "", user_id: str = "", platform: str = ""):
         self.chat_id = chat_id
         self.tool_name = tool_name
         self.change_type = change_type
+        self.session_key = session_key
+        self.user_id = user_id
+        self.platform = platform
         self.event = threading.Event()
         self.approved = False
         self.session_scope = False  # /approve session → True
@@ -77,10 +81,10 @@ class GatewayRunner:
         # regardless of which chat it's from. Concurrent turns from different
         # chats would corrupt each other's state.
         self._turn_lock = asyncio.Lock()
-        # Approval routing: chat_id → _PendingApproval (only one pending per chat)
-        self._pending_approvals: dict[str, _PendingApproval] = {}
-        # Session-scoped approvals: change_types already approved for this session
-        self._session_allowlist: set[str] = set()
+        # Approval routing: (platform, chat_id) → _PendingApproval.
+        self._pending_approvals: dict[tuple[str, str], _PendingApproval] = {}
+        # Session-scoped approvals are bound to the originating session and user.
+        self._session_allowlist: set[tuple[str, str, str]] = set()
         self._rate_limiter = _RateLimiter(
             int(A.APP_CONFIG.get("gateway_rate_limit_per_min", "20")))
 
@@ -185,13 +189,16 @@ class GatewayRunner:
 
             # Session-scoped auto-approve: if this change_type was already
             # approved for the session, grant without prompting.
-            if change_type in self._session_allowlist:
+            approval_scope = (key, event.user_id, change_type)
+            if approval_scope in self._session_allowlist:
                 log.info("escalation: auto-approved (session scope: %s)", change_type)
                 A.grant_escalation(change_type)
                 return True
 
-            entry = _PendingApproval(event.chat_id, name, change_type)
-            self._pending_approvals[event.chat_id] = entry
+            approval_key = (event.platform, event.chat_id)
+            entry = _PendingApproval(event.chat_id, name, change_type, key, event.user_id,
+                                     event.platform)
+            self._pending_approvals[approval_key] = entry
             log.info("escalation: sent approval prompt to %s, waiting for /approve or /deny", event.chat_id)
 
             # Send the prompt to chat (async, from the agent thread)
@@ -205,20 +212,20 @@ class GatewayRunner:
                 future.result(timeout=10)
             except Exception as e:
                 log.warning("send_approval_prompt failed: %s", e)
-                self._pending_approvals.pop(event.chat_id, None)
+                self._pending_approvals.pop(approval_key, None)
                 return False
 
             # Block until user replies or timeout
             if not entry.event.wait(timeout=APPROVAL_TIMEOUT):
                 log.warning("approval timed out for %s", event.chat_id)
-                self._pending_approvals.pop(event.chat_id, None)
+                self._pending_approvals.pop(approval_key, None)
                 return False
 
-            self._pending_approvals.pop(event.chat_id, None)
+            self._pending_approvals.pop(approval_key, None)
             if entry.approved:
                 A.grant_escalation(change_type)
                 if entry.session_scope:
-                    self._session_allowlist.add(change_type)
+                    self._session_allowlist.add(approval_scope)
                 return True
             return False
 
@@ -244,6 +251,7 @@ class GatewayRunner:
         if cmd == "/new":
             key = build_session_key(event.platform, event.chat_type, event.chat_id, event.thread_id)
             self.sessions.clear(key)
+            self._session_allowlist = {scope for scope in self._session_allowlist if scope[0] != key}
             if adapter:
                 await adapter.send_message(event.chat_id, "Session cleared.")
             return True
@@ -263,11 +271,15 @@ class GatewayRunner:
                 await adapter.send_message(event.chat_id, "Queued messages cleared.")
             return True
         if cmd == "/approve":
-            entry = self._pending_approvals.get(event.chat_id)
+            entry = self._pending_approvals.get((event.platform, event.chat_id))
             log.info("/approve from %s — pending: %s", event.chat_id, bool(entry))
             if not entry:
                 if adapter:
                     await adapter.send_message(event.chat_id, "No pending approval.")
+                return True
+            if entry.user_id and entry.user_id != event.user_id:
+                if adapter:
+                    await adapter.send_message(event.chat_id, "Only the requester may approve this action.")
                 return True
             parts = event.text.split(None, 1)
             entry.session_scope = len(parts) > 1 and parts[1].strip().lower() == "session"
@@ -278,11 +290,15 @@ class GatewayRunner:
                 await adapter.send_message(event.chat_id, f"Approved ({scope}).")
             return True
         if cmd == "/deny":
-            entry = self._pending_approvals.get(event.chat_id)
+            entry = self._pending_approvals.get((event.platform, event.chat_id))
             log.info("/deny from %s — pending: %s", event.chat_id, bool(entry))
             if not entry:
                 if adapter:
                     await adapter.send_message(event.chat_id, "No pending approval.")
+                return True
+            if entry.user_id and entry.user_id != event.user_id:
+                if adapter:
+                    await adapter.send_message(event.chat_id, "Only the requester may deny this action.")
                 return True
             entry.approved = False
             entry.event.set()

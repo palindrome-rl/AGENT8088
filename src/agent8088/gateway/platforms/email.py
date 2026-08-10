@@ -246,6 +246,9 @@ class EmailAdapter(BaseChannelAdapter):
             raw={"email": {"from": from_header, "subject": subject, "message_id": message_id}},
         )
         logger.info("Email: received message from %s (%d chars)", from_addr, len(text))
+        if self._loop is None:
+            logger.warning("Email: cannot dispatch message before connect()")
+            return
         try:
             asyncio.run_coroutine_threadsafe(
                 self.runner.on_message(event), self._loop

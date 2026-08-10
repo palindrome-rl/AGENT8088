@@ -132,6 +132,12 @@ def test_create_mcp_server_http_configures_endpoint():
     except ImportError:
         pytest.skip("MCP package not installed")
 
+
+def test_http_mcp_refuses_a_non_loopback_bind():
+    from agent8088.mcp_server import run_mcp_server
+    with pytest.raises(ValueError, match="localhost"):
+        run_mcp_server(transport="streamable-http", host="0.0.0.0")
+
 # --- Regression: write_file was exposed while the server forced full-auto ---
 # An external MCP client could write anywhere under allowed_paths with no
 # approval prompt (there is no approval channel over MCP). Writes are now

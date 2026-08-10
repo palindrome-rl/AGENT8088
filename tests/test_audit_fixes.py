@@ -458,7 +458,7 @@ def test_private_file_is_protected_before_content_is_written(
     assert private.read_text(encoding="utf-8") == "private content"
 
 
-def test_edit_mode_runs_shell_without_sandbox_consent(engine, monkeypatch):
+def test_edit_mode_escalates_shell_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -466,11 +466,10 @@ def test_edit_mode_runs_shell_without_sandbox_consent(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine._exec_sandbox_command("echo hi")
-    assert "ESCALATION_REQUEST" not in result
-    assert "ran:echo hi" in result
+    assert result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
+def test_edit_mode_escalates_sandboxed_code_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -478,11 +477,10 @@ def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine.run_tool("run_sandboxed", {"code": "print(1)"})
-    assert "ESCALATION_REQUEST" not in result
-    assert "ran:" in result and "print(1)" in result
+    assert result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
+def test_edit_mode_escalates_sandbox_argv_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -494,8 +492,8 @@ def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
     )
 
     result = engine._exec_sandbox_argv(["git", "status"])
-    assert "ESCALATION_REQUEST" not in result
-    assert seen["argv"] == ["git", "status"]
+    assert result.startswith("ESCALATION_REQUEST")
+    assert seen == {}
 
 
 def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):
