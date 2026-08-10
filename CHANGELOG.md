@@ -4,6 +4,47 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Long-Horizon Reliability
+
+Both changes target the same failure: a step that did not do what it claimed,
+recorded as though it had, with every later step built on top of it.
+
+### Plans halt on the first failed step
+
+- `_exec_plan()` now stops at the first failed step instead of running the rest.
+  Previously a failing step appended its error to the output and the loop
+  continued — a plan whose first step failed would run all remaining steps
+  against a state the plan no longer described.
+- New `_plan_step_failed()` recognises two forms: a tool result starting with
+  `Error:`, and an unanswered or denied `ESCALATION_REQUEST:` (the request string
+  survives only when nobody approved it).
+- Unknown tools and missing required arguments now halt too, rather than `continue`.
+- The result reports where it stopped and how many steps did not run, so a
+  half-executed plan cannot be mistaken for a finished one.
+- Not a rollback: steps that already ran stay run.
+
+### Sub-agent permission floor + `auditor` profile
+
+- Sub-agent profiles accept `permission: readonly` in frontmatter. The sub-run is
+  pinned to readonly for its whole lifetime regardless of the caller's mode,
+  including `--edit`.
+- The floor only restricts. No frontmatter value widens a sub-agent past what the
+  caller had — an unrecognised value leaves the caller's mode untouched.
+- Pending parent grants (`_one_shot_grant`, `_plan_execution_grant`,
+  `_local_fallback_grant`, `_remote_git_grant`) are cleared for the sub-run and
+  restored after. Without this, an auditor spawned mid-plan would run inside the
+  parent's write grant.
+- New `auditor` profile (`read_text`, `execute_shell`, `last_output`, readonly
+  floor) verifies a completed step against the environment and returns a
+  `VERDICT: pass|fail|unknown` line. Read-only-ness is enforced by
+  `check_permission()`, not by the prompt.
+- Tests in `tests/test_plan_audit.py`. Note the floor tests use a purpose-built
+  profile that *includes* `write_file`: the auditor's own tool list omits it, so
+  the tool restriction would block the write before the permission layer was ever
+  consulted, and the tests would pass with the floor deleted.
+
+---
+
 ## Permission Layer
 
 ### readonly → edit Escalation (commits `2f2a3e6`, `e720b88`, `0a7339e`)

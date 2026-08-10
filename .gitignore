@@ -11,7 +11,10 @@ dist/
 # Environment
 .env
 venv/
+.venv/
 env/
+# Local dev venvs live in the repo root; `venv/` alone does not cover them.
+agent/
 
 # Secrets
 *.key

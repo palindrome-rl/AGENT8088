@@ -1732,6 +1732,7 @@ _DEFAULT_SUBAGENT_PROFILE = {
     "description": "General-purpose sub-agent for multi-step research, search, and code tasks.",
     "tools": sorted(n for n in TOOL_NAMES if n != "spawn_subagent"),
     "max_turns": 8,
+    "permission": "",
     "system_prompt": (
         "You are a focused sub-agent spawned to complete ONE delegated task with a "
         "fresh context. Use your tools actively. When done, reply with a concise final "
@@ -1751,6 +1752,10 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 "description": meta.get("description", default_tool_description(name)),
                 "tools": parse_csv(meta.get("tools", "")),
                 "max_turns": int(meta.get("max_turns", "8")),
+                # Optional permission floor for the sub-run. Only "readonly" is
+                # honoured: a profile may restrict itself below the caller's mode,
+                # never widen past it.
+                "permission": meta.get("permission", "").strip().lower(),
                 "system_prompt": body.strip() or _DEFAULT_SUBAGENT_PROFILE["system_prompt"],
             }
     if DEFAULT_SUBAGENT not in specs:
@@ -1979,6 +1984,17 @@ def _format_with_args(template: str, args: dict) -> str:
         raise ValueError(f"Missing required argument: {exc.args[0]}") from None
 
 
+def _plan_step_failed(result: str) -> bool:
+    """True if a plan step did not do what the plan asked.
+
+    Two forms count: a tool that reported an error, and an escalation that went
+    unanswered or was denied (the request string survives only when nobody
+    approved it). Both mean the intended effect is absent, so every later step
+    is now standing on an assumption that is already false.
+    """
+    return (result or "").lstrip().startswith(("Error:", "ESCALATION_REQUEST:"))
+
+
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
@@ -2029,6 +2045,8 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             _plan_execution_grant = True
 
     outputs = []
+    halted = ""
+    stopped_at = 0
     for idx, step in enumerate(steps, 1):
         if isinstance(step, dict):
             step_text = str(step.get("step") or step.get("text") or "")
@@ -2041,7 +2059,8 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             tool_args = _infer_step_args(tool_name, step_text, {})
         if tool_name not in TOOL_SPECS:
             outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
-            continue
+            halted, stopped_at = f"unknown tool '{tool_name}'", idx
+            break
         missing = [param for param in TOOL_REQUIRED_PARAMS.get(tool_name, [])
                    if param not in tool_args]
         if missing:
@@ -2050,7 +2069,8 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             outputs.append(f"[{idx}] {tool_name}: {result}")
             if on_step:
                 on_step(idx, total, step_text, tool_name, "done", result)
-            continue
+            halted, stopped_at = f"{tool_name} was missing required arguments", idx
+            break
         if on_step:
             on_step(idx, total, step_text, tool_name, "running", None)
         try:
@@ -2067,7 +2087,22 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         if on_step:
             on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
+        # Stop at the first failed step. Continuing would run every later step
+        # against a state the plan no longer describes, and the caller would get
+        # back a transcript in which the failure is one line among many that all
+        # look alike — which is how a half-done plan gets reported as done.
+        if _plan_step_failed(result):
+            halted, stopped_at = f"{tool_name} did not complete", idx
+            break
     _plan_execution_grant = False  # clear temporary grant — back to plan-only
+    if halted:
+        skipped = total - stopped_at
+        outputs.append(
+            f"Plan halted at step {stopped_at}/{total}: {halted}."
+            + (f" The remaining {skipped} step(s) were NOT run." if skipped else "")
+            + " Fix the cause, then issue a new plan for the work that is left —"
+              " do not assume any later step ran."
+        )
     return "\n".join(outputs)
 
 
@@ -2075,6 +2110,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
+    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
+    global _local_fallback_grant, _remote_git_grant
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -2102,6 +2139,27 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # Optional live presentation hooks for the sub-agent's own loop.
     ui = subagent_ui(type_name, task, depth) if callable(subagent_ui) else {}
 
+    # Permission floor. A profile declaring `permission: readonly` is pinned to
+    # readonly for the whole sub-run, whatever the caller was running as. This is
+    # a floor, not a mode switch: it can only restrict, never widen — there is no
+    # profile value that grants more than the caller already had.
+    #
+    # Pending grants are cleared too, and that is the point rather than a detail.
+    # An approval the *parent* obtained (a one-shot y/n, or the temporary grant
+    # `_exec_plan` holds while running an approved plan) would otherwise be live
+    # inside an agent whose whole contract is that it cannot change anything —
+    # so an auditor spawned mid-plan could write through the parent's grant.
+    floor = profile.get("permission", "")
+    saved_permission = None
+    if floor == "readonly":
+        saved_permission = (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+                            _local_fallback_grant, _remote_git_grant)
+        PERMISSION_MODE = "readonly"
+        _one_shot_grant = False
+        _plan_execution_grant = False
+        _local_fallback_grant = False
+        _remote_git_grant = False
+
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
     try:
@@ -2121,6 +2179,9 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         answer = f"Sub-agent failed: {e}"
     finally:
         _last_tool_output, _last_tool_name, _last_write_diff = saved
+        if saved_permission is not None:
+            (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+             _local_fallback_grant, _remote_git_grant) = saved_permission
 
     if ui.get("done"):
         ui["done"](answer)

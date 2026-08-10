@@ -86,6 +86,7 @@ more tools are not required to add more sub-agents.
 | `explore` | 5 (read-only) | 6 | Searching/reading — **cannot write files** |
 | `coder` | 4 | 10 | Write code, then verify it runs |
 | `researcher` | 4 | 8 | Web research with citations |
+| `auditor` | 3 (readonly-pinned) | 6 | Verify a completed step against the environment |
 
 ```bash
 /agents        # list profiles with their tools, turn budgets, descriptions

@@ -66,6 +66,22 @@ Per user turn, `run_agent()` loops up to `max_turns`:
 If the model backend errors mid-turn, the loop returns the best output it has
 rather than crashing the session.
 
+## Plans stop at the first failed step
+
+`execute_plan` runs its steps in order and **halts on the first failure**, rather
+than running the rest against a state the plan no longer describes. A step counts
+as failed when the tool reported an error, or when its escalation went unanswered
+or denied.
+
+The result then says where it stopped and how many steps did not run, so a caller
+cannot mistake a half-executed plan for a finished one. Continuing past a failure
+is what turns one bad step into a cascade: every later step is built on an effect
+that never happened, and the transcript gives the failure no more weight than any
+other line.
+
+A halted plan is not a rollback — steps that already ran stay run. The caller is
+expected to fix the cause and issue a new plan for the remaining work.
+
 ## Tools are data
 
 `tools.txt` is a pipe-delimited registry, not Python. A tool declares a `mode`,

@@ -53,7 +53,9 @@ class Scripted:
 # ---------------------------------------------------------------- 1. LOADING
 section("1. CORE LOADING (was 0 tools before the config fix)")
 check("tools load", len(A.TOOL_NAMES) >= 18, f"{len(A.TOOL_NAMES)} tools")
-check("subagents load", len(A.SUBAGENT_SPECS) == 4, ", ".join(sorted(A.SUBAGENT_SPECS)))
+check("subagents load",
+      {"auditor", "coder", "explore", "general-purpose", "researcher"} <= set(A.SUBAGENT_SPECS),
+      ", ".join(sorted(A.SUBAGENT_SPECS)))
 check("system.md loaded (not the stub)", "Agent8088 Skill Document" in A.BASE_SYSTEM_PROMPT)
 check("tool docs reach the prompt", "spawn_subagent(" in A.SYSTEM_PROMPT)
 check("new tools present",

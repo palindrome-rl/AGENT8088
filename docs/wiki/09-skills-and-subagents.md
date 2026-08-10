@@ -19,18 +19,40 @@ Two different extension mechanisms that are easy to confuse:
 conversation, its own turn budget, and a **restricted tool set**. The parent
 gets back only the final answer — intermediate steps never enter its context.
 
-### The 4 bundled profiles
+### The 5 bundled profiles
 
 | Profile | Tools | Max turns | For |
 |---|---|---|---|
 | `explore` | `execute_shell`, `read_text`, `web_search`, `get_page_title`, `last_output` | 6 | Read-only codebase search. No write tool at all. |
 | `researcher` | `web_search`, `get_page_title`, `read_text`, `last_output` | 8 | Web research with citations. No shell. |
 | `coder` | `execute_shell`, `read_text`, `write_file`, `last_output` | 10 | Write code and verify it runs. |
+| `auditor` | `read_text`, `execute_shell`, `last_output` | 6 | Verify a completed step against the environment. Pinned readonly. |
 | `general-purpose` | the above plus `calculate` | 8 | Mixed multi-step work. |
 
 Note the tool restriction is real isolation, not advice: `explore` has no
 `write_file`, so an explore sub-agent physically cannot write, whatever the
 model decides.
+
+### The permission floor
+
+A profile may add `permission: readonly` to its frontmatter. The sub-run is then
+pinned to readonly for its whole lifetime, whatever mode the caller was in —
+including `--edit`. `auditor` is the one bundled profile that uses it.
+
+The floor only ever restricts. There is no frontmatter value that grants a
+sub-agent more than the caller already had, so a profile cannot widen its own
+permissions.
+
+It also clears any grant the parent is holding — a one-shot y/n approval, or the
+temporary grant `execute_plan` holds while running an approved plan. That part
+matters more than it looks: without it, an auditor spawned in the middle of an
+approved plan would be running inside the parent's write grant, and an agent
+whose entire contract is "I only observe" could change the thing it was sent to
+inspect.
+
+This is why the auditor's read-only-ness is a property of the engine rather than
+of its prompt. `check_permission()` refuses the write; the model is not being
+asked to behave.
 
 ### Defining your own
 
