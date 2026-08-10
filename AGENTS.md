@@ -1,136 +1,215 @@
+# AGENTS.md
+
+Agent8088 — local AI agent with an enforced permission layer. One engine
+(`src/agent8088/engine.py`), four front ends (CLI, messaging gateway, MCP
+server, cron). Python ≥3.10, built with hatchling, packaged via `uv`
+(`uv.lock` is the lockfile). Active branch is `development`.
+
+Long-form reference: `CLAUDE.md` (architecture, security layers, full testing
+matrix). This file is the compact version — only what an agent would miss
+without help.
+
+## Setup
+
+```bash
+uv sync --extra dev --extra gateway
+```
+
+- `dev` → pytest, ruff, pip-audit. `gateway` → slack-bolt, slack-sdk, httpx,
+  discord.py (optional extras, NOT core deps).
+- A bare `uv sync` gives a venv with **no pytest** and **no gateway libs** —
+  tests will hard-fail at import. Always sync with the extras you need.
+- Creates `.venv\Scripts\python.exe` (Windows) / `.venv/bin/python` (Unix).
+
+## Run the agent (dev)
+
+**Never run the CLI bare.** `agent8088` / `python -m agent8088.cli` reads and
+writes `~/.agent8088/config.txt` and `~/.agent8088/.env` by default — a bare
+invocation once triggered the one-time `api_key` → `.env` migration against a
+real config. Always isolate:
+
+```bash
+AGENT8088_CONFIG=/nonexistent AGENT8088_HOME=/tmp/agent8088-sandbox python -m agent8088.cli ...
+# flags: --setup | --gateway | --mcp-serve [--mcp-http --mcp-port 8931] | --mode readonly|full-auto|plan-only | --edit
+```
+
+A `PreToolUse` hook (`.claude/hooks/guard-agent8088-cli.sh`) backstops this in
+session, but a fresh session may not have the hook loaded — isolate every time.
+
+## Tests
+
+```bash
+# Full suite (Windows)
+AGENT8088_CONFIG=/nonexistent .venv\Scripts\python.exe -m pytest tests/ -q
+
+# Full suite (Unix)
+AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest tests/ -q
+
+# Single file
+AGENT8088_CONFIG=/nonexistent .venv\Scripts\python.exe -m pytest tests/test_permission.py -v
+
+# Single test
+AGENT8088_CONFIG=/nonexistent .venv\Scripts\python.exe -m pytest "tests/test_permission.py::test_check_permission_blocks_write_in_readonly" -v
+
+# Functional verification (real code paths, no mocks; SKIPs missing deps)
+VERIFY_HOME="$(mktemp -d)"; AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" .venv\Scripts\python.exe scripts\verify_features.py
+
+# Duplicate-definition scan — run after touching engine.py or cli.py
+.venv\Scripts\python.exe scripts\check_duplicate_defs.py
+```
+
+**`AGENT8088_CONFIG=/nonexistent` is mandatory, not optional.** It forces
+repo-relative path loading so tests never read or pollute your real
+`config.txt`. The conftest sets it too, but pass it explicitly.
+
+**No CI on this repo** — GitHub Actions is blocked by a billing issue on the
+account. "Green" means: the pytest suite passes (modulo the known Windows
+failures below), `scripts/verify_features.py` doesn't regress, and
+`scripts/check_duplicate_defs.py` is clean. Don't propose Actions-based
+automation. The `.claude/skills/pr-check` skill is the manual PR gate.
+
+**Windows has several platform-related failures that are pre-existing, not
+regressions**: file-ownership `0600` checks (POSIX-only permission model),
+posix bash fallback, InquirerPy TTY prompts, the cron `unattended` env var,
+searxng settings-file perms. Before calling any failure a regression, run a
+baseline on the target branch first — see `.claude/skills/pr-check/SKILL.md`.
+
+**Gateway tests need the `[gateway]` extras installed.** Without
+`slack-bolt`/`discord.py`/`httpx`, the Slack/Discord platform tests fail at
+import with `ModuleNotFoundError` (~19 failures) rather than skipping — that's
+a missing optional dependency, not breakage. Check `pip show slack-bolt`
+before treating a wall of gateway failures as real.
+
+## Mandatory rules an agent would otherwise miss
+
+1. **Data files live ONLY under `src/agent8088/`** — `tools.txt`, `system.md`,
+   `config.txt`, `agents/`, `skills_installed/`. The engine loads them from
+   the package dir (`APP_DIR`); the wheel ships only that copy. Never add
+   copies at the repo root — they are silently ignored, and edits there do
+   nothing. Config resolves: `$AGENT8088_CONFIG` → `~/.agent8088/config.txt` →
+   `src/agent8088/config.txt` (first match wins).
+
+2. **`scripts/check_duplicate_defs.py` is load-bearing.** Ruff's `F811`
+   missed a real duplicate `_wrap_untrusted` in `engine.py` once (two feature
+   branches defined the same function; Python kept only the last). Run it
+   after any change to a large shared module (`engine.py`, `cli.py`). The
+   `PostToolUse` hook runs the suite on edit as a backstop.
+
+3. **One unresolved precedence disagreement — don't pick a side.**
+   `tests/test_providers.py::test_configured_api_key_wins_over_adapter_environment_key`
+   is `xfail(strict=False)`. `_provider_api_key()`'s docstring says ".env
+   first, then os.environ, then api_key"; the test asserts the opposite. This
+   is an open product decision. If asked to touch it, surface the
+   disagreement and ask which precedence is intended before changing code or
+   test.
+
+4. **`graphify-out/` dirty is expected.** It's a generated knowledge graph,
+   not hand-maintained. Dirty files after a hook or incremental update are
+   not a bug. See the graphify section below.
+
+## Architecture (1 paragraph)
+
+All four front ends call the same `run_agent()` and `run_tool()` in
+`engine.py`; adapters translate transport only and never re-implement
+permissions — fixing the permission layer once fixes it everywhere. Security
+layering is outermost-first, each layer can only refuse (never grant):
+`allowed_paths` → sensitive-file floor → shell-startup floor → write zones →
+`check_permission(mode)` → shell classifier → hard git blocks → SSRF guard →
+sandbox → output guards. Layers 2, 3, 7 (sensitive files, shell-startup
+writes, git push/reset) are the **always-on floor** — no mode and no
+escalation grant unlocks them, not even `full-auto`. State on disk, no DB:
+`~/.agent8088/config.txt` + `.env` (0600), `mcp.json` (user + project scopes),
+`gateway-sessions/`, `USER.md` (persona, read-only). Full detail:
+`docs/wiki/03-permissions-and-security.md`.
+
+## Layout
+
+```
+src/agent8088/        # the ONLY place data files live — engine.py, cli.py, providers.py, mcp.py, mcp_server.py, gateway/, tools.txt, system.md, config.txt, agents/, skills_installed/
+tests/                # ~739 tests; conftest.py sets AGENT8088_CONFIG
+scripts/              # verify_features.py, verify_everything.py, check_duplicate_defs.py, release_check.py, sync_wiki.py
+docs/wiki/            # 13-page reference — the source of truth (GitHub Wiki is a mirror)
+research/             # non-runtime: SkillOpt, benchmarks, training
+skills/               # 20 YAML skill packages (installable)
+.claude/              # hooks (guard-agent8088-cli, guard-protected-push, run-tests-on-edit) + skills (pr-check, project-conventions) + settings.json
+```
+
+`docs/wiki/` is the verified source of truth — the README sometimes lags it.
+Sync the GitHub Wiki tab with `python scripts/sync_wiki.py`; never edit the
+wiki UI directly (overwritten on next sync).
+
+## Git
+
+- Conventional commits: `<type>: <imperative summary, <=50 chars>`; body
+  explains *why*. One logical change per commit, repo working after each.
+- **Never push to `main` or `development` without explicit go-ahead this
+  turn.** A hook (`.claude/hooks/guard-protected-push.sh`) hard-blocks it from
+  the Bash tool. Open a PR and let the user merge.
+- `--force-with-lease` only, never bare `--force` on shared branches.
+- PRs <400 lines; diff contains only what the task required.
+
+## Engineering
+
+From `docs/Practical-Software-Engineering-Field-Guide (2).md`. Highlights:
+test contracts not implementation; one behavior per test; deterministic
+(mock externals, never the code under test); a new test must fail when code
+is broken — verify by breaking it deliberately. No secrets in diffs. Validate
+model output before acting on it. Pin exact model versions, never
+`-latest`. Full block: `CLAUDE.md` §Engineering practices.
+
+## Testing matrix
+
+Full per-area coverage table and what-to-test-for-each-change lives in
+`CLAUDE.md` §Testing matrix (kept there to avoid drift between two copies).
+Short version: unit-test every function with non-trivial logic;
+end-to-end pipeline test per feature (mock `imaplib`/`smtplib`/`httpx`/
+`discord.Client`, never the function under test); test edge cases (empty
+input, missing config, unauthorized sender, connection failure, special
+chars in paths).
+
+## Navigation
+
+| Want | Read |
+|---|---|
+| Architecture, security layers in depth | `CLAUDE.md`, `docs/wiki/11-architecture.md`, `docs/wiki/03-permissions-and-security.md` |
+| Every config key | `docs/wiki/02-configuration.md` |
+| MCP client + server | `MCP_FEATURES.md`, `docs/wiki/07-mcp.md` |
+| Messaging gateway | `docs/wiki/08-messaging-gateway.md` |
+| Testing details | `TESTING.md`, `docs/wiki/12-testing-and-verification.md` |
+| Pre-PR checklist | `.claude/skills/pr-check/SKILL.md` |
+| Non-obvious conventions | `.claude/skills/project-conventions/SKILL.md` |
+| Change history by feature | `CHANGELOG.md` |
+
 ## graphify
 
-This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+Knowledge graph at `graphify-out/` (god nodes, community structure, cross-file
+relationships). Generated, not hand-maintained.
 
-When the user types `/graphify`, use the installed graphify skill or instructions before doing anything else.
+When the user types `/graphify`, use the installed graphify skill or
+instructions before doing anything else.
 
-Rules:
-- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
-- Dirty graphify-out/ files are expected after hooks or incremental updates; dirty graph files are not a reason to skip graphify. Only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.
-- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
-- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
-- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- For codebase questions, first run `graphify query "<question>"` when
+  `graphify-out/graph.json` exists. Use `graphify path "<A>" "<B>"` for
+  relationships and `graphify explain "<concept>"` for focused concepts.
+  These return a scoped subgraph, usually much smaller than `GRAPH_REPORT.md`
+  or raw grep.
+- Dirty `graphify-out/` files are expected after hooks or incremental updates;
+  not a reason to skip graphify. Only skip if the task is about stale/incorrect
+  graph output, or the user says not to use it.
+- If `graphify-out/wiki/index.md` exists, use it for broad navigation.
+- Read `graphify-out/GRAPH_REPORT.md` only for broad architecture review or
+  when query/path/explain don't surface enough.
+- After modifying code, run `graphify update .` (AST-only, no API cost).
 
 ## ponytail
 
-Lazy senior dev mode. The best code is the code never written. Active by
-default at the `full` level (switch: `/ponytail lite|full|ultra|off`).
-
-Before writing any code, stop at the first rung that holds:
-
-1. Does this need to be built at all? (YAGNI)
-2. Does it already exist in this codebase? Reuse the helper, util, or pattern that's already here, don't re-write it.
-3. Does the standard library already do this? Use it.
-4. Does a native platform feature cover it? Use it.
-5. Does an already-installed dependency solve it? Use it.
-6. Can this be one line? Make it one line.
-7. Only then: write the minimum code that works.
-
-The ladder runs after you understand the problem, not instead of it: read the task and the code it touches, trace the real flow end to end, then climb.
-
-Bug fix = root cause, not symptom: a report names a symptom. Grep every caller of the function you touch and fix the shared function once — one guard there is a smaller diff than one per caller, and patching only the path the ticket names leaves a sibling caller still broken.
-
-Rules:
-
-- No abstractions that weren't explicitly requested.
-- No new dependency if it can be avoided.
-- No boilerplate nobody asked for.
-- Deletion over addition. Boring over clever. Fewest files possible.
-- Shortest working diff wins, but only once you understand the problem. The smallest change in the wrong place isn't lazy, it's a second bug.
-- Question complex requests: "Do you actually need X, or does Y cover it?"
-- Pick the edge-case-correct option when two stdlib approaches are the same size, lazy means less code, not the flimsier algorithm.
-- Mark deliberate simplifications that cut a real corner with a known ceiling (global lock, O(n²) scan, naive heuristic) with a `ponytail:` comment naming the ceiling and upgrade path.
-
-Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks (an assert-based demo/self-check or one small test file; no frameworks, no fixtures). Trivial one-liners need no test.
-
-## engineering
-
-From `docs/Practical-Software-Engineering-Field-Guide (2).md` — follow these on every change.
-
-**Done** means: code works for the intended case and the obvious edge cases; tests exist that would fail if someone broke this in six months; CI is green (lint, types, tests); the change is reviewed; anything a future reader needs is written down; it has been observed working somewhere other than the author's laptop; nothing left commented-out, no debug prints, no `TODO: fix later` without a linked issue.
-
-**Commits** — one logical change per commit that leaves the repo working. Conventional shape: `<type>: <imperative summary, <=50 chars>`; body explains *why*, not what the diff already shows. Run `git status` and `git diff --staged` before every commit.
-
-**History** — never rewrite history or `push --force` on a branch other people have pulled; use `--force-with-lease`. Rewriting history is only safe on branches only you have.
-
-**PRs** — a PR is a unit of review, not a unit of work; keep changes small (<400 lines) and split large ones. Diff contains only what the task required (read the full file list). Description says what, why, how to verify, and what you are unsure about. No secrets, keys, or real user data anywhere in the diff.
-
-**Scope** — unrelated issues spotted while working get written down (open an issue, note in the PR), never fixed in the same PR.
-
-**Security** — never commit secrets; if one leaks, rotate it immediately and report it. Validate model output before acting on it — never pass it raw to `eval`, a shell, SQL, or a file path. Least privilege on tools; never combine private data + untrusted input + an outbound channel in one agent.
-
-**Tests** — test contracts, not implementation. Name states the behaviour; one behaviour per test; independent and order-free; deterministic. A new test must fail when the code is broken — verify by breaking it deliberately. Fix or delete flaky tests; never ignore them.
-
-**AI specifics** — prompts are source code: own files, versioned, reviewed. Pin exact model versions, never `-latest`. Instrument every model call (input/output/cached tokens, cost, latency, `stop_reason`, model id). Bound `max_tokens`; alert on `stop_reason == max_tokens`, output-parse failure, and cost spikes.
-
-**Reviewing agent code** — check for plausible-but-wrong APIs, silently swallowed errors, tests that mock the thing under test, scope creep, confidently invented config, and duplicated logic where an existing helper fits.
-
-## testing
-
-Every code change must have tests that would fail if the logic broke. The test suite lives in `tests/` and uses pytest.
-
-**Test structure:**
-
-| Directory | What it covers |
-|---|---|
-| `tests/gateway/platforms/` | Per-adapter unit tests (Slack, WhatsApp, Discord, Email) |
-| `tests/gateway/` | Gateway runner, auth, session store, agent bridge |
-| `tests/test_mcp.py` | MCP client (connecting to external servers) |
-| `tests/test_mcp_server.py` | MCP server mode (exposing tools to external agents) |
-| `tests/test_env_key_store.py` | `.env` key store, migration, masking, secret resolution |
-| `tests/test_permission.py` | Permission modes, escalation, grants, path zones |
-| `tests/test_audit_fixes.py` | Security hardening, shell guards, git blocks, calculator safety |
-| `tests/test_cli_setup.py` | Setup wizard, model picker, custom provider config |
-| `tests/test_subagents.py` | Subagent specs, tool-call parsing, reasoning strip, secret redaction |
-| `tests/test_providers.py` | Multi-model provider registry, API key precedence, model switching |
-| `tests/test_security_fixes.py` | Sensitive file blocks, host shell gating, git mutation blocks |
-| `tests/test_ssrf.py` | SSRF guard, IP validation, redirect re-checking |
-| `tests/test_http_search.py` | HTTP tools, template formatting, search tool declarations |
-| `tests/test_new_tools.py` | Cron, Docker sandbox, browser, native sandbox, structured git |
-| `tests/test_skills.py` | Skill package loading, tool merging, core-tool protection |
-| `tests/test_persona.py` | Persona rendering, frontmatter stripping |
-| `tests/test_images.py` | Image message building, MIME inference, sensitive symlink block |
-
-**What to test for each type of change:**
-
-| Change type | What to test |
-|---|---|
-| **New adapter** (Slack/Discord/WhatsApp/Email) | Imports, config reading, markdown conversion, send/edit, streaming support, allowlist integration, automated-sender handling |
-| **Gateway runner change** | Slash commands (`/approve`, `/deny`, `/new`, `/help`), session queueing, turn lock, adapter registration in `build_runner()` |
-| **Permission/security change** | `check_permission()` for each mode, escalation flow, grant lifecycle, hard-blocked commands, path zones, sensitive files |
-| **MCP change** | Tool registration, curated subset (dangerous tools excluded), handler signature synthesis, transport config, tool dispatch via `run_tool()` |
-| **Config/env change** | `.env` load/update, migration, masking, secret resolution precedence, allowlist from config |
-| **Engine change** | `find_tool_calls()` parsing (all formats including `<\|mask_start\|>`), `run_tool()` dispatch, `run_agent()` loop, escalation retry, unknown-tool recovery |
-| **CLI change** | Setup wizard flow, provider picker, gateway setup, `--mcp-serve` flag, `--mode` flag |
-
-**Test rules:**
-
-1. **Unit test every function with non-trivial logic** — branches, loops, parsers, permission gates, format converters. One-liners that pass through to stdlib need no test.
-2. **End-to-end pipeline test for each feature** — e.g. email adapter: IMAP poll → parse → allowlist check → dispatch to runner → agent processes → SMTP reply. Mock external services, test the full chain.
-3. **Test contracts, not implementation** — assert behavior, not internal variable names. If you refactor, tests should still pass.
-4. **One behavior per test** — test name states the behavior: `test_email_process_message_drops_unauthorized_sender`, not `test_email_1`.
-5. **Independent and order-free** — no test depends on another test's side effects. Use `tmp_path` for filesystem, `monkeypatch` for env/config.
-6. **Deterministic** — no `time.sleep`, no network calls, no random without a seed. Mock `asyncio.to_thread`, `imaplib.IMAP4_SSL`, `smtplib.SMTP`.
-7. **Verify the test fails when code is broken** — break the code deliberately, run the test, confirm it goes red. Then fix the code and confirm it goes green.
-8. **Mock external services, not the code under test** — mock `imaplib`/`smtplib` for email, `httpx` for WhatsApp, `discord.Client` for Discord. Never mock the function you're testing.
-9. **Test edge cases** — empty input, missing config, unauthorized sender, connection failure, timeout, large message, special characters in paths.
-10. **Run before committing** — `pytest tests/ -q` must pass. Pre-existing Windows failures (2 tests) are documented and excluded.
-
-**How to run tests:**
-
-```bash
-# Full suite
-.venv\Scripts\python.exe -m pytest tests/ -q
-
-# Gateway only
-.venv\Scripts\python.exe -m pytest tests/gateway/ -q
-
-# Single adapter
-.venv\Scripts\python.exe -m pytest tests/gateway/platforms/test_email.py -v
-
-# MCP server + client
-.venv\Scripts\python.exe -m pytest tests/test_mcp_server.py tests/test_mcp.py -v
-
-# Permission + security
-.venv\Scripts\python.exe -m pytest tests/test_permission.py tests/test_security_fixes.py -q
-```
+Lazy senior dev mode — the best code is the code never written. Active by
+default at `full` (`/ponytail lite|full|ultra|off`). The full ladder and rules
+live in the loaded skill; the one-line version: before writing code, stop at
+the first rung that holds — YAGNI → reuse in this codebase → stdlib → native
+platform feature → installed dependency → one line → minimum that works. The
+ladder runs *after* you understand the problem (read the task, trace the real
+flow end to end), not instead of it. Bug fix = root cause, not symptom (grep
+every caller, fix the shared function once). Not lazy about: input validation
+at trust boundaries, error handling that prevents data loss, security,
+accessibility, anything explicitly requested.
