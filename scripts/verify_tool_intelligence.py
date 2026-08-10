@@ -52,11 +52,33 @@ def _guard_environment():
         sys.exit("Refusing to run against your real ~/.agent8088.")
 
 
-def _judge(expectation, calls, moment):
+BACKEND_ERROR_MARKERS = ("The model backend errored", "<EXCEPTION")
+
+REFUSALS = ("Error:", "ESCALATION_REQUEST:", "Follow-up fetch was not run",
+            "This search already ran", "already ran with this output")
+
+
+def _refused(result: str) -> bool:
+    """Whether the engine stopped this call rather than letting it run."""
+    return any(str(result).startswith(marker) or marker in str(result)[:80]
+               for marker in REFUSALS)
+
+
+def _judge(expectation, calls, moment, answer=""):
     """Return (passed, note) for one case.
 
-    `calls` is the list of (name, arguments) the model actually made.
+    `calls` is the list of (name, arguments) that actually RAN — not what the
+    model asked for. The distinction matters: an unsolicited browse_page that
+    the engine refused is the gate working, and scoring the request as a
+    failure would report a working guard as broken.
+
+    A backend error fails every case. Without this check a run where every
+    single call 401s scores the no-tool cases as passes, because the model
+    "called no tools" — a broken provider reads as a well-behaved agent.
     """
+    if any(marker in (answer or "") for marker in BACKEND_ERROR_MARKERS):
+        return False, f"backend error: {answer[:80]}"
+
     names = [name for name, _args in calls]
 
     if expectation == NO_TOOL:
@@ -89,18 +111,26 @@ def main():
 
     for prompt, expectation in CASES:
         calls = []
+        asked = {}
 
-        def _on_calls(made, _sink=calls):
+        def _on_result(name, result, _sink=calls, _asked=asked):
+            # Record what RAN. A refusal means the engine stopped it, which is
+            # the guard doing its job, not a tool the model got to use.
+            if _refused(result):
+                return
+            _sink.append((name, _asked.get(name, {})))
+
+        def _on_calls(made, _asked=asked):
             for call in made:
-                _sink.append((call["name"], call.get("arguments", {})))
+                _asked[call["name"]] = call.get("arguments", {})
 
         try:
-            A.run_agent([{"role": "user", "content": prompt}], max_turns=3,
-                        on_calls=_on_calls)
+            answer = A.run_agent([{"role": "user", "content": prompt}], max_turns=3,
+                                 on_calls=_on_calls, on_result=_on_result)
         except Exception as exc:                       # noqa: BLE001 - report, don't crash the sweep
             results.append((prompt, expectation, False, f"error: {exc}"))
             continue
-        passed, note = _judge(expectation, calls, moment)
+        passed, note = _judge(expectation, calls, moment, answer)
         results.append((prompt, expectation, passed, note))
         print(f"{'PASS' if passed else 'FAIL'}  {expectation:<17} {prompt[:52]:<54} {note}")
 

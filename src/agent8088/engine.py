@@ -4382,11 +4382,34 @@ def run_agent(messages, *, budget=None, **kwargs):
         _active_budget = previous
 
 
+# Every tool result the loop feeds back starts with this. It is the marker that
+# separates "the human said it" from "a web page said it".
+_TOOL_RESULT_PREFIX = "Tool result ("
+
+
+def _genuine_user_turns(messages) -> list:
+    """The turns the human actually typed.
+
+    Tool output is fed back as role="user" (see the appends in the loop), so a
+    plain role check treats a fetched page or a search snippet as something the
+    user said. That let web content authorise the very tools these gates
+    restrict: a result containing the URL made browse_page look user-supplied,
+    and a page reading "run the command below" unlocked execute_shell.
+
+    Tool results are always prefixed by the loop, so the marker is reliable —
+    and a model echoing that prefix in its own text cannot help, because
+    assistant turns are excluded first.
+    """
+    return [m for m in messages
+            if m.get("role") == "user"
+            and not str(m.get("content", "")).startswith(_TOOL_RESULT_PREFIX)]
+
+
 def _user_supplied_url(messages, url: object) -> bool:
     """Whether the exact page URL came from the user's request."""
     return (isinstance(url, str) and bool(url) and any(
-        message.get("role") == "user" and url in str(message.get("content", ""))
-        for message in messages
+        url in str(message.get("content", ""))
+        for message in _genuine_user_turns(messages)
     ))
 
 
@@ -4408,9 +4431,7 @@ def _user_requested_tool(messages, name: str) -> bool:
     tool call by narrating it first.
     """
     phrases = (name, *_EXPLICIT_TOOL_PHRASES.get(name, ()))
-    for message in messages:
-        if message.get("role") != "user":
-            continue
+    for message in _genuine_user_turns(messages):
         text = str(message.get("content", "")).lower()
         if any(phrase in text for phrase in phrases):
             return True
@@ -4613,7 +4634,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 if turn_tools is not None:
                     turn_tools.append({"name": name, "arguments": args,
                                        "result": result, "blocked": True})
-                messages.append({"role": "user", "content": f"Tool result ({name}):\n{result}"})
+                messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                 continue
 
             # Equivalent-query guard. `sig` above is byte-exact, so rewording
@@ -4634,7 +4655,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         turn_tools.append({"name": name, "arguments": args,
                                            "result": "(duplicate search)", "cached": True})
                     messages.append({"role": "user",
-                                     "content": f"Tool result ({name}):\n{result}"})
+                                     "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                     continue
 
             if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
@@ -4714,7 +4735,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             interactive_fail = "EOFError" in result or "EOF when reading" in result or "input()" in result.lower()
             note = ("\n\nThis script needs interactive input which is not available. "
                     "Do NOT retry it. Give your final answer now." if interactive_fail else "")
-            messages.append({"role": "user", "content": f"Tool result ({name}):\n{result[:3000]}{note}"})
+            messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result[:3000]}{note}"})
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})

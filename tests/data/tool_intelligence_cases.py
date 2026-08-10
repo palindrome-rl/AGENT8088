@@ -39,9 +39,13 @@ CASES = [
     ("what are today's top technology headlines", SEARCH_MONTH),
     ("what happened this week in AI", SEARCH_MONTH),
 
-    # --- historical: pin the period, don't drift to the present ----------
-    ("who won the 1998 football world cup final", SEARCH),
-    ("what were the main causes of the 2008 financial crisis", SEARCH),
+    # --- historical: settled facts, and searching them would contradict the
+    # no-tool rule. Both were originally marked SEARCH; the live run showed the
+    # agent answering directly, which is the correct behaviour — the table was
+    # wrong, not the agent. Kept as cases because drifting to a search here
+    # would be a regression.
+    ("who won the 1998 football world cup final", NO_TOOL),
+    ("what were the main causes of the 2008 financial crisis", NO_TOOL),
 
     # --- a specific tool is the right answer -----------------------------
     ("what is 17 * 23 + 4", "calculate"),
