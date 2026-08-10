@@ -3907,7 +3907,7 @@ def _search_context():
     """
     try:
         env_values = load_env_file(ENV_FILE_PATH)
-    except Exception:  # a missing or unreadable .env is not an error here
+    except Exception:  # noqa: BLE001 — a missing/unreadable .env must not break search
         env_values = {}
 
     def check_url(url: str):
@@ -3932,7 +3932,7 @@ def _search_chain_summary() -> str:
     """
     try:
         chain = WEB_SEARCH_REGISTRY.chain(_search_config(), _search_context())
-    except Exception:
+    except Exception:  # noqa: BLE001 — /capabilities must never fail on a backend probe
         return "unavailable"
     if not chain:
         return "none configured (run /search setup)"

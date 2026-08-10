@@ -55,6 +55,9 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
 | `ssrf_allow_hosts` | `127.0.0.1,localhost` | Internal hosts the agent may reach (e.g. a local SearXNG). |
+| `web_search_provider` | (unset) | Pin one backend: `searxng`, `tavily`, `exa`, or `ddgs`. Unset auto-selects and allows fallback. |
+| `search_base_url` | (commented) | SearXNG instance, ending at `q=`. `https://` required for public hosts. |
+| `web_search_results` | `5` | Results per search (max 20). |
 | `ssrf_allow_private` | `0` | `1` opens the entire private network. Prefer the allowlist. |
 | `allowed_domains` | (empty) | If set, the **only** public hosts the agent may reach. Empty means all are reachable. |
 | `blocked_domains` | (empty) | Public hosts the agent may never reach. Wins over `allowed_domains`. |

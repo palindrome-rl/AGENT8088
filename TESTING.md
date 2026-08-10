@@ -67,7 +67,7 @@ agent8088
 | `/tool git_status` | real git output |
 | `/tool web_search query="python 3.13"` | clean `• title / url / snippet` list |
 | `/tool web_search` (no arg) | names the missing arg: `pass query=<value>` |
-| `/tool web_search_tavily query="..."` | needs `tavily_api_key`, else a clear message |
+| `/tool web_search query="..."` | routes to a configured backend; falls back to keyless `ddgs` |
 | `/tool schedule_task action=list` | your Agent8088 schedules |
 | `Tab` after `/agent `, `/tool `, `/model ` | autocompletion |
 

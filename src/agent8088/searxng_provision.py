@@ -73,7 +73,9 @@ def _docker():
 
 
 def _run(argv, timeout=90):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    # check=False: callers inspect returncode and surface docker's own message.
+    return subprocess.run(argv, capture_output=True, text=True,
+                          timeout=timeout, check=False)
 
 
 def status() -> dict:

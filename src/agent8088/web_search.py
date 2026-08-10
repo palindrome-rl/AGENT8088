@@ -36,8 +36,8 @@ import json as _json
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
 
 # searxng first: it is the default when self-hosted. tavily/exa next: a user who
 # added a key wants it used. ddgs last: it is the only backend that scrapes
@@ -85,7 +85,7 @@ class SearchContext:
     """
     config: dict = field(default_factory=dict)
     get_secret: Callable[[str], str] = lambda name: ""
-    check_url: Callable[[str], Optional[str]] = lambda url: None
+    check_url: Callable[[str], str | None] = lambda url: None
     wrap: Callable[..., str] = lambda text, source="": text
 
 
@@ -385,7 +385,7 @@ class DdgsProvider(WebSearchProvider):
                     retryable=False)
         try:
             raw = _ddgs_text(query, limit) or []
-        except Exception as exc:  # the library raises a wide range of types
+        except Exception as exc:  # noqa: BLE001 — ddgs raises many types; a provider must never raise
             message = str(exc)
             if "ratelimit" in message.lower().replace(" ", "") or "202" in message:
                 return SearchFailure(

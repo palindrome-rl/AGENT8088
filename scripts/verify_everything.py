@@ -281,15 +281,14 @@ section("5. TOOL INVENTORY — spec integrity")
 # one place instead of three hardcoded numbers.
 expected_tools = {
     "execute_shell": "shell", "write_file": "write_text", "read_text": "read_text",
-    "web_search": "http_get", "get_page_title": "http_get", "calculate": "python_eval",
+    "web_search": "search", "get_page_title": "http_get", "calculate": "python_eval",
     "last_output": "last_output", "spawn_subagent": "subagent",
     "describe_capabilities": "introspect",
     "execute_plan": "plan",
     "git_status": "shell", "git_diff": "shell", "git_log": "shell",
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
-    "browse_page": "browser", "web_search_tavily": "http_post",
-    "web_search_exa": "http_post",
+    "browse_page": "browser",
 }
 ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")
@@ -804,24 +803,26 @@ ok("_safe_format pulls from config", "192.168" in E._safe_format("{search_base_u
    or bool(E._safe_format("{search_base_url}", {})))
 with with_mode("edit"):
     r = E.run_tool("web_search", {})
-    ok("missing arg names itself", "unresolved placeholder" in r and "pass query=" in r, r[:50])
-    ok("no misleading scheme error", "scheme" not in r)
-    r = E.run_tool("web_search_tavily", {"query": "x"})
-    if "not configured" in r:
-        ok("tavily degrades clearly", "tavily_api_key" in r)
-        skip("tavily REAL query", "api key not configured")
-    elif r.startswith("HTTP "):
-        skip("tavily REAL query", r[:80])
+    ok("web_search names a missing query", "query" in r.lower(), r[:50])
+    ok("web_search declares mode=search", E.TOOL_SPECS["web_search"]["mode"] == "search")
+    # Tavily/Exa are backends now, not tools: they must stay OUT of the chain
+    # until a key exists, and the keyless fallback must always be in it.
+    ctx = E._search_context()
+    reg = E.WEB_SEARCH_REGISTRY
+    names = [p.name for p in reg.chain(E._search_config(), ctx)]
+    ok("chain is never empty (ddgs is bundled)", bool(names), str(names))
+    for backend in ("tavily", "exa"):
+        provider = reg.get(backend)
+        has_key = bool(ctx.get_secret(provider.env_var))
+        ok(f"{backend} in chain only with a key",
+           (backend in names) == has_key, f"key={has_key} chain={names}")
+    ok("ddgs importable", E.web_search._ddgs_installed())
+    r = E.run_tool("web_search", {"query": "python release notes"})
+    if "Every configured web search provider failed" in r or "rate limited" in r:
+        skip("web_search REAL query", r.splitlines()[0][:80])
     else:
-        ok("tavily REAL query returns content", bool(r.strip()), r[:45])
-    r = E.run_tool("web_search_exa", {"query": "x"})
-    if "not configured" in r:
-        ok("exa degrades clearly", "exa_api_key" in r)
-        skip("exa REAL query", "api key not configured")
-    elif r.startswith("HTTP "):
-        skip("exa REAL query", r[:80])
-    else:
-        ok("exa REAL query returns content", bool(r.strip()), r[:45])
+        ok("web_search REAL query returns content", bool(r.strip()), r[:45])
+        ok("results are wrapped untrusted", "EXTERNAL_UNTRUSTED_CONTENT" in r, r[:60])
     r = E.run_tool("get_page_title", {"url": "https://example.com"})
     if "Example" in r:
         ok("REAL http_get + title extraction", True, r[:40])

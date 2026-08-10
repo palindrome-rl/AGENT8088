@@ -29,7 +29,7 @@ unlimited model providers · 7 new security guardrails.
 | 19 | Image understanding | `/image` |
 | 20 | Skill marketplace | `skills_installed/`, `/skills` |
 | 21 | Test + verification suites | `pytest`, `scripts/verify_features.py` |
-| 22 | Web search overhaul (jq filters, Tavily/Exa, SSRF allowlist) | `web_search`, `web_search_tavily`, `web_search_exa` |
+| 22 | Web search overhaul (jq filters, Tavily/Exa, SSRF allowlist) | `web_search` (backends: searxng, tavily, exa, ddgs) |
 | 23 | Classic AGENT8088 UI | `agent8088` |
 | 24 | Responsive terminal branding | automatic at narrow widths |
 | 25 | Live slash-command suggestions | type `/`, then type or use `Tab` |
@@ -463,8 +463,8 @@ a large slice of the context window — costly for a small local model.
 
 ```bash
 /tool web_search "python 3.13 release notes"       # SearXNG (default, free, private)
-/tool web_search_tavily query="python 3.13 release notes"   # agent-optimized
-/tool web_search_exa query="papers on agent harness design" # semantic/neural
+/tool web_search query="python 3.13 release notes"          # routes to the active backend
+/search use exa                                             # pin a specific backend
 ```
 
 Add a key to `config.txt` to enable one (both are optional; without a key the tool
@@ -654,8 +654,7 @@ agent8088                                   # Rich CLI (all features)
 | `read_text` | read_text | filename |
 | `write_file` | write_text | filename, content |
 | `web_search` | http_get | query |
-| `web_search_tavily` | http_post | query |
-| `web_search_exa` | http_post | query |
+
 | `get_page_title` | shell | url |
 | `calculate` | python_eval | expression |
 | `last_output` | last_output | — |

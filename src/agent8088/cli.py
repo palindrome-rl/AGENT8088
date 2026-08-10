@@ -1544,7 +1544,7 @@ def _search_provider_rows():
         schema = provider.setup_schema()
         try:
             available = provider.is_available(ctx)
-        except Exception:
+        except Exception:  # noqa: BLE001 — /search status must list every backend regardless
             available = False
         keys = ", ".join(v["key"] for v in schema.get("env_vars") or [])
         hint = keys or schema.get("tag", "")

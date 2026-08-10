@@ -307,3 +307,65 @@ key that never says "full-auto". `manual` and `off` already have exact equivalen
 ### Tests added
 `tests/test_shell_parser_failclosed.py` (29), `tests/test_approvals.py` (25),
 `tests/test_mcp_breaker.py` (9), plus 2 capability-report tests.
+
+---
+
+## Web Search Provider Registry (2026-08-10)
+
+One `web_search` tool, four interchangeable backends selected by config instead
+of by the model picking a per-vendor tool.
+
+- **New `src/agent8088/web_search.py`** — provider registry, four backends, and a
+  runtime fallback chain. Selection precedence follows Hermes'
+  `agent/web_search_registry.py`: explicit `web_search_provider`, then a single
+  available backend, then `searxng -> tavily -> exa -> ddgs` filtered by
+  availability.
+- **Runtime fallback.** Hermes only *selects* a backend; `run_search()` also
+  falls *through* the chain, so a configured-but-broken instance does not mean
+  "no web search". The output always names the serving backend, so a silent
+  fallback stays visible.
+- **New `src/agent8088/searxng_provision.py`** — `/search setup` provisions a
+  container bound to `127.0.0.1` only (the JSON API is unauthenticated) with a
+  generated `settings.yml` that enables `search.formats: [json]` and disables the
+  bot limiter. Both are off/on by default upstream and make the API unusable.
+- **New `mode=search`** in `run_tool`, gated like the other network modes.
+  `SAFE_MODES` treats it as non-mutating, same standing as `http_get`.
+- **New `/search`** — `status`, `setup`, `stop`, `doctor`, `use <backend>`.
+- **Wizard** now offers a Docker-aware picker instead of a bare URL field, with
+  **Keep current setting** when a URL is already configured.
+- **`ddgs>=9,<10` is now a hard dependency.** A fallback that might need
+  installing first is not a fallback. Web search works on a fresh install with
+  no Docker, no key, and no setup.
+- **Fixed:** the engine seeds a default `search_base_url` into `APP_CONFIG` so
+  tool templates interpolate, which made the SearXNG backend claim availability
+  on every machine — shadowing the fallback and misreporting in
+  `/capabilities`. `SEARCH_BASE_URL_CONFIGURED` now separates a user-set URL
+  from the default.
+
+### Security
+
+- Every backend runs the existing egress/SSRF/outbound-secret guards before each
+  request, injected via `SearchContext` so `engine.py` stays the single
+  enforcement point.
+- `ddgs` owns its own HTTP client and so sits outside `_exec_http`'s guard. Its
+  complete fixed host set is checked against the egress policy *before* the
+  library runs, and it **fails closed** rather than bypassing an
+  `allowed_domains` policy. A guard denial is non-retryable and stops the chain —
+  falling through would route around a policy decision rather than an outage.
+- A remote SearXNG must use `https://`; plaintext `http://` is accepted only for
+  loopback and private hosts.
+- API keys resolve from the `.env` store, never `config.txt`, and each backend
+  only ever receives its own key.
+
+### Migration
+
+`web_search_tavily` and `web_search_exa` are removed **as tool names only** —
+both remain fully supported backends behind `web_search`:
+
+| Before | Now |
+|---|---|
+| `web_search_tavily` + `tool_headers.*` / `tool_body.*` in `config.txt` | `TAVILY_API_KEY` in the `.env` store (optionally `web_search_provider=tavily`) |
+| `web_search_exa` + `tool_headers.*` / `tool_body.*` | `EXA_API_KEY` in the `.env` store (optionally `web_search_provider=exa`) |
+
+The shipped `config.txt` never contained those `tool_*` keys, so no default
+install had these tools working.
