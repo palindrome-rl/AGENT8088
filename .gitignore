@@ -44,6 +44,11 @@ skillopt_data/
 graphify-out/
 .opencode/
 
+# Local agent instructions (graphify + ponytail tool prefs). Still tracked, so
+# git keeps reporting changes to it — this entry only takes effect once the file
+# is untracked with `git rm --cached AGENTS.md`.
+AGENTS.md
+
 # Config snapshots (may contain secrets - never commit)
 backup.txt
 opencode.json
