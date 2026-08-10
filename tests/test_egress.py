@@ -70,8 +70,10 @@ def test_error_names_the_config_key(policy):
 
 # --- Integration: the policy must be reachable from the real tool paths ---
 
-def test_http_tool_is_blocked_by_policy(engine, monkeypatch):
+def test_http_tool_is_blocked_by_policy(engine, monkeypatch, register_tool):
     """run_tool's http gate consults the egress policy before any request."""
+    register_tool("probe_post", mode="http_post", args="query",
+                  url="https://api.tavily.com/search")
     monkeypatch.setattr(engine, "EGRESS_BLOCKED_DOMAINS", ["api.tavily.com"])
     monkeypatch.setattr(engine, "EGRESS_ALLOWED_DOMAINS", [])
 
@@ -79,7 +81,7 @@ def test_http_tool_is_blocked_by_policy(engine, monkeypatch):
         raise AssertionError("_exec_http must not be reached for a blocked domain")
 
     monkeypatch.setattr(engine, "_exec_http", _must_not_run)
-    result = engine.run_tool("web_search_tavily", {"query": "x"})
+    result = engine.run_tool("probe_post", {"query": "x"})
     assert "blocked_domains" in result
 
 
@@ -95,9 +97,11 @@ def test_browser_tool_is_blocked_by_policy(engine, monkeypatch):
     assert "allowed_domains" in result
 
 
-def test_http_tool_allowed_when_host_is_listed(engine, monkeypatch):
+def test_http_tool_allowed_when_host_is_listed(engine, monkeypatch, register_tool):
+    register_tool("probe_post", mode="http_post", args="query",
+                  url="https://api.tavily.com/search")
     monkeypatch.setattr(engine, "EGRESS_ALLOWED_DOMAINS", ["api.tavily.com"])
     monkeypatch.setattr(engine, "EGRESS_BLOCKED_DOMAINS", [])
     monkeypatch.setattr(engine, "_exec_http", lambda *a, **kw: "OK")
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
-    assert engine.run_tool("web_search_tavily", {"query": "x"}) == "OK"
+    assert engine.run_tool("probe_post", {"query": "x"}) == "OK"

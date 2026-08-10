@@ -1,7 +1,7 @@
 execute_shell|Execute a shell command and return output|mode=shell|args=command|command={command}|timeout=25
 write_file|Write content to a file|mode=write_text|args=filename,content|path_arg=filename|content_arg=content|timeout=10
 read_text|Read text from a file|mode=read_text|args=filename|path_arg=filename|timeout=10
-web_search|Search the web for information|mode=http_get|args=query|url={search_base_url}{query_q}&format=json|timeout=25
+web_search|Search the web. Routes to the configured backend (SearXNG by default, Tavily or Exa when an API key is set, keyless ddgs as fallback) and falls back automatically when one is unavailable.|mode=search|args=query|timeout=30
 get_page_title|Fetch a webpage and extract its title|mode=http_get|args=url|url={url}|extract=title|timeout=20
 calculate|Evaluate a mathematical expression|mode=python_eval|args=expression|expression={expression}|timeout=10
 last_output|Get full output from the last tool call|mode=last_output
@@ -18,8 +18,3 @@ git_create_pr|Open a pull request with the gh CLI. Only use when the user asked 
 schedule_task|Schedule this agent to run a task periodically, or list/remove schedules. action is list, add, or remove; schedule is 5 cron fields (e.g. "0 9 * * *"); task is the query to run. Windows uses Task Scheduler while the user is signed in and supports common minute, hourly, daily, weekly, and monthly forms.|mode=cron|args=action,schedule,task|timeout=20
 run_sandboxed|Run a Python snippet with native OS isolation and no network, using Docker only as a fallback. Use for untrusted or risky code instead of execute_shell.|mode=docker|args=code|timeout=90
 browse_page|Load a web page in a real headless browser and return its text. Handles JavaScript-rendered pages that curl cannot.|mode=browser|args=url|timeout=60
-# Search fallbacks. Their headers/body/filter live in config.txt (tool_headers.*,
-# tool_body.*, tool_filter.*) because those values contain '|' and ',', which
-# would collide with this file's field separator.
-web_search_tavily|Search the web via Tavily (agent-optimized, clean ranked results with citations). Use when web_search is unavailable or returns nothing.|mode=http_post|args=query|url=https://api.tavily.com/search|timeout=30
-web_search_exa|Search the web via Exa (semantic/neural search). Good for conceptual queries and finding pages by meaning.|mode=http_post|args=query|url=https://api.exa.ai/search|timeout=30

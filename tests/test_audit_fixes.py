@@ -395,10 +395,14 @@ def test_local_execution_grant_does_not_leak_to_later_action(engine, monkeypatch
     assert engine._local_fallback_grant is False
 
 
-def test_missing_http_argument_is_reported_before_ssrf(engine, monkeypatch):
+def test_missing_http_argument_is_reported_before_ssrf(engine, monkeypatch, register_tool):
+    # web_search is mode=search now, so this uses a test-local http tool to keep
+    # exercising _http_placeholder_error ahead of the SSRF guard.
+    register_tool("probe_get", mode="http_get", args="query",
+                  url="http://127.0.0.1:8888/search?q={query_q}")
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SSRF_ALLOW_HOSTS", set())
-    result = engine.run_tool("web_search", {})
+    result = engine.run_tool("probe_get", {})
     assert "unresolved placeholder" in result
     assert "pass query=" in result
 

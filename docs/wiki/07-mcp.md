@@ -131,8 +131,6 @@ Read-only by default — 8 tools:
 | `read_text` | read a file |
 | `calculate` | evaluate an expression |
 | `web_search` | SearXNG search |
-| `web_search_tavily` | Tavily search |
-| `web_search_exa` | Exa semantic search |
 | `get_page_title` | fetch a page title |
 | `last_output` | previous tool output |
 | `describe_capabilities` | what this server can do, and its active limits and guardrails |

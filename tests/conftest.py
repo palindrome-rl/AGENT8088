@@ -26,6 +26,30 @@ def engine():
     return _load_engine()
 
 
+@pytest.fixture
+def register_tool(engine):
+    """Register a throwaway tool spec on the engine under test.
+
+    Needed because the shipped tool set no longer contains an http_post tool:
+    web_search_tavily and web_search_exa were folded into the web_search
+    provider registry, and get_page_title is the only remaining http tool.
+
+    The http_post branch of run_tool's network gate and of _exec_http is still
+    live code, so it still needs a tool to exercise it. A test-local spec keeps
+    that coverage without shipping a vendor tool purely for the tests. Mutating
+    the module globals is safe here because the `engine` fixture reloads the
+    module for every test.
+    """
+    def _register(name, description="test tool", **fields):
+        spec = engine._build_spec(name, fields, engine.APP_CONFIG, description)
+        engine.TOOL_SPECS[name] = spec
+        engine.TOOL_NAMES.add(name)
+        engine.TOOL_REQUIRED_PARAMS[name] = list(spec["args"])
+        return spec
+
+    return _register
+
+
 class ScriptedModel:
     """Stand-in for create_completion: returns queued responses in order.
 

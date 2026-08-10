@@ -74,9 +74,38 @@ sandbox_runtime_version=0.0.67
 # model_telemetry=0
 # model_telemetry_path=~/.agent8088/model-telemetry.jsonl
 
-# --- search (SearXNG) ---
-# Leave commented to disable web_search.
-# search_base_url=http://localhost:8888/search?q=
+# --- web search ---
+# One web_search tool, four interchangeable backends. With nothing set below,
+# the agent picks the first available: searxng -> tavily -> exa -> ddgs.
+#   searxng  default   self-hosted, no key   (`/search setup` provisions it)
+#   tavily   optional  needs TAVILY_API_KEY
+#   exa      optional  needs EXA_API_KEY
+#   ddgs     fallback  keyless, bundled — always available, needs no setup
+#
+# If the active backend fails (instance down, rate limited) the next available
+# one serves the request, so web search keeps working. Run `/search status` to
+# see the live chain and `/search doctor` to diagnose.
+#
+# Pin one backend (skips auto-selection AND the fallback chain):
+# web_search_provider=searxng
+#
+# SearXNG instance. `/search setup` writes this for you. A remote instance must
+# use https:// — plaintext http:// is only accepted for loopback/private hosts.
+# The host must also appear in ssrf_allow_hosts above, or requests to it are
+# blocked as internal.
+# search_base_url=http://127.0.0.1:8888/search?q=
+#
+# Results per search (default 5, max 20):
+# web_search_results=5
+#
+# Optional backends. Add a key and they join the chain automatically; leave them
+# unset and they stay out of it entirely. Keys live in the .env store next to
+# this file, NEVER here:
+#   TAVILY_API_KEY   agent-optimized results with citations  (https://tavily.com)
+#   EXA_API_KEY      semantic/neural search                  (https://exa.ai)
+#
+# The keyless ddgs fallback needs nothing: it ships with agent8088 and is used
+# automatically whenever SearXNG is unset, unreachable, or failing.
 
 # --- gateway allowlist scoping ---
 # User ids are scoped to the platform whose *_allowed_users line they appear

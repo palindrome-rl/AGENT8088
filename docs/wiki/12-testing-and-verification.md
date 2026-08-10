@@ -152,8 +152,7 @@ These are normal on a clean machine and not failures:
 | Skip | Why |
 |---|---|
 | `REAL browser page load` | `playwright` not installed |
-| `web_search_tavily REAL query` | no Tavily key (HTTP 401) |
-| `web_search_exa REAL query` | no Exa credit (HTTP 402) |
+| `web_search REAL query` | all backends failed, or ddgs rate limited |
 | `configured search backend reachable` | no local SearXNG on `127.0.0.1:8888` |
 | `REAL native sandbox` | sandbox runtime not installed |
 
