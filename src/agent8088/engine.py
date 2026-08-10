@@ -3027,6 +3027,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         query = str(args.get("query") or "").strip()
         if not query:
             return "Error: web_search requires 'query'."
+        # Date-qualify BEFORE the guards: they must inspect what actually
+        # leaves the machine, not the string the model happened to produce.
+        query = _augment_relative_time_query(query)
         sensitive = _web_search_query_guard(query)
         if sensitive:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
@@ -3058,9 +3061,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             )
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=query[:200])
-        return web_search.run_search(
+        return _frame_search_results(web_search.run_search(
             query, _web_search_limit(), WEB_SEARCH_REGISTRY, _search_config(),
-            _search_context())
+            _search_context()))
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
@@ -3956,6 +3959,62 @@ _WEB_SEARCH_SENSITIVE_PATTERNS = (
      "phone number or identifier"),
     (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "payment-card-like number"),
 )
+
+
+# Markers that make a query mean "as of now" — the ones where an undated
+# search happily ranks a years-old page above this month's news.
+_RELATIVE_TIME_MARKERS = re.compile(
+    r"\b(?:today|todays|tonight|latest|newest|current|currently|now|recent|"
+    r"recently|upcoming|next|this\s+(?:week|month|year|season)|"
+    r"as\s+of\s+now|right\s+now|so\s+far)\b", re.IGNORECASE)
+
+# "today" or "this week" needs the month to be worth anything; "latest" only
+# needs the year.
+_MONTH_GRANULARITY = re.compile(
+    r"\b(?:today|todays|tonight|this\s+week|this\s+month|right\s+now|"
+    r"as\s+of\s+now)\b", re.IGNORECASE)
+
+_EXPLICIT_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _augment_relative_time_query(query: str, now=None) -> str:
+    """Add the current year (or month) to a query that means "as of now".
+
+    Search engines rank an undated "latest X" on popularity rather than
+    recency, so a well-linked old page beats this month's news. Naming the
+    year is the cheapest change that measurably shifts what comes back.
+
+    Deliberately narrow: fires only when the query carries a relative-time
+    marker AND names no year of its own, so "iPhone 2019 reviews" and "world
+    cup 1998" are never rewritten. That precondition also makes it idempotent
+    — once the year is appended, the query has an explicit year and stops
+    qualifying. Set search_date_augmentation=0 to disable.
+    """
+    if APP_CONFIG.get("search_date_augmentation", "1") != "1":
+        return query
+    if not _RELATIVE_TIME_MARKERS.search(query) or _EXPLICIT_YEAR.search(query):
+        return query
+    moment = now or datetime.now().astimezone()
+    suffix = (moment.strftime("%B %Y") if _MONTH_GRANULARITY.search(query)
+              else str(moment.year))
+    return f"{query} {suffix}"
+
+
+def _frame_search_results(results: str, now=None) -> str:
+    """Stamp results with when they were fetched.
+
+    Code cannot reliably date-check arbitrary snippets — every provider
+    formats dates differently, and dropping whatever fails to parse would lose
+    good answers. What it can do is hand the model the comparison point it
+    otherwise lacks, so "the next launch" gets checked against today rather
+    than against training.
+    """
+    if results.startswith("Error:"):
+        return results
+    moment = now or datetime.now().astimezone()
+    return (f"[Retrieved {moment:%Y-%m-%d}. Check each result's own date before "
+            f"calling anything current, latest, or upcoming — search results "
+            f"routinely include older pages.]\n\n{results}")
 
 
 def _web_search_query_guard(query: str) -> str | None:
