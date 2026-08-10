@@ -170,3 +170,30 @@ names which backend served it, so a silent fallback is visible.
 Because `ddgs` needs no key, no hosting, and no setup, web search works on a
 fresh install. Run `/search status` for the live chain, `/search doctor` to
 diagnose, and `/search use <backend>` to pin one.
+
+## How the agent chooses a tool
+
+Tool choice is enforced in three places, each doing only what it is good at.
+
+**The prompt** carries the judgement calls: use the smallest tool that answers
+the request, never call one for text you already have (summarizing,
+translating, reasoning about readable code, writing), treat MCP tools as
+belonging to the system they wrap, and always follow an explicit instruction
+over any of these preferences.
+
+**Runtime context** gives the model the current date. Without it there is only
+a training cutoff, so "the next election" means whatever was next during
+training and an old page reads as current.
+
+**The engine** enforces what a prompt cannot be trusted with:
+
+| Behaviour | What happens |
+|---|---|
+| Date-qualified queries | A query meaning "as of now" with no year of its own gets the current year appended — or the month, for "today"/"this week". Controlled by `search_date_augmentation` |
+| Result dating | Results are stamped with their retrieval date so the model can spot a stale one |
+| Repeat searches | A reworded or reordered repeat is answered from the first search's results instead of re-running. A failed or empty search stays retryable |
+| Follow-up fetches | After a search succeeds, an unsolicited `browse_page`, `curl`-style shell command, or fetch-shaped MCP call is refused |
+
+Every gate yields to an explicit request: give a URL, name a command, or name
+an MCP tool and it runs. The gates only catch tools the model reached for on
+its own.

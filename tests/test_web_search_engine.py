@@ -214,7 +214,9 @@ def test_search_allows_a_clean_query(engine, monkeypatch):
     monkeypatch.setattr(engine, "_SECRET_VALUES", ["sk-verysecret123"])
     monkeypatch.setattr(engine.web_search, "run_search",
                         lambda q, limit, registry, config, ctx: "OK")
-    assert engine.run_tool("web_search", {"query": "weather"}) == "OK"
+    # Results carry a retrieval-date stamp, so assert the search ran and its
+    # output came back — not that the string is byte-identical.
+    assert "OK" in engine.run_tool("web_search", {"query": "weather"})
 
 
 def _enable_local_searxng_without_prompt(engine):
@@ -238,14 +240,22 @@ def test_local_searxng_search_runs_without_permission_in_readonly(engine, monkey
     _enable_local_searxng_without_prompt(engine)
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
-    assert engine.run_tool("web_search", {"query": "hi"}) == "OK"
+
+    result = engine.run_tool("web_search", {"query": "hi"})
+
+    assert "OK" in result
+    assert not result.startswith("ESCALATION_REQUEST:")
 
 
 def test_local_searxng_search_runs_without_permission_in_plan_only(engine, monkeypatch):
     _enable_local_searxng_without_prompt(engine)
     monkeypatch.setattr(engine, "PERMISSION_MODE", "plan-only")
     monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
-    assert engine.run_tool("web_search", {"query": "hi"}) == "OK"
+
+    result = engine.run_tool("web_search", {"query": "hi"})
+
+    assert "OK" in result
+    assert not result.startswith("ESCALATION_REQUEST:")
 
 
 def test_allowlisted_private_lan_searxng_runs_without_permission(engine, monkeypatch):
@@ -259,7 +269,11 @@ def test_allowlisted_private_lan_searxng_runs_without_permission(engine, monkeyp
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
     assert engine._local_searxng_no_prompt_enabled() is True
-    assert engine.run_tool("web_search", {"query": "Pakistan public holidays"}) == "OK"
+
+    result = engine.run_tool("web_search", {"query": "Pakistan public holidays"})
+
+    assert "OK" in result
+    assert not result.startswith("ESCALATION_REQUEST:")
 
 
 def test_no_prompt_search_cannot_use_a_nonlocal_or_unpinned_provider(engine):

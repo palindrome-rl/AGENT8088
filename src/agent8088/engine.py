@@ -1184,7 +1184,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = ""):
     selected_model = model_name or MODEL_NAME
-    full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
+    full_messages = [{"role": "system", "content": system_prompt or current_system_prompt()}, *messages]
     penalties = {}
     if FREQUENCY_PENALTY:
         penalties["frequency_penalty"] = FREQUENCY_PENALTY
@@ -1573,6 +1573,42 @@ def _resolve_tool_name(name):
     return TOOL_ALIASES.get(name, name)
 
 
+RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
+
+
+def render_runtime_context(now=None) -> str:
+    """Tell the model what day it is.
+
+    Without this it has no clock — only a training cutoff — so "the next
+    election" silently means whatever was next while it was trained, and a
+    page from years ago reads as current. Every date-aware behaviour in the
+    search path depends on this block being present.
+
+    Rendered per turn rather than at import: a gateway or cron process runs
+    for days and would otherwise keep answering with the date it booted on.
+    """
+    moment = now or datetime.now().astimezone()
+    return (
+        f"{RUNTIME_CONTEXT_HEADING}"
+        f"- Today is {moment.strftime('%A, %d %B %Y')}.\n"
+        f"- Current year: {moment.year}. Current month: {moment.strftime('%B %Y')}.\n"
+        "- Your training data is older than today. For anything current, "
+        "time-sensitive, or scheduled, search rather than answering from memory.\n"
+    )
+
+
+def current_system_prompt() -> str:
+    """The default system prompt, carrying today's date rather than import day's.
+
+    SYSTEM_PROMPT is built once at module import. That is fine for a one-shot
+    CLI invocation and wrong for the gateway and cron, which stay up long
+    enough for the date to move underneath them. Splitting on the heading
+    keeps repeated calls from stacking context blocks.
+    """
+    base = SYSTEM_PROMPT.split(RUNTIME_CONTEXT_HEADING)[0]
+    return base + render_runtime_context()
+
+
 def render_tool_docs(specs: dict) -> str:
     """Generate the tool section of the system prompt from TOOL_SPECS, so the
     prompt can never drift from tools.txt. Required because the Ollama backend
@@ -1713,7 +1749,8 @@ if SKILL_PACKAGES:
 
 
 SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
-                 + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE))
+                 + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE)
+                 + render_runtime_context())
 
 _last_tool_output = ""
 _last_tool_name = ""
@@ -2990,6 +3027,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         query = str(args.get("query") or "").strip()
         if not query:
             return "Error: web_search requires 'query'."
+        # Date-qualify BEFORE the guards: they must inspect what actually
+        # leaves the machine, not the string the model happened to produce.
+        query = _augment_relative_time_query(query)
         sensitive = _web_search_query_guard(query)
         if sensitive:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
@@ -3021,9 +3061,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             )
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=query[:200])
-        return web_search.run_search(
+        return _frame_search_results(web_search.run_search(
             query, _web_search_limit(), WEB_SEARCH_REGISTRY, _search_config(),
-            _search_context())
+            _search_context()))
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
@@ -3921,6 +3961,105 @@ _WEB_SEARCH_SENSITIVE_PATTERNS = (
 )
 
 
+# Markers that make a query mean "as of now" — the ones where an undated
+# search happily ranks a years-old page above this month's news.
+_RELATIVE_TIME_MARKERS = re.compile(
+    r"\b(?:today|todays|tonight|latest|newest|current|currently|now|recent|"
+    r"recently|upcoming|next|this\s+(?:week|month|year|season)|"
+    r"as\s+of\s+now|right\s+now|so\s+far)\b", re.IGNORECASE)
+
+# "today" or "this week" needs the month to be worth anything; "latest" only
+# needs the year.
+_MONTH_GRANULARITY = re.compile(
+    r"\b(?:today|todays|tonight|this\s+week|this\s+month|right\s+now|"
+    r"as\s+of\s+now)\b", re.IGNORECASE)
+
+_EXPLICIT_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _augment_relative_time_query(query: str, now=None) -> str:
+    """Add the current year (or month) to a query that means "as of now".
+
+    Search engines rank an undated "latest X" on popularity rather than
+    recency, so a well-linked old page beats this month's news. Naming the
+    year is the cheapest change that measurably shifts what comes back.
+
+    Deliberately narrow: fires only when the query carries a relative-time
+    marker AND names no year of its own, so "iPhone 2019 reviews" and "world
+    cup 1998" are never rewritten. That precondition also makes it idempotent
+    — once the year is appended, the query has an explicit year and stops
+    qualifying. Set search_date_augmentation=0 to disable.
+    """
+    if APP_CONFIG.get("search_date_augmentation", "1") != "1":
+        return query
+    if not _RELATIVE_TIME_MARKERS.search(query) or _EXPLICIT_YEAR.search(query):
+        return query
+    moment = now or datetime.now().astimezone()
+    suffix = (moment.strftime("%B %Y") if _MONTH_GRANULARITY.search(query)
+              else str(moment.year))
+    return f"{query} {suffix}"
+
+
+# Words carrying no search intent. Dropping them stops a reworded repeat from
+# reading as a fresh query.
+_SEARCH_FILLER = frozenset({
+    "the", "a", "an", "of", "in", "on", "at", "for", "to", "is", "are", "was",
+    "were", "what", "whats", "who", "whos", "when", "where", "which", "how",
+    "do", "does", "did", "tell", "me", "about", "please", "current",
+    "currently", "latest", "newest", "recent", "now",
+})
+
+
+_SEARCH_STAMP_PREFIX = "[Retrieved "
+
+
+def _search_signature(query: str) -> tuple:
+    """Reduce a query to its meaning-bearing tokens, order-independent.
+
+    The loop's existing guard compares json.dumps(args), so a single changed
+    character reads as a brand-new call — and a model that rephrases when it
+    dislikes an answer can spend its whole turn budget on one question.
+    Sorting the tokens catches word-order variants too.
+    """
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    return tuple(sorted(w for w in words if w not in _SEARCH_FILLER))
+
+
+def _search_was_usable(result: str) -> bool:
+    """Whether a completed search is worth reusing instead of re-running.
+
+    An error or an empty result is not an answer; trapping the agent with it
+    would be worse than letting it try once more.
+    """
+    stripped = (result or "").strip()
+    if not stripped or stripped.startswith("Error:"):
+        return False
+    # Framed results carry a stamp line; a stamp with nothing under it is empty.
+    if stripped.startswith(_SEARCH_STAMP_PREFIX):
+        _stamp, _, body = stripped.partition("]")
+        return bool(body.strip())
+    return True
+
+
+def _frame_search_results(results: str, now=None) -> str:
+    """Stamp results with when they were fetched.
+
+    Code cannot reliably date-check arbitrary snippets — every provider
+    formats dates differently, and dropping whatever fails to parse would lose
+    good answers. What it can do is hand the model the comparison point it
+    otherwise lacks, so "the next launch" gets checked against today rather
+    than against training.
+    """
+    # An error or an empty result set is not something to stamp — the stamp
+    # would be the only content, and would read as a result that has none.
+    if not results.strip() or results.startswith("Error:"):
+        return results
+    moment = now or datetime.now().astimezone()
+    return (f"{_SEARCH_STAMP_PREFIX}{moment:%Y-%m-%d}. Check each result's own date before "
+            f"calling anything current, latest, or upcoming — search results "
+            f"routinely include older pages.]\n\n{results}")
+
+
 def _web_search_query_guard(query: str) -> str | None:
     """Refuse sensitive data in any outbound search query.
 
@@ -4251,6 +4390,64 @@ def _user_supplied_url(messages, url: object) -> bool:
     ))
 
 
+# Phrases that mean the user asked for this class of tool themselves. Kept
+# literal on purpose: the gates below only fire on tools the model reached for
+# unprompted, and wrongly reading "the user asked" is far safer than refusing
+# something they explicitly requested.
+_EXPLICIT_TOOL_PHRASES = {
+    "execute_shell": ("run ", "execute ", "shell", "command", "terminal", "`"),
+    "browse_page": ("browse", "open the page", "visit", "inspect the page"),
+    "get_page_title": ("title of", "browse", "visit"),
+}
+
+
+def _user_requested_tool(messages, name: str) -> bool:
+    """Whether the user asked for this tool, by name or in plain language.
+
+    Only user turns count. The model must not be able to authorise its own
+    tool call by narrating it first.
+    """
+    phrases = (name, *_EXPLICIT_TOOL_PHRASES.get(name, ()))
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content", "")).lower()
+        if any(phrase in text for phrase in phrases):
+            return True
+    return False
+
+
+# Web fetching wearing a shell command as a disguise.
+_WEB_FETCH_SHELL = re.compile(r"\b(?:curl|wget|httpie|http|https|lynx|w3m)\b",
+                              re.IGNORECASE)
+
+# MCP tools whose name says they fetch. Name-based because MCP specs carry no
+# capability metadata to key off — see the docstring in _is_fetch_followup.
+_MCP_FETCH_NAME = re.compile(r"(?:search|fetch|browse|web|http|scrape)", re.IGNORECASE)
+
+
+def _is_fetch_followup(messages, name: str, args: dict) -> bool:
+    """Whether this call is an unsolicited fetch after a search already worked.
+
+    Narrow by design. The brief asks that shell and MCP not be used as
+    redundant follow-ups, but blocking them broadly is unsafe: after searching
+    for a library version the agent may legitimately need to install it, and
+    refusing that is a worse bug than one wasted fetch. So only fetch-shaped
+    calls qualify, and an explicit user request overrides all of it.
+    """
+    if name in {"browse_page", "get_page_title"}:
+        return not (_user_supplied_url(messages, args.get("url"))
+                    or _user_requested_tool(messages, name))
+    if name == "execute_shell":
+        command = str(args.get("command") or "")
+        return bool(_WEB_FETCH_SHELL.search(command)) and not _user_requested_tool(
+            messages, "execute_shell")
+    if (TOOL_SPECS.get(name) or {}).get("mode") == "mcp":
+        return bool(_MCP_FETCH_NAME.search(name)) and not _user_requested_tool(
+            messages, name)
+    return False
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -4280,6 +4477,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     searched = False     # prevents speculative page browsing after search results
+    search_results = {}  # query signature -> that search's output, for reuse
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -4405,10 +4603,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
 
-            if (searched and name in {"browse_page", "get_page_title"}
-                    and not _user_supplied_url(messages, args.get("url"))):
-                result = ("Browser follow-up was not run. Use the web_search results, "
-                          "or ask the user for a specific page URL.")
+            if searched and _is_fetch_followup(messages, name, args):
+                result = ("Follow-up fetch was not run — the search already "
+                          "answered this. Use the web_search results, or ask the "
+                          "user for a specific page URL.")
                 tool_outputs.append(result)
                 if on_result:
                     on_result(name, result)
@@ -4417,6 +4615,27 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                        "result": result, "blocked": True})
                 messages.append({"role": "user", "content": f"Tool result ({name}):\n{result}"})
                 continue
+
+            # Equivalent-query guard. `sig` above is byte-exact, so rewording
+            # or reordering the same question slipped straight past it and the
+            # search ran again. A failed or empty first attempt stays
+            # retryable — trapping the agent with a dud result would be worse
+            # than one extra call.
+            if name == "web_search":
+                query_sig = _search_signature(str(args.get("query") or ""))
+                earlier = search_results.get(query_sig)
+                if earlier is not None and _search_was_usable(earlier):
+                    result = ("This search already ran. Answer from these results "
+                              f"instead of searching again:\n\n{earlier}")
+                    tool_outputs.append(result)
+                    if on_result:
+                        on_result(name, result)
+                    if turn_tools is not None:
+                        turn_tools.append({"name": name, "arguments": args,
+                                           "result": "(duplicate search)", "cached": True})
+                    messages.append({"role": "user",
+                                     "content": f"Tool result ({name}):\n{result}"})
+                    continue
 
             if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
@@ -4439,7 +4658,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
             tool_outputs.append(result)
-            searched = searched or name == "web_search"
+            if name == "web_search" and not result.startswith("ESCALATION_REQUEST:"):
+                # Remember what this query returned so a reworded repeat can be
+                # answered from it. An escalation is not a result — recording it
+                # would make the approved retry look like a duplicate.
+                search_results[_search_signature(str(args.get("query") or ""))] = result
+                if not _search_was_usable(result):
+                    # An errored or empty search must stay retryable, and the
+                    # byte-exact `seen` guard above would otherwise block the
+                    # identical retry before the equivalence check runs. Same
+                    # discard the escalation path uses.
+                    seen.discard(sig)
+            searched = searched or (name == "web_search" and _search_was_usable(result))
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.

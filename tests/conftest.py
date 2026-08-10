@@ -74,3 +74,32 @@ class ScriptedModel:
 def scripted():
     """Factory for ScriptedModel instances."""
     return ScriptedModel
+
+
+@pytest.fixture
+def artifacts_dir():
+    """Scratch directory for files a test needs to create.
+
+    Tests that write into the repo root leave droppings that show up in every
+    later `git status` and occasionally get committed by accident. Everything
+    generated goes here instead; artifacts/ is gitignored.
+    """
+    path = ROOT / "artifacts" / "tests"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _repo_root_stays_clean():
+    """Fail the run if a test created a file in the repo root.
+
+    A guard rather than a convention: the rule is only worth having if
+    breaking it is noisy, and "don't write to the repo root" is exactly the
+    kind of thing that regresses silently.
+    """
+    ignore = {".pytest_cache", "__pycache__", ".ruff_cache", "artifacts",
+              ".coverage", ".venv"}
+    before = set(os.listdir(ROOT))
+    yield
+    created = set(os.listdir(ROOT)) - before - ignore
+    assert not created, f"tests created files in the repo root: {sorted(created)}"

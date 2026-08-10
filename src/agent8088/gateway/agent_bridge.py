@@ -7,7 +7,8 @@ def build_system_prompt() -> str:
     """Build the gateway system prompt: base + tool docs + permission mode,
     mirroring the CLI's _session_system_prompt() so the model knows what
     tools exist and whether writes need approval."""
-    prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(A.TOOL_SPECS))
+    prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(A.TOOL_SPECS)
+              + A.render_runtime_context())
     prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
     if A.PERMISSION_MODE in ("edit", "full-auto"):
         prompt += ("You are in full-auto mode. All tools are allowed without prompts. "

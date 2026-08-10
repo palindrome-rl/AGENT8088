@@ -355,7 +355,8 @@ def _active_provider_name():
 def _session_system_prompt():
     specs = _active_tool_specs()
     prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
-              + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE))
+              + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE)
+              + A.render_runtime_context())
     # Inject current permission mode so the model knows what it can/can't do right now
     prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
     if A.PERMISSION_MODE == "plan-only":
