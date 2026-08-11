@@ -291,6 +291,18 @@ class GatewayRunner:
                 finally:
                     A._plan_on_approval = None
             await _finalize(answer)
+            # Mirrors cli.py's _after_turn_plan_state: an approved plan's turn
+            # just finished, so the session goes back to the mode it had before
+            # /plan / /mode plan-only. No-op if no plan was approved this turn.
+            # Without this the mode picked at approval time (full-auto/readonly)
+            # stuck forever instead of reverting, unlike the CLI.
+            restored = A.finish_plan_session()
+            if restored and adapter:
+                try:
+                    await adapter.send_message(
+                        event.chat_id, f"plan complete — permission mode back to {restored}.")
+                except Exception:
+                    pass
         except Exception as e:
             log.error("turn failed for %s: %s", key, e)
             if adapter:

@@ -20,6 +20,21 @@ def build_system_prompt() -> str:
     return prompt
 
 
+PLAN_MODE_MIN_TURNS = 25
+
+
+def _turn_max_turns(mode: str) -> int:
+    """Round budget for this turn. A plan-mode turn does three things in one
+    turn — research, propose, then execute everything the user approved — so
+    it needs more rounds than a normal exchange. Mirrors cli.py's
+    _turn_max_turns; a flat cap here truncated large multi-file plans
+    mid-write on the gateway (the CLI never had this problem)."""
+    configured = int(A.APP_CONFIG.get("max_turns", "10"))
+    if mode == "plan-only":
+        return max(configured, PLAN_MODE_MIN_TURNS)
+    return configured
+
+
 def run_turn(session_key: str, user_text: str, session_store: SessionStore,
              on_escalation=None) -> str:
     """Load a JSON session, run the agent loop, save it, return the answer.
@@ -48,7 +63,7 @@ def run_turn(session_key: str, user_text: str, session_store: SessionStore,
 
     answer = A.run_agent(
         messages,
-        max_turns=int(A.APP_CONFIG.get("max_turns", "10")),
+        max_turns=_turn_max_turns(A.PERMISSION_MODE),
         temperature=float(A.APP_CONFIG.get("temperature", "0.1")),
         system_prompt=build_system_prompt(),
         tools_def=A.build_tools_def(A.TOOL_SPECS),

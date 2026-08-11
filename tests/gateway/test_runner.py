@@ -314,6 +314,65 @@ def test_plan_command_with_inline_task_runs_it_as_a_followup():
         A.set_permission_mode("readonly")
 
 
+def test_run_turn_restores_mode_after_an_approved_plan_finishes():
+    """The other half of the plan-mode bug: after an approved plan's turn
+    ends, PERMISSION_MODE must go back to whatever it was before /plan, not
+    stay stuck on whatever mode the plan was approved into."""
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088 import engine as A
+    A.set_permission_mode("readonly")
+    A.enter_plan_mode()  # records _plan_return_mode = "readonly"
+    A.set_permission_mode("full-auto")  # what present_plan does on approval
+    A._plan_approved = True
+
+    def fake_run_turn(key, text, sessions, on_escalation=None):
+        return "the plan ran"
+
+    try:
+        with patch("agent8088.gateway.runner.run_turn", fake_run_turn):
+            evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                               user_id="U1", text="do the thing")
+            asyncio.run(runner.on_message(evt))
+
+        assert A.PERMISSION_MODE == "readonly"
+        notices = [c.args[1] for c in adapter.send_message.call_args_list]
+        assert any("permission mode back to readonly" in n for n in notices)
+    finally:
+        A.set_permission_mode("readonly")
+        A._plan_approved = False
+
+
+def test_run_turn_leaves_mode_alone_when_no_plan_was_approved():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088 import engine as A
+    A.set_permission_mode("full-auto")
+
+    def fake_run_turn(key, text, sessions, on_escalation=None):
+        return "just a normal reply"
+
+    try:
+        with patch("agent8088.gateway.runner.run_turn", fake_run_turn):
+            evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                               user_id="U1", text="hi")
+            asyncio.run(runner.on_message(evt))
+
+        assert A.PERMISSION_MODE == "full-auto"
+        notices = [c.args[1] for c in adapter.send_message.call_args_list]
+        assert not any("permission mode back to" in n for n in notices)
+    finally:
+        A.set_permission_mode("readonly")
+
+
 def test_mode_no_arg_reports_current_mode():
     runner, sessions = _make_runner()
     adapter = AsyncMock()
