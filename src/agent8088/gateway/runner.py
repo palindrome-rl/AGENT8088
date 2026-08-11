@@ -21,6 +21,7 @@ SLASH_COMMANDS = {
     "/approve": "Approve a pending action (once/session)",
     "/deny": "Deny a pending action",
     "/mode": "Show or set the permission mode (readonly/full-auto/plan-only)",
+    "/plan": "Enter plan mode and (optionally) propose a plan for the given task",
 }
 
 APPROVAL_TIMEOUT = 300  # seconds, fail-closed
@@ -415,6 +416,17 @@ class GatewayRunner:
                 A.set_permission_mode(arg)
             if adapter:
                 await adapter.send_message(event.chat_id, f"Permission mode: {arg}")
+            return True
+        if cmd == "/plan":
+            # Mirrors cli.py's cmd_plan: enter plan mode, then let on_message's
+            # existing "text after the command" follow-up (see below) run the
+            # task in the same turn if one was given inline.
+            A.enter_plan_mode()
+            if adapter:
+                await adapter.send_message(
+                    event.chat_id,
+                    "plan mode — reads only. Agent8088 will research, propose a "
+                    "plan, and wait for your approval before anything is written or run.")
             return True
         return False
 

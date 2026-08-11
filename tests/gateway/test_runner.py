@@ -264,6 +264,56 @@ def test_gateway_wires_plan_on_approval_for_run_turn():
     assert A._plan_on_approval is None  # reset after the turn
 
 
+def test_plan_command_with_no_task_just_enters_plan_mode():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088 import engine as A
+    A.set_permission_mode("readonly")
+    try:
+        evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                           user_id="U1", text="/plan")
+        asyncio.run(runner.on_message(evt))
+        assert A.PERMISSION_MODE == "plan-only"
+        assert adapter.send_message.call_count == 1  # only the "plan mode" notice
+        sent = adapter.send_message.call_args.args[1]
+        assert "plan mode" in sent.lower()
+    finally:
+        A.set_permission_mode("readonly")
+
+
+def test_plan_command_with_inline_task_runs_it_as_a_followup():
+    """Mirrors cli.py's cmd_plan: /plan <task> enters plan mode AND processes
+    the task in the same turn, via on_message's existing "text after the
+    command" follow-up dispatch (the same mechanism /new <text> already uses)."""
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088 import engine as A
+    A.set_permission_mode("readonly")
+    calls = []
+
+    def fake_run_turn(key, text, sessions, on_escalation=None):
+        calls.append(text)
+        return "ok"
+
+    try:
+        with patch("agent8088.gateway.runner.run_turn", fake_run_turn):
+            evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                               user_id="U1", text="/plan build me a snake game")
+            asyncio.run(runner.on_message(evt))
+        assert A.PERMISSION_MODE == "plan-only"
+        assert calls == ["build me a snake game"]
+    finally:
+        A.set_permission_mode("readonly")
+
+
 def test_mode_no_arg_reports_current_mode():
     runner, sessions = _make_runner()
     adapter = AsyncMock()
