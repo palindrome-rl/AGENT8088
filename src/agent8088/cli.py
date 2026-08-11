@@ -455,7 +455,11 @@ def _palindrome_logo():
     if console.legacy_windows or "utf" not in console.encoding.lower():
         return Text(_PALINDROME_ASCII_LOGO, style="bold #00C8FF")
     if _PALINDROME_ANSI_LOGO.is_file():
-        return Text.from_ansi(_PALINDROME_ANSI_LOGO.read_text().rstrip("\n"))
+        # encoding is explicit because read_text() defaults to the locale codec:
+        # on Windows that is cp1252, which cannot decode this file at all, so the
+        # banner raised UnicodeDecodeError before the REPL ever appeared.
+        return Text.from_ansi(
+            _PALINDROME_ANSI_LOGO.read_text(encoding="utf-8").rstrip("\n"))
     fallback = _PALINDROME_BLOCK_LOGO
     if not _PALINDROME_LOGO.is_file():
         return Text(fallback, style="bold #00C8FF")

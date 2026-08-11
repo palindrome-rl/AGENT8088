@@ -90,7 +90,13 @@ def test_palindrome_logo_uses_ascii_on_legacy_windows(tmp_path, monkeypatch):
 
 def test_narrow_banner_keeps_the_palindrome_brand(monkeypatch):
     output = io.StringIO()
-    monkeypatch.setattr(classic, "console", Console(file=output, width=50, color_system=None))
+    # legacy_windows=False for the same reason as the test above: the braille
+    # logo has an ASCII fallback for consoles that cannot render it, so without
+    # pinning this the assertion passes on Linux and fails on a Windows terminal
+    # — by platform rather than by behaviour.
+    monkeypatch.setattr(classic, "console",
+                        Console(file=output, width=50, color_system=None,
+                                legacy_windows=False))
 
     classic.banner()
 
