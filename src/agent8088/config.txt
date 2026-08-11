@@ -64,6 +64,15 @@ default_provider=ollama
 timeout_seconds=120
 # max_tool_timeout_seconds=300
 
+# --- display ---
+# Pygments theme for the code the agent reads and writes: file listings, diffs
+# and fenced code blocks in its answers. Any Pygments style name works —
+# monokai, dracula, nord, one-dark, github-dark, gruvbox-dark, or solarized-light
+# and friends for a light terminal. The theme's own background is never painted,
+# so only its foreground colours apply.
+# Set to `none` for plain, uncoloured output.
+# syntax_theme=monokai
+
 # --- sandbox ---
 # auto uses free native OS isolation first, then Docker when available.
 # If neither is available, shell and code execution are refused.
