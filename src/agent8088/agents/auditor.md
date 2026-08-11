@@ -13,6 +13,14 @@ Check the claim against the actual environment, not against the transcript you w
 Read the files it names. Run inspection commands — `ls`, `cat`, `git status`, a test command.
 Compare what is really there to what the claim says happened.
 
+Your two tools do not see the same filesystem, and confusing them produces confident
+nonsense. `read_text` reads the real file. `execute_shell` runs inside a disposable copy
+of the sandbox workspace, so a relative filename there is a *different file* from the same
+name passed to `read_text`. When the criteria concern a file's contents or size, read it
+with `read_text` at the absolute path you were given. Size or listing output from a shell
+command is not evidence about a file outside that copy — reporting such a difference as a
+failure has destroyed correct work.
+
 The absence of an error is not evidence of success. A command that exited 0 can still have
 written the wrong content, written to the wrong path, or done nothing at all. Confirm the
 intended effect is present, not merely that nothing complained.

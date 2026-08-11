@@ -10,8 +10,6 @@ could not verify its work and printed an invented "expected output" table.
 The retry is deliberately limited to PRE-FLIGHT failures. A command that ran and
 failed must never be retried on another backend: it may already have had effects.
 """
-import pytest
-
 PREFLIGHT = (
     "Error: WFP egress fence could not be verified — `srt-win wfp verify` exited 1 "
     'with unparseable output "" (stderr: "srt-win: error: spawn runner for egress '
@@ -78,6 +76,40 @@ def test_without_docker_the_runtime_error_is_kept(engine, monkeypatch):
     result = engine._exec_sandbox_command("python demo.py")
     assert calls == ["native"]
     assert "Secondary Logon" in result, "the actionable detail must survive"
+
+
+def test_a_broken_native_runtime_is_only_attempted_once(engine, monkeypatch):
+    """It does not heal between commands, so retrying costs a subprocess to
+    reach the same failure — and reprints its stderr above every command."""
+    calls = _wire(engine, monkeypatch, PREFLIGHT)
+
+    engine._exec_sandbox_command("echo one")
+    engine._exec_sandbox_command("echo two")
+    engine._exec_sandbox_command("echo three")
+
+    assert calls == ["native", "docker", "docker", "docker"], (
+        "native should be tried once, then skipped for the session")
+
+
+def test_the_fallback_warns_once_not_per_command(engine, monkeypatch, caplog):
+    _wire(engine, monkeypatch, PREFLIGHT)
+
+    with caplog.at_level("WARNING"):
+        engine._exec_sandbox_command("echo one")
+        engine._exec_sandbox_command("echo two")
+
+    warnings = [r for r in caplog.records if "native sandbox could not start" in r.message]
+    assert len(warnings) == 1, f"expected one warning, got {len(warnings)}"
+
+
+def test_a_healthy_native_runtime_is_never_marked_broken(engine, monkeypatch):
+    calls = _wire(engine, monkeypatch, "hello from native")
+
+    engine._exec_sandbox_command("echo one")
+    engine._exec_sandbox_command("echo two")
+
+    assert calls == ["native", "native"], "a working runtime must keep being used"
+    assert engine._native_sandbox_broken is False
 
 
 def test_python_code_still_reaches_docker_as_python(engine, monkeypatch):
