@@ -26,6 +26,12 @@ research read-only, propose one plan, get it approved, run it, come back.
 
 ### Added
 
+- `/audit [on|off]` turns step verification on or off from the prompt, and writes the
+  choice through to `config.txt` so it survives a restart. It was reachable only by
+  editing `plan_audit` and relaunching, which is the wrong shape for this setting:
+  verification is something you want to try on one task, see what it cost, and then
+  decide about. With no argument it reports the current state and the last turn's
+  verification share. Turning it on says what it will cost.
 - `present_plan` tool: presents a plan as markdown for approval. Plan proposal and
   plan execution used to be the same tool, which meant the only approvable plan
   was a fully-specified JSON step array — something models do not reliably
@@ -33,6 +39,24 @@ research read-only, propose one plan, get it approved, run it, come back.
 
 ### Fixed
 
+- Verification follows the work. The auditor only ever hooked `execute_plan`, which
+  was the same thing as hooking the plan only because plan mode forced every
+  mutation through it. With approval handing execution to ordinary tool calls, the
+  default `/plan` flow would have become the one flow `plan_audit=1` did not cover.
+  Post-approval calls are now audited too, at depth 0 only — a sub-agent's writes
+  are not the plan, and auditing inside the auditor would set it verifying itself.
+- The auditor grades against the plan the user approved. An `execute_plan` step can
+  declare `acceptance`; an ordinary tool call cannot, and without a criterion the
+  auditor only checks that the call took effect — which a write that did the wrong
+  thing passes. A `write_file` of `hi` against a plan promising a revenue table now
+  fails verification and the file is removed.
+- A sub-agent pinned to `permission: readonly` is refused a mutation instead of
+  being offered an escalation. Sub-agent escalations reach the user, so "this agent
+  only observes" was a question someone could answer yes to — about the file the
+  auditor was sent to inspect. Plain readonly mode still escalates; that prompt is
+  the approval flow.
+- Verification's cost stays visible on the new path: the turn's audit share is
+  captured as the budget is torn down, and the CLI reports it.
 - A plan the model only described is no longer reported as done. A turn that ends
   in plan mode with nothing approved now says so explicitly.
 - Plan mode is no longer one-shot. After an approved plan finished, every later

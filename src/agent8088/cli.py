@@ -804,6 +804,9 @@ def _after_turn_plan_state():
     approved gets said out loud: a model that writes a plan as prose and then
     reports it complete is indistinguishable, in the transcript, from one that
     actually did the work — the only difference the user can see is this line."""
+    share = A.last_audit_share()
+    if share:
+        console.print(f"[dim]verification cost this turn: {share * 100:.0f}% of tokens[/dim]")
     restored = A.finish_plan_session()
     if restored:
         console.print(f"[dim]plan complete · permission mode back to {restored}[/dim]")
@@ -969,6 +972,7 @@ def cmd_help(_):
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
         ("/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session"),
         ("/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs"),
+        ("/audit [on|off]", "Verify each step against the real files after it runs"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
@@ -1747,6 +1751,66 @@ def cmd_mode(rest):
     console.print(f"Permission mode: [bold green]{arg}[/bold green]")
 
 
+_AUDIT_ON = ("on", "1", "true", "yes", "enable", "enabled")
+_AUDIT_OFF = ("off", "0", "false", "no", "disable", "disabled")
+
+
+def cmd_audit(rest):
+    """Show or change step verification — the friendly face of `plan_audit`.
+
+    It was reachable only by editing config.txt and restarting, which is the wrong
+    shape for this particular setting: verification is something you want to try on
+    one task, look at what it cost, and then decide about. Writing through to the
+    config the same way the other preferences do means the decision also survives
+    the next launch."""
+    arg = rest.strip().lower()
+    if arg in ("", "status"):
+        state = "on" if A.PLAN_AUDIT else "off"
+        colour = "green" if A.PLAN_AUDIT else "red"
+        console.print(f"step verification: [{colour}]{state}[/{colour}]"
+                      f"  ·  revert failed writes: "
+                      f"{'yes' if A.PLAN_AUDIT_REVERT else 'no'}")
+        share = A.last_audit_share()
+        if share:
+            console.print(f"[dim]last turn spent {share * 100:.0f}% of its tokens "
+                          f"on verification[/dim]")
+        console.print("[dim]change it with[/dim] [#237dd7]/audit on[/#237dd7][dim] or "
+                      "[/dim][#237dd7]/audit off[/#237dd7]")
+        return
+    if arg in _AUDIT_ON:
+        want = True
+    elif arg in _AUDIT_OFF:
+        want = False
+    else:
+        console.print("[red]usage:[/red] /audit [on|off]   (no argument shows the "
+                      "current setting)")
+        return
+
+    A.PLAN_AUDIT = want
+    saved = True
+    try:
+        A.update_simple_config(A.CONFIG_PATH, {"plan_audit": int(want)})
+        A.APP_CONFIG["plan_audit"] = str(int(want))
+    except Exception as exc:
+        saved = False
+        reason = exc
+
+    if want:
+        console.print("step verification: [green]on[/green] — after every mutating step a "
+                      "read-only auditor checks the real files against your approved plan, "
+                      "and a step that fails is put back.")
+        console.print("[dim]this spends one extra model call — and its tokens — per "
+                      "mutating step, and it comes out of the same turn budget as the "
+                      "work. Watch the 'verification cost this turn' line; turn it off "
+                      "with[/dim] [#237dd7]/audit off[/#237dd7]")
+    else:
+        console.print("step verification: [red]off[/red] — steps are trusted to have done "
+                      "what they report.")
+    if not saved:
+        console.print(f"[yellow]applies to this session only — could not write to "
+                      f"{A.CONFIG_PATH}: {reason}[/yellow]")
+
+
 def cmd_new(rest):
     try:
         name = _session_name(rest)
@@ -2137,6 +2201,7 @@ COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
+    "audit": cmd_audit,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config, "system": cmd_system,
     "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,

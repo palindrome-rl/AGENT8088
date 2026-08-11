@@ -89,6 +89,30 @@ A step that reports success has only told you the tool did not raise. Setting
 which inspects the real environment before the plan continues. A `fail` verdict
 halts the plan on the same path as any other failure.
 
+This covers two paths, because a plan's work now happens on both. Steps inside
+`execute_plan` are audited there. The tool calls an approved `/plan` makes are
+audited in `exec_tool`, at depth 0 only — a sub-agent's writes are not the plan,
+and auditing inside the auditor would set it verifying itself. That second path
+was not always covered: plan mode used to force every mutation through
+`execute_plan`, so hooking `execute_plan` was the same thing as hooking the plan.
+Once approval started handing execution to ordinary tool calls, the default
+`/plan` flow became the one flow with no verification at all.
+
+An `execute_plan` step can declare `acceptance`; an ordinary tool call has nowhere
+to put one, so the **plan the user approved** is passed as the criterion instead.
+Without it the auditor grades "did this call take effect", which a write that did
+confidently the wrong thing passes. With it, a `write_file` of `hi` against a plan
+promising a revenue table comes back:
+`VERDICT: fail — the file contains only "hi", not a markdown table of quarterly
+revenue with at least four data rows` — and the file is removed.
+
+Verification is not free, so the cost stays visible. `_exec_plan` appends its share
+to the plan's output; the post-approval path has no such output, so the share is
+captured as the turn's budget is torn down and the CLI prints
+`verification cost this turn: N% of tokens`. On a small turn that share is large —
+a single audit call against one tiny write measured over 90% — which is the number
+to look at before leaving auditing on.
+
 Two deliberate asymmetries:
 
 - A failed verification halts; an auditor that could not run does not. An
