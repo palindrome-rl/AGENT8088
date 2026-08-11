@@ -22,7 +22,8 @@ is what the permission layer gates on — see
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
 | `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
-| `execute_plan` | `plan` | `steps` | ✅ | Run a multi-step plan (the plan-only path). |
+| `present_plan` | `plan` | `plan` | ✅ | Show a plan as markdown and ask the user to approve it (plan mode's exit point). |
+| `execute_plan` | `plan` | `steps` | ✅ | Run an already-decided sequence of tool calls, verified step by step. |
 | `git_status` | `shell` | — | depends | `git status`. |
 | `git_diff` | `shell` | — | depends | `git diff`. |
 | `git_log` | `shell` | — | depends | `git log`. |

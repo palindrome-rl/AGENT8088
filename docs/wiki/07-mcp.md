@@ -143,7 +143,7 @@ surface has a non-mutating mode, so adding one here has to be justified.
 
 Never exposed, in any configuration: `execute_shell`, `run_sandboxed`, all
 mutating git tools, `schedule_task`, `browse_page`, `spawn_subagent`,
-`execute_plan`.
+`execute_plan`, `present_plan`.
 
 ### Why writes are opt-in
 

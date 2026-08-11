@@ -80,7 +80,7 @@ Run with no flags for the interactive REPL.
 | `/tools` | List tools with mode, args, description |
 | `/capabilities` | Full self-report: tools, MCP servers, skills, subagents, limits, active guardrails |
 | `/tool <name> <json>` | Invoke one tool directly |
-| `/plan <steps>` | Run the multi-step plan executor |
+| `/plan [task]` | Enter plan mode: propose a plan, approve it, then it runs |
 | `/image <path>` | Attach an image to the next prompt |
 | `/agents` | List sub-agent profiles |
 | `/agent <type> <task>` | Run a sub-agent directly |

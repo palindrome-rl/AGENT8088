@@ -100,10 +100,19 @@ allowed_sensitive_files=.env.example
 Shell startup files have no override by design — writing one is code execution on
 your next shell launch. Edit it yourself.
 
-### `plan-only mode — direct tool execution blocked`
+### `plan mode — nothing is written or run until the user approves a plan`
 
-Working as intended. Either use `execute_plan` / `/plan`, or switch with
+Working as intended. You are in plan mode. The agent will read whatever it needs,
+then call `present_plan` with the plan as markdown; approve it and the mode
+changes so the plan runs. To leave without a plan, `/mode full-auto` or
 `/mode readonly`.
+
+### The agent described a plan but nothing happened
+
+Look for `Still in plan mode — no plan was approved, so nothing above was written
+or run.` A plan the model only wrote out in prose is not a plan it ran, and that
+line is how you tell the two apart. Reply to have it revise and actually call
+`present_plan`.
 
 ### full-auto still won't `git push`
 
