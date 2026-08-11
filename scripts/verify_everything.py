@@ -266,7 +266,8 @@ with with_mode("readonly"):
     E._one_shot_grant = False
 
 req = E.request_escalation("edit", ["/tmp/x"], "file_write", "needs to write")
-ok("escalation request is structured", req.startswith("ESCALATION_REQUEST:edit:file_write:"))
+ok("escalation request is structured",
+   req.startswith("ESCALATION_REQUEST\x1fedit\x1ffile_write\x1f"))
 ok("escalation carries paths and reason", "/tmp/x" in req and "needs to write" in req)
 
 section("4c. PATH ZONES")

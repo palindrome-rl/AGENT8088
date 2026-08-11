@@ -107,17 +107,31 @@ def test_a_subagents_writes_are_not_audited(engine, tmp_path):
 
 
 def test_a_blocked_call_is_not_audited(engine, tmp_path):
-    """Nothing happened yet — it will be audited on the retry after approval."""
+    """Nothing happened yet — it will be audited on the retry after approval.
+
+    The prefix is \x1f-delimited. This assertion read ':' and so passed for the
+    wrong reason once the wire format changed: `out` was not recognised as an
+    escalation, the audit ran, and the test's own `seen == []` then failed.
+    """
     seen = _audit_on(engine, tmp_path)
     _approve(engine)
     engine.set_permission_mode("readonly")
     engine._plan_approved = True
 
+    target = tmp_path / "gated.txt"
     out = engine.exec_tool("write_file",
-                           json.dumps({"filename": str(tmp_path / "gated.txt"), "content": "x"}))
+                           json.dumps({"filename": str(target), "content": "x"}))
 
-    assert out.startswith("ESCALATION_REQUEST:")
-    assert seen == []
+    assert out.startswith("ESCALATION_REQUEST\x1f")
+    assert seen == [], "a call that was blocked has nothing to verify yet"
+    assert not target.exists(), "the write was gated, so nothing should be on disk"
+    # The escalation is what the user has to answer. Auditing a write that never
+    # happened appends a fail verdict, a claim to have reverted a file that was
+    # never created, and an instruction to abandon the plan — onto the very
+    # payload the approval prompt renders.
+    assert "audit:" not in out
+    assert "reverted" not in out
+    assert "verification failed" not in out
 
 
 def test_an_inconclusive_audit_does_not_undo_the_write(engine, tmp_path):
@@ -206,7 +220,10 @@ def test_a_readonly_pinned_agent_is_refused_the_write(engine, tmp_path, monkeypa
     monkeypatch.setattr(engine, "run_agent", spy)
     engine._exec_subagent({"agent_type": "auditor", "task": "check it"})
 
-    assert not inside["result"].startswith("ESCALATION_REQUEST:"), (
+    # \x1f, not ':'. As a *negative* assertion against the old prefix this passed
+    # for free once the wire format changed — it would no longer have noticed the
+    # pin regressing and the auditor being offered an escalation again.
+    assert not inside["result"].startswith("ESCALATION_REQUEST\x1f"), (
         "an escalation is a question the user could answer yes to — "
         "'it only observes' has to be a refusal")
     assert "read-only" in inside["result"] or "readonly" in inside["result"]
@@ -232,7 +249,7 @@ def test_a_normal_readonly_turn_still_escalates(engine, tmp_path):
 
     out = engine.run_tool("write_file", {"filename": str(tmp_path / "ask.txt"), "content": "x"})
 
-    assert out.startswith("ESCALATION_REQUEST:")
+    assert out.startswith("ESCALATION_REQUEST\x1f")
 
 
 @pytest.mark.parametrize("profile", ["explore", "researcher", "general-purpose", "coder"])
