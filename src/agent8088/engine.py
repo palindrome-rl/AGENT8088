@@ -980,6 +980,29 @@ def _local_shell_reads_files(command: str) -> bool:
     )
 
 
+def _is_fixed_host_tool_command(command: str) -> bool:
+    """Whether this is verbatim the command of a host tool that takes no arguments.
+
+    The host file-read guard exists for commands whose target the model chose —
+    `cat <path>`, `git show <ref>:<path>`. A tool declared with a fixed `command`
+    and no `args=` has no such target: the text is identical every time and comes
+    from tools.txt, not from the model. Refusing those made `git_status` demand
+    an approval in readonly, the mode it is most useful in.
+
+    Derived from the registry rather than hardcoded, so a tool that later gains
+    an argument drops out of the exemption by construction.
+    """
+    normalised = " ".join((command or "").split())
+    if not normalised:
+        return False
+    return normalised in {
+        " ".join(str(spec.get("command", "")).split())
+        for spec in TOOL_SPECS.values()
+        if spec.get("host") and spec.get("mode") == "shell"
+        and not spec.get("args") and spec.get("command")
+    }
+
+
 def check_permission(mode: str, command: str = "", path_zone: str = "default",
                      host: bool = False, approval_key: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
@@ -1021,7 +1044,8 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
         return False  # read_paths zone active: reads outside zone escalate
     if mode == "shell" and _readonly_shell(command):
         if ((host or _resolve_sandbox_backend() == "local")
-                and _local_shell_reads_files(command)):
+                and _local_shell_reads_files(command)
+                and not _is_fixed_host_tool_command(command)):
             return False
         return True
     # One-shot grant: allow one blocked tool through, then revert
@@ -2324,9 +2348,35 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     workspace = ", ".join(dict.fromkeys(
         [str(ARTIFACTS_ROOT), *(str(p) for p in ALLOWED_PATHS)]
     ))
-    task += (f"\nWorkspace paths (resolve any relative name against these): {workspace}\n"
+    task += f"\nWorkspace paths (resolve any relative name against these): {workspace}\n"
+
+    # The exact file the step touched, resolved the way the step resolved it.
+    # Without this the auditor is handed a bare name like "library.py", which
+    # read_text resolves against the project while execute_shell resolves inside
+    # a disposable copy of artifacts/ — two different files. It compared one
+    # against a claim about the other, correctly reported a mismatch, and a
+    # correct write was reverted on the strength of it.
+    spec = TOOL_SPECS.get(tool_name, {})
+    raw_path = _tool_path(spec, tool_args)
+    if raw_path:
+        try:
+            resolver = (resolve_write_path if spec.get("mode") == "write_text"
+                        else resolve_user_path)
+            task += f"The step touched exactly this path: {resolver(raw_path)}\n"
+        except Exception:
+            pass
+
+    task += ("\nYour two tools do not see the same filesystem:\n"
+             "- read_text reads the real file. Use it, with the absolute path "
+             "above, whenever the criteria concern a file's contents or size.\n"
+             "- execute_shell runs inside a DISPOSABLE COPY of the sandbox "
+             "workspace, not the project. A relative name there is a different "
+             "file, so `wc`, `ls` or `tail` on it is not evidence about the path "
+             "above.\n"
              "If you cannot locate what the criteria refer to, the verdict is "
-             "'unknown'. Never answer 'pass' for something you did not observe.\n"
+             "'unknown'. Never answer 'pass' for something you did not observe, "
+             "and never answer 'fail' from a path you have not confirmed is the "
+             "one the step wrote.\n"
              "\nReply with a single VERDICT line as instructed.")
     answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
     verdict = _VERDICT_RE.search(answer or "")
@@ -3030,6 +3080,32 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
 )
 
 
+# Set once the native runtime has proved it cannot start a sandbox in this
+# process. A runtime that cannot log into its restricted account does not heal
+# between commands, so retrying it per command spends a node subprocess to reach
+# the same failure and reprints the same wall of stderr in the transcript.
+_native_sandbox_broken = False
+
+
+def _native_sandbox_repair_hint(result: str) -> str:
+    """Turn the runtime's pre-flight error into something the reader can act on.
+
+    Raw, it is 200 characters of WFP and CreateProcessWithLogonW detail whose own
+    suggestion — start the Secondary Logon service — is usually wrong: the
+    service is running and the sandbox account is enabled, but the credential the
+    runtime holds no longer opens it. Reprovisioning is what actually fixes that,
+    and it needs elevation, which is the part worth saying out loud.
+    """
+    text = result or ""
+    if "CreateProcessWithLogonW" in text or "Access is denied" in text:
+        return ("The sandbox account could not be logged into. Re-run "
+                "`agent8088 --sandbox-setup` from an elevated terminal to "
+                "reprovision it.")
+    if "Native sandbox runtime is unavailable" in text:
+        return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
+    return f"Reason: {text[:200]}"
+
+
 def _native_sandbox_unusable(result: str) -> bool:
     """Whether the native runtime failed to start the command at all.
 
@@ -3184,7 +3260,12 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                         ignore=shutil.ignore_patterns(
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
+    global _native_sandbox_broken
     try:
+        # Already proved unusable this process: go straight to Docker rather than
+        # paying for the same failure again.
+        if backend == "native" and _native_sandbox_broken and _docker_available():
+            backend = "docker"
         if backend == "native":
             local_command = (
                 _process_display([sys.executable, "-c", command])
@@ -3203,8 +3284,13 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                 return result
             if not _docker_available():
                 return result  # keep the runtime's own error; it says more
-            _log.warning("native sandbox could not start, falling back to docker: %s",
-                         result[:200])
+            # Once per process. The condition is permanent for this run, and
+            # repeating a 200-character stderr dump above every command turns a
+            # working fallback into visible breakage.
+            if not _native_sandbox_broken:
+                _log.warning("native sandbox could not start, using docker for the "
+                             "rest of this session. %s", _native_sandbox_repair_hint(result))
+            _native_sandbox_broken = True
         return _exec_docker_command(command, timeout, python_code, image,
                                     workspace=workspace)
     finally:

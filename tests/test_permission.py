@@ -238,15 +238,26 @@ def test_run_tool_allows_safe_shell_in_readonly(monkeypatch):
     assert "ESCALATION_REQUEST" not in result
 
 def test_readonly_git_inspection_depends_on_sandbox(monkeypatch):
+    """Ad-hoc git reads still depend on isolation; the fixed tool commands do not.
+
+    The host file-read guard exists for a target the model chose. The three
+    read-only git tools ship as fixed, argument-free commands, so there is no
+    target to choose — and refusing them would make `git_status` demand an
+    approval in the mode it is most useful in.
+    """
     monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "native")
     for subcommand in ("status", "diff", "log", "show", "branch"):
         assert A.check_permission("shell", f"git {subcommand}") is True
-    monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "local")
-    for subcommand in ("status", "diff", "log", "show"):
-        assert A.check_permission("shell", f"git {subcommand}") is False
-    assert A.check_permission("shell", "git branch") is True
-    monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "docker")
+
+    # An arbitrary git read on the host is still refused...
+    assert A.check_permission("shell", "git show", host=True) is False
     assert A.check_permission("shell", "git show HEAD:.env", host=True) is False
+    assert A.check_permission("shell", "git diff -- .env", host=True) is False
+    # ...while the exact command git_diff ships is allowed.
+    assert A.check_permission("shell", "git diff", host=True) is True
+    assert A.check_permission("shell", "git status --short --branch", host=True) is True
+    assert A.check_permission("shell", "git branch", host=True) is True
+
     for subcommand in ("clone", "commit", "push", "reset", "checkout"):
         assert A.check_permission("shell", f"git {subcommand}") is False
 

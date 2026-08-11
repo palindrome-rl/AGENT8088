@@ -91,12 +91,20 @@ def test_normal_writes_are_utf8_and_preserve_newlines(engine, tmp_path, monkeypa
 
 # ----------------------------------------------------------- 2. HOST TOOLS
 def test_git_tools_declared_host(engine):
-    """Read-only git tools stay sandboxed with a Git-capable image."""
+    """Every git tool runs on the host — the sandbox is not the repository.
+
+    The read-only three used to run in a container with a Git-capable image.
+    Once the sandbox workspace was confined to artifacts/, that container held no
+    repository and they returned `fatal: not a git repository`. They are safe on
+    the host because each is a FIXED command with no `args=`: no model-chosen
+    text reaches the shell. See tests/test_git_tools_host.py.
+    """
     for name in ("git_clone", "git_commit", "git_push", "git_create_pr"):
         assert engine.TOOL_SPECS[name].get("host"), f"{name} should be host=1"
     for name in ("git_status", "git_diff", "git_log"):
-        assert not engine.TOOL_SPECS[name].get("host"), f"{name} should be sandboxed"
-        assert engine.TOOL_SPECS[name].get("sandbox_image") == "alpine/git:v2.47.2"
+        assert engine.TOOL_SPECS[name].get("host"), f"{name} should be host=1"
+        assert not engine.TOOL_SPECS[name].get("args"), (
+            f"{name} takes arguments; host execution needs re-justifying")
 
 
 def test_execute_shell_stays_sandboxed(engine):
@@ -159,7 +167,9 @@ def test_host_git_push_requires_dedicated_confirmation(engine, monkeypatch):
 
 def test_missing_binary_reports_actionably(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
-    monkeypatch.setattr(engine, "_exec_sandbox_command",
+    # git_status is a host tool now, so it runs through _exec_process rather
+    # than the sandbox path this used to stub.
+    monkeypatch.setattr(engine, "_exec_process",
                         lambda *a, **k: "sh: 1: git: not found\nCommand exited with status 127.")
     out = engine.run_tool("git_status", {})
     assert "not available" in out.lower() or "not found" in out.lower()
