@@ -195,8 +195,19 @@ class DiscordAdapter(BaseChannelAdapter):
         return DiscordStreamSink(self, chat_id)
 
     async def send_message(self, chat_id: str, text: str, **meta) -> str:
-        msg = await self._send(chat_id, text)
-        return str(msg.id) if msg else "0"
+        # Discord's hard limit is 2000 chars (regular) / 4000 (boosted server) —
+        # chunk so a long reply (a presented plan, /capabilities, big tool
+        # output) doesn't get rejected outright with a 400.
+        chunks = [text[i:i + MAX_MESSAGE_LENGTH]
+                  for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+        if not chunks:
+            chunks = [text]
+        first_id = "0"
+        for chunk in chunks:
+            msg = await self._send(chat_id, chunk)
+            if msg and first_id == "0":
+                first_id = str(msg.id)
+        return first_id
 
     async def edit_message(self, chat_id: str, msg_id: str, text: str) -> None:
         if not self._client:

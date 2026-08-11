@@ -62,6 +62,43 @@ def test_discord_adapter_supports_streaming(tmp_path, monkeypatch):
     assert adapter.streaming_overflow_limit() == 2000
 
 
+def test_discord_send_message_chunks_long_text(tmp_path, monkeypatch):
+    """Discord rejects any single message over ~2000-4000 chars with a 400.
+    A long presented plan (or any big reply) must be split into multiple
+    sends instead of handed to _send whole."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from agent8088.gateway.platforms.discord import DiscordAdapter, MAX_MESSAGE_LENGTH
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
+    config = {"discord_bot_token": "test-token"}
+    adapter = DiscordAdapter(config, runner=None)
+    adapter._send = AsyncMock(side_effect=lambda chat_id, text, view=None: type(
+        "M", (), {"id": 1})())
+
+    long_text = "x" * (MAX_MESSAGE_LENGTH * 3 + 10)
+    asyncio.run(adapter.send_message("123", long_text))
+
+    assert adapter._send.call_count == 4
+    for call in adapter._send.call_args_list:
+        assert len(call.args[1]) <= MAX_MESSAGE_LENGTH
+
+
+def test_discord_send_message_short_text_sends_once(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from agent8088.gateway.platforms.discord import DiscordAdapter
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
+    config = {"discord_bot_token": "test-token"}
+    adapter = DiscordAdapter(config, runner=None)
+    adapter._send = AsyncMock(side_effect=lambda chat_id, text, view=None: type(
+        "M", (), {"id": 42})())
+
+    msg_id = asyncio.run(adapter.send_message("123", "hi"))
+
+    assert adapter._send.call_count == 1
+    assert msg_id == "42"
+
+
 def test_discord_approval_view_lookup_uses_tuple_key(tmp_path, monkeypatch):
     """Discord _ApprovalView must look up pending approvals by
     ("discord", chat_id) tuple -- the runner stores entries keyed by

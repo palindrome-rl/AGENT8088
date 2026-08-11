@@ -1,6 +1,6 @@
 from unittest.mock import patch
 from agent8088.gateway.session import SessionStore
-from agent8088.gateway.agent_bridge import run_turn
+from agent8088.gateway.agent_bridge import run_turn, _turn_max_turns
 
 
 def test_run_turn_loads_session_calls_engine_saves(tmp_path):
@@ -64,6 +64,65 @@ def test_run_turn_no_streaming(tmp_path):
     # Verify on_token was NOT passed to run_agent (no streaming in gateway)
     _, kwargs = mock_A.run_agent.call_args
     assert "on_token" not in kwargs
+
+# --- Plan-mode round budget --------------------------------------------------
+
+def test_turn_max_turns_uses_configured_value_outside_plan_mode():
+    assert _turn_max_turns_with_config({"max_turns": "10"}, "readonly") == 10
+    assert _turn_max_turns_with_config({"max_turns": "10"}, "full-auto") == 10
+
+
+def test_turn_max_turns_floors_at_25_for_plan_only():
+    assert _turn_max_turns_with_config({"max_turns": "10"}, "plan-only") == 25
+
+
+def test_turn_max_turns_keeps_a_higher_configured_value_in_plan_only():
+    assert _turn_max_turns_with_config({"max_turns": "40"}, "plan-only") == 40
+
+
+def _turn_max_turns_with_config(app_config, mode):
+    with patch("agent8088.gateway.agent_bridge.A") as mock_A:
+        mock_A.APP_CONFIG = app_config
+        return _turn_max_turns(mode)
+
+
+def test_run_turn_gives_plan_only_the_25_round_floor(tmp_path):
+    store = SessionStore(base_dir=str(tmp_path))
+    key = "agent:main:telegram:private:U1"
+
+    with patch("agent8088.gateway.agent_bridge.A") as mock_A:
+        mock_A.APP_CONFIG = {"max_turns": "10"}
+        mock_A.PERMISSION_MODE = "plan-only"
+        mock_A.BASE_SYSTEM_PROMPT = "sys"
+        mock_A.TOOL_SPECS = {}
+        mock_A.build_tools_def.return_value = []
+        mock_A.run_agent.return_value = "ok"
+        mock_A.strip_tool_json.side_effect = lambda x: x
+
+        run_turn(key, "build me a big thing", session_store=store)
+
+    _, kwargs = mock_A.run_agent.call_args
+    assert kwargs["max_turns"] == 25
+
+
+def test_run_turn_uses_configured_value_when_not_plan_only(tmp_path):
+    store = SessionStore(base_dir=str(tmp_path))
+    key = "agent:main:telegram:private:U1"
+
+    with patch("agent8088.gateway.agent_bridge.A") as mock_A:
+        mock_A.APP_CONFIG = {"max_turns": "10"}
+        mock_A.PERMISSION_MODE = "full-auto"
+        mock_A.BASE_SYSTEM_PROMPT = "sys"
+        mock_A.TOOL_SPECS = {}
+        mock_A.build_tools_def.return_value = []
+        mock_A.run_agent.return_value = "ok"
+        mock_A.strip_tool_json.side_effect = lambda x: x
+
+        run_turn(key, "hi", session_store=store)
+
+    _, kwargs = mock_A.run_agent.call_args
+    assert kwargs["max_turns"] == 10
+
 
 # --- Inbound sanitizing -----------------------------------------------------
 
