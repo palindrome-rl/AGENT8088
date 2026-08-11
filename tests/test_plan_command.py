@@ -359,3 +359,21 @@ def test_the_system_prompt_teaches_present_plan_not_json_steps(engine):
 
     assert "present_plan" in prompt
     assert "## Plan Mode" in prompt
+
+
+def test_a_subagent_cannot_take_the_session_out_of_plan_mode(engine):
+    """The plan belongs to the main agent's turn. A delegated sub-task asking the
+    user to approve *its* plan would leave plan mode on the strength of an approval
+    the user gave for something else. No shipped profile can reach present_plan,
+    but a hand-written one could, and the hole would be silent."""
+    engine.PERMISSION_MODE = "readonly"
+    engine.enter_plan_mode()
+    asked = []
+    engine._plan_on_approval = lambda text: asked.append(text) or "full-auto"
+
+    out = engine.run_tool("present_plan", {"plan": PLAN}, depth=1)
+
+    assert asked == [], "a subagent must not get to ask"
+    assert engine.PERMISSION_MODE == "plan-only"
+    assert engine._plan_approved is False
+    assert "sub-agent" in out

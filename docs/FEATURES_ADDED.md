@@ -618,7 +618,7 @@ agent8088 --model-setup
 /usage [off|tokens|full]  Control post-turn usage summaries
 /tools                    List every tool with args, mode, description
 /tool <name> <args>       Invoke one tool directly (JSON or key=value)
-/plan <steps>             Run the plan-executor
+/plan [task]              Enter plan mode: propose, approve, then run
 /raw <text>               One raw model call (content, reasoning, tool_calls)
 /config                   Active configuration
 /doctor                   Check endpoint reachability and local capability state

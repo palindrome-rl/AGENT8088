@@ -4,6 +4,52 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Plan Mode
+
+`/plan` now means what it means in Claude Code, Hermes and Codex: enter plan mode,
+research read-only, propose one plan, get it approved, run it, come back.
+
+### Changed
+
+- `/plan` is a mode, not a one-shot wrapper. It used to flip to plan-only for
+  exactly one message and restore the previous mode in a `finally`, so there was
+  no state in which a plan could be reviewed, approved and then run. It now holds
+  across turns, and `/mode plan-only` starts the same session.
+- Approving a plan switches the permission mode, the plan runs through the
+  ordinary tool path, and the session returns to the mode it had before `/plan`
+  once the work is done. Approve with `a` to run it, or `e` to be asked before
+  each edit.
+- `set_permission_mode()` is the single funnel for mode changes, so no grant
+  outlives the mode that authorized it.
+- The prompt shows `plan` while plan mode is active, and `/model plan-only` now
+  points at `/mode` instead of dead-ending on "unknown provider".
+
+### Added
+
+- `present_plan` tool: presents a plan as markdown for approval. Plan proposal and
+  plan execution used to be the same tool, which meant the only approvable plan
+  was a fully-specified JSON step array — something models do not reliably
+  produce, so a plan written the way a human reads it halted on its first step.
+
+### Fixed
+
+- A plan the model only described is no longer reported as done. A turn that ends
+  in plan mode with nothing approved now says so explicitly.
+- Plan mode is no longer one-shot. After an approved plan finished, every later
+  mutation was hard-blocked with a message naming a JSON step array, and the model
+  retried the direct call until the turn died with "I wasn't able to produce an
+  answer" — for every turn thereafter.
+- A plan step that names no tool halts with an explicit error instead of being
+  classified into an arbitrary tool and handed its own prose as that tool's single
+  required argument, which could route plan text to a shell as a literal command.
+- `find_tool_calls` parses every batched `✿FUNCTION✿`/`✿ARGS✿` block instead of
+  only the first. One greedy regex spanned all the blocks in a reply at once, so
+  three batched `write_file` calls arrived as a single unparseable blob and all
+  three were lost. Each block's JSON extent is now found by counting braces
+  outside string literals, which keeps nested JSON intact.
+
+---
+
 ## Long-Horizon Reliability
 
 Both changes target the same failure: a step that did not do what it claimed,

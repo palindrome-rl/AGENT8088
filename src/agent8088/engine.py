@@ -2177,7 +2177,7 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     return "", ""
 
 
-def _exec_present_plan(args: dict) -> str:
+def _exec_present_plan(args: dict, depth: int = 0) -> str:
     """Show a finished plan and ask the user to approve it.
 
     This is plan mode's exit point, not an executor. Presentation and execution
@@ -2189,6 +2189,13 @@ def _exec_present_plan(args: dict) -> str:
     does the work.
     """
     global _plan_approved, _plan_tool_ran
+    if depth:
+        # The plan belongs to the main agent's turn. A sub-agent asking the user to
+        # approve *its* plan for a delegated sub-task would leave plan mode on the
+        # strength of an approval given for something else entirely.
+        return ("Error: a sub-agent cannot present a plan. Finish your task with the "
+                "tools you have and report back; the agent that delegated to you owns "
+                "the plan.")
     _plan_tool_ran = True
     plan_text = str(args.get("plan") or args.get("text") or args.get("steps") or "").strip()
     if not plan_text:
@@ -3557,7 +3564,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
         if name == "present_plan":
-            return _exec_present_plan(args)
+            return _exec_present_plan(args, depth=depth)
         return _exec_plan(args, on_step=_plan_on_step,
                           on_escalation=_plan_on_escalation, depth=depth)
 
