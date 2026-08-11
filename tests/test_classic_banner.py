@@ -138,14 +138,17 @@ def test_interactive_prompt_uses_the_persistent_status_bar(monkeypatch):
 def test_stream_view_hides_large_tool_wire_payloads():
     output = io.StringIO()
     console = Console(file=output, width=100, color_system=None)
+    stream = classic._StreamFilter()
+    stream.feed(
+        '✿FUNCTION✿: write_file ✿ARGS✿: {"content":"' + "x" * 20_000 + '"}'
+    )
 
-    console.print(classic._stream_view([], [
-        '✿FUNCTION✿: write_file ✿ARGS✿: {"content":"' + "x" * 20_000 + '"}',
-    ]))
+    console.print(classic._stream_view([], stream.prose_text()))
 
     rendered = output.getvalue()
-    assert "preparing tool call" in rendered
     assert "x" * 100 not in rendered
+    assert "✿FUNCTION✿" not in rendered
+    assert "writing" in stream.status_label()
 
 
 def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):
