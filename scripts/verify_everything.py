@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -292,7 +293,7 @@ expected_tools = {
     "web_search": "search", "get_page_title": "http_get", "calculate": "python_eval",
     "last_output": "last_output", "spawn_subagent": "subagent",
     "describe_capabilities": "introspect",
-    "execute_plan": "plan",
+    "present_plan": "plan", "execute_plan": "plan",
     "git_status": "shell", "git_diff": "shell", "git_log": "shell",
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
@@ -342,26 +343,23 @@ with with_mode("readonly"):
     # Shell-mode tools execute INSIDE the sandbox, so git availability depends on
     # the backend. Verify them on a host-capable backend, then record what the
     # container backend can and cannot do.
+    # Run them on whatever backend this machine actually resolves to. The old
+    # form forced SANDBOX_BACKEND="local" and granted local_execution per call;
+    # both are gone — unisolated execution was removed, so "local" now falls
+    # through to auto and the grant applies to nothing.
     _pb = E.SANDBOX_BACKEND
-    E.SANDBOX_BACKEND = "local"
-    with with_mode("edit"):
-        # The local backend refuses to run unisolated without an explicit
-        # local_execution grant, and the grant is consumed per command. These
-        # checks are about what git returns once approved, so approve each one —
-        # otherwise they assert on an ESCALATION_REQUEST string, which is the
-        # gate working correctly rather than the tool failing.
-        E.grant_escalation("local_execution")
-        r = E.run_tool("git_status", {})
-        ok("git_status runs after explicit host approval",
-           "##" in r, r.splitlines()[0][:40] if r else "")
-        E.grant_escalation("local_execution")
-        r = E.run_tool("git_log", {})
-        ok("git_log runs after explicit host approval",
-           len(r.splitlines()) > 3, f"{len(r.splitlines())} lines")
-        E.grant_escalation("local_execution")
-        r = E.run_tool("git_diff", {})
-        ok("git_diff runs after explicit host approval", isinstance(r, str))
-    E.SANDBOX_BACKEND = _pb
+    if E._resolve_sandbox_backend() == "unavailable":
+        skip("git tools", "no sandbox backend available")
+    else:
+        with with_mode("edit"):
+            r = E.run_tool("git_status", {})
+            ok("git_status returns branch and status",
+               "##" in r, r.splitlines()[0][:40] if r else "")
+            r = E.run_tool("git_log", {})
+            ok("git_log returns commits",
+               len(r.splitlines()) > 3, f"{len(r.splitlines())} lines")
+            r = E.run_tool("git_diff", {})
+            ok("git_diff returns a string", isinstance(r, str))
     if E._resolve_sandbox_backend() == "docker":
         with with_mode("edit"):
             r = E.run_tool("git_status", {})
@@ -502,7 +500,10 @@ ok("network is blocked by default", st["network"] == "blocked", st["network"])
 ok("runtime version pinned", bool(st["runtime_version"]), st["runtime_version"])
 
 prev_backend = E.SANDBOX_BACKEND
-for req, expect_in in [("local", {"local"}), ("native", {"native", "unavailable"}),
+# "local" is no longer a backend: unisolated execution was removed outright, so
+# the name now falls through to auto rather than selecting anything.
+for req, expect_in in [("local", {"native", "docker", "unavailable"}),
+                       ("native", {"native", "unavailable"}),
                        ("docker", {"docker", "unavailable"}),
                        ("auto", {"native", "docker", "unavailable"})]:
     E.SANDBOX_BACKEND = req
@@ -524,7 +525,13 @@ _op = E._exec_process
 E._exec_process = cap.process
 E._exec_docker_command("print(1)", 30, python_code=True)
 E._exec_process = _op
-argv = cap.calls[0]["command"] if cap.calls else []
+# The container run, not merely the first subprocess: image provisioning probes
+# with `docker image inspect` and may `docker pull` before anything runs, so
+# calls[0] was the probe and every flag below read as missing — a hardening
+# regression that was not one.
+_docker_runs = [c["command"] for c in cap.calls
+                if isinstance(c["command"], list) and c["command"][:2] == ["docker", "run"]]
+argv = _docker_runs[0] if _docker_runs else (cap.calls[0]["command"] if cap.calls else [])
 argv_s = " ".join(argv) if isinstance(argv, list) else str(argv)
 for flag, why in [("--rm", "disposable"), ("--network none", "no network"),
                   ("--memory 512m", "memory cap"), ("--cpus 1", "cpu cap"),
@@ -603,7 +610,13 @@ deny = " ".join(data["filesystem"]["denyRead"])
 for p in (".ssh", ".aws", ".gnupg", ".kube", ".netrc"):
     ok(f"denies read of {p}", p in deny)
 ok("denies read of the active config", str(E.CONFIG_PATH.resolve()) in deny)
-ok("workspace is writable", str(E.PROJECT_ROOT) in data["filesystem"]["allowWrite"])
+# Writes are confined to artifacts/, not the whole checkout — the same rule
+# resolve_write_path applies on the host. Pinning the confinement is worth more
+# than pinning that "the workspace" is writable, which it deliberately is not.
+_allow_write = data["filesystem"]["allowWrite"]
+ok("artifacts dir is writable", str(E.ARTIFACTS_ROOT) in _allow_write)
+ok("project root is not blanket-writable", str(E.PROJECT_ROOT) not in _allow_write,
+   ", ".join(_allow_write))
 sp = E._write_sandbox_settings()
 ok("settings file written", sp.exists())
 if E.sys.platform == "win32":
@@ -642,23 +655,25 @@ else:
     ok("settings file is owner-only (0600)", oct(sp.stat().st_mode)[-3:] == "600",
        oct(sp.stat().st_mode)[-3:])
 
-section("8e. SANDBOX — local fallback requires consent")
+section("8e. SANDBOX — no backend means refusal, never an unisolated run")
+# Local execution used to be offered behind a one-shot consent prompt. It was
+# removed: a prompt is only a safeguard if the person answering knows what they
+# are agreeing to, and "run this without isolation?" mid-task is answered yes.
+# What matters now is that the absence of a sandbox refuses rather than degrades.
 E.SANDBOX_BACKEND = "docker"
-_da = E._docker_available
+_da, _nsb = E._docker_available, E._native_sandbox_broken
 E._docker_available = lambda: False
-E._local_fallback_grant = False
-r = E._exec_sandbox_command("echo hi", 5)
-ok("no backend -> escalation request, not silent local run",
-   "ESCALATION_REQUEST" in r and "local_execution" in r, r[:55])
-E.grant_escalation("local_execution")
-r = E._exec_sandbox_command("echo consented_run", 5)
-ok("after consent it runs locally once", "consented_run" in r, r.strip()[:40])
-E._local_fallback_grant = False
-r = E._exec_sandbox_command("echo second_try", 5)
-ok("consent is one-shot (second call re-escalates)", "ESCALATION_REQUEST" in r)
+E._native_sandbox_broken = False
+marker = TMP / "unisolated-run-happened"
+r = E._exec_sandbox_command(f"echo hi > {shlex.quote(str(marker))}", 5)
+ok("no backend -> refused", "Error:" in r and "sandbox is required" in r, r[:55])
+ok("refusal names the way out", "--sandbox-setup" in r or "Docker" in r)
+ok("nothing ran on the host", not marker.exists())
+ok("'local' is not a selectable backend", "local" not in E._SANDBOX_BACKENDS,
+   ", ".join(sorted(E._SANDBOX_BACKENDS)))
 E._docker_available = _da
+E._native_sandbox_broken = _nsb
 E.SANDBOX_BACKEND = prev_backend
-E._local_fallback_grant = False
 
 # ============================================================ 9. PROVIDERS
 section("9. PROVIDERS")
@@ -1050,11 +1065,20 @@ E.create_completion = _orig_cc
 section("18b. PLAN EXECUTOR")
 steps = []
 with with_mode("readonly"):
-    r = E._exec_plan({"steps": '["compute 2+2", "list files"]'},
-                     on_step=lambda *a: steps.append(a[3]))
+    # Structured steps, because free text is now refused rather than guessed into
+    # a tool — driving this with prose measured zero callbacks and read as a
+    # broken callback rather than a changed contract.
+    r = E._exec_plan({"steps": json.dumps([
+        {"tool": "calculate", "arguments": {"expression": "2+2"}},
+        {"tool": "calculate", "arguments": {"expression": "3+3"}},
+    ])}, on_step=lambda *a: steps.append(a[3]))
     ok("plan runs steps and reports", isinstance(r, str) and "[1]" in r, r[:45])
-    ok("plan step callback fires for each step", len(set(steps)) >= 1 and len(steps) >= 2,
+    ok("plan step callback fires for each step", len(steps) >= 2,
        f"{len(steps)} callbacks across {len(set(steps))} tools")
+    prose = E._exec_plan({"steps": json.dumps(["compute 2+2"])})
+    ok("free-text plan step is refused, not guessed into a tool",
+       "names no tool" in prose or "free text" in prose or "not a tool call" in prose,
+       prose[:60])
     ok("plan rejects a non-list", "requires a list" in E._exec_plan({"steps": "{}"})
        or isinstance(E._exec_plan({"steps": "not json"}), str))
     ok("nested plan blocked",
