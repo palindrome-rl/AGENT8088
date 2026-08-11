@@ -148,7 +148,7 @@ mutating git tools, `schedule_task`, `browse_page`, `spawn_subagent`,
 ### Why writes are opt-in
 
 **MCP has no approval channel.** In readonly mode a blocked write returns
-`ESCALATION_REQUEST:…`, which is just a string the client can't answer — there is
+an `ESCALATION_REQUEST` payload, which is just a string the client can't answer — there is
 no prompt to show anyone. So the server runs the engine in **full-auto**, and
 that is only safe while the exposed set is non-mutating. A test asserts every
 default-exposed tool has a non-mutating mode, so a future addition can't quietly

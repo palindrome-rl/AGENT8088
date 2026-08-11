@@ -40,7 +40,7 @@ Run with no flags for the interactive REPL.
 
 ## Slash commands
 
-**33 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
+**36 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
 `/models`.
 
 ### Session

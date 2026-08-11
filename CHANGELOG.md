@@ -4,6 +4,55 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Merge: feature work onto the fix work
+
+Two branches ran in parallel for a day — fixes and hardening on one, plan mode and
+the auditor on the other. Three files conflicted textually. The interesting part is
+what did not: `engine.py` merged cleanly while four of its functions had been edited
+on both sides, so git had nothing to report and the defects below stayed silent
+until they were looked for.
+
+### Fixed
+
+- **Seven `:`-delimited escalation checks** the merge preserved from the fix branch.
+  The payload is `\x1f`-delimited so a Windows path (`C:\Users\...`) stops splitting
+  on `:`; a stale check does not raise, it simply stops matching. The one that
+  mattered is in `_run_agent_loop`: a `web_search` blocked pending approval was
+  recorded as a *completed* search, so the redundancy guard answered the user's
+  approved retry out of the escalation text. The code's own comment said "an
+  escalation is not a result" — which is exactly what had broken.
+  `tests/test_escalation_wire_format.py` now pins the invariant structurally, across
+  `engine.py`, `cli.py`, `tests/` and `scripts/`.
+- **An approved plan no longer trips the post-search fetch gate.** A plan-mode turn
+  researches with a search and then runs the approved steps in that same turn, so
+  the gate refused work the user had just authorised — and `_user_requested_tool`
+  could not rescue it, because they approved a plan rather than naming a tool. The
+  exemption holds only between approval and the end of that turn.
+- **The plan-approval prompt pauses the ESC listener.** The fix branch solved this
+  for `_handle_escalation`; the feature branch then added a second interactive
+  prompt it had never seen, which inherited the bug instead of the fix. A running
+  listener eats the keystroke meant for `Approve plan?`.
+- **Two tests that were passing for the wrong reason.**
+  `test_readonly_safe_shell_runs_in_readonly` asserted that `pwd` does not escalate;
+  with no sandbox available it does, but the escalation was buried inside the
+  `<<<EXTERNAL_UNTRUSTED_CONTENT ...>>>` envelope where `startswith` could not see
+  it. Unwrapping escalations — so a blocked step cannot read as a successful one —
+  made unchanged behaviour start failing.
+  `test_search_without_the_opt_in_is_blocked_in_plan_only` asserted a literal
+  message string that had deliberately changed. Both now assert their stated intent.
+
+### Notes
+
+- `discord.py` resolved to the fix branch's side: both branches had independently
+  fixed the same tuple-key bug, but only one added `_check_clicker`, which three
+  button handlers already call.
+- The prompt label keeps its bare form. `_status_bar_fragments()` already renders
+  the context percentage *and* the permission mode, so a `plan` badge would sit an
+  inch above a bar reading `plan-only`. `_prompt_label()` — the Rich fallback, which
+  has no toolbar — keeps both.
+
+---
+
 ## Tool-Use Intelligence
 
 ### Runtime date context

@@ -25,7 +25,7 @@ def run_turn(session_key: str, user_text: str, session_store: SessionStore,
     """Load a JSON session, run the agent loop, save it, return the answer.
 
     If on_escalation is provided, it is called as on_escalation(name, result)
-    when a tool result starts with ESCALATION_REQUEST:. It must return True
+    when a tool result starts with the escalation prefix. It must return True
     (approved) or False (denied). The callback is synchronous (runs in the
     agent thread) and should block until the user responds.
     """
