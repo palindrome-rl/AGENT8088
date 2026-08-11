@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="assets/palindrome-research-labs.png" alt="Agent8088" width="420">
+  <img src="assets/agent8088-logo.png" alt="Agent8088" width="540">
 </p>
-
-<h1 align="center">Agent8088</h1>
 
 <p align="center">
   <strong>A local-first AI agent that can use tools, work across your chats, and ask before it acts.</strong>
@@ -22,8 +20,6 @@
 </p>
 
 Agent8088 is a local-first agent for real work: it reads files, runs tools, researches the web, and can make changes only within a permission system you control. Run it against local Ollama or a hosted OpenAI-compatible model, use it from the terminal or a messaging gateway, and extend it with MCP servers, skills, and focused sub-agents.
-
-Built by Palindrome Research Labs.
 
 ---
 
@@ -148,3 +144,7 @@ See the [contribution guide](docs/wiki/14-contributing.md) for the required isol
 ## License
 
 [MIT](LICENSE)
+
+<p align="center">
+  <img src="assets/palindrome-research-labs.png" alt="Palindrome Research Labs" width="72">
+</p>
