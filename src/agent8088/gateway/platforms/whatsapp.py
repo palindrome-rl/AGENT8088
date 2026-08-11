@@ -321,7 +321,10 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 return SendResult(ok=True, message_id=str(msg_id) if msg_id else None)
             return SendResult(ok=False, error=data.get("error", "unknown"))
         except Exception as e:
-            logger.warning("WhatsApp send failed: %s", e)
+            # str(e) is empty for some httpx transport-level errors on Windows
+            # (e.g. a reset loopback connection) — include the type so a blank
+            # message doesn't hide what actually failed.
+            logger.warning("WhatsApp send failed: %s: %s", type(e).__name__, e)
             return SendResult(ok=False, error=str(e))
 
     async def _edit(self, chat_id: str, msg_id: str, text: str) -> None:

@@ -3321,8 +3321,14 @@ def _run_gateway_setup():
                 if not node_modules.exists():
                     print("\nInstalling WhatsApp bridge npm dependencies...")
                     try:
+                        # Bare "npm" fails on Windows with WinError 2: the real
+                        # executable is npm.cmd, and subprocess.run without
+                        # shell=True skips PATHEXT resolution for a bare command
+                        # name. shutil.which resolves the actual npm.cmd path
+                        # (same pattern engine.py's install_native_sandbox uses).
+                        npm = shutil.which("npm")
                         subprocess.run(
-                            ["npm", "install", "--silent"],
+                            [npm, "install", "--silent"],
                             cwd=str(bridge_dir),
                             check=True,
                             timeout=120,
