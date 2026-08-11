@@ -2215,6 +2215,26 @@ def _prompt_label():
     return f"\n[bold #237dd7]8088[/bold #237dd7] [#237dd7]({pct}% ctx) ›[/#237dd7] "
 
 
+def _status_bar_fragments():
+    """Persistent session summary shown by prompt_toolkit while waiting for input."""
+    pct = _estimate_context_pct()
+    filled = min(10, max(0, pct // 10))
+    last = S.last_usage or {}
+    return [
+        ("fg:#00edff bold", " ✢ "),
+        ("fg:#237dd7 bold", f"{_active_provider_name()}:{A.MODEL_NAME}"[:26]),
+        ("", " │ "),
+        ("fg:#237dd7", f"{'█' * filled}{'░' * (10 - filled)} {pct}% ctx"),
+        ("", " │ "),
+        ("fg:#237dd7", A.PERMISSION_MODE),
+        ("", " │ "),
+        ("fg:#237dd7", (S.name or "ephemeral")[:18]),
+        ("", " │ "),
+        ("fg:#237dd7", f"last {last.get('seconds', 0):.1f}s ↑{last.get('tokens', 0)}"),
+        ("fg:#00edff", " │ ● idle "),
+    ]
+
+
 def _command_matches(text, slash=True):
     prefix = text.lstrip("/").lower()
     matches = [command for command in _COMPLETABLE_COMMANDS if command.startswith(prefix)]
@@ -2242,7 +2262,7 @@ def _read_line():
     try:
         from prompt_toolkit import prompt
         from prompt_toolkit.completion import Completer, Completion
-        from prompt_toolkit.formatted_text import ANSI
+        from prompt_toolkit.formatted_text import ANSI, FormattedText
         from prompt_toolkit.shortcuts import CompleteStyle
     except ImportError:
         return console.input(_prompt_label())
@@ -2253,15 +2273,13 @@ def _read_line():
             for match in matches:
                 yield Completion(match, start_position=-len(token))
 
-    pct = _estimate_context_pct()
-    label = (f"\n\x1b[1;38;2;35;125;215m8088\x1b[0m "
-             f"\x1b[38;2;35;125;215m({pct}% ctx) ›\x1b[0m ")
+    label = "\n\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
     return prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
-        bottom_toolbar="↑↓ select · Tab accept · Esc dismiss",
+        bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
     )
 
 

@@ -3,6 +3,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import prompt_toolkit
 from rich.console import Console
 
 import agent8088.cli as classic
@@ -89,6 +90,28 @@ def test_command_suggestions_cover_slash_and_bare_prefixes():
     assert classic._live_matches("/")[1] == classic._command_matches("/")
     assert classic._live_matches("/m")[1] == ["/maxturns", "/mcp", "/mode", "/model", "/models"]
     assert classic._live_matches("m") == ("m", ["maxturns", "mcp", "mode", "model", "models"])
+
+
+def test_status_bar_summarizes_the_idle_session(monkeypatch):
+    monkeypatch.setattr(classic, "_estimate_context_pct", lambda: 50)
+    monkeypatch.setattr(classic, "_active_provider_name", lambda: "local")
+    monkeypatch.setattr(classic.A, "MODEL_NAME", "test-model")
+    monkeypatch.setattr(classic.A, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(classic.S, "name", "demo")
+    monkeypatch.setattr(classic.S, "last_usage", {"seconds": 2.5, "tokens": 12})
+
+    rendered = "".join(text for _, text in classic._status_bar_fragments())
+
+    assert rendered == " ✢ local:test-model │ █████░░░░░ 50% ctx │ full-auto │ demo │ last 2.5s ↑12 │ ● idle "
+
+
+def test_interactive_prompt_uses_the_persistent_status_bar(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(prompt_toolkit, "prompt", lambda *args, **kwargs: captured.update(kwargs) or "hello")
+
+    assert classic._read_line() == "hello"
+    assert "idle" in "".join(text for _, text in captured["bottom_toolbar"]())
 
 
 def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):
