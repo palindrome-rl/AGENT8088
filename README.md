@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/agent8088-logo.png" alt="Agent8088" width="540">
+  <img src="assets/agent8088-wordmark.png" alt="Agent8088" width="540">
 </p>
 
 <p align="center">
