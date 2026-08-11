@@ -2,8 +2,9 @@
 
 [← Wiki index](README.md)
 
-Run Agent8088 as a bot in Slack, WhatsApp or Discord. Same engine, same tools,
-same permission layer — approvals just happen in chat instead of a terminal.
+Run Agent8088 as a bot in Slack, WhatsApp, Discord, Email or Telegram. Same
+engine, same tools, same permission layer — approvals just happen in chat
+instead of a terminal.
 
 ```sh
 agent8088 --gateway-setup     # configure a channel
@@ -18,9 +19,9 @@ pip install -e ".[gateway]"
 
 ## One channel at a time
 
-`--gateway-setup` is a single-select picker: choosing Slack disables WhatsApp and
-Discord. This is deliberate — one agent identity per running gateway keeps
-session keys and approvals unambiguous.
+`--gateway-setup` is a single-select picker: choosing Slack disables WhatsApp,
+Discord, Email and Telegram. This is deliberate — one agent identity per
+running gateway keeps session keys and approvals unambiguous.
 
 ## Access control — fail closed
 
@@ -30,6 +31,7 @@ Nobody can talk to the bot unless listed:
 slack_allowed_users=U01ABC2DEF3,U02GHI4JKL
 discord_allowed_users=123456789012345678
 whatsapp_allowed_users=+15551234567
+telegram_allowed_users=123456789,987654321
 ```
 
 An **empty list denies everyone.** `*` allows anyone (use with care).
@@ -133,15 +135,15 @@ refused. See [Permissions & Security](03-permissions-and-security.md#audit-trail
 
 ## Platform specifics
 
-| | Slack | WhatsApp | Discord |
-|---|---|---|---|
-| Transport | Socket Mode (outbound WS, no public URL) | local Baileys bridge (Node.js) | `discord.py` gateway |
-| Streaming | ✅ | ✅ | ✅ |
-| Message cap | 39,000 chars | 4,096 | 2,000 |
-| Threads | ✅ `thread_ts` | ❌ | ❌ |
-| Approval UI | text | text | **buttons** |
-| Markdown | `markdown_to_slack()` | `markdown_to_whatsapp()` | `markdown_to_discord()` |
-| Dedup | by `ts`, 500-entry cap | by message id | by message id, 500-entry cap |
+| | Slack | WhatsApp | Discord | Email | Telegram |
+|---|---|---|---|---|---|
+| Transport | Socket Mode (outbound WS, no public URL) | local Baileys bridge (Node.js) | `discord.py` gateway | IMAP poll + SMTP | `python-telegram-bot` long polling |
+| Streaming | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Message cap | 39,000 chars | 4,096 | 2,000 | — | 4,096 |
+| Threads | ✅ `thread_ts` | ❌ | ❌ | ✅ `In-Reply-To` | ✅ `message_thread_id` |
+| Approval UI | text | text | **buttons** | text | text |
+| Markdown | `markdown_to_slack()` | `markdown_to_whatsapp()` | `markdown_to_discord()` | plain text | `markdown_to_telegram()` |
+| Dedup | by `ts`, 500-entry cap | by message id | by message id, 500-entry cap | by UID | by `update_id`, 500-entry cap |
 
 ### Slack
 
@@ -189,6 +191,24 @@ WhatsApp LIDs back to phone numbers so allowlist matching works.
 
 DMs are always accepted; in guild channels it **requires an @mention**.
 
+### Telegram
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) -- `/newbot`, copy the
+   API token (looks like `123456789:ABCdef...`)
+2. For group chats, disable **privacy mode** via BotFather or promote the bot
+   to group admin. Remove and re-add the bot to any group afterwards.
+
+```ini
+telegram_enabled=1
+telegram_allowed_users=123456789
+```
+
+The token lives in `~/.agent8088/.env` as `TELEGRAM_BOT_TOKEN`.
+
+DMs are always accepted; in groups/supergroups it **requires an @mention of
+the bot or a reply to one of its messages**. The @mention is stripped from
+the text before the model sees it.
+
 ## Sessions
 
 Per-chat history in `~/.agent8088/gateway-sessions/`, one JSON file per
@@ -206,6 +226,7 @@ Gateway tokens live in `~/.agent8088/.env`, not `config.txt`:
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 DISCORD_BOT_TOKEN=...
+TELEGRAM_BOT_TOKEN=...
 ```
 
 Existing literal tokens in `config.txt` are migrated automatically on first run.

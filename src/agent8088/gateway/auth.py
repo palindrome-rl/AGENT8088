@@ -146,7 +146,7 @@ class Allowlist:
     def from_config(cls, config: dict) -> "Allowlist":
         users = []
         by_platform = {}
-        for key in ("whatsapp_allowed_users", "slack_allowed_users", "signal_allowed_users", "discord_allowed_users", "email_allowed_users"):
+        for key in ("whatsapp_allowed_users", "slack_allowed_users", "signal_allowed_users", "discord_allowed_users", "email_allowed_users", "telegram_allowed_users"):
             raw = config.get(key, "") or ""
             entries = [u.strip() for u in raw.split(",") if u.strip()]
             if not entries:

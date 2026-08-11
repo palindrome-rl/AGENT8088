@@ -86,7 +86,7 @@ def test_docker_missing_is_graceful(engine, monkeypatch):
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
     out = engine._exec_docker({"code": "print(1)"})
-    assert "ESCALATION_REQUEST:edit:local_execution:" in out
+    assert "ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1f" in out
 
 
 def test_docker_runs_code_isolated(engine, tmp_path, monkeypatch):

@@ -239,9 +239,14 @@ class _ApprovalView(discord.ui.View):
         self.runner = runner
         self.chat_id = chat_id
 
+    def _lookup(self):
+        """Look up the pending approval by (platform, chat_id) tuple —
+        the runner stores entries keyed by tuple, not bare string."""
+        return self.runner._pending_approvals.get(("discord", self.chat_id))
+
     @discord.ui.button(label="Approve", emoji="✅", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if not entry:
             await interaction.response.send_message("No pending approval.", ephemeral=True)
             return
@@ -252,7 +257,7 @@ class _ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Approve (session)", emoji="✔️", style=discord.ButtonStyle.primary)
     async def approve_session(self, interaction: discord.Interaction, button: discord.ui.Button):
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if not entry:
             await interaction.response.send_message("No pending approval.", ephemeral=True)
             return
@@ -264,7 +269,7 @@ class _ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Deny", emoji="❌", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if not entry:
             await interaction.response.send_message("No pending approval.", ephemeral=True)
             return
@@ -279,7 +284,7 @@ class _ApprovalView(discord.ui.View):
 
     async def on_timeout(self):
         """Fail-closed: mark as denied when buttons expire."""
-        entry = self.runner._pending_approvals.get(self.chat_id)
+        entry = self._lookup()
         if entry and not entry.event.is_set():
             entry.approved = False
             entry.event.set()

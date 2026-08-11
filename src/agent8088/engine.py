@@ -481,7 +481,7 @@ def _tool_call_key(name: str, args: dict) -> str:
 
 def _remember_escalation(name: str, args: dict, result: str) -> None:
     global _pending_approval_key
-    if result.startswith("ESCALATION_REQUEST:"):
+    if result.startswith("ESCALATION_REQUEST\x1f"):
         _pending_approval_key = _tool_call_key(name, args)
 
 
@@ -988,9 +988,12 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
 
 def request_escalation(target_mode: str, paths: list, change_type: str, reason: str) -> str:
     """Return a structured escalation request string for the model to relay
-    to the user. The UI intercepts this and prompts the user for approval."""
+    to the user. The UI intercepts this and prompts the user for approval.
+
+    Fields are delimited by \\x1f (ASCII unit separator) instead of ':' so
+    Windows paths like C:\\Users\\... don't break the parser."""
     return (
-        f"ESCALATION_REQUEST:{target_mode}:{change_type}:{','.join(paths)}:{reason}"
+        f"ESCALATION_REQUEST\x1f{target_mode}\x1f{change_type}\x1f{','.join(paths)}\x1f{reason}"
     )
 
 
@@ -2090,7 +2093,7 @@ def _plan_step_failed(result: str) -> bool:
     approved it). Both mean the intended effect is absent, so every later step
     is now standing on an assumption that is already false.
     """
-    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST:"))
+    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST\x1f"))
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -2351,7 +2354,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         # Unwrapped: shell results arrive inside the untrusted-content markers, so
         # matching the raw string meant a shell step in a plan never offered the
         # approval prompt at all — it just came back blocked.
-        if (_unwrap_untrusted(result).lstrip().startswith("ESCALATION_REQUEST:")
+        if (_unwrap_untrusted(result).lstrip().startswith("ESCALATION_REQUEST\x1f")
                 and callable(on_escalation)):
             if on_escalation(result):
                 try:
@@ -3662,7 +3665,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # "ESCALATION_REQUEST:" prefix every caller matches on, so the local
         # -execution prompt never reached the user and the step came back
         # blocked with no way to approve it.
-        if text.lstrip().startswith("ESCALATION_REQUEST:"):
+        if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
             return text.strip()
         return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
@@ -4914,7 +4917,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.
-            blocked = result.startswith("ESCALATION_REQUEST:")
+            blocked = result.startswith("ESCALATION_REQUEST\x1f")
             if blocked:
                 seen.discard(sig)
 

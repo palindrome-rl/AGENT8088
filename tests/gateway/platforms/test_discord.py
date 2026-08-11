@@ -60,3 +60,25 @@ def test_discord_adapter_supports_streaming(tmp_path, monkeypatch):
     adapter = DiscordAdapter(config, runner=None)
     assert adapter.supports_streaming() is True
     assert adapter.streaming_overflow_limit() == 2000
+
+
+def test_discord_approval_view_lookup_uses_tuple_key(tmp_path, monkeypatch):
+    """Discord _ApprovalView must look up pending approvals by
+    ("discord", chat_id) tuple -- the runner stores entries keyed by
+    tuple, not bare string. Regression for the 'No pending approval'
+    bug that broke Discord buttons."""
+    import threading
+    from unittest.mock import MagicMock
+    from agent8088.gateway.platforms.discord import _ApprovalView
+    from agent8088.gateway.runner import _PendingApproval
+
+    entry = _PendingApproval(
+        chat_id="123", tool_name="write_file", change_type="new_file",
+        session_key="k", user_id="5", platform="discord")
+    entry.event = threading.Event()
+    runner = MagicMock()
+    runner._pending_approvals = {("discord", "123"): entry}
+
+    view = _ApprovalView(runner, "123")
+    assert view._lookup() is entry
+    assert runner._pending_approvals.get("123") is None

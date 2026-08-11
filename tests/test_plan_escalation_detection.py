@@ -3,7 +3,7 @@
 Found by running the auditor against the real model: a shell step that was never
 approved and never executed was recorded as a success, and the plan carried on
 past it. Shell results are wrapped in untrusted-content markers before the plan
-executor sees them, so the `ESCALATION_REQUEST:` prefix every caller matches on
+executor sees them, so the ESCALATION_REQUEST prefix every caller matches on
 was no longer at the start of the string.
 
 Three call sites shared that mistake — the failure check, the escalation retry in
@@ -15,7 +15,7 @@ import json
 
 WRAPPED_ESCALATION = (
     '<<<EXTERNAL_UNTRUSTED_CONTENT source="shell command: echo hi">>>\n'
-    "ESCALATION_REQUEST:edit:local_execution:C:\\repo:Run this locally?\n"
+    "ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1fC:\\repo\x1fRun this locally?\n"
     "<<<END_UNTRUSTED_CONTENT>>>"
 )
 
@@ -52,9 +52,9 @@ def test_shell_escalation_is_not_wrapped(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
     monkeypatch.setattr(
         engine, "_exec_shell_command",
-        lambda *a, **k: "ESCALATION_REQUEST:edit:local_execution:C:\\repo:Run locally?")
+        lambda *a, **k: "ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1fC:\\repo\x1fRun locally?")
     result = engine.run_tool("execute_shell", {"command": "echo hi"})
-    assert result.startswith("ESCALATION_REQUEST:"), (
+    assert result.startswith("ESCALATION_REQUEST\x1f"), (
         "a control signal must not be wrapped as untrusted output")
     assert "EXTERNAL_UNTRUSTED_CONTENT" not in result
 
@@ -72,7 +72,7 @@ def test_blocked_shell_step_halts_the_plan(engine, tmp_path, monkeypatch):
     engine.PERMISSION_MODE = "full-auto"
     monkeypatch.setattr(
         engine, "_exec_shell_command",
-        lambda *a, **k: "ESCALATION_REQUEST:edit:local_execution:C:\\repo:Run locally?")
+        lambda *a, **k: "ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1fC:\\repo\x1fRun locally?")
     later = tmp_path / "later.txt"
     out = engine._exec_plan({"steps": json.dumps([
         {"tool": "execute_shell", "arguments": {"command": "echo hi"}},
@@ -91,7 +91,7 @@ def test_plan_offers_approval_for_a_blocked_shell_step(engine, tmp_path, monkeyp
     def _shell(*_a, **_k):
         calls["n"] += 1
         if calls["n"] == 1:
-            return "ESCALATION_REQUEST:edit:local_execution:C:\\repo:Run locally?"
+            return "ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1fC:\\repo\x1fRun locally?"
         return "hello"
 
     monkeypatch.setattr(engine, "_exec_shell_command", _shell)
@@ -101,5 +101,5 @@ def test_plan_offers_approval_for_a_blocked_shell_step(engine, tmp_path, monkeyp
         on_escalation=lambda request: seen.append(request) or True,
     )
     assert seen, "the user must be offered the approval"
-    assert seen[0].startswith("ESCALATION_REQUEST:")
+    assert seen[0].startswith("ESCALATION_REQUEST\x1f")
     assert "halted" not in out, "approving should let the step through"
