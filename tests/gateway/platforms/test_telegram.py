@@ -89,7 +89,6 @@ def test_telegram_adapter_supports_streaming(tmp_path, monkeypatch):
 
 def test_telegram_allowlist_merge(tmp_path, monkeypatch):
     from agent8088.gateway.auth import Allowlist
-    from agent8088 import engine as A
     monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
     config = {
         "telegram_allowed_users": "111,222",
@@ -273,13 +272,15 @@ def test_telegram_approval_uses_base_class_plain_text(tmp_path, monkeypatch):
     """Telegram does NOT override send_approval_prompt — it uses the base
     class plain-text /approve and /deny prompt (same as Slack/WhatsApp)."""
     from agent8088.gateway.platforms.telegram import TelegramAdapter
-    from agent8088.gateway.platforms.base import BaseChannelAdapter
     from agent8088 import engine as A
     monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
     with patch.object(A, "get_secret", return_value="t"):
         adapter = TelegramAdapter({"telegram_bot_token": "t"}, runner=None)
     # No override — inherits the base class method.
     assert "send_approval_prompt" not in TelegramAdapter.__dict__
+    # Asserted on the instance too: the class-dict check alone would still pass
+    # if an intermediate class between Telegram and the base overrode it.
+    assert adapter.send_approval_prompt.__qualname__.startswith("BaseChannelAdapter")
 
 
 def test_telegram_message_handler_uses_block_false(tmp_path, monkeypatch):

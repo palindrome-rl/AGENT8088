@@ -1,6 +1,5 @@
 """Tests for the Email adapter."""
 import asyncio
-import socket
 import smtplib
 from unittest.mock import MagicMock, AsyncMock, patch
 

@@ -28,7 +28,6 @@ from agent8088 import engine as A
 from agent8088.gateway.platforms.base import (
     BaseChannelAdapter, MessageEvent,
 )
-from agent8088.gateway.runner import APPROVAL_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
