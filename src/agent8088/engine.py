@@ -381,7 +381,14 @@ _local_fallback_grant = False
 _remote_git_grant = False
 _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
 _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
+_plan_on_approval = None    # set by CLI do_chat; shows the plan and returns the mode to run it in
 _plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
+# A plan session spans turns: plan mode is entered once, and left once — when the
+# work it authorized is done. Keeping the return mode here rather than in the CLI
+# means an embedder driving run_agent directly gets the same lifecycle.
+_plan_return_mode = ""      # mode to restore when an approved plan finishes
+_plan_approved = False      # the user approved this session's plan; execution is live
+_plan_tool_ran = False      # turn-scoped: did a plan tool actually run this turn?
 _active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
 # Which role is spending right now: "main", or "subagent:<type>". Verification is
 # not free — published figures put auditors at 19-38% of harness tokens — and a
@@ -392,11 +399,64 @@ _turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PE
 _consecutive_denials = 0  # denial circuit breaker (see DENIAL_BREAKER_THRESHOLD)
 
 
+def set_permission_mode(mode: str) -> None:
+    """The one place PERMISSION_MODE changes, so every grant tied to the old mode
+    is dropped with it. A grant that outlives its mode is a hole: an approval the
+    user gave for a plan step must not still be spendable after the mode moved on."""
+    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant, _pending_approval_key
+    PERMISSION_MODE = mode
+    _one_shot_grant = False
+    _plan_execution_grant = False
+    _pending_approval_key = ""
+
+
+def enter_plan_mode() -> None:
+    """Enter plan mode and remember the mode to come back to.
+
+    Idempotent on purpose: `/plan` twice in a row must not record `plan-only` as
+    the destination, which would strand the session in plan mode forever."""
+    global _plan_return_mode, _plan_approved
+    if PERMISSION_MODE != "plan-only":
+        _plan_return_mode = PERMISSION_MODE
+    _plan_approved = False
+    set_permission_mode("plan-only")
+
+
+def cancel_plan_session() -> None:
+    """Abandon a plan session without running it — the user changed mode by hand."""
+    global _plan_return_mode, _plan_approved
+    _plan_return_mode = ""
+    _plan_approved = False
+
+
+def finish_plan_session() -> str:
+    """Leave plan mode once the approved plan's turn is over.
+
+    Returns the mode restored to, or "" if nothing changed. An unapproved plan
+    stays in plan mode: the user asked for a plan and has not agreed to anything,
+    so nothing about the session's permissions should have moved."""
+    global _plan_return_mode, _plan_approved
+    if not _plan_approved:
+        return ""
+    target = _plan_return_mode or "readonly"
+    _plan_approved = False
+    _plan_return_mode = ""
+    set_permission_mode(target)
+    return target
+
+
+def plan_tool_ran() -> bool:
+    """True if a plan tool ran during the current turn. The CLI uses this to tell
+    an executed plan apart from a model that only described one."""
+    return _plan_tool_ran
+
+
 def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
-    global _turn_writes
+    global _turn_writes, _plan_tool_ran
     _turn_writes = 0
+    _plan_tool_ran = False
 
 
 # ---------------------------------------------------------------------------
@@ -1817,7 +1877,11 @@ def classify_plan_component(step_text: str) -> str:
         score += len(words.intersection(spec.get("keywords", set())))
         if score > best_score:
             best_score, best_tool = score, name
-    return best_tool or next(iter(TOOL_NAMES), "")
+    # No signal means no answer. Guessing here used to pick whichever tool
+    # iterated first at score zero, and _infer_step_args then filled its single
+    # required argument with the step's own prose — which is how "Delete the old
+    # backups" became a literal shell command.
+    return best_tool if best_score > 0 else ""
 
 
 def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) -> dict:
@@ -2113,7 +2177,45 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     return "", ""
 
 
+def _exec_present_plan(args: dict) -> str:
+    """Show a finished plan and ask the user to approve it.
+
+    This is plan mode's exit point, not an executor. Presentation and execution
+    were the same tool before, which forced every approvable plan to be a JSON
+    array of fully-specified tool calls — so a plan written the way a human reads
+    it halted on its first step, and a model that wrote prose instead had nothing
+    approved and nothing run while still sounding finished. Here the plan is
+    text, the user picks the mode the work runs in, and the ordinary tool path
+    does the work.
+    """
+    global _plan_approved, _plan_tool_ran
+    _plan_tool_ran = True
+    plan_text = str(args.get("plan") or args.get("text") or args.get("steps") or "").strip()
+    if not plan_text:
+        return ("Error: present_plan requires a non-empty 'plan' — the plan itself, "
+                "as markdown text the user can read.")
+    if PERMISSION_MODE != "plan-only":
+        return (f"Error: present_plan only applies in plan mode; this session is in "
+                f"{PERMISSION_MODE} mode. Do the work with ordinary tool calls.")
+    if not callable(_plan_on_approval):
+        return ("Plan not approved: this session has no way to ask the user "
+                "(non-interactive). Nothing was written or run. Report the plan "
+                "to the user as your answer instead.")
+    chosen = _plan_on_approval(plan_text)
+    if not chosen:
+        return ("Plan not approved — still in plan mode. Revise the plan and call "
+                "present_plan again, or answer the user's questions about it. "
+                "Nothing has been written or run.")
+    set_permission_mode(chosen)
+    _plan_approved = True
+    return (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
+            "in order, with ordinary tool calls, and report what each step actually "
+            "did. Do not call present_plan again for this plan.")
+
+
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
+    global _plan_execution_grant, _plan_tool_ran
+    _plan_tool_ran = True
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
     if isinstance(raw, str):
@@ -2134,7 +2236,6 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
     # In plan-only mode: show all steps as pending, then get approval BEFORE running.
     # On approve: set _plan_execution_grant so steps run without per-step prompts,
     # but PERMISSION_MODE stays plan-only (temporary grant, not a mode switch).
-    global _plan_execution_grant
     if PERMISSION_MODE == "plan-only" and on_step and on_escalation:
         pre_parsed = []
         has_gated = False
@@ -2148,7 +2249,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             spec = TOOL_SPECS.get(tool_name, {})
             if spec.get("mode") in ("write_text", "shell", "docker", "cron", "browser"):
                 has_gated = True
-            pre_parsed.append((idx, step_text, tool_name))
+            pre_parsed.append((idx, step_text, tool_name or "(no tool)"))
         for idx, step_text, tool_name in pre_parsed:
             on_step(idx, total, step_text, tool_name, "pending", None)
         if has_gated:
@@ -2178,6 +2279,12 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             tool_name = classify_plan_component(step_text)
             tool_args = _infer_step_args(tool_name, step_text, {})
             acceptance = evidence = ""
+        if not tool_name:
+            outputs.append(f"[{idx}] Error: this step names no tool: {step_text[:120]!r}. "
+                           'Give every step an explicit "tool" and "arguments", or '
+                           "write the plan as prose and call present_plan instead.")
+            halted, stopped_at = f"step {idx} named no tool", idx
+            break
         if tool_name not in TOOL_SPECS:
             outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
             halted, stopped_at = f"unknown tool '{tool_name}'", idx
@@ -3155,6 +3262,22 @@ def _tool_path(spec: dict, args: dict) -> str:
             or args.get("file_path") or args.get("filepath") or args.get("path") or "")
 
 
+def _plan_mode_block_message() -> str:
+    """What a model is told when it reaches for a mutation inside plan mode.
+
+    It used to be told to call execute_plan with a JSON array of fully-specified
+    tool calls. Models do not reliably produce that, so they re-issued the direct
+    call until the loop gave up and the user saw "I wasn't able to produce an
+    answer". Naming the one tool that does work, and saying what happens after
+    approval, is what makes the block recoverable."""
+    return ("Error: plan mode — nothing is written or run until the user approves a "
+            "plan. Keep reading if you still need facts. Once you know what to do, "
+            "call present_plan(plan=\"...\") with the plan written out as markdown: "
+            "the goal, numbered steps, and the files each step touches. The user "
+            "approves it, the permission mode changes, and THEN you make this tool "
+            "call normally. Do not claim any of it is done before that happens.")
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
@@ -3169,17 +3292,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"
-    # instead of telling the model to use execute_plan — the model never learns why.
+    # instead of telling the model how plan mode works — the model never learns why.
     # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
     # to the normal check_permission gate so it escalates properly.
     plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
     plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
-        return ("Error: plan-only mode — direct tool execution blocked. "
-                "Call the execute_plan tool with a JSON steps array, e.g.: "
-                'execute_plan(steps=[{"tool":"write_file",'
-                '"arguments":{"filename":"C:/tmp/x.txt","content":"hi"}}]) '
-                "Do NOT describe the plan in prose — call execute_plan as a tool call.")
+        return _plan_mode_block_message()
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
@@ -3367,11 +3486,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode in gated_modes and not remote_git_approved and not check_permission(
             mode, command, path_zone, bool(spec.get("host")), approval_key):
         if PERMISSION_MODE == "plan-only" and allow_plan:
-            return ("Error: plan-only mode — direct tool execution blocked. "
-                    "Call the execute_plan tool with a JSON steps array, e.g.: "
-                    'execute_plan(steps=[{"tool":"write_file",'
-                    '"arguments":{"filename":"/tmp/x","content":"hi"}}]) '
-                    "Do NOT describe the plan in prose — call execute_plan as a tool call.")
+            return _plan_mode_block_message()
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -3441,6 +3556,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "plan":
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
+        if name == "present_plan":
+            return _exec_present_plan(args)
         return _exec_plan(args, on_step=_plan_on_step,
                           on_escalation=_plan_on_escalation, depth=depth)
 
