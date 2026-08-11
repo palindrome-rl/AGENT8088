@@ -33,10 +33,11 @@ except ImportError:  # not available on Windows
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
-from rich.markdown import Markdown
+from rich.markdown import CodeBlock, Markdown
 from rich.text import Text
 from rich.padding import Padding
 from rich.spinner import SPINNERS, Spinner
+from rich.syntax import Syntax
 from rich.live import Live
 from rich import box
 
@@ -650,7 +651,28 @@ def _tool_summary(name, args, limit=None):
     return _format_args(args, limit) if args else ""
 
 
+_last_call_paths = {}  # tool name -> the file path that call targeted
+
+
+def _remember_call_path(call):
+    """Stash the file a call targets, so on_result can pick a lexer for its output.
+
+    The result hook is handed a tool's name and its output but not its arguments,
+    and the file's extension is the only reliable way to know how to highlight
+    what came back. Keyed by tool name because that is all on_result has to look
+    it up with. Uses the spec's own path_arg, so MCP tools and anything added to
+    tools.txt get highlighted output without being listed here.
+    """
+    spec = A.TOOL_SPECS.get(call["name"], {})
+    path_arg = spec.get("path_arg")
+    value = (call.get("arguments") or {}).get(path_arg)
+    if path_arg in _spec_args(spec) and isinstance(value, str) and value.strip():
+        _last_call_paths[call["name"]] = value.strip()
+
+
 def on_calls(calls):
+    for call in calls:
+        _remember_call_path(call)
     if S.verbose == "off":
         return
     for call in calls:
@@ -671,36 +693,298 @@ def on_tool(name):
     pass  # covered by on_calls; the spinner shows "running <name>..."
 
 
-def _numbered_lines(text, limit=40):
-    lines = text.splitlines()
+# ---------------------------------------------------------------------------
+# Code rendering — listings and diffs shaped like an editor
+#
+# File bodies are the bulkiest thing the tool trace prints, and they used to be
+# the least readable: nothing was syntax-highlighted, so a written file arrived as
+# an undifferentiated wall of monospace, and a brand-new file arrived as a hundred
+# identical '+' rows. Everything below builds the same two-part shape an editor
+# uses — a dim gutter of real line numbers, then highlighted source — off nothing
+# but the file's own extension.
+#
+# The source itself is sacred: this trace is the user's only view of what went to
+# disk, so every step here falls back to plain, unstyled lines rather than risk
+# showing something the file does not say. And since file bodies come from the
+# model, they are composed with Text() throughout — never interpolated into
+# console markup, which would let a literal "[bold]" in the code eat the line.
+# ---------------------------------------------------------------------------
+_NO_HIGHLIGHT = {"", "none", "off", "no", "0", "plain"}
+
+# Conventional diff colours rather than the UI's accent blue: blue additions read
+# as "more tool output", where green/red reads as "this line changed".
+_DIFF_ADD = "#3fb950"
+_DIFF_DEL = "#f85149"
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_TAB_WIDTH = 4
+_DEFAULT_THEME = "monokai"
+
+
+def _theme_is_real(name):
+    """Whether Pygments knows this style, memoised on the answer.
+
+    Worth checking rather than leaving to Rich, which silently substitutes
+    Pygments' default style for an unknown name. That style is built for a light
+    background — on the dark terminal this CLI is coloured for, a typo in
+    `syntax_theme` would render code as near-black text on near-black.
+    """
+    if name not in _theme_cache:
+        try:
+            from pygments.styles import get_style_by_name
+            get_style_by_name(name)
+            _theme_cache[name] = True
+        except Exception:
+            _theme_cache[name] = False
+    return _theme_cache[name]
+
+
+_theme_cache = {}
+
+
+def _configured_theme():
+    """The raw `syntax_theme` setting, whether or not it names a real style."""
+    return (A.APP_CONFIG.get("syntax_theme") or _DEFAULT_THEME).strip()
+
+
+def _syntax_theme():
+    """Pygments theme for code listings — `syntax_theme=none` turns colour off.
+
+    Read per call rather than captured at import so an edited config takes effect
+    without restarting the session.
+    """
+    name = _configured_theme()
+    if name.lower() in _NO_HIGHLIGHT or _theme_is_real(name):
+        return name
+    return _DEFAULT_THEME
+
+
+def warn_about_unknown_theme():
+    """Say so at startup if `syntax_theme` names a style that does not exist.
+
+    Kept out of _syntax_theme so nothing prints from inside a render: that runs
+    within console.print, and printing there interleaves with the output being
+    drawn.
+    """
+    name = _configured_theme()
+    if name.lower() in _NO_HIGHLIGHT or _theme_is_real(name):
+        return
+    console.print(f"[yellow]unknown syntax_theme[/yellow] [bold]{name}[/bold]"
+                  f" [dim]— using {_DEFAULT_THEME}. Run /config to see the setting.[/dim]")
+
+
+def _source_lines(text):
+    """`text` as a list of lines, ready to be numbered.
+
+    Deliberately splits on "\\n" alone: str.splitlines() also breaks on \\r, \\f
+    and U+2028, which would number lines the highlighter never split there and
+    desynchronise the gutter from the source. CR and CRLF are normalised first
+    instead — a stray \\r reaching the terminal would overwrite the row.
+
+    Tabs are expanded here rather than left to the terminal, which measures its
+    tab stops from the start of the row and so indents tab-indented code by the
+    width of the line-number gutter. Expanding against the line itself is what an
+    editor does, and it keeps a nested block lined up under its parent.
+    """
+    body = str(text).replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n")
+    return [line.expandtabs(_TAB_WIDTH) for line in body.split("\n")] if body else []
+
+
+def _highlighted_lines(lines, path):
+    """`lines` as one Text each, syntax-highlighted from `path`'s extension.
+
+    Both sides of a hunk are lexed as a single block rather than line by line: a
+    docstring or a bracketed literal spanning several rows only colours correctly
+    when the lexer sees them together.
+    """
+    plain = [Text(line) for line in lines]
+    theme = _syntax_theme()
+    if theme.lower() in _NO_HIGHLIGHT or not any(line.strip() for line in lines):
+        return plain
+    code = "\n".join(lines)
+    try:
+        # background_color="default" keeps the theme from painting its own dark
+        # block across the trace instead of sitting inside it.
+        syntax = Syntax(code, Syntax.guess_lexer(path or "", code), theme=theme,
+                        background_color="default")
+        highlighted = list(syntax.highlight(code).split("\n"))
+    except Exception:
+        return plain
+    # highlight() re-emits the code through Pygments. If that ever disagrees with
+    # the source — an exotic lexer, a theme that does not exist — the source wins.
+    if len(highlighted) != len(plain) or any(
+            got.plain != want.plain for got, want in zip(highlighted, plain)):
+        return plain
+    return highlighted
+
+
+def _numbered_lines(text, limit=None, path=""):
+    """An editor-style listing: dim right-aligned line numbers, highlighted source.
+
+    Returns (renderable, total_lines) — the total counts the whole file, not just
+    the rows shown, so the caller can report "Read 108 lines" honestly.
+    """
+    if limit is None:
+        limit = 200 if S.verbose == "full" else 40
+    lines = _source_lines(text)
     total = len(lines)
-    width = len(str(min(total, limit)))
+    shown = lines[:limit]
+    width = max(len(str(len(shown))), 2)
     body = Text()
-    for i, line_text in enumerate(lines[:limit], 1):
-        body.append(f"{i:>{width}}  ", style="dim")
-        body.append(line_text + "\n")
-    if total > limit:
-        body.append(f"… {total - limit} more line{'s' if total - limit != 1 else ''}", style="dim italic")
+    for number, line in enumerate(_highlighted_lines(shown, path), 1):
+        body.append(f"{number:>{width}}  ", style="dim")
+        body.append_text(line)
+        body.append("\n")
+    hidden = total - len(shown)
+    if hidden > 0:
+        body.append(f"… {hidden} more line{'s' if hidden != 1 else ''}", style="dim italic")
     return body, total
 
 
-def _diff_block(diff_lines, limit=60):
-    body = Text()
-    shown = diff_lines[:limit]
-    for line in shown:
-        if line.startswith(("+++", "---")):
-            body.append(line + "\n", style="dim")
-        elif line.startswith("+"):
-            body.append(line + "\n", style="#237dd7")
-        elif line.startswith("-"):
-            body.append(line + "\n", style="red")
-        elif line.startswith("@@"):
-            body.append(line + "\n", style="#237dd7")
+def _parse_hunks(diff_lines):
+    """A unified diff regrouped into hunks of (marker, old_no, new_no, code) rows.
+
+    Two jobs beyond grouping. It tracks each side's line number so the gutter can
+    show where in the file the change actually landed. And it strips the trailing
+    newline difflib leaves on every body line (`keepends=True`) — appending
+    another one is what made every diff the CLI ever printed come out
+    double-spaced, at half the content per screen.
+    """
+    hunks = []
+    old_no = new_no = 0
+    for raw in diff_lines:
+        line = str(raw).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+        header = _HUNK_RE.match(line)
+        if header:
+            old_no, new_no = int(header.group(1)), int(header.group(3))
+            hunks.append({
+                "old_count": int(header.group(2)) if header.group(2) else 1,
+                "rows": [],
+            })
+            continue
+        # Everything before the first hunk is preamble. Recognising '--- '/'+++ '
+        # by shape anywhere would swallow real content: deleting a line that opens
+        # with '-- ' — an SQL or Haskell comment — produces exactly '--- ...'.
+        if not hunks:
+            continue
+        prefixed = line[:1] in ("+", "-", " ")
+        marker = line[0] if prefixed else " "
+        code = (line[1:] if prefixed else line).expandtabs(_TAB_WIDTH)
+        rows = hunks[-1]["rows"]
+        if marker == "+":
+            rows.append(("+", None, new_no, code))
+            new_no += 1
+        elif marker == "-":
+            rows.append(("-", old_no, None, code))
+            old_no += 1
         else:
-            body.append(line + "\n", style="dim")
-    if len(diff_lines) > limit:
-        body.append(f"… {len(diff_lines) - limit} more diff lines", style="dim italic")
+            rows.append((" ", old_no, new_no, code))
+            old_no += 1
+            new_no += 1
+    return hunks
+
+
+def _styled_rows(rows, path):
+    """`rows` paired with a highlighted Text each, lexing the two sides separately.
+
+    A removed line has to be lexed against the *old* file and an added one against
+    the new, or a hunk that rewrites a block colours the wrong halves.
+    """
+    old_side = iter(_highlighted_lines([code for marker, _, _, code in rows
+                                        if marker != "+"], path))
+    new_side = iter(_highlighted_lines([code for marker, _, _, code in rows
+                                        if marker != "-"], path))
+    for row in rows:
+        marker, _, _, code = row
+        styled = next(old_side if marker == "-" else new_side, None)
+        if marker == " ":
+            next(old_side, None)  # context sits on both sides; keep them in step
+        yield row, styled if styled is not None else Text(code)
+
+
+def _diff_block(diff_lines, limit=None, path=""):
+    """A write rendered the way an editor shows one: numbered, marked, highlighted.
+
+    A brand-new file is a special case worth having. Its diff is one hunk of
+    nothing but additions, and a hundred rows each prefixed '+' say nothing the
+    header has not already said — so it renders as a plain listing of the file
+    instead, and the '+' column is saved for edits, where it carries information.
+    """
+    if limit is None:
+        limit = 200 if S.verbose == "full" else 60
+    hunks = _parse_hunks(diff_lines)
+    if not hunks:
+        return Text()
+
+    if len(hunks) == 1 and hunks[0]["old_count"] == 0:
+        listing, _ = _numbered_lines(
+            "\n".join(code for _, _, _, code in hunks[0]["rows"]), limit, path)
+        return listing
+
+    total = sum(len(hunk["rows"]) for hunk in hunks)
+    highest = max((row[1] or row[2] or 0 for hunk in hunks for row in hunk["rows"]),
+                  default=0)
+    width = max(len(str(highest)), 2)
+    body = Text()
+    shown = 0
+    for index, hunk in enumerate(hunks):
+        if shown >= limit:
+            break
+        if index:
+            # The rows either side of this are not adjacent in the file; without a
+            # break the gutter looks like it simply skipped a number.
+            body.append(f"{'⋯':>{width}}\n", style="dim")
+        for (marker, old_no, new_no, code), styled in _styled_rows(hunk["rows"], path):
+            if shown >= limit:
+                break
+            marker_style = {"+": _DIFF_ADD, "-": _DIFF_DEL}.get(marker, "dim")
+            body.append(f"{old_no if marker == '-' else new_no:>{width}} ", style="dim")
+            body.append(f"{marker} ", style=marker_style)
+            if marker == "-":
+                # Deleted code recedes rather than competing with what replaced it,
+                # while keeping its highlighting so it stays readable as code.
+                styled = styled.copy()
+                styled.stylize("dim")
+            body.append_text(styled)
+            body.append("\n")
+            shown += 1
+    hidden = total - shown
+    if hidden > 0:
+        body.append(f"… {hidden} more diff line{'s' if hidden != 1 else ''}",
+                    style="dim italic")
     return body
+
+
+def _diff_path(diff_lines):
+    """The file a diff is against, taken from its own '+++' header.
+
+    Only the preamble is searched, for the same reason _parse_hunks stops looking
+    there: an added line reading '++ tally' arrives as '+++ tally'.
+    """
+    for line in diff_lines:
+        text = str(line)
+        if _HUNK_RE.match(text):
+            break
+        if text.startswith("+++ "):
+            return text[4:].strip()
+    return ""
+
+
+def _diff_counts(diff_lines):
+    """(added, removed) — the shape of a change, readable before the change itself."""
+    added = removed = 0
+    in_hunk = False
+    for raw in diff_lines:
+        line = str(raw)
+        if _HUNK_RE.match(line):
+            in_hunk = True
+        elif not in_hunk:
+            continue  # preamble: '--- old' / '+++ new' are not changed lines
+        elif line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return added, removed
 
 
 def on_result(name, result):
@@ -714,14 +998,23 @@ def on_result(name, result):
         return
 
     if mode == "read_text":
-        body, total = _numbered_lines(result)
+        body, total = _numbered_lines(result, path=_last_call_paths.get(name, ""))
         console.print(Text(f"  ⎿  Read {total} line{'s' if total != 1 else ''}", style="dim"))
         console.print(Padding(body, (0, 0, 0, 5)))
         return
 
     if mode == "write_text" and A._last_write_diff:
-        console.print(Text(f"  ⎿  {result}", style="dim"))
-        console.print(Padding(_diff_block(A._last_write_diff), (0, 0, 0, 5)))
+        # The diff's own '+++' header is the authoritative path — the engine has
+        # already resolved the argument against the workspace root by then.
+        path = _diff_path(A._last_write_diff) or _last_call_paths.get(name, "")
+        added, removed = _diff_counts(A._last_write_diff)
+        header = Text(f"  ⎿  {result}", style="dim")
+        if removed:
+            # Only for an edit: on a new file every line is an addition, and the
+            # numbered listing below already says how big it is.
+            header.append(f" · +{added} −{removed}", style="dim")
+        console.print(header)
+        console.print(Padding(_diff_block(A._last_write_diff, path=path), (0, 0, 0, 5)))
         return
 
     preview = result.strip().replace("\n", " ")
@@ -736,12 +1029,45 @@ def on_result(name, result):
     console.print(line)
 
 
+class _TraceCodeBlock(CodeBlock):
+    """A fenced code block styled like the tool trace's own listings.
+
+    Rich's default paints the theme's background across the block, which puts a
+    dark slab inside the answer panel and makes the same snippet look like it came
+    from a different program than the diff printed moments earlier. Honours
+    `syntax_theme=none` for the same reason the listings do.
+    """
+
+    def __rich_console__(self, console, options):
+        code = str(self.text).rstrip()
+        theme = _syntax_theme()
+        if theme.lower() in _NO_HIGHLIGHT:
+            yield Text(code)
+            return
+        try:
+            yield Syntax(code, self.lexer_name or "text", theme=theme,
+                         background_color="default", word_wrap=True, padding=0)
+        except Exception:
+            yield Text(code)
+
+
+class _AnswerMarkdown(Markdown):
+    """Markdown that renders fenced code the way the rest of the CLI does."""
+
+    elements = {**Markdown.elements, "fence": _TraceCodeBlock,
+                "code_block": _TraceCodeBlock}
+
+    def __init__(self, markup, **kwargs):
+        super().__init__(markup, code_theme=_syntax_theme(), **kwargs)
+
+
 def render_answer(answer):
     if not answer:
         console.print("[dim](no answer)[/dim]")
         return
     try:
-        console.print(Panel(Markdown(answer), title="[bold #00edff]Agent8088[/bold #00edff]",
+        console.print(Panel(_AnswerMarkdown(answer),
+                            title="[bold #00edff]Agent8088[/bold #00edff]",
                             box=box.ROUNDED, border_style="#00C8FF"))
     except Exception:
         console.print(Panel(Text(answer), title="[bold #00edff]Agent8088[/bold #00edff]",
@@ -1174,7 +1500,8 @@ def _make_plan_approval(live=None, esc=None):
         if live is not None:
             live.stop()
         console.print()
-        console.print(Panel(Markdown(plan_text), title="[bold #00edff]Plan[/bold #00edff]",
+        console.print(Panel(_AnswerMarkdown(plan_text),
+                            title="[bold #00edff]Plan[/bold #00edff]",
                             box=box.ROUNDED, border_style="#00C8FF"))
         try:
             with (esc.paused() if esc is not None else nullcontext()):
@@ -1898,7 +2225,8 @@ def cmd_config(_):
     t.add_column("Key", style="#237dd7")
     t.add_column("Value", style="#237dd7")
     keys = ["default_provider", "temperature", "max_turns", "show_trace", "show_reasoning",
-            "verbose", "usage_mode", "disabled_skills", "timeout_seconds", "allowed_paths",
+            "verbose", "usage_mode", "syntax_theme", "disabled_skills",
+            "timeout_seconds", "allowed_paths",
             "search_base_url", "ssrf_allow_hosts", "prompt_paths", "blocked_paths"]
     for k in keys:
         v = A.APP_CONFIG.get(k, "—")
@@ -3566,6 +3894,7 @@ def main():
             console.print(f"[red]could not enable trace export:[/red] {exc}")
     _install_completion()
     banner()
+    warn_about_unknown_theme()
     while True:
         try:
             line = _read_line().strip()
