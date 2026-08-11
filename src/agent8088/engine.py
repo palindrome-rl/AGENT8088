@@ -3742,6 +3742,42 @@ def _outside_fenced_code(text: str) -> str:
                    if index % 2 == 0)
 
 
+def _scan_json_object(text: str, start: int, limit: int = None) -> str:
+    """Return the brace-balanced JSON object that begins at text[start].
+
+    A greedy regex spans from the first brace in the reply to the last one, which
+    merges several batched tool calls into a single unparseable blob and loses all
+    of them; a non-greedy one stops at the first '}', truncating nested JSON such
+    as {"steps": "[{...}]"}. Counting braces outside string literals is the only
+    thing that gets both right. Quote and backslash state are tracked so a brace
+    inside a string value does not close the object, and `limit` bounds the scan
+    so an unterminated string in one block cannot swallow the blocks after it.
+    """
+    limit = len(text) if limit is None else min(limit, len(text))
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, limit):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return text[start:limit]
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
     text = _outside_fenced_code(text)
@@ -3757,24 +3793,32 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 calls.append(d)
         except Exception:
             pass
-    # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}
-    # Greedy match (\{.*\}) captures nested JSON braces — non-greedy (\{.*?\})
-    # stops at the first }, truncating args like {"steps": "[{\"tool\": ...}]"}
-    # and causing the args to fail parsing, falling through to empty-args match.
+    # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}, once per block
+    # Every block is taken, not just the first: models batch several calls into
+    # one reply — routinely so when working through an approved plan — and a
+    # single greedy re.search spanned all of them at once, so all of them were
+    # lost to one parse error. Each block's JSON extent is found by counting
+    # braces (see _scan_json_object) rather than by a regex, which is what keeps
+    # nested JSON like {"steps": "[{...}]"} intact while still ending the match
+    # at the right place.
     if not calls:
-        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*\})', text, re.DOTALL)
-        if m:
-            resolved = _resolve_tool_name(m.group(1))
-            if resolved in allowed:
-                try:
-                    calls.append({"name": resolved, "arguments": _loads_tool_args(m.group(2))})
-                except Exception:
-                    # An ARGS block was sent but is unparseable. Surfacing empty
-                    # args here would make the tool report the argument as
-                    # missing, which sends the model chasing the wrong problem.
-                    # Flag the parse failure instead.
-                    calls.append({"name": resolved,
-                                  "arguments": {"__parse_error__": m.group(2)[:400]}})
+        headers = list(re.finditer(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(?=\{)', text))
+        for position, header in enumerate(headers):
+            resolved = _resolve_tool_name(header.group(1))
+            if resolved not in allowed:
+                continue
+            limit = (headers[position + 1].start()
+                     if position + 1 < len(headers) else len(text))
+            raw_args = _scan_json_object(text, header.end(), limit)
+            try:
+                calls.append({"name": resolved, "arguments": _loads_tool_args(raw_args)})
+            except Exception:
+                # An ARGS block was sent but is unparseable. Surfacing empty
+                # args here would make the tool report the argument as
+                # missing, which sends the model chasing the wrong problem.
+                # Flag the parse failure instead.
+                calls.append({"name": resolved,
+                              "arguments": {"__parse_error__": raw_args[:400]}})
         if not calls and "✿ARGS✿" not in text:  # loose ✿FUNCTION✿ line, genuinely no args
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:

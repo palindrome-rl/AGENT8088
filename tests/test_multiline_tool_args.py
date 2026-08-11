@@ -123,3 +123,63 @@ def test_code_takes_precedence_over_aliases(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_sandbox_command", lambda code, **_: code)
     out = engine.run_tool("run_sandboxed", {"code": "print(111)", "script": "print(222)"})
     assert "111" in out and "222" not in out
+
+
+# --- several calls in one message -------------------------------------------
+# Pattern 2 used one re.search with a greedy (\{.*\}). Greedy was deliberate — a
+# non-greedy match truncates nested JSON like {"steps": "[{\"tool\": ...}]"} — but
+# with three FUNCTION/ARGS blocks in one reply it spans from the first brace to
+# the last, so all three calls arrive as one unparseable blob and every one of
+# them is lost. Models batch calls exactly like this when executing an approved
+# plan step by step.
+
+def _calls(engine, text):
+    return engine.find_tool_calls(text, set(engine.TOOL_SPECS))
+
+
+def test_three_batched_calls_all_parse(engine):
+    text = "\n".join(
+        f'{FUNC}: write_file {ARGS}: {{"filename": "{name}.txt", "content": "{name}"}}'
+        for name in ("a", "b", "c"))
+
+    calls = _calls(engine, text)
+
+    assert [c["name"] for c in calls] == ["write_file"] * 3
+    assert [c["arguments"]["filename"] for c in calls] == ["a.txt", "b.txt", "c.txt"]
+    assert [c["arguments"]["content"] for c in calls] == ["a", "b", "c"]
+
+
+def test_batched_calls_may_name_different_tools(engine):
+    text = (f'{FUNC}: write_file {ARGS}: {{"filename": "a.txt", "content": "a"}}\n'
+            f'{FUNC}: read_text {ARGS}: {{"filename": "a.txt"}}')
+
+    assert [c["name"] for c in _calls(engine, text)] == ["write_file", "read_text"]
+
+
+def test_nested_json_in_a_batch_is_not_truncated(engine):
+    """The reason the greedy match existed: a step array inside a string value."""
+    steps = '[{\\"tool\\": \\"write_file\\", \\"arguments\\": {\\"filename\\": \\"a.txt\\"}}]'
+    text = (f'{FUNC}: execute_plan {ARGS}: {{"steps": "{steps}"}}\n'
+            f'{FUNC}: read_text {ARGS}: {{"filename": "a.txt"}}')
+
+    calls = _calls(engine, text)
+
+    assert [c["name"] for c in calls] == ["execute_plan", "read_text"]
+    assert calls[0]["arguments"]["steps"].endswith("}}]")
+    assert calls[1]["arguments"] == {"filename": "a.txt"}
+
+
+def test_one_unparseable_block_does_not_lose_the_others(engine):
+    text = (f'{FUNC}: write_file {ARGS}: {{"filename": "a.txt", "content": "a"}}\n'
+            f'{FUNC}: read_text {ARGS}: {{not json at all')
+
+    calls = _calls(engine, text)
+
+    assert calls[0]["arguments"] == {"filename": "a.txt", "content": "a"}
+    assert "__parse_error__" in calls[1]["arguments"], (
+        "the broken block still has to report a parse error, not vanish")
+
+
+def test_a_single_call_still_parses_the_same_way(engine):
+    args = _call(engine, f'{FUNC}: read_text {ARGS}: {{"filename": "a.txt"}}')
+    assert args == {"filename": "a.txt"}
