@@ -185,6 +185,152 @@ def test_help_lists_approve_and_deny():
     assert "/deny" in sent
 
 
+def test_approve_plan_resolves_pending_full_auto():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088.gateway.runner import _PendingPlanApproval
+    entry = _PendingPlanApproval(chat_id="C1", user_id="U1", platform="telegram")
+    runner._pending_plan_approvals[("telegram", "C1")] = entry
+
+    evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                       user_id="U1", text="/approve")
+    asyncio.run(runner.on_message(evt))
+    assert entry.mode == "full-auto"
+    assert entry.event.is_set()
+
+
+def test_approve_plan_readonly_sets_readonly_mode():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088.gateway.runner import _PendingPlanApproval
+    entry = _PendingPlanApproval(chat_id="C1", user_id="U1", platform="telegram")
+    runner._pending_plan_approvals[("telegram", "C1")] = entry
+
+    evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                       user_id="U1", text="/approve readonly")
+    asyncio.run(runner.on_message(evt))
+    assert entry.mode == "readonly"
+
+
+def test_deny_plan_keeps_planning():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088.gateway.runner import _PendingPlanApproval
+    entry = _PendingPlanApproval(chat_id="C1", user_id="U1", platform="telegram")
+    runner._pending_plan_approvals[("telegram", "C1")] = entry
+
+    evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                       user_id="U1", text="/deny")
+    asyncio.run(runner.on_message(evt))
+    assert entry.mode == ""
+    assert entry.event.is_set()
+
+
+def test_gateway_wires_plan_on_approval_for_run_turn():
+    """The actual bug: A._plan_on_approval must be set around the agent turn,
+    or present_plan() always hits the non-interactive branch and a plan can
+    never be approved through chat."""
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "telegram"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    from agent8088 import engine as A
+    seen = {}
+
+    def fake_run_turn(key, text, sessions, on_escalation=None):
+        seen["plan_on_approval_set"] = callable(A._plan_on_approval)
+        return "ok"
+
+    with patch("agent8088.gateway.runner.run_turn", fake_run_turn):
+        evt = MessageEvent(platform="telegram", chat_id="C1", chat_type="private",
+                           user_id="U1", text="hello")
+        asyncio.run(runner.on_message(evt))
+
+    assert seen.get("plan_on_approval_set") is True
+    assert A._plan_on_approval is None  # reset after the turn
+
+
+def test_mode_no_arg_reports_current_mode():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    with patch("agent8088.gateway.runner.A") as mock_A:
+        mock_A.PERMISSION_MODE = "readonly"
+        evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                           user_id="U1", text="/mode")
+        asyncio.run(runner.on_message(evt))
+    sent = adapter.send_message.call_args.args[1]
+    assert "readonly" in sent
+    assert "full-auto" in sent
+    assert "plan-only" in sent
+
+
+def test_mode_edit_is_aliased_to_full_auto():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    with patch("agent8088.gateway.runner.A") as mock_A:
+        evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                           user_id="U1", text="/mode edit")
+        asyncio.run(runner.on_message(evt))
+    mock_A.cancel_plan_session.assert_called_once()
+    mock_A.set_permission_mode.assert_called_once_with("full-auto")
+    sent = adapter.send_message.call_args.args[1]
+    assert "full-auto" in sent
+
+
+def test_mode_plan_only_enters_plan_mode():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    with patch("agent8088.gateway.runner.A") as mock_A:
+        evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                           user_id="U1", text="/mode plan-only")
+        asyncio.run(runner.on_message(evt))
+    mock_A.enter_plan_mode.assert_called_once()
+    mock_A.set_permission_mode.assert_not_called()
+
+
+def test_mode_unknown_value_is_rejected():
+    runner, sessions = _make_runner()
+    adapter = AsyncMock()
+    adapter.platform = "discord"
+    adapter.send_message = AsyncMock(return_value="0")
+    runner.register_adapter(adapter)
+
+    with patch("agent8088.gateway.runner.A") as mock_A:
+        evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
+                           user_id="U1", text="/mode bogus")
+        asyncio.run(runner.on_message(evt))
+    mock_A.set_permission_mode.assert_not_called()
+    mock_A.enter_plan_mode.assert_not_called()
+    sent = adapter.send_message.call_args.args[1]
+    assert "Unknown mode" in sent
+
+
 def test_session_allowlist_is_scoped_to_session_user_and_change_type():
     runner, sessions = _make_runner()
     runner._session_allowlist.add(("agent:main:discord:channel:C1", "U1", "new_file"))
