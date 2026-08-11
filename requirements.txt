@@ -15,6 +15,9 @@ InquirerPy>=0.3.4,<1
 # MCP client and server runtime (external servers, and --mcp-serve).
 mcp>=1.27,<2
 
+# Terminal logo rendering.
+Pillow>=9,<13
+
 # Headless browser behind browse_page. Note this pulls in the Python package
 # only — the browser binaries still need `playwright install`.
 playwright>=1.40,<2

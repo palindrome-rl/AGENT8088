@@ -22,7 +22,7 @@ def setup_function():
     A._one_shot_grant = False
     A._local_fallback_grant = False
     A._remote_git_grant = False
-    A.SANDBOX_BACKEND = "local"
+    A.SANDBOX_BACKEND = "auto"
 
 def test_permission_mode_defaults_to_readonly():
     assert A.PERMISSION_MODE == "readonly"
@@ -149,6 +149,24 @@ def test_direct_tool_retries_an_approved_action(monkeypatch):
     cli.cmd_tool('write_file {"filename": "test.txt", "content": "ok"}')
 
     assert len(calls) == 2
+
+
+def test_direct_tool_does_not_print_wire_payload_after_denial(monkeypatch):
+    from agent8088 import cli
+
+    printed = []
+    monkeypatch.setattr(cli, "_active_tool_specs", lambda: {"write_file": {}})
+    monkeypatch.setattr(cli, "status_cm", lambda _: nullcontext())
+    monkeypatch.setattr(cli.console, "print", lambda *items, **_kwargs: printed.extend(items))
+    monkeypatch.setattr(cli, "_handle_escalation", lambda _: False)
+    monkeypatch.setattr(
+        cli.A, "exec_tool",
+        lambda *_: "ESCALATION_REQUEST\x1fedit\x1fnew_file\x1ftest.txt\x1fblocked",
+    )
+
+    cli.cmd_tool('write_file {"filename": "test.txt", "content": "ok"}')
+
+    assert not any("ESCALATION_REQUEST" in str(item) for item in printed)
 
 def test_run_tool_allows_write_in_edit(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "edit"

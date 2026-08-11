@@ -345,6 +345,11 @@ def _active_tool_specs():
     active_skill_tools = {tool for skill in _active_skills().values()
                           for tool in skill.get("tools", {})}
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
+    if A.PERMISSION_MODE == "plan-only":
+        allowed &= {
+            "present_plan", "read_text", "calculate", "describe_capabilities",
+            "git_status", "git_diff", "git_log", "last_output", "web_search",
+        }
     return {name: spec for name, spec in A.TOOL_SPECS.items() if name in allowed}
 
 
@@ -371,13 +376,14 @@ def _session_system_prompt():
                    "of it is done before that happens.\n")
     elif A.PERMISSION_MODE == "full-auto":
         prompt += ("You are in full-auto mode. Permission-gated tools are allowed without "
-                   "prompts when sandboxed. Unisolated local execution still needs a one-shot "
-                   "grant. Catastrophic commands and credential path writes are always blocked.\n")
+                   "prompts when sandboxed. Code execution is refused when neither the native "
+                   "sandbox nor Docker is available. Catastrophic commands and credential path "
+                   "writes are always blocked.\n")
     elif A.PERMISSION_MODE == "edit":
         prompt += ("You are in edit mode. Permission-gated tools are allowed when sandboxed. "
-                   "Use a tool only when it is necessary; unisolated local execution still "
-                   "needs a one-shot grant. Catastrophic commands and credential path writes "
-                   "are always blocked.\n")
+                   "Use a tool only when necessary; code execution is refused when no sandbox "
+                   "is available. Catastrophic commands and credential path writes are always "
+                   "blocked.\n")
     else:
         prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
                    "Writes and mutations require user approval.\n")
@@ -437,7 +443,7 @@ def _catalog(items, columns=4):
 
 
 def _palindrome_logo():
-    """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
+    """Render the supplied PNG as high-detail, terminal-native character art."""
     if console.legacy_windows or "utf" not in console.encoding.lower():
         return Text(_PALINDROME_ASCII_LOGO, style="bold #00C8FF")
     fallback = _PALINDROME_BLOCK_LOGO
@@ -448,32 +454,35 @@ def _palindrome_logo():
     except ImportError:
         return Text(fallback, style="bold #00C8FF")
 
-    image = Image.open(_PALINDROME_LOGO).convert("RGB")
+    with Image.open(_PALINDROME_LOGO) as source:
+        image = source.convert("RGB")
     blue = image.getchannel("B")
     bounds = blue.point(lambda value: 255 if value > 24 else 0).getbbox()
     image = image.crop(bounds) if bounds else image
-    height = max(2, round(image.height / image.width * 24))
-    height += height % 2
-    image = image.resize((24, height), Image.Resampling.LANCZOS)
+    width = 30
+    height = max(2, round(image.height / image.width * width / 2))
+    image = image.resize((width * 2, height * 4), Image.Resampling.LANCZOS)
 
     logo = Text()
     pixels = image.load()
-    for y in range(0, height, 2):
-        for x in range(image.width):
-            top, bottom = pixels[x, y], pixels[x, y + 1]
-            if max(*top, *bottom) < 12:
+    dots = ((0, 0, 0x01), (0, 1, 0x02), (0, 2, 0x04), (1, 0, 0x08),
+            (1, 1, 0x10), (1, 2, 0x20), (0, 3, 0x40), (1, 3, 0x80))
+    for y in range(height):
+        for x in range(width):
+            active = []
+            mask = 0
+            for dx, dy, bit in dots:
+                pixel = pixels[x * 2 + dx, y * 4 + dy]
+                if max(pixel) >= 24:
+                    mask |= bit
+                    active.append(pixel)
+            if not mask:
                 logo.append(" ")
-            elif max(*top) < 12:
-                logo.append("▄", style=f"rgb({bottom[0]},{bottom[1]},{bottom[2]})")
-            elif max(*bottom) < 12:
-                logo.append("▀", style=f"rgb({top[0]},{top[1]},{top[2]})")
-            else:
-                logo.append(
-                    "▀",
-                    style=(f"rgb({top[0]},{top[1]},{top[2]}) "
-                           f"on rgb({bottom[0]},{bottom[1]},{bottom[2]})"),
-                )
-        if y + 2 < height:
+                continue
+            colour = tuple(sum(pixel[index] for pixel in active) // len(active)
+                           for index in range(3))
+            logo.append(chr(0x2800 + mask), style=f"rgb({colour[0]},{colour[1]},{colour[2]})")
+        if y + 1 < height:
             logo.append("\n")
     return logo
 
@@ -730,7 +739,12 @@ def _stream_view(reasoning_parts, content_parts):
                             title="[dim]thinking (/reasoning off to hide)[/dim]",
                             box=box.MINIMAL, border_style="grey50"))
     if content_parts:
-        blocks.append(Panel(Text("".join(content_parts)), title="[bold #00edff]Agent8088[/bold #00edff]",
+        content = "".join(content_parts)
+        if "✿FUNCTION✿" in content or "✿ARGS✿" in content:
+            content = "preparing tool call…"
+        elif len(content) > 4000:
+            content = "… " + content[-4000:]
+        blocks.append(Panel(Text(content), title="[bold #00edff]Agent8088[/bold #00edff]",
                             box=box.ROUNDED, border_style="#00C8FF"))
     return Group(*blocks) if blocks else Text("")
 
@@ -1007,9 +1021,9 @@ def do_chat(query):
                 on_result=_on_result, on_escalation=_on_escalation,
                 on_answer=None, on_token=on_token,
                 interrupt_check=esc.triggered.is_set, trace=trace,
-                system_prompt=_session_system_prompt(),
-                tools_def=A.build_tools_def(_active_tool_specs()),
-                allowed_tools=set(_active_tool_specs()),
+                system_prompt=_session_system_prompt,
+                tools_def=lambda: A.build_tools_def(_active_tool_specs()),
+                allowed_tools=lambda: set(_active_tool_specs()),
             )
         except A.AgentInterrupted:
             answer = None
@@ -1389,7 +1403,9 @@ def cmd_tool(rest):
         return
     with status_cm(f"running {name}..."):
         result = A.exec_tool(name, json.dumps(args))
-    if result.startswith("ESCALATION_REQUEST\x1f") and _handle_escalation(result):
+    if result.startswith("ESCALATION_REQUEST\x1f"):
+        if not _handle_escalation(result):
+            return
         with status_cm(f"running {name}..."):
             result = A.exec_tool(name, json.dumps(args))
     console.print(Panel(Text(result), title=f"[#237dd7]{name}[/#237dd7]  {json.dumps(args)}",
@@ -2351,7 +2367,7 @@ def _estimate_context_pct():
 def _prompt_label():
     pct = _estimate_context_pct()
     mode = " [bold #00edff]plan[/bold #00edff]" if A.PERMISSION_MODE == "plan-only" else ""
-    return (f"\n[bold #237dd7]8088[/bold #237dd7]{mode} "
+    return (f"[bold #237dd7]8088[/bold #237dd7]{mode} "
             f"[#237dd7]({pct}% ctx) ›[/#237dd7] ")
 
 
@@ -2361,8 +2377,8 @@ def _status_bar_fragments():
     filled = min(10, max(0, pct // 10))
     last = S.last_usage or {}
     return [
-        ("fg:#00edff bold", " ✢ "),
-        ("fg:#237dd7 bold", f"{_active_provider_name()}:{A.MODEL_NAME}"[:26]),
+        ("fg:#00edff bold", " ◆ 8088 "),
+        ("fg:#237dd7 bold", f"· {_active_provider_name()}:{A.MODEL_NAME}"[:28]),
         ("", " │ "),
         ("fg:#237dd7", f"{'█' * filled}{'░' * (10 - filled)} {pct}% ctx"),
         ("", " │ "),
@@ -2371,7 +2387,7 @@ def _status_bar_fragments():
         ("fg:#237dd7", (S.name or "ephemeral")[:18]),
         ("", " │ "),
         ("fg:#237dd7", f"last {last.get('seconds', 0):.1f}s ↑{last.get('tokens', 0)}"),
-        ("fg:#00edff", " │ ● idle "),
+        ("fg:#00edff bold", " │ ● ready "),
     ]
 
 
@@ -2417,13 +2433,14 @@ def _read_line():
     # the context percentage *and* A.PERMISSION_MODE, so repeating either here
     # would print `plan` an inch above a bar reading `plan-only`. The Rich
     # fallback `_prompt_label()` does keep both — that path has no toolbar.
-    label = "\n\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
+    label = "\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
     return prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
+        reserve_space_for_menu=0,
     )
 
 

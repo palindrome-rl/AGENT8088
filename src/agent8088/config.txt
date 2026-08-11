@@ -62,10 +62,11 @@ default_provider=ollama
 # provider.openrouter.api_key=sk-or-...
 
 timeout_seconds=120
+# max_tool_timeout_seconds=300
 
 # --- sandbox ---
 # auto uses free native OS isolation first, then Docker when available.
-# local disables isolation and should only be used on trusted commands.
+# If neither is available, shell and code execution are refused.
 sandbox_backend=auto
 sandbox_runtime_version=0.0.67
 # sandbox_allowed_domains=api.example.com
@@ -73,6 +74,11 @@ sandbox_runtime_version=0.0.67
 # separate from a tool's own timeout: the read-only git tools allow 20s, and a
 # first-run image pull inside that budget fails as an unexplained timeout.
 # docker_pull_seconds=300
+
+# Plan mode gets a wall-clock ceiling even when max_turn_seconds is unset, and
+# stops after repeated mutation attempts instead of looping until max_turns.
+# plan_mode_timeout_seconds=300
+# plan_mode_retry_limit=2
 
 # --- plan step auditing ---
 # With plan_audit=1, every mutating execute_plan step is verified against the

@@ -101,7 +101,7 @@ not per call.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `sandbox_backend` | `auto` | `auto` → native, then Docker. `native`, `docker`, or `local` to force. |
+| `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
 | `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox. |
 | `docker_image` / `docker_network` | | Docker fallback settings. |
@@ -137,6 +137,7 @@ MCP *servers you connect to* are configured in `mcp.json`, not here. See
 | `max_read_bytes` | Cap on a single file read. |
 | `max_http_bytes` | Cap on an HTTP response. |
 | `max_tool_output_bytes` | Cap on tool output fed back to the model. |
+| `max_tool_timeout_seconds` | Hard ceiling for one tool call (default `300`). |
 | `max_image_bytes` | Cap on an image attachment. |
 | `browser_timeout_ms` | `browse_page` timeout. |
 
@@ -149,6 +150,8 @@ number of rounds. All default to `0`, meaning disabled.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
+| `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
+| `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
 | `max_turn_cost_usd` | `0` | USD ceiling. Needs the two price keys below. |
 | `cost_per_1k_input` | `0` | Input token price, for the cost ceiling. |
