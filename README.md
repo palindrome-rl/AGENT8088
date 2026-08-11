@@ -146,5 +146,5 @@ See the [contribution guide](docs/wiki/14-contributing.md) for the required isol
 [MIT](LICENSE)
 
 <p align="center">
-  <img src="assets/palindrome-research-labs.png" alt="Palindrome Research Labs" width="72">
+  <img src="assets/palindrome-research-labs-footer.png" alt="Palindrome Research Labs" width="180">
 </p>
