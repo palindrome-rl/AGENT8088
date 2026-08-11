@@ -3245,6 +3245,29 @@ def _ensure_docker_image(image: str) -> str:
     return ""
 
 
+def _to_container_path(command: str, workspace: Path) -> str:
+    """Rewrite host paths in a command to the path the container will see.
+
+    The mirror of _from_container_path. The agent reads a file at an absolute
+    Windows path, then passes that same path to a shell command — which runs in
+    the container, where C:\\Users\\... does not exist and the command silently
+    finds nothing. Both directions have to hold or the two tool families cannot
+    describe the same file to each other.
+
+    Handles the escaped spelling too: a path that reached the model through JSON
+    arrives as C:\\\\Users\\\\..., and a replacement that only matched the plain
+    form would leave exactly the calls that came from tool arguments untouched.
+    """
+    host = str(workspace)
+    if not host:
+        return command
+    for spelling in (host.replace("\\", "\\\\"), host, host.replace("\\", "/")):
+        if spelling and spelling in command:
+            command = command.replace(spelling, _CONTAINER_WORKSPACE)
+    return command.replace("\\\\", "/").replace(_CONTAINER_WORKSPACE + "\\",
+                                                _CONTAINER_WORKSPACE + "/")
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "", workspace: Path | None = None,
                          readonly: bool = False) -> str:
@@ -3260,6 +3283,10 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     workspace = str(workspace_path)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     git_image = selected_image.startswith("alpine/git:")
+    # A host path in the command names nothing inside the container. Rewrite it
+    # to the mount point, so a file the agent just read at an absolute Windows
+    # path can also be listed, run or tested by a shell command.
+    command = _to_container_path(command, workspace_path)
     container_command = (["python", "-c", command] if python_code else
                          (["-lc", command] if git_image else ["sh", "-lc", command]))
     argv = [
