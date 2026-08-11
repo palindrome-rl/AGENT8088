@@ -3017,6 +3017,30 @@ def _write_sandbox_settings(readonly: bool = False, workspace: Path | None = Non
     return path
 
 
+# Signatures of the native runtime failing BEFORE it runs anything: no sandbox
+# was started, so the command did not execute. Matched narrowly on purpose — a
+# generic "Error:" test would also match a command that ran and printed an error,
+# and re-running that under Docker would repeat whatever it had already done.
+_NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
+    "Native sandbox runtime is unavailable.",
+    "WFP egress fence could not be verified",
+    "CreateProcessWithLogonW",
+    "Secondary Logon service",
+    "srt-win: error:",
+)
+
+
+def _native_sandbox_unusable(result: str) -> bool:
+    """Whether the native runtime failed to start the command at all.
+
+    Distinguishing this from "the command ran and failed" is the whole point:
+    only the former is safe to retry on another backend. On Windows the give-away
+    is that a succeeding command and a deliberately failing one return the *same*
+    text — the runtime never got as far as either.
+    """
+    return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
+
+
 def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
                          readonly: bool = False) -> str:
     argv = _native_sandbox_argv()
@@ -3160,18 +3184,27 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                         ignore=shutil.ignore_patterns(
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
-    if backend == "native":
-        local_command = (
-            _process_display([sys.executable, "-c", command])
-            if python_code else command
-        )
-        try:
-            return _exec_native_sandbox(local_command, timeout, workspace,
-                                        readonly=_sandbox_readonly)
-        finally:
-            if temporary:
-                temporary.cleanup()
     try:
+        if backend == "native":
+            local_command = (
+                _process_display([sys.executable, "-c", command])
+                if python_code else command
+            )
+            result = _exec_native_sandbox(local_command, timeout, workspace,
+                                          readonly=_sandbox_readonly)
+            # `auto` documents native first, Docker when available — but that
+            # choice was only ever made at selection time, from the presence of
+            # the runtime binary. A runtime that is installed and still cannot
+            # start a sandbox (on Windows, a restricted account it cannot log
+            # into) left the command refused with a working Docker sitting idle.
+            # Retry only a pre-flight failure: the command has not run, so
+            # nothing can be done twice.
+            if not _native_sandbox_unusable(result):
+                return result
+            if not _docker_available():
+                return result  # keep the runtime's own error; it says more
+            _log.warning("native sandbox could not start, falling back to docker: %s",
+                         result[:200])
         return _exec_docker_command(command, timeout, python_code, image,
                                     workspace=workspace)
     finally:
