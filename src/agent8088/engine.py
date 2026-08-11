@@ -1981,7 +1981,20 @@ def resolve_user_path(raw_path: str) -> Path:
 
 
 def resolve_write_path(raw_path: str) -> Path:
-    """Keep edits in place, but route every new workspace-relative file to artifacts/."""
+    """Store what the agent creates in artifacts/; honour a stated location.
+
+    A path that names a directory, or an absolute path to a file that is really
+    there, states where the write belongs and is written there. Everything else
+    is a file the agent is inventing, and it goes to artifacts/.
+
+    A *bare* filename is routed to artifacts/ even when the project root holds a
+    file of that name. Existence used to be read as "this is an edit, keep it in
+    place", which meant one leftover at the root pinned every later write to it:
+    a plan wrote `library.py` to the root because an earlier run had left one
+    there, while its new `library.json` went to artifacts/. The program was split
+    across two directories, could not run, and the auditor — which resolves a
+    bare name against the sandbox workspace — reported the source missing.
+    """
     p = Path(raw_path or "").expanduser()
     if p.is_absolute():
         resolved = p.resolve()
@@ -1989,6 +2002,8 @@ def resolve_write_path(raw_path: str) -> Path:
                 and PROJECT_ROOT in resolved.parents
                 and ARTIFACTS_ROOT not in resolved.parents):
             resolved = (ARTIFACTS_ROOT / resolved.relative_to(PROJECT_ROOT)).resolve()
+    elif len(p.parts) == 1:
+        resolved = (ARTIFACTS_ROOT / p).resolve()
     else:
         project_path = (PROJECT_ROOT / p).resolve()
         if project_path.exists() or project_path == ARTIFACTS_ROOT or ARTIFACTS_ROOT in project_path.parents:
@@ -1998,6 +2013,21 @@ def resolve_write_path(raw_path: str) -> Path:
     if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
         raise ValueError(f"Path not allowed: {resolved}")
     return resolved
+
+
+def _shadowed_project_file(raw_path: str, target: Path) -> Path | None:
+    """The existing project file a bare-name write was routed away from.
+
+    Diverting silently is the one thing that cannot be recovered from: a model
+    that meant the project's own README.md would report success and never learn
+    it wrote a copy. Naming the file it did not touch makes the write correctable
+    on the next call.
+    """
+    p = Path(raw_path or "").expanduser()
+    if p.is_absolute() or len(p.parts) != 1:
+        return None
+    project_path = (PROJECT_ROOT / p).resolve()
+    return project_path if project_path.exists() and project_path != target else None
 
 
 def _read_text_limited(path: Path, limit: int = MAX_READ_BYTES) -> str:
@@ -3768,6 +3798,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     command = ""
     write_path = ""
     path_zone = "default"
+    shadowed = None
     if mode == "shell":
         try:
             argv = _structured_tool_argv(name, args)
@@ -3784,6 +3815,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             target = resolve_write_path(write_path)
         except ValueError as exc:
             return f"Error: {exc}"
+        shadowed = _shadowed_project_file(write_path, target)
         # Layer 1 applies to WRITES as well as reads. Without this a sensitive file
         # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
         # overwritten even though reading it is denied.
@@ -4006,7 +4038,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         else:
             target.write_text(content, encoding="utf-8", newline="")
         _last_write_diff = _make_diff(old_content, content, str(target))
-        return f"Wrote {len(content)} bytes to {target}"
+        result = f"Wrote {len(content)} bytes to {target}"
+        if shadowed is not None:
+            result += (f" — NOT {shadowed}. A bare filename is stored in "
+                       f"artifacts/; pass that absolute path if you meant to "
+                       f"edit the project's own file.")
+        return result
 
     if mode == "python_eval":
         expression = spec.get("expression") or args.get("expression") or ""
