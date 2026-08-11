@@ -49,6 +49,13 @@ Install the extras you actually need:
 > Without the `gateway` extra the Slack/Discord tests fail at import rather
 > than skipping — see [Troubleshooting](13-troubleshooting.md).
 
+Playwright is included in the base install. Install its Chromium browser once
+to enable `browse_page`:
+
+```sh
+playwright install chromium
+```
+
 ## Verify
 
 ```sh

@@ -222,9 +222,15 @@ _git_permission = A.PERMISSION_MODE
 A.PERMISSION_MODE = "edit"
 try:
     st = A.exec_tool("git_status", "{}")
+    if st.startswith("ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1f"):
+        A.grant_escalation("local_execution")
+        st = A.exec_tool("git_status", "{}")
     check("approved git_status returns real output",
           "##" in st, st.splitlines()[0][:40] if st else "")
     lg = A.exec_tool("git_log", "{}")
+    if lg.startswith("ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1f"):
+        A.grant_escalation("local_execution")
+        lg = A.exec_tool("git_log", "{}")
     check("approved git_log returns real commits",
           len(lg.splitlines()) > 3, f"{len(lg.splitlines())} lines")
 finally:

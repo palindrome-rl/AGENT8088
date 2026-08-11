@@ -13,7 +13,7 @@ except ImportError:
     pass
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088 import web_search
@@ -40,9 +40,9 @@ def _protect_private_file(path: Path) -> None:
     # with "Could not determine the current Windows user SID" for anyone running
     # Agent8088 from that shell.
     system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    whoami = Path(system_root) / "System32" / "whoami.exe"
+    whoami = PureWindowsPath(system_root) / "System32" / "whoami.exe"
     identity = subprocess.run(
-        [str(whoami) if whoami.is_file() else "whoami", "/user", "/fo", "csv", "/nh"],
+        [str(whoami), "/user", "/fo", "csv", "/nh"],
         capture_output=True, text=True, timeout=10,
     )
     try:
@@ -801,6 +801,25 @@ def _shell_targets_credential_path(command: str) -> bool:
         token and (_is_sensitive_path(token) or _is_shell_startup_file(token))
         for token in tokens
     )
+
+
+_SHELL_WEB_CLIENT = re.compile(
+    r"(?<![\w./-])(?:curl|wget|httpie|lynx|w3m)(?![\w.-])|(?<![\w./-])https?(?=\s)",
+    re.IGNORECASE,
+)
+_SHELL_HTTP_URL = re.compile(r"https?://[^\s\"'`<>|;&]+", re.IGNORECASE)
+
+
+def _shell_web_urls(command: str):
+    """Return explicit web targets used by a shell client, or None if not a fetch.
+
+    Shell clients accept too many syntaxes to infer a missing destination safely.
+    A fetch-shaped command with no explicit HTTP(S) URL therefore returns an empty
+    list and is refused by run_tool instead of bypassing the URL policy.
+    """
+    if not _SHELL_WEB_CLIENT.search(command or ""):
+        return None
+    return [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
 
 
 # Beyond this length a command is not something a person is reasonably asking
@@ -1723,6 +1742,13 @@ def render_tool_docs(specs: dict) -> str:
         "to the user. If a listed tool clearly does what's asked, use it rather than refusing.",
         "",
     ]
+    lines.append("Mandatory routing — call the matching tool before writing an answer:")
+    if "read_text" in specs:
+        lines.append("- A direct request to read a file MUST call read_text.")
+    if "execute_shell" in specs:
+        lines.append("- A direct request to run a command MUST call execute_shell.")
+    if "web_search" in specs:
+        lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
     for name, s in specs.items():
         args = ", ".join(s["args"]) or "no args"
         lines.append(f"- {name}({args}): {s['description']}")
@@ -3645,6 +3671,26 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                detail=command[:200], reason="hard_blocked_shell")
         return "Error: This shell operation is forbidden by Agent8088's safety policy."
 
+    if mode == "shell":
+        web_urls = _shell_web_urls(command)
+        if web_urls == []:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="unverifiable_shell_egress")
+            return ("Blocked: shell web clients require an explicit http:// or https:// "
+                    "URL so the egress and SSRF policies can verify the destination.")
+        for url in web_urls or ():
+            blocked = _egress_check(url) or _ssrf_check(url)
+            if blocked:
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=url[:200], reason="egress_policy")
+                return blocked
+        if web_urls:
+            leak = _outbound_secret_check(command)
+            if leak:
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=command[:200], reason="outbound_secret")
+                return leak
+
     gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
     if mode == "mcp" and spec.get("mcp_read_only"):
         gated_modes = tuple(item for item in gated_modes if item != "mcp")
@@ -5032,8 +5078,7 @@ def _user_requested_tool(messages, name: str) -> bool:
 
 
 # Web fetching wearing a shell command as a disguise.
-_WEB_FETCH_SHELL = re.compile(r"\b(?:curl|wget|httpie|http|https|lynx|w3m)\b",
-                              re.IGNORECASE)
+_WEB_FETCH_SHELL = _SHELL_WEB_CLIENT
 
 # MCP tools whose name says they fetch. Name-based because MCP specs carry no
 # capability metadata to key off — see the docstring in _is_fetch_followup.

@@ -1,4 +1,4 @@
-execute_shell|Execute a necessary local shell command and return output. Never use it for web research, current facts, or arithmetic.|mode=shell|args=command|command={command}|timeout=25
+execute_shell|Execute a necessary local shell command and return its real output. When the user asks to run a command, call this tool; do not merely describe or predict the result. Never use it for web research, current facts, or arithmetic.|mode=shell|args=command|command={command}|timeout=25
 write_file|Write content to a file|mode=write_text|args=filename,content|path_arg=filename|content_arg=content|timeout=10
 read_text|Read text from a file|mode=read_text|args=filename|path_arg=filename|timeout=10
 web_search|Search the web for fresh information. Always use it before answering about current leaders, releases, prices, availability, schedules, news, vulnerabilities, recommendations, or exchange rates. Routes to the configured backend (SearXNG by default, Tavily or Exa when an API key is set, keyless ddgs as fallback) and falls back automatically when one is unavailable.|mode=search|args=query|timeout=30

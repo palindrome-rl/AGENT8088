@@ -349,6 +349,7 @@ def test_sandbox_backend_setting_persists(engine, tmp_path, monkeypatch):
 
 def test_browser_missing_is_graceful(engine, monkeypatch):
     monkeypatch.setattr(engine, "_playwright_available", lambda: False)
+    monkeypatch.setattr(engine, "_ssrf_check", lambda _url: None)
     out = engine._exec_browser({"url": "https://example.com"})
     assert "Playwright is not installed" in out
     assert "pip install playwright" in out

@@ -234,18 +234,28 @@ def test_save_export_uses_private_permission_gated_write(tmp_path, monkeypatch):
     monkeypatch.setattr(classic.S, "name", "")
     monkeypatch.setattr(classic.S, "disabled_skills", set())
     monkeypatch.setattr(classic.A, "ALLOWED_PATHS", [tmp_path])
-    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [])
     monkeypatch.setattr(classic.A, "PERMISSION_MODE", "readonly")
+    prompts = []
 
     def capture_run_tool(name, args, *call_args, **call_kwargs):
         seen.update(args)
         return real_run_tool(name, args, *call_args, **call_kwargs)
 
+    def approve(payload):
+        prompts.append(payload)
+        classic.A.grant_escalation()
+        return True
+
     monkeypatch.setattr(classic.A, "run_tool", capture_run_tool)
+    monkeypatch.setattr(classic, "_handle_escalation", approve)
 
     classic.cmd_save(str(target))
 
     assert seen["_private"] is True
+    assert len(prompts) == 1
+    assert prompts[0].startswith("ESCALATION_REQUEST\x1f")
     assert json.loads(target.read_text())["messages"] == [
         {"role": "user", "content": "private"},
     ]
@@ -268,6 +278,7 @@ def test_trace_save_respects_write_permissions(tmp_path, monkeypatch):
 
     assert not target.exists()
     assert "could not save" in output.getvalue()
+    assert "ESCALATION_REQUEST" not in output.getvalue()
 
 
 def test_trace_on_creates_and_updates_a_default_export(tmp_path, monkeypatch):

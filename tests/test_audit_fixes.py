@@ -447,6 +447,7 @@ def test_windows_model_cache_uses_private_acl(tmp_path, monkeypatch):
     monkeypatch.setattr(providers.subprocess, "run", fake_run)
     providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
 
+    assert calls[0][0].lower().endswith("system32\\whoami.exe")
     assert any(command[0] == "icacls" for command in calls)
 
 

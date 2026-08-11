@@ -12,6 +12,7 @@ dependencies = [
     "rich>=13.0.0,<16",
     "InquirerPy>=0.3.4,<1",
     "mcp>=1.27,<2",
+    "playwright>=1.40,<2",
     # Keyless web search fallback. A hard dependency on purpose: web_search must
     # always have a backend that needs no Docker, no API key, and no setup step,
     # so a stopped or unreachable SearXNG still returns results instead of an

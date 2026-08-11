@@ -198,7 +198,7 @@ unlocks them. See [Permissions & Security](03-permissions-and-security.md).
 |---|---|
 | `~/.agent8088/config.txt` | Settings (`0600`) |
 | `~/.agent8088/.env` | Secrets (`0600`) |
-| `~/.agent8088/mcp.json` | User MCP servers (`0600`) |
+| `$AGENT8088_HOME/mcp.json` | User MCP servers (`0600`; defaults to `~/.agent8088/mcp.json`) |
 | `.agent8088/mcp.json` | Project MCP servers — override user-level |
 | `~/.agent8088/gateway-sessions/` | Per-chat history |
 | `~/.agent8088/runtime/` | Sandbox runtime |

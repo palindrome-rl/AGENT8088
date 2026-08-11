@@ -1,6 +1,7 @@
 """Small synchronous facade over the official async MCP client."""
 import asyncio
 import json
+import logging
 import os
 import re
 import threading
@@ -9,6 +10,21 @@ from pathlib import Path
 
 
 _SAFE_STDIO_ENV = ("HOME", "LANG", "LC_ALL", "PATH", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "USERPROFILE")
+
+
+class _InvalidJSONNoiseFilter(logging.Filter):
+    """Hide the MCP SDK's full traceback for malformed server stdout."""
+
+    def filter(self, record):
+        return record.getMessage() != "Failed to parse JSONRPC message from server"
+
+
+logging.getLogger("mcp.client.stdio").addFilter(_InvalidJSONNoiseFilter())
+
+
+def _agent_home():
+    configured = os.environ.get("AGENT8088_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".agent8088"
 
 
 def _tool_name(server, tool, used):
@@ -75,7 +91,7 @@ class MCPRuntime:
 
     @property
     def config_paths(self):
-        return (Path.home() / ".agent8088" / "mcp.json", self.project_root / ".agent8088" / "mcp.json")
+        return (_agent_home() / "mcp.json", self.project_root / ".agent8088" / "mcp.json")
 
     def _start_loop(self):
         if self._loop:

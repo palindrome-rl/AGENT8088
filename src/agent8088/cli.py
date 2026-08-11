@@ -438,11 +438,9 @@ def _catalog(items, columns=4):
 
 def _palindrome_logo():
     """Render the supplied PNG as truecolor terminal pixels, not an ASCII approximation."""
-    fallback = (
-        _PALINDROME_ASCII_LOGO
-        if console.legacy_windows or "utf" not in console.encoding.lower()
-        else _PALINDROME_BLOCK_LOGO
-    )
+    if console.legacy_windows or "utf" not in console.encoding.lower():
+        return Text(_PALINDROME_ASCII_LOGO, style="bold #00C8FF")
+    fallback = _PALINDROME_BLOCK_LOGO
     if not _PALINDROME_LOGO.is_file():
         return Text(fallback, style="bold #00C8FF")
     try:
@@ -2085,7 +2083,10 @@ def cmd_history(_):
 def _write_user_export(path, content):
     arguments = {"filename": path, "content": content, "_private": True}
     result = A.run_tool("write_file", arguments)
-    if result.startswith("ESCALATION_REQUEST\x1f") and _handle_escalation(result):
+    if result.startswith("ESCALATION_REQUEST\x1f"):
+        if not _handle_escalation(result):
+            console.print("[red]could not save:[/red] permission denied")
+            return None
         result = A.run_tool("write_file", arguments)
     if not result.startswith("Wrote "):
         console.print(f"[red]could not save:[/red] {result}")

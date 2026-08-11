@@ -40,7 +40,7 @@ FALLBACK_MODELS = {
 }
 
 import csv, hashlib, json, os, stat, subprocess, sys, tempfile, time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 _CACHE_FILE = Path(os.environ.get("AGENT8088_HOME", str(Path.home() / ".agent8088"))) / "models_cache.json"
 
@@ -52,9 +52,9 @@ def _protect_private_file(path: Path) -> None:
     # Absolute path: Git Bash / MSYS shadows Windows' whoami with the coreutils
     # build, which rejects /user — see the matching note in engine.py.
     _system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    _whoami = Path(_system_root) / "System32" / "whoami.exe"
+    _whoami = PureWindowsPath(_system_root) / "System32" / "whoami.exe"
     identity = subprocess.run(
-        [str(_whoami) if _whoami.is_file() else "whoami", "/user", "/fo", "csv", "/nh"],
+        [str(_whoami), "/user", "/fo", "csv", "/nh"],
         capture_output=True, text=True, timeout=10,
     )
     try:

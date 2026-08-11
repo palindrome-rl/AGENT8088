@@ -330,13 +330,14 @@ that `curl | grep` cannot. SSRF-guarded.
 /tool browse_page url=https://example.com selector=h1
 ```
 
-Setup (optional):
+The Playwright Python package is installed with Agent8088. Install its Chromium
+browser once after setup:
 
 ```bash
-pip install playwright && playwright install chromium
+playwright install chromium
 ```
 
-`get_page_title` is kept as a curl-based fallback for when Playwright isn't installed.
+`get_page_title` remains available when the Chromium browser is not installed.
 
 ## 18. Multi-provider LLM
 

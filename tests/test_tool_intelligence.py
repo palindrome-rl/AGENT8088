@@ -34,6 +34,15 @@ def test_unrelated_message_is_not_a_request(engine):
     assert not engine._user_requested_tool(_user("who is the UK PM?"), "execute_shell")
 
 
+def test_tool_docs_make_direct_actions_mandatory(engine):
+    docs = engine.render_tool_docs(engine.TOOL_SPECS)
+
+    assert "request to read a file MUST call read_text" in docs
+    assert "request to run a command MUST call execute_shell" in docs
+    assert "every recommendation, including products, MUST call web_search" in docs
+    assert "do not merely describe or predict the result" in docs
+
+
 def test_assistant_text_does_not_count_as_a_request(engine):
     """Only the user can ask for a tool — the model must not authorise itself."""
     messages = [{"role": "assistant", "content": "I will run execute_shell now"}]

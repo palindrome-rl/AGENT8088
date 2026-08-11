@@ -64,7 +64,10 @@ sandbox_allowed_domains=api.example.com,pypi.org
 
 This is separate from the SSRF allowlist: `sandbox_allowed_domains` governs what
 a *sandboxed command* may reach; `ssrf_allow_hosts` governs what the *HTTP
-tools* may reach. Both apply independently.
+tools* may reach. Shell commands that invoke a web client such as `curl` or
+`wget` must contain an explicit HTTP(S) URL; that URL is checked by the same
+domain and SSRF policies before the command can run. Both layers apply
+independently.
 
 ## Local execution and consent
 

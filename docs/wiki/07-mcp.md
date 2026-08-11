@@ -17,7 +17,7 @@ MCP servers are declared in `mcp.json`, using the standard `mcpServers` shape:
 
 | Path | Scope |
 |---|---|
-| `~/.agent8088/mcp.json` | user-level, all projects |
+| `$AGENT8088_HOME/mcp.json` (normally `~/.agent8088/mcp.json`) | user-level, all projects |
 | `.agent8088/mcp.json` | project root — **overrides** user-level per server name |
 
 ```json

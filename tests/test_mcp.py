@@ -8,7 +8,7 @@ from agent8088.mcp import MCPRuntime
 
 
 def test_project_config_overrides_user_config(tmp_path, monkeypatch):
-    monkeypatch.setattr("agent8088.mcp.Path.home", lambda: tmp_path / "home")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "home"))
     runtime = MCPRuntime(tmp_path / "project")
     user, project = runtime.config_paths
     user.parent.mkdir(parents=True)
@@ -20,7 +20,7 @@ def test_project_config_overrides_user_config(tmp_path, monkeypatch):
 
 
 def test_stdio_server_is_discovered_and_called(tmp_path, monkeypatch):
-    monkeypatch.setattr("agent8088.mcp.Path.home", lambda: tmp_path / "home")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "home"))
     project = tmp_path / "project"
     script = tmp_path / "server.py"
     script.write_text(
@@ -61,3 +61,43 @@ def test_mcp_tools_use_existing_permission_gate(monkeypatch):
     assert engine.run_tool(name, {}).startswith("ESCALATION_REQUEST\x1f")
     engine.grant_escalation()
     assert "done" in engine.run_tool(name, {})
+
+
+def test_agent_home_isolates_user_mcp_config(tmp_path, monkeypatch):
+    isolated = tmp_path / "isolated"
+    monkeypatch.setenv("AGENT8088_HOME", str(isolated))
+
+    runtime = MCPRuntime(tmp_path / "project")
+    runtime.set_server("probe", {"command": "probe"})
+
+    assert runtime.config_paths[0] == isolated / "mcp.json"
+    assert json.loads((isolated / "mcp.json").read_text()) == {
+        "mcpServers": {"probe": {"command": "probe"}},
+    }
+
+
+def test_malformed_stdio_server_reports_clean_error(tmp_path, monkeypatch, caplog, capsys):
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "home"))
+    project = tmp_path / "project"
+    script = tmp_path / "not_mcp.py"
+    script.write_text("print('not json-rpc')\n", encoding="utf-8")
+    config = project / ".agent8088" / "mcp.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"mcpServers": {"broken": {
+        "command": sys.executable,
+        "args": [str(script)],
+        "connect_timeout": 2,
+    }}}), encoding="utf-8")
+
+    runtime = MCPRuntime(project)
+    try:
+        assert runtime.reload() == {}
+        assert runtime.statuses["broken"]["state"] == "error"
+        assert "Connection closed" in runtime.statuses["broken"]["error"]
+    finally:
+        runtime.close()
+
+    captured = capsys.readouterr()
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Traceback" not in captured.err
+    assert "Failed to parse JSONRPC message from server" not in messages

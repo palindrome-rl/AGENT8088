@@ -112,6 +112,8 @@ def main():
     for prompt, expectation in CASES:
         calls = []
         asked = {}
+        if expectation == "execute_shell" and A._resolve_sandbox_backend() in {"local", "unavailable"}:
+            A.grant_escalation("local_execution")
 
         def _on_result(name, result, _sink=calls, _asked=asked):
             # Record what RAN. A refusal means the engine stopped it, which is
