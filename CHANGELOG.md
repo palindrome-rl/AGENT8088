@@ -26,6 +26,12 @@ research read-only, propose one plan, get it approved, run it, come back.
 
 ### Added
 
+- `/audit [on|off]` turns step verification on or off from the prompt, and writes the
+  choice through to `config.txt` so it survives a restart. It was reachable only by
+  editing `plan_audit` and relaunching, which is the wrong shape for this setting:
+  verification is something you want to try on one task, see what it cost, and then
+  decide about. With no argument it reports the current state and the last turn's
+  verification share. Turning it on says what it will cost.
 - `present_plan` tool: presents a plan as markdown for approval. Plan proposal and
   plan execution used to be the same tool, which meant the only approvable plan
   was a fully-specified JSON step array — something models do not reliably

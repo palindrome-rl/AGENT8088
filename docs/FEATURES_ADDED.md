@@ -619,6 +619,7 @@ agent8088 --model-setup
 /tools                    List every tool with args, mode, description
 /tool <name> <args>       Invoke one tool directly (JSON or key=value)
 /plan [task]              Enter plan mode: propose, approve, then run
+/audit [on|off]           Show or change step verification
 /raw <text>               One raw model call (content, reasoning, tool_calls)
 /config                   Active configuration
 /doctor                   Check endpoint reachability and local capability state
