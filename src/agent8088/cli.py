@@ -707,9 +707,9 @@ def _handle_escalation(result_text, live=None):
     In plan-only mode, offers a mode-switch choice (full-auto/readonly/deny)
     instead of once/session/deny — matches Claude Code's 'exit plan = pick
     destination mode' pattern."""
-    if not result_text.startswith("ESCALATION_REQUEST:"):
+    if not result_text.startswith("ESCALATION_REQUEST\x1f"):
         return False
-    parts = result_text.split(":", 4)
+    parts = result_text.split("\x1f", 4)
     if len(parts) < 5:
         return False
     _, target_mode, change_type, paths, reason = parts
@@ -1282,7 +1282,7 @@ def cmd_tool(rest):
         return
     with status_cm(f"running {name}..."):
         result = A.exec_tool(name, json.dumps(args))
-    if result.startswith("ESCALATION_REQUEST:") and _handle_escalation(result):
+    if result.startswith("ESCALATION_REQUEST\x1f") and _handle_escalation(result):
         with status_cm(f"running {name}..."):
             result = A.exec_tool(name, json.dumps(args))
     console.print(Panel(Text(result), title=f"[#237dd7]{name}[/#237dd7]  {json.dumps(args)}",
@@ -1976,7 +1976,7 @@ def cmd_history(_):
 def _write_user_export(path, content):
     arguments = {"filename": path, "content": content, "_private": True}
     result = A.run_tool("write_file", arguments)
-    if result.startswith("ESCALATION_REQUEST:") and _handle_escalation(result):
+    if result.startswith("ESCALATION_REQUEST\x1f") and _handle_escalation(result):
         result = A.run_tool("write_file", arguments)
     if not result.startswith("Wrote "):
         console.print(f"[red]could not save:[/red] {result}")
@@ -2709,7 +2709,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
 
 def _run_gateway_setup():
-    """Interactive wizard for configuring Slack + WhatsApp messaging gateways."""
+    """Interactive wizard for configuring messaging platform gateways."""
     import re as _re
     import subprocess
     import shutil
@@ -2734,13 +2734,14 @@ def _run_gateway_setup():
 
     print("Agent8088 Gateway Setup\n")
     print("Configure messaging platforms so the agent can respond on")
-    print("Slack, WhatsApp, Discord, and Email. Run `agent8088 --gateway` to start.\n")
+    print("Slack, WhatsApp, Discord, Email, and Telegram. Run `agent8088 --gateway` to start.\n")
 
     # Show current state
     slack_on = _current("slack_enabled") in ("1", "true", "True")
     wa_on = _current("whatsapp_enabled") in ("1", "true", "True")
     discord_on = _current("discord_enabled") in ("1", "true", "True")
     email_on = _current("email_enabled") in ("1", "true", "True")
+    telegram_on = _current("telegram_enabled") in ("1", "true", "True")
 
     # Only one gateway channel can be active at a time (mutually exclusive).
     # Single-select picker — choosing one disables the others.
@@ -2749,29 +2750,34 @@ def _run_gateway_setup():
         "WhatsApp" + (" (current)" if wa_on else ""),
         "Discord" + (" (current)" if discord_on else ""),
         "Email" + (" (current)" if email_on else ""),
+        "Telegram" + (" (current)" if telegram_on else ""),
         "None (disable all)",
     ]
     selected = _choice_prompt("Select gateway channel (only one can be active):", choices)
 
     if selected == "None (disable all)":
-        slack_on = wa_on = discord_on = email_on = False
+        slack_on = wa_on = discord_on = email_on = telegram_on = False
         newly_enabled = set()
     elif selected.startswith("Slack"):
         newly_enabled = set() if slack_on else {"slack"}
         slack_on = True
-        wa_on = discord_on = email_on = False
+        wa_on = discord_on = email_on = telegram_on = False
     elif selected.startswith("WhatsApp"):
         newly_enabled = set() if wa_on else {"whatsapp"}
         wa_on = True
-        slack_on = discord_on = email_on = False
+        slack_on = discord_on = email_on = telegram_on = False
     elif selected.startswith("Discord"):
         newly_enabled = set() if discord_on else {"discord"}
         discord_on = True
-        slack_on = wa_on = email_on = False
+        slack_on = wa_on = email_on = telegram_on = False
     elif selected.startswith("Email"):
         newly_enabled = set() if email_on else {"email"}
         email_on = True
-        slack_on = wa_on = discord_on = False
+        slack_on = wa_on = discord_on = telegram_on = False
+    elif selected.startswith("Telegram"):
+        newly_enabled = set() if telegram_on else {"telegram"}
+        telegram_on = True
+        slack_on = wa_on = discord_on = email_on = False
     else:
         newly_enabled = set()
 
@@ -2988,11 +2994,44 @@ def _run_gateway_setup():
             content = _set_line(content, "email_enabled", "1")
             print("Email configured.\n")
 
+    # --- Telegram configuration (only if newly enabled) ---
+    if telegram_on and "telegram" in newly_enabled:
+        print("\n--- Telegram ---")
+        print("Create a Telegram bot via @BotFather (https://t.me/BotFather):")
+        print("  1. Send /newbot to @BotFather")
+        print("  2. Choose a display name and a username ending in 'bot'")
+        print("  3. Copy the API token (looks like 123456789:ABCdef...)\n")
+        print("For group chats: disable privacy mode via @BotFather ->")
+        print("  /mybots -> Bot Settings -> Group Privacy -> Turn off,")
+        print("  OR promote the bot to group admin. Then remove and re-add")
+        print("  the bot to any group so the new privacy state takes effect.\n")
+
+        _env_vars = A.load_env_file(A.ENV_FILE_PATH)
+        bot_token = _custom_prompt("Telegram Bot Token:",
+                                    default=_env_vars.get("TELEGRAM_BOT_TOKEN", ""),
+                                    secret=True)
+        if bot_token:
+            A.update_env_file(A.ENV_FILE_PATH, {"TELEGRAM_BOT_TOKEN": bot_token})
+        else:
+            bot_token = _env_vars.get("TELEGRAM_BOT_TOKEN", "")
+        allowed = _custom_prompt("Allowed Telegram user IDs (comma-separated numerics, or *):",
+                                 _current("telegram_allowed_users"))
+        if allowed:
+            content = _set_line(content, "telegram_allowed_users", allowed)
+        if not bot_token:
+            content = _set_line(content, "telegram_enabled", "0")
+            telegram_on = False
+            print("Telegram disabled — bot token required.\n")
+        else:
+            content = _set_line(content, "telegram_enabled", "1")
+            print("Telegram configured.\n")
+
     # Mutually exclusive: ensure only the selected channel is enabled
     content = _set_line(content, "slack_enabled", "1" if slack_on else "0")
     content = _set_line(content, "whatsapp_enabled", "1" if wa_on else "0")
     content = _set_line(content, "discord_enabled", "1" if discord_on else "0")
     content = _set_line(content, "email_enabled", "1" if email_on else "0")
+    content = _set_line(content, "telegram_enabled", "1" if telegram_on else "0")
 
     # Write config
     A._write_private_text(config_path, content)
@@ -3001,6 +3040,7 @@ def _run_gateway_setup():
     elif wa_on: enabled.append("WhatsApp")
     elif discord_on: enabled.append("Discord")
     elif email_on: enabled.append("Email")
+    elif telegram_on: enabled.append("Telegram")
     if enabled:
         print(f"Config written to {config_path}")
         print(f"Enabled: {', '.join(enabled)}")
@@ -3030,8 +3070,8 @@ def main():
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
-    parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp) instead of the REPL")
-    parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp messaging gateways, then exit")
+    parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp/Discord/Email/Telegram) instead of the REPL")
+    parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp/Discord/Email/Telegram messaging gateways, then exit")
     parser.add_argument("--mcp-serve", action="store_true", help="run Agent8088 as an MCP server (expose tools to external AI agents)")
     parser.add_argument("--mcp-http", action="store_true", help="use HTTP transport for MCP server (with --mcp-serve)")
     parser.add_argument("--mcp-port", type=int, default=8931, help="MCP server HTTP port (default 8931)")

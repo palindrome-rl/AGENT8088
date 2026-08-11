@@ -179,9 +179,9 @@ class GatewayRunner:
         loop = asyncio.get_event_loop()
 
         def _on_escalation(name: str, result: str) -> bool:
-            if not result.startswith("ESCALATION_REQUEST:"):
+            if not result.startswith("ESCALATION_REQUEST"):
                 return False
-            parts = result.split(":", 4)
+            parts = result.split("\x1f", 4)
             if len(parts) < 5:
                 return False
             _, target_mode, change_type, paths, reason = parts
@@ -353,5 +353,12 @@ def build_runner() -> GatewayRunner:
             runner.register_adapter(EmailAdapter(config, runner))
         except ImportError:
             log.warning("Email enabled but failed to import. "
-                         "Email uses stdlib only — check config.")
+                        "Email uses stdlib only — check config.")
+    if config.get("telegram_enabled", "0") in ("1", "true", "True"):
+        try:
+            from agent8088.gateway.platforms.telegram import TelegramAdapter
+            runner.register_adapter(TelegramAdapter(config, runner))
+        except ImportError:
+            log.warning("Telegram enabled but python-telegram-bot not installed. "
+                        "Run: uv pip install -e \".[gateway]\"")
     return runner

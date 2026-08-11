@@ -68,7 +68,7 @@ def test_plan_halts_on_unknown_tool(engine):
 
 def test_plan_step_failed_recognises_errors_and_unanswered_escalations(engine):
     assert engine._plan_step_failed("Error: boom") is True
-    assert engine._plan_step_failed("ESCALATION_REQUEST:edit:write:/x:why") is True
+    assert engine._plan_step_failed("ESCALATION_REQUEST\x1fedit\x1fwrite\x1f/x\x1fwhy") is True
     assert engine._plan_step_failed("Wrote 12 bytes to /tmp/x") is False
     assert engine._plan_step_failed("") is False
 

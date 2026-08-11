@@ -46,7 +46,7 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 - **SkillOpt** — self-improving agent skills via text-space optimization
 - **MCP client** — connect stdio and Streamable HTTP MCP servers as Agent8088 tools
 - **MCP server** — expose Agent8088's tools to external AI agents (Claude Code, Codex, Cursor) via stdio or HTTP
-- **Messaging gateway** — Slack, WhatsApp, Discord, and Email adapters with allowlist + approval prompts
+- **Messaging gateway** — Slack, WhatsApp, Discord, Email, and Telegram adapters with allowlist + approval prompts
 - **Chat-based approvals** — `/approve` + `/deny` in chat; Discord gets interactive ✅/❌ buttons
 - **Separate .env key store** — API keys and tokens stored in `~/.agent8088/.env` (0600), not in config.txt
 

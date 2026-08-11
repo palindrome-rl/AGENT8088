@@ -4,6 +4,51 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Telegram Gateway Adapter
+
+### New adapter: Telegram (`python-telegram-bot`)
+
+- **`src/agent8088/gateway/platforms/telegram.py`** -- fifth platform adapter,
+  alongside Slack, WhatsApp, Discord, and Email. Uses `python-telegram-bot`
+  (long polling, no public URL required).
+- **Config keys:** `telegram_enabled`, `telegram_bot_token` (env fallback
+  `TELEGRAM_BOT_TOKEN`), `telegram_allowed_users` (numeric user IDs,
+  comma-separated, `*` for wildcard).
+- **CLI wizard:** Telegram added to `--gateway-setup` single-select picker.
+- **`pyproject.toml`:** `python-telegram-bot>=20,<23` added to `gateway` extras.
+- **Allowlist:** `telegram_allowed_users` added to `Allowlist.from_config()`.
+- **Runner:** `build_runner()` registers `TelegramAdapter` when enabled.
+- **Wiki:** platform table, setup section, and token entry updated.
+
+### Adapter features
+
+- DMs always respond; groups require @mention or reply-to-bot.
+- Bot-sender filter, dedup by `update_id` (500-entry cap).
+- Streaming via `TelegramStreamSink`, markdown conversion, 4096-char chunking.
+- Approval prompts: plain-text `/approve` and `/deny` (base class default).
+- `block=False` on MessageHandler to prevent PTB sequential-update deadlock
+  during approval waits.
+
+### Bug fixes in this pass
+
+- **Fixed: garbled escalation prompts on Windows** -- `:` delimiter broke on
+  Windows paths (`C:\Users\...`). Changed to `\x1f` (ASCII unit separator).
+- **Fixed: Discord approval buttons never resolved** -- `_ApprovalView` used
+  string `chat_id` but runner stores tuple `(platform, chat_id)`.
+- **Fixed: slash commands silently dropped in Telegram DMs** -- removed
+  `~filters.COMMAND` exclusion from MessageHandler.
+- **Fixed: Telegram approval deadlock** -- `block=False` so PTB dispatches
+  updates concurrently instead of sequentially.
+- **Fixed: "No messaging platforms enabled" error message** -- now lists all
+  five platforms.
+
+### Tests
+
+- 21 tests in `test_telegram.py`, 1 new test in `test_discord.py`.
+- All regression tests verified red against buggy code, green with fix.
+
+---
+
 ## Plan Mode
 
 `/plan` now means what it means in Claude Code, Hermes and Codex: enter plan mode,
