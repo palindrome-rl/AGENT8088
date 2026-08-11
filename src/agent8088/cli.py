@@ -3424,6 +3424,14 @@ def _run_gateway_setup():
         else:
             smtp_host = _env_vars.get("EMAIL_SMTP_HOST", "")
 
+        smtp_port = _custom_prompt("SMTP port (587=STARTTLS, 465=implicit SSL; Enter=587):",
+                                    default=_current("email_smtp_port") or "587")
+        if smtp_port and smtp_port != "587":
+            content = _set_line(content, "email_smtp_port", smtp_port)
+        else:
+            # Default port: clear any stale override so the adapter uses 587.
+            content = _set_line(content, "email_smtp_port", "")
+
         imap_host = _custom_prompt("IMAP host (e.g. imap.gmail.com):",
                                     default=_env_vars.get("EMAIL_IMAP_HOST", ""))
         if imap_host and "smtp" in imap_host.lower():

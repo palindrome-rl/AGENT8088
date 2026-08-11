@@ -21,6 +21,7 @@ import asyncio
 import email as email_lib
 import logging
 import smtplib
+import socket
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -131,9 +132,9 @@ class EmailAdapter(BaseChannelAdapter):
         self._address = A.get_secret(config, "email_address", "EMAIL_ADDRESS")
         self._password = A.get_secret(config, "email_password", "EMAIL_PASSWORD")
         self._smtp_host = A.get_secret(config, "email_smtp_host", "EMAIL_SMTP_HOST")
-        self._smtp_port = int(config.get("email_smtp_port", "587"))
+        self._smtp_port = int(config.get("email_smtp_port") or "587")
         self._imap_host = A.get_secret(config, "email_imap_host", "EMAIL_IMAP_HOST")
-        self._imap_port = int(config.get("email_imap_port", "993"))
+        self._imap_port = int(config.get("email_imap_port") or "993")
         self._running = False
         self._seen_uids: set = set()
         self._thread_context: dict = {}  # sender → {subject, message_id}
@@ -286,7 +287,13 @@ class EmailAdapter(BaseChannelAdapter):
             return "0"
 
     def _send_email(self, to_addr: str, subject: str, body: str, reply_to_id: str) -> str:
-        """Send an email via SMTP."""
+        """Send an email via SMTP.
+
+        Tries the configured port first. If the configured port is 587
+        (STARTTLS) and the connection times out — a common failure when an
+        ISP or corporate firewall blackholes outbound SMTP-on-587 while
+        leaving 465 (implicit SSL) open — falls back to port 465 once.
+        """
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
@@ -295,17 +302,42 @@ class EmailAdapter(BaseChannelAdapter):
             msg["In-Reply-To"] = reply_to_id
             msg["References"] = reply_to_id
         msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        ports_to_try = [self._smtp_port]
+        # ponytail: 587 is frequently blackholed by ISPs; 465 (implicit SSL)
+        # is the standard fallback. Drop this fallback if a configurable
+        # port is explicitly set to something other than 587.
+        if self._smtp_port == 587:
+            ports_to_try.append(465)
+
+        last_exc = None
+        for port in ports_to_try:
+            try:
+                self._smtp_send_on_port(msg, port)
+                logger.info("Email: sent reply to %s via SMTP %s:%d (%d chars)",
+                            to_addr, self._smtp_host, port, len(body))
+                return "1"
+            except (smtplib.SMTPConnectError, socket.timeout, TimeoutError, OSError) as e:
+                last_exc = e
+                logger.warning("Email: SMTP %s:%d failed (%s), %s",
+                               self._smtp_host, port, e,
+                               "falling back to 465" if port != ports_to_try[-1]
+                               else "no more ports to try")
+                continue
+        logger.warning("Email send failed: %s", last_exc)
+        return "0"
+
+    def _smtp_send_on_port(self, msg, port: int) -> None:
+        """Connect to SMTP on the given port, login, send, and quit."""
         smtp = None
         try:
-            if self._smtp_port == 465:
-                smtp = smtplib.SMTP_SSL(self._smtp_host, self._smtp_port, timeout=30)
+            if port == 465:
+                smtp = smtplib.SMTP_SSL(self._smtp_host, port, timeout=30)
             else:
-                smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
+                smtp = smtplib.SMTP(self._smtp_host, port, timeout=30)
                 smtp.starttls()
             smtp.login(self._address, self._password)
             smtp.send_message(msg)
-            logger.info("Email: sent reply to %s (%d chars)", to_addr, len(body))
-            return "1"
         finally:
             if smtp:
                 try:

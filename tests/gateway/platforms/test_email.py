@@ -1,6 +1,27 @@
 """Tests for the Email adapter."""
 import asyncio
+import socket
+import smtplib
 from unittest.mock import MagicMock, AsyncMock, patch
+
+
+def _make_adapter(monkeypatch, tmp_path, smtp_port="587", runner=None):
+    """Build an EmailAdapter with secrets stubbed and a temp .env."""
+    from agent8088.gateway.platforms.email import EmailAdapter
+    from agent8088 import engine as A
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
+    monkeypatch.setattr(A, "get_secret", lambda c, k, env=None: {
+        "email_address": "test@gmail.com",
+        "email_password": "app-password",
+        "email_smtp_host": "smtp.gmail.com",
+        "email_imap_host": "imap.gmail.com",
+    }.get(k, ""))
+    config = {
+        "email_enabled": "1",
+        "email_smtp_port": smtp_port,
+        "email_imap_port": "993",
+    }
+    return EmailAdapter(config, runner=runner)
 
 
 def test_email_adapter_imports():
@@ -217,3 +238,141 @@ def test_email_rejects_unverified_sender_before_allowlist():
     adapter._process_message(msg)
 
     allowlist.is_allowed.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# SMTP port handling and 587 → 465 fallback
+# --------------------------------------------------------------------------- #
+
+def test_email_send_uses_smtp_ssl_when_port_is_465(monkeypatch, tmp_path):
+    """Port 465 must use SMTP_SSL (implicit TLS), never STARTTLS."""
+    adapter = _make_adapter(monkeypatch, tmp_path, smtp_port="465")
+    calls = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=30):
+            calls.append(("SMTP_SSL" if isinstance(self, _FakeSSL) else "SMTP", host, port))
+        def login(self, *a, **k): pass
+        def send_message(self, m): pass
+        def quit(self): pass
+        def starttls(self): calls.append(("starttls",))
+
+    class _FakeSSL(FakeSMTP): pass
+
+    with patch("smtplib.SMTP_SSL", _FakeSSL), patch("smtplib.SMTP", FakeSMTP):
+        result = adapter._send_email("to@x.com", "subj", "body", "")
+    assert result == "1"
+    # SMTP_SSL should have been used; plain SMTP should not
+    ssl_calls = [c for c in calls if c[0] == "SMTP_SSL"]
+    smtp_calls = [c for c in calls if c[0] == "SMTP"]
+    starttls_calls = [c for c in calls if c[0] == "starttls"]
+    assert len(ssl_calls) == 1
+    assert len(smtp_calls) == 0
+    assert len(starttls_calls) == 0
+
+
+def test_email_send_falls_back_to_465_when_587_times_out(monkeypatch, tmp_path):
+    """When port 587 times out, the adapter must retry on 465 (SMTP_SSL)."""
+    adapter = _make_adapter(monkeypatch, tmp_path, smtp_port="587")
+    attempts = []
+
+    class FakeSSL:
+        def __init__(self, host, port, timeout=30):
+            attempts.append(("SSL", host, port))
+        def login(self, *a, **k): pass
+        def send_message(self, m): pass
+        def quit(self): pass
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=30):
+            attempts.append(("SMTP", host, port))
+        def starttls(self): pass
+        def login(self, *a, **k): pass
+        def send_message(self, m): pass
+        def quit(self): pass
+
+    def smtp_factory_that_times_out(host, port, timeout=30):
+        # Record the attempt before raising, so the test can verify the
+        # 587-then-465 ordering.
+        attempts.append(("SMTP", host, port))
+        raise smtplib.SMTPConnectError(421, b"connect error 10060")
+
+    with patch("smtplib.SMTP", smtp_factory_that_times_out), \
+         patch("smtplib.SMTP_SSL", FakeSSL):
+        result = adapter._send_email("to@x.com", "subj", "body", "")
+    assert result == "1"
+    # Should have attempted 587 (SMTP) then 465 (SSL)
+    ports = [a[2] for a in attempts]
+    assert 587 in ports
+    assert 465 in ports
+
+
+def test_email_send_returns_0_when_both_ports_fail(monkeypatch, tmp_path):
+    """If both 587 and 465 fail, the adapter returns '0' (no crash)."""
+    adapter = _make_adapter(monkeypatch, tmp_path, smtp_port="587")
+
+    def smtp_fail(host, port, timeout=30):
+        raise smtplib.SMTPConnectError(421, b"connect error 10060")
+
+    with patch("smtplib.SMTP", smtp_fail), patch("smtplib.SMTP_SSL", smtp_fail):
+        result = adapter._send_email("to@x.com", "subj", "body", "")
+    assert result == "0"
+
+
+def test_email_send_explicit_non_587_port_is_honored(monkeypatch, tmp_path):
+    """A port other than 587 (e.g. 2525) is tried as-is, with no 465 fallback."""
+    adapter = _make_adapter(monkeypatch, tmp_path, smtp_port="2525")
+    attempts = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=30):
+            attempts.append(port)
+        def starttls(self): pass
+        def login(self, *a, **k): pass
+        def send_message(self, m): pass
+        def quit(self): pass
+
+    with patch("smtplib.SMTP", FakeSMTP):
+        result = adapter._send_email("to@x.com", "subj", "body", "")
+    assert result == "1"
+    # Only 2525 should be attempted, not 465
+    assert attempts == [2525]
+
+
+def test_email_send_falls_back_on_timeout_error(monkeypatch, tmp_path):
+    """socket.timeout / TimeoutError on 587 also triggers the 465 fallback."""
+    adapter = _make_adapter(monkeypatch, tmp_path, smtp_port="587")
+    attempts = []
+
+    class FakeSSL:
+        def __init__(self, host, port, timeout=30):
+            attempts.append(port)
+        def login(self, *a, **k): pass
+        def send_message(self, m): pass
+        def quit(self): pass
+
+    def smtp_timeout(host, port, timeout=30):
+        raise TimeoutError("timed out reading banner")
+
+    with patch("smtplib.SMTP", smtp_timeout), patch("smtplib.SMTP_SSL", FakeSSL):
+        result = adapter._send_email("to@x.com", "subj", "body", "")
+    assert result == "1"
+    assert 465 in attempts
+
+
+def test_email_empty_smtp_port_falls_back_to_587(monkeypatch, tmp_path):
+    """An empty email_smtp_port value must not crash int(); it defaults to 587."""
+    from agent8088.gateway.platforms.email import EmailAdapter
+    from agent8088 import engine as A
+    monkeypatch.setattr("agent8088.engine.ENV_FILE_PATH", tmp_path / ".env")
+    monkeypatch.setattr(A, "get_secret", lambda c, k, env=None: {
+        "email_address": "test@gmail.com",
+        "email_password": "app-password",
+        "email_smtp_host": "smtp.gmail.com",
+        "email_imap_host": "imap.gmail.com",
+    }.get(k, ""))
+    # Stale empty string from the wizard — must not raise ValueError.
+    config = {"email_enabled": "1", "email_smtp_port": "", "email_imap_port": ""}
+    adapter = EmailAdapter(config, runner=None)
+    assert adapter._smtp_port == 587
+    assert adapter._imap_port == 993
