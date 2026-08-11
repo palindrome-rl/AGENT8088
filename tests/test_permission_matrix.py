@@ -223,19 +223,15 @@ def test_readonly_safe_shell_runs_in_readonly(engine, monkeypatch):
                                {"command": "pwd"}).startswith(ESCALATION)
 
 
-def test_a_safe_shell_command_still_asks_before_running_unisolated(engine, monkeypatch):
-    """The other half of the same story, and the reason the above is split in two:
-    permission mode allowing a command is not the same as there being somewhere
-    safe to run it. Running unisolated is the user's call however harmless the
-    command looks."""
+def test_a_safe_shell_command_is_refused_without_isolation(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine, "_exec_sandbox_command",
-                        lambda command, **kw: engine._local_execution_request(command))
+                        lambda command, **kw: engine._sandbox_required_error())
 
     result = engine.run_tool("execute_shell", {"command": "pwd"})
 
-    assert result.startswith(ESCALATION)
-    assert "local_execution" in result
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith(ESCALATION)
 
 
 def test_mutating_shell_escalates_in_readonly(engine, monkeypatch, artifacts_dir):

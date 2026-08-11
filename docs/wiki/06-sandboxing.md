@@ -11,10 +11,9 @@ command can't reach your whole filesystem or network.
 
 | Value | Behaviour |
 |---|---|
-| `auto` *(default)* | Native runtime first, Docker if unavailable, then ask before running locally |
+| `auto` *(default)* | Native runtime first, Docker if unavailable, otherwise refuse execution |
 | `native` | Force the free OS-level sandbox |
 | `docker` | Force the Docker fallback |
-| `local` | **No isolation.** Explicit opt-in only |
 
 Check what's active:
 
@@ -69,22 +68,15 @@ tools* may reach. Shell commands that invoke a web client such as `curl` or
 domain and SSRF policies before the command can run. Both layers apply
 independently.
 
-## Local execution and consent
+## No unsandboxed fallback
 
-Under `local` — or `auto` with neither backend present — Agent8088 asks before
-each command:
+When neither backend is available, Agent8088 refuses shell and code execution
+and explains how to install the native runtime or Docker. Approval cannot bypass
+this requirement.
 
-```
-Run this command locally without isolation? ls -la
-```
-
-The command shown is passed through secret redaction first, so a command
-containing a key doesn't print it back at you.
-
-Permission mode never bypasses missing isolation. Under `local` — or when
-`auto` has neither native nor Docker available — each local command needs an
-explicit one-shot escalation. The always-on floor still applies: catastrophic
-commands and destructive git are refused regardless of backend or mode.
+Commands start in `artifacts/`, the only project directory they may write. A
+read-only auditor runs tests in a disposable copy, so runtime files created by a
+test disappear afterward and the real workspace remains unchanged.
 
 ## What sandboxing does *not* cover
 
@@ -95,15 +87,15 @@ Worth being precise, because it's easy to over-trust:
   command is refused before the sandbox is even consulted.
 - **File tools don't go through it.** `read_text` / `write_file` are gated by
   path zones and the sensitive-file floor, not by the sandbox.
-- **`local` means local.** Choosing it disables isolation entirely. It exists
-  for trusted commands and debugging, not as a normal setting.
+- **Host-side workflow tools remain explicit.** Structured operations such as a
+  user-approved commit or push are permission-gated separately; arbitrary code
+  never uses that path.
 
 ## Interaction with git tools
 
 Under the native sandbox, `git status` / `git diff` / `git log` run without a
-prompt — the sandbox contains them. Under `local` they escalate instead, because
-reading a repo unsandboxed can surface credential content (e.g. via
-`git show HEAD:.env`, which is separately blocked outright).
+prompt. If no sandbox is available they are refused; `git show HEAD:.env` is
+separately blocked outright in every backend.
 
 ## Verifying it works
 

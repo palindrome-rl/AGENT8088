@@ -307,10 +307,8 @@ def test_a_turn_with_no_verification_reports_no_share(engine, monkeypatch):
 # The auditor grades against the plan the user approved
 # ---------------------------------------------------------------------------
 
-def test_the_auditor_is_told_the_plan_it_is_checking_against(engine, tmp_path):
-    """An execute_plan step can declare `acceptance`; an ordinary call cannot. Without
-    the plan text the auditor grades "did this call take effect", which a write that
-    did the wrong thing passes. The approved plan is the criterion the user agreed to."""
+def test_the_auditor_treats_the_plan_as_context_not_a_per_call_criterion(engine, tmp_path):
+    """Later plan steps must not make an earlier successful call fail verification."""
     seen = _audit_on(engine, tmp_path)
     engine.PERMISSION_MODE = "readonly"
     engine.enter_plan_mode()
@@ -322,8 +320,26 @@ def test_the_auditor_is_told_the_plan_it_is_checking_against(engine, tmp_path):
                      json.dumps({"filename": str(tmp_path / "revenue.txt"), "content": "hi"}))
 
     assert seen, "the auditor should have been asked"
-    assert "at least four rows" in seen[0]["task"], (
-        "the auditor has to see the plan, or it grades its own invented criterion")
+    task = seen[0]["task"]
+    assert "at least four rows" in task, "the approved plan remains useful context"
+    assert "Acceptance criteria" not in task
+    assert "do not require later steps" in task
+
+
+def test_auditor_may_run_code_only_inside_a_readonly_sandbox(engine, monkeypatch):
+    engine.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    seen = {}
+
+    def spy(messages, **kw):
+        seen["allowed"] = engine.check_permission("shell", "python library.py")
+        seen["readonly"] = engine._sandbox_readonly
+        return "VERDICT: pass"
+
+    monkeypatch.setattr(engine, "run_agent", spy)
+    engine._exec_subagent({"agent_type": "auditor", "task": "run it"})
+
+    assert seen == {"allowed": True, "readonly": True}
 
 
 def test_the_approved_plan_is_forgotten_when_the_session_ends(engine, tmp_path):

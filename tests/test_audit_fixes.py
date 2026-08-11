@@ -37,16 +37,15 @@ def test_resolve_user_path_accepts_path_objects(engine, tmp_path, monkeypatch):
     "git diff",
     "git log -p",
 ])
-def test_readonly_local_git_reads_require_approval(engine, monkeypatch, command):
+def test_readonly_git_reads_fail_closed_without_a_sandbox(engine, monkeypatch, command):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
-    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "local")
-    monkeypatch.setattr(
-        engine, "_exec_sandbox_command",
-        lambda *_args, **_kwargs: pytest.fail("unapproved command must not execute"),
-    )
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
 
-    assert "ESCALATION_REQUEST" in engine.run_tool(
-        "execute_shell", {"command": command})
+    result = engine.run_tool("execute_shell", {"command": command})
+    assert "sandbox is required" in result.lower()
+    assert "ESCALATION_REQUEST" not in result
 
 
 def test_git_read_of_sensitive_file_is_hard_blocked(engine, monkeypatch):
@@ -399,7 +398,7 @@ def test_local_execution_grant_does_not_leak_to_later_action(engine, monkeypatch
     monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "ran")
     engine.grant_escalation("local_execution")
 
-    assert engine._exec_sandbox_command("echo fake") == "ran"
+    assert "sandbox is required" in engine._exec_sandbox_command("echo fake").lower()
     assert engine._one_shot_grant is False
     assert engine._local_fallback_grant is False
 
@@ -494,7 +493,7 @@ def test_private_file_is_protected_before_content_is_written(
     assert private.read_text(encoding="utf-8") == "private content"
 
 
-def test_edit_mode_escalates_shell_when_no_sandbox_is_available(engine, monkeypatch):
+def test_edit_mode_refuses_shell_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -502,10 +501,11 @@ def test_edit_mode_escalates_shell_when_no_sandbox_is_available(engine, monkeypa
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine._exec_sandbox_command("echo hi")
-    assert result.startswith("ESCALATION_REQUEST")
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_escalates_sandboxed_code_when_no_sandbox_is_available(engine, monkeypatch):
+def test_edit_mode_refuses_sandboxed_code_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -513,10 +513,11 @@ def test_edit_mode_escalates_sandboxed_code_when_no_sandbox_is_available(engine,
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine.run_tool("run_sandboxed", {"code": "print(1)"})
-    assert result.startswith("ESCALATION_REQUEST")
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_escalates_sandbox_argv_when_no_sandbox_is_available(engine, monkeypatch):
+def test_edit_mode_refuses_sandbox_argv_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -528,11 +529,12 @@ def test_edit_mode_escalates_sandbox_argv_when_no_sandbox_is_available(engine, m
     )
 
     result = engine._exec_sandbox_argv(["git", "status"])
-    assert result.startswith("ESCALATION_REQUEST")
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")
     assert seen == {}
 
 
-def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):
+def test_readonly_refuses_when_no_sandbox(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -540,4 +542,5 @@ def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: pytest.fail("must not run"))
 
     result = engine._exec_sandbox_command("mkdir x")
-    assert result.startswith("ESCALATION_REQUEST")
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")

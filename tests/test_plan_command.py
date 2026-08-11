@@ -339,6 +339,79 @@ def test_a_plan_mode_turn_gets_room_to_research_plan_and_execute():
     assert cli._turn_max_turns("plan-only") >= 25
 
 
+def test_plan_mode_exposes_only_research_and_approval_tools(monkeypatch):
+    monkeypatch.setattr(cli.A, "PERMISSION_MODE", "plan-only")
+    specs = cli._active_tool_specs()
+
+    assert {"present_plan", "read_text", "git_status"} <= set(specs)
+    assert "write_file" not in specs
+    assert "execute_shell" not in specs
+
+
+def test_plan_mode_tool_and_prompt_providers_refresh_after_approval(
+        engine, tmp_path, monkeypatch, scripted):
+    engine.PROJECT_ROOT = tmp_path
+    engine.ARTIFACTS_ROOT = tmp_path / "artifacts"
+    engine.ALLOWED_PATHS = [tmp_path]
+    engine.PERMISSION_MODE = "plan-only"
+    engine._plan_on_approval = lambda _plan: "full-auto"
+    target = tmp_path / "artifacts" / "out.txt"
+    model = scripted([
+        '✿FUNCTION✿: present_plan ✿ARGS✿: {"plan": "1. write out.txt"}',
+        '✿FUNCTION✿: write_file ✿ARGS✿: '
+        + __import__("json").dumps({"filename": str(tmp_path / "out.txt"), "content": "done"}),
+        "done",
+    ])
+    monkeypatch.setattr(engine, "create_completion", model)
+
+    def allowed():
+        return ({"present_plan"} if engine.PERMISSION_MODE == "plan-only"
+                else {"write_file"})
+
+    answer = engine.run_agent(
+        [{"role": "user", "content": "make it"}], max_turns=4,
+        tools_def=lambda: [], allowed_tools=allowed,
+        system_prompt=lambda: f"mode={engine.PERMISSION_MODE}",
+    )
+
+    assert answer == "done"
+    assert target.read_text() == "done"
+    assert model.calls[0]["kwargs"]["system_prompt"] == "mode=plan-only"
+    assert model.calls[1]["kwargs"]["system_prompt"] == "mode=full-auto"
+
+
+def test_plan_mode_stops_after_bounded_invalid_mutation_retries(
+        engine, monkeypatch, scripted):
+    engine.PERMISSION_MODE = "plan-only"
+    engine.PLAN_MODE_RETRY_LIMIT = 2
+    model = scripted([
+        '✿FUNCTION✿: write_file ✿ARGS✿: {"filename":"one.txt","content":"x"}',
+        '✿FUNCTION✿: write_file ✿ARGS✿: {"filename":"two.txt","content":"x"}',
+        '✿FUNCTION✿: write_file ✿ARGS✿: {"filename":"three.txt","content":"x"}',
+    ])
+    monkeypatch.setattr(engine, "create_completion", model)
+
+    answer = engine.run_agent([{"role": "user", "content": "plan it"}], max_turns=25)
+
+    assert len(model.calls) == 2
+    assert "stopped" in answer.lower()
+    assert "nothing was written" in answer.lower()
+
+
+def test_plan_mode_has_a_default_wall_clock_limit(engine, monkeypatch):
+    seen = {}
+    engine.PERMISSION_MODE = "plan-only"
+    engine.MAX_TURN_SECONDS = 0
+    engine.PLAN_MODE_TIMEOUT_SECONDS = 123
+    monkeypatch.setattr(
+        engine, "_run_agent_loop",
+        lambda *_args, budget=None, **_kwargs: seen.setdefault("seconds", budget.max_seconds),
+    )
+
+    assert engine.run_agent([]) == 123
+    assert seen == {"seconds": 123}
+
+
 def test_the_prompt_shows_when_you_are_in_plan_mode(monkeypatch):
     monkeypatch.setattr(cli.A, "PERMISSION_MODE", "plan-only")
     assert "plan" in cli._prompt_label()

@@ -26,8 +26,8 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     assert "█████╗  ██████╗" in rendered
     assert classic._PALINDROME_LOGO.is_file()
     logo = classic._palindrome_logo().plain
-    assert "▀" in logo
-    assert max(map(len, logo.splitlines())) == 24
+    assert any("\u2800" <= character <= "\u28ff" for character in logo)
+    assert max(map(len, logo.splitlines())) == 30
     assert len(classic._classic_masthead().spans) == 6
     assert "Palindrome" in rendered
     assert "Research Labs" in rendered
@@ -88,7 +88,7 @@ def test_narrow_banner_keeps_the_palindrome_brand(monkeypatch):
 
     rendered = output.getvalue()
     assert "Palindrome Research Labs" in rendered
-    assert any(pixel in rendered for pixel in ("#", "█", "▀", "▄"))
+    assert any("\u2800" <= character <= "\u28ff" for character in rendered)
 
 
 def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
@@ -118,16 +118,37 @@ def test_status_bar_summarizes_the_idle_session(monkeypatch):
 
     rendered = "".join(text for _, text in classic._status_bar_fragments())
 
-    assert rendered == " ✢ local:test-model │ █████░░░░░ 50% ctx │ full-auto │ demo │ last 2.5s ↑12 │ ● idle "
+    assert rendered == " ◆ 8088 · local:test-model │ █████░░░░░ 50% ctx │ full-auto │ demo │ last 2.5s ↑12 │ ● ready "
 
 
 def test_interactive_prompt_uses_the_persistent_status_bar(monkeypatch):
     captured = {}
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr(prompt_toolkit, "prompt", lambda *args, **kwargs: captured.update(kwargs) or "hello")
+    monkeypatch.setattr(
+        prompt_toolkit, "prompt",
+        lambda message, **kwargs: captured.update(kwargs, message=message) or "hello",
+    )
 
     assert classic._read_line() == "hello"
-    assert "idle" in "".join(text for _, text in captured["bottom_toolbar"]())
+    assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
+    assert captured["reserve_space_for_menu"] == 0
+    assert "\n" not in captured["message"].value
+
+
+def test_stream_view_hides_large_tool_wire_payloads():
+    output = io.StringIO()
+    console = Console(file=output, width=100, color_system=None)
+    stream = classic._StreamFilter()
+    stream.feed(
+        '✿FUNCTION✿: write_file ✿ARGS✿: {"content":"' + "x" * 20_000 + '"}'
+    )
+
+    console.print(classic._stream_view([], stream.prose_text()))
+
+    rendered = output.getvalue()
+    assert "x" * 100 not in rendered
+    assert "✿FUNCTION✿" not in rendered
+    assert "writing" in stream.status_label()
 
 
 def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):

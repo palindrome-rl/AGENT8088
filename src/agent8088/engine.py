@@ -256,6 +256,7 @@ except Exception as _e:
     _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
+ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
@@ -282,11 +283,14 @@ MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
+MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "300")))
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = int(APP_CONFIG.get("max_turn_seconds", "0"))
+PLAN_MODE_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("plan_mode_timeout_seconds", "300")))
+PLAN_MODE_RETRY_LIMIT = max(1, int(APP_CONFIG.get("plan_mode_retry_limit", "2")))
 MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
 # USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
 MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
@@ -395,6 +399,7 @@ _plan_tool_ran = False      # turn-scoped: did a plan tool actually run this tur
 # an escalation is a question the user can say yes to, and "this agent only
 # observes" has to be a guarantee, not a default. See _exec_subagent.
 _permission_floor_readonly = False
+_sandbox_readonly = False
 _last_audit_share = 0.0     # verification's share of the last completed turn's tokens
 
 
@@ -981,6 +986,13 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
+    # Read-only subagents may execute verification commands only when the
+    # backend guarantees isolation. Their disposable workspace is prepared by
+    # _exec_sandbox_command; host execution never enters this exception.
+    if (_permission_floor_readonly and _sandbox_readonly and not host
+            and mode in ("shell", "docker")
+            and _resolve_sandbox_backend() in ("native", "docker")):
+        return True
     if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser", "search"):
         return True  # temporary grant for approved plan steps — only in plan-only mode
     if PERMISSION_MODE in ("edit", "full-auto"):
@@ -1040,9 +1052,13 @@ def grant_escalation(change_type: str = ""):
         _local_fallback_grant = False
         _pending_approval_key = ""
         return
+    if change_type == "local_execution":
+        _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
+        _pending_approval_key = ""
+        return
     _one_shot_grant = _pending_approval_key or True
     _pending_approval_key = ""
-    _local_fallback_grant = change_type == "local_execution"
+    _local_fallback_grant = False
     _remote_git_grant = False
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
@@ -1931,8 +1947,30 @@ subagent_ui = None
 def resolve_user_path(raw_path: str) -> Path:
     p = Path(raw_path or "").expanduser()
     if not p.is_absolute():
-        p = PROJECT_ROOT / p
+        project_path = PROJECT_ROOT / p
+        artifact_path = ARTIFACTS_ROOT / p
+        p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
     resolved = p.resolve()
+    if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
+        raise ValueError(f"Path not allowed: {resolved}")
+    return resolved
+
+
+def resolve_write_path(raw_path: str) -> Path:
+    """Keep edits in place, but route every new workspace-relative file to artifacts/."""
+    p = Path(raw_path or "").expanduser()
+    if p.is_absolute():
+        resolved = p.resolve()
+        if (not resolved.exists() and resolved != ARTIFACTS_ROOT
+                and PROJECT_ROOT in resolved.parents
+                and ARTIFACTS_ROOT not in resolved.parents):
+            resolved = (ARTIFACTS_ROOT / resolved.relative_to(PROJECT_ROOT)).resolve()
+    else:
+        project_path = (PROJECT_ROOT / p).resolve()
+        if project_path.exists() or project_path == ARTIFACTS_ROOT or ARTIFACTS_ROOT in project_path.parents:
+            resolved = project_path
+        else:
+            resolved = (ARTIFACTS_ROOT / p).resolve()
     if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
         raise ValueError(f"Path not allowed: {resolved}")
     return resolved
@@ -2214,7 +2252,7 @@ def _capture_write_state(tool_name: str, tool_args: dict):
     if spec.get("mode") != "write_text":
         return None
     try:
-        path = resolve_user_path(_tool_path(spec, tool_args))
+        path = resolve_write_path(_tool_path(spec, tool_args))
     except Exception:
         return None
     try:
@@ -2243,7 +2281,8 @@ def _revert_plan_write(snapshot) -> str:
 
 def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
                      result: str, depth: int,
-                     acceptance: str = "", evidence: str = "") -> tuple:
+                     acceptance: str = "", evidence: str = "",
+                     plan_context: str = "") -> tuple:
     """Check a completed step against the environment. Returns (halt_reason, note).
 
     Off unless `plan_audit=1`. A step that reports success has only told us the
@@ -2273,10 +2312,18 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
         task += f"\nAcceptance criteria (the step is done only if this holds): {acceptance}\n"
     if evidence:
         task += f"Evidence to collect: {evidence}\n"
+    if plan_context:
+        task += (
+            "\nApproved plan context (use this to understand the current call, "
+            "but do not require later steps to be complete yet):\n"
+            f"{plan_context}\n"
+        )
     # Without this the auditor has no idea where "the workspace" is, and a
     # criterion naming a file it cannot locate was answered `pass` rather than
     # `unknown` — a false pass, the one verdict that costs more than no auditing.
-    workspace = ", ".join(str(p) for p in ALLOWED_PATHS) or str(PROJECT_ROOT)
+    workspace = ", ".join(dict.fromkeys(
+        [str(ARTIFACTS_ROOT), *(str(p) for p in ALLOWED_PATHS)]
+    ))
     task += (f"\nWorkspace paths (resolve any relative name against these): {workspace}\n"
              "If you cannot locate what the criteria refer to, the verdict is "
              "'unknown'. Never answer 'pass' for something you did not observe.\n"
@@ -2318,12 +2365,8 @@ def _audit_approved_plan_call(tool_name: str, tool_args: dict, result: str,
     an auditor that could not reach its model must not be able to destroy work.
     """
     step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
-    # The plan the user approved is the criterion. Without it the auditor grades
-    # "did this call take effect", which a write that did confidently the wrong
-    # thing passes. An execute_plan step can declare `acceptance`; an ordinary
-    # tool call has nowhere to put one, so the plan stands in for it.
     reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
-                                    acceptance=_plan_approved_text[:1500])
+                                    plan_context=_plan_approved_text[:1500])
     parts = [result]
     if note:
         parts.append(f"audit: {note}")
@@ -2549,6 +2592,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     global _last_tool_output, _last_tool_name, _last_write_diff
     global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
     global _local_fallback_grant, _remote_git_grant, _active_role
+    global _sandbox_readonly
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -2597,13 +2641,14 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     if floor == "readonly":
         saved_permission = (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
                             _local_fallback_grant, _remote_git_grant,
-                            _permission_floor_readonly)
+                            _permission_floor_readonly, _sandbox_readonly)
         PERMISSION_MODE = "readonly"
         _one_shot_grant = False
         _plan_execution_grant = False
         _local_fallback_grant = False
         _remote_git_grant = False
         _permission_floor_readonly = True
+        _sandbox_readonly = True
 
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
@@ -2629,7 +2674,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         if saved_permission is not None:
             (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
              _local_fallback_grant, _remote_git_grant,
-             _permission_floor_readonly) = saved_permission
+             _permission_floor_readonly, _sandbox_readonly) = saved_permission
 
     if ui.get("done"):
         ui["done"](answer)
@@ -2832,7 +2877,7 @@ def _exec_browser(args: dict) -> str:
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
-_SANDBOX_BACKENDS = frozenset(("auto", "native", "docker", "local"))
+_SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
 
 
 def _agent_data_dir() -> Path:
@@ -2883,8 +2928,6 @@ def _docker_available() -> bool:
 def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
-    if requested == "local":
-        return "local"
     if requested == "native":
         return "native" if native_available else "unavailable"
     if requested == "docker":
@@ -2899,7 +2942,6 @@ def sandbox_status() -> dict:
     detail = {
         "native": "OS-native isolation via sandbox-runtime",
         "docker": "Docker fallback with no network and capped resources",
-        "local": "unsandboxed local execution (explicit opt-in)",
         "unavailable": "native runtime and Docker are unavailable",
     }[resolved]
     missing = _native_sandbox_missing_requirements()
@@ -2918,17 +2960,18 @@ def set_sandbox_backend(backend: str) -> dict:
     global SANDBOX_BACKEND
     backend = str(backend or "").strip().lower()
     if backend not in _SANDBOX_BACKENDS:
-        raise ValueError("Sandbox must be auto, native, docker, or local.")
+        raise ValueError("Sandbox must be auto, native, or docker.")
     update_simple_config(CONFIG_PATH, {"sandbox_backend": backend})
     APP_CONFIG["sandbox_backend"] = backend
     SANDBOX_BACKEND = backend
     return sandbox_status()
 
 
-def _sandbox_settings_data() -> dict:
+def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
     home = Path.home()
     denied = [
         CONFIG_PATH, _agent_data_dir() / "srt-settings.json",
+        _agent_data_dir() / "srt-settings-readonly.json",
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
@@ -2939,10 +2982,13 @@ def _sandbox_settings_data() -> dict:
         PROJECT_ROOT / "**" / "*_PASSWORD*",
     ]
     deny_paths = [str(path.expanduser().resolve()) for path in denied]
-    allow_write = [str(PROJECT_ROOT), tempfile.gettempdir()]
-    if sys.platform != "win32":
-        allow_write.append(str(Path("/tmp").resolve()))
-    allow_write.extend(str(path) for path in NO_PROMPT_PATHS)
+    sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    sandbox_tmp.mkdir(parents=True, exist_ok=True)
+    allow_write = [str(sandbox_tmp)]
+    if not readonly:
+        allow_write.append(str(ARTIFACTS_ROOT))
+    elif workspace is not None:
+        allow_write.append(str(workspace.resolve()))
     return {
         "network": {
             "allowedDomains": SANDBOX_ALLOWED_DOMAINS,
@@ -2962,40 +3008,46 @@ def _sandbox_settings_data() -> dict:
     }
 
 
-def _write_sandbox_settings() -> Path:
-    path = _agent_data_dir() / "srt-settings.json"
-    _write_private_text(path, json.dumps(_sandbox_settings_data(), indent=2) + "\n")
+def _write_sandbox_settings(readonly: bool = False, workspace: Path | None = None) -> Path:
+    name = "srt-settings-readonly.json" if readonly else "srt-settings.json"
+    path = _agent_data_dir() / name
+    _write_private_text(
+        path, json.dumps(_sandbox_settings_data(readonly, workspace), indent=2) + "\n"
+    )
     return path
 
 
-def _exec_native_sandbox(command: str, timeout: int) -> str:
+def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
+                         readonly: bool = False) -> str:
     argv = _native_sandbox_argv()
     if not argv:
         return "Native sandbox runtime is unavailable."
-    settings = _write_sandbox_settings()
+    cwd = (cwd or ARTIFACTS_ROOT).resolve()
+    settings = _write_sandbox_settings(readonly, cwd)
+    sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    command = (f"cd {shlex.quote(str(cwd))} && "
+               f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
     return _exec_process(
         argv + ["--settings", str(settings), "-c", command], timeout=timeout
     )
 
 
 def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
-    global _local_fallback_grant, _one_shot_grant
     backend = _resolve_sandbox_backend()
     if backend == "native":
         runtime = _native_sandbox_argv()
-        settings = _write_sandbox_settings()
+        settings = _write_sandbox_settings(readonly=True)
+        sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
         return _exec_process(
-            runtime + ["--settings", str(settings), *argv], timeout=timeout
+            runtime + ["--settings", str(settings), "-c",
+                       f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                       f"TMPDIR={shlex.quote(str(sandbox_tmp))} {_process_display(argv)}"],
+            timeout=timeout
         )
     if backend == "docker":
-        return _exec_docker_command(_process_display(argv), timeout)
-    using_fallback_grant = _local_fallback_grant
-    if using_fallback_grant:
-        _local_fallback_grant = False
-        if using_fallback_grant:
-            _one_shot_grant = False
-        return _exec_process(argv, timeout=timeout)
-    return _local_execution_request(_process_display(argv))
+        return _exec_docker_command(_process_display(argv), timeout,
+                                    workspace=PROJECT_ROOT, readonly=True)
+    return _sandbox_required_error()
 
 
 DOCKER_PULL_TIMEOUT = int(APP_CONFIG.get("docker_pull_seconds", "300"))
@@ -3028,14 +3080,18 @@ def _ensure_docker_image(image: str) -> str:
 
 
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
-                         image: str = "") -> str:
+                         image: str = "", workspace: Path | None = None,
+                         readonly: bool = False) -> str:
     selected_image = image or DOCKER_IMAGE
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
     unavailable = _ensure_docker_image(selected_image)
     if unavailable:
         return unavailable
-    workspace = str(PROJECT_ROOT)
+    workspace_path = workspace or ARTIFACTS_ROOT
+    if hasattr(workspace_path, "resolve"):
+        workspace_path = workspace_path.resolve()
+    workspace = str(workspace_path)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     git_image = selected_image.startswith("alpine/git:")
     container_command = (["python", "-c", command] if python_code else
@@ -3044,14 +3100,15 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
         "docker", "run", "--rm", "--name", container_name, "--network", DOCKER_NETWORK,
         "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--mount", f"type=bind,src={workspace},dst=/workspace",
+        "--mount", (f"type=bind,src={workspace},dst=/workspace"
+                    + (",readonly" if readonly else "")),
     ]
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
     skipped_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"}
     sensitive_mounts = 0
-    for root, dirs, files in os.walk(PROJECT_ROOT):
+    for root, dirs, files in os.walk(workspace_path):
         dirs[:] = [name for name in dirs if name not in skipped_dirs]
         for filename in files:
             path = Path(root) / filename
@@ -3060,7 +3117,7 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             sensitive_mounts += 1
             if sensitive_mounts > 128:
                 return "Error: too many sensitive workspace files to mask safely."
-            relative = path.relative_to(PROJECT_ROOT).as_posix()
+            relative = path.relative_to(workspace_path).as_posix()
             destination = f"/workspace/{relative}"
             argv.extend([
                 "--mount", f"type=bind,src={empty},dst={destination},readonly",
@@ -3080,39 +3137,46 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     return result
 
 
-def _local_execution_request(command: str) -> str:
-    return request_escalation(
-        target_mode="edit",
-        paths=[str(SHELL_CWD)],
-        change_type="local_execution",
-        reason=(
-            "No native sandbox or Docker fallback is available. "
-            f"Run this command locally without isolation? {_redact_secrets(command[:160])}"
-        ),
+def _sandbox_required_error() -> str:
+    return (
+        "Error: a sandbox is required to run code, but neither the native OS "
+        "sandbox nor Docker is available. Run `agent8088 --sandbox-setup` or "
+        "install and start Docker, then retry. Local execution is disabled."
     )
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
-    global _local_fallback_grant, _one_shot_grant
     backend = _resolve_sandbox_backend()
+    if backend == "unavailable":
+        return _sandbox_required_error()
+    ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    workspace = ARTIFACTS_ROOT
+    if _sandbox_readonly:
+        temporary = tempfile.TemporaryDirectory(prefix="agent8088-audit-")
+        workspace = Path(temporary.name)
+        shutil.copytree(ARTIFACTS_ROOT, workspace, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(
+                            ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
+        command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
     if backend == "native":
         local_command = (
             _process_display([sys.executable, "-c", command])
             if python_code else command
         )
-        return _exec_native_sandbox(local_command, timeout)
-    if backend == "docker":
-        return _exec_docker_command(command, timeout, python_code, image)
-    using_fallback_grant = _local_fallback_grant
-    if using_fallback_grant:
-        _local_fallback_grant = False
-        if using_fallback_grant:
-            _one_shot_grant = False
-        if python_code:
-            return _exec_process([sys.executable, "-c", command], timeout=timeout)
-        return _exec_process(command, timeout=timeout, shell=True)
-    return _local_execution_request(command)
+        try:
+            return _exec_native_sandbox(local_command, timeout, workspace,
+                                        readonly=_sandbox_readonly)
+        finally:
+            if temporary:
+                temporary.cleanup()
+    try:
+        return _exec_docker_command(command, timeout, python_code, image,
+                                    workspace=workspace)
+    finally:
+        if temporary:
+            temporary.cleanup()
 
 
 def install_native_sandbox() -> str:
@@ -3192,7 +3256,7 @@ def _exec_docker(args: dict) -> str:
         return ("Error: sandboxed execution requires 'code'. Pass the Python "
                 "source as code=\"...\" (newlines escaped as \\n).")
     image = str(args.get("image") or DOCKER_IMAGE)
-    timeout = int(args.get("timeout") or 60)
+    timeout = min(max(1, int(args.get("timeout") or 60)), MAX_TOOL_TIMEOUT_SECONDS)
     return _exec_sandbox_command(code, timeout=timeout, python_code=True, image=image)
 
 
@@ -3473,7 +3537,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return f"Unknown tool: {name}"
 
     mode = (spec.get("mode") or "").lower()
-    timeout = int(spec.get("timeout") or 25)
+    timeout = min(max(1, int(spec.get("timeout") or 25)), MAX_TOOL_TIMEOUT_SECONDS)
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
     approval_key = _tool_call_key(name, args)
@@ -3598,7 +3662,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if not write_path:
             return "Error: write tool requires a file path."
         try:
-            target = resolve_user_path(write_path)
+            target = resolve_write_path(write_path)
         except ValueError as exc:
             return f"Error: {exc}"
         # Layer 1 applies to WRITES as well as reads. Without this a sensitive file
@@ -3690,6 +3754,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 _audit("tool_call", tool=name, mode=mode, decision="denied",
                        detail=command[:200], reason="outbound_secret")
                 return leak
+
+    if (mode in ("shell", "docker") and not spec.get("host")
+            and PERMISSION_MODE != "plan-only"
+            and _resolve_sandbox_backend() == "unavailable"):
+        _audit("tool_call", tool=name, mode=mode, decision="denied",
+               detail=command[:200], reason="sandbox_unavailable")
+        return _sandbox_required_error()
 
     gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
     if mode == "mcp" and spec.get("mcp_read_only"):
@@ -4872,9 +4943,13 @@ def describe_capabilities() -> str:
         f"- Denial circuit breaker: {_on_off(DENIAL_BREAKER_THRESHOLD, ' denials')}",
         f"- Turn token budget: {_on_off(MAX_TURN_TOKENS, ' tokens')}",
         f"- Turn wall-clock budget: {_on_off(MAX_TURN_SECONDS, 's')}",
+        f"- Plan-mode wall-clock budget: {PLAN_MODE_TIMEOUT_SECONDS}s when turn budget is unset",
+        f"- Plan invalid-mutation retry limit: {PLAN_MODE_RETRY_LIMIT}",
+        f"- Tool-call timeout ceiling: {MAX_TOOL_TIMEOUT_SECONDS}s",
         f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
+        f"- New generated files: {ARTIFACTS_ROOT}",
         f"- Web search: {_search_chain_summary()}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
@@ -4885,6 +4960,7 @@ def describe_capabilities() -> str:
         "",
         "## Always-on protections (no mode or approval disables these)",
         "- Unrecoverable commands refused (rm -rf /, mkfs, dd to a device, fork bombs, curl | sh)",
+        "- Arbitrary code requires the native sandbox or Docker; no local fallback",
         "- Commands too long or too quote-dense to analyse are refused, not skipped",
         "- Sensitive files refused for read and write (.env, SSH/GPG/AWS keys, *.pem)",
         "- Shell startup files refused for write (would execute code on next shell launch)",
@@ -4996,8 +5072,10 @@ def run_agent(messages, *, budget=None, **kwargs):
     """
     global _active_budget
     if budget is None:
+        max_seconds = (MAX_TURN_SECONDS or PLAN_MODE_TIMEOUT_SECONDS
+                       if PERMISSION_MODE == "plan-only" else MAX_TURN_SECONDS)
         budget = _TurnBudget(
-            max_seconds=MAX_TURN_SECONDS, max_tokens=MAX_TURN_TOKENS,
+            max_seconds=max_seconds, max_tokens=MAX_TURN_TOKENS,
             max_cost=MAX_TURN_COST_USD,
             cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
         )
@@ -5145,6 +5223,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
 
@@ -5159,6 +5238,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         return refusal
 
     for turn in range(max_turns):
+        round_tools_def = tools_def() if callable(tools_def) else tools_def
+        round_allowed_tools = set(
+            allowed_tools() if callable(allowed_tools) else allowed_tools
+        )
+        round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         # Resource ceiling. Checked before the model call so an exhausted budget
@@ -5177,8 +5261,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
-                    messages, tools_def, temperature=temperature,
-                    system_prompt=system_prompt, on_token=on_token,
+                    messages, round_tools_def, temperature=temperature,
+                    system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
                 )
         except AgentInterrupted:
@@ -5204,7 +5288,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             content = "\n".join(part for part in (content, native_text) if part)
         messages.append({"role": "assistant", "content": content})
 
-        calls = find_tool_calls(content, allowed_tools)
+        calls = find_tool_calls(content, round_allowed_tools)
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -5215,11 +5299,29 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # failure — e.g. `current_time`). Rather than leaking the raw ✿FUNCTION✿
             # markup as the "answer", tell the model what went wrong and loop so it can
             # recover (call a real tool or just answer). Bounded to avoid infinite loops.
-            unknown = [n for n in _attempted_tool_names(content)
-                       if _resolve_tool_name(n) not in allowed_tools]
+            attempted = _attempted_tool_names(content)
+            invalid_plan = [n for n in attempted
+                            if PERMISSION_MODE == "plan-only"
+                            and _resolve_tool_name(n) in TOOL_SPECS
+                            and _resolve_tool_name(n) not in round_allowed_tools]
+            if invalid_plan:
+                plan_mutation_retries += 1
+                if plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT:
+                    answer = _guard_answer(
+                        f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
+                        "attempts. Nothing was written or run. Present the plan with "
+                        "present_plan, or leave plan mode before retrying."
+                    )
+                    if on_answer:
+                        on_answer(answer)
+                    return answer
+                messages.append({"role": "user", "content": _plan_mode_block_message()})
+                continue
+            unknown = [n for n in attempted
+                       if _resolve_tool_name(n) not in round_allowed_tools]
             if unknown and unknown_retries < 2 and not forcing:
                 unknown_retries += 1
-                available = ", ".join(sorted(allowed_tools)) or "(none)"
+                available = ", ".join(sorted(round_allowed_tools)) or "(none)"
                 if on_result:
                     on_result("error", f"Unknown tool '{unknown[0]}' — not available.")
                 messages.append({"role": "user", "content":
@@ -5252,7 +5354,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # Stripping removed everything (the message was ONLY a tool-call
                 # attempt or pure reasoning) — never fall back to the raw markup.
                 answer = (f"I tried to use a tool that isn't available. "
-                          f"Available tools: {', '.join(sorted(allowed_tools)) or 'none'}."
+                          f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
             answer = _guard_answer(answer)
@@ -5325,6 +5427,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_tool(name)
             with spin(f"running {name}..."):
                 result = exec_tool(name, json.dumps(args), depth=depth)
+            if (PERMISSION_MODE == "plan-only"
+                    and result.startswith("Error: plan mode")):
+                plan_mutation_retries += 1
             executed = True
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
@@ -5387,6 +5492,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             note = ("\n\nThis script needs interactive input which is not available. "
                     "Do NOT retry it. Give your final answer now." if interactive_fail else "")
             messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result[:3000]}{note}"})
+
+        if (PERMISSION_MODE == "plan-only"
+                and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
+            answer = _guard_answer(
+                f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
+                "attempts. Nothing was written or run. Present the plan with "
+                "present_plan, or leave plan mode before retrying."
+            )
+            if on_answer:
+                on_answer(answer)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "plan_retry_limit",
+                              "content": answer})
+            return answer
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
