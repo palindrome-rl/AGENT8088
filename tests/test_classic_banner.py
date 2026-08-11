@@ -24,9 +24,12 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     rendered = output.getvalue()
     assert "AGENT8088" in rendered
     assert "█████╗  ██████╗" in rendered
+    assert "██╔═████╗" not in rendered
+    assert "██║██╔██║" not in rendered
+    assert classic._PALINDROME_ANSI_LOGO.is_file()
     assert classic._PALINDROME_LOGO.is_file()
     logo = classic._palindrome_logo().plain
-    assert any("\u2800" <= character <= "\u28ff" for character in logo)
+    assert "▔" in logo
     assert max(map(len, logo.splitlines())) == 30
     assert len(classic._classic_masthead().spans) == 6
     assert "Palindrome" in rendered
@@ -46,6 +49,10 @@ def test_logo_falls_back_to_ascii_on_a_legacy_console(monkeypatch):
     assert "#" in logo
 
 
+def test_palindrome_logo_colours_are_brightened():
+    assert classic._brighten_logo_colour((100, 150, 250)) == (130, 195, 255)
+
+
 def test_web_search_call_hides_the_query_in_the_cli(monkeypatch):
     output = io.StringIO()
     monkeypatch.setattr(classic, "console", Console(file=output, width=180, color_system=None))
@@ -61,6 +68,7 @@ def test_web_search_call_hides_the_query_in_the_cli(monkeypatch):
 
 def test_palindrome_logo_falls_back_when_asset_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
+    monkeypatch.setattr(classic, "_PALINDROME_ANSI_LOGO", tmp_path / "missing.ansi")
 
     logo = classic._palindrome_logo().plain
     assert len(logo.splitlines()) == 8
@@ -88,7 +96,7 @@ def test_narrow_banner_keeps_the_palindrome_brand(monkeypatch):
 
     rendered = output.getvalue()
     assert "Palindrome Research Labs" in rendered
-    assert any("\u2800" <= character <= "\u28ff" for character in rendered)
+    assert "▔" in rendered
 
 
 def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):

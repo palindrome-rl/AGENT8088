@@ -34,6 +34,7 @@ packages = ["src/agent8088"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "assets/palindrome-research-labs.png" = "agent8088/assets/palindrome-research-labs.png"
+"assets/palindrome-research-labs.ansi" = "agent8088/assets/palindrome-research-labs.ansi"
 "src/agent8088/gateway/platforms/whatsapp_bridge/bridge.js" = "agent8088/gateway/platforms/whatsapp_bridge/bridge.js"
 "src/agent8088/gateway/platforms/whatsapp_bridge/package.json" = "agent8088/gateway/platforms/whatsapp_bridge/package.json"
 "src/agent8088/gateway/platforms/whatsapp_bridge/package-lock.json" = "agent8088/gateway/platforms/whatsapp_bridge/package-lock.json"

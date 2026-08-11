@@ -395,9 +395,9 @@ def _session_system_prompt():
 # ---------------------------------------------------------------------------
 _CLASSIC_BANNER = """\
  █████╗  ██████╗ ███████╗███╗   ██╗████████╗ █████╗  ██████╗  █████╗  █████╗
-██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██╔══██╗██╔═████╗██╔══██╗██╔══██╗
-███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ╚█████╔╝██║██╔██║╚█████╔╝╚█████╔╝
-██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ██╔══██╗████╔╝██║██╔══██╗██╔══██╗
+██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██╔══██╗██╔═══██╗██╔══██╗██╔══██╗
+███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   ╚█████╔╝██║   ██║╚█████╔╝╚█████╔╝
+██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   ██╔══██╗██║   ██║██╔══██╗██╔══██╗
 ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   ╚█████╔╝╚██████╔╝╚█████╔╝╚█████╔╝
 ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝    ╚════╝  ╚════╝  ╚════╝  ╚════╝
 """
@@ -432,6 +432,10 @@ _PALINDROME_ASCII_LOGO = """\
 _PALINDROME_LOGO = APP_DIR / "assets" / "palindrome-research-labs.png"
 if not _PALINDROME_LOGO.is_file():
     _PALINDROME_LOGO = APP_DIR.parent.parent / "assets" / "palindrome-research-labs.png"
+_PALINDROME_ANSI_LOGO = APP_DIR / "assets" / "palindrome-research-labs.ansi"
+if not _PALINDROME_ANSI_LOGO.is_file():
+    _PALINDROME_ANSI_LOGO = APP_DIR.parent.parent / "assets" / "palindrome-research-labs.ansi"
+_PALINDROME_BRIGHTNESS = 1.3
 
 
 def _catalog(items, columns=4):
@@ -442,10 +446,16 @@ def _catalog(items, columns=4):
     return "\n".join("  ".join(names[i:i + columns]) for i in range(0, len(names), columns))
 
 
+def _brighten_logo_colour(colour):
+    return tuple(min(255, round(channel * _PALINDROME_BRIGHTNESS)) for channel in colour)
+
+
 def _palindrome_logo():
     """Render the supplied PNG as high-detail, terminal-native character art."""
     if console.legacy_windows or "utf" not in console.encoding.lower():
         return Text(_PALINDROME_ASCII_LOGO, style="bold #00C8FF")
+    if _PALINDROME_ANSI_LOGO.is_file():
+        return Text.from_ansi(_PALINDROME_ANSI_LOGO.read_text().rstrip("\n"))
     fallback = _PALINDROME_BLOCK_LOGO
     if not _PALINDROME_LOGO.is_file():
         return Text(fallback, style="bold #00C8FF")
@@ -481,6 +491,7 @@ def _palindrome_logo():
                 continue
             colour = tuple(sum(pixel[index] for pixel in active) // len(active)
                            for index in range(3))
+            colour = _brighten_logo_colour(colour)
             logo.append(chr(0x2800 + mask), style=f"rgb({colour[0]},{colour[1]},{colour[2]})")
         if y + 1 < height:
             logo.append("\n")
