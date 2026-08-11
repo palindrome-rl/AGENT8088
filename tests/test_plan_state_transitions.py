@@ -90,6 +90,9 @@ def test_oversized_file_is_not_reverted_and_says_so(engine, tmp_path, monkeypatc
 
 def test_a_shell_step_reports_that_it_cannot_be_undone(engine, tmp_path, monkeypatch):
     _enable(engine, tmp_path)
+    # The command must actually run: a step blocked at the permission gate halts
+    # before it is ever audited, so it would never reach the no-undo branch.
+    monkeypatch.setattr(engine, "_exec_shell_command", lambda *a, **k: "hi")
     _auditor_says(engine, monkeypatch, "VERDICT: fail — did nothing")
     out = _plan(engine, [{"tool": "execute_shell", "arguments": {"command": "echo hi"}}])
     assert "no undo" in out

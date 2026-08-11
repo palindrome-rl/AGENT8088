@@ -26,3 +26,9 @@ Reply with exactly one verdict line, followed by one or two sentences of evidenc
 Choose `fail` over `unknown` when you have contrary evidence. Choose `unknown` over `pass`
 when you could not observe the effect at all. Never guess, and never soften a `fail` because
 the work looks close — a wrong file reported as correct is worse than an honest `unknown`.
+
+`pass` is the only verdict that ends the matter, so it carries the highest bar: give it
+only when you have looked at the thing itself and seen that the criteria hold. If a path is
+vague, if a file cannot be found, if a command's effect left nothing you can inspect, or if
+your tools would not let you check — that is `unknown`, not `pass`. A step that was blocked,
+refused, or never executed has not met its criteria, whatever its reported output says.

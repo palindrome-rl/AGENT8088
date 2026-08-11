@@ -2060,6 +2060,28 @@ def _format_with_args(template: str, args: dict) -> str:
         raise ValueError(f"Missing required argument: {exc.args[0]}") from None
 
 
+_UNTRUSTED_OPEN_RE = re.compile(r"^<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\n?")
+_UNTRUSTED_CLOSE = "<<<END_UNTRUSTED_CONTENT>>>"
+
+
+def _unwrap_untrusted(text: str) -> str:
+    """Strip the untrusted-content boundary markers, if present.
+
+    Shell-mode results are wrapped before they reach the plan executor, so a
+    status prefix like `Error:` or `ESCALATION_REQUEST:` is no longer at the
+    start of the string. Checking the wrapped text meant an unapproved shell step
+    read as a success and the plan carried on past it.
+
+    Unwrapping rather than searching the whole string on purpose: a command's own
+    output may legitimately contain the word "Error:", and matching that would
+    halt plans on a passing step.
+    """
+    body = _UNTRUSTED_OPEN_RE.sub("", (text or "").lstrip(), count=1)
+    if body is not (text or "") and body.rstrip().endswith(_UNTRUSTED_CLOSE):
+        body = body.rstrip()[: -len(_UNTRUSTED_CLOSE)]
+    return body
+
+
 def _plan_step_failed(result: str) -> bool:
     """True if a plan step did not do what the plan asked.
 
@@ -2068,7 +2090,7 @@ def _plan_step_failed(result: str) -> bool:
     approved it). Both mean the intended effect is absent, so every later step
     is now standing on an assumption that is already false.
     """
-    return (result or "").lstrip().startswith(("Error:", "ESCALATION_REQUEST:"))
+    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST:"))
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -2167,7 +2189,14 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
         task += f"\nAcceptance criteria (the step is done only if this holds): {acceptance}\n"
     if evidence:
         task += f"Evidence to collect: {evidence}\n"
-    task += "\nReply with a single VERDICT line as instructed."
+    # Without this the auditor has no idea where "the workspace" is, and a
+    # criterion naming a file it cannot locate was answered `pass` rather than
+    # `unknown` — a false pass, the one verdict that costs more than no auditing.
+    workspace = ", ".join(str(p) for p in ALLOWED_PATHS) or str(PROJECT_ROOT)
+    task += (f"\nWorkspace paths (resolve any relative name against these): {workspace}\n"
+             "If you cannot locate what the criteria refer to, the verdict is "
+             "'unknown'. Never answer 'pass' for something you did not observe.\n"
+             "\nReply with a single VERDICT line as instructed.")
     answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
     verdict = _VERDICT_RE.search(answer or "")
     if verdict is None:
@@ -2319,7 +2348,11 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         except Exception as exc:
             result = f"Error: {exc}"
         _remember_escalation(tool_name, tool_args, result)
-        if result.startswith("ESCALATION_REQUEST:") and callable(on_escalation):
+        # Unwrapped: shell results arrive inside the untrusted-content markers, so
+        # matching the raw string meant a shell step in a plan never offered the
+        # approval prompt at all — it just came back blocked.
+        if (_unwrap_untrusted(result).lstrip().startswith("ESCALATION_REQUEST:")
+                and callable(on_escalation)):
             if on_escalation(result):
                 try:
                     result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
@@ -3623,7 +3656,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         else:
             result = _exec_shell_command(
                 command, timeout=timeout, image=spec.get("sandbox_image", ""))
-        return _wrap_untrusted(str(result), f"shell command: {_redact_secrets(command[:160])}")
+        text = str(result)
+        # An escalation request is a control signal for the UI, not output from
+        # the command — the command has not run yet. Wrapping it hid the
+        # "ESCALATION_REQUEST:" prefix every caller matches on, so the local
+        # -execution prompt never reached the user and the step came back
+        # blocked with no way to approve it.
+        if text.lstrip().startswith("ESCALATION_REQUEST:"):
+            return text.strip()
+        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
