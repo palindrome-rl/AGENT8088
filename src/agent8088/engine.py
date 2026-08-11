@@ -3441,6 +3441,24 @@ def _tool_arg_parse_error(name: str, raw: str) -> str:
             f'{{"code": "a = 1\\nprint(a)"}}. Received: {raw[:200]}')
 
 
+# Every shape a "you left the argument out" refusal takes: the generic one below,
+# and the per-tool ones ("web_search requires 'query'", "browser tool requires
+# 'url'", "sandboxed execution requires 'code'"). Matching only the first meant
+# the search loop — eight identical argument-less calls — went uncorrected.
+_MISSING_ARG_RE = re.compile(
+    r"^Error: .*?(was called with no arguments|requires '\w+')")
+
+
+def _is_missing_argument_error(result: str) -> bool:
+    """Whether a tool refused because its arguments never arrived.
+
+    That is a malformed call, not a result. Returned as one, the model re-sent
+    the identical shape and the text travelled onward as evidence — an auditor
+    read it as the step having failed.
+    """
+    return bool(_MISSING_ARG_RE.match((result or "").lstrip()))
+
+
 def _tool_arg_missing_error(name: str, missing: str) -> str:
     """Message for a call whose argument block never arrived at all.
 
@@ -5469,6 +5487,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
+    missing_args_retries = 0  # times a call arrived without its arguments
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
@@ -5677,6 +5696,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if (PERMISSION_MODE == "plan-only"
                     and result.startswith("Error: plan mode")):
                 plan_mutation_retries += 1
+            # A call whose arguments never arrived is malformed, not a result.
+            # Correct it the way an unknown tool is corrected — a bounded turn
+            # naming what is missing — instead of handing the model back an
+            # error it re-sends verbatim. Eight identical argument-less
+            # web_search calls in one turn is what this costs otherwise, and in
+            # a sub-run the text travels on as evidence the step failed.
+            if _is_missing_argument_error(result) and missing_args_retries < 2:
+                missing_args_retries += 1
+                seen.discard(sig)
+                messages.append({"role": "user", "content": result})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "missing_tool_args",
+                                  "tool": name})
+                continue
             executed = True
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
