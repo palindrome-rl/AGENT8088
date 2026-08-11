@@ -11,7 +11,13 @@ import agent8088.cli as classic
 
 def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     output = io.StringIO()
-    monkeypatch.setattr(classic, "console", Console(file=output, width=180, color_system=None))
+    # legacy_windows=False pins which logo variant is under test. Left to the
+    # ambient console, this asserts the block logo on Linux and the ASCII one on
+    # a Windows terminal, so the same test passes or fails by platform rather
+    # than by behaviour. The ASCII branch has its own test below.
+    monkeypatch.setattr(classic, "console",
+                        Console(file=output, width=180, color_system=None,
+                                legacy_windows=False))
 
     classic.banner()
 
@@ -28,6 +34,16 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     assert "Available Tools" in rendered
     assert "Available Skills" in rendered
     assert classic._catalog(["delta", "alpha"], columns=1) == "alpha\ndelta"
+
+
+def test_logo_falls_back_to_ascii_on_a_legacy_console(monkeypatch):
+    """A console that cannot render block characters must not emit them."""
+    monkeypatch.setattr(classic, "console",
+                        Console(file=io.StringIO(), width=180, color_system=None,
+                                legacy_windows=True))
+    logo = classic._palindrome_logo().plain
+    assert "▀" not in logo and "▄" not in logo
+    assert "#" in logo
 
 
 def test_web_search_call_hides_the_query_in_the_cli(monkeypatch):
@@ -124,6 +140,14 @@ def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):
     monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
     classic.cmd_status("")
     assert "Session Status" in output.getvalue()
+
+
+def test_plan_command_is_covered_by_the_plan_mode_suite():
+    """`/plan` is a mode now, not a one-shot wrapper: see tests/test_plan_command.py.
+    Kept as a signpost so the deletion of the old one-shot tests is deliberate —
+    those tests asserted that /plan restored the previous mode when the turn ended,
+    which is exactly the behaviour that made plan → approve → run impossible."""
+    assert classic.cmd_plan.__doc__ and "plan mode" in classic.cmd_plan.__doc__
 
 
 def test_named_session_round_trips_skill_state(tmp_path, monkeypatch):

@@ -10,7 +10,7 @@ guard fails the run if anything lands in the repo root instead.
 """
 import pytest
 
-ESCALATION = "ESCALATION_REQUEST:"
+ESCALATION = "ESCALATION_REQUEST\x1f"   # \x1f: a Windows path splits on ':'
 
 
 def _zone(engine, artifacts_dir, zone):
@@ -60,7 +60,15 @@ def test_search_without_the_opt_in_prompts_in_readonly(engine, monkeypatch):
 
 
 def test_search_without_the_opt_in_is_blocked_in_plan_only(engine, monkeypatch):
-    """plan-only routes everything through execute_plan rather than escalating."""
+    """Plan mode blocks the search and does not escalate — the user asked for a
+    plan, so the answer is a plan, not a permission prompt.
+
+    Asserted the literal prefix "Error: plan-only mode" before. The message now
+    names `present_plan` and says what happens after approval, because the old one
+    pointed the model at a JSON step array it could not reliably produce and it
+    retried the blocked call until the turn died. Assert the contract — blocked,
+    not escalated, and told what to do instead — rather than the wording.
+    """
     monkeypatch.setattr(engine, "PERMISSION_MODE", "plan-only")
     monkeypatch.setitem(engine.APP_CONFIG, "web_search_no_prompt", "0")
     monkeypatch.setattr(engine.web_search, "run_search",
@@ -68,7 +76,9 @@ def test_search_without_the_opt_in_is_blocked_in_plan_only(engine, monkeypatch):
 
     result = engine.run_tool("web_search", {"query": "weather"})
 
-    assert result.startswith("Error: plan-only mode")
+    assert result.startswith("Error:")
+    assert not result.startswith(ESCALATION)
+    assert "present_plan" in result
 
 
 def test_no_prompt_opt_in_does_not_cover_a_public_provider(engine, monkeypatch):
@@ -191,9 +201,41 @@ def test_catastrophic_shell_is_refused_even_in_full_auto(engine, monkeypatch, co
 # --- shell and MCP gating -------------------------------------------------
 
 def test_readonly_safe_shell_runs_in_readonly(engine, monkeypatch):
+    """Readonly does not gate a read-only shell command.
+
+    This asserted on `run_tool` output alone and passed for the wrong reason: on a
+    machine with no native sandbox and no Docker, `pwd` *does* stop for
+    local-execution consent — but that escalation was buried inside the
+    `<<<EXTERNAL_UNTRUSTED_CONTENT ...>>>` envelope, so `startswith` never saw it.
+    Once escalations were unwrapped, so that a blocked step could not read as a
+    successful one, the same assertion began failing on unchanged behaviour.
+
+    Isolation availability is a separate, ambient gate from permission mode. Pin
+    the permission layer directly, and pin the end-to-end path with isolation
+    present.
+    """
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
 
-    assert not engine.run_tool("execute_shell", {"command": "pwd"}).startswith(ESCALATION)
+    assert engine.check_permission("shell", "pwd") is True
+
+    monkeypatch.setattr(engine, "_exec_sandbox_command", lambda command, **kw: "/some/dir")
+    assert not engine.run_tool("execute_shell",
+                               {"command": "pwd"}).startswith(ESCALATION)
+
+
+def test_a_safe_shell_command_still_asks_before_running_unisolated(engine, monkeypatch):
+    """The other half of the same story, and the reason the above is split in two:
+    permission mode allowing a command is not the same as there being somewhere
+    safe to run it. Running unisolated is the user's call however harmless the
+    command looks."""
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(engine, "_exec_sandbox_command",
+                        lambda command, **kw: engine._local_execution_request(command))
+
+    result = engine.run_tool("execute_shell", {"command": "pwd"})
+
+    assert result.startswith(ESCALATION)
+    assert "local_execution" in result
 
 
 def test_mutating_shell_escalates_in_readonly(engine, monkeypatch, artifacts_dir):

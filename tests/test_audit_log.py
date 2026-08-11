@@ -95,7 +95,7 @@ def test_blocked_write_is_audited(audited_engine, monkeypatch, tmp_path):
     monkeypatch.setattr(audited_engine, "PERMISSION_MODE", "readonly")
     result = audited_engine.run_tool(
         "write_file", {"filename": str(tmp_path / "x.txt"), "content": "hi"})
-    assert result.startswith("ESCALATION_REQUEST:")
+    assert result.startswith("ESCALATION_REQUEST\x1f")
     assert any(e["decision"] == "blocked" and e["tool"] == "write_file"
                for e in _entries(audited_engine._audit_path))
 

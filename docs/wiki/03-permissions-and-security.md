@@ -64,11 +64,28 @@ full-auto.
 
 ### plan-only
 
-The agent must call `execute_plan` with a structured list of steps. You approve
-the plan as a whole, then a temporary grant lets exactly those steps run.
-Direct tool calls are refused with a message telling the model to use a plan.
-The grant is cleared when the plan finishes and **only applies in plan-only
-mode** — it cannot leak into another mode.
+Enter it with `/plan [task]` or `/mode plan-only`. Reads are allowed; every write
+and mutation is refused, with a message telling the model to present a plan
+instead. The agent researches, then calls `present_plan` with the plan written as
+markdown. You see the plan and choose: `a` runs it in full-auto, `e` runs it with
+a prompt before each edit, `d` keeps planning.
+
+Approving **changes the permission mode**, and the plan then runs through the
+ordinary tool path — the same gates as any other work in that mode. When the turn
+ends, the session returns to the mode it had before `/plan`. A plan you decline
+changes nothing at all.
+
+Plan mode holds across turns until a plan is approved or you change mode by hand.
+`set_permission_mode()` is the only thing that changes the mode, and it clears
+every grant tied to the old one, so an approval cannot outlive its mode.
+
+If a turn ends in plan mode without a plan being approved, Agent8088 says so:
+`Still in plan mode — no plan was approved, so nothing above was written or run.`
+A model that writes a plan out in prose and then reports it complete is otherwise
+indistinguishable from one that did the work.
+
+`execute_plan` still exists for running an already-decided sequence of tool calls
+with per-step verification (see `plan_audit`). It is not how a plan is proposed.
 
 ## The always-on floor
 

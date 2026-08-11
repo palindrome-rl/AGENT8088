@@ -34,8 +34,15 @@ def _protect_private_file(path: Path) -> None:
 
     import csv
 
+    # Absolute path on purpose. Under Git Bash / MSYS, PATH resolves `whoami` to
+    # the coreutils build, which rejects /user and exits non-zero — so every
+    # private-file write (the .env key store, telemetry, sandbox settings) fails
+    # with "Could not determine the current Windows user SID" for anyone running
+    # Agent8088 from that shell.
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    whoami = Path(system_root) / "System32" / "whoami.exe"
     identity = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"],
+        [str(whoami) if whoami.is_file() else "whoami", "/user", "/fo", "csv", "/nh"],
         capture_output=True, text=True, timeout=10,
     )
     try:
@@ -374,17 +381,96 @@ _local_fallback_grant = False
 _remote_git_grant = False
 _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
 _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
+_plan_on_approval = None    # set by CLI do_chat; shows the plan and returns the mode to run it in
 _plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
+# A plan session spans turns: plan mode is entered once, and left once — when the
+# work it authorized is done. Keeping the return mode here rather than in the CLI
+# means an embedder driving run_agent directly gets the same lifecycle.
+_plan_return_mode = ""      # mode to restore when an approved plan finishes
+_plan_approved = False      # the user approved this session's plan; execution is live
+_plan_approved_text = ""    # the approved plan, so the auditor grades against it
+_plan_tool_ran = False      # turn-scoped: did a plan tool actually run this turn?
+# Set while a sub-agent whose profile declares `permission: readonly` is running.
+# Such an agent is refused mutations outright rather than being allowed to escalate:
+# an escalation is a question the user can say yes to, and "this agent only
+# observes" has to be a guarantee, not a default. See _exec_subagent.
+_permission_floor_readonly = False
+_last_audit_share = 0.0     # verification's share of the last completed turn's tokens
+
+
+def last_audit_share() -> float:
+    """Verification's share of the last completed turn's tokens, 0.0 if none."""
+    return _last_audit_share
 _active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
+# Which role is spending right now: "main", or "subagent:<type>". Verification is
+# not free — published figures put auditors at 19-38% of harness tokens — and a
+# cost you cannot see is a cost you cannot decide about. Both the turn budget and
+# the telemetry line attribute spend to whichever role incurred it.
+_active_role = "main"
 _turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
 _consecutive_denials = 0  # denial circuit breaker (see DENIAL_BREAKER_THRESHOLD)
+
+
+def set_permission_mode(mode: str) -> None:
+    """The one place PERMISSION_MODE changes, so every grant tied to the old mode
+    is dropped with it. A grant that outlives its mode is a hole: an approval the
+    user gave for a plan step must not still be spendable after the mode moved on."""
+    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant, _pending_approval_key
+    PERMISSION_MODE = mode
+    _one_shot_grant = False
+    _plan_execution_grant = False
+    _pending_approval_key = ""
+
+
+def enter_plan_mode() -> None:
+    """Enter plan mode and remember the mode to come back to.
+
+    Idempotent on purpose: `/plan` twice in a row must not record `plan-only` as
+    the destination, which would strand the session in plan mode forever."""
+    global _plan_return_mode, _plan_approved
+    if PERMISSION_MODE != "plan-only":
+        _plan_return_mode = PERMISSION_MODE
+    _plan_approved = False
+    set_permission_mode("plan-only")
+
+
+def cancel_plan_session() -> None:
+    """Abandon a plan session without running it — the user changed mode by hand."""
+    global _plan_return_mode, _plan_approved, _plan_approved_text
+    _plan_return_mode = ""
+    _plan_approved = False
+    _plan_approved_text = ""
+
+
+def finish_plan_session() -> str:
+    """Leave plan mode once the approved plan's turn is over.
+
+    Returns the mode restored to, or "" if nothing changed. An unapproved plan
+    stays in plan mode: the user asked for a plan and has not agreed to anything,
+    so nothing about the session's permissions should have moved."""
+    global _plan_return_mode, _plan_approved, _plan_approved_text
+    if not _plan_approved:
+        return ""
+    target = _plan_return_mode or "readonly"
+    _plan_approved = False
+    _plan_approved_text = ""
+    _plan_return_mode = ""
+    set_permission_mode(target)
+    return target
+
+
+def plan_tool_ran() -> bool:
+    """True if a plan tool ran during the current turn. The CLI uses this to tell
+    an executed plan apart from a model that only described one."""
+    return _plan_tool_ran
 
 
 def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
-    global _turn_writes
+    global _turn_writes, _plan_tool_ran
     _turn_writes = 0
+    _plan_tool_ran = False
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +495,7 @@ def _tool_call_key(name: str, args: dict) -> str:
 
 def _remember_escalation(name: str, args: dict, result: str) -> None:
     global _pending_approval_key
-    if result.startswith("ESCALATION_REQUEST:"):
+    if result.startswith("ESCALATION_REQUEST\x1f"):
         _pending_approval_key = _tool_call_key(name, args)
 
 
@@ -916,9 +1002,12 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
 
 def request_escalation(target_mode: str, paths: list, change_type: str, reason: str) -> str:
     """Return a structured escalation request string for the model to relay
-    to the user. The UI intercepts this and prompts the user for approval."""
+    to the user. The UI intercepts this and prompts the user for approval.
+
+    Fields are delimited by \\x1f (ASCII unit separator) instead of ':' so
+    Windows paths like C:\\Users\\... don't break the parser."""
     return (
-        f"ESCALATION_REQUEST:{target_mode}:{change_type}:{','.join(paths)}:{reason}"
+        f"ESCALATION_REQUEST\x1f{target_mode}\x1f{change_type}\x1f{','.join(paths)}\x1f{reason}"
     )
 
 
@@ -1769,6 +1858,7 @@ _DEFAULT_SUBAGENT_PROFILE = {
     "description": "General-purpose sub-agent for multi-step research, search, and code tasks.",
     "tools": sorted(n for n in TOOL_NAMES if n != "spawn_subagent"),
     "max_turns": 8,
+    "permission": "",
     "system_prompt": (
         "You are a focused sub-agent spawned to complete ONE delegated task with a "
         "fresh context. Use your tools actively. When done, reply with a concise final "
@@ -1788,6 +1878,10 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 "description": meta.get("description", default_tool_description(name)),
                 "tools": parse_csv(meta.get("tools", "")),
                 "max_turns": int(meta.get("max_turns", "8")),
+                # Optional permission floor for the sub-run. Only "readonly" is
+                # honoured: a profile may restrict itself below the caller's mode,
+                # never widen past it.
+                "permission": meta.get("permission", "").strip().lower(),
                 "system_prompt": body.strip() or _DEFAULT_SUBAGENT_PROFILE["system_prompt"],
             }
     if DEFAULT_SUBAGENT not in specs:
@@ -1837,7 +1931,11 @@ def classify_plan_component(step_text: str) -> str:
         score += len(words.intersection(spec.get("keywords", set())))
         if score > best_score:
             best_score, best_tool = score, name
-    return best_tool or next(iter(TOOL_NAMES), "")
+    # No signal means no answer. Guessing here used to pick whichever tool
+    # iterated first at score zero, and _infer_step_args then filled its single
+    # required argument with the step's own prose — which is how "Delete the old
+    # backups" became a literal shell command.
+    return best_tool if best_score > 0 else ""
 
 
 def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) -> dict:
@@ -2016,7 +2114,257 @@ def _format_with_args(template: str, args: dict) -> str:
         raise ValueError(f"Missing required argument: {exc.args[0]}") from None
 
 
+_UNTRUSTED_OPEN_RE = re.compile(r"^<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\n?")
+_UNTRUSTED_CLOSE = "<<<END_UNTRUSTED_CONTENT>>>"
+
+
+def _unwrap_untrusted(text: str) -> str:
+    """Strip the untrusted-content boundary markers, if present.
+
+    Shell-mode results are wrapped before they reach the plan executor, so a
+    status prefix like `Error:` or `ESCALATION_REQUEST:` is no longer at the
+    start of the string. Checking the wrapped text meant an unapproved shell step
+    read as a success and the plan carried on past it.
+
+    Unwrapping rather than searching the whole string on purpose: a command's own
+    output may legitimately contain the word "Error:", and matching that would
+    halt plans on a passing step.
+    """
+    body = _UNTRUSTED_OPEN_RE.sub("", (text or "").lstrip(), count=1)
+    if body is not (text or "") and body.rstrip().endswith(_UNTRUSTED_CLOSE):
+        body = body.rstrip()[: -len(_UNTRUSTED_CLOSE)]
+    return body
+
+
+def _plan_step_failed(result: str) -> bool:
+    """True if a plan step did not do what the plan asked.
+
+    Two forms count: a tool that reported an error, and an escalation that went
+    unanswered or was denied (the request string survives only when nobody
+    approved it). Both mean the intended effect is absent, so every later step
+    is now standing on an assumption that is already false.
+    """
+    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+
+
+PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
+PLAN_AUDIT_REVERT = APP_CONFIG.get("plan_audit_revert", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+PLAN_REVERT_MAX_BYTES = int(APP_CONFIG.get("plan_audit_revert_max_bytes", str(1 << 20)))
+# Modes whose effect leaves something durable to inspect afterwards. `browser` is
+# deliberately absent: a rendered page closes over nothing, so auditing it buys an
+# inconclusive verdict at the price of a model call. Reads are absent for the
+# obvious reason — auditing a read tells you the read returned what it returned.
+_CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
+_VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
+
+
+def _plan_step_is_auditable(tool_name: str, acceptance: str) -> bool:
+    """Whether this step has an inspectable closure worth spending an audit on.
+
+    A declared `acceptance` always qualifies: the step's author has named what
+    done means, which is the strongest thing an auditor can be handed. Otherwise
+    fall back to modes that leave a durable trace.
+
+    So a browser step is audited only when the plan says what done means for it —
+    the reported page text is in the auditor's task, so "the page mentions pricing"
+    is checkable, while an invented criterion for a page nobody kept would not be.
+    """
+    if acceptance:
+        return True
+    return TOOL_SPECS.get(tool_name, {}).get("mode") in _CLOSURE_MODES
+
+
+def _capture_write_state(tool_name: str, tool_args: dict):
+    """Snapshot what a write step is about to overwrite, so a failed audit can
+    put it back. Returns (path, prior_bytes) with prior_bytes None when the file
+    did not exist, or None when no snapshot can be taken.
+
+    Bounded by plan_audit_revert_max_bytes: holding an arbitrarily large file in
+    memory to enable a maybe-revert is a worse trade than declining to revert and
+    saying so.
+    """
+    spec = TOOL_SPECS.get(tool_name, {})
+    if spec.get("mode") != "write_text":
+        return None
+    try:
+        path = resolve_user_path(_tool_path(spec, tool_args))
+    except Exception:
+        return None
+    try:
+        if not path.exists():
+            return (path, None)
+        if path.stat().st_size > PLAN_REVERT_MAX_BYTES:
+            return None
+        return (path, path.read_bytes())
+    except OSError:
+        return None
+
+
+def _revert_plan_write(snapshot) -> str:
+    """Undo one write step, returning the file to its exact pre-step bytes."""
+    path, prior = snapshot
+    try:
+        if prior is None:
+            if path.exists():
+                path.unlink()
+            return f"reverted — removed {path.name}"
+        path.write_bytes(prior)
+        return f"reverted — restored the previous contents of {path.name}"
+    except OSError as exc:
+        return f"REVERT FAILED for {path.name} ({exc}) — inspect this file by hand"
+
+
+def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
+                     result: str, depth: int,
+                     acceptance: str = "", evidence: str = "") -> tuple:
+    """Check a completed step against the environment. Returns (halt_reason, note).
+
+    Off unless `plan_audit=1`. A step that reports success has only told us the
+    tool did not raise; the auditor looks at what is actually on disk. It runs
+    under the readonly floor its profile declares, so it cannot alter what it is
+    inspecting.
+
+    Skipped when the shared turn budget is already spent — the auditor spends the
+    parent's budget by design, and burning the remainder on verification would
+    starve the work being verified. A `fail` verdict halts the plan; anything
+    else is recorded but never halts, because an auditor that cannot run must not
+    be able to stop work on its own.
+    """
+    if _active_budget is not None and _active_budget.exceeded():
+        return "", "audit skipped — turn budget spent"
+    task = (
+        "Verify that the following step actually took effect. Inspect the real "
+        "environment; do not trust the reported output.\n\n"
+        f"Step: {step_text or tool_name}\n"
+        f"Tool: {tool_name}\n"
+        f"Arguments: {json.dumps(tool_args, default=str)[:500]}\n"
+        f"Reported result: {result[:500]}\n"
+    )
+    # A stated criterion beats the auditor inventing one. Without it the auditor
+    # has to guess what "worked" means and grades against its own guess.
+    if acceptance:
+        task += f"\nAcceptance criteria (the step is done only if this holds): {acceptance}\n"
+    if evidence:
+        task += f"Evidence to collect: {evidence}\n"
+    # Without this the auditor has no idea where "the workspace" is, and a
+    # criterion naming a file it cannot locate was answered `pass` rather than
+    # `unknown` — a false pass, the one verdict that costs more than no auditing.
+    workspace = ", ".join(str(p) for p in ALLOWED_PATHS) or str(PROJECT_ROOT)
+    task += (f"\nWorkspace paths (resolve any relative name against these): {workspace}\n"
+             "If you cannot locate what the criteria refer to, the verdict is "
+             "'unknown'. Never answer 'pass' for something you did not observe.\n"
+             "\nReply with a single VERDICT line as instructed.")
+    answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
+    verdict = _VERDICT_RE.search(answer or "")
+    if verdict is None:
+        return "", f"audit inconclusive — no verdict returned ({(answer or '')[:120]})"
+    if verdict.group(1).lower() == "fail":
+        return f"{tool_name} failed verification", answer.strip()[:300]
+    return "", ""
+
+
+def _approved_plan_audit_applies(tool_name: str, depth: int) -> bool:
+    """Whether an ordinary tool call should be verified right now.
+
+    The auditor reached a plan's writes for a structural reason rather than a
+    deliberate one: plan mode forced every mutation through `execute_plan`, and
+    that is the only path the audit hooked. An approved plan now runs as ordinary
+    tool calls, so without this the default `/plan` path would be the one path
+    with no verification at all — the opposite of what the audit is for.
+
+    Depth 0 only. A sub-agent's writes are not the plan, and auditing inside the
+    auditor would set it verifying itself.
+    """
+    if not (PLAN_AUDIT and _plan_approved and depth == 0):
+        return False
+    return _plan_step_is_auditable(tool_name, "")
+
+
+def _audit_approved_plan_call(tool_name: str, tool_args: dict, result: str,
+                              depth: int, snapshot) -> str:
+    """Verify one post-approval call and put a failed write back.
+
+    `_exec_plan` halts its remaining steps on a failed verdict. There is no step
+    list to halt here, so the equivalent is to hand the model a result it cannot
+    read as success and to say plainly that nothing later should be built on top
+    of it. The same asymmetry holds as in plans: only a `fail` undoes anything —
+    an auditor that could not reach its model must not be able to destroy work.
+    """
+    step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
+    # The plan the user approved is the criterion. Without it the auditor grades
+    # "did this call take effect", which a write that did confidently the wrong
+    # thing passes. An execute_plan step can declare `acceptance`; an ordinary
+    # tool call has nowhere to put one, so the plan stands in for it.
+    reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
+                                    acceptance=_plan_approved_text[:1500])
+    parts = [result]
+    if note:
+        parts.append(f"audit: {note}")
+    if reason:
+        if snapshot is not None:
+            parts.append(_revert_plan_write(snapshot))
+        elif PLAN_AUDIT_REVERT and TOOL_SPECS.get(tool_name, {}).get("mode") != "write_text":
+            parts.append(f"not reverted — {tool_name} has no undo; "
+                         "inspect the effect by hand")
+        parts.append(f"Error: verification failed — {reason}. Stop carrying out the plan "
+                     "and report what actually happened; do not assume any later step is "
+                     "safe to run.")
+    return "\n".join(parts)
+
+
+def _exec_present_plan(args: dict, depth: int = 0) -> str:
+    """Show a finished plan and ask the user to approve it.
+
+    This is plan mode's exit point, not an executor. Presentation and execution
+    were the same tool before, which forced every approvable plan to be a JSON
+    array of fully-specified tool calls — so a plan written the way a human reads
+    it halted on its first step, and a model that wrote prose instead had nothing
+    approved and nothing run while still sounding finished. Here the plan is
+    text, the user picks the mode the work runs in, and the ordinary tool path
+    does the work.
+    """
+    global _plan_approved, _plan_approved_text, _plan_tool_ran
+    if depth:
+        # The plan belongs to the main agent's turn. A sub-agent asking the user to
+        # approve *its* plan for a delegated sub-task would leave plan mode on the
+        # strength of an approval given for something else entirely.
+        return ("Error: a sub-agent cannot present a plan. Finish your task with the "
+                "tools you have and report back; the agent that delegated to you owns "
+                "the plan.")
+    _plan_tool_ran = True
+    plan_text = str(args.get("plan") or args.get("text") or args.get("steps") or "").strip()
+    if not plan_text:
+        return ("Error: present_plan requires a non-empty 'plan' — the plan itself, "
+                "as markdown text the user can read.")
+    if PERMISSION_MODE != "plan-only":
+        return (f"Error: present_plan only applies in plan mode; this session is in "
+                f"{PERMISSION_MODE} mode. Do the work with ordinary tool calls.")
+    if not callable(_plan_on_approval):
+        return ("Plan not approved: this session has no way to ask the user "
+                "(non-interactive). Nothing was written or run. Report the plan "
+                "to the user as your answer instead.")
+    chosen = _plan_on_approval(plan_text)
+    if not chosen:
+        return ("Plan not approved — still in plan mode. Revise the plan and call "
+                "present_plan again, or answer the user's questions about it. "
+                "Nothing has been written or run.")
+    set_permission_mode(chosen)
+    _plan_approved = True
+    _plan_approved_text = plan_text
+    message = (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
+               "in order, with ordinary tool calls, and report what each step actually "
+               "did. Do not call present_plan again for this plan.")
+    if PLAN_AUDIT:
+        message += (" Every mutating step will be verified against the real environment "
+                    "by a read-only auditor, and a step that fails verification is put "
+                    "back — so make each one do exactly what the plan said.")
+    return message
+
+
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
+    global _plan_execution_grant, _plan_tool_ran
+    _plan_tool_ran = True
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
     if isinstance(raw, str):
@@ -2037,7 +2385,6 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
     # In plan-only mode: show all steps as pending, then get approval BEFORE running.
     # On approve: set _plan_execution_grant so steps run without per-step prompts,
     # but PERMISSION_MODE stays plan-only (temporary grant, not a mode switch).
-    global _plan_execution_grant
     if PERMISSION_MODE == "plan-only" and on_step and on_escalation:
         pre_parsed = []
         has_gated = False
@@ -2051,7 +2398,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             spec = TOOL_SPECS.get(tool_name, {})
             if spec.get("mode") in ("write_text", "shell", "docker", "cron", "browser"):
                 has_gated = True
-            pre_parsed.append((idx, step_text, tool_name))
+            pre_parsed.append((idx, step_text, tool_name or "(no tool)"))
         for idx, step_text, tool_name in pre_parsed:
             on_step(idx, total, step_text, tool_name, "pending", None)
         if has_gated:
@@ -2066,19 +2413,31 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             _plan_execution_grant = True
 
     outputs = []
+    halted = ""
+    stopped_at = 0
     for idx, step in enumerate(steps, 1):
         if isinstance(step, dict):
             step_text = str(step.get("step") or step.get("text") or "")
             tool_name = str(step.get("tool") or classify_plan_component(step_text))
             given = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
             tool_args = _infer_step_args(tool_name, step_text, given)
+            acceptance = str(step.get("acceptance") or step.get("acceptance_criteria") or "")
+            evidence = str(step.get("evidence") or "")
         else:
             step_text = str(step)
             tool_name = classify_plan_component(step_text)
             tool_args = _infer_step_args(tool_name, step_text, {})
+            acceptance = evidence = ""
+        if not tool_name:
+            outputs.append(f"[{idx}] Error: this step names no tool: {step_text[:120]!r}. "
+                           'Give every step an explicit "tool" and "arguments", or '
+                           "write the plan as prose and call present_plan instead.")
+            halted, stopped_at = f"step {idx} named no tool", idx
+            break
         if tool_name not in TOOL_SPECS:
             outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
-            continue
+            halted, stopped_at = f"unknown tool '{tool_name}'", idx
+            break
         missing = [param for param in TOOL_REQUIRED_PARAMS.get(tool_name, [])
                    if param not in tool_args]
         if missing:
@@ -2087,15 +2446,26 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             outputs.append(f"[{idx}] {tool_name}: {result}")
             if on_step:
                 on_step(idx, total, step_text, tool_name, "done", result)
-            continue
+            halted, stopped_at = f"{tool_name} was missing required arguments", idx
+            break
         if on_step:
             on_step(idx, total, step_text, tool_name, "running", None)
+        # Taken before the step runs: once it has written, the previous state is
+        # the one thing that cannot be reconstructed.
+        snapshot = None
+        will_audit = PLAN_AUDIT and _plan_step_is_auditable(tool_name, acceptance)
+        if will_audit and PLAN_AUDIT_REVERT:
+            snapshot = _capture_write_state(tool_name, tool_args)
         try:
             result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
         except Exception as exc:
             result = f"Error: {exc}"
         _remember_escalation(tool_name, tool_args, result)
-        if result.startswith("ESCALATION_REQUEST:") and callable(on_escalation):
+        # Unwrapped: shell results arrive inside the untrusted-content markers, so
+        # matching the raw string meant a shell step in a plan never offered the
+        # approval prompt at all — it just came back blocked.
+        if (_unwrap_untrusted(result).lstrip().startswith("ESCALATION_REQUEST\x1f")
+                and callable(on_escalation)):
             if on_escalation(result):
                 try:
                     result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
@@ -2104,7 +2474,46 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         if on_step:
             on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
+        # Stop at the first failed step. Continuing would run every later step
+        # against a state the plan no longer describes, and the caller would get
+        # back a transcript in which the failure is one line among many that all
+        # look alike — which is how a half-done plan gets reported as done.
+        if _plan_step_failed(result):
+            halted, stopped_at = f"{tool_name} did not complete", idx
+            break
+        if will_audit:
+            reason, note = _audit_plan_step(step_text, tool_name, tool_args, result,
+                                            depth, acceptance, evidence)
+            if note:
+                outputs.append(f"[{idx}] audit: {note}")
+            if reason:
+                # Only verified state persists. A write that failed verification
+                # is put back exactly as it was, so the plan leaves behind what
+                # it proved rather than what it attempted. Nothing outside this
+                # step is touched, and a step with no snapshot says so instead of
+                # implying a rollback that did not happen.
+                if snapshot is not None:
+                    outputs.append(f"[{idx}] {_revert_plan_write(snapshot)}")
+                elif PLAN_AUDIT_REVERT and TOOL_SPECS[tool_name].get("mode") != "write_text":
+                    outputs.append(f"[{idx}] not reverted — {tool_name} has no undo; "
+                                   "inspect the effect by hand")
+                halted, stopped_at = reason, idx
+                break
     _plan_execution_grant = False  # clear temporary grant — back to plan-only
+    if PLAN_AUDIT and _active_budget is not None:
+        share = _active_budget.audit_share()
+        if share:
+            outputs.append(f"Verification cost this turn: {share * 100:.0f}% of tokens "
+                           f"({_active_budget.role_total('subagent:auditor')} of "
+                           f"{_active_budget.total_tokens}).")
+    if halted:
+        skipped = total - stopped_at
+        outputs.append(
+            f"Plan halted at step {stopped_at}/{total}: {halted}."
+            + (f" The remaining {skipped} step(s) were NOT run." if skipped else "")
+            + " Fix the cause, then issue a new plan for the work that is left —"
+              " do not assume any later step ran."
+        )
     return "\n".join(outputs)
 
 
@@ -2112,6 +2521,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
+    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
+    global _local_fallback_grant, _remote_git_grant, _active_role
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -2139,8 +2550,38 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # Optional live presentation hooks for the sub-agent's own loop.
     ui = subagent_ui(type_name, task, depth) if callable(subagent_ui) else {}
 
+    # Permission floor. A profile declaring `permission: readonly` is pinned to
+    # readonly for the whole sub-run, whatever the caller was running as. This is
+    # a floor, not a mode switch: it can only restrict, never widen — there is no
+    # profile value that grants more than the caller already had.
+    #
+    # Pending grants are cleared too, and that is the point rather than a detail.
+    # An approval the *parent* obtained (a one-shot y/n, or the temporary grant
+    # `_exec_plan` holds while running an approved plan) would otherwise be live
+    # inside an agent whose whole contract is that it cannot change anything —
+    # so an auditor spawned mid-plan could write through the parent's grant.
+    #
+    # The pin also turns a blocked mutation into a flat refusal rather than an
+    # escalation. Escalations from a sub-agent do reach the user, so leaving them
+    # in place made "this agent only observes" a question the user could answer
+    # yes to — including for the very file the auditor was sent to inspect.
+    global _permission_floor_readonly
+    floor = profile.get("permission", "")
+    saved_permission = None
+    if floor == "readonly":
+        saved_permission = (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+                            _local_fallback_grant, _remote_git_grant,
+                            _permission_floor_readonly)
+        PERMISSION_MODE = "readonly"
+        _one_shot_grant = False
+        _plan_execution_grant = False
+        _local_fallback_grant = False
+        _remote_git_grant = False
+        _permission_floor_readonly = True
+
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
+    saved_role, _active_role = _active_role, f"subagent:{type_name}"
     try:
         answer = run_agent(
             [{"role": "user", "content": task}],
@@ -2158,6 +2599,11 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         answer = f"Sub-agent failed: {e}"
     finally:
         _last_tool_output, _last_tool_name, _last_write_diff = saved
+        _active_role = saved_role
+        if saved_permission is not None:
+            (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+             _local_fallback_grant, _remote_git_grant,
+             _permission_floor_readonly) = saved_permission
 
     if ui.get("done"):
         ui["done"](answer)
@@ -2526,11 +2972,43 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     return _local_execution_request(_process_display(argv))
 
 
+DOCKER_PULL_TIMEOUT = int(APP_CONFIG.get("docker_pull_seconds", "300"))
+_docker_images_present = set()
+
+
+def _ensure_docker_image(image: str) -> str:
+    """Pull `image` if it is not already local. Returns "" or an error string.
+
+    `docker run` pulls a missing image itself, but it does so inside whatever
+    timeout the *tool* declared — 20s for the read-only git tools. On any machine
+    that does not already hold the image, the first call therefore dies with a
+    bare "Command timed out after 20s" that names neither Docker nor the pull.
+    Pull explicitly instead, on its own budget, so a slow download is slow rather
+    than fatal and a genuine pull failure says so.
+    """
+    if image in _docker_images_present:
+        return ""
+    probe = _exec_process(["docker", "image", "inspect", "--format", "present", image],
+                          timeout=30)
+    if "present" in probe and "exited with status" not in probe:
+        _docker_images_present.add(image)
+        return ""
+    pulled = _exec_process(["docker", "pull", image], timeout=DOCKER_PULL_TIMEOUT)
+    if "exited with status" in pulled or "timed out" in pulled:
+        return (f"Error: container image {image} is missing and could not be pulled. "
+                f"Run `docker pull {image}` and retry. Details: {pulled[:200]}")
+    _docker_images_present.add(image)
+    return ""
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "") -> str:
     selected_image = image or DOCKER_IMAGE
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
+    unavailable = _ensure_docker_image(selected_image)
+    if unavailable:
+        return unavailable
     workspace = str(PROJECT_ROOT)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     git_image = selected_image.startswith("alpine/git:")
@@ -2946,6 +3424,22 @@ def _tool_path(spec: dict, args: dict) -> str:
             or args.get("file_path") or args.get("filepath") or args.get("path") or "")
 
 
+def _plan_mode_block_message() -> str:
+    """What a model is told when it reaches for a mutation inside plan mode.
+
+    It used to be told to call execute_plan with a JSON array of fully-specified
+    tool calls. Models do not reliably produce that, so they re-issued the direct
+    call until the loop gave up and the user saw "I wasn't able to produce an
+    answer". Naming the one tool that does work, and saying what happens after
+    approval, is what makes the block recoverable."""
+    return ("Error: plan mode — nothing is written or run until the user approves a "
+            "plan. Keep reading if you still need facts. Once you know what to do, "
+            "call present_plan(plan=\"...\") with the plan written out as markdown: "
+            "the goal, numbered steps, and the files each step touches. The user "
+            "approves it, the permission mode changes, and THEN you make this tool "
+            "call normally. Do not claim any of it is done before that happens.")
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
@@ -2960,17 +3454,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"
-    # instead of telling the model to use execute_plan — the model never learns why.
+    # instead of telling the model how plan mode works — the model never learns why.
     # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
     # to the normal check_permission gate so it escalates properly.
     plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
     plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
-        return ("Error: plan-only mode — direct tool execution blocked. "
-                "Call the execute_plan tool with a JSON steps array, e.g.: "
-                'execute_plan(steps=[{"tool":"write_file",'
-                '"arguments":{"filename":"C:/tmp/x.txt","content":"hi"}}]) '
-                "Do NOT describe the plan in prose — call execute_plan as a tool call.")
+        return _plan_mode_block_message()
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
@@ -3161,11 +3651,18 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode in gated_modes and not remote_git_approved and not check_permission(
             mode, command, path_zone, bool(spec.get("host")), approval_key):
         if PERMISSION_MODE == "plan-only" and allow_plan:
-            return ("Error: plan-only mode — direct tool execution blocked. "
-                    "Call the execute_plan tool with a JSON steps array, e.g.: "
-                    'execute_plan(steps=[{"tool":"write_file",'
-                    '"arguments":{"filename":"/tmp/x","content":"hi"}}]) '
-                    "Do NOT describe the plan in prose — call execute_plan as a tool call.")
+            return _plan_mode_block_message()
+        # A profile pinned to readonly is refused outright. Escalations from a
+        # sub-agent do reach the user, so offering one here would make "this agent
+        # only observes" a question the user could answer yes to — for the very
+        # file the auditor was sent to inspect.
+        if _permission_floor_readonly:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200] or str(target), reason="readonly_floor")
+            return (f"Error: {name} is not available to you. This agent is pinned "
+                    "read-only for its whole run: it observes and reports, and it "
+                    "cannot change anything or ask for permission to. Report what "
+                    "you found instead.")
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -3235,6 +3732,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "plan":
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
+        if name == "present_plan":
+            return _exec_present_plan(args, depth=depth)
         return _exec_plan(args, on_step=_plan_on_step,
                           on_escalation=_plan_on_escalation, depth=depth)
 
@@ -3293,7 +3792,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         else:
             result = _exec_shell_command(
                 command, timeout=timeout, image=spec.get("sandbox_image", ""))
-        return _wrap_untrusted(str(result), f"shell command: {_redact_secrets(command[:160])}")
+        text = str(result)
+        # An escalation request is a control signal for the UI, not output from
+        # the command — the command has not run yet. Wrapping it hid the
+        # "ESCALATION_REQUEST:" prefix every caller matches on, so the local
+        # -execution prompt never reached the user and the step came back
+        # blocked with no way to approve it.
+        if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
+            return text.strip()
+        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
@@ -3316,12 +3823,26 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except Exception:
         return "Invalid JSON"
 
+    # Taken before the call runs: once it has written, the previous state is the
+    # one thing that cannot be reconstructed.
+    will_audit = _approved_plan_audit_applies(name, depth)
+    snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
+
     try:
         result = run_tool(name, args, depth=depth)
     except subprocess.TimeoutExpired:
         result = "Command timed out"
     except Exception as e:
         result = f"Error: {e}"
+
+    # A blocked call has not done anything yet, so there is nothing to verify —
+    # it gets audited on the retry that follows approval. The prefix is
+    # \x1f-delimited (a Windows path splits on ':'); matching ':' here meant the
+    # check never fired, so the auditor was sent to inspect a write that had not
+    # happened and its fail verdict was appended to the escalation the user still
+    # had to answer.
+    if will_audit and not result.startswith("ESCALATION_REQUEST\x1f"):
+        result = _audit_approved_plan_call(name, args, result, depth, snapshot)
 
     _remember_escalation(name, args, result)
 
@@ -3419,6 +3940,42 @@ def _outside_fenced_code(text: str) -> str:
                    if index % 2 == 0)
 
 
+def _scan_json_object(text: str, start: int, limit: int = None) -> str:
+    """Return the brace-balanced JSON object that begins at text[start].
+
+    A greedy regex spans from the first brace in the reply to the last one, which
+    merges several batched tool calls into a single unparseable blob and loses all
+    of them; a non-greedy one stops at the first '}', truncating nested JSON such
+    as {"steps": "[{...}]"}. Counting braces outside string literals is the only
+    thing that gets both right. Quote and backslash state are tracked so a brace
+    inside a string value does not close the object, and `limit` bounds the scan
+    so an unterminated string in one block cannot swallow the blocks after it.
+    """
+    limit = len(text) if limit is None else min(limit, len(text))
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, limit):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return text[start:limit]
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
     text = _outside_fenced_code(text)
@@ -3434,24 +3991,32 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 calls.append(d)
         except Exception:
             pass
-    # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}
-    # Greedy match (\{.*\}) captures nested JSON braces — non-greedy (\{.*?\})
-    # stops at the first }, truncating args like {"steps": "[{\"tool\": ...}]"}
-    # and causing the args to fail parsing, falling through to empty-args match.
+    # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}, once per block
+    # Every block is taken, not just the first: models batch several calls into
+    # one reply — routinely so when working through an approved plan — and a
+    # single greedy re.search spanned all of them at once, so all of them were
+    # lost to one parse error. Each block's JSON extent is found by counting
+    # braces (see _scan_json_object) rather than by a regex, which is what keeps
+    # nested JSON like {"steps": "[{...}]"} intact while still ending the match
+    # at the right place.
     if not calls:
-        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*\})', text, re.DOTALL)
-        if m:
-            resolved = _resolve_tool_name(m.group(1))
-            if resolved in allowed:
-                try:
-                    calls.append({"name": resolved, "arguments": _loads_tool_args(m.group(2))})
-                except Exception:
-                    # An ARGS block was sent but is unparseable. Surfacing empty
-                    # args here would make the tool report the argument as
-                    # missing, which sends the model chasing the wrong problem.
-                    # Flag the parse failure instead.
-                    calls.append({"name": resolved,
-                                  "arguments": {"__parse_error__": m.group(2)[:400]}})
+        headers = list(re.finditer(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(?=\{)', text))
+        for position, header in enumerate(headers):
+            resolved = _resolve_tool_name(header.group(1))
+            if resolved not in allowed:
+                continue
+            limit = (headers[position + 1].start()
+                     if position + 1 < len(headers) else len(text))
+            raw_args = _scan_json_object(text, header.end(), limit)
+            try:
+                calls.append({"name": resolved, "arguments": _loads_tool_args(raw_args)})
+            except Exception:
+                # An ARGS block was sent but is unparseable. Surfacing empty
+                # args here would make the tool report the argument as
+                # missing, which sends the model chasing the wrong problem.
+                # Flag the parse failure instead.
+                calls.append({"name": resolved,
+                              "arguments": {"__parse_error__": raw_args[:400]}})
         if not calls and "✿ARGS✿" not in text:  # loose ✿FUNCTION✿ line, genuinely no args
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
@@ -3726,6 +4291,7 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
             "provider": _redact_secrets(str(provider)),
             "model": _redact_secrets(str(model)),
             "attempt": attempt,
+            "role": _active_role,
             "outcome": "error" if error else "success",
             "latency_ms": round((time.monotonic() - started) * 1000),
             "max_tokens": max_tokens,
@@ -4307,10 +4873,30 @@ class _TurnBudget:
         self.started = time.monotonic()
         self.input_tokens = 0
         self.output_tokens = 0
+        # role -> [input, output]. Lets a caller answer "what did verification
+        # cost me" from its own workload instead of from a published average.
+        self.role_tokens = {}
 
     def add_tokens(self, prompt: int, completion: int) -> None:
-        self.input_tokens += int(prompt or 0)
-        self.output_tokens += int(completion or 0)
+        prompt, completion = int(prompt or 0), int(completion or 0)
+        self.input_tokens += prompt
+        self.output_tokens += completion
+        slot = self.role_tokens.setdefault(_active_role, [0, 0])
+        slot[0] += prompt
+        slot[1] += completion
+
+    def role_total(self, role: str) -> int:
+        spent = self.role_tokens.get(role)
+        return sum(spent) if spent else 0
+
+    def audit_share(self) -> float:
+        """Fraction of this turn's tokens spent on verification (0.0-1.0)."""
+        total = self.total_tokens
+        if not total:
+            return 0.0
+        audited = sum(sum(v) for k, v in self.role_tokens.items()
+                      if k.startswith("subagent:auditor"))
+        return audited / total
 
     def add_usage(self, response, text: str = "") -> None:
         """Record one model call. Streaming responses come from _build_response
@@ -4369,6 +4955,7 @@ def run_agent(messages, *, budget=None, **kwargs):
             max_cost=MAX_TURN_COST_USD,
             cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
         )
+    global _last_audit_share
     previous, _active_budget = _active_budget, budget
     # Only the outermost run_agent resets the blast-radius counters: a subagent
     # must not hand itself a fresh write budget, same reasoning as the token one.
@@ -4379,6 +4966,12 @@ def run_agent(messages, *, budget=None, **kwargs):
     try:
         return _run_agent_loop(messages, budget=budget, **kwargs)
     finally:
+        # Read the share before the budget goes out of scope. Verification spends
+        # the parent's tokens, and an audit on the post-approval path reports no
+        # cost of its own — so without this the only unattributed verification
+        # spend would be the one the default /plan flow incurs.
+        if previous is None:
+            _last_audit_share = budget.audit_share() if budget is not None else 0.0
         _active_budget = previous
 
 
@@ -4455,7 +5048,17 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
     for a library version the agent may legitimately need to install it, and
     refusing that is a worse bug than one wasted fetch. So only fetch-shaped
     calls qualify, and an explicit user request overrides all of it.
+
+    An approved plan overrides it too, and for the same reason only more so. A
+    plan-mode turn researches with a search and then runs the approved steps in
+    that same turn, so this gate would refuse work the user had just said yes to —
+    and `_user_requested_tool` cannot rescue it, because they approved a plan
+    rather than naming a tool. `_plan_approved` is true only between approval and
+    the end of that turn, so the widening lasts exactly as long as the work it
+    authorises.
     """
+    if _plan_approved:
+        return False
     if name in {"browse_page", "get_page_title"}:
         return not (_user_supplied_url(messages, args.get("url"))
                     or _user_requested_tool(messages, name))
@@ -4679,10 +5282,13 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 result = exec_tool(name, json.dumps(args), depth=depth)
             executed = True
             tool_outputs.append(result)
-            if name == "web_search" and not result.startswith("ESCALATION_REQUEST:"):
+            if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
                 # answered from it. An escalation is not a result — recording it
-                # would make the approved retry look like a duplicate.
+                # would make the approved retry look like a duplicate. The prefix
+                # is \x1f-delimited; matching ':' here meant a search blocked
+                # pending approval was filed as a completed one, so the retry the
+                # user had just authorised was answered from the escalation text.
                 search_results[_search_signature(str(args.get("query") or ""))] = result
                 if not _search_was_usable(result):
                     # An errored or empty search must stay retryable, and the
@@ -4694,7 +5300,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.
-            blocked = result.startswith("ESCALATION_REQUEST:")
+            blocked = result.startswith("ESCALATION_REQUEST\x1f")
             if blocked:
                 seen.discard(sig)
 

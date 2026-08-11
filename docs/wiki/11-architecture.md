@@ -66,6 +66,100 @@ Per user turn, `run_agent()` loops up to `max_turns`:
 If the model backend errors mid-turn, the loop returns the best output it has
 rather than crashing the session.
 
+## Plans stop at the first failed step
+
+`execute_plan` runs its steps in order and **halts on the first failure**, rather
+than running the rest against a state the plan no longer describes. A step counts
+as failed when the tool reported an error, or when its escalation went unanswered
+or denied.
+
+The result then says where it stopped and how many steps did not run, so a caller
+cannot mistake a half-executed plan for a finished one. Continuing past a failure
+is what turns one bad step into a cascade: every later step is built on an effect
+that never happened, and the transcript gives the failure no more weight than any
+other line.
+
+A halted plan is not a rollback — steps that already ran stay run. The caller is
+expected to fix the cause and issue a new plan for the remaining work.
+
+### Verifying a step actually landed
+
+A step that reports success has only told you the tool did not raise. Setting
+`plan_audit=1` sends each *mutating* step to the readonly `auditor` sub-agent,
+which inspects the real environment before the plan continues. A `fail` verdict
+halts the plan on the same path as any other failure.
+
+This covers two paths, because a plan's work now happens on both. Steps inside
+`execute_plan` are audited there. The tool calls an approved `/plan` makes are
+audited in `exec_tool`, at depth 0 only — a sub-agent's writes are not the plan,
+and auditing inside the auditor would set it verifying itself. That second path
+was not always covered: plan mode used to force every mutation through
+`execute_plan`, so hooking `execute_plan` was the same thing as hooking the plan.
+Once approval started handing execution to ordinary tool calls, the default
+`/plan` flow became the one flow with no verification at all.
+
+An `execute_plan` step can declare `acceptance`; an ordinary tool call has nowhere
+to put one, so the **plan the user approved** is passed as the criterion instead.
+Without it the auditor grades "did this call take effect", which a write that did
+confidently the wrong thing passes. With it, a `write_file` of `hi` against a plan
+promising a revenue table comes back:
+`VERDICT: fail — the file contains only "hi", not a markdown table of quarterly
+revenue with at least four data rows` — and the file is removed.
+
+Verification is not free, so the cost stays visible. `_exec_plan` appends its share
+to the plan's output; the post-approval path has no such output, so the share is
+captured as the turn's budget is torn down and the CLI prints
+`verification cost this turn: N% of tokens`. On a small turn that share is large —
+a single audit call against one tiny write measured over 90% — which is the number
+to look at before leaving auditing on.
+
+Two deliberate asymmetries:
+
+- A failed verification halts; an auditor that could not run does not. An
+  inconclusive result is recorded in the output and the plan proceeds — a
+  verifier that cannot reach the model must not be able to stop all work on its
+  own.
+- Auditing is skipped once the shared turn budget is spent. The auditor draws on
+  the same `_TurnBudget` as the work it checks (a fresh budget would be a free
+  bypass), so it yields rather than starving the task it exists to protect.
+
+Off by default: it costs one model call per mutating step. The case for turning
+it on is the unattended paths — gateway and cron — where nobody is watching and
+a half-done plan reported as finished is the expensive failure.
+
+### Only verified state persists
+
+A step *proposes* a change; verification is what *commits* it. With
+`plan_audit_revert=1` (the default when auditing is on), a `write_file` step that
+fails verification is restored to its exact pre-step bytes — created files are
+removed, overwritten files are put back.
+
+The boundaries are deliberate and worth knowing before you rely on it:
+
+- **Only the failed step is reverted.** Steps that already passed verification
+  stay committed; a failed audit is not a transaction rollback across the plan.
+- **Only `write_file` can be undone.** `execute_shell`, `run_sandboxed` and
+  `schedule_task` have no inverse. Those steps report `not reverted — no undo`
+  rather than implying a rollback that did not happen.
+- **Large files are not snapshotted.** Above `plan_audit_revert_max_bytes` the
+  prior contents are not held in memory, so the write stands and the output says
+  so. Declining to revert is acceptable; silently failing to revert is not.
+
+The worst case is bounded by construction: a revert restores the exact bytes that
+were there before the step, so a wrong `fail` verdict costs you the step, never
+data that predates it.
+
+### What verification costs
+
+`_TurnBudget` attributes tokens to the role that spent them (`main`, or
+`subagent:<type>`), and each model-telemetry line carries the same `role` field.
+After an audited plan the result reports the share, e.g.
+`Verification cost this turn: 22% of tokens (4400 of 20000)`.
+
+This exists so the decision to run auditing is made from your own numbers.
+Published figures put auditors at roughly a fifth to a third of harness tokens;
+whether that holds for your workload is measurable rather than assumed.
+
 ## Tools are data
 
 `tools.txt` is a pipe-delimited registry, not Python. A tool declares a `mode`,

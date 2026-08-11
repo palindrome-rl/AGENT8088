@@ -54,7 +54,7 @@ def _guard_environment():
 
 BACKEND_ERROR_MARKERS = ("The model backend errored", "<EXCEPTION")
 
-REFUSALS = ("Error:", "ESCALATION_REQUEST:", "Follow-up fetch was not run",
+REFUSALS = ("Error:", "ESCALATION_REQUEST\x1f", "Follow-up fetch was not run",
             "This search already ran", "already ran with this output")
 
 

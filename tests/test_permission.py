@@ -2,6 +2,8 @@ import os, sys, json
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
+
 # Data files live inside the package (that is what the engine loads and what ships
 # in the wheel) — never at the repo root.
 PKG = Path(__file__).resolve().parent.parent / "src" / "agent8088"
@@ -64,7 +66,7 @@ def test_escalation_grant_is_bound_to_the_blocked_call():
     approved = A._tool_call_key("write_file", {"filename": "approved.txt", "content": "ok"})
     other = A._tool_call_key("write_file", {"filename": "other.txt", "content": "no"})
     A._remember_escalation("write_file", {"filename": "approved.txt", "content": "ok"},
-                           "ESCALATION_REQUEST:edit:new_file:approved.txt:blocked")
+                           "ESCALATION_REQUEST\x1fedit\x1fnew_file\x1fapproved.txt\x1fblocked")
     A.grant_escalation()
 
     assert A.check_permission("write_text", approval_key=other) is False
@@ -141,7 +143,7 @@ def test_direct_tool_retries_an_approved_action(monkeypatch):
 
     def exec_tool(name, arguments):
         calls.append((name, arguments))
-        return "ESCALATION_REQUEST:edit:new_file:test.txt:blocked" if len(calls) == 1 else "Wrote 2 bytes"
+        return "ESCALATION_REQUEST\x1fedit\x1fnew_file\x1ftest.txt\x1fblocked" if len(calls) == 1 else "Wrote 2 bytes"
 
     monkeypatch.setattr(cli.A, "exec_tool", exec_tool)
     cli.cmd_tool('write_file {"filename": "test.txt", "content": "ok"}')
@@ -196,7 +198,10 @@ def test_read_text_rejects_sensitive_symlink(tmp_path, monkeypatch):
     secret = tmp_path / ".env"
     secret.write_text("API_KEY=secret")
     link = tmp_path / "notes.txt"
-    link.symlink_to(secret)
+    try:
+        link.symlink_to(secret)
+    except OSError:  # Windows needs Developer Mode or elevation to symlink
+        pytest.skip("symlink creation not permitted in this environment")
     monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
 
     result = A.run_tool("read_text", {"filename": str(link)})
@@ -340,8 +345,8 @@ def test_system_prompt_contains_security_instructions():
 def test_escalation_message_format():
     A.PERMISSION_MODE = "readonly"
     msg = A.request_escalation("edit", ["/tmp/test.txt"], "new_file", "Write test.txt")
-    # Must start with ESCALATION_REQUEST: and contain the mode, change_type, paths, reason
-    parts = msg.split(":", 4)
+    # Fields are \x1f-delimited so Windows paths (C:\...) don't break parsing.
+    parts = msg.split("\x1f", 4)
     assert parts[0] == "ESCALATION_REQUEST"
     assert parts[1] == "edit"
     assert parts[2] == "new_file"

@@ -59,7 +59,13 @@ def test_uninstall_requires_exact_yes_and_removes_install_dir(tmp_path, monkeypa
     assert not home.exists()
     assert not shim.exists()
     assert "AGENT8088_CONFIG" not in os.environ
-    assert rc.read_text(encoding="utf-8") == "export KEEP_ME=1\n"
+    if sys.platform == "win32":
+        # Windows has no shell rc to clean: _run_uninstall() deletes the
+        # AGENT8088_CONFIG value from the HKCU Environment key instead, which
+        # the assertion above already covers. The rc file must be left alone.
+        assert rc.read_text(encoding="utf-8").startswith("export AGENT8088_CONFIG=")
+    else:
+        assert rc.read_text(encoding="utf-8") == "export KEEP_ME=1\n"
     output = capsys.readouterr().out
     assert "Removed" in output
     assert "Done" in output

@@ -46,7 +46,7 @@ Agent 8088 is a local AI agent powered by a fine-tuned Qwen 2.5 14B model, desig
 - **SkillOpt** — self-improving agent skills via text-space optimization
 - **MCP client** — connect stdio and Streamable HTTP MCP servers as Agent8088 tools
 - **MCP server** — expose Agent8088's tools to external AI agents (Claude Code, Codex, Cursor) via stdio or HTTP
-- **Messaging gateway** — Slack, WhatsApp, Discord, and Email adapters with allowlist + approval prompts
+- **Messaging gateway** — Slack, WhatsApp, Discord, Email, and Telegram adapters with allowlist + approval prompts
 - **Chat-based approvals** — `/approve` + `/deny` in chat; Discord gets interactive ✅/❌ buttons
 - **Separate .env key store** — API keys and tokens stored in `~/.agent8088/.env` (0600), not in config.txt
 
@@ -173,7 +173,7 @@ Run with no flags to start the interactive REPL.
 | `/tools` | List loaded tools with args/mode/description |
 | `/capabilities` | Full self-report: tools, MCP servers, skills, subagents, limits, active guardrails |
 | `/tool <name> <args>` | Invoke one tool directly |
-| `/plan <steps>` | Run the plan-executor (multi-step) |
+| `/plan [task]` | Enter plan mode: propose a plan, approve it, then it runs |
 | `/raw <text>` | One raw model call — shows content + reasoning + tool_calls |
 | `/model <provider:model>` | Switch provider + model (e.g. `/model cerebras:gpt-oss-120b`); `/model setup` adds/updates a provider |
 | `/models [provider]` | Fuzzy searchable model picker — lists + switches models from active or specified provider |
@@ -212,6 +212,10 @@ The config file (`config.txt`) is a flat `key=value` file with `#` comments. Key
 | `prompt_paths` | `~` | Writes here show y/n escalation |
 | `blocked_paths` | (commented) | Writes here always blocked, even in edit mode |
 | `sandbox_backend` | `auto` | Native OS sandbox, then Docker fallback; `local` is explicit opt-in |
+| `docker_pull_seconds` | `300` | Budget for pulling a missing container image, separate from any tool's own timeout |
+| `plan_audit` | `0` | Toggle at runtime with `/audit on` / `/audit off`. Verify every mutating step with the readonly `auditor` sub-agent — both `execute_plan` steps and the tool calls an approved `/plan` runs, graded against the plan you approved; a failed verification halts the work |
+| `plan_audit_revert` | `1` | Restore a write that failed verification to its exact pre-step bytes, so only verified state persists |
+| `plan_audit_revert_max_bytes` | `1048576` | Files above this are not snapshotted, so they are not reverted (reported, never implied) |
 | `sandbox_allowed_domains` | (empty) | Network domains reachable from sandboxed commands |
 | `model_telemetry` | `0` | Append local, metadata-only model-call health records |
 | `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local path for model telemetry (mode 0600) |
@@ -340,9 +344,10 @@ Transport: **stdio** (default) or **HTTP** (`--mcp-http`). HTTP is restricted to
 
 - **readonly** (default) — read files, run inspection-only shell commands (`ls`, `cat`, `git status`). Every write/mutation prompts y/n. Gateway sends approval prompts to chat (`/approve`, `/deny`).
 - **full-auto** (`--edit` or `--mode full-auto`) — everything readonly allows, plus writes within `allowed_paths`. Still forbidden: `git push`, `git reset --hard`, branch deletion, credential paths.
-- **plan-only** (`--mode plan-only`) — only `execute_plan` runs; direct tools blocked. Forces the model to plan first, user approves the plan, then steps run with a temporary grant.
+- **plan-only** (`--mode plan-only`, or `/plan`) — reads only. The agent researches, then calls `present_plan` with the plan as markdown; you approve it, the mode changes so the plan runs, and the session returns to its previous mode when the work is done.
 
 Switch modes at runtime with `/mode readonly`, `/mode full-auto`, or `/mode plan-only`.
+`/plan [task]` is the shorthand for entering plan mode, optionally with the task.
 
 ### Chat-Based Approvals (Gateway)
 
@@ -483,7 +488,8 @@ When neither backend is available, Agent8088 asks before running locally.
 | `calculate` | python_eval | Evaluate a math expression |
 | `last_output` | last_output | Get full output from the last tool call |
 | `describe_capabilities` | introspect | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails |
-| `execute_plan` | plan | Execute a multi-step plan (plan-only mode) |
+| `present_plan` | plan | Present a plan as markdown for the user to approve (plan mode) |
+| `execute_plan` | plan | Run an already-decided sequence of tool calls, verified step by step |
 | `spawn_subagent` | subagent | Delegate a task to an independent sub-agent |
 | `run_sandboxed` | docker | Run Python with OS isolation |
 | `schedule_task` | cron | Schedule periodic tasks (cron) |

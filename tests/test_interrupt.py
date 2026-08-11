@@ -30,7 +30,10 @@ def _clean_state(monkeypatch):
     monkeypatch.setattr(A, "PERMISSION_MODE", "readonly")
 
 
-ESCALATION = ("ESCALATION_REQUEST:edit:new_file:/tmp/x:"
+# \x1f-delimited: a Windows path (C:\\Users\\...) splits on ':' and corrupts
+# the parse, so the payload must be built the way request_escalation builds it or
+# _handle_escalation will not recognise it at all.
+ESCALATION = ("ESCALATION_REQUEST\x1fedit\x1fnew_file\x1f/tmp/x\x1f"
               "Tool 'write_file' requires write_text access")
 
 
@@ -327,7 +330,7 @@ def test_abort_at_the_approval_prompt_unwinds_the_whole_turn(monkeypatch, engine
     monkeypatch.setattr(engine, "_create_completion_with_fallback",
                         lambda *a, **kw: _tool_call_response("1+1"))
     monkeypatch.setattr(engine, "exec_tool",
-                        lambda *a, **kw: "ESCALATION_REQUEST:edit:new_file:/tmp/x:needs write")
+                        lambda *a, **kw: ESCALATION)
 
     def _abort(_name, _result):
         raise engine.AgentInterrupted()

@@ -92,14 +92,14 @@ def test_tool_works_in_readonly_mode(engine, monkeypatch):
     """The most restrictive mode must still be able to answer the question."""
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     result = engine.run_tool("describe_capabilities", {})
-    assert not result.startswith("ESCALATION_REQUEST:")
+    assert not result.startswith("ESCALATION_REQUEST\x1f")
     assert "write_file" in result
 
 
 def test_tool_works_in_plan_only_mode(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "plan-only")
     result = engine.run_tool("describe_capabilities", {})
-    assert not result.startswith("ESCALATION_REQUEST:")
+    assert not result.startswith("ESCALATION_REQUEST\x1f")
     assert "write_file" in result
 
 
