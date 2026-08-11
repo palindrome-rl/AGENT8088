@@ -388,7 +388,7 @@ def test_mode_no_arg_reports_current_mode():
     sent = adapter.send_message.call_args.args[1]
     assert "readonly" in sent
     assert "full-auto" in sent
-    assert "plan-only" in sent
+    assert "plan-only" not in sent.split("Valid modes: ")[1]
 
 
 def test_mode_edit_is_aliased_to_full_auto():
@@ -408,7 +408,9 @@ def test_mode_edit_is_aliased_to_full_auto():
     assert "full-auto" in sent
 
 
-def test_mode_plan_only_enters_plan_mode():
+def test_mode_plan_only_is_not_a_valid_mode_argument():
+    """/plan is the one door into plan mode (mirrors cli.py's /plan vs /mode
+    split) — /mode must not offer plan-only as a destination."""
     runner, sessions = _make_runner()
     adapter = AsyncMock()
     adapter.platform = "discord"
@@ -419,8 +421,11 @@ def test_mode_plan_only_enters_plan_mode():
         evt = MessageEvent(platform="discord", chat_id="C1", chat_type="channel",
                            user_id="U1", text="/mode plan-only")
         asyncio.run(runner.on_message(evt))
-    mock_A.enter_plan_mode.assert_called_once()
+    mock_A.enter_plan_mode.assert_not_called()
     mock_A.set_permission_mode.assert_not_called()
+    sent = adapter.send_message.call_args.args[1]
+    assert "Unknown mode" in sent
+    assert "plan-only" not in sent.split("Valid modes: ")[1]
 
 
 def test_mode_unknown_value_is_rejected():

@@ -401,7 +401,9 @@ class GatewayRunner:
                 await adapter.send_message(event.chat_id, "Denied.")
             return True
         if cmd == "/mode":
-            valid = ("readonly", "full-auto", "plan-only")
+            # plan-only is deliberately not offered here — /plan is the one
+            # door into plan mode (mirrors cli.py's /plan vs /mode split).
+            valid = ("readonly", "full-auto")
             arg = event.text.split(None, 1)
             arg = arg[1].strip().lower() if len(arg) > 1 else ""
             if arg == "edit":
@@ -421,11 +423,8 @@ class GatewayRunner:
                 return True
             # Mirrors cli.py's cmd_mode. Switching mode resets any escalation
             # grant banked under the old mode (engine.py:set_permission_mode).
-            if arg == "plan-only":
-                A.enter_plan_mode()
-            else:
-                A.cancel_plan_session()
-                A.set_permission_mode(arg)
+            A.cancel_plan_session()
+            A.set_permission_mode(arg)
             if adapter:
                 await adapter.send_message(event.chat_id, f"Permission mode: {arg}")
             return True
