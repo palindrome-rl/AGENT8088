@@ -1968,8 +1968,31 @@ subagent_ui = None
 # ---------------------------------------------------------------------------
 # Tool execution engine
 # ---------------------------------------------------------------------------
+_CONTAINER_WORKSPACE = "/workspace"
+
+
+def _from_container_path(raw_path: str) -> str:
+    """Map a container path back to its host original.
+
+    Shell tools run inside the sandbox, where the workspace is bind-mounted at
+    /workspace, so that is the path the agent sees from `ls` and reports back.
+    The file tools run on the host, where "/workspace/x" is drive-relative and
+    resolves to C:\\workspace\\x — a directory that does not exist. A file the
+    agent had just listed could not then be read, and the error named a path
+    nobody had mentioned.
+
+    Only the prefix is rewritten; the result still goes through the allowed-path
+    check below, so `/workspace/../../etc/passwd` is refused exactly as before.
+    """
+    text = str(raw_path or "").replace("\\", "/")
+    if text != _CONTAINER_WORKSPACE and not text.startswith(_CONTAINER_WORKSPACE + "/"):
+        return str(raw_path or "")
+    relative = text[len(_CONTAINER_WORKSPACE):].lstrip("/")
+    return str(ARTIFACTS_ROOT / relative) if relative else str(ARTIFACTS_ROOT)
+
+
 def resolve_user_path(raw_path: str) -> Path:
-    p = Path(raw_path or "").expanduser()
+    p = Path(_from_container_path(raw_path)).expanduser()
     if not p.is_absolute():
         project_path = PROJECT_ROOT / p
         artifact_path = ARTIFACTS_ROOT / p
@@ -1995,7 +2018,7 @@ def resolve_write_path(raw_path: str) -> Path:
     across two directories, could not run, and the auditor — which resolves a
     bare name against the sandbox workspace — reported the source missing.
     """
-    p = Path(raw_path or "").expanduser()
+    p = Path(_from_container_path(raw_path)).expanduser()
     if p.is_absolute():
         resolved = p.resolve()
         if (not resolved.exists() and resolved != ARTIFACTS_ROOT
