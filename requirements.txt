@@ -1,4 +1,34 @@
-# Core dependencies
-openai>=1.0.0
-rich>=13.0.0
-InquirerPy>=0.3.4
+# Runtime dependencies, mirroring [project.dependencies] in pyproject.toml.
+#
+# pyproject.toml is the source of truth: the installers, `pip install -e .` and
+# uv.lock all resolve from it. This file serves `pip install -r` only, and is
+# kept in step by hand — it had drifted to three packages while the engine had
+# gained two more, and because both are imported lazily the result was not an
+# error but a quietly reduced agent: MCP servers failed to connect, and the
+# keyless search fallback reported itself unavailable, so web_search had nothing
+# to fall back to when SearXNG was down.
+
+openai>=1.0.0,<3
+rich>=13.0.0,<16
+InquirerPy>=0.3.4,<1
+
+# MCP client and server runtime (external servers, and --mcp-serve).
+mcp>=1.27,<2
+
+# Headless browser behind browse_page. Note this pulls in the Python package
+# only — the browser binaries still need `playwright install`.
+playwright>=1.40,<2
+
+# Keyless web search fallback. A hard dependency on purpose: web_search must
+# always have a backend needing no Docker, no API key and no setup step, so a
+# stopped or unreachable SearXNG still returns results instead of an error.
+ddgs>=9,<10
+
+# --- Optional extras, NOT installed by this file ---------------------------
+#   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
+#   pip install -e ".[dev]"       pytest, ruff, pip-audit
+#
+# Listed so the whole dependency surface is visible in one place:
+#   gateway: slack-bolt>=1.18.0,<2  slack-sdk>=3.23.0,<4  httpx>=0.24.0,<1
+#            discord.py>=2.3.0,<3   python-telegram-bot>=20,<23
+#   dev:     pytest>=7.0.0,<10      ruff>=0.8,<1          pip-audit>=2.7,<3

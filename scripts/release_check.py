@@ -32,6 +32,7 @@ def main() -> None:
         _run("uv", "run", "--extra", "dev", "--extra", "gateway", "pytest", "-q", env=isolated)
         _run("uv", "run", "--extra", "dev", "ruff", "check", "--select=E9,F", "src", "tests", "scripts")
         _run("uv", "run", "python", "scripts/check_duplicate_defs.py", env=isolated)
+        _run("uv", "run", "python", "scripts/check_requirements_sync.py", env=isolated)
         _run("uv", "run", "--extra", "dev", "pip-audit")
         _run("npm", "ci", "--ignore-scripts", "--prefix", str(BRIDGE))
         _run("npm", "audit", "--omit=dev", "--prefix", str(BRIDGE))
