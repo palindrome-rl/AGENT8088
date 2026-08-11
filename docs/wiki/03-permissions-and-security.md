@@ -64,7 +64,9 @@ full-auto.
 
 ### plan-only
 
-Enter it with `/plan [task]` or `/mode plan-only`. Reads are allowed; every write
+Enter it with `/plan [task]` — the only door, because a plan session has an end
+as well as a beginning and `/mode` sets things that simply stay set. Reads are
+allowed; every write
 and mutation is refused, with a message telling the model to present a plan
 instead. The agent researches, then calls `present_plan` with the plan written as
 markdown. You see the plan and choose: `a` runs it in full-auto, `e` runs it with

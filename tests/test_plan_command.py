@@ -250,18 +250,45 @@ def test_slash_plan_does_not_restore_the_mode_when_the_turn_ends(monkeypatch, ca
     assert cli.A.PERMISSION_MODE == "plan-only"
 
 
-def test_mode_plan_only_starts_the_same_plan_session_as_slash_plan(monkeypatch, captured):
+def test_mode_no_longer_offers_plan_only(monkeypatch, captured):
+    """`/plan` is the only door into a plan session.
+
+    A plan session has a beginning and an end — propose, approve, run, return to
+    the mode you came from. Offering it as a `/mode` setting let a user enter one
+    and walk away from it by hand, leaving the mode it was meant to restore
+    stranded. It redirects rather than erroring, because typing it is reasonable.
+    """
     monkeypatch.setattr(cli.A, "PERMISSION_MODE", "full-auto")
 
     cli.cmd_mode("plan-only")
 
-    assert cli.A.PERMISSION_MODE == "plan-only"
-    assert cli.A._plan_return_mode == "full-auto"
+    assert cli.A.PERMISSION_MODE == "full-auto", "the mode must not change"
+    assert "/plan" in captured.getvalue()
+
+
+def test_mode_lists_only_the_settable_modes(monkeypatch, captured):
+    monkeypatch.setattr(cli.A, "PERMISSION_MODE", "readonly")
+
+    cli.cmd_mode("")
+
+    rendered = captured.getvalue()
+    assert "readonly" in rendered and "full-auto" in rendered
+    assert "Valid modes: readonly, full-auto" in rendered
+    assert "/plan" in rendered, "the way into plan mode still needs signposting"
+
+
+@pytest.mark.parametrize("mode", ["readonly", "full-auto", "edit"])
+def test_the_real_modes_still_switch(monkeypatch, captured, mode):
+    monkeypatch.setattr(cli.A, "PERMISSION_MODE", "readonly")
+
+    cli.cmd_mode(mode)
+
+    assert cli.A.PERMISSION_MODE == ("full-auto" if mode == "edit" else mode)
 
 
 def test_leaving_plan_mode_by_hand_cancels_the_pending_plan(monkeypatch, captured):
     monkeypatch.setattr(cli.A, "PERMISSION_MODE", "readonly")
-    cli.cmd_mode("plan-only")
+    cli.cmd_plan("")
 
     cli.cmd_mode("full-auto")
 
@@ -420,11 +447,13 @@ def test_the_prompt_shows_when_you_are_in_plan_mode(monkeypatch):
     assert "plan" not in cli._prompt_label()
 
 
-def test_model_plan_only_points_at_the_mode_command(monkeypatch, captured):
+def test_model_plan_only_points_at_slash_plan(monkeypatch, captured):
+    """It used to advise `/mode plan-only`, which no longer exists."""
     cli.cmd_model("plan-only")
 
     rendered = captured.getvalue()
-    assert "/plan" in rendered or "/mode plan-only" in rendered
+    assert "/plan" in rendered
+    assert "/mode plan-only" not in rendered
 
 
 def test_the_system_prompt_teaches_present_plan_not_json_steps(engine):

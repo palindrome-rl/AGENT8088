@@ -1806,10 +1806,12 @@ def cmd_model(rest):
                       + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
         # Permission modes are not providers. `/model plan-only` is a common
         # mix-up and used to dead-end here with no route to the real command.
-        if arg in ("plan-only", "plan", "readonly", "full-auto", "edit"):
+        if arg in ("plan-only", "plan"):
+            console.print("[dim]plan mode is a session, not a provider — start it "
+                          "with [/dim][#237dd7]/plan[/#237dd7][dim].[/dim]")
+        elif arg in ("readonly", "full-auto", "edit"):
             console.print(f"[dim]'{arg}' is a permission mode, not a provider — "
-                          f"use [/dim][#237dd7]/mode {arg}[/#237dd7]"
-                          f"[dim], or [/dim][#237dd7]/plan[/#237dd7][dim] for plan mode.[/dim]")
+                          f"use [/dim][#237dd7]/mode {arg}[/#237dd7][dim].[/dim]")
         return
     active = _active_provider_name()
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
@@ -2132,7 +2134,12 @@ def cmd_search(rest):
 
 
 def cmd_mode(rest):
-    valid = ("readonly", "full-auto", "plan-only")
+    # plan-only is deliberately absent. It is a session with a beginning and an
+    # end — propose, approve, run, return to the mode you came from — not a
+    # setting you flip. `/plan` owns that door; offering a second one here let a
+    # user enter a plan session and leave it by hand, stranding the mode it was
+    # meant to restore.
+    valid = ("readonly", "full-auto")
     arg = rest.strip().lower()
     # Backward-compat: "edit" is an alias for "full-auto"
     if arg == "edit":
@@ -2140,19 +2147,18 @@ def cmd_mode(rest):
     if not arg:
         console.print(f"Current mode: [bold #00edff]{A.PERMISSION_MODE}[/bold #00edff]")
         console.print(f"Valid modes: {', '.join(valid)}")
+        console.print("Use [bold]/plan[/bold] to start a plan session.")
+        return
+    if arg in ("plan-only", "plan"):
+        console.print("Plan mode is a session, not a setting — "
+                      "start it with [bold]/plan[/bold].")
         return
     if arg not in valid:
         console.print(f"[red]unknown mode:[/red] {arg}")
         console.print(f"Valid modes: {', '.join(valid)}")
         return
-    # `/mode plan-only` and `/plan` are the same door: both start a plan session
-    # that knows where to return. Leaving by hand abandons it, so a plan the user
-    # walked away from cannot restore a mode later.
-    if arg == "plan-only":
-        A.enter_plan_mode()
-    else:
-        A.cancel_plan_session()
-        A.set_permission_mode(arg)
+    A.cancel_plan_session()
+    A.set_permission_mode(arg)
     console.print(f"Permission mode: [bold green]{arg}[/bold green]")
 
 
