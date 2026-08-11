@@ -547,8 +547,87 @@ def status_cm(msg):
 # NOTE: tool names/args/results all originate from the model or from files on disk, so
 # none of it is trusted to be free of "[" — everything user-controlled is composed with
 # Text() (literal, no markup parsing) rather than interpolated into console.print(f"...").
-def _format_args(args):
-    return ", ".join(f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}" for k, v in (args or {}).items())
+def _format_args(args, limit=None):
+    """Fallback rendering for a tool whose spec gives nothing better to show.
+
+    Values are clipped: an unclipped write_file put the entire file on one line,
+    which the terminal then wrapped into a screenful of escaped JSON.
+    """
+    def show(value):
+        if not isinstance(value, str):
+            return str(value)
+        flat = value.replace("\n", "\\n")
+        if limit and len(flat) > limit:
+            flat = flat[:limit] + "…"
+        return f'"{flat}"'
+    return ", ".join(f"{k}={show(v)}" for k, v in (args or {}).items())
+
+
+_HEADING_RE = re.compile(r'^#{1,6}\s')
+
+
+def _human_size(n):
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def _first_meaningful_line(text, limit=70):
+    """The first line worth showing as a subject: blanks and bare headings skipped,
+    so a plan opening with '## Goal' is summarised by the goal itself rather than
+    by the word 'Goal'."""
+    lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    body = next((ln for ln in lines if not _HEADING_RE.match(ln)), None)
+    if body is None:
+        body = _HEADING_RE.sub("", lines[0])
+    return body[:limit] + ("…" if len(body) > limit else "")
+
+
+def _spec_args(spec):
+    return list(spec.get("args") or [])
+
+
+def _tool_summary(name, args, limit=None):
+    """A short human subject for a tool call — 'library.py (94 lines, 2.7 KB)'.
+
+    Driven by the tool's own spec (path_arg / content_arg / declared arg order)
+    rather than a hardcoded per-tool table, so MCP tools and anything added to
+    tools.txt get sensible output for free. Note that _build_spec gives *every*
+    tool a default path_arg of 'filename', so a spec hint only counts when the
+    named argument is actually one the tool declares.
+    """
+    args = args or {}
+    limit = limit or (200 if S.verbose == "full" else 70)
+    spec = A.TOOL_SPECS.get(name, {})
+    declared = _spec_args(spec)
+
+    path_arg = spec.get("path_arg")
+    if path_arg in declared and isinstance(args.get(path_arg), str):
+        subject = args[path_arg]
+        content_arg = spec.get("content_arg")
+        body = args.get(content_arg) if content_arg in declared else None
+        if isinstance(body, str):
+            lines = body.count("\n") + 1 if body else 0
+            size = _human_size(len(body.encode("utf-8", "replace")))
+            return f"{subject} ({lines} line{'s' if lines != 1 else ''}, {size})"
+        return subject
+
+    strings = [(k, args[k]) for k in (declared or list(args))
+               if isinstance(args.get(k), str) and args[k].strip()]
+    if strings:
+        key, value = strings[0]
+        subject = _first_meaningful_line(value, limit)
+        # A short leading arg is usually a selector, not the subject — 'explore'
+        # says far less than 'explore · find every TODO in the repo'.
+        if len(subject) <= 24 and len(strings) > 1:
+            subject += " · " + _first_meaningful_line(strings[1][1], limit)
+        return subject
+
+    return _format_args(args, limit) if args else ""
 
 
 def on_calls(calls):
@@ -561,7 +640,10 @@ def on_calls(calls):
         line = Text()
         line.append("⏺ ", style="#237dd7")
         line.append(call["name"], style="bold")
-        line.append("(" + _format_args(call.get("arguments")) + ")")
+        summary = _tool_summary(call["name"], call.get("arguments"))
+        if summary:
+            line.append(" · ", style="dim")
+            line.append(summary)
         console.print(line)
 
 
@@ -684,7 +766,10 @@ def _make_subagent_ui(live):
                 line = Text("│  ", style="#237dd7")
                 line.append("⏺ ", style="#237dd7")
                 line.append(call["name"], style="bold")
-                line.append("(" + _format_args(call.get("arguments")) + ")")
+                summary = _tool_summary(call["name"], call.get("arguments"))
+                if summary:
+                    line.append(" · ", style="dim")
+                    line.append(summary)
                 console.print(line)
 
         def sub_on_result(name, result):
@@ -716,21 +801,211 @@ def _make_subagent_ui(live):
 
 # ---------------------------------------------------------------------------
 # Chat turn (drives the real run_agent)
+#
+# Live content stream — prose in, tool-call protocol out
 # ---------------------------------------------------------------------------
-def _stream_view(reasoning_parts, content_parts):
+# Agent8088's tool protocol lives in the *content* channel: the model literally
+# types `✿FUNCTION✿: name ✿ARGS✿: {...}` as ordinary output (see
+# engine.render_tool_docs). Echoing that stream verbatim is what turned a
+# write_file call into a screenful of escaped JSON. engine.strip_tool_json already
+# removes it, but only from the finished answer — never from the live view.
+_CALL_SENTINELS = ("✿FUNCTION✿", "<tool_call>")
+_MAX_SENTINEL_LEN = max(len(s) for s in _CALL_SENTINELS)
+# The bare {"name": ..., "arguments": ...} form the parser also accepts.
+_CALL_JSON_RE = re.compile(r'\{\s*"name"\s*:\s*"\w+"\s*,\s*"arguments"\s*:')
+# Each branch requires the character that *ends* the name to have arrived. Without
+# that, a half-streamed "✿FUNCTION✿: w" latches the tool as "w" and never revises.
+_CALL_NAME_RE = re.compile(
+    r'✿FUNCTION✿\s*:\s*(\w+)(?=\W)'
+    r'|<tool_call>\s*\{\s*"(?:tool|name)"\s*:\s*"(\w+)"'
+    r'|\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"'
+)
+# How far back a lone '{' is treated as a possible call opener. Bounded so that
+# ordinary prose containing a brace is never withheld indefinitely.
+_MAX_JSON_HOLD = 64
+
+_STREAM_VERBS = {
+    "write_file": "writing",
+    "read_text": "reading",
+    "execute_shell": "preparing command",
+    "present_plan": "composing plan",
+    "execute_plan": "composing plan",
+    "web_search": "composing search",
+    "spawn_subagent": "briefing sub-agent",
+    "run_sandboxed": "writing sandboxed code",
+}
+
+
+_JSON_OPENER = '{"name":'
+
+
+def _hold_back(text):
+    """Length of the suffix to withhold because it could still grow into a call opener.
+
+    Deltas split anywhere, so a sentinel routinely straddles two of them ('✿FUNC'
+    then 'TION✿'); releasing the first half would flash protocol into the answer.
+    The brace case is deliberately narrow — it fires only when the text after the
+    last '{' is a partial `{"name":`, so ordinary prose containing JSON or code is
+    never stalled.
+    """
+    for n in range(min(len(text), _MAX_SENTINEL_LEN - 1), 0, -1):
+        if any(s.startswith(text[-n:]) for s in _CALL_SENTINELS):
+            return n
+    brace = text.rfind("{")
+    if brace != -1 and len(text) - brace <= _MAX_JSON_HOLD:
+        tail = re.sub(r"\s+", "", text[brace:])
+        if tail.startswith(_JSON_OPENER) or _JSON_OPENER.startswith(tail):
+            return len(text) - brace
+    return 0
+
+
+class _StreamFilter:
+    """Splits a raw content stream into prose the user should see and tool-call
+    protocol they should not.
+
+    Prose is derived from the accumulated message rather than appended to an
+    output buffer, so a call recognised late can be *retracted*: the moment a
+    bare `{"name": ..., "arguments":` completes, everything from its opening brace
+    stops being prose, even though some of it was already on screen.
+
+    Once a call begins, the rest of that message is withheld. The finished answer
+    is rebuilt by engine.strip_tool_json regardless, so nothing is lost, while
+    resuming mid-message would mean brace-matching a half-written JSON string
+    whose content may itself contain braces. `reset()` runs at each new model
+    round so prose following a tool result streams normally again.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._seen = ""
+        self._cut = None   # index where the tool call begins
+        self.tool = None
+
+    def prose_text(self):
+        if self._cut is not None:
+            return self._seen[:self._cut]
+        keep = _hold_back(self._seen)
+        return self._seen[:len(self._seen) - keep] if keep else self._seen
+
+    def feed(self, delta):
+        """Absorb one content delta. Returns True while a tool call is streaming."""
+        self._seen += delta
+        if self._cut is None:
+            start = self._find_call_start(self._seen)
+            if start is None:
+                return False
+            self._cut = start
+            self.tool = {"name": None, "subject": None, "lines": 0}
+        self._update_tool()
+        return True
+
+    @staticmethod
+    def _find_call_start(text):
+        """Index of the earliest call opener in `text`, or None."""
+        starts = [i for i in (text.find(s) for s in _CALL_SENTINELS) if i != -1]
+        m = _CALL_JSON_RE.search(text)
+        if m:
+            starts.append(m.start())
+        return min(starts) if starts else None
+
+    def _update_tool(self):
+        call, tool = self._seen[self._cut:], self.tool
+        if tool["name"] is None:
+            m = _CALL_NAME_RE.search(call)
+            if m:
+                raw = next((g for g in m.groups() if g), None)
+                if raw:
+                    tool["name"] = A.TOOL_ALIASES.get(raw, raw)
+        if tool["name"] and tool["subject"] is None:
+            spec = A.TOOL_SPECS.get(tool["name"], {})
+            declared = _spec_args(spec)
+            key = spec.get("path_arg") if spec.get("path_arg") in declared else None
+            key = key or next(iter(declared), None)
+            if key:
+                m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % re.escape(key), call)
+                # A long match is a file body, not a subject — leave it unnamed and
+                # let the line counter carry the progress instead.
+                if m and len(m.group(1)) <= 120:
+                    tool["subject"] = m.group(1)
+        # Newlines inside the JSON payload arrive escaped; unescaped ones show up
+        # when the model emits a real line break mid-string. Separators, so the
+        # count of lines written so far is one more than the count of breaks.
+        breaks = call.count("\\n") + call.count("\n")
+        tool["lines"] = breaks + 1 if breaks else 0
+
+    def status_label(self):
+        """Text for the animated status line while a call streams."""
+        if self.tool is None:
+            return "thinking"
+        name = self.tool["name"]
+        if not name:
+            return "calling a tool"
+        label = _STREAM_VERBS.get(name, f"calling {name}")
+        if self.tool["subject"]:
+            label += " " + self.tool["subject"]
+        if self.tool["lines"] > 1:
+            label += f" · {self.tool['lines']} lines"
+        return label
+
+
+def _window_tail(text, max_rows, width):
+    """The last `max_rows` *rendered* rows of `text`, wrapping accounted for.
+
+    Counting newlines is not enough — one 6 KB line wraps to hundreds of rows on
+    its own. Returns (text, truncated).
+    """
+    width = max(int(width), 1)
+    max_rows = max(int(max_rows), 1)
+    kept, rows, truncated = [], 0, False
+    for line in reversed(text.split("\n")):
+        cost = max(1, -(-len(line) // width))
+        if rows + cost > max_rows:
+            spare = (max_rows - rows) * width - 1
+            if spare > 0:
+                kept.append("…" + line[-spare:])
+            truncated = True
+            break
+        kept.append(line)
+        rows += cost
+    return "\n".join(reversed(kept)), truncated
+
+
+def _stream_budget():
+    """Rows the live region may occupy. Kept short of the terminal height because
+    Live is transient and Rich can only erase what is still inside the viewport:
+    anything taller scrolls away, burns into the scrollback permanently, and is
+    then printed a second time by render_answer at the end of the turn."""
+    return max(4, console.height - 8)
+
+
+def _stream_view(reasoning_parts, content):
     """While generating: reasoning (if any) shown dim/italic above the growing answer,
-    so the model's chain-of-thought never gets mistaken for its actual reply. The
-    reasoning preview is capped so a runaway thinking block can't render megabytes."""
+    so the model's chain-of-thought never gets mistaken for its actual reply. Both
+    panes are windowed to their live tail — see _stream_budget for why."""
     blocks = []
+    budget = _stream_budget()
+    width = max(20, console.width - 4)
     if reasoning_parts:  # only populated when S.show_reasoning is on (see on_token)
         reasoning = A._mask_system_content("".join(reasoning_parts))
         if len(reasoning) > 2000:  # show only the live tail of long reasoning
             reasoning = "… " + reasoning[-2000:]
-        blocks.append(Panel(Text(reasoning, style="dim italic"),
+        body, _ = _window_tail(reasoning, max(3, budget // 2), width)
+        blocks.append(Panel(Text(body, style="dim italic"),
                             title="[dim]thinking (/reasoning off to hide)[/dim]",
                             box=box.MINIMAL, border_style="grey50"))
-    if content_parts:
-        blocks.append(Panel(Text("".join(content_parts)), title="[bold #00edff]Agent8088[/bold #00edff]",
+    # Trailing blanks are usually the gap the model left before a tool call, and
+    # they render as dead rows inside the panel.
+    content = (content or "").rstrip()
+    if content:
+        rows = budget - (budget // 2 if blocks else 0)
+        body, truncated = _window_tail(content, max(3, rows), width)
+        pane = Text(body)
+        if truncated:
+            pane = Group(Text("… earlier lines scrolled — the full answer prints below",
+                              style="dim italic"), pane)
+        blocks.append(Panel(pane, title="[bold #00edff]Agent8088[/bold #00edff]",
                             box=box.ROUNDED, border_style="#00C8FF"))
     return Group(*blocks) if blocks else Text("")
 
@@ -940,13 +1215,19 @@ def _turn_max_turns(mode):
 def do_chat(query):
     S.messages.append({"role": "user", "content": query})
     trace = [] if S.show_trace else None
-    reasoning_parts, content_parts = [], []
+    reasoning_parts = []
+    stream = _StreamFilter()
     tokens_ref = [0]
     turn_start = time.time()
     esc = EscListener()
 
     with esc, Live(console=console, refresh_per_second=20, transient=True) as live:
         def spin(msg):
+            # Each round starts with "thinking..."; that is the boundary at which a
+            # finished tool call stops being the thing on screen, so the filter is
+            # cleared here and prose after a tool result streams normally again.
+            if msg.startswith("thinking"):
+                stream.reset()
             live.update(_StatusLine(msg, turn_start, tokens_ref, interruptible=msg.startswith("thinking")))
             return nullcontext()
 
@@ -960,9 +1241,15 @@ def do_chat(query):
                     live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=True))
                     return
                 reasoning_parts.append(delta)
+                live.update(_stream_view(reasoning_parts, stream.prose_text()))
+                return
+            # A tool call is protocol, not prose: swap the panel for the animated
+            # status line naming what is being composed, rather than echoing JSON.
+            if stream.feed(delta):
+                live.update(_StatusLine(stream.status_label(), turn_start, tokens_ref,
+                                        interruptible=True))
             else:
-                content_parts.append(delta)
-            live.update(_stream_view(reasoning_parts, content_parts))
+                live.update(_stream_view(reasoning_parts, stream.prose_text()))
 
         # Let sub-agents render their own nested, animated activity in this Live.
         A.subagent_ui = _make_subagent_ui(live)
@@ -1021,7 +1308,7 @@ def do_chat(query):
 
     elapsed = time.time() - turn_start
     if answer is None:
-        partial = "".join(content_parts).strip()
+        partial = stream.prose_text().strip()
         if partial:
             render_answer(partial)
         console.print(f"[dim]⏹ interrupted · {elapsed:.1f}s[/dim]")
