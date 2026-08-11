@@ -178,7 +178,7 @@ else:
     skip("REAL sandbox network isolation", "native runtime and Docker unavailable")
     graceful = A._exec_docker({"code": "print(1)"})
     check("missing sandbox asks before local execution",
-          "ESCALATION_REQUEST:edit:local_execution:" in graceful)
+          "ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1f" in graceful)
 
 # --------------------------------------------------------------- 4. BROWSER
 section("4. BROWSER TOOL")

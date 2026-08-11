@@ -3796,8 +3796,12 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
         result = f"Error: {e}"
 
     # A blocked call has not done anything yet, so there is nothing to verify —
-    # it gets audited on the retry that follows approval.
-    if will_audit and not result.startswith("ESCALATION_REQUEST:"):
+    # it gets audited on the retry that follows approval. The prefix is
+    # \x1f-delimited (a Windows path splits on ':'); matching ':' here meant the
+    # check never fired, so the auditor was sent to inspect a write that had not
+    # happened and its fail verdict was appended to the escalation the user still
+    # had to answer.
+    if will_audit and not result.startswith("ESCALATION_REQUEST\x1f"):
         result = _audit_approved_plan_call(name, args, result, depth, snapshot)
 
     _remember_escalation(name, args, result)
