@@ -17,7 +17,6 @@ import io
 
 import pytest
 from rich.console import Console
-from rich.text import Text
 
 import agent8088.cli as cli
 
