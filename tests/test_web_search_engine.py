@@ -244,7 +244,7 @@ def test_local_searxng_search_runs_without_permission_in_readonly(engine, monkey
     result = engine.run_tool("web_search", {"query": "hi"})
 
     assert "OK" in result
-    assert not result.startswith("ESCALATION_REQUEST:")
+    assert not result.startswith("ESCALATION_REQUEST\x1f")
 
 
 def test_local_searxng_search_runs_without_permission_in_plan_only(engine, monkeypatch):
@@ -255,7 +255,7 @@ def test_local_searxng_search_runs_without_permission_in_plan_only(engine, monke
     result = engine.run_tool("web_search", {"query": "hi"})
 
     assert "OK" in result
-    assert not result.startswith("ESCALATION_REQUEST:")
+    assert not result.startswith("ESCALATION_REQUEST\x1f")
 
 
 def test_allowlisted_private_lan_searxng_runs_without_permission(engine, monkeypatch):
@@ -273,7 +273,7 @@ def test_allowlisted_private_lan_searxng_runs_without_permission(engine, monkeyp
     result = engine.run_tool("web_search", {"query": "Pakistan public holidays"})
 
     assert "OK" in result
-    assert not result.startswith("ESCALATION_REQUEST:")
+    assert not result.startswith("ESCALATION_REQUEST\x1f")
 
 
 def test_no_prompt_search_cannot_use_a_nonlocal_or_unpinned_provider(engine):

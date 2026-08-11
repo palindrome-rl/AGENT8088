@@ -10,7 +10,7 @@ def main() -> None:
     from agent8088.gateway.runner import build_runner
     runner = build_runner()
     if not runner.adapters:
-        logging.error("No messaging platforms enabled. Set slack_enabled=1 or whatsapp_enabled=1 in config.txt.")
+        logging.error("No messaging platforms enabled. Set one of slack_enabled, whatsapp_enabled, discord_enabled, email_enabled, or telegram_enabled to 1 in config.txt (or run: agent8088 --gateway-setup).")
         return
     try:
         asyncio.run(runner.run())

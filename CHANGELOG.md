@@ -4,6 +4,55 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Merge: feature work onto the fix work
+
+Two branches ran in parallel for a day — fixes and hardening on one, plan mode and
+the auditor on the other. Three files conflicted textually. The interesting part is
+what did not: `engine.py` merged cleanly while four of its functions had been edited
+on both sides, so git had nothing to report and the defects below stayed silent
+until they were looked for.
+
+### Fixed
+
+- **Seven `:`-delimited escalation checks** the merge preserved from the fix branch.
+  The payload is `\x1f`-delimited so a Windows path (`C:\Users\...`) stops splitting
+  on `:`; a stale check does not raise, it simply stops matching. The one that
+  mattered is in `_run_agent_loop`: a `web_search` blocked pending approval was
+  recorded as a *completed* search, so the redundancy guard answered the user's
+  approved retry out of the escalation text. The code's own comment said "an
+  escalation is not a result" — which is exactly what had broken.
+  `tests/test_escalation_wire_format.py` now pins the invariant structurally, across
+  `engine.py`, `cli.py`, `tests/` and `scripts/`.
+- **An approved plan no longer trips the post-search fetch gate.** A plan-mode turn
+  researches with a search and then runs the approved steps in that same turn, so
+  the gate refused work the user had just authorised — and `_user_requested_tool`
+  could not rescue it, because they approved a plan rather than naming a tool. The
+  exemption holds only between approval and the end of that turn.
+- **The plan-approval prompt pauses the ESC listener.** The fix branch solved this
+  for `_handle_escalation`; the feature branch then added a second interactive
+  prompt it had never seen, which inherited the bug instead of the fix. A running
+  listener eats the keystroke meant for `Approve plan?`.
+- **Two tests that were passing for the wrong reason.**
+  `test_readonly_safe_shell_runs_in_readonly` asserted that `pwd` does not escalate;
+  with no sandbox available it does, but the escalation was buried inside the
+  `<<<EXTERNAL_UNTRUSTED_CONTENT ...>>>` envelope where `startswith` could not see
+  it. Unwrapping escalations — so a blocked step cannot read as a successful one —
+  made unchanged behaviour start failing.
+  `test_search_without_the_opt_in_is_blocked_in_plan_only` asserted a literal
+  message string that had deliberately changed. Both now assert their stated intent.
+
+### Notes
+
+- `discord.py` resolved to the fix branch's side: both branches had independently
+  fixed the same tuple-key bug, but only one added `_check_clicker`, which three
+  button handlers already call.
+- The prompt label keeps its bare form. `_status_bar_fragments()` already renders
+  the context percentage *and* the permission mode, so a `plan` badge would sit an
+  inch above a bar reading `plan-only`. `_prompt_label()` — the Rich fallback, which
+  has no toolbar — keeps both.
+
+---
+
 ## Tool-Use Intelligence
 
 ### Runtime date context
@@ -28,6 +77,260 @@ All notable changes to the Agent8088 project, organized by feature area.
 - `artifacts/` for generated test files, with a session guard that fails the run if anything is written to the repo root
 - Permission matrix across modes, path zones, and tool kinds, including the always-on floors under `full-auto`
 - `scripts/verify_tool_intelligence.py` — opt-in live-model scoring of tool choice (`A8088_LIVE_MODEL=1`), reports to `artifacts/`
+
+---
+
+## Telegram Gateway Adapter
+
+### New adapter: Telegram (`python-telegram-bot`)
+
+- **`src/agent8088/gateway/platforms/telegram.py`** -- fifth platform adapter,
+  alongside Slack, WhatsApp, Discord, and Email. Uses `python-telegram-bot`
+  (long polling, no public URL required).
+- **Config keys:** `telegram_enabled`, `telegram_bot_token` (env fallback
+  `TELEGRAM_BOT_TOKEN`), `telegram_allowed_users` (numeric user IDs,
+  comma-separated, `*` for wildcard).
+- **CLI wizard:** Telegram added to `--gateway-setup` single-select picker.
+- **`pyproject.toml`:** `python-telegram-bot>=20,<23` added to `gateway` extras.
+- **Allowlist:** `telegram_allowed_users` added to `Allowlist.from_config()`.
+- **Runner:** `build_runner()` registers `TelegramAdapter` when enabled.
+- **Wiki:** platform table, setup section, and token entry updated.
+
+### Adapter features
+
+- DMs always respond; groups require @mention or reply-to-bot.
+- Bot-sender filter, dedup by `update_id` (500-entry cap).
+- Streaming via `TelegramStreamSink`, markdown conversion, 4096-char chunking.
+- Approval prompts: plain-text `/approve` and `/deny` (base class default).
+- `block=False` on MessageHandler to prevent PTB sequential-update deadlock
+  during approval waits.
+
+### Bug fixes in this pass
+
+- **Fixed: garbled escalation prompts on Windows** -- `:` delimiter broke on
+  Windows paths (`C:\Users\...`). Changed to `\x1f` (ASCII unit separator).
+- **Fixed: Discord approval buttons never resolved** -- `_ApprovalView` used
+  string `chat_id` but runner stores tuple `(platform, chat_id)`.
+- **Fixed: slash commands silently dropped in Telegram DMs** -- removed
+  `~filters.COMMAND` exclusion from MessageHandler.
+- **Fixed: Telegram approval deadlock** -- `block=False` so PTB dispatches
+  updates concurrently instead of sequentially.
+- **Fixed: "No messaging platforms enabled" error message** -- now lists all
+  five platforms.
+
+### Tests
+
+- 21 tests in `test_telegram.py`, 1 new test in `test_discord.py`.
+- All regression tests verified red against buggy code, green with fix.
+
+---
+
+## Plan Mode
+
+`/plan` now means what it means in Claude Code, Hermes and Codex: enter plan mode,
+research read-only, propose one plan, get it approved, run it, come back.
+
+### Changed
+
+- `/plan` is a mode, not a one-shot wrapper. It used to flip to plan-only for
+  exactly one message and restore the previous mode in a `finally`, so there was
+  no state in which a plan could be reviewed, approved and then run. It now holds
+  across turns, and `/mode plan-only` starts the same session.
+- Approving a plan switches the permission mode, the plan runs through the
+  ordinary tool path, and the session returns to the mode it had before `/plan`
+  once the work is done. Approve with `a` to run it, or `e` to be asked before
+  each edit.
+- `set_permission_mode()` is the single funnel for mode changes, so no grant
+  outlives the mode that authorized it.
+- The prompt shows `plan` while plan mode is active, and `/model plan-only` now
+  points at `/mode` instead of dead-ending on "unknown provider".
+
+### Added
+
+- `/audit [on|off]` turns step verification on or off from the prompt, and writes the
+  choice through to `config.txt` so it survives a restart. It was reachable only by
+  editing `plan_audit` and relaunching, which is the wrong shape for this setting:
+  verification is something you want to try on one task, see what it cost, and then
+  decide about. With no argument it reports the current state and the last turn's
+  verification share. Turning it on says what it will cost.
+- `present_plan` tool: presents a plan as markdown for approval. Plan proposal and
+  plan execution used to be the same tool, which meant the only approvable plan
+  was a fully-specified JSON step array — something models do not reliably
+  produce, so a plan written the way a human reads it halted on its first step.
+
+### Fixed
+
+- Verification follows the work. The auditor only ever hooked `execute_plan`, which
+  was the same thing as hooking the plan only because plan mode forced every
+  mutation through it. With approval handing execution to ordinary tool calls, the
+  default `/plan` flow would have become the one flow `plan_audit=1` did not cover.
+  Post-approval calls are now audited too, at depth 0 only — a sub-agent's writes
+  are not the plan, and auditing inside the auditor would set it verifying itself.
+- The auditor grades against the plan the user approved. An `execute_plan` step can
+  declare `acceptance`; an ordinary tool call cannot, and without a criterion the
+  auditor only checks that the call took effect — which a write that did the wrong
+  thing passes. A `write_file` of `hi` against a plan promising a revenue table now
+  fails verification and the file is removed.
+- A sub-agent pinned to `permission: readonly` is refused a mutation instead of
+  being offered an escalation. Sub-agent escalations reach the user, so "this agent
+  only observes" was a question someone could answer yes to — about the file the
+  auditor was sent to inspect. Plain readonly mode still escalates; that prompt is
+  the approval flow.
+- Verification's cost stays visible on the new path: the turn's audit share is
+  captured as the budget is torn down, and the CLI reports it.
+- A plan the model only described is no longer reported as done. A turn that ends
+  in plan mode with nothing approved now says so explicitly.
+- Plan mode is no longer one-shot. After an approved plan finished, every later
+  mutation was hard-blocked with a message naming a JSON step array, and the model
+  retried the direct call until the turn died with "I wasn't able to produce an
+  answer" — for every turn thereafter.
+- A plan step that names no tool halts with an explicit error instead of being
+  classified into an arbitrary tool and handed its own prose as that tool's single
+  required argument, which could route plan text to a shell as a literal command.
+- `find_tool_calls` parses every batched `✿FUNCTION✿`/`✿ARGS✿` block instead of
+  only the first. One greedy regex spanned all the blocks in a reply at once, so
+  three batched `write_file` calls arrived as a single unparseable blob and all
+  three were lost. Each block's JSON extent is now found by counting braces
+  outside string literals, which keeps nested JSON intact.
+
+---
+
+## Long-Horizon Reliability
+
+Both changes target the same failure: a step that did not do what it claimed,
+recorded as though it had, with every later step built on top of it.
+
+### Plans halt on the first failed step
+
+- `_exec_plan()` now stops at the first failed step instead of running the rest.
+  Previously a failing step appended its error to the output and the loop
+  continued — a plan whose first step failed would run all remaining steps
+  against a state the plan no longer described.
+- New `_plan_step_failed()` recognises two forms: a tool result starting with
+  `Error:`, and an unanswered or denied `ESCALATION_REQUEST:` (the request string
+  survives only when nobody approved it).
+- Unknown tools and missing required arguments now halt too, rather than `continue`.
+- The result reports where it stopped and how many steps did not run, so a
+  half-executed plan cannot be mistaken for a finished one.
+- Not a rollback: steps that already ran stay run.
+
+### Only verified state persists (`plan_audit_revert`, default on with auditing)
+
+Verification previously stopped the *next* step but left the failed one on disk,
+so a plan committed what it attempted rather than what it proved.
+
+- A `write_file` step that fails verification is now restored to its exact
+  pre-step bytes: created files are removed, overwritten files are put back. The
+  snapshot is taken before the step runs, because afterwards the prior state is
+  the one thing that cannot be reconstructed.
+- Bounded on purpose, and each boundary is reported rather than implied: only the
+  failed step is reverted (verified steps stay committed); only `write_file` has
+  an inverse, so shell/docker/cron steps report `not reverted — no undo`; files
+  over `plan_audit_revert_max_bytes` are not snapshotted and say so.
+- Worst case is bounded by construction — a revert restores the bytes that were
+  there before the step, so a wrong `fail` verdict costs the step, never data
+  predating it.
+
+### Acceptance criteria and evidence per step
+
+- A plan step may declare `acceptance` (what must be true for it to count as
+  done) and `evidence` (what to inspect). Both are passed to the auditor, which
+  otherwise has to invent a criterion and then grade against its own guess.
+- Audit scope is now closure-based rather than permission-based. A declared
+  `acceptance` always qualifies a step; otherwise only modes leaving a durable
+  trace are audited. `browse_page` dropped out: a rendered page closes over
+  nothing, so auditing it bought an inconclusive verdict for the price of a model
+  call.
+- `execute_plan`'s tool description advertises both fields, or the model would
+  never emit them.
+
+### Verification cost is measured, not assumed
+
+- `_TurnBudget` attributes tokens to the spending role (`main`,
+  `subagent:<type>`), and each model-telemetry line carries the same `role`.
+- An audited plan reports its share: `Verification cost this turn: 22% of tokens
+  (4400 of 20000)`.
+- Published figures put auditors at roughly a fifth to a third of harness tokens.
+  Whether that holds for a given workload is now measurable locally instead of
+  taken on faith — which is what makes `plan_audit` a decision rather than a
+  guess.
+
+### Opt-in per-step verification (`plan_audit=1`)
+
+- Each *mutating* plan step is verified by the readonly `auditor` sub-agent
+  before the plan continues; a `fail` verdict halts the plan on the same path as
+  any other failure. Reads are not audited — auditing a read tells you the read
+  returned what it returned.
+- An auditor that cannot run does **not** halt: an inconclusive result is
+  recorded in the output and the plan proceeds. A verifier that cannot reach the
+  model must not be able to stop all work by itself.
+- Auditing is skipped once the shared `_TurnBudget` is spent. The auditor draws
+  on the same budget as the work it checks, so it yields rather than starving the
+  task it exists to protect.
+- Off by default: one extra model call per mutating step. The case for enabling
+  it is the unattended paths (gateway, cron) where nobody is watching.
+
+### Container images are provisioned before a tool's timeout applies
+
+- `_exec_docker_command()` now ensures the image is local before starting a
+  container. `docker run` pulls a missing image itself, but inside the *tool's*
+  timeout — 20s for the read-only git tools — so the first `git_status` on any
+  machine without `alpine/git` died with a bare "Command timed out after 20s"
+  naming neither Docker nor the pull. This was the long-standing
+  `approved git_status returns real output` failure in `verify_features.py`.
+- New `docker_pull_seconds` (default 300) budgets the pull separately. A failed
+  pull now names the image and the `docker pull` command that fixes it.
+- Presence is cached per image, so the probe costs one `docker image inspect`
+  per image per process.
+
+### Windows: suite green, and a real gap closed
+
+- The suite now passes on Windows (previously 7 failures, documented as 2).
+  `assert_owner_only()` in `tests/conftest.py` asserts mode 0600 on POSIX and the
+  actual ACL on Windows, where `st_mode` reads 0666 on a correctly locked file.
+- **`searxng_provision.write_settings()` used `chmod(0o600)`**, which on Windows
+  protects nothing — the generated `settings.yml` holds a `secret_key` and kept
+  its inherited SYSTEM/Administrators ACL. It now writes through
+  `_write_private_text()` like every other private file.
+- Genuinely POSIX-only tests (crontab, `/bin/sh` fallback, shell-rc cleanup) are
+  now `skipif`-marked with the Windows counterpart named; the symlink test skips
+  when the OS denies symlink creation.
+- `tests/test_searxng_provision.py` patched `sp.subprocess.run` — the *shared*
+  stdlib module — which leaked a docker fake into every other module. It now
+  patches the module's own `_run` seam.
+
+### Verification scripts
+
+- `verify_everything.py` read the developer's real `~/.agent8088/config.txt`, so
+  whether in-repo checks passed depended on someone's setup wizard. It now pins
+  `AGENT8088_CONFIG` to the packaged default.
+- Its git checks asserted "runs after explicit host approval" without ever
+  granting `local_execution`, so they asserted on an `ESCALATION_REQUEST` string
+  — the gate working correctly, reported as the tool failing.
+- Its Windows ACL check compared `icacls` output against a raw SID, but icacls
+  resolves a granted SID to `DOMAIN\user`, so it could never match.
+- Both scripts hardcoded `len(SUBAGENT_SPECS) == 4`; they now assert the bundled
+  set is present, so adding a profile does not fail the gate.
+
+### Sub-agent permission floor + `auditor` profile
+
+- Sub-agent profiles accept `permission: readonly` in frontmatter. The sub-run is
+  pinned to readonly for its whole lifetime regardless of the caller's mode,
+  including `--edit`.
+- The floor only restricts. No frontmatter value widens a sub-agent past what the
+  caller had — an unrecognised value leaves the caller's mode untouched.
+- Pending parent grants (`_one_shot_grant`, `_plan_execution_grant`,
+  `_local_fallback_grant`, `_remote_git_grant`) are cleared for the sub-run and
+  restored after. Without this, an auditor spawned mid-plan would run inside the
+  parent's write grant.
+- New `auditor` profile (`read_text`, `execute_shell`, `last_output`, readonly
+  floor) verifies a completed step against the environment and returns a
+  `VERDICT: pass|fail|unknown` line. Read-only-ness is enforced by
+  `check_permission()`, not by the prompt.
+- Tests in `tests/test_plan_audit.py`. Note the floor tests use a purpose-built
+  profile that *includes* `write_file`: the auditor's own tool list omits it, so
+  the tool restriction would block the write before the permission layer was ever
+  consulted, and the tests would pass with the floor deleted.
 
 ---
 

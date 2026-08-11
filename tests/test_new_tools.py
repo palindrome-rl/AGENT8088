@@ -86,7 +86,7 @@ def test_docker_missing_is_graceful(engine, monkeypatch):
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
     out = engine._exec_docker({"code": "print(1)"})
-    assert "ESCALATION_REQUEST:edit:local_execution:" in out
+    assert "ESCALATION_REQUEST\x1fedit\x1flocal_execution\x1f" in out
 
 
 def test_docker_runs_code_isolated(engine, tmp_path, monkeypatch):
@@ -126,7 +126,7 @@ def test_docker_rejects_option_like_image(engine, tmp_path, monkeypatch):
     })
 
 
-def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
+def test_docker_quotes_code_safely(engine, docker_image_present, tmp_path, monkeypatch):
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
@@ -141,7 +141,7 @@ def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
     assert seen["cmd"][-3:] == ["python", "-c", code]
 
 
-def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
+def test_docker_masks_workspace_secrets(engine, docker_image_present, tmp_path, monkeypatch):
     secret = tmp_path / ".env"
     secret.write_text("TOKEN=secret")
     skipped_secret = tmp_path / "node_modules" / ".env"
@@ -163,7 +163,7 @@ def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
     assert not any("node_modules/.env" in mount for mount in mounts)
 
 
-def test_docker_refuses_unbounded_sensitive_mounts(engine, tmp_path, monkeypatch):
+def test_docker_refuses_unbounded_sensitive_mounts(engine, docker_image_present, tmp_path, monkeypatch):
     for index in range(129):
         (tmp_path / f".env-{index}").write_text("secret")
     engine.SANDBOX_BACKEND = "docker"
@@ -178,7 +178,7 @@ def test_docker_refuses_unbounded_sensitive_mounts(engine, tmp_path, monkeypatch
     assert "too many sensitive" in engine._exec_docker({"code": "print(1)"})
 
 
-def test_windows_docker_mounts_use_container_path_separators(engine, tmp_path, monkeypatch):
+def test_windows_docker_mounts_use_container_path_separators(engine, docker_image_present, tmp_path, monkeypatch):
     project = PureWindowsPath("C:/workspace")
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "PROJECT_ROOT", project)

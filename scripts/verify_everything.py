@@ -24,6 +24,11 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 os.environ.setdefault("AGENT8088_SANDBOX", "auto")
+# Verify the checkout, not the developer's machine. Without this the script reads
+# whatever ~/.agent8088/config.txt happens to say, so allowed_paths from someone's
+# setup wizard decides whether in-repo checks pass — the result then varies by
+# machine and says nothing about the code. setdefault keeps an explicit override.
+os.environ.setdefault("AGENT8088_CONFIG", str(ROOT / "src" / "agent8088" / "config.txt"))
 
 from agent8088 import engine as E          # noqa: E402
 from agent8088 import providers as P       # noqa: E402
@@ -107,7 +112,9 @@ ok("engine imports", E is not None)
 # Smoke check for the "0 tools loaded" regression this was written for —
 # a floor, not an exact count, so adding a tool doesn't fail the run.
 ok("tools loaded", len(E.TOOL_NAMES) >= 20, f"{len(E.TOOL_NAMES)} tools")
-ok("sub-agents loaded", len(E.SUBAGENT_SPECS) == 4, ", ".join(sorted(E.SUBAGENT_SPECS)))
+ok("sub-agents loaded",
+   {"auditor", "coder", "explore", "general-purpose", "researcher"} <= set(E.SUBAGENT_SPECS),
+   ", ".join(sorted(E.SUBAGENT_SPECS)))
 ok("skills loaded", len(E.SKILL_PACKAGES) == 5, ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
@@ -259,7 +266,8 @@ with with_mode("readonly"):
     E._one_shot_grant = False
 
 req = E.request_escalation("edit", ["/tmp/x"], "file_write", "needs to write")
-ok("escalation request is structured", req.startswith("ESCALATION_REQUEST:edit:file_write:"))
+ok("escalation request is structured",
+   req.startswith("ESCALATION_REQUEST\x1fedit\x1ffile_write\x1f"))
 ok("escalation carries paths and reason", "/tmp/x" in req and "needs to write" in req)
 
 section("4c. PATH ZONES")
@@ -337,12 +345,20 @@ with with_mode("readonly"):
     _pb = E.SANDBOX_BACKEND
     E.SANDBOX_BACKEND = "local"
     with with_mode("edit"):
+        # The local backend refuses to run unisolated without an explicit
+        # local_execution grant, and the grant is consumed per command. These
+        # checks are about what git returns once approved, so approve each one —
+        # otherwise they assert on an ESCALATION_REQUEST string, which is the
+        # gate working correctly rather than the tool failing.
+        E.grant_escalation("local_execution")
         r = E.run_tool("git_status", {})
         ok("git_status runs after explicit host approval",
            "##" in r, r.splitlines()[0][:40] if r else "")
+        E.grant_escalation("local_execution")
         r = E.run_tool("git_log", {})
         ok("git_log runs after explicit host approval",
            len(r.splitlines()) > 3, f"{len(r.splitlines())} lines")
+        E.grant_escalation("local_execution")
         r = E.run_tool("git_diff", {})
         ok("git_diff runs after explicit host approval", isinstance(r, str))
     E.SANDBOX_BACKEND = _pb
@@ -607,9 +623,19 @@ if E.sys.platform == "win32":
         if acl_match and "(DENY)" not in acl_match.group(2):
             acl_entries.append(acl_match.group(1).lstrip("*"))
     owner_sid = sid_match.group(1) if sid_match else ""
+    # icacls resolves a granted SID back to an account name, so the listing shows
+    # DOMAIN\user where the grant said *S-1-5-.... Comparing entries to the raw
+    # SID can therefore never match on a machine where the name resolves.
+    owner_names = {owner_sid.lower()}
+    account = os.environ.get("USERNAME", "")
+    domain = os.environ.get("USERDOMAIN", "")
+    if account:
+        owner_names.add(account.lower())
+        if domain:
+            owner_names.add(f"{domain}\\{account}".lower())
     ok("settings file has a protected owner ACL",
        acl_result.returncode == 0 and bool(owner_sid) and bool(acl_entries)
-       and all(principal == owner_sid for principal in acl_entries)
+       and all(principal.lower() in owner_names for principal in acl_entries)
        and "(I)" not in acl_result.stdout,
        acl_result.stdout[:80].replace("\n", " "))
 else:

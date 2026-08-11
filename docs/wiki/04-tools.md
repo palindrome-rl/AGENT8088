@@ -22,7 +22,8 @@ is what the permission layer gates on — see
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
 | `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
-| `execute_plan` | `plan` | `steps` | ✅ | Run a multi-step plan (the plan-only path). |
+| `present_plan` | `plan` | `plan` | ✅ | Show a plan as markdown and ask the user to approve it (plan mode's exit point). |
+| `execute_plan` | `plan` | `steps` | ✅ | Run an already-decided sequence of tool calls, verified step by step. |
 | `git_status` | `shell` | — | depends | `git status`. |
 | `git_diff` | `shell` | — | depends | `git diff`. |
 | `git_log` | `shell` | — | depends | `git log`. |
@@ -192,7 +193,13 @@ training and an old page reads as current.
 | Date-qualified queries | A query meaning "as of now" with no year of its own gets the current year appended — or the month, for "today"/"this week". Controlled by `search_date_augmentation` |
 | Result dating | Results are stamped with their retrieval date so the model can spot a stale one |
 | Repeat searches | A reworded or reordered repeat is answered from the first search's results instead of re-running. A failed or empty search stays retryable |
-| Follow-up fetches | After a search succeeds, an unsolicited `browse_page`, `curl`-style shell command, or fetch-shaped MCP call is refused |
+| Follow-up fetches | After a search succeeds, an *unsolicited* `browse_page`, `curl`-style shell command, or fetch-shaped MCP call is refused |
+
+An **approved plan** lifts the follow-up gate for the rest of that turn. A
+plan-mode turn researches with a search and then carries out the approved steps in
+the same turn, so the gate would otherwise refuse work the user had just said yes
+to — and naming a tool is not how they said it, so the explicit-request escape
+below cannot cover it. The exemption ends when the plan's turn does.
 
 Every gate yields to an explicit request: give a URL, name a command, or name
 an MCP tool and it runs. The gates only catch tools the model reached for on

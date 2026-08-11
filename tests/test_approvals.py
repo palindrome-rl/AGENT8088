@@ -18,6 +18,9 @@ would mean `PERMISSION_MODE=readonly` plus one other key silently behaves like
 Agent8088 keys are flat. Defaults keep existing behaviour: breaker on at 3, cron
 denies, confirmations on.
 """
+import sys
+
+import pytest
 
 # --- Denial circuit breaker ------------------------------------------------
 
@@ -125,7 +128,7 @@ def test_unattended_run_denies_escalation_by_default(engine, monkeypatch):
     monkeypatch.setattr(engine, "CRON_MODE", "deny")
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     result = engine.run_tool("execute_shell", {"command": "rm -rf build"})
-    assert not result.startswith("ESCALATION_REQUEST:")
+    assert not result.startswith("ESCALATION_REQUEST\x1f")
     assert "unattended" in result.lower()
     assert "cron_mode" in result
 
@@ -137,7 +140,7 @@ def test_unattended_run_can_be_configured_to_approve(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_shell_command", lambda *a, **kw: "OK")
     monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
     result = engine.run_tool("execute_shell", {"command": "echo hi"})
-    assert not result.startswith("ESCALATION_REQUEST:")
+    assert not result.startswith("ESCALATION_REQUEST\x1f")
 
 
 def test_unattended_approve_does_not_unlock_the_always_on_floor(engine, monkeypatch):
@@ -152,7 +155,7 @@ def test_attended_run_still_escalates_normally(engine, monkeypatch):
     monkeypatch.setattr(engine, "UNATTENDED", False)
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     result = engine.run_tool("execute_shell", {"command": "rm -rf build"})
-    assert result.startswith("ESCALATION_REQUEST:")
+    assert result.startswith("ESCALATION_REQUEST\x1f")
 
 
 def test_unattended_denial_is_audited(engine, monkeypatch, tmp_path):
@@ -170,6 +173,9 @@ def test_unattended_denial_is_audited(engine, monkeypatch, tmp_path):
 
 # --- Unattended entry points must mark themselves ---------------------------
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="crontab path; Windows uses Task Scheduler — covered by "
+                           "test_windows_task_script_sets_the_unattended_env_var")
 def test_cron_entry_sets_the_unattended_env_var(engine, monkeypatch):
     """A scheduled run must announce that no operator is present."""
     captured = {}
@@ -290,4 +296,4 @@ def test_readonly_always_gates_a_mutating_command(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine, "UNATTENDED", False)
     result = engine.run_tool("execute_shell", {"command": "rm -rf build"})
-    assert result.startswith("ESCALATION_REQUEST:")
+    assert result.startswith("ESCALATION_REQUEST\x1f")

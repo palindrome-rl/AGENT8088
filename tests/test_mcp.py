@@ -58,6 +58,6 @@ def test_mcp_tools_use_existing_permission_gate(monkeypatch):
     monkeypatch.setattr(engine.MCP_RUNTIME, "call", lambda *_: "done")
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
 
-    assert engine.run_tool(name, {}).startswith("ESCALATION_REQUEST:")
+    assert engine.run_tool(name, {}).startswith("ESCALATION_REQUEST\x1f")
     engine.grant_escalation()
     assert "done" in engine.run_tool(name, {})

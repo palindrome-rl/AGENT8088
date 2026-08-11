@@ -114,7 +114,20 @@ Every code change must have tests that would fail if the logic broke. The test s
 7. **Verify the test fails when code is broken** — break the code deliberately, run the test, confirm it goes red. Then fix the code and confirm it goes green.
 8. **Mock external services, not the code under test** — mock `imaplib`/`smtplib` for email, `httpx` for WhatsApp, `discord.Client` for Discord. Never mock the function you're testing.
 9. **Test edge cases** — empty input, missing config, unauthorized sender, connection failure, timeout, large message, special characters in paths.
-10. **Run before committing** — `pytest tests/ -q` must pass. Pre-existing Windows failures (2 tests) are documented and excluded.
+10. **Run before committing** — `pytest tests/ -q` must pass. Seven tests fail on Windows because they assert POSIX behaviour; none carry a `skipif` yet, so check your failures against this list before assuming you broke something:
+
+| Test | Why it fails on Windows |
+|---|---|
+| `test_model_cache_is_owner_only`, `test_settings_file_is_owner_only` | Assert POSIX `0600` mode bits; Windows uses ACLs, so `st_mode` reads `0666` |
+| `test_read_text_rejects_sensitive_symlink` | Needs the Windows symlink privilege (Developer Mode) |
+| `test_cron_entry_sets_the_unattended_env_var` | Asserts the crontab path; Windows takes the Task Scheduler branch |
+| `test_shell_uses_posix_fallback_when_bash_is_unavailable` | Asserts `executable=/bin/sh` |
+| `test_uninstall_requires_exact_yes_and_removes_install_dir` | Asserts shell-rc cleanup, which is `os.name != "nt"`-gated |
+| `test_classic_banner_includes_brand_and_catalogues` | Console codepage renders the ASCII fallback instead of block characters |
+
+**Run pytest from PowerShell, not Git Bash.** Under MSYS, `whoami` shadows Windows'
+`whoami.exe`, so `_protect_private_file` cannot parse a SID and ~36 tests fail with a
+spurious `OSError`. The same applies to running the agent itself from Git Bash.
 
 **How to run tests:**
 

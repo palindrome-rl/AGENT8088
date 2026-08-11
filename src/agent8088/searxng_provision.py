@@ -63,8 +63,13 @@ def write_settings(home: Path) -> Path:
     path = directory / "settings.yml"
     if path.exists() and re.search(r'secret_key:\s*"([^"]+)"', path.read_text()):
         return path
-    path.write_text(_SETTINGS_TEMPLATE.format(secret=secrets.token_hex(32)))
-    path.chmod(0o600)
+    # Written through the engine's private-file helper rather than chmod(0o600):
+    # this file holds a secret_key, and on Windows chmod cannot express
+    # owner-only — the file would keep its inherited SYSTEM/Administrators ACL
+    # while still reading as "0600" to a POSIX-shaped check.
+    from .engine import _write_private_text
+
+    _write_private_text(path, _SETTINGS_TEMPLATE.format(secret=secrets.token_hex(32)))
     return path
 
 

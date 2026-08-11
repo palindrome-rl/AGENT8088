@@ -49,9 +49,13 @@ def _protect_private_file(path: Path) -> None:
     if sys.platform != "win32":
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         return
+    # Absolute path: Git Bash / MSYS shadows Windows' whoami with the coreutils
+    # build, which rejects /user — see the matching note in engine.py.
+    _system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    _whoami = Path(_system_root) / "System32" / "whoami.exe"
     identity = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True,
-        text=True, timeout=10,
+        [str(_whoami) if _whoami.is_file() else "whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True, text=True, timeout=10,
     )
     try:
         sid = next(csv.reader([identity.stdout]))[1]

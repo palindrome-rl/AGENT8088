@@ -46,7 +46,7 @@ At a glance, verified against the current tree:
 | Built-in tools | **21** |
 | Built-in model providers | **12** (plus custom OpenAI-compatible and litellm) |
 | Permission modes | **3** — `readonly`, `full-auto`, `plan-only` |
-| Sub-agent profiles | **4** — `coder`, `explore`, `general-purpose`, `researcher` |
+| Sub-agent profiles | **5** — `auditor`, `coder`, `explore`, `general-purpose`, `researcher` |
 | Bundled skills | **5** |
 | Slash commands | **33** |
 | Gateway platforms | **3** — Slack, WhatsApp, Discord |

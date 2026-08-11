@@ -86,6 +86,7 @@ more tools are not required to add more sub-agents.
 | `explore` | 5 (read-only) | 6 | Searching/reading — **cannot write files** |
 | `coder` | 4 | 10 | Write code, then verify it runs |
 | `researcher` | 4 | 8 | Web research with citations |
+| `auditor` | 3 (readonly-pinned) | 6 | Verify a completed step against the environment |
 
 ```bash
 /agents        # list profiles with their tools, turn budgets, descriptions
@@ -617,7 +618,8 @@ agent8088 --model-setup
 /usage [off|tokens|full]  Control post-turn usage summaries
 /tools                    List every tool with args, mode, description
 /tool <name> <args>       Invoke one tool directly (JSON or key=value)
-/plan <steps>             Run the plan-executor
+/plan [task]              Enter plan mode: propose, approve, then run
+/audit [on|off]           Show or change step verification
 /raw <text>               One raw model call (content, reasoning, tool_calls)
 /config                   Active configuration
 /doctor                   Check endpoint reachability and local capability state
