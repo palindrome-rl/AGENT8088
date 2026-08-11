@@ -2218,6 +2218,19 @@ def _safe_calculate(expression: str):
     return evaluate(tree.body)
 
 
+class MissingToolArgument(ValueError):
+    """A command template placeholder had no value, and which one is known.
+
+    A ValueError subclass so every existing `except ValueError` around argument
+    formatting keeps behaving as it did; the parameter name rides along so the
+    caller can build a message that names the tool too.
+    """
+
+    def __init__(self, param: str):
+        super().__init__(f"Missing required argument: {param}")
+        self.param = param
+
+
 def _format_with_args(template: str, args: dict) -> str:
     import urllib.parse
     # Config supplies defaults like {project_root}; model args override and win.
@@ -2229,7 +2242,7 @@ def _format_with_args(template: str, args: dict) -> str:
     try:
         return (template or "").format(**safe)
     except KeyError as exc:
-        raise ValueError(f"Missing required argument: {exc.args[0]}") from None
+        raise MissingToolArgument(str(exc.args[0])) from None
 
 
 _UNTRUSTED_OPEN_RE = re.compile(r"^<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\n?")
@@ -3378,6 +3391,20 @@ def _tool_arg_parse_error(name: str, raw: str) -> str:
             f'{{"code": "a = 1\\nprint(a)"}}. Received: {raw[:200]}')
 
 
+def _tool_arg_missing_error(name: str, missing: str) -> str:
+    """Message for a call whose argument block never arrived at all.
+
+    The mirror of _tool_arg_parse_error, and it needs the same care for the
+    opposite reason. "Missing required argument: command" is true, but it reads
+    as "the argument you sent is named wrong" — so a model that omitted the
+    block entirely re-sent the identical shape rather than adding one. Name the
+    block that is missing, and show one it can copy.
+    """
+    return (f"Error: '{name}' was called with no arguments. Send an ✿ARGS✿ "
+            f"block containing '{missing}', e.g. "
+            f'✿ARGS✿: {json.dumps({missing: "..."})}')
+
+
 _CODE_ARG_ALIASES = ("code", "script", "python", "source", "snippet", "command")
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_+-]*\s*\n(.*?)\n?\s*```\s*$", re.DOTALL)
 
@@ -3804,8 +3831,11 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             argv = _structured_tool_argv(name, args)
         except ValueError as exc:
             return f"Error: {exc}"
-        command = _process_display(argv) if argv else _format_with_args(
-            spec.get("command") or "{command}", args)
+        try:
+            command = _process_display(argv) if argv else _format_with_args(
+                spec.get("command") or "{command}", args)
+        except MissingToolArgument as exc:
+            return _tool_arg_missing_error(name, exc.param)
     elif mode == "write_text":
         command = "write_file"
         write_path = _tool_path(spec, args)
@@ -4290,6 +4320,17 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 # Flag the parse failure instead.
                 calls.append({"name": resolved,
                               "arguments": {"__parse_error__": raw_args[:400]}})
+        # An ✿ARGS✿ block that is not a JSON object matches no header above (they
+        # require a '{'), and the loose-line branch below skips it because ✿ARGS✿
+        # IS present — so the call was dropped and the model saw no result at
+        # all, which is worse than a wrong one: there is nothing to react to.
+        if not calls and "✿ARGS✿" in text:
+            loose = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(.*)', text)
+            if loose:
+                resolved = _resolve_tool_name(loose.group(1))
+                if resolved in allowed:
+                    calls.append({"name": resolved,
+                                  "arguments": {"__parse_error__": loose.group(2).strip()[:400]}})
         if not calls and "✿ARGS✿" not in text:  # loose ✿FUNCTION✿ line, genuinely no args
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
