@@ -33,6 +33,24 @@ research read-only, propose one plan, get it approved, run it, come back.
 
 ### Fixed
 
+- Verification follows the work. The auditor only ever hooked `execute_plan`, which
+  was the same thing as hooking the plan only because plan mode forced every
+  mutation through it. With approval handing execution to ordinary tool calls, the
+  default `/plan` flow would have become the one flow `plan_audit=1` did not cover.
+  Post-approval calls are now audited too, at depth 0 only — a sub-agent's writes
+  are not the plan, and auditing inside the auditor would set it verifying itself.
+- The auditor grades against the plan the user approved. An `execute_plan` step can
+  declare `acceptance`; an ordinary tool call cannot, and without a criterion the
+  auditor only checks that the call took effect — which a write that did the wrong
+  thing passes. A `write_file` of `hi` against a plan promising a revenue table now
+  fails verification and the file is removed.
+- A sub-agent pinned to `permission: readonly` is refused a mutation instead of
+  being offered an escalation. Sub-agent escalations reach the user, so "this agent
+  only observes" was a question someone could answer yes to — about the file the
+  auditor was sent to inspect. Plain readonly mode still escalates; that prompt is
+  the approval flow.
+- Verification's cost stays visible on the new path: the turn's audit share is
+  captured as the budget is torn down, and the CLI reports it.
 - A plan the model only described is no longer reported as done. A turn that ends
   in plan mode with nothing approved now says so explicitly.
 - Plan mode is no longer one-shot. After an approved plan finished, every later

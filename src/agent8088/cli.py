@@ -804,6 +804,9 @@ def _after_turn_plan_state():
     approved gets said out loud: a model that writes a plan as prose and then
     reports it complete is indistinguishable, in the transcript, from one that
     actually did the work — the only difference the user can see is this line."""
+    share = A.last_audit_share()
+    if share:
+        console.print(f"[dim]verification cost this turn: {share * 100:.0f}% of tokens[/dim]")
     restored = A.finish_plan_session()
     if restored:
         console.print(f"[dim]plan complete · permission mode back to {restored}[/dim]")

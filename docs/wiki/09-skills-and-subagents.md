@@ -50,6 +50,12 @@ approved plan would be running inside the parent's write grant, and an agent
 whose entire contract is "I only observe" could change the thing it was sent to
 inspect.
 
+And a pinned agent is **refused** a mutation rather than offered an escalation.
+Sub-agent escalations do reach the user, so leaving them in place left "this agent
+only observes" as a question someone could answer yes to — about the very file the
+auditor was sent to look at. Only profiles that declare the floor are refused;
+plain readonly mode still escalates, because that prompt *is* the approval flow.
+
 This is why the auditor's read-only-ness is a property of the engine rather than
 of its prompt. `check_permission()` refuses the write; the model is not being
 asked to behave.

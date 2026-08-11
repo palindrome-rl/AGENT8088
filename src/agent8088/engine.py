@@ -388,7 +388,19 @@ _plan_execution_grant = False  # temporary: set True when user approves a plan; 
 # means an embedder driving run_agent directly gets the same lifecycle.
 _plan_return_mode = ""      # mode to restore when an approved plan finishes
 _plan_approved = False      # the user approved this session's plan; execution is live
+_plan_approved_text = ""    # the approved plan, so the auditor grades against it
 _plan_tool_ran = False      # turn-scoped: did a plan tool actually run this turn?
+# Set while a sub-agent whose profile declares `permission: readonly` is running.
+# Such an agent is refused mutations outright rather than being allowed to escalate:
+# an escalation is a question the user can say yes to, and "this agent only
+# observes" has to be a guarantee, not a default. See _exec_subagent.
+_permission_floor_readonly = False
+_last_audit_share = 0.0     # verification's share of the last completed turn's tokens
+
+
+def last_audit_share() -> float:
+    """Verification's share of the last completed turn's tokens, 0.0 if none."""
+    return _last_audit_share
 _active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
 # Which role is spending right now: "main", or "subagent:<type>". Verification is
 # not free — published figures put auditors at 19-38% of harness tokens — and a
@@ -424,9 +436,10 @@ def enter_plan_mode() -> None:
 
 def cancel_plan_session() -> None:
     """Abandon a plan session without running it — the user changed mode by hand."""
-    global _plan_return_mode, _plan_approved
+    global _plan_return_mode, _plan_approved, _plan_approved_text
     _plan_return_mode = ""
     _plan_approved = False
+    _plan_approved_text = ""
 
 
 def finish_plan_session() -> str:
@@ -435,11 +448,12 @@ def finish_plan_session() -> str:
     Returns the mode restored to, or "" if nothing changed. An unapproved plan
     stays in plan mode: the user asked for a plan and has not agreed to anything,
     so nothing about the session's permissions should have moved."""
-    global _plan_return_mode, _plan_approved
+    global _plan_return_mode, _plan_approved, _plan_approved_text
     if not _plan_approved:
         return ""
     target = _plan_return_mode or "readonly"
     _plan_approved = False
+    _plan_approved_text = ""
     _plan_return_mode = ""
     set_permission_mode(target)
     return target
@@ -2089,6 +2103,10 @@ def _plan_step_is_auditable(tool_name: str, acceptance: str) -> bool:
     A declared `acceptance` always qualifies: the step's author has named what
     done means, which is the strongest thing an auditor can be handed. Otherwise
     fall back to modes that leave a durable trace.
+
+    So a browser step is audited only when the plan says what done means for it —
+    the reported page text is in the auditor's task, so "the page mentions pricing"
+    is checkable, while an invented criterion for a page nobody kept would not be.
     """
     if acceptance:
         return True
@@ -2177,6 +2195,55 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     return "", ""
 
 
+def _approved_plan_audit_applies(tool_name: str, depth: int) -> bool:
+    """Whether an ordinary tool call should be verified right now.
+
+    The auditor reached a plan's writes for a structural reason rather than a
+    deliberate one: plan mode forced every mutation through `execute_plan`, and
+    that is the only path the audit hooked. An approved plan now runs as ordinary
+    tool calls, so without this the default `/plan` path would be the one path
+    with no verification at all — the opposite of what the audit is for.
+
+    Depth 0 only. A sub-agent's writes are not the plan, and auditing inside the
+    auditor would set it verifying itself.
+    """
+    if not (PLAN_AUDIT and _plan_approved and depth == 0):
+        return False
+    return _plan_step_is_auditable(tool_name, "")
+
+
+def _audit_approved_plan_call(tool_name: str, tool_args: dict, result: str,
+                              depth: int, snapshot) -> str:
+    """Verify one post-approval call and put a failed write back.
+
+    `_exec_plan` halts its remaining steps on a failed verdict. There is no step
+    list to halt here, so the equivalent is to hand the model a result it cannot
+    read as success and to say plainly that nothing later should be built on top
+    of it. The same asymmetry holds as in plans: only a `fail` undoes anything —
+    an auditor that could not reach its model must not be able to destroy work.
+    """
+    step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
+    # The plan the user approved is the criterion. Without it the auditor grades
+    # "did this call take effect", which a write that did confidently the wrong
+    # thing passes. An execute_plan step can declare `acceptance`; an ordinary
+    # tool call has nowhere to put one, so the plan stands in for it.
+    reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
+                                    acceptance=_plan_approved_text[:1500])
+    parts = [result]
+    if note:
+        parts.append(f"audit: {note}")
+    if reason:
+        if snapshot is not None:
+            parts.append(_revert_plan_write(snapshot))
+        elif PLAN_AUDIT_REVERT and TOOL_SPECS.get(tool_name, {}).get("mode") != "write_text":
+            parts.append(f"not reverted — {tool_name} has no undo; "
+                         "inspect the effect by hand")
+        parts.append(f"Error: verification failed — {reason}. Stop carrying out the plan "
+                     "and report what actually happened; do not assume any later step is "
+                     "safe to run.")
+    return "\n".join(parts)
+
+
 def _exec_present_plan(args: dict, depth: int = 0) -> str:
     """Show a finished plan and ask the user to approve it.
 
@@ -2188,7 +2255,7 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
     text, the user picks the mode the work runs in, and the ordinary tool path
     does the work.
     """
-    global _plan_approved, _plan_tool_ran
+    global _plan_approved, _plan_approved_text, _plan_tool_ran
     if depth:
         # The plan belongs to the main agent's turn. A sub-agent asking the user to
         # approve *its* plan for a delegated sub-task would leave plan mode on the
@@ -2215,9 +2282,15 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
                 "Nothing has been written or run.")
     set_permission_mode(chosen)
     _plan_approved = True
-    return (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
-            "in order, with ordinary tool calls, and report what each step actually "
-            "did. Do not call present_plan again for this plan.")
+    _plan_approved_text = plan_text
+    message = (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
+               "in order, with ordinary tool calls, and report what each step actually "
+               "did. Do not call present_plan again for this plan.")
+    if PLAN_AUDIT:
+        message += (" Every mutating step will be verified against the real environment "
+                    "by a read-only auditor, and a step that fails verification is put "
+                    "back — so make each one do exactly what the plan said.")
+    return message
 
 
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
@@ -2414,16 +2487,24 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # `_exec_plan` holds while running an approved plan) would otherwise be live
     # inside an agent whose whole contract is that it cannot change anything —
     # so an auditor spawned mid-plan could write through the parent's grant.
+    #
+    # The pin also turns a blocked mutation into a flat refusal rather than an
+    # escalation. Escalations from a sub-agent do reach the user, so leaving them
+    # in place made "this agent only observes" a question the user could answer
+    # yes to — including for the very file the auditor was sent to inspect.
+    global _permission_floor_readonly
     floor = profile.get("permission", "")
     saved_permission = None
     if floor == "readonly":
         saved_permission = (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
-                            _local_fallback_grant, _remote_git_grant)
+                            _local_fallback_grant, _remote_git_grant,
+                            _permission_floor_readonly)
         PERMISSION_MODE = "readonly"
         _one_shot_grant = False
         _plan_execution_grant = False
         _local_fallback_grant = False
         _remote_git_grant = False
+        _permission_floor_readonly = True
 
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
@@ -2448,7 +2529,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         _active_role = saved_role
         if saved_permission is not None:
             (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
-             _local_fallback_grant, _remote_git_grant) = saved_permission
+             _local_fallback_grant, _remote_git_grant,
+             _permission_floor_readonly) = saved_permission
 
     if ui.get("done"):
         ui["done"](answer)
@@ -3494,6 +3576,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             mode, command, path_zone, bool(spec.get("host")), approval_key):
         if PERMISSION_MODE == "plan-only" and allow_plan:
             return _plan_mode_block_message()
+        # A profile pinned to readonly is refused outright. Escalations from a
+        # sub-agent do reach the user, so offering one here would make "this agent
+        # only observes" a question the user could answer yes to — for the very
+        # file the auditor was sent to inspect.
+        if _permission_floor_readonly:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200] or str(target), reason="readonly_floor")
+            return (f"Error: {name} is not available to you. This agent is pinned "
+                    "read-only for its whole run: it observes and reports, and it "
+                    "cannot change anything or ask for permission to. Report what "
+                    "you found instead.")
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -3646,12 +3739,22 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except Exception:
         return "Invalid JSON"
 
+    # Taken before the call runs: once it has written, the previous state is the
+    # one thing that cannot be reconstructed.
+    will_audit = _approved_plan_audit_applies(name, depth)
+    snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
+
     try:
         result = run_tool(name, args, depth=depth)
     except subprocess.TimeoutExpired:
         result = "Command timed out"
     except Exception as e:
         result = f"Error: {e}"
+
+    # A blocked call has not done anything yet, so there is nothing to verify —
+    # it gets audited on the retry that follows approval.
+    if will_audit and not result.startswith("ESCALATION_REQUEST:"):
+        result = _audit_approved_plan_call(name, args, result, depth, snapshot)
 
     _remember_escalation(name, args, result)
 
@@ -4665,6 +4768,7 @@ def run_agent(messages, *, budget=None, **kwargs):
             max_cost=MAX_TURN_COST_USD,
             cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
         )
+    global _last_audit_share
     previous, _active_budget = _active_budget, budget
     # Only the outermost run_agent resets the blast-radius counters: a subagent
     # must not hand itself a fresh write budget, same reasoning as the token one.
@@ -4675,6 +4779,12 @@ def run_agent(messages, *, budget=None, **kwargs):
     try:
         return _run_agent_loop(messages, budget=budget, **kwargs)
     finally:
+        # Read the share before the budget goes out of scope. Verification spends
+        # the parent's tokens, and an audit on the post-approval path reports no
+        # cost of its own — so without this the only unattributed verification
+        # spend would be the one the default /plan flow incurs.
+        if previous is None:
+            _last_audit_share = budget.audit_share() if budget is not None else 0.0
         _active_budget = previous
 
 
