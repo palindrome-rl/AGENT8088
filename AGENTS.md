@@ -125,10 +125,6 @@ Every code change must have tests that would fail if the logic broke. The test s
 | `test_uninstall_requires_exact_yes_and_removes_install_dir` | Asserts shell-rc cleanup, which is `os.name != "nt"`-gated |
 | `test_classic_banner_includes_brand_and_catalogues` | Console codepage renders the ASCII fallback instead of block characters |
 
-**Run pytest from PowerShell, not Git Bash.** Under MSYS, `whoami` shadows Windows'
-`whoami.exe`, so `_protect_private_file` cannot parse a SID and ~36 tests fail with a
-spurious `OSError`. The same applies to running the agent itself from Git Bash.
-
 **How to run tests:**
 
 ```bash

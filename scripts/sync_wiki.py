@@ -49,6 +49,31 @@ PAGES = [
     ("12-testing-and-verification.md", "Testing-and-Verification"),
     ("13-troubleshooting.md", "Troubleshooting"),
     ("14-contributing.md", "Contributing"),
+    ("15-faq.md", "FAQ"),
+]
+
+# Sidebar grouping, following the shape Hermes uses for its reference manual:
+# guides first, then a Reference section split by kind, then development docs.
+# Published page names stay decoupled from filenames via PAGES above, so
+# regrouping here never changes a wiki URL.
+SIDEBAR_SECTIONS = [
+    ("Start here", ["Home", "Getting-Started"]),
+    ("Guides", [
+        "Permissions-and-Security",
+        "Sandboxing",
+        "Model-Providers",
+        "MCP",
+        "Messaging-Gateway",
+        "Skills-and-Subagents",
+    ]),
+    ("Reference", [
+        "CLI-Reference",
+        "Configuration",
+        "Tools",
+        "FAQ",
+        "Troubleshooting",
+    ]),
+    ("Development", ["Architecture", "Testing-and-Verification", "Contributing"]),
 ]
 
 BANNER = (
@@ -75,11 +100,27 @@ def convert(text: str, link_map: dict) -> str:
 
 
 def build_sidebar() -> str:
+    known = {page for _, page in PAGES}
+    grouped = {page for _, pages in SIDEBAR_SECTIONS for page in pages}
+    # A page added to PAGES but not to a section would vanish from the sidebar,
+    # so fail loudly rather than publishing navigation that silently omits it.
+    missing = known - grouped
+    if missing:
+        raise SystemExit(
+            f"sync_wiki: page(s) not assigned to a sidebar section: {sorted(missing)}"
+        )
+    unknown = grouped - known
+    if unknown:
+        raise SystemExit(f"sync_wiki: sidebar references unknown page(s): {sorted(unknown)}")
+
     lines = ["### Agent8088 Wiki", ""]
-    for _, page in PAGES:
-        label = "Home" if page == "Home" else page.replace("-", " ")
-        lines.append(f"- [{label}]({page})")
-    lines.append("")
+    for section, pages in SIDEBAR_SECTIONS:
+        lines.append(f"**{section}**")
+        lines.append("")
+        for page in pages:
+            label = "Home" if page == "Home" else page.replace("-", " ")
+            lines.append(f"- [{label}]({page})")
+        lines.append("")
     lines.append(f"[Repository](https://github.com/{REPO})")
     return "\n".join(lines) + "\n"
 
