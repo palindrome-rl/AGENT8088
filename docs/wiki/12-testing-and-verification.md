@@ -4,15 +4,23 @@
 
 Three layers, all runnable offline with no model backend.
 
-| Layer | Command | Scale |
+| Layer | Command | Covers |
 |---|---|---|
-| Unit tests | `uv run python -m pytest tests/` | 1271 tests, ~37s |
-| Feature verification | `scripts/verify_features.py` | 93 checks, 13 sections |
-| Exhaustive verification | `scripts/verify_everything.py` | 461 checks, 20 sections |
+| Unit tests | `uv run python -m pytest tests/` | Permission layer, tools, gateway, MCP |
+| Feature verification | `scripts/verify_features.py` | Real behaviour in temp repos and sandboxes |
+| Exhaustive verification | `scripts/verify_everything.py` | Tool specs, shell-classifier matrix, CLI surface |
 
-**A machine without a sandbox runtime does not merely skip — it fails.** Read
-[Interpreting expected skips](#interpreting-expected-skips) before treating a
-red run as a regression.
+## Prerequisites
+
+Install the sandbox runtime before running anything here:
+
+```sh
+agent8088 --sandbox-setup     # or: start Docker
+```
+
+Agent8088 refuses to run commands with no isolation available — see
+[No unsandboxed fallback](06-sandboxing.md#no-unsandboxed-fallback) — so the
+checks that exercise shell and permission behaviour cannot complete without it.
 
 ## 1. Unit tests
 
@@ -47,9 +55,8 @@ AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_subagents.py -q
 
 ### Gateway extras are required
 
-Without them, the Slack/Discord tests fail at **import** rather than skipping —
-roughly 19 failures that look like real breakage but are a missing optional
-dependency:
+Without them, the Slack/Discord adapters fail at **import** rather than skipping
+— which looks like real breakage but is a missing optional dependency:
 
 ```sh
 uv sync --all-extras --locked
@@ -184,54 +191,12 @@ These are normal on a clean machine and not failures:
 | `configured search backend reachable` | the temporary LAN SearXNG at `127.0.0.1:8888` is unreachable from this machine |
 | `REAL native sandbox` | sandbox runtime not installed |
 
-### No sandbox means failures, not skips
+If the sandbox runtime is missing, checks that exercise shell and permission
+behaviour report `a sandbox is required to run code` instead of completing.
+That is the isolation rule working as designed — install the runtime rather than
+changing the check.
 
-This one trips people up, so it is worth stating plainly. With **neither** the
-native sandbox installed **nor** the Docker daemon running, roughly **17 unit
-tests and 2 `verify_everything` checks fail outright** — they do not skip.
-
-Every one of them reports the same thing:
-
-```
-Error: a sandbox is required to run code, but neither the native OS sandbox nor
-Docker is available. Run `agent8088 --sandbox-setup` or install and start Docker,
-then retry. Local execution is disabled.
-```
-
-That is [the no-unsandboxed-fallback rule](06-sandboxing.md#no-unsandboxed-fallback)
-working correctly. The affected tests assert on permission behaviour
-(`ESCALATION_REQUEST`, hard blocks) that they never reach, because refusing to
-run without isolation happens *first*. The clusters are `test_approvals.py`,
-`test_multiline_tool_args.py`, `test_permission.py`,
-`test_permission_matrix.py`, `test_plan_*.py` and `test_security_fixes.py`.
-
-Fix the environment rather than the tests:
-
-```sh
-agent8088 --sandbox-setup     # or: start Docker Desktop
-```
-
-Before calling any of these a regression, confirm the sandbox is actually
-available — otherwise you are reading an environment problem as a code problem.
-
-## Current state
-
-Measured on `development` @ `86850ca`, on a macOS machine with **no native
-sandbox installed and the Docker daemon stopped**:
-
-| Suite | Result |
-|---|---|
-| Unit tests | 1254 passed, 17 failed, 37s |
-| `verify_features.py` | 91 passed, 0 failed, 2 skipped |
-| `verify_everything.py` | 456 passed, 2 failed, 3 skipped |
-| Duplicate-def check | clean |
-
-All 19 failures are the missing-sandbox cluster described under
-[Interpreting expected skips](#no-sandbox-means-failures-not-skips) — every one
-returns the same "a sandbox is required to run code" error. A clean run on a
-sandbox-equipped machine has not been re-measured for this table; treat the
-numbers above as the floor, and record your own baseline before comparing a
-branch against it.
+## No CI
 
 There is **no CI**. GitHub Actions is blocked by a billing issue on this
 account, so a workflow was written and then removed rather than left
