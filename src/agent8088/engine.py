@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import web_search
+from agent8088 import memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -4807,6 +4807,147 @@ MODEL_TELEMETRY_PATH = Path(APP_CONFIG.get(
     "model_telemetry_path", str(_agent_data_dir() / "model-telemetry.jsonl"))).expanduser()
 
 
+# ---------------------------------------------------------------------------
+# Persistent memory
+# ---------------------------------------------------------------------------
+# Off by default. Enabling costs one extra model call per turn and a 274MB
+# embedding model pull, and an upgrade must not start doing either silently --
+# `agent8088 --setup` and `/memory on` are the places that ask.
+MEMORY_DB_PATH = Path(APP_CONFIG.get(
+    "memory_db_path", str(_agent_data_dir() / "memory.db"))).expanduser()
+MEMORY_EXTRACT_MODEL = APP_CONFIG.get("memory_extract_model", "").strip()
+# The CLI renders its answer and then captures on a background thread, so the
+# user never waits. The gateway, MCP server and cron have nobody watching, so
+# they capture synchronously rather than risk a daemon thread dying at exit.
+MEMORY_CAPTURE_BACKGROUND = False
+
+
+def _memory_extract_completion(prompt: str):
+    """One model call for fact extraction. Returns (text, usage).
+
+    Deliberately not given the agent's own system prompt: the extractor is not
+    the agent, it needs none of the tool documentation, and paying for that
+    prompt on every turn is the difference between memory being cheap and memory
+    being the most expensive thing in a session.
+    """
+    model = MEMORY_EXTRACT_MODEL or MODEL_NAME
+    response = create_completion(
+        client, [{"role": "user", "content": prompt}], [],
+        max_tokens=800,
+        system_prompt="You extract durable facts for long-term memory. "
+                      "You reply with JSON only.",
+        temperature=0.0, model_name=model,
+        telemetry_attempt="memory_extract",
+    )
+    text = _strip_reasoning(response.choices[0].message.content or "")
+    usage, _source = _model_usage(response)
+    return text, {
+        "model": model,
+        "input_tokens": usage.get("input_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+    }
+
+
+def configure_memory() -> None:
+    """Wire the memory package to this engine's config, client and redactor.
+
+    Called at import and again whenever config changes (`/memory on`, a reload),
+    so the store follows the live settings rather than import-time ones.
+    """
+    try:
+        memory.configure(
+            config=APP_CONFIG,
+            client_factory=lambda: get_client(
+                APP_CONFIG.get("memory_embed_provider", "").strip() or None)[0],
+            completion=_memory_extract_completion,
+            redact=_redact_secrets,
+            db_path=MEMORY_DB_PATH,
+            project=str(PROJECT_ROOT),
+        )
+    except Exception as exc:
+        _log.debug("memory configuration skipped: %s", exc)
+
+
+def _message_text(message) -> str:
+    """The text of a message, whether its content is a string or image parts."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return str(content or "")
+
+
+def _recalled_memory_prompt(messages, system_prompt, identity=None):
+    """Wrap `system_prompt` so this turn's rounds carry the recalled block.
+
+    The recall query is the last GENUINE user turn. That distinction is the whole
+    security story: tool output is fed back into the loop as role="user", so
+    using the last user message would let a fetched web page choose what the
+    agent recalls -- and, with capture, what it believes it learned.
+
+    Recall runs once per turn, not once per round: the query cannot change
+    mid-turn, so re-running it per round would buy nothing and cost an embedding
+    call each time.
+    """
+    if not memory.enabled():
+        return system_prompt
+    turns = _genuine_user_turns(messages)
+    if not turns:
+        return system_prompt
+    block = memory.recall_block(_message_text(turns[-1]), identity=identity)
+    if not block:
+        return system_prompt
+
+    def with_memory():
+        base = system_prompt() if callable(system_prompt) else system_prompt
+        return (base or current_system_prompt()) + "\n\n" + block
+
+    return with_memory
+
+
+def _capture_turn_memory(messages, answer, *, identity=None, run_id=None) -> None:
+    """Store what this turn taught, after the answer is already the user's.
+
+    Only the last genuine user turn is offered: earlier ones were captured when
+    they happened, and re-extracting them every turn would pay for the same facts
+    repeatedly. Tool output is excluded here for the same reason it is excluded
+    from recall -- a web page must not be able to write the agent's memory.
+    """
+    if not memory.enabled() or not str(answer or "").strip():
+        return
+    turns = _genuine_user_turns(messages)
+    if not turns:
+        return
+    try:
+        memory.capture([_message_text(turns[-1])], answer, identity=identity,
+                       run_id=run_id, in_background=MEMORY_CAPTURE_BACKGROUND)
+    except Exception as exc:
+        _log.debug("memory capture skipped: %s", exc)
+
+
+def _memory_summary() -> str:
+    """One line for describe_capabilities, from live state rather than config.
+
+    Reports the embedder honestly: with memory on but no embedder pulled, recall
+    still works on keywords alone, and saying so is the difference between a user
+    tuning it and a user assuming it is broken.
+    """
+    if not memory.enabled():
+        return "off (enable with /memory on)"
+    report = memory.status()
+    if report.get("embedder_ok"):
+        retrieval = f"hybrid keyword+semantic via {report['embed_model']}"
+    else:
+        retrieval = f"keyword only — {report['embed_model']} unavailable"
+    capture = "recall+capture" if report.get("capture_enabled") else "recall only"
+    return f"on — {report['count']} memories, {capture}, {retrieval}"
+
+
+configure_memory()
+
+
 def _append_private_jsonl(path: Path, entry: dict) -> None:
     """Append a local structured record without weakening the caller on failure."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -5464,6 +5605,7 @@ def describe_capabilities() -> str:
         f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
         f"- Shell denylist: {', '.join(_USER_DENY_GLOBS) or 'not set'}",
         f"- Audit log: {'on — ' + str(AUDIT_LOG_PATH) if AUDIT_ENABLED else 'off'}",
+        f"- Persistent memory: {_memory_summary()}",
         f"- Subagent max depth: {SUBAGENT_MAX_DEPTH}",
         "",
         "## Always-on protections (no mode or approval disables these)",
@@ -5569,7 +5711,8 @@ class _TurnBudget:
 # ---------------------------------------------------------------------------
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
-def run_agent(messages, *, budget=None, **kwargs):
+def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
+              **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
 
@@ -5577,6 +5720,13 @@ def run_agent(messages, *, budget=None, **kwargs):
     of the turn (subagents and plan steps read it, since there is no way to
     thread a parameter through run_tool) and is always restored afterwards,
     including on an exception or an AgentInterrupted.
+
+    Memory hangs off this seam rather than off the loop, for two reasons. The
+    loop has seven return points and a new one would silently skip capture,
+    whereas `finally` here cannot be escaped. And `previous is None` already
+    marks the outermost turn, which is exactly the scope memory wants: a
+    subagent is handed a delegated task rather than something a human said, so it
+    neither recalls nor writes.
     """
     global _active_budget
     if budget is None:
@@ -5595,8 +5745,12 @@ def run_agent(messages, *, budget=None, **kwargs):
         reset_turn_counters()
         reset_approval_state()
         reset_turn_approval_state()
+        kwargs["system_prompt"] = _recalled_memory_prompt(
+            messages, kwargs.get("system_prompt"), identity=memory_identity)
+    answer = None
     try:
-        return _run_agent_loop(messages, budget=budget, **kwargs)
+        answer = _run_agent_loop(messages, budget=budget, **kwargs)
+        return answer
     finally:
         # Read the share before the budget goes out of scope. Verification spends
         # the parent's tokens, and an audit on the post-approval path reports no
@@ -5604,6 +5758,10 @@ def run_agent(messages, *, budget=None, **kwargs):
         # spend would be the one the default /plan flow incurs.
         if previous is None:
             _last_audit_share = budget.audit_share() if budget is not None else 0.0
+            # After the answer, never in front of it. An interrupted or failed
+            # turn leaves `answer` None and teaches nothing.
+            _capture_turn_memory(messages, answer, identity=memory_identity,
+                                 run_id=memory_run_id)
         _active_budget = previous
 
 
