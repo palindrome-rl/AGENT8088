@@ -784,7 +784,7 @@ install_native_sandbox() {
         SANDBOX_INSTALLED=true
         log_success "Native sandbox runtime installed"
     else
-        log_warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' manually"
+        log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
     fi
 }
 
@@ -1170,7 +1170,8 @@ verify_install() {
     if [ "$SANDBOX_INSTALLED" = true ]; then
         echo "  Sandbox:  native runtime installed"
     else
-        echo "  Sandbox:  run 'agent8088 --sandbox-setup' to install the native runtime"
+        echo "  Sandbox:  Docker fallback is automatic when available"
+        echo "            Native setup: agent8088 --sandbox-setup"
     fi
     echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | bash"
     echo ""

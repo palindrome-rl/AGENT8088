@@ -16,7 +16,7 @@ feature is reachable here:
 
 Run:  python agent8088_cli.py
 """
-import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
+import sys, os, re, json, shlex, time, threading, select, socket, atexit  # noqa: F401
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -1729,8 +1729,10 @@ def do_chat(query):
     tokens_ref = [0]
     turn_start = time.time()
     esc = EscListener()
+    _response_footer.start("working")
 
-    with esc, Live(console=console, refresh_per_second=20, transient=True) as live:
+    with esc, Live(console=console, refresh_per_second=20, transient=True) as rich_live:
+        live = _LiveWithFooter(rich_live, _response_footer)
         def spin(msg):
             # Each round starts with "thinking..."; that is the boundary at which a
             # finished tool call stops being the thing on screen, so the filter is
@@ -1830,6 +1832,7 @@ def do_chat(query):
             render_answer(partial)
         console.print(f"[dim]⏹ interrupted · {elapsed:.1f}s[/dim]")
         S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "interrupted": True}
+        _response_footer.refresh("ready")
         _record_trace(query, trace, elapsed, interrupted=True)
         _after_turn_plan_state()
         _save_active_session()
@@ -1837,6 +1840,7 @@ def do_chat(query):
 
     render_answer(answer)
     S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "context": _estimate_context_pct()}
+    _response_footer.refresh("ready")
     if S.usage_mode == "tokens":
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens[/dim]")
     elif S.usage_mode == "full":
@@ -3536,8 +3540,8 @@ def _prompt_label():
             f"[#237dd7]({pct}% ctx) ›[/#237dd7] ")
 
 
-def _status_bar_fragments():
-    """Persistent session summary shown by prompt_toolkit while waiting for input."""
+def _status_bar_fragments(state="ready"):
+    """Persistent session summary shared by input and response rendering."""
     pct = _estimate_context_pct()
     filled = min(10, max(0, pct // 10))
     last = S.last_usage or {}
@@ -3552,8 +3556,108 @@ def _status_bar_fragments():
         ("fg:#237dd7", (S.name or "ephemeral")[:18]),
         ("", " │ "),
         ("fg:#237dd7", f"last {last.get('seconds', 0):.1f}s ↑{last.get('tokens', 0)}"),
-        ("fg:#00edff bold", " │ ● ready "),
+        ("fg:#00edff bold", f" │ ● {state} "),
     ]
+
+
+class _PersistentStatusBar:
+    """Reserve the terminal's last row while a response is being generated.
+
+    prompt_toolkit owns that row while reading input, but exits its application
+    as soon as Enter is pressed. A DEC scrolling region keeps Rich's streaming
+    output above the same row until prompt_toolkit takes ownership again.
+    """
+
+    _STYLES = {
+        "": "\x1b[0m",
+        "fg:#237dd7": "\x1b[38;2;35;125;215m",
+        "fg:#237dd7 bold": "\x1b[1;38;2;35;125;215m",
+        "fg:#00edff bold": "\x1b[1;38;2;0;237;255m",
+    }
+
+    def __init__(self):
+        self.active = False
+        self.rows = 0
+        self.state = "working"
+
+    def _stream(self):
+        stream = getattr(console, "file", None)
+        if not (getattr(console, "is_terminal", False) and stream
+                and getattr(stream, "isatty", lambda: False)()):
+            return None
+        return stream
+
+    def _render(self):
+        remaining = max(1, console.width)
+        parts = []
+        for style, value in _status_bar_fragments(self.state):
+            if remaining <= 0:
+                break
+            value = value[:remaining]
+            parts.extend((self._STYLES.get(style, "\x1b[0m"), value))
+            remaining -= len(value)
+        return "".join(parts) + "\x1b[0m"
+
+    def start(self, state="working"):
+        if self._stream() is None or console.height < 3:
+            return
+        self.active = True
+        self.refresh(state)
+
+    def refresh(self, state="working"):
+        stream = self._stream()
+        if not self.active or stream is None:
+            return
+        self.state = state
+        rows = max(3, console.height)
+        margins = ""
+        if rows != self.rows:
+            margins = f"\x1b[r\x1b[1;{rows - 1}r"
+            self.rows = rows
+        stream.write(
+            f"\x1b7{margins}\x1b[{rows};1H\x1b[2K{self._render()}\x1b8"
+        )
+        stream.flush()
+
+    def stop(self):
+        stream = self._stream()
+        if self.active and stream is not None:
+            # Do not erase the row: prompt_toolkit replaces it immediately, so
+            # clearing it here would recreate the visible blink this fixes.
+            stream.write("\x1b7\x1b[r\x1b8")
+            stream.flush()
+        self.active = False
+        self.rows = 0
+
+
+class _LiveWithFooter:
+    """Keep the reserved footer current across Rich Live updates and resizes."""
+
+    def __init__(self, live, footer):
+        self.live = live
+        self.footer = footer
+
+    def update(self, *args, **kwargs):
+        result = self.live.update(*args, **kwargs)
+        self.footer.refresh("working")
+        return result
+
+    def stop(self):
+        result = self.live.stop()
+        self.footer.refresh("working")
+        return result
+
+    def start(self):
+        result = self.live.start()
+        self.footer.refresh("working")
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self.live, name)
+
+
+_response_footer = _PersistentStatusBar()
+atexit.register(_response_footer.stop)
 
 
 def _command_matches(text, slash=True):
@@ -3578,6 +3682,7 @@ def _live_matches(text):
 
 def _read_line():
     """Use a live completion menu in a TTY, with Rich/readline as a safe fallback."""
+    _response_footer.stop()
     if not sys.stdin.isatty():
         return console.input(_prompt_label())
     try:
@@ -3601,13 +3706,17 @@ def _read_line():
     label = "\n\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
     # Keep prompt_toolkit's default menu reserve. Multi-column completion
     # floats otherwise share the last row and displace the status bar.
-    return prompt(
+    answer = prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
     )
+    # prompt_toolkit releases its toolbar as soon as Enter is accepted. Reclaim
+    # that row here, before command dispatch, so there is no blank-frame gap.
+    _response_footer.start("ready")
+    return answer
 
 
 def _completer(text, state):

@@ -1017,11 +1017,12 @@ function Install-Native-Sandbox {
         if ($script:SandboxInstalled) {
             Write-Success "Native sandbox runtime installed"
         } else {
-            Write-Warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' from an elevated terminal"
+            Write-Warn "Native sandbox setup did not complete - Docker will be used automatically when available"
         }
     } else {
         Write-Info "Native sandbox setup needs an elevated terminal (provisions a restricted account + WFP filter)."
-        Write-Info "To enable local code execution, open an elevated terminal and run: agent8088 --sandbox-setup"
+        Write-Info "Docker will be used automatically when Docker Desktop is running."
+        Write-Info "For native isolation, open an elevated terminal and run: agent8088 --sandbox-setup"
     }
 }
 
@@ -1301,7 +1302,8 @@ function Verify-Install {
     if ($script:SandboxInstalled) {
         Write-Host "  Sandbox:  native runtime installed"
     } else {
-        Write-Host "  Sandbox:  run 'agent8088 --sandbox-setup' from an elevated terminal"
+        Write-Host "  Sandbox:  Docker fallback is automatic when available"
+        Write-Host "            Native setup: elevated agent8088 --sandbox-setup"
     }
     # $Branch, not a hardcoded one: this told everyone to update from
     # feat/install-all-deps, a merged feature branch that can be deleted at any

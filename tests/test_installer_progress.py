@@ -24,7 +24,9 @@ import re
 import runpy
 import subprocess
 import sys
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -303,6 +305,7 @@ def test_windows_repl_keeps_completion_space_above_the_status_bar(
     import prompt_toolkit
 
     captured = {}
+    footer_events = []
 
     class Tty:
         @staticmethod
@@ -310,6 +313,13 @@ def test_windows_repl_keeps_completion_space_above_the_status_bar(
             return True
 
     monkeypatch.setattr(cli.sys, "stdin", Tty())
+    monkeypatch.setattr(
+        cli, "_response_footer",
+        SimpleNamespace(
+            stop=lambda: footer_events.append("stop"),
+            start=lambda state: footer_events.append(("start", state)),
+        ),
+    )
     monkeypatch.setattr(
         prompt_toolkit,
         "prompt",
@@ -320,6 +330,52 @@ def test_windows_repl_keeps_completion_space_above_the_status_bar(
     assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
     assert "reserve_space_for_menu" not in captured
     assert captured["message"].value.startswith("\n")
+    assert footer_events == ["stop", ("start", "ready")]
+
+
+@pytest.mark.parametrize(("width", "height"), [(50, 10), (100, 30), (190, 50)])
+def test_response_footer_reserves_the_last_terminal_row(
+        width, height, tmp_path, monkeypatch):
+    """Submitting a prompt must not remove the footer while Rich streams."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+    from rich.console import Console
+
+    output = StringIO()
+    output.isatty = lambda: True
+    monkeypatch.setattr(
+        cli, "console",
+        Console(file=output, width=width, height=height, force_terminal=True),
+    )
+
+    footer = cli._PersistentStatusBar()
+    footer.start("working")
+    footer.stop()
+
+    rendered = output.getvalue()
+    assert f"\x1b[1;{height - 1}r" in rendered
+    assert f"\x1b[{height};1H" in rendered
+    assert "8088" in rendered
+    if width == 190:
+        assert "working" in rendered
+    assert "\x1b[r" in rendered
+
+
+def test_live_response_updates_keep_the_footer_current(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+
+    updates = []
+    refreshes = []
+    live = SimpleNamespace(update=lambda value, **kwargs: updates.append((value, kwargs)))
+    footer = SimpleNamespace(refresh=lambda state="working": refreshes.append(state))
+
+    cli._LiveWithFooter(live, footer).update("partial response", refresh=True)
+
+    assert updates == [("partial response", {"refresh": True})]
+    assert refreshes == ["working"]
 
 
 def test_setup_model_discovery_has_a_short_timeout_and_no_retries(
@@ -370,6 +426,58 @@ def test_release_gate_uses_the_resolved_windows_launcher(monkeypatch):
     monkeypatch.setattr(release_check["shutil"], "which", lambda _name: npm)
 
     assert release_check["_required_executable"]("npm", "missing") == npm
+
+
+def test_unusable_native_argv_falls_back_to_readonly_docker(
+        tmp_path, monkeypatch):
+    """Every sandboxed command path shares the safe pre-flight fallback."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    preflight = "CreateProcessWithLogonW(srt-sandbox): Access is denied."
+    calls = []
+    monkeypatch.setattr(engine, "_native_sandbox_broken", False)
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["node", "srt.js"])
+    monkeypatch.setattr(engine, "_write_sandbox_settings", lambda **_kwargs: "settings.json")
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: engine.PROJECT_ROOT)
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda *_args, **_kwargs: calls.append("native") or preflight,
+    )
+    monkeypatch.setattr(
+        engine, "_exec_docker_command",
+        lambda *args, **kwargs: calls.append(("docker", args, kwargs)) or "ran in docker",
+    )
+
+    assert engine._exec_sandbox_argv(["git", "status"]) == "ran in docker"
+    assert calls[0] == "native"
+    assert calls[1][0] == "docker"
+    assert calls[1][2]["workspace"] == engine.PROJECT_ROOT
+    assert calls[1][2]["readonly"] is True
+
+
+def test_status_reports_docker_after_native_preflight_failure(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["node", "srt.js"])
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(engine, "_native_sandbox_broken", True)
+
+    assert engine.sandbox_status()["resolved"] == "docker"
+
+
+def test_installer_keeps_the_documented_docker_fallback():
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert "Docker will be used automatically when Docker Desktop is running" in installer
+    assert "Sandbox:  Docker fallback is automatic when available" in installer
 
 
 def test_a_stage_that_reads_stdin_fails_instead_of_hanging(tmp_path):
