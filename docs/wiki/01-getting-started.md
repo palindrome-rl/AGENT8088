@@ -13,7 +13,7 @@ No admin rights are needed for the base install.
 
 ## Install
 
-**macOS / Linux / WSL2 / Termux**
+**macOS / Linux / WSL2**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash

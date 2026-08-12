@@ -42,7 +42,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 
 ### Install the latest branch
 
-**macOS, Linux, WSL2, or Termux**
+**macOS, Linux, or WSL2**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | AGENT8088_BRANCH=feat/install-all-deps bash
