@@ -65,7 +65,7 @@ Run with no flags for the interactive REPL.
 | `/model setup` | Add or update a provider profile |
 | `/models [provider]` | Fuzzy model picker, fetched live |
 | `/temp <float>` | Sampling temperature |
-| `/maxturns <int>` | Max agent turns per prompt |
+| `/maxturns <int>` | Max agent turns per prompt (same as `/limits max_turns`) |
 | `/reasoning` | Toggle reasoning display |
 | `/think` | Extended thinking mode |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
@@ -107,9 +107,12 @@ Run with no flags for the interactive REPL.
 
 | Command | Does |
 |---|---|
+| `/limits` | Show every limit: turns, budgets, write caps, sub-agent turns, tool timeouts |
+| `/limits <key> <value>` | Change one — **persists to `config.txt`** |
+| `/limits subagent <name> <turns>` | Per-profile sub-agent round cap |
+| `/limits tool <name> <seconds>` | Per-tool timeout |
 | `/config` | Active config + file path |
 | `/capabilities` | What the agent can do and which guardrails are in force |
-| `/system` | Full system prompt |
 | `/doctor` | Environment health check |
 | `/trace [on\|off]` | Toggle JSON trace capture |
 | `/verbose` | Toggle verbose output |
