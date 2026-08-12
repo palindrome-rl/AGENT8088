@@ -1981,6 +1981,11 @@ def _from_container_path(raw_path: str) -> str:
     agent had just listed could not then be read, and the error named a path
     nobody had mentioned.
 
+    Two different roots get mounted there. Ordinary runs mount ARTIFACTS_ROOT;
+    _exec_sandbox_argv mounts PROJECT_ROOT for the structured git tools. The
+    string alone cannot say which, so prefer whichever candidate actually
+    exists, and fall back to artifacts/ — the common case — when neither does.
+
     Only the prefix is rewritten; the result still goes through the allowed-path
     check below, so `/workspace/../../etc/passwd` is refused exactly as before.
     """
@@ -1988,7 +1993,16 @@ def _from_container_path(raw_path: str) -> str:
     if text != _CONTAINER_WORKSPACE and not text.startswith(_CONTAINER_WORKSPACE + "/"):
         return str(raw_path or "")
     relative = text[len(_CONTAINER_WORKSPACE):].lstrip("/")
-    return str(ARTIFACTS_ROOT / relative) if relative else str(ARTIFACTS_ROOT)
+    if not relative:
+        return str(ARTIFACTS_ROOT)
+    for root in (ARTIFACTS_ROOT, PROJECT_ROOT):
+        candidate = root / relative
+        try:
+            if candidate.exists():
+                return str(candidate)
+        except OSError:
+            continue
+    return str(ARTIFACTS_ROOT / relative)
 
 
 def resolve_user_path(raw_path: str) -> Path:
@@ -3245,6 +3259,11 @@ def _ensure_docker_image(image: str) -> str:
     return ""
 
 
+# The path tail following a rewritten /workspace prefix, stopping at whitespace
+# or a quote so the rest of the command is never touched.
+_CONTAINER_TAIL_RE = re.compile(r"(/workspace)([^\s\"']*)")
+
+
 def _to_container_path(command: str, workspace: Path) -> str:
     """Rewrite host paths in a command to the path the container will see.
 
@@ -3261,11 +3280,20 @@ def _to_container_path(command: str, workspace: Path) -> str:
     host = str(workspace)
     if not host:
         return command
+    rewritten = command
     for spelling in (host.replace("\\", "\\\\"), host, host.replace("\\", "/")):
-        if spelling and spelling in command:
-            command = command.replace(spelling, _CONTAINER_WORKSPACE)
-    return command.replace("\\\\", "/").replace(_CONTAINER_WORKSPACE + "\\",
-                                                _CONTAINER_WORKSPACE + "/")
+        if spelling and spelling in rewritten:
+            rewritten = rewritten.replace(spelling, _CONTAINER_WORKSPACE)
+    if rewritten == command:
+        return command   # no workspace path here; leave the command untouched
+    # Flip separators only inside the paths just rewritten, and along the whole
+    # tail rather than the first separator. A blanket replace would also mangle
+    # backslashes elsewhere in the command — an escaped string in a python -c,
+    # say — and fixing only the first one left `/workspace/a\b\c.py` half
+    # converted, which the container cannot open either.
+    return _CONTAINER_TAIL_RE.sub(
+        lambda m: m.group(1) + m.group(2).replace("\\\\", "/").replace("\\", "/"),
+        rewritten)
 
 
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,

@@ -59,3 +59,32 @@ def test_an_unrelated_absolute_path_is_left_alone(engine):
 
 def test_an_empty_workspace_changes_nothing(engine):
     assert engine._to_container_path("ls", Path("")) == "ls"
+
+
+# --- raised in review of PR #45 -------------------------------------------
+
+def test_a_command_without_a_workspace_path_is_returned_untouched(engine):
+    r"""A blanket separator flip mangled commands that never named the workspace.
+
+    `python -c "print('a\\b')"` carries escaped backslashes of its own, and
+    rewriting them changes what the program does.
+    """
+    command = 'python -c "print(\'a' + chr(92) + chr(92) + 'b\')"'
+    assert engine._to_container_path(command, WS) == command
+
+
+def test_the_whole_path_tail_is_converted_not_just_the_first_separator(engine):
+    r"""`/workspace/a\b\c.py` is no more openable than the original was."""
+    command = 'python "' + str(WS) + chr(92) + 'tests' + chr(92) + 'unit.py"'
+    assert engine._to_container_path(command, WS) == 'python "/workspace/tests/unit.py"'
+
+
+def test_backslashes_elsewhere_survive_a_rewrite(engine):
+    """Only the rewritten path tails are normalised, not the whole command."""
+    escaped = "print('a" + chr(92) + chr(92) + "b')"
+    command = f'python -c "{escaped}" && ls "{WS}{chr(92)}sub{chr(92)}x.py"'
+
+    result = engine._to_container_path(command, WS)
+
+    assert "/workspace/sub/x.py" in result
+    assert escaped in result, "an escaped backslash outside the path must survive"
