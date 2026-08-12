@@ -485,9 +485,11 @@ install_node_bridge() {
                 [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
                 case "$DISTRO" in
                     ubuntu|debian)
-                        log_info "Installing Node via apt..."
-                        $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-                        $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm >/dev/null 2>&1 && _did_install=true || true
+                        # Ubuntu/Debian ship ancient Node (12.x) in apt - too old
+                        # for sandbox-runtime (needs 20.11+). Skip apt and use the
+                        # portable tarball fallback below instead of wasting time
+                        # on a package that will fail the version check.
+                        log_info "Skipping apt nodejs (too old on $DISTRO) - using portable download"
                         ;;
                     fedora)
                         log_info "Installing Node via dnf..."
