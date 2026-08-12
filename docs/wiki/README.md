@@ -24,7 +24,7 @@ copied from the README. Where the two disagree, the wiki notes it explicitly.
 | Point it at a different model | [Model Providers](05-model-providers.md) |
 | Understand command isolation | [Sandboxing](06-sandboxing.md) |
 | Connect MCP servers, or expose Agent8088 as one | [MCP](07-mcp.md) |
-| Run it in Slack / WhatsApp / Discord | [Messaging Gateway](08-messaging-gateway.md) |
+| Run it in Slack / WhatsApp / Discord / Telegram / Email | [Messaging Gateway](08-messaging-gateway.md) |
 | Use skills and sub-agents | [Skills & Sub-agents](09-skills-and-subagents.md) |
 | Look up a flag or slash command | [CLI Reference](10-cli-reference.md) |
 | Understand how the pieces fit | [Architecture](11-architecture.md) |
@@ -47,9 +47,9 @@ At a glance, verified against the current tree:
 | Built-in model providers | **12** (plus custom OpenAI-compatible and litellm) |
 | Permission modes | **3** — `readonly`, `full-auto`, `plan-only` |
 | Sub-agent profiles | **5** — `auditor`, `coder`, `explore`, `general-purpose`, `researcher` |
-| Bundled skills | **5** |
-| Slash commands | **33** |
-| Gateway platforms | **3** — Slack, WhatsApp, Discord |
+| Bundled skills | **5** installed, plus **20** behaviour skills in `skills/*.yaml` |
+| Slash commands | **36** |
+| Gateway platforms | **5** — Slack, WhatsApp, Discord, Telegram, Email |
 | Python | **3.10+** |
 
 ## The design idea worth knowing up front
@@ -70,13 +70,25 @@ prompt — they live in code that runs regardless of what the model decides:
 
 [Permissions & Security](03-permissions-and-security.md) covers all of it.
 
-## Known documentation drift
+## Re-deriving the numbers
 
-The top-level `README.md` is slightly ahead of / behind the code in two places.
-The wiki uses the verified values:
+The counts above drift whenever someone adds a tool, a command or an adapter, so
+derive them from the tree rather than trusting this page:
 
-| Claim in README | Actual |
-|---|---|
-| "13 model providers", listing Anthropic | **12** built-in; `anthropic` is *not* one of them. Anthropic works via a custom `api_mode=litellm` provider or through OpenRouter — see [Model Providers](05-model-providers.md) |
-| Slash-command table lists 24 | **33** commands are registered — see [CLI Reference](10-cli-reference.md) |
-| CLI flag list omits MCP-server flags | `--mcp-serve`, `--mcp-http`, `--mcp-port`, `--mcp-host` exist |
+```sh
+export AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$(mktemp -d)"   # never import bare
+
+grep -c '^[a-z]' src/agent8088/tools.txt                             # 21 tools
+uv run python -c "import agent8088.cli as c; print(len(c.COMMANDS))" # 36 commands
+ls src/agent8088/gateway/platforms/*.py | grep -vc 'base\|__init__'  # 5 platforms
+ls src/agent8088/agents/ | wc -l                                     # 5 sub-agents
+uv run python -c "import agent8088.providers as p; print(len(p.BUILTIN_PROVIDERS))"  # 12
+```
+
+The `AGENT8088_CONFIG` / `AGENT8088_HOME` line is not decoration: importing
+`agent8088.cli` bare reads — and can migrate — your real `~/.agent8088/config.txt`.
+See [Testing & Verification](12-testing-and-verification.md#isolation-rules-for-anything-you-write).
+
+One count that is deliberately *not* derivable: there is no `anthropic` built-in
+provider. Claude is reached through OpenRouter or a custom `api_mode=litellm`
+profile — see [Model Providers](05-model-providers.md#reaching-anthropic--claude).

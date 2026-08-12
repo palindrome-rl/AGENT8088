@@ -2,7 +2,7 @@
 
 [← Wiki index](README.md)
 
-22 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+21 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
 is what the permission layer gates on — see
 [Permissions & Security](03-permissions-and-security.md).
 
@@ -105,11 +105,25 @@ Notes that save time:
 - Everything stays behind the SSRF guard, which is exactly why HTTP is a *mode*
   rather than something you'd shell out to `curl` for.
 
-Disable a built-in without editing the file:
+### Disabling a built-in
+
+There is **no `disabled_tools` config key** — the loader has no such filter, so
+setting one has no effect. To drop a tool, comment out its line (the parser
+skips blank lines and `#`):
+
+```
+# browse_page|Load a user-supplied web page…
+```
+
+To do it without editing the installed package, copy `tools.txt`, remove the
+line, and point config at your copy:
 
 ```ini
-disabled_tools=browse_page
+tools_file=~/.agent8088/tools.txt
 ```
+
+Either way, confirm it is gone with `/tools` — the registry is what the model is
+offered, so a tool absent there cannot be called at all.
 
 ## `describe_capabilities`
 

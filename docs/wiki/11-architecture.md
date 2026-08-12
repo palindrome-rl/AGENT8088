@@ -38,7 +38,7 @@ than a design choice.
 | `gateway/agent_bridge.py` | Bridges a chat turn to `run_agent()` |
 | `gateway/session.py` | Per-chat JSON session files |
 | `gateway/auth.py` | Allowlist, per-platform scoping, WhatsApp id normalisation |
-| `gateway/platforms/*.py` | Slack / WhatsApp / Discord adapters |
+| `gateway/platforms/*.py` | Slack / WhatsApp / Discord / Telegram / Email adapters |
 | `tools.txt` | Tool registry (data, not code) |
 | `system.md` | Base system prompt |
 | `config.txt` | Default settings |

@@ -124,7 +124,7 @@ Client config:
 
 ### What's exposed
 
-Read-only by default — 8 tools:
+Read-only by default — 6 tools (`EXPOSED_TOOLS` in `src/agent8088/mcp_server.py`):
 
 | Tool | |
 |---|---|
@@ -178,9 +178,9 @@ needs an authenticated proxy that is not included in Agent8088.
 ## Both directions at once
 
 Nothing stops you connecting servers *and* serving. A useful pattern:
-`browse_page` disabled in favour of a Playwright MCP server, while exposing
-Agent8088's search tools to your editor's agent:
+`browse_page` dropped in favour of a Playwright MCP server, while exposing
+Agent8088's search tools to your editor's agent.
 
-```ini
-disabled_tools=browse_page
-```
+To drop it, comment out its line in `tools.txt` — there is no `disabled_tools`
+config key, and setting one has no effect. See
+[Disabling a built-in](04-tools.md#disabling-a-built-in).

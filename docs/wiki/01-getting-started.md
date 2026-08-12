@@ -43,7 +43,7 @@ Install the extras you actually need:
 | Extra | Gives you |
 |---|---|
 | *(base)* | CLI, all 21 tools, MCP client and server |
-| `gateway` | Slack, WhatsApp and Discord adapters |
+| `gateway` | Slack, WhatsApp, Discord, Telegram and Email adapters |
 | `dev` | `pytest` for the test suite |
 
 > Without the `gateway` extra the Slack/Discord tests fail at import rather

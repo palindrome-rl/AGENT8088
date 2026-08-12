@@ -209,6 +209,46 @@ DMs are always accepted; in groups/supergroups it **requires an @mention of
 the bot or a reply to one of its messages**. The @mention is stripped from
 the text before the model sees it.
 
+### Email
+
+Polls IMAP for new mail and replies over SMTP, so any mailbox works — no bot
+registration and no platform app to create.
+
+```ini
+email_enabled=1
+email_allowed_users=you@example.com,colleague@example.com
+email_smtp_port=587      # optional, this is the default
+email_imap_port=993      # optional, this is the default
+email_verify_sender=1    # optional, on by default
+```
+
+Credentials live in `~/.agent8088/.env`, never in `config.txt`:
+
+```
+EMAIL_ADDRESS=you@gmail.com
+EMAIL_PASSWORD=app-specific-password
+EMAIL_SMTP_HOST=smtp.gmail.com
+EMAIL_IMAP_HOST=imap.gmail.com
+```
+
+Use an app-specific password, not your account password — Gmail and most
+providers require one anyway once 2FA is on.
+
+Replies thread against the sender's original subject and `Message-ID`, so a
+conversation stays in one mail thread rather than starting a new one each turn.
+
+`email_verify_sender=1` (the default) reads the `Authentication-Results` header
+and requires `dmarc=pass`, `spf=pass` or `dkim=pass` before the allowlist is
+even consulted — authentication runs *first*, because a `From:` header on its
+own is trivially forgeable. Turning it off means anyone who can spoof a `From:`
+line matching `email_allowed_users` can drive your agent.
+
+It **fails closed**: a message with no `Authentication-Results` header at all is
+rejected. If your mail server does not add that header, every message is
+silently dropped — that is the setting to look at first when the bot receives
+nothing. Unauthorized mail is discarded without a reply either way, so silence
+is the expected symptom rather than an error.
+
 ## Sessions
 
 Per-chat history in `~/.agent8088/gateway-sessions/`, one JSON file per

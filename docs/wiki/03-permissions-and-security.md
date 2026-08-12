@@ -440,7 +440,7 @@ different means:
 
 | Surface | Default | Approvals |
 |---|---|---|
-| **Gateway** (Slack/WhatsApp/Discord) | `readonly` | `/approve` + `/deny` in chat; Discord gets ✅/❌ buttons with a **fail-closed** timeout |
+| **Gateway** (Slack/WhatsApp/Discord/Telegram/Email) | `readonly` | `/approve` + `/deny` in chat; Discord gets ✅/❌ buttons with a **fail-closed** timeout |
 | **MCP server** (`--mcp-serve`) | read-only tool set | none possible — MCP has no approval channel, so writes are opt-in via `mcp_server_allow_writes=1` |
 
 The gateway also rate-limits per user (`gateway_rate_limit_per_min`, default 20,

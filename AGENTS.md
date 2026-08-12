@@ -47,7 +47,7 @@ Not lazy about: understanding the problem (read it fully and trace the real flow
 
 From `docs/Practical-Software-Engineering-Field-Guide (2).md` — follow these on every change.
 
-**Done** means: code works for the intended case and the obvious edge cases; tests exist that would fail if someone broke this in six months; CI is green (lint, types, tests); the change is reviewed; anything a future reader needs is written down; it has been observed working somewhere other than the author's laptop; nothing left commented-out, no debug prints, no `TODO: fix later` without a linked issue.
+**Done** means: code works for the intended case and the obvious edge cases; tests exist that would fail if someone broke this in six months; the local gates are green (there is no hosted CI on this repo — run `scripts/release_check.py` and the suites in `docs/wiki/12-testing-and-verification.md`); the change is reviewed; anything a future reader needs is written down; it has been observed working somewhere other than the author's laptop; nothing left commented-out, no debug prints, no `TODO: fix later` without a linked issue.
 
 **Commits** — one logical change per commit that leaves the repo working. Conventional shape: `<type>: <imperative summary, <=50 chars>`; body explains *why*, not what the diff already shows. Run `git status` and `git diff --staged` before every commit.
 
@@ -73,7 +73,7 @@ Every code change must have tests that would fail if the logic broke. The test s
 
 | Directory | What it covers |
 |---|---|
-| `tests/gateway/platforms/` | Per-adapter unit tests (Slack, WhatsApp, Discord, Email) |
+| `tests/gateway/platforms/` | Per-adapter unit tests (Slack, WhatsApp, Discord, Telegram, Email) |
 | `tests/gateway/` | Gateway runner, auth, session store, agent bridge |
 | `tests/test_mcp.py` | MCP client (connecting to external servers) |
 | `tests/test_mcp_server.py` | MCP server mode (exposing tools to external agents) |
