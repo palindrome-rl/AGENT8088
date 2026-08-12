@@ -20,6 +20,7 @@ review of this code and were caught only by running it:
     of these paths comes from $env:LOCALAPPDATA, which contains a space
     whenever the account name does.
 """
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,7 +40,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     "{installer}", [ref]$null, [ref]$null)
 $wanted = @("Test-ProgressAnimated", "Format-ProgressBar", "Format-ProgressSweep",
             "Get-ReportedPercent", "Invoke-WithProgress", "ConvertTo-ArgumentString",
-            "Write-Info", "Write-Warn")
+            "Get-ProgressLineWidth", "Format-ProgressLine", "Write-Info", "Write-Warn")
 foreach ($fn in $ast.FindAll({{
     $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }}, $true)) {{
     if ($wanted -contains $fn.Name) {{ . ([scriptblock]::Create($fn.Extent.Text)) }}
@@ -165,6 +166,67 @@ def test_an_argument_containing_a_space_survives_intact(tmp_path):
     assert quoted  # the path really did contain a space
 
 
+def _run_script(script, args='@("install")'):
+    return _powershell(
+        'function Test-ProgressAnimated { $true }\n'
+        f'$code = Invoke-WithProgress -Label "npm" -FilePath "{script}" '
+        f'-ArgumentList {args}\n'
+        'Write-Output "EXIT=$code"'
+    ).splitlines()[-1]
+
+
+def test_a_powershell_script_runs(tmp_path):
+    """The exact shape that broke the WhatsApp bridge stage.
+
+    A standard Node install ships npm three ways side by side -- npm (bash),
+    npm.cmd and npm.ps1 -- and Get-Command resolves to npm.ps1. The call
+    operator ran that in-process; Start-Process cannot, because CreateProcess
+    has no image to load and -NoNewWindow with a redirect rules out
+    ShellExecute. It failed with "%1 is not a valid Win32 application".
+    """
+    script = tmp_path / "fake_npm.ps1"
+    script.write_text("Write-Output 'installing'\nexit 0\n", encoding="ascii")
+
+    assert _run_script(script) == "EXIT=0"
+
+
+def test_a_failing_powershell_script_reports_its_exit_code(tmp_path):
+    script = tmp_path / "fake_npm.ps1"
+    script.write_text("exit 7\n", encoding="ascii")
+
+    assert _run_script(script) == "EXIT=7"
+
+
+def test_a_batch_file_runs(tmp_path):
+    """npm.cmd is what Resolve-NpmLauncher now prefers, so it has to work."""
+    script = tmp_path / "fake_npm.cmd"
+    script.write_text("@echo off\r\necho installing\r\nexit /b 0\r\n", encoding="ascii")
+
+    assert _run_script(script) == "EXIT=0"
+
+
+def test_a_script_in_a_path_with_spaces_runs(tmp_path):
+    """Program Files is where Node actually lives."""
+    directory = tmp_path / "node dir"
+    directory.mkdir()
+    script = directory / "fake npm.ps1"
+    marker = directory / "ran.txt"
+    script.write_text(f"'ok' | Set-Content -LiteralPath '{marker}'\nexit 0\n", encoding="ascii")
+
+    assert _run_script(script) == "EXIT=0"
+    assert marker.exists(), "the script never actually ran"
+
+
+def test_npm_is_resolved_to_something_start_process_can_launch():
+    """Get-Command alone returns npm.ps1; the launcher must prefer npm.cmd."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert "function Resolve-NpmLauncher" in installer
+    assert '$npmExe = (Get-Command npm' not in installer, \
+        "back to the .ps1 that Start-Process cannot launch"
+    assert installer.count("$npmExe = Resolve-NpmLauncher") == 2
+
+
 def test_a_missing_executable_does_not_abort_the_install():
     """These stages are optional; the progress display must never be fatal."""
     out = _powershell(
@@ -192,6 +254,72 @@ def test_the_plain_fallback_runs_the_command_too():
 # ---------------------------------------------------------------------------
 # the stages are actually wired to it
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# erasing the animated line
+#
+# The line is erased by overwriting it with spaces, so the erase has to be as
+# wide as the widest line drawn. A fixed 78 was too narrow for the gateway
+# stage, whose line came to 88 characters -- the 10 past the end were never
+# cleared and "ram)    2s", the tail of "...Telegram)    2s", was left stranded
+# on the completed [OK] line above it.
+# ---------------------------------------------------------------------------
+LONG_LABEL = "Gateway adapters (Slack, Discord, WhatsApp, Telegram)"
+
+
+def _rendered_width(label, width, suffix="   2s"):
+    """Measured inside PowerShell: the indent and padding are the point here,
+    and this module's helper strips surrounding whitespace off stdout."""
+    bar = "[" + "." * 24 + "]"
+    return int(_powershell(
+        f'Write-Output (Format-ProgressLine -Bar "{bar}" -Label "{label}" '
+        f'-Suffix "{suffix}" -Width {width}).Length'
+    ))
+
+
+def test_a_long_label_cannot_overrun_the_erase_width():
+    """The exact line that stranded "ram)    2s" on screen."""
+    assert _rendered_width(LONG_LABEL, 78) == 78
+
+
+def test_every_label_renders_to_exactly_the_erase_width():
+    """Short lines must be padded, or the tail of a previous line survives."""
+    for label in ("x", "Keyless web search backend (ddgs)", LONG_LABEL, "y" * 200):
+        assert _rendered_width(label, 78) == 78, f"{label[:20]!r} broke the width"
+
+
+def test_the_line_never_exceeds_the_window_and_wraps():
+    """A wrapped line cannot be erased: \\r only returns to the last screen row."""
+    for width in (40, 60, 78, 100):
+        assert _rendered_width(LONG_LABEL, width) == width
+
+
+def test_the_width_stays_within_the_console():
+    """Reported width must leave the last column free; some terminals wrap on it."""
+    reported = int(_powershell("Write-Output (Get-ProgressLineWidth)"))
+    assert 24 <= reported <= 100
+
+
+def test_the_erase_is_driven_by_the_same_width_as_the_render():
+    """Two independent constants are exactly how the residue appeared: the
+    render grew past a hardcoded erase and the overflow stayed on screen."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert '(" " * $width)' in installer, "erase no longer tracks the render width"
+    for hardcoded in ('.PadRight(78)', '(" " * 78)'):
+        assert hardcoded not in installer, f"fixed erase width is back: {hardcoded}"
+
+
+def test_the_shipped_labels_fit_an_eighty_column_console():
+    """Truncating mid-word is legible but looks broken; the labels should fit."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+    labels = re.findall(r'Invoke-WithProgress -Label "([^"]+)"', installer)
+
+    assert labels, "no progress stages found"
+    for label in labels:
+        # 2 indent + 26 bar + 2 spaces + suffix of 5 ("  60%" / " 120s")
+        assert len(label) + 35 <= 78, f"{label!r} overruns an 80-column console"
+
+
 def test_the_long_stages_no_longer_swallow_their_output():
     """A helper nothing calls would leave the console just as silent."""
     installer = INSTALLER.read_text(encoding="utf-8")
