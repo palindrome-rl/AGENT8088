@@ -31,7 +31,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 | **Work safely by default** | `readonly` is the default. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
 | **Delegate without losing context** | Five restricted sub-agent profiles handle exploration, research, coding, verification, and general-purpose work in separate runs. |
-| **Use tools without lock-in** | 22 built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
+| **Use tools without lock-in** | 21 built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
 | **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |

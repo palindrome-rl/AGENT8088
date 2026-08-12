@@ -79,7 +79,7 @@ nameserver.
 
 ## Approvals
 
-Agent8088's flattened form of Hermes' `approvals:` block.
+Flat keys rather than a nested block, so every approval setting is greppable.
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -192,10 +192,14 @@ cannot hand itself a fresh write budget.
 | `system_file` | Path to `system.md` (base prompt). |
 | `user_file` | Path to `USER.md` (persona). |
 | `skills_dir` / `agents_dir` | Skill packages and sub-agent profiles. |
-| `disabled_tools` | Comma-separated tools to unregister. |
 | `subagent_max_depth` | Recursion limit for `spawn_subagent`. |
 | `default_subagent` | Profile used when none is named. |
 | `banner_file` | Custom startup banner. |
+
+> To remove a built-in tool, comment out its line in `tools.txt` — see
+> [Disabling a built-in](04-tools.md#disabling-a-built-in). There is no
+> `disabled_tools` key; an earlier version of this page documented one that was
+> never implemented.
 
 ## API keys and the `.env` store
 

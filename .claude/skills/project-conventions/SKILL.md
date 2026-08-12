@@ -30,9 +30,15 @@ This forces repo-relative path loading so tests never depend on (or write to) a 
 
 `slack-bolt`, `slack-sdk`, `httpx`, `discord.py` are the `gateway` extras (`pip install -e ".[gateway]"`), not core dependencies. Without them, the Slack/Discord platform tests fail with `ModuleNotFoundError` at import time rather than skipping cleanly — that's ~19 failures that look like real breakage but are just a missing optional dependency. Always check `pip show slack-bolt` (or just try installing the extras) before treating a wall of gateway-test failures as a regression.
 
-## An unresolved, real precedence disagreement
+## Provider key precedence (settled — this note is the record)
 
-`tests/test_providers.py::test_configured_api_key_wins_over_adapter_environment_key` is marked `xfail(strict=False)`, not fixed. `_provider_api_key()`'s docstring says ".env file first, then os.environ, then direct api_key" — the test asserts the opposite (a configured `api_key` should win over an env var). This is a genuine product decision, not a stale test — don't silently resolve it by picking a side. If asked to fix it, surface the disagreement and ask which precedence is intended before changing either the code or the test.
+This was once an open disagreement: `test_configured_api_key_wins_over_adapter_environment_key` was `xfail`, and `_provider_api_key()`'s docstring contradicted it. **Both have since been reconciled.** The order is now stated identically in the docstring, the tests, and the docs:
+
+1. the `.env` key store — where `_migrate_keys_to_env` writes, so it outranks a leftover plaintext key
+2. an explicit `api_key` in `config.txt`
+3. `os.environ` — **last**, so a stray shell export (`OPENAI_API_KEY` set for another tool) cannot silently redirect a configured provider
+
+No `xfail` remains in `tests/test_providers.py`, and the seven precedence tests pass. Documented in `docs/wiki/02-configuration.md#resolution-order`. If you change the order, change all four places together.
 
 ## `_wrap_untrusted` has already broken once from a silent duplicate definition
 

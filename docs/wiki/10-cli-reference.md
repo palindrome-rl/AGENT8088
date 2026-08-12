@@ -35,9 +35,6 @@ usage: agent8088 [-h] [--version] [--edit] [--full-auto]
 
 Run with no flags for the interactive REPL.
 
-> The top-level `README.md` flag list predates the MCP-server work and omits
-> `--mcp-serve` / `--mcp-http` / `--mcp-port` / `--mcp-host`.
-
 ## Slash commands
 
 **36 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
@@ -119,7 +116,7 @@ Run with no flags for the interactive REPL.
 
 ## Gateway commands
 
-Inside Slack / WhatsApp / Discord:
+Inside Slack / WhatsApp / Discord / Telegram / Email:
 
 | Command | Does |
 |---|---|

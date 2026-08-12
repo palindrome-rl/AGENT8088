@@ -4,11 +4,23 @@
 
 Three layers, all runnable offline with no model backend.
 
-| Layer | Command | Scale |
+| Layer | Command | Covers |
 |---|---|---|
-| Unit tests | `uv run python -m pytest tests/` | 627 tests, ~10s |
-| Feature verification | `scripts/verify_features.py` | 89 checks, 13 sections |
-| Exhaustive verification | `scripts/verify_everything.py` | 450 checks, 20 sections |
+| Unit tests | `uv run python -m pytest tests/` | Permission layer, tools, gateway, MCP |
+| Feature verification | `scripts/verify_features.py` | Real behaviour in temp repos and sandboxes |
+| Exhaustive verification | `scripts/verify_everything.py` | Tool specs, shell-classifier matrix, CLI surface |
+
+## Prerequisites
+
+Install the sandbox runtime before running anything here:
+
+```sh
+agent8088 --sandbox-setup     # or: start Docker
+```
+
+Agent8088 refuses to run commands with no isolation available — see
+[No unsandboxed fallback](06-sandboxing.md#no-unsandboxed-fallback) — so the
+checks that exercise shell and permission behaviour cannot complete without it.
 
 ## 1. Unit tests
 
@@ -35,7 +47,7 @@ AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_capabilities.py
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/test_rate_limit.py -q  # gateway rate limiting
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp.py -q             # MCP client
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp_server.py -q      # MCP server
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/ -q                # all 3 platforms
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/ -q                # all 5 platforms
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_env_key_store.py -q   # .env store + redaction
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_providers.py -q       # providers + key precedence
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_subagents.py -q       # sub-agents + guardrails
@@ -43,9 +55,8 @@ AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_subagents.py -q
 
 ### Gateway extras are required
 
-Without them, the Slack/Discord tests fail at **import** rather than skipping —
-roughly 19 failures that look like real breakage but are a missing optional
-dependency:
+Without them, the Slack/Discord adapters fail at **import** rather than skipping
+— which looks like real breakage but is a missing optional dependency:
 
 ```sh
 uv sync --all-extras --locked
@@ -165,9 +176,10 @@ skipping when native sandbox prerequisites are absent.
 Run it after `agent8088 --sandbox-setup` on macOS, Linux, and Windows. Windows
 needs the one-time restricted-account setup accepted during that command.
 
-Manual release evidence remains required for WhatsApp, Slack, Discord, and
-email: authenticate a staging account, send and receive one authorized message,
-confirm an unauthorized sender is refused, and verify disconnect/reconnect.
+Manual release evidence remains required for WhatsApp, Slack, Discord, Telegram
+and email: authenticate a staging account, send and receive one authorized
+message, confirm an unauthorized sender is refused, and verify
+disconnect/reconnect.
 
 ## Interpreting expected skips
 
@@ -179,16 +191,12 @@ These are normal on a clean machine and not failures:
 | `configured search backend reachable` | the temporary LAN SearXNG at `127.0.0.1:8888` is unreachable from this machine |
 | `REAL native sandbox` | sandbox runtime not installed |
 
-## Current state
+If the sandbox runtime is missing, checks that exercise shell and permission
+behaviour report `a sandbox is required to run code` instead of completing.
+That is the isolation rule working as designed — install the runtime rather than
+changing the check.
 
-Verified on the tree this wiki documents:
-
-| Suite | Result |
-|---|---|
-| Unit tests | 627 passed, 0 failed |
-| `verify_features.py` | 89 passed, 0 failed, 4 skipped |
-| `verify_everything.py` | 450 passed, 0 failed, 4 skipped |
-| Duplicate-def check | clean |
+## No CI
 
 There is **no CI**. GitHub Actions is blocked by a billing issue on this
 account, so a workflow was written and then removed rather than left
