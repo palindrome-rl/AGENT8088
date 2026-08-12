@@ -218,7 +218,7 @@ def recall_block(query, *, identity=None, limit=None) -> str:
 # -- capture ---------------------------------------------------------------
 
 def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-            in_background=False):
+            in_background=False, on_stored=None):
     """Distil and store durable facts from a finished exchange.
 
     Returns the number stored, or 0. `user_turns` must already be narrowed to the
@@ -230,21 +230,21 @@ def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
             target=_capture_guarded,
             args=(user_turns, answer),
             kwargs={"identity": identity, "run_id": run_id, "agent_id": agent_id,
-                    "close_connection": True},
+                    "on_stored": on_stored, "close_connection": True},
             name="agent8088-memory-capture",
             daemon=True,
         )
         thread.start()
         return thread
     return _capture_guarded(user_turns, answer, identity=identity, run_id=run_id,
-                            agent_id=agent_id)
+                            agent_id=agent_id, on_stored=on_stored)
 
 
 def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-                     close_connection=False):
+                     on_stored=None, close_connection=False):
     try:
         return _capture(user_turns, answer, identity=identity, run_id=run_id,
-                        agent_id=agent_id)
+                        agent_id=agent_id, on_stored=on_stored)
     except Exception as exc:
         log.debug("memory capture failed: %s", exc)
         return 0
@@ -260,7 +260,8 @@ def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id
                     log.debug("closing the previous memory store failed: %s", exc)
 
 
-def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None):
+def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
+             on_stored=None):
     if not enabled() or not _RUNTIME.get("capture_enabled"):
         return 0
     completion = _RUNTIME.get("completion")
@@ -294,6 +295,8 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None):
     _LAST_CAPTURE.update(usage or {})
     candidates = parse_response(raw, max_memories=max_per_turn)
     if not candidates:
+        if on_stored:
+            on_stored([])
         return 0
 
     texts = [redact(item["text"]) for item in candidates]
@@ -304,7 +307,7 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None):
         # them, and /memory status reports what needs re-embedding.
         vectors = [None] * len(texts)
 
-    stored = 0
+    stored, stored_rows = 0, []
     for item, text, vector in zip(candidates, texts, vectors):
         if not text.strip():
             continue
@@ -321,7 +324,14 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None):
         )
         if memory_id:
             stored += 1
+            stored_rows.append({"id": memory_id, "text": text,
+                                "categories": item.get("categories") or []})
     _LAST_CAPTURE["stored"] = stored
+    if on_stored:
+        # Handed to the caller rather than printed here: the CLI's capture runs on
+        # a background thread, and writing to the console from there would
+        # interleave with whatever the user is typing at the prompt.
+        on_stored(stored_rows)
     return stored
 
 

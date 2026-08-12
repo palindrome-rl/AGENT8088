@@ -4833,6 +4833,19 @@ MEMORY_EXTRACT_MODEL = APP_CONFIG.get("memory_extract_model", "").strip()
 MEMORY_EMBED_PROVIDER = (APP_CONFIG.get("memory_embed_provider", "").strip()
                          or "ollama")
 
+# Presentation hook, set by a front end that wants to show what memory stored.
+# Same shape as subagent_ui and _plan_on_step: the loop stays free of rendering,
+# and a front end that sets nothing sees no change in behaviour.
+#
+# It is handed the stored rows rather than printing them, because capture runs on
+# a background thread in the REPL -- writing to the console from there would
+# interleave with whatever the user is typing.
+memory_on_capture = None
+
+# The capture thread of the most recent turn, so a front end can wait for it
+# before reporting. None when capture ran synchronously or did not run.
+memory_capture_thread = None
+
 
 def _memory_extract_completion(prompt: str):
     """One model call for fact extraction. Returns (text, usage).
@@ -4921,6 +4934,7 @@ def _recalled_memory_prompt(messages, system_prompt, identity=None):
 
 def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
                          in_background=False) -> None:
+    global memory_capture_thread
     """Store what this turn taught, after the answer is already the user's.
 
     Only the last genuine user turn is offered: earlier ones were captured when
@@ -4941,8 +4955,10 @@ def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
     if not turns:
         return
     try:
-        memory.capture([_message_text(turns[-1])], answer, identity=identity,
-                       run_id=run_id, in_background=in_background)
+        result = memory.capture([_message_text(turns[-1])], answer, identity=identity,
+                               run_id=run_id, in_background=in_background,
+                               on_stored=memory_on_capture)
+        memory_capture_thread = result if in_background else None
     except Exception as exc:
         _log.debug("memory capture skipped: %s", exc)
 
@@ -5770,6 +5786,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         reset_turn_counters()
         reset_approval_state()
         reset_turn_approval_state()
+        global memory_capture_thread
+        memory_capture_thread = None
         kwargs["system_prompt"] = _recalled_memory_prompt(
             messages, kwargs.get("system_prompt"), identity=memory_identity)
     answer = None

@@ -148,6 +148,7 @@ On by default. Full explanation in [Memory](16-memory.md).
 | `memory_rrf_k` | `60` | RRF damping constant. Lower makes rank 1 dominate; higher flattens. |
 | `memory_min_score` | `0` | Drop fused hits below this score. |
 | `memory_max_per_turn` | `10` | Cap on facts one turn may create. |
+| `memory_notifications` | `on` | What you see when a turn learns something: `off` silent, `on` a one-line count, `verbose` the facts themselves plus a line on turns that stored nothing. `/memory notify` changes it live. |
 
 Only what **you** type can become a memory or trigger a recall — tool output
 never does — and a recalled memory can never authorise a tool call.
