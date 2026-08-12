@@ -1899,6 +1899,7 @@ def _remove_agent8088_config_exports():
 
 def _run_uninstall():
     import shutil
+    import stat
     home = _agent8088_home()
     print(f"This will permanently remove Agent8088 from: {home}")
     answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
@@ -1909,7 +1910,12 @@ def _run_uninstall():
         print(f"Refusing to remove unsafe path: {home}")
         return False
     if home.exists():
-        shutil.rmtree(home)
+        # git pack files (.idx/.pack) are created read-only on Windows; rmtree's
+        # os.unlink raises PermissionError on them. Clear the bit and retry.
+        def _clear_readonly(func, path, _exc):
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        shutil.rmtree(home, onerror=_clear_readonly)
         print(f"Removed {home}")
     else:
         print(f"Install directory not found: {home}")
