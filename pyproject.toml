@@ -20,11 +20,24 @@ dependencies = [
     # error. Reached only through web_search.DdgsProvider, which enforces the
     # egress policy on its fixed upstream hosts before the library runs.
     "ddgs>=9,<10",
+    # Both of these are imported directly by cli.py and were reaching the
+    # install only as transitive dependencies -- prompt_toolkit via InquirerPy,
+    # Pygments via rich. That works until an upstream drops or re-bounds them,
+    # and the failure is silent rather than loud: both call sites fall back on
+    # ImportError, so Tab completion would quietly disappear and every syntax
+    # theme would quietly validate as invalid. Depend on what you import.
+    "prompt_toolkit>=3.0.1,<4",
+    "Pygments>=2.13,<3",
 ]
 
 [project.optional-dependencies]
 gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
 dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
+# Only needed for a provider profile with api_mode=litellm. Kept out of the base
+# install because it is a large dependency serving one optional backend, but
+# declared so `pip install agent8088[litellm]` works instead of leaving the user
+# to discover the package name from a runtime error.
+litellm = ["litellm>=1,<2"]
 
 [project.scripts]
 agent8088 = "agent8088.cli:main"
