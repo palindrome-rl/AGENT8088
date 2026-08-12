@@ -21,6 +21,7 @@ review of this code and were caught only by running it:
     whenever the account name does.
 """
 import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32",
                                 reason="install.ps1 is the Windows installer")
 
 INSTALLER = Path(__file__).resolve().parent.parent / "install.ps1"
+RELEASE_CHECK = Path(__file__).resolve().parent.parent / "scripts" / "release_check.py"
 
 # Lift the named functions out of the AST and declare them. Parsing never runs
 # the script, so none of the installer's stages execute.
@@ -181,7 +183,7 @@ def test_a_powershell_script_runs(tmp_path):
     A standard Node install ships npm three ways side by side -- npm (bash),
     npm.cmd and npm.ps1 -- and Get-Command resolves to npm.ps1. The call
     operator ran that in-process; Start-Process cannot, because CreateProcess
-    has no image to load and -NoNewWindow with a redirect rules out
+    has no image to load and redirected streams rule out
     ShellExecute. It failed with "%1 is not a valid Win32 application".
     """
     script = tmp_path / "fake_npm.ps1"
@@ -241,6 +243,133 @@ def test_a_stage_is_given_no_access_to_the_console_input():
 
     assert "-RedirectStandardInput $inLog" in installer, \
         "stages are sharing the user's console input again"
+
+
+def test_a_progress_child_cannot_modify_the_installers_console():
+    """The progress child needs no console because all three streams are
+    redirected. A shared console lets it corrupt input/output modes globally."""
+    installer = INSTALLER.read_text(encoding="utf-8")
+    progress = installer[
+        installer.index("function Invoke-WithProgress"):installer.index("function Protect-ConfigFile")
+    ]
+
+    assert "-WindowStyle Hidden" in progress
+    assert "-NoNewWindow" not in progress
+
+
+def test_agent_startup_repairs_only_missing_console_flags(tmp_path, monkeypatch):
+    """An already-corrupted PowerShell window must be usable without requiring
+    the user to discover that closing and reopening it repairs the symptom."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+
+    modes = {10: 0, 20: 0x0040}
+    writes = []
+
+    class Stream:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def fileno(self):
+            return self.handle
+
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(cli.os, "name", "nt")
+    monkeypatch.setattr(cli.sys, "stdin", Stream(10))
+    monkeypatch.setattr(cli.sys, "stdout", Stream(20))
+    monkeypatch.setattr(
+        cli,
+        "_windows_console_functions",
+        lambda: (
+            lambda stream: stream.handle,
+            lambda handle: modes[handle],
+            lambda handle, mode: writes.append((handle, mode)),
+        ),
+    )
+
+    assert cli._repair_windows_console() is True
+    assert writes == [(10, 0x0007), (20, 0x0047)]
+
+
+def test_windows_repl_keeps_completion_space_above_the_status_bar(
+        tmp_path, monkeypatch):
+    """The completion menu must not share and displace the sticky footer."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+    import prompt_toolkit
+
+    captured = {}
+
+    class Tty:
+        @staticmethod
+        def isatty():
+            return True
+
+    monkeypatch.setattr(cli.sys, "stdin", Tty())
+    monkeypatch.setattr(
+        prompt_toolkit,
+        "prompt",
+        lambda message, **kwargs: captured.update(kwargs, message=message) or "hello",
+    )
+
+    assert cli._read_line() == "hello"
+    assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
+    assert "reserve_space_for_menu" not in captured
+    assert captured["message"].value.startswith("\n")
+
+
+def test_setup_model_discovery_has_a_short_timeout_and_no_retries(
+        tmp_path, monkeypatch, capsys):
+    """A dead custom endpoint must fall back to model entry instead of making
+    setup look frozen behind the OpenAI SDK's retry policy."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli, providers
+
+    config = tmp_path / "config.txt"
+    config.write_text(
+        "default_provider=openai\nprovider.openai.model=typed-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.A, "ENV_FILE_PATH", tmp_path / ".env")
+    monkeypatch.setattr(cli, "_choice_prompt", lambda *_args, **_kwargs: "openai")
+    monkeypatch.setattr(
+        cli,
+        "_custom_prompt",
+        lambda message, *_args, **_kwargs: (
+            "key" if message.startswith("API key") else "typed-model"
+        ),
+    )
+    created = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+
+    monkeypatch.setattr(providers, "list_models", lambda *_args, **_kwargs: [])
+
+    cli._run_setup(config_path=config, include_workspace=False)
+
+    assert created["timeout"] == cli.MODEL_DISCOVERY_TIMEOUT_SECONDS
+    assert created["max_retries"] == 0
+    assert providers.MODEL_LIST_TIMEOUT_SECONDS == cli.MODEL_DISCOVERY_TIMEOUT_SECONDS
+    assert "enter the model name manually" in capsys.readouterr().out
+
+
+def test_release_gate_uses_the_resolved_windows_launcher(monkeypatch):
+    """Windows command shims such as npm.cmd must be passed to CreateProcess
+    by their resolved path instead of the extensionless command name."""
+    release_check = runpy.run_path(str(RELEASE_CHECK))
+    npm = r"C:\Program Files\nodejs\npm.cmd"
+    monkeypatch.setattr(release_check["shutil"], "which", lambda _name: npm)
+
+    assert release_check["_required_executable"]("npm", "missing") == npm
 
 
 def test_a_stage_that_reads_stdin_fails_instead_of_hanging(tmp_path):

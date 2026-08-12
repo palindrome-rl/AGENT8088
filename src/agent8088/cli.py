@@ -44,6 +44,69 @@ from rich import box
 APP_DIR = Path(__file__).resolve().parent
 console = Console()
 
+# Model discovery is a convenience in an interactive wizard, not a prerequisite
+# for configuration.  Keep it short and do not let the OpenAI SDK retry a dead
+# or mistyped custom endpoint behind an unchanging "Fetching model list..."
+# message.  The user can always type the model id when discovery is unavailable.
+MODEL_DISCOVERY_TIMEOUT_SECONDS = 5
+
+
+def _windows_console_functions():
+    """Return the small Win32 console API surface used by startup repair."""
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def get_handle(stream):
+        return msvcrt.get_osfhandle(stream.fileno())
+
+    def get_mode(handle):
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            raise OSError(ctypes.get_last_error(), "GetConsoleMode failed")
+        return mode.value
+
+    def set_mode(handle, mode):
+        if not kernel32.SetConsoleMode(handle, mode):
+            raise OSError(ctypes.get_last_error(), "SetConsoleMode failed")
+
+    return get_handle, get_mode, set_mode
+
+
+def _repair_windows_console():
+    """Restore the minimum interactive console flags Agent8088 relies on.
+
+    Older Windows installer builds let download subprocesses inherit the
+    console input handle.  A child could leave the shared console in raw mode,
+    after which setup dropped typed characters and prompt_toolkit painted an
+    unusable blank REPL.  The installer now prevents that inheritance, but a
+    PowerShell window corrupted by an older run stays corrupted until it is
+    closed.  Repair only missing baseline flags here; preserve every unrelated
+    user/terminal flag.
+    """
+    if os.name != "nt" or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    try:
+        get_handle, get_mode, set_mode = _windows_console_functions()
+        # stdin: processed input, line input, echo input
+        # stdout: processed output, wrap-at-EOL, virtual-terminal processing
+        streams = ((sys.stdin, 0x0001 | 0x0002 | 0x0004),
+                   (sys.stdout, 0x0001 | 0x0002 | 0x0004))
+        repaired = False
+        for stream, required in streams:
+            handle = get_handle(stream)
+            current = get_mode(handle)
+            wanted = current | required
+            if wanted != current:
+                set_mode(handle, wanted)
+                repaired = True
+        return repaired
+    except (OSError, ValueError):
+        # Redirected/pseudo terminals may claim to be TTYs without exposing a
+        # Win32 console handle.  Their existing fallback path remains valid.
+        return False
+
 # A quiet pulsing sparkle for the "thinking" indicator — same idea as Claude Code's own
 # status spinner: a single soft-flashing glyph next to dim status text, not a novelty animation.
 SPINNERS["agent8088_pulse"] = {
@@ -3535,14 +3598,15 @@ def _read_line():
     # the context percentage *and* A.PERMISSION_MODE, so repeating either here
     # would print `plan` an inch above a bar reading `plan-only`. The Rich
     # fallback `_prompt_label()` does keep both — that path has no toolbar.
-    label = "\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
+    label = "\n\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
+    # Keep prompt_toolkit's default menu reserve. Multi-column completion
+    # floats otherwise share the last row and displace the status bar.
     return prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
-        reserve_space_for_menu=0,
     )
 
 
@@ -3942,14 +4006,19 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         secret=True,
     )
     # Fetch models
-    print("\nFetching model list...")
+    print(f"\nFetching model list (up to {MODEL_DISCOVERY_TIMEOUT_SECONDS}s)...")
     try:
         from agent8088.providers import list_models
         from openai import OpenAI
         defaults = provider_registry.builtin_provider_defaults(provider)
         base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
         api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
-        fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
+        fetch_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
         models = list_models(provider, client=fetch_client, fallback=False)
     except Exception:
         models = []
@@ -3960,6 +4029,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             current_model if current_model in models else "",
         )
     else:
+        print("Model discovery unavailable; enter the model name manually.")
         model_name = ""
         while not model_name:
             model_name = _custom_prompt(
@@ -4460,6 +4530,10 @@ def main():
     parser.add_argument("--mcp-port", type=int, default=8931, help="MCP server HTTP port (default 8931)")
     parser.add_argument("--mcp-host", default="127.0.0.1", help="MCP server bind host (default localhost)")
     args = parser.parse_args()
+
+    # Do this before any interactive wizard or prompt.  It is intentionally a
+    # no-op for redirected input, CI, and non-Windows terminals.
+    _repair_windows_console()
 
     if args.uninstall:
         _run_uninstall()
