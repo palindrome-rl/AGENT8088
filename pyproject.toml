@@ -13,25 +13,36 @@ dependencies = [
     "InquirerPy>=0.3.4,<1",
     "mcp>=1.27,<2",
     "Pillow>=9,<13",
-    "playwright>=1.40,<2",
-    # Keyless web search fallback. A hard dependency on purpose: web_search must
-    # always have a backend that needs no Docker, no API key, and no setup step,
-    # so a stopped or unreachable SearXNG still returns results instead of an
-    # error. Reached only through web_search.DdgsProvider, which enforces the
-    # egress policy on its fixed upstream hosts before the library runs.
-    "ddgs>=9,<10",
-    # Both of these are imported directly by cli.py and were reaching the
-    # install only as transitive dependencies -- prompt_toolkit via InquirerPy,
-    # Pygments via rich. That works until an upstream drops or re-bounds them,
-    # and the failure is silent rather than loud: both call sites fall back on
-    # ImportError, so Tab completion would quietly disappear and every syntax
-    # theme would quietly validate as invalid. Depend on what you import.
+    # Both are imported directly by cli.py and were reaching the install only as
+    # transitive dependencies -- prompt_toolkit via InquirerPy, Pygments via
+    # rich. That works until an upstream drops or re-bounds them, and the failure
+    # is silent rather than loud: both call sites fall back on ImportError, so
+    # Tab completion would quietly disappear and every syntax theme would quietly
+    # validate as invalid. Depend on what you import.
+    #
+    # These stay core while playwright and ddgs became extras below: both are
+    # pure Python with no compiled component, so neither can fail an install on
+    # a platform lacking a wheel — which is the only reason the other two moved.
     "prompt_toolkit>=3.0.1,<4",
     "Pygments>=2.13,<3",
 ]
 
 [project.optional-dependencies]
 gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
+# browse_page degrades gracefully without this (engine.py: _playwright_available()),
+# so it's optional rather than a hard dep - keeps install.sh's core install from
+# hard-failing on platforms/Python versions playwright hasn't shipped wheels for yet
+# (e.g. Termux's rolling `pkg install python`, which can land on a brand-new minor).
+browser = ["playwright>=1.40,<2"]
+# Keyless web search fallback: web_search should always have a backend needing
+# no Docker, no API key, and no setup, so an unreachable SearXNG still returns
+# results. install.sh/install.ps1 install this on every platform, so that holds
+# in practice. It is an extra rather than a core dep only because ddgs pulls in
+# primp (Rust), which publishes no Android wheel and cannot build under Termux
+# (rustup has no x86_64-unknown-linux-android target) - as a core dep it failed
+# the entire Termux install. web_search.DdgsProvider already degrades cleanly
+# when absent (_ddgs_installed() -> is_available() False -> SearchFailure).
+search = ["ddgs>=9,<10"]
 dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
 # Only needed for a provider profile with api_mode=litellm. Kept out of the base
 # install because it is a large dependency serving one optional backend, but

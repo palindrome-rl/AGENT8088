@@ -136,7 +136,7 @@ def update_env_file(path: Path, values: dict) -> None:
     path = Path(path)
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     for key, raw_value in values.items():
-        value = str(raw_value)
+        value = str(raw_value).strip()
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", key) or "\n" in value or "\r" in value:
             raise ValueError(f"Invalid env value for {key!r}")
         line = f"{key}={value}"

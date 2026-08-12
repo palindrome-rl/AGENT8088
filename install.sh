@@ -34,6 +34,7 @@ AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
 PYTHON_FALLBACK_VERSIONS=("3.12" "3.10")
+NODE_VERSION="22.11.0"
 
 # Options
 SKIP_SETUP=false
@@ -41,6 +42,13 @@ BRANCH="$REPO_BRANCH"
 IS_INTERACTIVE=true
 FRESH_INSTALL=false
 INITIAL_SETUP_RAN=false
+# Readiness flags set by the new stages so verify_install can report actual state.
+GATEWAY_EXTRAS_INSTALLED=false
+SEARCH_EXTRAS_INSTALLED=false
+CHROMIUM_INSTALLED=false
+NODE_INSTALLED=false
+WHATSAPP_BRIDGE_READY=false
+SANDBOX_INSTALLED=false
 
 # Detect non-interactive mode (curl | bash). When stdin is not a terminal,
 # read -p fails with EOF, causing set -e to abort.
@@ -385,6 +393,7 @@ clone_repo() {
 # Stage 5: Create venv + install the package
 # ----------------------------------------------------------------------------
 install_deps() {
+    local _py="$INSTALL_DIR/venv/bin/python"
     if [ "$DISTRO" = "termux" ]; then
         log_info "Creating venv (stdlib) and installing via pip..."
         python -m venv "$INSTALL_DIR/venv"
@@ -394,16 +403,325 @@ install_deps() {
         pip install --upgrade --force-reinstall -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
     else
         log_info "Creating venv and installing via uv..."
-        "$UV_CMD" venv "$INSTALL_DIR/venv" >/dev/null 2>&1
-        "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
+        "$UV_CMD" venv --python "$PYTHON_PATH" "$INSTALL_DIR/venv" >/dev/null 2>&1
+        "$UV_CMD" pip install --python "$_py" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
             log_error "uv pip install failed; trying with --all-extras"
-            "$UV_CMD" pip install --python "$INSTALL_DIR/venv/bin/python" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
+            "$UV_CMD" pip install --python "$_py" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
                 log_error "Failed to install agent8088"
                 exit 1
             }
         }
     fi
     log_success "agent8088 installed (editable)"
+
+    # --- Gateway adapter Python extras (Slack, Discord, WhatsApp, Telegram) ---
+    # The [gateway] extra from pyproject.toml: slack-bolt, slack-sdk, httpx,
+    # discord.py, python-telegram-bot. Without these, runner.py:463-497 guards
+    # each adapter with try/except ImportError and silently no-ops.
+    log_info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
+    if [ "$DISTRO" = "termux" ]; then
+        pip install -e ".[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
+            log_warn "Gateway extras install failed - core agent still works"
+    else
+        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
+            log_warn "Gateway extras install failed - core agent still works"
+    fi
+    [ "$GATEWAY_EXTRAS_INSTALLED" = true ] && log_success "Gateway adapters installed"
+
+    # --- Keyless web search backend (optional [search] extra) ---
+    # Installed everywhere so web_search keeps its no-key fallback; non-fatal
+    # because ddgs->primp has no Android wheel and cannot build under Termux.
+    log_info "Installing keyless web search backend (ddgs)..."
+    if [ "$DISTRO" = "termux" ]; then
+        pip install -e ".[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
+            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+    else
+        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
+            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+    fi
+    [ "$SEARCH_EXTRAS_INSTALLED" = true ] && log_success "Keyless web search backend installed"
+
+    # --- Playwright (optional [browser] extra) + Chromium binary ---
+    # playwright degrades gracefully at runtime (engine.py: _playwright_available()),
+    # so it's an optional extra, not a core dep - a platform/Python combo without
+    # wheels for it (e.g. Termux landing on a brand-new Python minor) shouldn't
+    # fail the whole install.
+    log_info "Installing Playwright (optional, for browse_page)..."
+    local _playwright_installed=false
+    if [ "$DISTRO" = "termux" ]; then
+        pip install -e ".[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
+            log_warn "Playwright install failed - browse_page will show install instructions"
+    else
+        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
+            log_warn "Playwright install failed - browse_page will show install instructions"
+    fi
+    if [ "$_playwright_installed" = true ]; then
+        log_info "Installing Playwright Chromium browser (~280 MB)..."
+        "$_py" -m playwright install chromium >/dev/null 2>&1 && CHROMIUM_INSTALLED=true || \
+            log_warn "Chromium download failed - browse_page will show install instructions"
+        [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Stage 5b: Node.js (for WhatsApp bridge) + npm install
+# ----------------------------------------------------------------------------
+# WhatsApp's bridge is a Node.js process (Baileys). Without Node on PATH the
+# adapter errors at connect() time. We ensure Node >= 20.11 is available
+# (brew/package manager/download), then npm install in the bridge dir so
+# node_modules is materialized for the bridge to require().
+install_node_bridge() {
+    # --- 1. Ensure Node >= 20.11 is available ------------------------------
+    local _node_ok=false
+    if command -v node >/dev/null 2>&1; then
+        local _ver
+        _ver="$(node --version 2>/dev/null | sed 's/^v//')"
+        local _major="${_ver%%.*}"
+        if [ -n "$_major" ] && [ "$_major" -ge 20 ]; then
+            log_success "Node $_ver found on PATH"
+            _node_ok=true
+        else
+            log_warn "Node $_ver found but < 20 - will install newer Node"
+        fi
+    fi
+
+    # Check managed Node in $AGENT8088_HOME/node
+    if [ "$_node_ok" = false ] && [ -x "$AGENT8088_HOME/node/bin/node" ]; then
+        local _ver
+        _ver="$("$AGENT8088_HOME/node/bin/node" --version 2>/dev/null | sed 's/^v//')"
+        local _major="${_ver%%.*}"
+        if [ -n "$_major" ] && [ "$_major" -ge 20 ]; then
+            export PATH="$AGENT8088_HOME/node/bin:$PATH"
+            log_success "Managed Node $_ver found"
+            _node_ok=true
+        fi
+    fi
+
+    # Install Node if still needed
+    if [ "$_node_ok" = false ]; then
+        local _did_install=false
+        case "$OS" in
+            macos)
+                if command -v brew >/dev/null 2>&1; then
+                    log_info "Installing Node via Homebrew..."
+                    brew install node >/dev/null 2>&1 && _did_install=true || true
+                fi
+                ;;
+            linux)
+                local sudo_cmd=""
+                [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+                case "$DISTRO" in
+                    ubuntu|debian)
+                        # Ubuntu/Debian ship ancient Node (12.x) in apt - too old
+                        # for sandbox-runtime (needs 20.11+). Skip apt and use the
+                        # portable tarball fallback below instead of wasting time
+                        # on a package that will fail the version check.
+                        log_info "Skipping apt nodejs (too old on $DISTRO) - using portable download"
+                        ;;
+                    fedora)
+                        log_info "Installing Node via dnf..."
+                        $sudo_cmd dnf install -y nodejs npm >/dev/null 2>&1 && _did_install=true || true
+                        ;;
+                    arch)
+                        log_info "Installing Node via pacman..."
+                        $sudo_cmd pacman -S --noconfirm nodejs npm >/dev/null 2>&1 && _did_install=true || true
+                        ;;
+                esac
+                ;;
+            android)
+                if is_termux; then
+                    log_info "Installing Node via pkg..."
+                    pkg install -y nodejs >/dev/null 2>&1 && _did_install=true || true
+                fi
+                ;;
+        esac
+
+        # Verify package-manager install worked
+        if [ "$_did_install" = true ] && command -v node >/dev/null 2>&1; then
+            local _ver
+            _ver="$(node --version 2>/dev/null | sed 's/^v//')"
+            local _major="${_ver%%.*}"
+            if [ -n "$_major" ] && [ "$_major" -ge 20 ]; then
+                log_success "Node $_ver installed via package manager"
+                _node_ok=true
+            else
+                log_warn "Installed Node $_ver is still < 20"
+                _did_install=false
+            fi
+        fi
+
+        # Fallback: download a portable Node tarball (no admin needed)
+        if [ "$_node_ok" = false ] && [ "$OS" != "android" ]; then
+            log_info "Downloading portable Node $NODE_VERSION..."
+            local _arch
+            case "$(uname -m)" in
+                x86_64|amd64) _arch="x64" ;;
+                aarch64|arm64) _arch="arm64" ;;
+                *)            _arch="x64" ;;
+            esac
+            local _os_tag _ext
+            # .tar.gz on both: .tar.xz needs xz-utils, which minimal images
+            # (e.g. ubuntu:24.04) do not ship - tar then fails and, under
+            # `set -e`, took down the whole installer at an optional stage.
+            case "$OS" in
+                macos) _os_tag="darwin"; _ext="tar.gz" ;;
+                linux) _os_tag="linux";  _ext="tar.gz" ;;
+            esac
+            local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
+            local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
+            if curl -fsSL "$_url" -o "$_tmp" 2>/dev/null; then
+                mkdir -p "$AGENT8088_HOME/node"
+                # Guarded: Node is optional (WhatsApp bridge only), so a bad
+                # tarball or missing decompressor must warn, not abort the run.
+                tar -xf "$_tmp" -C "$AGENT8088_HOME/node" --strip-components=1 2>/dev/null || true
+                rm -f "$_tmp"
+                if [ -x "$AGENT8088_HOME/node/bin/node" ]; then
+                    export PATH="$AGENT8088_HOME/node/bin:$PATH"
+                    local _ver
+                    _ver="$("$AGENT8088_HOME/node/bin/node" --version 2>/dev/null | sed 's/^v//')"
+                    log_success "Node $_ver installed to $AGENT8088_HOME/node (portable, user-scoped)"
+                    _node_ok=true
+                fi
+            fi
+        fi
+
+        if [ "$_node_ok" = false ]; then
+            log_warn "Could not install Node $NODE_VERSION automatically."
+            log_info "WhatsApp bridge needs Node 20.11+ - install manually from https://nodejs.org/"
+            return 0
+        fi
+    fi
+
+    NODE_INSTALLED=true
+
+    # --- 2. npm install in the WhatsApp bridge dir ------------------------
+    local _bridge_dir="$INSTALL_DIR/src/agent8088/gateway/platforms/whatsapp_bridge"
+    if [ ! -f "$_bridge_dir/package.json" ]; then
+        log_warn "WhatsApp bridge package.json not found at $_bridge_dir - skipping npm install"
+        return 0
+    fi
+    if [ -d "$_bridge_dir/node_modules" ]; then
+        log_success "WhatsApp bridge node_modules already present"
+        WHATSAPP_BRIDGE_READY=true
+        return 0
+    fi
+
+    log_info "Installing WhatsApp bridge npm dependencies..."
+    if npm install --prefix "$_bridge_dir" --no-audit --no-fund >/dev/null 2>&1; then
+        if [ -d "$_bridge_dir/node_modules" ]; then
+            WHATSAPP_BRIDGE_READY=true
+            log_success "WhatsApp bridge npm dependencies installed"
+        else
+            log_warn "WhatsApp bridge npm install reported success but node_modules missing"
+        fi
+    else
+        log_warn "WhatsApp bridge npm install failed"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Stage 5c: Native sandbox runtime (Linux/macOS - auto-setup, Option B)
+# ----------------------------------------------------------------------------
+# install_native_sandbox() (engine.py:3344) needs Node+npm (installed by the
+# prior stage), then runs `npm install @anthropic-ai/sandbox-runtime@<ver>`
+# and checks for OS helper binaries: bwrap+socat+rg on Linux, rg on macOS
+# (sandbox-exec ships with macOS). We install the OS helpers via the distro
+# package manager (reusing the sudo_cmd pattern from check_git), then invoke
+# `agent8088 --sandbox-setup` which runs engine.install_native_sandbox().
+# On Windows this stage is skipped - the sandbox needs an elevated terminal
+# (provisions a restricted account + WFP filter) which a user-scoped installer
+# cannot guarantee. On Termux the bwrap/socat helpers are unreliable and the
+# runtime is not validated there, so we skip it too.
+install_native_sandbox() {
+    # Only auto-run on fresh installs (not updates)
+    [ "$FRESH_INSTALL" = true ] || { log_info "Existing installation updated - skipping sandbox setup"; return 0; }
+    # Only Linux/macOS (Windows needs elevation, Termux helpers unreliable)
+    case "$OS" in
+        linux|macos) ;;
+        *) return 0 ;;
+    esac
+    # Node is a hard prereq for the sandbox runtime
+    [ "$NODE_INSTALLED" = true ] || { log_info "Node not available - native sandbox needs Node 20.11+. Skipping."; return 0; }
+
+    local _shim
+    _shim="$(get_command_link_dir)/agent8088"
+    # The shim may not exist yet (setup_path runs after us). Build the path
+    # the engine uses and invoke the venv python directly.
+    local _py="$INSTALL_DIR/venv/bin/python"
+    if [ ! -x "$_py" ]; then
+        log_warn "venv python not found at $_py - skipping sandbox setup"
+        return 0
+    fi
+
+    # Install OS helper binaries the runtime needs.
+    case "$OS" in
+        linux)
+            local sudo_cmd=""
+            [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+            # engine.py:3003 requires: bwrap, socat, rg
+            local _missing=()
+            command -v bwrap >/dev/null 2>&1 || _missing+=("bubblewrap")  # Debian/Ubuntu pkg name
+            command -v socat >/dev/null 2>&1 || _missing+=("socat")
+            command -v rg >/dev/null 2>&1 || _missing+=("ripgrep")
+            if [ "${#_missing[@]}" -gt 0 ]; then
+                log_info "Installing sandbox OS helpers: ${_missing[*]}..."
+                case "$DISTRO" in
+                    ubuntu|debian)
+                        # Map package names for apt
+                        local _apt_pkgs=()
+                        for _pkg in "${_missing[@]}"; do
+                            case "$_pkg" in
+                                bubblewrap) _apt_pkgs+=("bubblewrap") ;;
+                                socat)      _apt_pkgs+=("socat") ;;
+                                ripgrep)    _apt_pkgs+=("ripgrep") ;;
+                            esac
+                        done
+                        $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_apt_pkgs[@]}" >/dev/null 2>&1 || true
+                        ;;
+                    fedora)
+                        local _dnf_pkgs=()
+                        for _pkg in "${_missing[@]}"; do
+                            case "$_pkg" in
+                                bubblewrap) _dnf_pkgs+=("bubblewrap") ;;
+                                socat)      _dnf_pkgs+=("socat") ;;
+                                ripgrep)    _dnf_pkgs+=("ripgrep") ;;
+                            esac
+                        done
+                        $sudo_cmd dnf install -y "${_dnf_pkgs[@]}" >/dev/null 2>&1 || true
+                        ;;
+                    arch)
+                        local _pacman_pkgs=()
+                        for _pkg in "${_missing[@]}"; do
+                            case "$_pkg" in
+                                bubblewrap) _pacman_pkgs+=("bubblewrap") ;;
+                                socat)      _pacman_pkgs+=("socat") ;;
+                                ripgrep)    _pacman_pkgs+=("ripgrep") ;;
+                            esac
+                        done
+                        $sudo_cmd pacman -S --noconfirm "${_pacman_pkgs[@]}" >/dev/null 2>&1 || true
+                        ;;
+                esac
+            fi
+            ;;
+        macos)
+            # engine.py:3001 requires: sandbox-exec (ships with macOS), rg
+            if ! command -v rg >/dev/null 2>&1; then
+                if command -v brew >/dev/null 2>&1; then
+                    log_info "Installing ripgrep via Homebrew..."
+                    brew install ripgrep >/dev/null 2>&1 || true
+                fi
+            fi
+            ;;
+    esac
+
+    # Invoke the engine's install_native_sandbox() via the CLI flag.
+    log_info "Running native sandbox setup..."
+    if "$_py" -m agent8088.cli --sandbox-setup >/dev/null 2>&1; then
+        SANDBOX_INSTALLED=true
+        log_success "Native sandbox runtime installed"
+    else
+        log_warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' manually"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -476,14 +794,17 @@ EOF
 drop_config() {
     if [ ! -f "$AGENT8088_HOME/config.txt" ]; then
         log_info "Dropping default config.txt to $AGENT8088_HOME/config.txt"
-        # The installed package ships a default config.txt next to engine.py.
-        # Copy it from the venv's site-packages if available, else from repo.
+        # The default config.txt ships at src/agent8088/config.txt in the repo.
+        # For an editable install (-e), site-packages only has a .pth pointer,
+        # so the venv glob misses; the repo source path is the reliable one.
         local src_config="$INSTALL_DIR/venv/lib/python*/site-packages/agent8088/config.txt"
         local found=$(ls $src_config 2>/dev/null | head -1)
         if [ -n "$found" ] && [ -f "$found" ]; then
             cp "$found" "$AGENT8088_HOME/config.txt"
         elif [ -f "$INSTALL_DIR/config.txt" ]; then
             cp "$INSTALL_DIR/config.txt" "$AGENT8088_HOME/config.txt"
+        elif [ -f "$INSTALL_DIR/src/agent8088/config.txt" ]; then
+            cp "$INSTALL_DIR/src/agent8088/config.txt" "$AGENT8088_HOME/config.txt"
         else
             log_warn "No default config.txt found; you'll need to create one"
             return 0
@@ -759,8 +1080,35 @@ verify_install() {
     echo ""
     echo -e "\033[0;32mDone.\033[0m  Run \033[1magent8088\033[0m to start."
     echo "  Config: $AGENT8088_HOME/config.txt"
-    echo "  Native sandbox: agent8088 --sandbox-setup (Docker is the fallback)"
-    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash"
+    # Readiness summary - reflects what actually installed, not static text.
+    if [ "$GATEWAY_EXTRAS_INSTALLED" = true ]; then
+        echo "  Adapters: Slack/Discord/Telegram/WhatsApp (Python deps installed)"
+    else
+        echo "  Adapters: gateway extras not installed (run: uv pip install -e \".[gateway]\")"
+    fi
+    if [ "$SEARCH_EXTRAS_INSTALLED" = true ]; then
+        echo "  Search:   keyless ddgs backend installed"
+    else
+        echo "  Search:   ddgs unavailable - configure SearXNG or an API-key backend"
+    fi
+    if [ "$CHROMIUM_INSTALLED" = true ]; then
+        echo "  Browser:  Chromium installed (browse_page ready)"
+    else
+        echo "  Browser:  Chromium missing (browse_page will show install instructions)"
+    fi
+    if [ "$WHATSAPP_BRIDGE_READY" = true ]; then
+        echo "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"
+    elif [ "$NODE_INSTALLED" = true ]; then
+        echo "  WhatsApp: Node installed but bridge npm deps missing"
+    else
+        echo "  WhatsApp: needs Node 20.11+ (install from https://nodejs.org/)"
+    fi
+    if [ "$SANDBOX_INSTALLED" = true ]; then
+        echo "  Sandbox:  native runtime installed"
+    else
+        echo "  Sandbox:  run 'agent8088 --sandbox-setup' to install the native runtime"
+    fi
+    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
 }
@@ -822,6 +1170,8 @@ main() {
     check_git
     clone_repo
     install_deps
+    install_node_bridge
+    install_native_sandbox
     setup_path
     drop_config
     run_initial_setup

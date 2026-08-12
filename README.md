@@ -42,7 +42,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 
 ### Install the development branch
 
-**macOS, Linux, WSL2, or Termux**
+**macOS, Linux, or WSL2**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
@@ -56,21 +56,35 @@ $env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.co
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
+**What the installer provisions automatically:**
+
+| Component | Linux / macOS | Windows |
+| --- | --- | --- |
+| Core agent (chat, tools, MCP, search) | yes | yes |
+| Gateway adapters (Slack, Discord, WhatsApp, Telegram) | yes | yes |
+| Playwright Chromium (`browse_page`) | yes | yes |
+| Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
+| Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
+
+The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed — run `uv pip install -e ".[dev]"` if you need the test suite.
+
 ### Configure and run
 
 ```sh
 agent8088 --setup            # choose a provider, model, workspace, and search backend
-agent8088 --sandbox-setup    # optional: install the native sandbox runtime
 agent8088                    # start the interactive agent
 ```
 
 The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`. Start with a local Ollama model or select a hosted provider; the agent can switch models later with `/model` or `/models`.
+
+> **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account + WFP egress filter. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
 
 ### A few useful commands
 
 | Command | Purpose |
 | --- | --- |
 | `agent8088` | Start an interactive session. |
+| `agent8088 --uninstall` | Remove the install dir, config, and env vars. |
 | `agent8088 --gateway-setup` | Configure Slack, Discord, WhatsApp, Telegram, or email. |
 | `agent8088 --gateway` | Run the messaging gateway. |
 | `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |

@@ -2983,8 +2983,14 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
             kwargs["default"] = default
         if instruction:
             kwargs["instruction"] = instruction
-        return prompt(**kwargs).execute()
-    except ImportError:
+        value = prompt(**kwargs).execute()
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        # ImportError: InquirerPy not installed.
+        # EOFError/OSError: InquirerPy crashed at runtime (e.g. macOS Python
+        #   3.13 kqueue selector issue with prompt_toolkit, non-interactive
+        #   terminal, piped stdin).
+        # KeyboardInterrupt: user hit Ctrl-C during a prompt.
+        # All fall back to stdlib input()/getpass().
         suffix = ""
         if secret and instruction:
             suffix = f" {instruction}"
@@ -2994,9 +3000,14 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
             suffix += f" {instruction}"
         if secret:
             import getpass
-            return getpass.getpass(f"{message}{suffix} ") or ""
-        value = input(f"{message}{suffix} ").strip()
-        return value or default
+            value = getpass.getpass(f"{message}{suffix} ") or ""
+        else:
+            value = input(f"{message}{suffix} ").strip() or default
+    # Secrets read via getpass on Windows can carry a trailing \r; strip
+    # whitespace so a CRLF in the input doesn't crash update_env_file.
+    if secret:
+        return value.strip()
+    return value
 
 
 def _choice_prompt(message, choices, default=""):
@@ -3006,7 +3017,8 @@ def _choice_prompt(message, choices, default=""):
         if default:
             kwargs["default"] = default
         return inquirer.fuzzy(**kwargs).execute()
-    except ImportError:
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        # See _custom_prompt for why these exceptions are grouped.
         print(message)
         for index, choice in enumerate(choices, 1):
             marker = " (default)" if choice == default else ""
@@ -3236,7 +3248,13 @@ def _remove_agent8088_shim(home):
         text = ""
     if str(home) not in text and "-m agent8088.cli" not in text:
         return False
-    shim.unlink()
+    try:
+        shim.unlink()
+    except PermissionError:
+        # On Windows the running agent8088.exe IS the shim - the OS holds a
+        # lock on it. The deferred cmd.exe rmtree in _run_uninstall will
+        # remove it after this process exits.
+        return False
     return True
 
 
@@ -3258,6 +3276,7 @@ def _remove_agent8088_config_exports():
 
 def _run_uninstall():
     import shutil
+    import stat
     home = _agent8088_home()
     print(f"This will permanently remove Agent8088 from: {home}")
     answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
@@ -3267,11 +3286,38 @@ def _run_uninstall():
     if not _safe_uninstall_home(home):
         print(f"Refusing to remove unsafe path: {home}")
         return False
+
+    def _clear_readonly(func, path, _exc):
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    _deferred = False
     if home.exists():
-        shutil.rmtree(home)
-        print(f"Removed {home}")
+        try:
+            shutil.rmtree(home, onerror=_clear_readonly)
+            print(f"Removed {home}")
+        except PermissionError:
+            # On Windows the running agent8088.exe lives inside `home`, so the
+            # OS holds a lock and rmtree cannot delete it from this process.
+            # Hand the actual deletion to a detached cmd.exe that waits for
+            # this process to exit, then deletes the directory tree.
+            import subprocess
+            del_cmd = (
+                f'timeout /t 2 /nobreak >nul & '
+                f'rmdir /s /q "{home}" 2>nul || '
+                f'(timeout /t 2 /nobreak >nul & rmdir /s /q "{home}" 2>nul) || '
+                f'(timeout /t 3 /nobreak >nul & rmdir /s /q "{home}")'
+            )
+            subprocess.Popen(
+                ["cmd", "/c", del_cmd],
+                close_fds=True, creationflags=0x00000008,  # DETACHED_PROCESS
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            _deferred = True
+            print(f"Scheduled removal of {home} (will complete after this process exits).")
     else:
         print(f"Install directory not found: {home}")
+
     if _remove_agent8088_shim(home):
         print("Removed agent8088 command shim.")
     os.environ.pop("AGENT8088_CONFIG", None)
