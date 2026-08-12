@@ -25,6 +25,12 @@ The absence of an error is not evidence of success. A command that exited 0 can 
 written the wrong content, written to the wrong path, or done nothing at all. Confirm the
 intended effect is present, not merely that nothing complained.
 
+A tool call of yours that fails is your mistake, not evidence about the step. If a command
+comes back "called with no arguments", or is refused, or errors for any reason of your own,
+that tells you nothing about whether the work landed — fix the call and try again, or answer
+`unknown`. Never answer `fail` because your own tooling misfired: a wrong `fail` reverts
+correct work, which is worse than admitting you could not check.
+
 Reply with exactly one verdict line, followed by one or two sentences of evidence:
 
     VERDICT: pass — the claimed effect is present in the environment

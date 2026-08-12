@@ -1968,8 +1968,31 @@ subagent_ui = None
 # ---------------------------------------------------------------------------
 # Tool execution engine
 # ---------------------------------------------------------------------------
+_CONTAINER_WORKSPACE = "/workspace"
+
+
+def _from_container_path(raw_path: str) -> str:
+    """Map a container path back to its host original.
+
+    Shell tools run inside the sandbox, where the workspace is bind-mounted at
+    /workspace, so that is the path the agent sees from `ls` and reports back.
+    The file tools run on the host, where "/workspace/x" is drive-relative and
+    resolves to C:\\workspace\\x — a directory that does not exist. A file the
+    agent had just listed could not then be read, and the error named a path
+    nobody had mentioned.
+
+    Only the prefix is rewritten; the result still goes through the allowed-path
+    check below, so `/workspace/../../etc/passwd` is refused exactly as before.
+    """
+    text = str(raw_path or "").replace("\\", "/")
+    if text != _CONTAINER_WORKSPACE and not text.startswith(_CONTAINER_WORKSPACE + "/"):
+        return str(raw_path or "")
+    relative = text[len(_CONTAINER_WORKSPACE):].lstrip("/")
+    return str(ARTIFACTS_ROOT / relative) if relative else str(ARTIFACTS_ROOT)
+
+
 def resolve_user_path(raw_path: str) -> Path:
-    p = Path(raw_path or "").expanduser()
+    p = Path(_from_container_path(raw_path)).expanduser()
     if not p.is_absolute():
         project_path = PROJECT_ROOT / p
         artifact_path = ARTIFACTS_ROOT / p
@@ -1995,7 +2018,7 @@ def resolve_write_path(raw_path: str) -> Path:
     across two directories, could not run, and the auditor — which resolves a
     bare name against the sandbox workspace — reported the source missing.
     """
-    p = Path(raw_path or "").expanduser()
+    p = Path(_from_container_path(raw_path)).expanduser()
     if p.is_absolute():
         resolved = p.resolve()
         if (not resolved.exists() and resolved != ARTIFACTS_ROOT
@@ -3222,6 +3245,29 @@ def _ensure_docker_image(image: str) -> str:
     return ""
 
 
+def _to_container_path(command: str, workspace: Path) -> str:
+    """Rewrite host paths in a command to the path the container will see.
+
+    The mirror of _from_container_path. The agent reads a file at an absolute
+    Windows path, then passes that same path to a shell command — which runs in
+    the container, where C:\\Users\\... does not exist and the command silently
+    finds nothing. Both directions have to hold or the two tool families cannot
+    describe the same file to each other.
+
+    Handles the escaped spelling too: a path that reached the model through JSON
+    arrives as C:\\\\Users\\\\..., and a replacement that only matched the plain
+    form would leave exactly the calls that came from tool arguments untouched.
+    """
+    host = str(workspace)
+    if not host:
+        return command
+    for spelling in (host.replace("\\", "\\\\"), host, host.replace("\\", "/")):
+        if spelling and spelling in command:
+            command = command.replace(spelling, _CONTAINER_WORKSPACE)
+    return command.replace("\\\\", "/").replace(_CONTAINER_WORKSPACE + "\\",
+                                                _CONTAINER_WORKSPACE + "/")
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "", workspace: Path | None = None,
                          readonly: bool = False) -> str:
@@ -3237,6 +3283,10 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     workspace = str(workspace_path)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     git_image = selected_image.startswith("alpine/git:")
+    # A host path in the command names nothing inside the container. Rewrite it
+    # to the mount point, so a file the agent just read at an absolute Windows
+    # path can also be listed, run or tested by a shell command.
+    command = _to_container_path(command, workspace_path)
     container_command = (["python", "-c", command] if python_code else
                          (["-lc", command] if git_image else ["sh", "-lc", command]))
     argv = [
@@ -3389,6 +3439,24 @@ def _tool_arg_parse_error(name: str, raw: str) -> str:
     return (f"Error: could not parse the arguments for '{name}'. Send valid "
             f"JSON with newlines escaped as \\n, e.g. "
             f'{{"code": "a = 1\\nprint(a)"}}. Received: {raw[:200]}')
+
+
+# Every shape a "you left the argument out" refusal takes: the generic one below,
+# and the per-tool ones ("web_search requires 'query'", "browser tool requires
+# 'url'", "sandboxed execution requires 'code'"). Matching only the first meant
+# the search loop — eight identical argument-less calls — went uncorrected.
+_MISSING_ARG_RE = re.compile(
+    r"^Error: .*?(was called with no arguments|requires '\w+')")
+
+
+def _is_missing_argument_error(result: str) -> bool:
+    """Whether a tool refused because its arguments never arrived.
+
+    That is a malformed call, not a result. Returned as one, the model re-sent
+    the identical shape and the text travelled onward as evidence — an auditor
+    read it as the step having failed.
+    """
+    return bool(_MISSING_ARG_RE.match((result or "").lstrip()))
 
 
 def _tool_arg_missing_error(name: str, missing: str) -> str:
@@ -5419,6 +5487,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
+    missing_args_retries = 0  # times a call arrived without its arguments
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
@@ -5627,6 +5696,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if (PERMISSION_MODE == "plan-only"
                     and result.startswith("Error: plan mode")):
                 plan_mutation_retries += 1
+            # A call whose arguments never arrived is malformed, not a result.
+            # Correct it the way an unknown tool is corrected — a bounded turn
+            # naming what is missing — instead of handing the model back an
+            # error it re-sends verbatim. Eight identical argument-less
+            # web_search calls in one turn is what this costs otherwise, and in
+            # a sub-run the text travels on as evidence the step failed.
+            if _is_missing_argument_error(result) and missing_args_retries < 2:
+                missing_args_retries += 1
+                seen.discard(sig)
+                messages.append({"role": "user", "content": result})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "missing_tool_args",
+                                  "tool": name})
+                continue
             executed = True
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
