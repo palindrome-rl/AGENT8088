@@ -922,6 +922,46 @@ function Install-Node-Bridge {
 }
 
 # ----------------------------------------------------------------------------
+# Stage 5c2: Embedding model for persistent memory
+# ----------------------------------------------------------------------------
+# Memory is on by default, and its semantic recall needs an embedding model. This
+# pulls it here rather than leaving it to first use, because the failure mode
+# otherwise is silent: recall quietly degrades to keyword-only and the user has no
+# reason to suspect the store is working at half strength.
+#
+# nomic-embed-text: 274 MB, 768 dimensions. Chosen over the top-of-leaderboard
+# qwen3-embedding:0.6b (~1.2 GB) because memories are one-line facts and short
+# queries, and BM25 carries half the ranking through RRF. See
+# docs/wiki/16-memory.md.
+#
+# Not fatal if it cannot be pulled: an install that dies because a 274 MB model
+# download failed is worse than one that says memory will use keyword search until
+# the model is there. The message names the exact command to fix it.
+$EmbedModel = "nomic-embed-text"
+
+function Install-Embedding-Model {
+    $ollama = Get-Command ollama -ErrorAction SilentlyContinue
+    if (-not $ollama) {
+        # A cloud provider serves /embeddings itself, so there is nothing to pull.
+        Write-Info "Ollama not found - memory will embed through your configured provider"
+        return
+    }
+    $installed = & ollama list 2>$null | Select-String -Pattern "^$EmbedModel" -Quiet
+    if ($installed) {
+        Write-Success "Embedding model $EmbedModel already present"
+        return
+    }
+    Write-Info "Pulling embedding model $EmbedModel (274 MB, for memory recall)..."
+    & ollama pull $EmbedModel *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Success "Embedding model $EmbedModel installed"
+    } else {
+        Write-Warn "Could not pull $EmbedModel - memory recall will use keyword search only"
+        Write-Warn "Fix it later with:  ollama pull $EmbedModel"
+    }
+}
+
+# ----------------------------------------------------------------------------
 # Stage 5d: Native sandbox runtime (Windows - elevation-aware)
 # ----------------------------------------------------------------------------
 # install_native_sandbox() (engine.py:3344) needs Node+npm (installed by the
@@ -1304,6 +1344,7 @@ Clone-Repo
 Install-Deps
 Install-Gateway-Extras
 Install-Node-Bridge
+Install-Embedding-Model
 Install-Native-Sandbox
 Setup-Path
 Drop-Config
