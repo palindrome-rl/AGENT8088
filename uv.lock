@@ -17,10 +17,12 @@ name = "agent8088"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "ddgs" },
     { name = "inquirerpy" },
     { name = "mcp" },
     { name = "openai" },
     { name = "pillow" },
+    { name = "playwright" },
     { name = "prompt-toolkit" },
     { name = "pygments" },
     { name = "rich" },
@@ -51,6 +53,7 @@ search = [
 
 [package.metadata]
 requires-dist = [
+    { name = "ddgs", specifier = ">=9,<10" },
     { name = "ddgs", marker = "extra == 'search'", specifier = ">=9,<10" },
     { name = "discord-py", marker = "extra == 'gateway'", specifier = ">=2.3.0,<3" },
     { name = "httpx", marker = "extra == 'gateway'", specifier = ">=0.24.0,<1" },
@@ -60,6 +63,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0.0,<3" },
     { name = "pillow", specifier = ">=9,<13" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.7,<3" },
+    { name = "playwright", specifier = ">=1.40,<2" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.40,<2" },
     { name = "prompt-toolkit", specifier = ">=3.0.1,<4" },
     { name = "pygments", specifier = ">=2.13,<3" },
