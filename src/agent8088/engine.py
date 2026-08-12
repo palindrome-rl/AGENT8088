@@ -3215,6 +3215,7 @@ def _exec_browser(args: dict) -> str:
 # Sandboxed execution — native OS isolation, with Docker as a fallback
 # ---------------------------------------------------------------------------
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
+GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
@@ -3251,7 +3252,11 @@ def _agent_data_dir() -> Path:
 def _native_sandbox_argv():
     override = os.environ.get("AGENT8088_SRT")
     if override:
-        return shlex.split(override, posix=sys.platform != "win32")
+        argv = shlex.split(override, posix=sys.platform != "win32")
+        if sys.platform == "win32":
+            argv = [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"'
+                    else part for part in argv]
+        return argv
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
     node = _which_executable("node")
@@ -3456,25 +3461,32 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
 
 def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     backend = _resolve_sandbox_backend()
+    command = _process_display(argv)
+
+    def docker():
+        # Structured argv execution is the isolated Git-tool path. Preserve the
+        # pinned Git image introduced in fa4d77b; the general Python image has
+        # no git binary and turns a successful fallback into status 127.
+        return _exec_docker_command(
+            command, timeout, image=GIT_DOCKER_IMAGE,
+            workspace=PROJECT_ROOT, readonly=True,
+        )
+
     if backend == "native":
         runtime = _native_sandbox_argv()
         settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
-        command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
-                   f"TMPDIR={shlex.quote(str(sandbox_tmp))} {_process_display(argv)}")
+        native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                          f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
         return _native_or_docker(
             lambda: _exec_process(
-                runtime + ["--settings", str(settings), "-c", command],
+                runtime + ["--settings", str(settings), "-c", native_command],
                 timeout=timeout,
             ),
-            lambda: _exec_docker_command(
-                _process_display(argv), timeout,
-                workspace=PROJECT_ROOT, readonly=True,
-            ),
+            docker,
         )
     if backend == "docker":
-        return _exec_docker_command(_process_display(argv), timeout,
-                                    workspace=PROJECT_ROOT, readonly=True)
+        return docker()
     return _sandbox_required_error()
 
 

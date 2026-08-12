@@ -621,6 +621,7 @@ def test_unusable_native_argv_falls_back_to_readonly_docker(
     assert engine._exec_sandbox_argv(["git", "status"]) == "ran in docker"
     assert calls[0] == "native"
     assert calls[1][0] == "docker"
+    assert calls[1][2]["image"] == engine.GIT_DOCKER_IMAGE
     assert calls[1][2]["workspace"] == engine.PROJECT_ROOT
     assert calls[1][2]["readonly"] is True
 
@@ -663,6 +664,38 @@ def test_windows_docker_probe_prefers_the_executable_over_the_unix_shim(
 
     assert engine._docker_available() is True
     assert seen == [[windows_exe, "info"]]
+
+
+def test_native_verifier_finds_the_installed_windows_runtime(tmp_path, monkeypatch):
+    """The release gate must use the same data directory as the engine."""
+    runtime = (tmp_path / "agent8088" / "runtime" / "node_modules"
+               / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
+    runtime.parent.mkdir(parents=True)
+    runtime.touch()
+    verifier = runpy.run_path(
+        str(INSTALLER.parent / "scripts" / "verify_native_sandbox.py"))
+    monkeypatch.delenv("AGENT8088_HOME", raising=False)
+    monkeypatch.delenv("AGENT8088_SRT", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(
+        verifier["shutil"], "which",
+        lambda name: "node.exe" if name == "node" else None,
+    )
+
+    assert verifier["_runtime_argv"]() == ["node.exe", str(runtime)]
+
+
+def test_windows_native_runtime_override_removes_command_line_quotes(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    argv = [r"C:\Program Files\nodejs\node.exe", r"C:\runtime\cli.js"]
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("AGENT8088_SRT", subprocess.list2cmdline(argv))
+
+    assert engine._native_sandbox_argv() == argv
 
 
 def test_configured_working_directory_is_used_outside_the_launch_directory(
