@@ -134,6 +134,22 @@ def dot(left, right) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
+# Stripped from the keyword leg. Not an optimisation: the tokens are OR-ed so a
+# partial match can still rank, which means one shared stopword is enough to make
+# any query match any memory. "what is the capital of France" matched a memory
+# about uv on the word "the", and on a small store BM25 has nothing better to
+# rank, so the irrelevant memory was injected into the prompt. The vector leg
+# handles meaning; the keyword leg only needs the words that carry any.
+_STOPWORDS = frozenset("""
+a about all also am an and any are as at be because been but by can cannot could
+did do does doing done for from get got had has have how however i if in into is
+it its just me my no nor not of off on once only or other our out over own please
+same should so some such than that the their them then there these they this
+those to too under until up us very was we were what when where which while who
+whom why will with would you your
+""".split())
+
+
 def fts_query(text: str) -> str:
     """Turn arbitrary user text into a safe FTS5 MATCH expression.
 
@@ -144,10 +160,14 @@ def fts_query(text: str) -> str:
     OR-ed so a partial match still ranks.
 
     Returns "" when nothing survives, which callers read as "skip the BM25 leg".
+    A query of nothing but stopwords carries no keyword signal, so skipping is
+    the honest answer rather than matching everything.
     """
     tokens = []
     for raw in text.split():
         token = "".join(character for character in raw if character.isalnum() or character in "-_")
+        if token.casefold() in _STOPWORDS:
+            continue
         if len(token) > 1 or token.isdigit():
             tokens.append(f'"{token}"')
     return " OR ".join(tokens)
