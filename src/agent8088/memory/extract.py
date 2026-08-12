@@ -34,22 +34,28 @@ Return ONLY a JSON object, no prose, no code fence:
 {"memories": [{"text": "...", "categories": ["..."]}]}
 
 What qualifies as a memory:
-- Stable preferences, conventions and decisions ("prefers uv over pip")
-- Facts about the user, their projects, tools, environment and constraints
+- Who the user is: name, role, employer, team, location, timezone, languages,
+  working hours, anything they state about themselves or their situation
+- Stable preferences and conventions ("prefers uv over pip", "no emoji in commits")
+- Decisions and constraints that outlive this exchange
+- Facts about their projects, tools and environment
 - Corrections the user made to you, and instructions meant to persist
 
 What does NOT qualify:
-- Anything answered and finished within this exchange
-- Transient state: what a command printed, what a file currently contains
+- Transient state: what a command printed, what a file currently contains right now
 - Restating the request, or your own plan for it
 - Anything already covered by the memories shown below
 
 Rules:
-- Each memory is one self-contained sentence, understandable a year from now
-  with no access to this conversation. No "it", "that file", "as discussed".
+- Each memory is one self-contained sentence, understandable a year from now with
+  no access to this conversation. No "it", "that file", "as discussed".
 - Write it as a third-person fact, not as an instruction to yourself.
-- At most {max_memories}. Return {"memories": []} if nothing durable came up --
-  that is the common and correct answer for most exchanges.
+- When in doubt, extract. A slightly redundant memory costs far less than a
+  missing one, and duplicates are filtered out after you.
+- If the user says something about themselves, that is a memory. If they say it
+  twice, it matters to them.
+- At most {max_memories}. Return {"memories": []} only when the exchange genuinely
+  contains nothing about the user, their work or their preferences.
 - Never record credentials, tokens, keys or passwords, even if they appear above.
 
 Memories already held (do not repeat or rephrase these):

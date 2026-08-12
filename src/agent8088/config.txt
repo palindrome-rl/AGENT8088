@@ -181,6 +181,28 @@ memory=1
 # Most memories one turn may create, so a single odd exchange cannot flood the
 # store:
 # memory_max_per_turn=10
+#
+# --- what you see when memory learns something ---
+# off      silent; memory still works, it just never says so
+# on       (default) one dim line when a turn stored something:
+#              memory - stored 2 new memories
+# verbose  the same line plus the facts themselves, and a line on the turns that
+#          stored nothing -- "it ran and found nothing" and "it never ran" are
+#          different, and only one of them is a problem
+# Change it live with `/memory notify off|on|verbose`.
+#
+# The report waits up to 10s after the answer for the extraction call to finish.
+# A local extraction call routinely takes 15-20s, so past that budget the line is
+# shown with your NEXT message instead, marked "(from your previous message)" --
+# deferred rather than dropped, because a line printed after the prompt is drawn
+# would land in the middle of your typing, and silence is indistinguishable from
+# memory not working.
+#
+# `/memory test` runs one real extraction call on a sample exchange and shows the
+# raw reply, what parsed out of it, and how long it took. Use it when memory seems
+# to be learning nothing: a model that cannot produce the JSON stores nothing and
+# says nothing, which looks exactly like a turn that had nothing worth keeping.
+# memory_notifications=on
 
 # --- local model telemetry ---
 # Writes metadata only (provider/model, timing, token/cost estimates, outcome).

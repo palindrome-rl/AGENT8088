@@ -85,11 +85,69 @@ Two details that came out of testing rather than theory:
 
 ## Seeing what it does
 
+Every turn that learns something says so:
+
+```
+⏺ memory · stored 2 new memories
+```
+
+With `memory_notifications=verbose`, it shows what it learned — and says when a
+turn taught it nothing, because "it ran and found nothing" and "it never ran" are
+different problems and only one of them needs fixing:
+
+```
+⏺ memory · stored 2 new memories
+    • the user is named Taha Waheed
+    • the project uses uv, never pip
+
+⏺ memory · nothing new to remember
+```
+
+| Level | Behaviour |
+|---|---|
+| `off` | silent; memory still works, it just never says so |
+| `on` *(default)* | one dim line on turns that stored something |
+| `verbose` | the same line plus the facts, and a line on turns that stored nothing |
+
+Change it live with `/memory notify off|on|verbose`.
+
+The line appears after the answer, because that is when the extraction call runs.
+The REPL waits up to 10 seconds for it. A local extraction call routinely takes
+15–20 seconds, so past that budget the line is shown with your **next** message
+instead, marked `(from your previous message)`:
+
+```
+⏺ memory · stored 1 new memory (from your previous message)
+    • User works at Five Rivers Technologies as a backend engineer
+```
+
+Deferred rather than dropped: a line printed after the prompt is drawn would land
+in the middle of your typing, and silence is indistinguishable from memory not
+working.
+
+### When memory seems to be learning nothing
+
+```
+/memory test
+```
+
+Runs one real extraction call on a sample exchange and shows the raw model reply,
+what parsed out of it, and how long it took. This is the check worth running first,
+because a model that cannot produce the JSON stores nothing and says nothing —
+which looks exactly like a turn that had nothing worth keeping.
+
+If it reports the model replied but not with usable JSON, point
+`memory_extract_model` at a stronger model. Extraction quality is the whole
+feature: a capable model captures what you say about yourself, and a weak one
+silently captures nothing.
+
 ```
 /memory                     status: count, embedder, store size, last call's cost
 /memory search <query>      run the search and show each leg's rank
 /memory add <text>          store a fact by hand
 /memory forget <id>         delete one (the short id from /memory search works)
+/memory notify <level>      off | on | verbose
+/memory test                run one extraction call and show what it produced
 /memory clear               delete all, with confirmation
 /memory off                 stop recalling and learning; keeps what is stored
 ```

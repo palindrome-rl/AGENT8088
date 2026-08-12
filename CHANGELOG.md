@@ -4,6 +4,64 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Memory says when it learns something
+
+### Fixed
+
+- **The extraction prompt talked the model out of extracting.** It ended with
+  `Return {"memories": []} if nothing durable came up -- that is the common and
+  correct answer for most exchanges`, and its "what qualifies" list covered
+  preferences, projects and tools but nothing that obviously included who the user
+  is. The reported symptom was a user stating their workplace twice and it never
+  being stored, while their name and age were.
+
+  Rewritten toward Mem0's stance — *"When in doubt, extract. A slightly redundant
+  memory costs far less than a missing one"* — with name, role, employer, team,
+  location and timezone named explicitly, and repetition called out as
+  significance rather than noise. The exclusions and the credentials rule are
+  unchanged.
+
+  Measured against a real local model on statements a user makes about
+  themselves: **3/5 captured before, 5/5 after, no false positives** — the "what
+  is 2+2" control still stores nothing. It also fixed the canonical `prefers uv
+  over pip` example, which the old prompt missed.
+
+- **A slow capture no longer loses its notification.** A real local extraction
+  call measured **17.7s**, past the 10s report budget, so the line was dropped and
+  the common experience was silence — indistinguishable from memory not working.
+  Late reports are now deferred to the next turn and marked `(from your previous
+  message)`. They are queued rather than held in a single slot: two slow turns in
+  a row both have a report owed, and a single slot let the second overwrite the
+  first, so one stored fact was never mentioned.
+
+### Added
+
+- **A turn that stores a memory now says so**, instead of writing silently and
+  leaving you to guess whether memory works at all:
+
+  ```
+  ⏺ memory · stored 2 new memories
+  ```
+
+- **`memory_notifications=off|on|verbose`**, following Hermes'
+  `display.memory_notifications`. `on` (default) is the count; `verbose` previews
+  the facts *and* reports turns that stored nothing, because "it ran and found
+  nothing" and "it never ran" are different problems and only one needs fixing.
+  `/memory notify off|on|verbose` changes it live and persists it.
+- **The report is printed from the main thread, never from the capture thread.**
+  Capture runs in the background so the answer is never delayed; writing to the
+  console from there would interleave with whatever is being typed at the prompt.
+  The stored rows are handed back through a hook (the same shape as `subagent_ui`
+  and `_plan_on_step`) and the REPL waits up to 10s for the extraction call before
+  reporting, deferring to the next turn past that.
+- **`/memory test`** runs one real extraction call on a sample exchange and shows
+  the raw reply, what parsed out of it, and the elapsed time. A model that cannot
+  produce the JSON stores nothing and says nothing, which looks exactly like a turn
+  with nothing worth keeping; this separates the two, and warns when the extractor
+  is slower than the report budget.
+
+---
+
 ## Memory embeddings no longer depend on the chat provider
 
 ### Fixed
