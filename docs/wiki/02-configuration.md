@@ -194,6 +194,7 @@ cannot hand itself a fresh write budget.
 | `skills_dir` / `agents_dir` | Skill packages and sub-agent profiles. |
 | `subagent_max_depth` | Recursion limit for `spawn_subagent`. |
 | `default_subagent` | Profile used when none is named. |
+| `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
 | `banner_file` | Custom startup banner. |
 
 > To remove a built-in tool, comment out its line in `tools.txt` — see

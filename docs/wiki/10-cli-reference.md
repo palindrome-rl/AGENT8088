@@ -37,7 +37,7 @@ Run with no flags for the interactive REPL.
 
 ## Slash commands
 
-**36 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
+**35 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
 `/models`.
 
 ### Session
@@ -109,7 +109,6 @@ Run with no flags for the interactive REPL.
 |---|---|
 | `/config` | Active config + file path |
 | `/capabilities` | What the agent can do and which guardrails are in force |
-| `/system` | Full system prompt |
 | `/doctor` | Environment health check |
 | `/trace [on\|off]` | Toggle JSON trace capture |
 | `/verbose` | Toggle verbose output |

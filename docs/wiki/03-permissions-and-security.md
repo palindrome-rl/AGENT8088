@@ -161,6 +161,17 @@ similar are refused pre-flight, without a model round-trip. Answers are also
 checked against fingerprints of the base prompt so a verbatim leak is caught on
 the way out.
 
+There is also **no slash command that prints the prompt.** `/system` used to
+show it in full, which made the floor above trivially avoidable: the model was
+refused, and the operator typed six characters to get the same text. It was
+removed rather than gated, because a command that exists behind a config key is
+still one config key away from undoing the guarantee.
+
+This is not a claim that the prompt is secret from someone with the files —
+`src/agent8088/system.md` is on disk and readable. It removes the *in-session*
+route, which is the one that shows up in a screen share, a recorded demo, or a
+terminal someone else is watching.
+
 ## Write path zones
 
 Within `allowed_paths`, writes are classified into three zones:

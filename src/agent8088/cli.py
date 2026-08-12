@@ -12,7 +12,7 @@ feature is reachable here:
   • /plan           — enter plan mode: propose a plan, approve it, then it runs.
   • /raw            — one raw model call, showing reasoning + tool_calls fields.
   • /model          — switch backend (Ornith  <->  Gemma fallback).
-  • /config /system /tools /history /trace /temp /maxturns /save /clear ...
+  • /config /tools /history /trace /temp /maxturns /save /clear ...
 
 Run:  python agent8088_cli.py
 """
@@ -1142,6 +1142,12 @@ def _make_subagent_ui(live):
             foot.append("✓ ", style="#237dd7")
             foot.append(f"done · {n} tool{'s' if n != 1 else ''} · {elapsed:.1f}s", style="dim")
             console.print(foot)
+            # Sub-agents answer in markdown. Printed raw it arrives as literal
+            # '##' and '**' in the terminal, which is what the caller sees of
+            # the whole delegation — so render it rather than dumping it.
+            text = (answer or "").strip()
+            if text:
+                console.print(Padding(Markdown(text), (0, 0, 0, 3)))
 
         return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result,
                 "on_escalation": sub_on_escalation, "done": done}
@@ -1736,7 +1742,6 @@ def cmd_help(_):
         ("/reset", "Clear the active session while retaining its name"),
         ("/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)"),
         ("/config", "Show the active configuration (model, endpoint, paths)"),
-        ("/system", "Show the full system prompt sent to the model"),
         ("/history", "Show the current conversation"),
         ("/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace"),
         ("/think [on|off]", "Alias for /reasoning"),
@@ -2714,10 +2719,6 @@ def cmd_compact(rest):
     console.print(f"[#237dd7]compacted[/#237dd7] → {len(older)} older messages summarized; {len(S.messages)} retained")
 
 
-def cmd_system(_):
-    console.print(Panel(Text(A.SYSTEM_PROMPT), title="System Prompt", box=box.ROUNDED, border_style="#0077B6"))
-
-
 def cmd_history(_):
     if not S.messages:
         console.print("[dim](conversation empty)[/dim]")
@@ -2968,7 +2969,7 @@ COMMANDS = {
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "audit": cmd_audit,
     "skills": cmd_skills,
-    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config, "system": cmd_system,
+    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
     "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,

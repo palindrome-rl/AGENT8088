@@ -280,6 +280,9 @@ MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
+# A sub-agent exists to keep work *out* of the parent's context, so an unbounded
+# answer defeats the delegation it was spawned for. 0 disables the cap.
+MAX_SUBAGENT_ANSWER_CHARS = int(APP_CONFIG.get("max_subagent_answer_chars", "6000"))
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
@@ -2716,6 +2719,48 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
     return "\n".join(outputs)
 
 
+# Appended to every sub-agent's system prompt, whatever its profile. A sub-run
+# reports into another agent's context rather than to a person, so a confident
+# summary is taken at face value — nothing downstream re-checks it. The failure
+# this prevents is real: an explore run whose searches all came back empty
+# reported "no SSRF protection exists" about a tree that has an SSRF guard, a
+# test module for it, and a documented section on it. Every search had failed;
+# none of that absence was evidence.
+_SUBAGENT_REPORTING_CONTRACT = """
+Reporting rules, which override any formatting preference in your instructions:
+
+- Separate what you VERIFIED from what you INFERRED. A claim you did not open a
+  file to confirm is an inference; label it.
+- A search that errored, returned nothing, or was refused is NOT evidence of
+  absence. Say the search failed and why. Never turn a failed lookup into a
+  finding, and never write a confident conclusion on top of one.
+- State the directory you actually inspected. If tools only let you see part of
+  the tree, say which part — a conclusion about "the codebase" drawn from one
+  subdirectory is wrong even when every fact in it is right.
+- If you could not complete the task, say so plainly in the first line. An
+  incomplete answer that says it is incomplete is useful; one that reads as
+  finished is worse than no answer.
+- Answer in plain prose with concrete paths and line numbers. No status
+  headings, no process narration, no report scaffolding.
+"""
+
+
+def _cap_subagent_answer(answer: str) -> str:
+    """Bound a sub-agent's answer so one delegation cannot flood the parent.
+
+    Keeps the head: a sub-agent that follows the contract above puts its actual
+    finding first and its supporting detail after, so the tail is what can be
+    dropped. The marker is explicit because a silently truncated answer reads as
+    a complete one to the parent model.
+    """
+    if MAX_SUBAGENT_ANSWER_CHARS <= 0 or len(answer) <= MAX_SUBAGENT_ANSWER_CHARS:
+        return answer
+    dropped = len(answer) - MAX_SUBAGENT_ANSWER_CHARS
+    return (answer[:MAX_SUBAGENT_ANSWER_CHARS]
+            + f"\n\n[sub-agent answer truncated — {dropped} more characters. "
+              "Ask it a narrower question if you need the rest.]")
+
+
 def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
@@ -2744,7 +2789,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     if not allowed:  # empty/misconfigured profile -> give it the safe read-only default
         allowed = {n for n in ("read_text", "execute_shell", "web_search") if n in TOOL_NAMES}
     sub_specs = {n: TOOL_SPECS[n] for n in allowed}
-    sub_system = profile["system_prompt"] + "\n" + render_tool_docs(sub_specs)
+    sub_system = (profile["system_prompt"] + "\n" + _SUBAGENT_REPORTING_CONTRACT
+                  + "\n" + render_tool_docs(sub_specs))
     sub_tools_def = build_tools_def(sub_specs)
 
     # Optional live presentation hooks for the sub-agent's own loop.
@@ -2806,6 +2852,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
              _local_fallback_grant, _remote_git_grant,
              _permission_floor_readonly, _sandbox_readonly) = saved_permission
 
+    answer = _cap_subagent_answer(answer)
     if ui.get("done"):
         ui["done"](answer)
     return f"[subagent:{type_name}] {answer}"
