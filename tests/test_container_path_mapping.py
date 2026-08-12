@@ -74,3 +74,48 @@ def test_a_similarly_named_path_is_not_rewritten(engine, tmp_path, monkeypatch):
 def test_relative_names_are_unaffected(engine, tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path)
     assert engine._from_container_path("library.py") == "library.py"
+
+
+# --- raised in review of PR #45 -------------------------------------------
+
+def test_a_project_root_mount_resolves_to_the_project(engine, tmp_path, monkeypatch):
+    """_exec_sandbox_argv mounts PROJECT_ROOT at /workspace for the git tools.
+
+    Mapping unconditionally to artifacts/ sent those paths to the wrong host
+    location, so prefer whichever candidate actually exists.
+    """
+    project = tmp_path
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    monkeypatch.setattr(engine, "PROJECT_ROOT", project)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", artifacts)
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [project])
+    only_in_project = project / "README.md"
+    only_in_project.write_text("x", encoding="utf-8")
+
+    assert engine.resolve_user_path("/workspace/README.md") == only_in_project.resolve()
+
+
+def test_artifacts_still_wins_when_the_name_exists_in_both(engine, tmp_path, monkeypatch):
+    """Ordinary runs mount artifacts/, so it stays the first candidate."""
+    project = tmp_path
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    monkeypatch.setattr(engine, "PROJECT_ROOT", project)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", artifacts)
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [project])
+    (project / "library.py").write_text("project", encoding="utf-8")
+    (artifacts / "library.py").write_text("artifacts", encoding="utf-8")
+
+    assert engine.resolve_user_path("/workspace/library.py") == (artifacts / "library.py").resolve()
+
+
+def test_an_unknown_name_still_defaults_to_artifacts(engine, tmp_path, monkeypatch):
+    """A file being created has no existing candidate to disambiguate on."""
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", artifacts)
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+
+    assert engine.resolve_user_path("/workspace/new.txt") == (artifacts / "new.txt").resolve()
