@@ -297,9 +297,9 @@ def test_agent_startup_repairs_only_missing_console_flags(tmp_path, monkeypatch)
     assert writes == [(10, 0x0007), (20, 0x0047)]
 
 
-def test_windows_repl_keeps_completion_space_above_the_status_bar(
+def test_windows_repl_preserves_known_good_prompt_layout(
         tmp_path, monkeypatch):
-    """The completion menu must not share and displace the sticky footer."""
+    """The prompt must not add vertical space above the sticky footer."""
     monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
     monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
     from agent8088 import cli
@@ -329,8 +329,8 @@ def test_windows_repl_keeps_completion_space_above_the_status_bar(
 
     assert cli._read_line() == "hello"
     assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
-    assert "reserve_space_for_menu" not in captured
-    assert captured["message"].value.startswith("\n")
+    assert captured["reserve_space_for_menu"] == 0
+    assert not captured["message"].value.startswith("\n")
     assert footer_events == ["stop", ("start", "ready")]
 
 

@@ -3727,15 +3727,16 @@ def _read_line():
     # the context percentage *and* A.PERMISSION_MODE, so repeating either here
     # would print `plan` an inch above a bar reading `plan-only`. The Rich
     # fallback `_prompt_label()` does keep both — that path has no toolbar.
-    label = "\n\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
-    # Keep prompt_toolkit's default menu reserve. Multi-column completion
-    # floats otherwise share the last row and displace the status bar.
+    # Match the last known-good prompt layout: do not insert a blank line or
+    # reserve extra rows above the toolbar for the completion menu.
+    label = "\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
     answer = prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
+        reserve_space_for_menu=0,
     )
     # prompt_toolkit releases its toolbar as soon as Enter is accepted. Reclaim
     # that row here, before command dispatch, so there is no blank-frame gap.
