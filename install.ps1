@@ -180,6 +180,37 @@ function Get-ReportedPercent {
     return $best
 }
 
+# The animated line is erased by overwriting it with spaces, so the erase has to
+# be exactly as wide as the widest line drawn. A fixed 78 was too narrow: the
+# gateway stage renders an 88-character line, and the 10 characters past the end
+# were never cleared, stranding "ram)    2s" -- the tail of "...Telegram)    2s"
+# -- on the completed [OK] line above.
+#
+# Overrunning the console is worse than leaving residue: a line wider than the
+# window wraps, and \r then only returns to the start of the final screen row,
+# so the earlier rows can never be erased at all. Lines are therefore truncated
+# to the window rather than allowed to wrap.
+function Get-ProgressLineWidth {
+    try {
+        $width = $Host.UI.RawUI.WindowSize.Width
+        # -1 keeps the cursor off the last column, where some terminals wrap
+        # eagerly. The cap stops a maximised window drawing a 300-wide bar.
+        if ($width -gt 24) { return [Math]::Min($width - 1, 100) }
+    } catch {
+        # No RawUI (a redirected or non-console host); the caller is on the
+        # plain path anyway, so any sane width will do.
+    }
+    return 78
+}
+
+# Built as its own function so the width rule is testable without a console.
+function Format-ProgressLine {
+    param([string]$Bar, [string]$Label, [string]$Suffix, [int]$Width)
+    $line = "  $Bar $Label $Suffix"
+    if ($line.Length -gt $Width) { $line = $line.Substring(0, $Width) }
+    return $line.PadRight($Width)
+}
+
 # Start-Process joins -ArgumentList with spaces and quotes nothing, so a path
 # containing a space arrives at the child split into separate arguments. Every
 # path here is derived from $env:LOCALAPPDATA, which contains a space whenever
@@ -233,26 +264,46 @@ function Invoke-WithProgress {
         # while the child runs, and a plain call blocks until it finishes.
         # -RedirectStandardOutput needs two distinct paths; pointing both at one
         # file fails outright.
-        $proc = Start-Process -FilePath $FilePath -ArgumentList (ConvertTo-ArgumentString $ArgumentList) `
+        # A script is not an image CreateProcess can load, and -NoNewWindow with
+        # a redirect forces UseShellExecute=false, so handing one straight to
+        # Start-Process fails with "%1 is not a valid Win32 application". The
+        # call operator this replaced ran scripts in-process and had no such
+        # limit, which is how the WhatsApp bridge stage broke: Get-Command npm
+        # resolves to npm.ps1 on a standard Node install, not npm.cmd.
+        # Resolve-NpmLauncher now prefers the .cmd, and this is the safety net
+        # for anything else that arrives as a script.
+        $exeToRun = $FilePath
+        $argumentString = ConvertTo-ArgumentString $ArgumentList
+        if ($FilePath -match '\.ps1$') {
+            $argumentString = ConvertTo-ArgumentString (
+                @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $FilePath) + $ArgumentList)
+            $exeToRun = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        }
+        $proc = Start-Process -FilePath $exeToRun -ArgumentList $argumentString `
             -NoNewWindow -PassThru -RedirectStandardOutput $outLog -RedirectStandardError $errLog
         # Touching .Handle caches it on the object. Without this .ExitCode reads
         # back as $null once the process ends, so every stage would look like a
         # failure and callers would get nothing back.
         $null = $proc.Handle
 
+        # Re-read each tick so a window resized mid-download still erases fully.
+        $width = Get-ProgressLineWidth
         while (-not $proc.HasExited) {
             Start-Sleep -Milliseconds 120
+            $width = Get-ProgressLineWidth
             $percent = Get-ReportedPercent -Paths @($outLog, $errLog) -Fallback $percent
             $bar = if ($percent -ge 0) { Format-ProgressBar $percent } else { Format-ProgressSweep $tick }
             $suffix = if ($percent -ge 0) { "{0,3}%" -f $percent } else { "{0,4:0}s" -f ((Get-Date) - $started).TotalSeconds }
-            Write-Host ("`r  $bar $Label $suffix ".PadRight(78)) -NoNewline -ForegroundColor Cyan
+            Write-Host ("`r" + (Format-ProgressLine -Bar $bar -Label $Label -Suffix $suffix -Width $width)) `
+                -NoNewline -ForegroundColor Cyan
             $tick++
         }
         $proc.WaitForExit()
         $exitCode = $proc.ExitCode
 
         # Clear the animated line so the [OK]/[!] the caller prints owns it.
-        Write-Host ("`r" + (" " * 78) + "`r") -NoNewline
+        # Same width as the render above, or the overflow is left on screen.
+        Write-Host ("`r" + (" " * $width) + "`r") -NoNewline
 
         if ($exitCode -ne 0) {
             foreach ($path in @($errLog, $outLog)) {
@@ -270,7 +321,7 @@ function Invoke-WithProgress {
         # Start-Process itself failed (missing executable, blocked by policy).
         # Report it as a non-zero exit so the caller's warn-and-continue path
         # runs, rather than aborting an install over the progress display.
-        Write-Host ("`r" + (" " * 78) + "`r") -NoNewline
+        Write-Host ("`r" + (" " * (Get-ProgressLineWidth)) + "`r") -NoNewline
         Write-Warn "could not start: $($_.Exception.Message)"
         return 1
     } finally {
@@ -690,12 +741,14 @@ function Install-Gateway-Extras {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $code = Invoke-WithProgress -Label "Gateway adapters (Slack, Discord, WhatsApp, Telegram)" `
+        # Kept short deliberately: at 80 columns the longer spelling overran the
+        # line and had to be truncated mid-word. The [OK] below names them.
+        $code = Invoke-WithProgress -Label "Gateway adapters" `
             -FilePath $script:UvCmd `
             -ArgumentList @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]")
         if ($code -eq 0) {
             $script:GatewayExtrasInstalled = $true
-            Write-Success "Gateway adapters installed"
+            Write-Success "Gateway adapters installed (Slack, Discord, WhatsApp, Telegram)"
         } else {
             Write-Warn "Gateway extras install failed (exit $LASTEXITCODE) - core agent still works"
         }
@@ -740,6 +793,19 @@ function Install-Gateway-Extras {
 # adapter errors at connect() time. We install a portable, user-scoped Node
 # (no admin needed) mirroring the PortableGit pattern. Then npm install in the
 # bridge dir so node_modules is materialized for the bridge to require().
+# Node ships npm three ways side by side: npm (a bash script), npm.cmd, and
+# npm.ps1. Get-Command resolves to npm.ps1, which the call operator could run
+# in-process but Start-Process cannot -- CreateProcess rejects a .ps1 with
+# "%1 is not a valid Win32 application". npm.cmd is the launcher meant for
+# starting a process, so prefer it and fall back only if it is absent.
+function Resolve-NpmLauncher {
+    $npm = Get-Command npm -ErrorAction SilentlyContinue
+    if (-not $npm) { return $null }
+    $sibling = Join-Path (Split-Path $npm.Source -Parent) "npm.cmd"
+    if (Test-Path $sibling) { return $sibling }
+    return $npm.Source
+}
+
 function Install-Node-Bridge {
     # --- 1. Ensure Node >= 20.11 is available ------------------------------
     $nodeExe = $null
@@ -750,11 +816,11 @@ function Install-Node-Bridge {
             $parts = $ver.Split('.')
             if ($parts.Count -ge 2 -and [int]$parts[0] -ge 20 -and [int]$parts[1] -ge 11) {
                 $nodeExe = $existingNode.Source
-                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
+                $npmExe = Resolve-NpmLauncher
                 Write-Success "Node $ver found on PATH"
             } elseif ($parts.Count -ge 1 -and [int]$parts[0] -gt 20) {
                 $nodeExe = $existingNode.Source
-                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
+                $npmExe = Resolve-NpmLauncher
                 Write-Success "Node $ver found on PATH"
             } else {
                 Write-Warn "Node $ver found but < 20.11 - sandbox-runtime needs 20.11+; will install portable Node"
