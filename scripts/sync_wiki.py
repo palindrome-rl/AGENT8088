@@ -52,10 +52,9 @@ PAGES = [
     ("15-faq.md", "FAQ"),
 ]
 
-# Sidebar grouping, following the shape Hermes uses for its reference manual:
-# guides first, then a Reference section split by kind, then development docs.
-# Published page names stay decoupled from filenames via PAGES above, so
-# regrouping here never changes a wiki URL.
+# Sidebar grouping: guides first, then a Reference section split by kind, then
+# development docs. Published page names stay decoupled from filenames via PAGES
+# above, so regrouping here never changes a wiki URL.
 SIDEBAR_SECTIONS = [
     ("Start here", ["Home", "Getting-Started"]),
     ("Guides", [

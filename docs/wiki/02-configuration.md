@@ -79,7 +79,7 @@ nameserver.
 
 ## Approvals
 
-Agent8088's flattened form of Hermes' `approvals:` block.
+Flat keys rather than a nested block, so every approval setting is greppable.
 
 | Key | Default | Purpose |
 |---|---|---|

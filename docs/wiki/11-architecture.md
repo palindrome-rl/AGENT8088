@@ -222,12 +222,11 @@ interactive tool. Two exceptions:
 
 Honest list, for anyone extending this:
 
-- **No persistent memory.** `USER.md` is read, never written. There's no
-  cross-session recall — unlike Hermes' layered memory or Letta's tiered
-  core/recall/archival model.
-- **No audit trail.** One `_log.info` per tool call; not a structured,
-  queryable record of what ran and who approved it.
-- **No token/cost accounting.** `/usage` reports session tokens, but nothing
-  tracks spend across runs.
+- **No persistent memory.** `USER.md` is read, never written. There is no
+  cross-session recall, and nothing layers short-term against archival storage.
+- **No cross-run cost accounting.** `/usage` reports session tokens and
+  `max_turn_cost_usd` bounds a single turn, but nothing aggregates spend across
+  runs. Enabling `model_telemetry` writes the per-call records that would make
+  that possible; nothing reads them back.
 - **`browse_page` is read-only.** It renders and extracts text; it can't click
   or fill forms.
