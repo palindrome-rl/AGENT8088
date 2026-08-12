@@ -3184,6 +3184,10 @@ DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
+# Set after a native pre-flight failure. The restricted account or OS policy
+# does not heal during the process, so both execution and status use Docker for
+# the rest of the session when it is available.
+_native_sandbox_broken = False
 
 
 def _agent_data_dir() -> Path:
@@ -3235,10 +3239,14 @@ def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
     if requested == "native":
+        if native_available and _native_sandbox_broken and _docker_available():
+            return "docker"
         return "native" if native_available else "unavailable"
     if requested == "docker":
         return "docker" if _docker_available() else "unavailable"
     if native_available:
+        if _native_sandbox_broken and _docker_available():
+            return "docker"
         return "native"
     return "docker" if _docker_available() else "unavailable"
 
@@ -3336,13 +3344,6 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
 )
 
 
-# Set once the native runtime has proved it cannot start a sandbox in this
-# process. A runtime that cannot log into its restricted account does not heal
-# between commands, so retrying it per command spends a node subprocess to reach
-# the same failure and reprints the same wall of stderr in the transcript.
-_native_sandbox_broken = False
-
-
 def _native_sandbox_repair_hint(result: str) -> str:
     """Turn the runtime's pre-flight error into something the reader can act on.
 
@@ -3373,6 +3374,21 @@ def _native_sandbox_unusable(result: str) -> bool:
     return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
 
 
+def _native_or_docker(native, docker):
+    """Run native isolation, retrying only a proven pre-flight failure."""
+    global _native_sandbox_broken
+    if _native_sandbox_broken and _docker_available():
+        return docker()
+    result = native()
+    if not _native_sandbox_unusable(result) or not _docker_available():
+        return result
+    if not _native_sandbox_broken:
+        _log.warning("native sandbox could not start, using docker for the "
+                     "rest of this session. %s", _native_sandbox_repair_hint(result))
+    _native_sandbox_broken = True
+    return docker()
+
+
 def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
                          readonly: bool = False) -> str:
     argv = _native_sandbox_argv()
@@ -3394,11 +3410,17 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
         runtime = _native_sandbox_argv()
         settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
-        return _exec_process(
-            runtime + ["--settings", str(settings), "-c",
-                       f"cd {shlex.quote(str(PROJECT_ROOT))} && "
-                       f"TMPDIR={shlex.quote(str(sandbox_tmp))} {_process_display(argv)}"],
-            timeout=timeout
+        command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                   f"TMPDIR={shlex.quote(str(sandbox_tmp))} {_process_display(argv)}")
+        return _native_or_docker(
+            lambda: _exec_process(
+                runtime + ["--settings", str(settings), "-c", command],
+                timeout=timeout,
+            ),
+            lambda: _exec_docker_command(
+                _process_display(argv), timeout,
+                workspace=PROJECT_ROOT, readonly=True,
+            ),
         )
     if backend == "docker":
         return _exec_docker_command(_process_display(argv), timeout,
@@ -3557,37 +3579,20 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                         ignore=shutil.ignore_patterns(
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
-    global _native_sandbox_broken
     try:
-        # Already proved unusable this process: go straight to Docker rather than
-        # paying for the same failure again.
-        if backend == "native" and _native_sandbox_broken and _docker_available():
-            backend = "docker"
         if backend == "native":
             local_command = (
                 _process_display([sys.executable, "-c", command])
                 if python_code else command
             )
-            result = _exec_native_sandbox(local_command, timeout, workspace,
-                                          readonly=_sandbox_readonly)
-            # `auto` documents native first, Docker when available — but that
-            # choice was only ever made at selection time, from the presence of
-            # the runtime binary. A runtime that is installed and still cannot
-            # start a sandbox (on Windows, a restricted account it cannot log
-            # into) left the command refused with a working Docker sitting idle.
-            # Retry only a pre-flight failure: the command has not run, so
-            # nothing can be done twice.
-            if not _native_sandbox_unusable(result):
-                return result
-            if not _docker_available():
-                return result  # keep the runtime's own error; it says more
-            # Once per process. The condition is permanent for this run, and
-            # repeating a 200-character stderr dump above every command turns a
-            # working fallback into visible breakage.
-            if not _native_sandbox_broken:
-                _log.warning("native sandbox could not start, using docker for the "
-                             "rest of this session. %s", _native_sandbox_repair_hint(result))
-            _native_sandbox_broken = True
+            return _native_or_docker(
+                lambda: _exec_native_sandbox(
+                    local_command, timeout, workspace, readonly=_sandbox_readonly,
+                ),
+                lambda: _exec_docker_command(
+                    command, timeout, python_code, image, workspace=workspace,
+                ),
+            )
         return _exec_docker_command(command, timeout, python_code, image,
                                     workspace=workspace)
     finally:
