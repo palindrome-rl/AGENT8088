@@ -276,8 +276,8 @@ function Invoke-WithProgress {
         # while the child runs, and a plain call blocks until it finishes.
         # -RedirectStandardOutput needs two distinct paths; pointing both at one
         # file fails outright.
-        # A script is not an image CreateProcess can load, and -NoNewWindow with
-        # a redirect forces UseShellExecute=false, so handing one straight to
+        # A script is not an image CreateProcess can load, and redirected
+        # streams force UseShellExecute=false, so handing one straight to
         # Start-Process fails with "%1 is not a valid Win32 application". The
         # call operator this replaced ran scripts in-process and had no such
         # limit, which is how the WhatsApp bridge stage broke: Get-Command npm
@@ -292,7 +292,7 @@ function Invoke-WithProgress {
             $exeToRun = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
         }
         $proc = Start-Process -FilePath $exeToRun -ArgumentList $argumentString `
-            -NoNewWindow -PassThru -RedirectStandardInput $inLog `
+            -WindowStyle Hidden -PassThru -RedirectStandardInput $inLog `
             -RedirectStandardOutput $outLog -RedirectStandardError $errLog
         # Touching .Handle caches it on the object. Without this .ExitCode reads
         # back as $null once the process ends, so every stage would look like a
