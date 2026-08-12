@@ -3175,16 +3175,38 @@ def _run_uninstall():
     if not _safe_uninstall_home(home):
         print(f"Refusing to remove unsafe path: {home}")
         return False
+
+    def _clear_readonly(func, path, _exc):
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    _deferred = False
     if home.exists():
-        # git pack files (.idx/.pack) are created read-only on Windows; rmtree's
-        # os.unlink raises PermissionError on them. Clear the bit and retry.
-        def _clear_readonly(func, path, _exc):
-            os.chmod(path, stat.S_IWRITE)
-            func(path)
-        shutil.rmtree(home, onerror=_clear_readonly)
-        print(f"Removed {home}")
+        try:
+            shutil.rmtree(home, onerror=_clear_readonly)
+            print(f"Removed {home}")
+        except PermissionError:
+            # On Windows the running agent8088.exe lives inside `home`, so the
+            # OS holds a lock and rmtree cannot delete it from this process.
+            # Hand the actual deletion to a detached cmd.exe that waits for
+            # this process to exit, then deletes the directory tree.
+            import subprocess
+            del_cmd = (
+                f'timeout /t 2 /nobreak >nul & '
+                f'rmdir /s /q "{home}" 2>nul || '
+                f'(timeout /t 2 /nobreak >nul & rmdir /s /q "{home}" 2>nul) || '
+                f'(timeout /t 3 /nobreak >nul & rmdir /s /q "{home}")'
+            )
+            subprocess.Popen(
+                ["cmd", "/c", del_cmd],
+                close_fds=True, creationflags=0x00000008,  # DETACHED_PROCESS
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            _deferred = True
+            print(f"Scheduled removal of {home} (will complete after this process exits).")
     else:
         print(f"Install directory not found: {home}")
+
     if _remove_agent8088_shim(home):
         print("Removed agent8088 command shim.")
     os.environ.pop("AGENT8088_CONFIG", None)
