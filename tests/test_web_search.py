@@ -65,10 +65,113 @@ def test_preference_order_filters_unavailable():
     assert [p.name for p in chain] == ["tavily", "ddgs"]
 
 
-def test_preference_order_is_searxng_tavily_exa_ddgs():
+def test_base_order_is_searxng_then_ddgs_without_any_key():
+    """No key configured: the two keyless backends serve, searxng first."""
+    registry = web_search.Registry([
+        _Stub("ddgs"), _Stub("exa", available=False),
+        _Stub("tavily", available=False), _Stub("searxng"),
+    ])
+    assert [p.name for p in registry.chain({}, ctx=None)] == ["searxng", "ddgs"]
+
+
+def test_configured_tavily_is_promoted_ahead_of_the_keyless_backends():
+    """Adding a key is the signal to prefer that backend — it jumps the queue
+    rather than waiting behind searxng and ddgs."""
+    registry = web_search.Registry([
+        _Stub("ddgs"), _Stub("exa", available=False),
+        _Stub("tavily", available=True), _Stub("searxng"),
+    ])
+    assert [p.name for p in registry.chain({}, ctx=None)] == [
+        "tavily", "searxng", "ddgs"]
+
+
+def test_configured_exa_is_promoted_ahead_of_the_keyless_backends():
+    registry = web_search.Registry([
+        _Stub("ddgs"), _Stub("exa", available=True),
+        _Stub("tavily", available=False), _Stub("searxng"),
+    ])
+    assert [p.name for p in registry.chain({}, ctx=None)] == [
+        "exa", "searxng", "ddgs"]
+
+
+def test_tavily_outranks_exa_when_both_keys_are_configured():
     registry = web_search.Registry([_Stub(n) for n in ("ddgs", "exa", "tavily", "searxng")])
     assert [p.name for p in registry.chain({}, ctx=None)] == [
-        "searxng", "tavily", "exa", "ddgs"]
+        "tavily", "exa", "searxng", "ddgs"]
+
+
+def test_promotion_keeps_searxng_ahead_of_ddgs():
+    """The promotion reorders the front of the chain without disturbing the
+    relative order of the keyless backends behind it."""
+    registry = web_search.Registry([_Stub(n) for n in ("ddgs", "tavily", "searxng")])
+    names = [p.name for p in registry.chain({}, ctx=None)]
+    assert names.index("searxng") < names.index("ddgs")
+
+
+def test_auto_is_not_treated_as_a_pin():
+    """`auto` reaching chain() means startup resolution never ran. It must fall
+    back to the full chain, not to "unknown provider" — search keeps working and
+    the unresolved pin denies itself the no-prompt exemption."""
+    registry = web_search.Registry([_Stub("searxng"), _Stub("ddgs")])
+    chain = registry.chain({"web_search_provider": web_search.AUTO}, ctx=None)
+    assert [p.name for p in chain] == ["searxng", "ddgs"]
+
+
+# ---------------------------------------------------------------------------
+# startup_pick — one backend, and SearXNG must actually answer
+# ---------------------------------------------------------------------------
+def test_startup_pick_requires_searxng_to_answer():
+    registry = web_search.Registry([_Stub("searxng"), _Stub("ddgs")])
+    assert registry.startup_pick(ctx=None, probe=lambda ctx: True) == "searxng"
+    assert registry.startup_pick(ctx=None, probe=lambda ctx: False) == "ddgs"
+
+
+def test_startup_pick_prefers_a_keyed_backend_and_skips_the_probe():
+    registry = web_search.Registry([
+        _Stub("searxng"), _Stub("ddgs"), _Stub("tavily", available=True)])
+    probed = []
+    picked = registry.startup_pick(ctx=None, probe=lambda ctx: probed.append(1) or True)
+    assert picked == "tavily" and probed == []
+
+
+def test_startup_pick_returns_empty_when_nothing_can_serve():
+    registry = web_search.Registry([
+        _Stub("searxng"), _Stub("ddgs", available=False)])
+    assert registry.startup_pick(ctx=None, probe=lambda ctx: False) == ""
+
+
+def test_probe_reports_false_without_a_base_url():
+    ctx = web_search.SearchContext(config={})
+    assert web_search.probe_searxng(ctx) is False
+
+
+def test_probe_respects_the_egress_guard_and_makes_no_request(monkeypatch):
+    """The probe is a real outbound request — it must not be the one that skips
+    the guard."""
+    called = []
+    monkeypatch.setattr(web_search, "_http_get_json",
+                        lambda *a, **k: called.append(1) or {})
+    ctx = web_search.SearchContext(
+        config={"search_base_url": "http://127.0.0.1:8888/search?q="},
+        check_url=lambda url: "Blocked: egress policy")
+    assert web_search.probe_searxng(ctx) is False
+    assert called == []
+
+
+def test_probe_reports_true_on_a_json_answer(monkeypatch):
+    monkeypatch.setattr(web_search, "_http_get_json", lambda *a, **k: {"results": []})
+    ctx = web_search.SearchContext(
+        config={"search_base_url": "http://127.0.0.1:8888/search?q="})
+    assert web_search.probe_searxng(ctx) is True
+
+
+def test_probe_reports_false_when_the_instance_errors(monkeypatch):
+    def _boom(*a, **k):
+        raise urllib.error.URLError("connection refused")
+    monkeypatch.setattr(web_search, "_http_get_json", _boom)
+    ctx = web_search.SearchContext(
+        config={"search_base_url": "http://127.0.0.1:8888/search?q="})
+    assert web_search.probe_searxng(ctx) is False
 
 
 def test_chain_is_empty_when_nothing_available():
@@ -372,6 +475,42 @@ def test_optional_provider_enters_chain_once_key_is_set(monkeypatch):
     ctx = web_search.SearchContext(
         config={}, get_secret=lambda n: "k" if n == "TAVILY_API_KEY" else "")
     assert [p.name for p in registry.chain({}, ctx)] == ["tavily", "ddgs"]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end ordering with the real providers, exercising the same
+# is_available() paths a live install uses rather than stub flags.
+# ---------------------------------------------------------------------------
+_SEARXNG_CONFIG = {"search_base_url": "http://127.0.0.1:8888/search?q="}
+
+
+def _real_chain(monkeypatch, keys=()):
+    _yes_ddgs(monkeypatch)
+    registry = web_search.default_registry()
+    ctx = web_search.SearchContext(
+        config=_SEARXNG_CONFIG, get_secret=lambda n: "k" if n in keys else "")
+    return [p.name for p in registry.chain({}, ctx)]
+
+
+def test_real_chain_is_searxng_then_ddgs_with_no_keys(monkeypatch):
+    """The configuration this repo ships as the default: a self-hosted SearXNG
+    serves, ddgs backs it up, and neither optional vendor is consulted."""
+    assert _real_chain(monkeypatch) == ["searxng", "ddgs"]
+
+
+def test_real_chain_promotes_tavily_when_its_key_is_added(monkeypatch):
+    assert _real_chain(monkeypatch, keys=("TAVILY_API_KEY",)) == [
+        "tavily", "searxng", "ddgs"]
+
+
+def test_real_chain_promotes_exa_when_its_key_is_added(monkeypatch):
+    assert _real_chain(monkeypatch, keys=("EXA_API_KEY",)) == [
+        "exa", "searxng", "ddgs"]
+
+
+def test_real_chain_puts_tavily_before_exa_when_both_keys_are_added(monkeypatch):
+    assert _real_chain(monkeypatch, keys=("TAVILY_API_KEY", "EXA_API_KEY")) == [
+        "tavily", "exa", "searxng", "ddgs"]
 
 
 def test_tavily_parses_results(monkeypatch):

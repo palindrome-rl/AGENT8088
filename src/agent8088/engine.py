@@ -280,6 +280,9 @@ MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
+# A sub-agent exists to keep work *out* of the parent's context, so an unbounded
+# answer defeats the delegation it was spawned for. 0 disables the cap.
+MAX_SUBAGENT_ANSWER_CHARS = int(APP_CONFIG.get("max_subagent_answer_chars", "6000"))
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
@@ -305,6 +308,127 @@ COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
 # 0 disables either check.
 MAX_WRITES_PER_TURN = int(APP_CONFIG.get("max_writes_per_turn", "0"))
 MAX_WRITE_BYTES = int(APP_CONFIG.get("max_write_bytes", "0"))
+
+# --- Runtime-adjustable limits ---------------------------------------------
+# Every limit here lives in two places: a module constant the hot path reads,
+# and a config key that outlives the process. `/limits` writes both, because
+# writing only the constant loses the setting on exit and writing only the file
+# leaves the running process on the old value — and a limit you believe you set
+# but did not is worse than one you never touched.
+#
+# Constants are resolved through globals() at call time, so this table does not
+# depend on where it sits relative to the definitions above.
+LIMIT_SPECS = {
+    "max_turn_tokens":           ("MAX_TURN_TOKENS", int, "Tokens one request may spend"),
+    "max_turn_seconds":          ("MAX_TURN_SECONDS", int, "Wall-clock seconds per request"),
+    "max_turn_cost_usd":         ("MAX_TURN_COST_USD", float, "Spend per request (USD)"),
+    "max_writes_per_turn":       ("MAX_WRITES_PER_TURN", int, "Files written per request"),
+    "max_write_bytes":           ("MAX_WRITE_BYTES", int, "Bytes per single write"),
+    "max_subagent_answer_chars": ("MAX_SUBAGENT_ANSWER_CHARS", int, "Sub-agent answer cap"),
+    "subagent_max_depth":        ("SUBAGENT_MAX_DEPTH", int, "Nested sub-agent depth"),
+    "max_tool_output_bytes":     ("MAX_TOOL_OUTPUT_BYTES", int, "Bytes kept from one tool result"),
+}
+
+# For most of these 0 means "no limit", so the numeric direction of a change is
+# the opposite of its safety direction: 0 -> 50 *adds* a ceiling that was not
+# there, and 50 -> 0 removes it. Comparing the numbers alone would warn on every
+# tightening and stay silent on the one change worth announcing.
+LIMITS_WHERE_ZERO_MEANS_UNLIMITED = frozenset({
+    "max_turn_tokens", "max_turn_seconds", "max_turn_cost_usd",
+    "max_writes_per_turn", "max_write_bytes", "max_subagent_answer_chars",
+})
+
+# Above these a single runaway request stops being cheap to interrupt. Passing
+# one is allowed — it is the user's machine — but it is said out loud.
+LIMIT_SOFT_CEILINGS = {
+    "max_turn_tokens": 200_000,
+    "max_turn_seconds": 900,
+    "max_turn_cost_usd": 10.0,
+    "max_writes_per_turn": 100,
+    "max_write_bytes": 10 * 1024 * 1024,
+    "subagent_max_depth": 3,
+}
+
+
+def limit_direction(key: str, old, new) -> str:
+    """'looser', 'tighter' or 'same' — in safety terms, not numeric terms."""
+    if old == new:
+        return "same"
+    if key in LIMITS_WHERE_ZERO_MEANS_UNLIMITED:
+        if old == 0:
+            return "tighter"   # a ceiling now exists where none did
+        if new == 0:
+            return "looser"    # the ceiling was removed entirely
+    return "looser" if new > old else "tighter"
+
+
+def set_limit(key: str, value) -> dict:
+    """Apply a limit to the live process and persist it. Returns a change record.
+
+    Raises KeyError for an unknown key and ValueError for a value that is not a
+    number or is negative, so a typo cannot silently write a junk config entry.
+    """
+    if key not in LIMIT_SPECS:
+        raise KeyError(key)
+    const_name, caster, _ = LIMIT_SPECS[key]
+    try:
+        new = caster(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} takes a number, got {value!r}")
+    if new < 0:
+        raise ValueError(f"{key} cannot be negative")
+
+    old = globals()[const_name]
+    globals()[const_name] = new
+    APP_CONFIG[key] = str(new)
+    update_simple_config(CONFIG_PATH, {key: new})
+
+    ceiling = LIMIT_SOFT_CEILINGS.get(key)
+    return {
+        "key": key, "old": old, "new": new,
+        "direction": limit_direction(key, old, new),
+        "over_ceiling": bool(ceiling is not None and new > ceiling),
+        "ceiling": ceiling,
+    }
+
+
+def set_subagent_turns(profile: str, turns: int) -> dict:
+    """Cap the rounds one sub-agent profile may take. Persisted per profile."""
+    if profile not in SUBAGENT_SPECS:
+        raise KeyError(profile)
+    turns = int(turns)
+    if turns < 1:
+        raise ValueError("a sub-agent needs at least 1 turn")
+    old = SUBAGENT_SPECS[profile]["max_turns"]
+    SUBAGENT_SPECS[profile]["max_turns"] = turns
+    key = f"subagent_max_turns.{profile}"
+    APP_CONFIG[key] = str(turns)
+    update_simple_config(CONFIG_PATH, {key: turns})
+    return {"key": key, "old": old, "new": turns,
+            "direction": "looser" if turns > old else "tighter" if turns < old else "same",
+            "over_ceiling": turns > 20, "ceiling": 20}
+
+
+def set_tool_timeout(tool: str, seconds: int) -> dict:
+    """Change one tool's timeout. Persisted as tool_timeout.<name>.
+
+    The persisted key deliberately outranks the inline `timeout=` in tools.txt
+    (see load_tool_specs) — a runtime override that silently lost to the shipped
+    file after a restart would be a setting that only appears to work.
+    """
+    if tool not in TOOL_SPECS:
+        raise KeyError(tool)
+    seconds = int(seconds)
+    if not 1 <= seconds <= MAX_TOOL_TIMEOUT_SECONDS:
+        raise ValueError(f"timeout must be 1..{MAX_TOOL_TIMEOUT_SECONDS} seconds")
+    old = TOOL_SPECS[tool].get("timeout", 25)
+    TOOL_SPECS[tool]["timeout"] = seconds
+    key = f"tool_timeout.{tool}"
+    APP_CONFIG[key] = str(seconds)
+    update_simple_config(CONFIG_PATH, {key: seconds})
+    return {"key": key, "old": old, "new": seconds,
+            "direction": "looser" if seconds > old else "tighter" if seconds < old else "same",
+            "over_ceiling": False, "ceiling": None}
 
 # --- Approval policy ---
 # There is deliberately no separate "approval mode" axis: PERMISSION_MODE already
@@ -1619,7 +1743,11 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "expression": g("expression", "tool_expression"),
         "path_arg": g("path_arg", "tool_path_arg", "filename"),
         "content_arg": g("content_arg", "tool_content_arg", "content"),
-        "timeout": int(g("timeout", "tool_timeout", "25")),
+        # A persisted `tool_timeout.<name>` outranks the inline tools.txt value,
+        # unlike every other field here. /limits writes that key, and an
+        # override the shipped file silently beat on the next start would be a
+        # setting that only appears to work.
+        "timeout": int(config.get(f"tool_timeout.{name}") or g("timeout", "tool_timeout", "25")),
         "arg_types": _parse_arg_types(g("arg_types", "tool_arg_types")),
     }
 
@@ -1943,7 +2071,11 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 "name": name,
                 "description": meta.get("description", default_tool_description(name)),
                 "tools": parse_csv(meta.get("tools", "")),
-                "max_turns": int(meta.get("max_turns", "8")),
+                # A persisted per-profile override (written by /limits) wins over
+                # the profile's own frontmatter, for the same reason as tool
+                # timeouts above.
+                "max_turns": int(APP_CONFIG.get(f"subagent_max_turns.{name}")
+                                 or meta.get("max_turns", "8")),
                 # Optional permission floor for the sub-run. Only "readonly" is
                 # honoured: a profile may restrict itself below the caller's mode,
                 # never widen past it.
@@ -2716,6 +2848,48 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
     return "\n".join(outputs)
 
 
+# Appended to every sub-agent's system prompt, whatever its profile. A sub-run
+# reports into another agent's context rather than to a person, so a confident
+# summary is taken at face value — nothing downstream re-checks it. The failure
+# this prevents is real: an explore run whose searches all came back empty
+# reported "no SSRF protection exists" about a tree that has an SSRF guard, a
+# test module for it, and a documented section on it. Every search had failed;
+# none of that absence was evidence.
+_SUBAGENT_REPORTING_CONTRACT = """
+Reporting rules, which override any formatting preference in your instructions:
+
+- Separate what you VERIFIED from what you INFERRED. A claim you did not open a
+  file to confirm is an inference; label it.
+- A search that errored, returned nothing, or was refused is NOT evidence of
+  absence. Say the search failed and why. Never turn a failed lookup into a
+  finding, and never write a confident conclusion on top of one.
+- State the directory you actually inspected. If tools only let you see part of
+  the tree, say which part — a conclusion about "the codebase" drawn from one
+  subdirectory is wrong even when every fact in it is right.
+- If you could not complete the task, say so plainly in the first line. An
+  incomplete answer that says it is incomplete is useful; one that reads as
+  finished is worse than no answer.
+- Answer in plain prose with concrete paths and line numbers. No status
+  headings, no process narration, no report scaffolding.
+"""
+
+
+def _cap_subagent_answer(answer: str) -> str:
+    """Bound a sub-agent's answer so one delegation cannot flood the parent.
+
+    Keeps the head: a sub-agent that follows the contract above puts its actual
+    finding first and its supporting detail after, so the tail is what can be
+    dropped. The marker is explicit because a silently truncated answer reads as
+    a complete one to the parent model.
+    """
+    if MAX_SUBAGENT_ANSWER_CHARS <= 0 or len(answer) <= MAX_SUBAGENT_ANSWER_CHARS:
+        return answer
+    dropped = len(answer) - MAX_SUBAGENT_ANSWER_CHARS
+    return (answer[:MAX_SUBAGENT_ANSWER_CHARS]
+            + f"\n\n[sub-agent answer truncated — {dropped} more characters. "
+              "Ask it a narrower question if you need the rest.]")
+
+
 def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
@@ -2744,7 +2918,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     if not allowed:  # empty/misconfigured profile -> give it the safe read-only default
         allowed = {n for n in ("read_text", "execute_shell", "web_search") if n in TOOL_NAMES}
     sub_specs = {n: TOOL_SPECS[n] for n in allowed}
-    sub_system = profile["system_prompt"] + "\n" + render_tool_docs(sub_specs)
+    sub_system = (profile["system_prompt"] + "\n" + _SUBAGENT_REPORTING_CONTRACT
+                  + "\n" + render_tool_docs(sub_specs))
     sub_tools_def = build_tools_def(sub_specs)
 
     # Optional live presentation hooks for the sub-agent's own loop.
@@ -2806,6 +2981,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
              _local_fallback_grant, _remote_git_grant,
              _permission_floor_readonly, _sandbox_readonly) = saved_permission
 
+    answer = _cap_subagent_answer(answer)
     if ui.get("done"):
         ui["done"](answer)
     return f"[subagent:{type_name}] {answer}"
@@ -5065,7 +5241,11 @@ def _local_searxng_no_prompt_enabled() -> bool:
     if APP_CONFIG.get("web_search_no_prompt", "0") != "1":
         return False
     config = _search_config()
-    if config.get("web_search_provider") != "searxng":
+    # Normalized the same way Registry.chain() normalizes it. Without this, a
+    # hand-edited `SearXNG` or a trailing space would pin searxng in chain()
+    # while failing this check — safe (it only adds prompts), but the two must
+    # not disagree about what the configured value means.
+    if str(config.get("web_search_provider") or "").strip().lower() != "searxng":
         return False
     base_url = str(config.get("search_base_url") or "")
     try:
@@ -5133,6 +5313,41 @@ def _search_context():
         check_url=check_url,
         wrap=_wrap_untrusted,
     )
+
+
+def resolve_auto_search_provider(probe=None) -> str:
+    """Turn ``web_search_provider=auto`` into a concrete pin for this process.
+
+    Called once at startup. AUTO exists so the operator does not have to choose
+    between "picks the best backend" and "does not prompt on every search": it
+    picks, then pins, and the pin is what makes the approval-free local-SearXNG
+    path safe (see _local_searxng_no_prompt_enabled — it requires a searxng pin
+    precisely because a chain could fall through to a public provider).
+
+    Consequence worth stating: when SearXNG is down the pick lands on ddgs, so
+    searches keep working but DO prompt, because the query now leaves the
+    network. Silent + external is the one combination this cannot give.
+
+    Returns the resolved name ("" if nothing can serve). A no-op unless the
+    configured value is AUTO, so calling it twice is harmless.
+    """
+    configured = str(APP_CONFIG.get("web_search_provider") or "").strip().lower()
+    if configured != web_search.AUTO:
+        return configured
+    try:
+        # Safe to build from the live config even though it still says "auto":
+        # startup_pick ranks by availability via _dynamic_order and never reads
+        # the pin, so the unresolved value cannot feed back into the decision.
+        context = _search_context()
+        picked = WEB_SEARCH_REGISTRY.startup_pick(context, probe=probe)
+    except Exception as exc:  # noqa: BLE001 — startup must not die on a probe
+        _audit("search_provider_resolved", tool="web_search", mode="search",
+               decision="allowed", detail=f"auto -> unresolved ({exc})")
+        return web_search.AUTO
+    APP_CONFIG["web_search_provider"] = picked
+    _audit("search_provider_resolved", tool="web_search", mode="search",
+           decision="allowed", detail=f"auto -> {picked or 'none available'}")
+    return picked
 
 
 def _search_chain_summary() -> str:

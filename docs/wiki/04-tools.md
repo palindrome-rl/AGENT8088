@@ -2,7 +2,7 @@
 
 [← Wiki index](README.md)
 
-22 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+21 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
 is what the permission layer gates on — see
 [Permissions & Security](03-permissions-and-security.md).
 
@@ -105,11 +105,25 @@ Notes that save time:
 - Everything stays behind the SSRF guard, which is exactly why HTTP is a *mode*
   rather than something you'd shell out to `curl` for.
 
-Disable a built-in without editing the file:
+### Disabling a built-in
+
+There is **no `disabled_tools` config key** — the loader has no such filter, so
+setting one has no effect. To drop a tool, comment out its line (the parser
+skips blank lines and `#`):
+
+```
+# browse_page|Load a user-supplied web page…
+```
+
+To do it without editing the installed package, copy `tools.txt`, remove the
+line, and point config at your copy:
 
 ```ini
-disabled_tools=browse_page
+tools_file=~/.agent8088/tools.txt
 ```
+
+Either way, confirm it is gone with `/tools` — the registry is what the model is
+offered, so a tool absent there cannot be called at all.
 
 ## `describe_capabilities`
 
@@ -158,15 +172,38 @@ configuration rather than by the model picking a per-vendor tool:
 | Backend | Role | Requires |
 |---|---|---|
 | `searxng` | **default** | Docker (`/search setup` provisions it) or an instance URL |
-| `tavily` | optional | `TAVILY_API_KEY` in the `.env` store |
-| `exa` | optional | `EXA_API_KEY` in the `.env` store |
 | `ddgs` | **fallback** | nothing — ships with agent8088 |
+| `tavily` | optional — **first priority once its key is set** | `TAVILY_API_KEY` in the `.env` store |
+| `exa` | optional — **priority once its key is set**, behind `tavily` | `EXA_API_KEY` in the `.env` store |
 
-Selection order is `web_search_provider` (explicit pin), then the first
-available of `searxng -> tavily -> exa -> ddgs`. If the chosen backend fails at
-call time — instance stopped, rate limited — the next available one serves the
-request, so a broken primary does not mean "no web search". The result always
-names which backend served it, so a silent fallback is visible.
+`web_search_provider` decides which one serves:
+
+- **`auto` (the shipped default)** — at startup, probe and pick the
+  highest-priority backend that can actually serve: a keyed `tavily`/`exa`
+  first, else `searxng` **if it answers**, else `ddgs`. The winner is then
+  pinned for the session. SearXNG has to pass a real liveness probe because a
+  pin has no fallback, so pinning a stopped instance would mean no web search.
+- **An explicit name** — pins exactly that backend. No auto-selection, no
+  fallback. `/search use <name>` writes it.
+
+Adding an API key is the signal to prefer that backend, so a configured
+`tavily` or `exa` outranks both keyless backends; with both keys set, `tavily`
+goes first. An optional backend whose key is absent stays out entirely.
+
+**`auto` pins rather than staying dynamic, and that is deliberate.**
+`web_search_no_prompt=1` only takes effect while a *local* SearXNG is the
+effective pin, because approval-free search is safe only when the query cannot
+leave your network. So under `auto`: SearXNG up means silent searches; SearXNG
+down means `ddgs` serves and each search asks, because those queries do reach a
+third party. Silent *and* external is the one combination this cannot produce.
+If startup resolution is skipped entirely (an embedder calling the engine
+directly), the unresolved value never matches the exemption, so it fails closed
+to prompting.
+
+If the chosen backend fails at call time — instance stopped, rate limited — the
+next available one serves the request, so a broken primary does not mean "no web
+search". The result always names which backend served it, so a silent fallback
+is visible.
 
 Because `ddgs` needs no key, no hosting, and no setup, web search works on a
 fresh install. Run `/search status` for the live chain, `/search doctor` to

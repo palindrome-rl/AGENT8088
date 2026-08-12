@@ -13,8 +13,10 @@ Roles:
 Selection precedence (mirrors Hermes' agent/web_search_registry.py):
 
   1. ``web_search_provider=<name>`` in config.txt — explicit, no fallback.
-  2. Exactly one available provider — use it.
-  3. PREFERENCE order below, filtered by availability.
+  2. A keyed backend (tavily, exa) whose API key is configured jumps to the
+     front of PREFERENCE — adding a key is a signal to prefer it. tavily wins
+     the tie if both are configured.
+  3. PREFERENCE order below for everything else, filtered by availability.
   4. Nothing available — the tool returns an actionable setup error.
 
 Unlike Hermes, which only *selects* a backend, run_search() also *falls
@@ -39,10 +41,24 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-# searxng first: it is the default when self-hosted. tavily/exa next: a user who
-# added a key wants it used. ddgs last: it is the only backend that scrapes
-# rather than using an API, and the only one that rate-limits under normal use.
-PREFERENCE = ("searxng", "tavily", "exa", "ddgs")
+# Base order when no keyed backend is configured: searxng first (self-hosted,
+# no key), then ddgs (keyless fallback, but scrapes rather than using an API
+# so it's the one that rate-limits under normal use). tavily/exa sit at the
+# end of this base order, but Registry.chain() promotes either one to the
+# front — ahead of searxng and ddgs — the moment its API key is configured;
+# adding a key is a signal to prefer that backend. tavily wins the tie if
+# both are configured.
+PREFERENCE = ("searxng", "ddgs", "tavily", "exa")
+
+# web_search_provider=auto — "pick the best available at startup, then behave
+# like a pin for the rest of the session". A pin is what keeps the approval-free
+# local-SearXNG path safe (it cannot fall through to a public provider), so AUTO
+# deliberately RESOLVES to a real name at startup instead of staying dynamic.
+AUTO = "auto"
+
+# One probe, short timeout: this runs on the startup path, so an unreachable
+# instance must not stall launch. Startup only — never per search.
+STARTUP_PROBE_TIMEOUT = 3
 
 MAX_SEARCH_BYTES = 2 * 1024 * 1024
 MAX_SNIPPET_CHARS = 400
@@ -185,14 +201,49 @@ class Registry:
         extra = [p for n, p in self._providers.items() if n not in PREFERENCE]
         return ordered + extra
 
+    def _dynamic_order(self, ctx) -> list:
+        """PREFERENCE, with any available keyed backend (tavily, exa) moved to
+        the front — ahead of searxng and ddgs. Only a *configured* keyed
+        backend is promoted; is_available() is the same check chain() already
+        filters on, so an unconfigured one is simply skipped, not demoted."""
+        promoted = [n for n in ("tavily", "exa")
+                    if n in self._providers and self._providers[n].is_available(ctx)]
+        rest = [n for n in PREFERENCE if n not in promoted]
+        return promoted + rest
+
     def chain(self, config: dict, ctx) -> list:
         """Ordered providers to attempt for one search call."""
         explicit = str(config.get("web_search_provider") or "").strip().lower()
-        if explicit:
+        # AUTO is resolved to a concrete name at startup (see engine's
+        # resolve_auto_search_provider). Reaching here still set to "auto" means
+        # resolution never ran — an embedder that skipped startup. Fall back to
+        # the full chain rather than to "unknown provider": search keeps working,
+        # and because the pin is unresolved the no-prompt exemption stays OFF,
+        # which is the safe direction to fail.
+        if explicit and explicit != AUTO:
             provider = self._providers.get(explicit)
             return [provider] if provider else []
-        return [self._providers[n] for n in PREFERENCE
+        return [self._providers[n] for n in self._dynamic_order(ctx)
                 if n in self._providers and self._providers[n].is_available(ctx)]
+
+    def startup_pick(self, ctx, probe=None) -> str:
+        """The one backend to pin for this process, or "" if none can serve.
+
+        Same priority as chain() — a keyed backend outranks the keyless ones —
+        with one addition: SearXNG must actually ANSWER before it is chosen.
+        chain() can afford to list a dead instance because it falls through at
+        call time, but a *pin* has no fallback, so pinning a stopped SearXNG
+        would mean no web search at all.
+        """
+        probe = probe_searxng if probe is None else probe
+        for name in self._dynamic_order(ctx):
+            provider = self._providers.get(name)
+            if provider is None or not provider.is_available(ctx):
+                continue
+            if name == "searxng" and not probe(ctx):
+                continue
+            return name
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +365,29 @@ class SearxngProvider(WebSearchProvider):
                                 snippet=str(r.get("content") or "")[:MAX_SNIPPET_CHARS])
                    for r in ranked[:limit] if r.get("url")]
         return SearchSuccess(results, provider=self.name)
+
+
+def probe_searxng(ctx: SearchContext, timeout: int = STARTUP_PROBE_TIMEOUT) -> bool:
+    """Does the configured SearXNG answer the JSON API right now?
+
+    Startup-only, called by Registry.startup_pick. Deliberately NOT wired into
+    SearxngProvider.is_available, which must stay network-free — a health ping
+    on every search would double latency and still race.
+
+    Goes through ctx.check_url like any other outbound request: the probe is a
+    real network call and must not be the one request that skips egress/SSRF.
+    """
+    base = str(ctx.config.get("search_base_url") or "").strip()
+    if not base:
+        return False
+    url = f"{base}{urllib.parse.quote('agent8088-startup-probe')}&format=json"
+    if ctx.check_url(url):
+        return False
+    try:
+        _http_get_json(url, timeout=timeout)
+        return True
+    except Exception:  # noqa: BLE001 — any failure means "not usable right now"
+        return False
 
 
 # ---------------------------------------------------------------------------

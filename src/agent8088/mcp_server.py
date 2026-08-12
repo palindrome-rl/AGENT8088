@@ -182,6 +182,14 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
             file=sys.stderr,
         )
         sys.exit(1)
+    # `python -m agent8088.mcp_server` reaches this without going through
+    # cli.main(), which is where web_search_provider=auto normally resolves.
+    # Resolving here too keeps that entry point from running the whole session
+    # on an unresolved pin (which fails closed, but would prompt every search).
+    # Idempotent: a no-op when already resolved or explicitly pinned.
+    from agent8088 import engine
+
+    engine.resolve_auto_search_provider()
 
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 

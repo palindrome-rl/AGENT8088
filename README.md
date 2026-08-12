@@ -16,7 +16,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
-  <a href="https://github.com/tayyabimam1/AGENT8088/tree/feat/install-all-deps"><img src="https://img.shields.io/badge/branch-feat/install--all--deps-18a0fb" alt="Latest branch"></a>
+  <a href="https://github.com/tayyabimam1/AGENT8088/tree/development"><img src="https://img.shields.io/badge/branch-development-18a0fb" alt="Development branch"></a>
 </p>
 
 Agent8088 is a local-first agent for real work: it reads files, runs tools, researches the web, and can make changes only within a permission system you control. Run it against local Ollama or a hosted OpenAI-compatible model, use it from the terminal or a messaging gateway, and extend it with MCP servers, skills, and focused sub-agents.
@@ -31,7 +31,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 | **Work safely by default** | `readonly` is the default. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
 | **Delegate without losing context** | Five restricted sub-agent profiles handle exploration, research, coding, verification, and general-purpose work in separate runs. |
-| **Use tools without lock-in** | 22 built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
+| **Use tools without lock-in** | 21 built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
 | **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
@@ -40,18 +40,18 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 
 ## Quick start
 
-### Install the latest branch
+### Install the development branch
 
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | AGENT8088_BRANCH=feat/install-all-deps bash
+curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "feat/install-all-deps"; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.ps1)
+$env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.ps1)
 ```
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
@@ -144,10 +144,10 @@ The versioned [documentation wiki](docs/wiki/README.md) is the source of truth f
 
 ## Contributing
 
-Develop against `feat/install-all-deps` and run the suite in an isolated configuration:
+Develop against `development` and run the suite in an isolated configuration:
 
 ```sh
-git clone --branch feat/install-all-deps https://github.com/tayyabimam1/AGENT8088.git
+git clone --branch development https://github.com/tayyabimam1/AGENT8088.git
 cd AGENT8088
 uv sync --all-extras
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q

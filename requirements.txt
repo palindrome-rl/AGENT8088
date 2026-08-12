@@ -18,12 +18,23 @@ mcp>=1.27,<2
 # Terminal logo rendering.
 Pillow>=9,<13
 
+# Imported directly by cli.py, and previously present only because rich and
+# InquirerPy happen to pull them in. Both call sites fall back on ImportError,
+# so losing them upstream would not raise — Tab completion would disappear and
+# every syntax theme would validate as invalid, with no error either way.
+#
+# These stay here while playwright and ddgs moved to extras: both are pure
+# Python, so neither can fail an install on a platform with no wheel.
+prompt_toolkit>=3.0.1,<4
+Pygments>=2.13,<3
+
 # --- Optional extras, NOT installed by this file ---------------------------
 #   pip install -e ".[search]"    ddgs keyless web search backend
 #   pip install -e ".[browser]"   playwright (browser binaries still need
 #                                 `playwright install chromium` afterwards)
 #   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
 #   pip install -e ".[dev]"       pytest, ruff, pip-audit
+#   pip install -e ".[litellm]"   litellm, for a provider with api_mode=litellm
 #
 # search and browser are extras rather than core deps so an install cannot be
 # failed outright by a platform that has no wheel for them: ddgs pulls in primp
@@ -37,3 +48,4 @@ Pillow>=9,<13
 #   gateway: slack-bolt>=1.18.0,<2  slack-sdk>=3.23.0,<4  httpx>=0.24.0,<1
 #            discord.py>=2.3.0,<3   python-telegram-bot>=20,<23
 #   dev:     pytest>=7.0.0,<10      ruff>=0.8,<1          pip-audit>=2.7,<3
+#   litellm: litellm>=1,<2

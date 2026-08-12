@@ -126,8 +126,26 @@ same source, so the model and the human never disagree about what is connected.
 - Use `/tools` to confirm the discovered name. Tool names are normalized, so
   punctuation in server or tool names becomes underscores.
 
+## Server mode
+
+Agent8088 also works in the other direction — exposing its own safe tools to
+Codex, Claude Code, Cursor or any other MCP host:
+
+```bash
+agent8088 --mcp-serve                                # stdio
+agent8088 --mcp-serve --mcp-http --mcp-port 8931     # Streamable HTTP, loopback only
+```
+
+Six non-mutating tools are exposed by default (`read_text`, `calculate`,
+`web_search`, `get_page_title`, `last_output`, `describe_capabilities`).
+`write_file` is added only with `mcp_server_allow_writes=1`, because MCP has no
+approval channel — there is no prompt for a client to answer. `execute_shell`,
+`run_sandboxed`, `browse_page`, `spawn_subagent`, `schedule_task` and the
+mutating git tools are never exposed in any configuration.
+
+Full detail, including why writes are opt-in: [MCP](docs/wiki/07-mcp.md#server-mode).
+
 ## Current scope
 
-This branch is an MCP client: Agent8088 connects to external servers. OAuth
-login flows, MCP server mode, catalog installs, resources/prompts, and dynamic
-tool-change notifications are not part of this first integration.
+OAuth login flows, catalog installs, resources/prompts, and dynamic tool-change
+notifications are not yet supported in either direction.

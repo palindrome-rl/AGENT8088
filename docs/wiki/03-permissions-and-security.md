@@ -161,6 +161,17 @@ similar are refused pre-flight, without a model round-trip. Answers are also
 checked against fingerprints of the base prompt so a verbatim leak is caught on
 the way out.
 
+There is also **no slash command that prints the prompt.** `/system` used to
+show it in full, which made the floor above trivially avoidable: the model was
+refused, and the operator typed six characters to get the same text. It was
+removed rather than gated, because a command that exists behind a config key is
+still one config key away from undoing the guarantee.
+
+This is not a claim that the prompt is secret from someone with the files —
+`src/agent8088/system.md` is on disk and readable. It removes the *in-session*
+route, which is the one that shows up in a screen share, a recorded demo, or a
+terminal someone else is watching.
+
 ## Write path zones
 
 Within `allowed_paths`, writes are classified into three zones:
@@ -270,9 +281,9 @@ Full key reference in [Configuration](02-configuration.md#turn-budget).
 
 ## Why there is no separate "approval mode"
 
-Hermes exposes `approvals.mode: smart | manual | off`, where `smart` has an
-auxiliary model auto-approve low-risk actions. Agent8088 deliberately does not
-mirror it.
+Some agents add a second setting alongside the permission mode — typically
+`smart | manual | off`, where `smart` has an auxiliary model auto-approve
+low-risk actions. Agent8088 deliberately has no equivalent.
 
 `permission_mode` already decides what is gated. A second setting that can also
 wave a gate through creates a contradiction: `permission_mode=readonly` plus
@@ -281,9 +292,9 @@ route to `full-auto` via a key that never says "full-auto". If you want actions 
 run without prompting, say so directly with `--mode full-auto`.
 
 `manual` and `off` therefore have exact equivalents already (`readonly` and
-`full-auto`), and an LLM reviewing another LLM's output is a heuristic, not a
-boundary — Hermes' own `SECURITY.md` says as much. The boundary is the OS; see
-[Sandboxing](06-sandboxing.md).
+`full-auto`). And an LLM reviewing another LLM's output is a heuristic, not a
+boundary: it can be talked out of its judgement by the same injected content it
+is meant to catch. The boundary is the OS; see [Sandboxing](06-sandboxing.md).
 
 ## Denial circuit breaker
 
@@ -313,8 +324,8 @@ scheduled run still cannot `rm -rf /`.
 Entries created by `schedule_task` (crontab and Windows Task Scheduler alike) set
 `AGENT8088_UNATTENDED=1`, so this applies without extra setup. The variable is read
 once at startup rather than per call: an env-var check on the hot path would let
-anything running inside the process flip it mid-turn, which is why Hermes freezes
-its equivalent at import too.
+anything running inside the process flip it mid-turn, turning a single tool call
+into a permission escalation.
 
 ## Destructive command confirmation
 
@@ -440,7 +451,7 @@ different means:
 
 | Surface | Default | Approvals |
 |---|---|---|
-| **Gateway** (Slack/WhatsApp/Discord) | `readonly` | `/approve` + `/deny` in chat; Discord gets ✅/❌ buttons with a **fail-closed** timeout |
+| **Gateway** (Slack/WhatsApp/Discord/Telegram/Email) | `readonly` | `/approve` + `/deny` in chat; Discord gets ✅/❌ buttons with a **fail-closed** timeout |
 | **MCP server** (`--mcp-serve`) | read-only tool set | none possible — MCP has no approval channel, so writes are opt-in via `mcp_server_allow_writes=1` |
 
 The gateway also rate-limits per user (`gateway_rate_limit_per_min`, default 20,

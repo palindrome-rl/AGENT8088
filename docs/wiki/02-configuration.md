@@ -79,7 +79,7 @@ nameserver.
 
 ## Approvals
 
-Agent8088's flattened form of Hermes' `approvals:` block.
+Flat keys rather than a nested block, so every approval setting is greppable.
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -192,10 +192,46 @@ cannot hand itself a fresh write budget.
 | `system_file` | Path to `system.md` (base prompt). |
 | `user_file` | Path to `USER.md` (persona). |
 | `skills_dir` / `agents_dir` | Skill packages and sub-agent profiles. |
-| `disabled_tools` | Comma-separated tools to unregister. |
 | `subagent_max_depth` | Recursion limit for `spawn_subagent`. |
 | `default_subagent` | Profile used when none is named. |
+| `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
+| `subagent_max_turns.<profile>` | Rounds one sub-agent profile may take. **Overrides the profile's own frontmatter.** |
+| `tool_timeout.<tool>` | Seconds one tool may run. **Overrides the inline `timeout=` in `tools.txt`.** |
+
+### Changing a limit without editing this file
+
+`/limits` shows every limit and sets any of them, writing both the running
+process and this file so the change survives a restart:
+
+```
+/limits                              # show everything
+/limits max_turn_seconds 60
+/limits subagent explore 12
+/limits tool browse_page 90
+```
+
+Raising a limit is allowed and reported as such, with a further warning past a
+recommended ceiling:
+
+```
+⚠ raised max_turn_seconds: 60 → 5000
+  above the recommended 900 — one request can now run a long way before
+  anything stops it.
+```
+
+Two of these keys deliberately outrank the files they duplicate — a runtime
+override that lost to `tools.txt` or to profile frontmatter on the next start
+would be a setting that only appeared to work.
+
+The always-on floor is not on this list and no value reaches it: credential
+files, shell startup files and destructive git stay refused whatever the
+numbers say.
 | `banner_file` | Custom startup banner. |
+
+> To remove a built-in tool, comment out its line in `tools.txt` — see
+> [Disabling a built-in](04-tools.md#disabling-a-built-in). There is no
+> `disabled_tools` key; an earlier version of this page documented one that was
+> never implemented.
 
 ## API keys and the `.env` store
 

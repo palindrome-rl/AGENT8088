@@ -13,6 +13,18 @@ dependencies = [
     "InquirerPy>=0.3.4,<1",
     "mcp>=1.27,<2",
     "Pillow>=9,<13",
+    # Both are imported directly by cli.py and were reaching the install only as
+    # transitive dependencies -- prompt_toolkit via InquirerPy, Pygments via
+    # rich. That works until an upstream drops or re-bounds them, and the failure
+    # is silent rather than loud: both call sites fall back on ImportError, so
+    # Tab completion would quietly disappear and every syntax theme would quietly
+    # validate as invalid. Depend on what you import.
+    #
+    # These stay core while playwright and ddgs became extras below: both are
+    # pure Python with no compiled component, so neither can fail an install on
+    # a platform lacking a wheel — which is the only reason the other two moved.
+    "prompt_toolkit>=3.0.1,<4",
+    "Pygments>=2.13,<3",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +44,11 @@ browser = ["playwright>=1.40,<2"]
 # when absent (_ddgs_installed() -> is_available() False -> SearchFailure).
 search = ["ddgs>=9,<10"]
 dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
+# Only needed for a provider profile with api_mode=litellm. Kept out of the base
+# install because it is a large dependency serving one optional backend, but
+# declared so `pip install agent8088[litellm]` works instead of leaving the user
+# to discover the package name from a runtime error.
+litellm = ["litellm>=1,<2"]
 
 [project.scripts]
 agent8088 = "agent8088.cli:main"
