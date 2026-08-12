@@ -468,8 +468,26 @@ function Install-Deps {
     $prevEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        & $script:UvCmd venv --python $script:PythonVersion $venvDir 2>&1 | Out-Null
-        if (-not (Test-Path $py)) { throw "venv creation failed: $py not found" }
+        # --allow-existing: re-running the installer over an existing install is
+        # a supported path, but plain `uv venv` exits 2 on one ("A virtual
+        # environment already exists"). Here that was masked rather than fatal:
+        # the Test-Path below finds python.exe from the PREVIOUS install and
+        # carries on, so a failed venv step reported success and the update
+        # silently did not happen. install.sh hit the same call and died.
+        & $script:UvCmd venv --python $script:PythonVersion --allow-existing $venvDir 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $py)) {
+            # A venv from a Python that has since gone, or a half-written one
+            # from an interrupted run, cannot be reused. Rebuild it rather than
+            # handing the user a decision they have no way to evaluate.
+            Write-Warn "Existing virtualenv is not usable - rebuilding it"
+            & $script:UvCmd venv --python $script:PythonVersion --clear $venvDir 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $py)) {
+                Write-Err "Run this to see the underlying error:"
+                Write-Err "  $script:UvCmd venv --python $script:PythonVersion --clear $venvDir"
+                Write-Err "If it keeps failing, remove the install and start clean: agent8088 --uninstall"
+                throw "venv creation failed (uv exit $LASTEXITCODE)"
+            }
+        }
         & $script:UvCmd pip install --python $py --reinstall-package agent8088 -e $InstallDir 2>&1 | Out-Null
         $exit = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP

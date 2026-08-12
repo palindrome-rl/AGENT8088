@@ -403,7 +403,31 @@ install_deps() {
         pip install --upgrade --force-reinstall -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
     else
         log_info "Creating venv and installing via uv..."
-        "$UV_CMD" venv --python "$PYTHON_PATH" "$INSTALL_DIR/venv" >/dev/null 2>&1
+        # Re-running the installer over an existing install is a supported path —
+        # the caller was told "Existing installation found, updating..." further
+        # up. Plain `uv venv` contradicts that: it exits 2 with "A virtual
+        # environment already exists ... Use --clear to replace it". With set -e
+        # and output on /dev/null, that ended the installer here with no error
+        # printed, no venv touched, and nothing to go on.
+        #
+        # --allow-existing reuses the venv, so an update keeps the packages it
+        # already has instead of re-downloading them.
+        if ! "$UV_CMD" venv --python "$PYTHON_PATH" --allow-existing "$INSTALL_DIR/venv" >/dev/null 2>&1 \
+                || [ ! -x "$_py" ]; then
+            # Reuse can legitimately fail: a venv built by a Python that has
+            # since been removed or upgraded, or one left half-written by an
+            # interrupted run. That is not something to hand back to the user as
+            # a decision — rebuild it.
+            log_warn "Existing virtualenv is not usable — rebuilding it"
+            "$UV_CMD" venv --python "$PYTHON_PATH" --clear "$INSTALL_DIR/venv" >/dev/null 2>&1 || {
+                log_error "Could not create the virtualenv at $INSTALL_DIR/venv"
+                log_error "Run this to see the underlying error:"
+                log_error "  $UV_CMD venv --python $PYTHON_PATH --clear $INSTALL_DIR/venv"
+                log_error "If it keeps failing, remove the install and start clean:"
+                log_error "  agent8088 --uninstall"
+                exit 1
+            }
+        fi
         "$UV_CMD" pip install --python "$_py" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
             log_error "uv pip install failed; trying with --all-extras"
             "$UV_CMD" pip install --python "$_py" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
