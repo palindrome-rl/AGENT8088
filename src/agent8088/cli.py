@@ -3573,6 +3573,26 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         A.update_env_file(A.ENV_FILE_PATH, search_keys)
     if search_provider:
         content = _set_line(content, "web_search_provider", search_provider)
+    # Backfill a key that postdates this config. Setup edits the file in place,
+    # so a config written before web_search_no_prompt existed never gains it and
+    # falls back to 0 — while a fresh install picks up 1 from the packaged
+    # template. The visible symptom is an approval prompt on every search
+    # against a local SearXNG that a new install runs silently, with no way to
+    # discover the key short of reading the source. Backfilled only here, on an
+    # explicit reconfiguration, so deleting the line by hand still sticks.
+    if (search.strip().lower() != "none"
+            and not _re.search(r'^\s*web_search_no_prompt=', content, _re.MULTILINE)):
+        packaged = Path(__file__).with_name("config.txt")
+        try:
+            shipped = _re.search(r'^\s*web_search_no_prompt=(.*)$',
+                                 packaged.read_text(encoding="utf-8"), _re.MULTILINE)
+        except OSError:
+            shipped = None
+        if shipped and shipped.group(1).strip():
+            value = shipped.group(1).strip()
+            content = _set_line(content, "web_search_no_prompt", value)
+            print(f"Added web_search_no_prompt={value} "
+                  "(approval-free search, local SearXNG only).")
     _write_private_text(config_path, content)
     if activate_runtime:
         _reload_model_runtime(config_path, provider, model_name)

@@ -6,6 +6,8 @@ real user state.
 """
 from types import SimpleNamespace
 
+import pytest
+
 from agent8088 import searxng_provision as sp
 from tests.conftest import assert_owner_only
 
@@ -190,3 +192,90 @@ def test_wait_ready_never_sleeps_more_than_attempts(monkeypatch):
 
 def test_base_url_matches_the_published_port():
     assert f":{sp.HOST_PORT}/" in sp.BASE_URL and sp.BASE_URL.endswith("?q=")
+
+
+# ---------------------------------------------------------------------------
+# a settings.yml the container cannot parse
+#
+# Observed live: an older build wrote this template through the Windows locale
+# codepage, so the em-dash on line 1 landed as a lone 0x97. SearXNG reads the
+# file as UTF-8 and died on byte 25 every time, restarting on a 15s loop. Setup
+# could not repair it: bare read_text() decoded the same bytes happily as
+# cp1252, found the secret_key, and returned the corrupt file as good.
+# ---------------------------------------------------------------------------
+def _corrupt_settings(home):
+    """Reproduce the real breakage: the template encoded as cp1252, not UTF-8."""
+    directory = sp.settings_dir(home)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "settings.yml"
+    path.write_bytes(sp._SETTINGS_TEMPLATE.format(secret="a" * 64).encode("cp1252"))
+    return path
+
+
+def test_the_corrupt_file_reproduces_the_container_crash(tmp_path):
+    """Guard the guard: assert the fixture really is the byte SearXNG rejects."""
+    raw = _corrupt_settings(tmp_path).read_bytes()
+    assert raw[25] == 0x97
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
+
+
+def test_a_settings_file_that_is_not_utf8_is_regenerated(tmp_path):
+    path = _corrupt_settings(tmp_path)
+
+    sp.write_settings(tmp_path)
+
+    raw = path.read_bytes()
+    raw.decode("utf-8")  # raises UnicodeDecodeError if still cp1252
+    assert raw[25] != 0x97
+    assert "a" * 64 not in path.read_text(encoding="utf-8"), "stale secret kept"
+
+
+def test_a_valid_utf8_settings_file_is_left_alone(tmp_path):
+    """The idempotency that protects a user's edits must survive the fix."""
+    first = sp.write_settings(tmp_path).read_text(encoding="utf-8")
+
+    assert sp.write_settings(tmp_path).read_text(encoding="utf-8") == first
+
+
+def test_generated_settings_are_utf8_on_any_locale(tmp_path):
+    sp.write_settings(tmp_path).read_bytes().decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# a crash-looping container is not a healthy one
+# ---------------------------------------------------------------------------
+def test_status_does_not_report_a_restarting_container_as_running(monkeypatch):
+    """docker sets State.Running=true while a container crash-loops."""
+    monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: _ok("true true\n"))
+
+    result = sp.status()
+
+    assert result["running"] is False
+    assert result["restarting"] is True
+    assert "restarting" in result["detail"]
+
+
+def test_status_reports_a_healthy_container_as_running(monkeypatch):
+    monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: _ok("true false\n"))
+
+    assert sp.status()["running"] is True
+    assert sp.status()["restarting"] is False
+
+
+def test_start_replaces_a_crash_looping_container(tmp_path, monkeypatch):
+    """Reporting "already running" here skipped the restart that would fix it."""
+    argvs = []
+    monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
+    monkeypatch.setattr(sp, "status",
+                        lambda: {"running": False, "restarting": True,
+                                 "detail": "container is restarting — check logs"})
+    monkeypatch.setattr(sp, "_run", lambda argv, **kw: argvs.append(argv) or _ok())
+
+    result = sp.start(tmp_path)
+
+    assert any("rm" in a for a in argvs), "the dead container was left in place"
+    assert any("run" in a for a in argvs), "no replacement was started"
+    assert "already running" not in result.get("detail", "")

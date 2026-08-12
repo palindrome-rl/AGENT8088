@@ -61,8 +61,19 @@ def write_settings(home: Path) -> Path:
     directory = settings_dir(home)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "settings.yml"
-    if path.exists() and re.search(r'secret_key:\s*"([^"]+)"', path.read_text()):
-        return path
+    # encoding is explicit, and a file that is not UTF-8 is regenerated rather
+    # than kept. An older build wrote this template through the locale codepage,
+    # so on Windows the em-dash in line 1 landed as a lone 0x97; SearXNG reads
+    # settings.yml as UTF-8 and crash-looped on it. Bare read_text() decoded
+    # that same file happily as cp1252, matched the secret_key, and returned
+    # early — so setup preserved the corruption instead of repairing it.
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            existing = ""
+        if re.search(r'secret_key:\s*"([^"]+)"', existing):
+            return path
     # Written through the engine's private-file helper rather than chmod(0o600):
     # this file holds a secret_key, and on Windows chmod cannot express
     # owner-only — the file would keep its inherited SYSTEM/Administrators ACL
@@ -89,14 +100,27 @@ def status() -> dict:
     if not docker:
         return {"running": False, "detail": "docker is not installed"}
     try:
-        result = _run([docker, "inspect", "-f", "{{.State.Running}}",
+        # Restarting is reported alongside Running because docker sets
+        # State.Running=true for a container in a crash loop. Trusting Running
+        # alone made `start()` answer "already running" for a container that had
+        # never once served a request, so setup skipped the restart that would
+        # have picked up a repaired settings.yml and only the readiness probe
+        # noticed — leaving the instance permanently broken across re-runs.
+        result = _run([docker, "inspect", "-f",
+                       "{{.State.Running}} {{.State.Restarting}}",
                        CONTAINER_NAME], timeout=15)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"running": False, "detail": str(exc)}
     if result.returncode != 0:
         return {"running": False, "detail": "container does not exist"}
-    running = (result.stdout or "").strip() == "true"
-    return {"running": running,
+    fields = (result.stdout or "").split()
+    running = bool(fields) and fields[0] == "true"
+    restarting = len(fields) > 1 and fields[1] == "true"
+    if restarting:
+        return {"running": False, "restarting": True,
+                "detail": "container is restarting — check `docker logs "
+                          f"{CONTAINER_NAME}`"}
+    return {"running": running, "restarting": False,
             "detail": "running" if running else "container exists but is stopped"}
 
 
@@ -112,8 +136,11 @@ def start(home: Path) -> dict:
     existing = status()
     if existing.get("running"):
         return {"ok": True, "detail": "already running", "base_url": BASE_URL}
-    # Remove a stopped leftover so `docker run` does not fail on a name clash.
-    if existing.get("detail") == "container exists but is stopped":
+    # Remove any leftover so `docker run` does not fail on a name clash. A
+    # crash-looping container counts: matching only the stopped wording left a
+    # restarting one in place, and the name clash then masked the real fault.
+    if existing.get("restarting") or existing.get("detail") == (
+            "container exists but is stopped"):
         try:
             _run([docker, "rm", "-f", CONTAINER_NAME], timeout=30)
         except (OSError, subprocess.TimeoutExpired):
