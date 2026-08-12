@@ -6,16 +6,22 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid  # readline enables input history
+import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
-    import readline  # Unix-only; enables input history/editing
+    import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
     pass
 from contextlib import nullcontext
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PureWindowsPath
 from openai import OpenAI
+from agent8088.mcp import MCPRuntime
+from agent8088 import web_search
 
 APP_DIR = Path(__file__).resolve().parent
+
+import logging
+_log = logging.getLogger("agent8088.engine")
 
 
 # ---------------------------------------------------------------------------
@@ -28,8 +34,15 @@ def _protect_private_file(path: Path) -> None:
 
     import csv
 
+    # Absolute path on purpose. Under Git Bash / MSYS, PATH resolves `whoami` to
+    # the coreutils build, which rejects /user and exits non-zero — so every
+    # private-file write (the .env key store, telemetry, sandbox settings) fails
+    # with "Could not determine the current Windows user SID" for anyone running
+    # Agent8088 from that shell.
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    whoami = PureWindowsPath(system_root) / "System32" / "whoami.exe"
     identity = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"],
+        [str(whoami), "/user", "/fo", "csv", "/nh"],
         capture_output=True, text=True, timeout=10,
     )
     try:
@@ -71,7 +84,7 @@ def load_simple_config(path: Path) -> dict:
     config = {}
     if not path.exists():
         return config
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -99,6 +112,123 @@ def update_simple_config(path: Path, values: dict) -> None:
     _write_private_text(path, content)
 
 
+
+# --- .env key store ---
+
+def load_env_file(path: Path = None) -> dict:
+    """Load a .env file into a dict. Same format as load_simple_config."""
+    if path is None:
+        path = ENV_FILE_PATH if 'ENV_FILE_PATH' in globals() else Path.home() / ".agent8088" / ".env"
+    if not path.exists():
+        return {}
+    env = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip()
+    return env
+
+
+def update_env_file(path: Path, values: dict) -> None:
+    """Update key=value settings in a .env file with 0600 perms."""
+    path = Path(path)
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    for key, raw_value in values.items():
+        value = str(raw_value)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", key) or "\n" in value or "\r" in value:
+            raise ValueError(f"Invalid env value for {key!r}")
+        line = f"{key}={value}"
+        pattern = rf"^{re.escape(key)}=.*$"
+        if re.search(pattern, content, re.MULTILINE):
+            content = re.sub(pattern, lambda _: line, content, flags=re.MULTILINE)
+        else:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += line + "\n"
+    _write_private_text(path, content)
+
+
+def _mask_value(value: str) -> str:
+    """Mask a secret for display: sk-...cdef or (set, too short)."""
+    if not value:
+        return "(not set yet)"
+    if len(value) < 8:
+        return "(set, too short to mask)"
+    return value[:3] + "..." + value[-4:]
+
+
+def get_secret(config: dict, key: str, env_var: str = None) -> str:
+    """Resolve a secret: .env file first, then config, then os.environ.
+    If env_var is not given, derive it from key.upper()."""
+    env_var = env_var or key.upper()
+    _env = load_env_file()
+    if env_var in _env:
+        return _env[env_var]
+    if os.environ.get(env_var):
+        return os.environ[env_var]
+    env_key = f"{key}_env"
+    if env_key in config:
+        env_name = config[env_key]
+        if env_name in _env:
+            return _env[env_name]
+        if os.environ.get(env_name):
+            return os.environ[env_name]
+    return config.get(key, "")
+
+
+def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
+    """One-time migration: move provider.*.api_key and *_token from config.txt to .env.
+    Returns the number of keys migrated."""
+    if env_path.exists():
+        return 0  # already migrated
+    config = load_simple_config(config_path)
+    env_values = {}
+    config_updates = {}
+    migrated = 0
+
+    for key, value in list(config.items()):
+        if key.startswith("provider.") and key.endswith(".api_key") and value:
+            provider_name = key.split(".")[1]
+            env_var = f"{provider_name.upper().replace('-', '_')}_API_KEY"
+            env_values[env_var] = value
+            config_updates[f"provider.{provider_name}.api_key_env"] = env_var
+            config_updates[key] = ""  # clear the literal key
+            migrated += 1
+        elif key.endswith("_bot_token") and value:
+            env_var = key.upper()
+            env_values[env_var] = value
+            config_updates[f"{key}_env"] = env_var
+            config_updates[key] = ""
+            migrated += 1
+        elif key.endswith("_app_token") and value:
+            env_var = key.upper()
+            env_values[env_var] = value
+            config_updates[f"{key}_env"] = env_var
+            config_updates[key] = ""
+            migrated += 1
+
+    if not migrated:
+        return 0
+
+    update_env_file(env_path, env_values)
+    # Remove the literal keys from config.txt
+    content = config_path.read_text(encoding="utf-8")
+    for key in config_updates:
+        if config_updates[key] == "":
+            content = re.sub(rf"^{re.escape(key)}=.*\n?", "", content, flags=re.MULTILINE)
+        else:
+            line = f"{key}={config_updates[key]}"
+            pattern = rf"^{re.escape(key)}=.*$"
+            if re.search(pattern, content, re.MULTILINE):
+                content = re.sub(pattern, lambda _: line, content, flags=re.MULTILINE)
+            else:
+                content += line + "\n"
+    _write_private_text(config_path, content)
+    return migrated
+
+
 # Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
@@ -112,12 +242,33 @@ else:
     CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
 
+# .env key store lives next to config.txt
+ENV_FILE_PATH = Path(str(CONFIG_PATH.parent / ".env"))
+
+# One-time migration: move provider.*.api_key and *_token from config.txt to .env
+try:
+    _migrated_count = _migrate_keys_to_env(CONFIG_PATH, ENV_FILE_PATH)
+    if _migrated_count:
+        print(f"[agent8088] Migrated {_migrated_count} keys to {ENV_FILE_PATH}")
+        APP_CONFIG = load_simple_config(CONFIG_PATH)
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
+
 PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
+ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
 # {query} here would produce a doubled placeholder in the final URL.)
 SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/search?q=")
+# Whether the user actually SET a search URL, captured before the default is
+# injected into APP_CONFIG below. The web search registry needs the distinction:
+# a defaulted value would make the SearXNG backend claim to be configured on
+# every machine, so a host with no instance running would try (and fail) a
+# loopback request before reaching the keyless fallback, and /capabilities would
+# report a backend that isn't there.
+SEARCH_BASE_URL_CONFIGURED = bool(str(APP_CONFIG.get("search_base_url", "")).strip())
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
 SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
@@ -132,6 +283,57 @@ MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
+MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "300")))
+
+# --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
+# max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
+# burn unbounded tokens and wall-clock inside a small number of rounds.
+MAX_TURN_SECONDS = int(APP_CONFIG.get("max_turn_seconds", "0"))
+PLAN_MODE_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("plan_mode_timeout_seconds", "300")))
+PLAN_MODE_RETRY_LIMIT = max(1, int(APP_CONFIG.get("plan_mode_retry_limit", "2")))
+MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
+# USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
+MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
+COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
+COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
+
+# --- Write blast radius: bounds how much damage one turn can do ---
+# The permission layer decides WHETHER a write is allowed; these bound HOW MANY
+# and HOW BIG. A model looping on write_file inside an approved turn, or one
+# emitting a multi-megabyte file by mistake, is a plausible accident rather than
+# an attack — which is exactly why the permission gate does not catch it.
+# 0 disables either check.
+MAX_WRITES_PER_TURN = int(APP_CONFIG.get("max_writes_per_turn", "0"))
+MAX_WRITE_BYTES = int(APP_CONFIG.get("max_write_bytes", "0"))
+
+# --- Approval policy ---
+# There is deliberately no separate "approval mode" axis: PERMISSION_MODE already
+# decides what is gated, and a second setting that could also wave a gate through
+# meant `PERMISSION_MODE=readonly` plus one other key silently became full-auto.
+# Use PERMISSION_MODE for that.
+
+# Denial circuit breaker: after this many consecutive denials the model is told to
+# stop and report instead of retrying the same blocked action until max_turns.
+# 0 disables. A single approval resets the count.
+DENIAL_BREAKER_THRESHOLD = int(APP_CONFIG.get("denial_breaker_threshold", "3"))
+
+# Unattended runs (cron / scheduled) have no operator to answer a prompt.
+#   deny     refuse the gated action and tell the model why (fail closed)
+#   approve  treat the gate as granted — the always-on floor still applies
+CRON_MODE = str(APP_CONFIG.get("cron_mode", "deny")).strip().lower()
+if CRON_MODE not in ("deny", "approve"):
+    CRON_MODE = "deny"
+# Set by the CLI for a non-interactive invocation (a scheduled task, a piped
+# prompt). Env var is read once at import: reading it per call would let anything
+# running inside the process flip it mid-turn, the same escalation path Hermes
+# closes by freezing HERMES_YOLO_MODE at import.
+UNATTENDED = os.environ.get("AGENT8088_UNATTENDED", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Confirm before a slash command discards conversation state (/reset, /clear,
+# /new, /compact) or invalidates the MCP tool cache (/mcp reload).
+DESTRUCTIVE_CONFIRM = APP_CONFIG.get("destructive_slash_confirm", "1") != "0"
+MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
+
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
@@ -177,9 +379,160 @@ ALLOWED_PATHS = [
 # Permission layer ÔÇö readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
 PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
-_one_shot_grant = False  # set True by grant_escalation(), cleared after one blocked tool runs
+_one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
+_pending_approval_key = ""
 _local_fallback_grant = False
 _remote_git_grant = False
+_plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
+_plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
+_plan_on_approval = None    # set by CLI do_chat; shows the plan and returns the mode to run it in
+_plan_execution_grant = False  # temporary: set True when user approves a plan; cleared after plan completes
+# A plan session spans turns: plan mode is entered once, and left once — when the
+# work it authorized is done. Keeping the return mode here rather than in the CLI
+# means an embedder driving run_agent directly gets the same lifecycle.
+_plan_return_mode = ""      # mode to restore when an approved plan finishes
+_plan_approved = False      # the user approved this session's plan; execution is live
+_plan_approved_text = ""    # the approved plan, so the auditor grades against it
+_plan_tool_ran = False      # turn-scoped: did a plan tool actually run this turn?
+# Set while a sub-agent whose profile declares `permission: readonly` is running.
+# Such an agent is refused mutations outright rather than being allowed to escalate:
+# an escalation is a question the user can say yes to, and "this agent only
+# observes" has to be a guarantee, not a default. See _exec_subagent.
+_permission_floor_readonly = False
+_sandbox_readonly = False
+_last_audit_share = 0.0     # verification's share of the last completed turn's tokens
+
+
+def last_audit_share() -> float:
+    """Verification's share of the last completed turn's tokens, 0.0 if none."""
+    return _last_audit_share
+_active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
+# Which role is spending right now: "main", or "subagent:<type>". Verification is
+# not free — published figures put auditors at 19-38% of harness tokens — and a
+# cost you cannot see is a cost you cannot decide about. Both the turn budget and
+# the telemetry line attribute spend to whichever role incurred it.
+_active_role = "main"
+_turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
+_consecutive_denials = 0  # denial circuit breaker (see DENIAL_BREAKER_THRESHOLD)
+
+
+def set_permission_mode(mode: str) -> None:
+    """The one place PERMISSION_MODE changes, so every grant tied to the old mode
+    is dropped with it. A grant that outlives its mode is a hole: an approval the
+    user gave for a plan step must not still be spendable after the mode moved on."""
+    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant, _pending_approval_key
+    PERMISSION_MODE = mode
+    _one_shot_grant = False
+    _plan_execution_grant = False
+    _pending_approval_key = ""
+
+
+def enter_plan_mode() -> None:
+    """Enter plan mode and remember the mode to come back to.
+
+    Idempotent on purpose: `/plan` twice in a row must not record `plan-only` as
+    the destination, which would strand the session in plan mode forever."""
+    global _plan_return_mode, _plan_approved
+    if PERMISSION_MODE != "plan-only":
+        _plan_return_mode = PERMISSION_MODE
+    _plan_approved = False
+    set_permission_mode("plan-only")
+
+
+def cancel_plan_session() -> None:
+    """Abandon a plan session without running it — the user changed mode by hand."""
+    global _plan_return_mode, _plan_approved, _plan_approved_text
+    _plan_return_mode = ""
+    _plan_approved = False
+    _plan_approved_text = ""
+
+
+def finish_plan_session() -> str:
+    """Leave plan mode once the approved plan's turn is over.
+
+    Returns the mode restored to, or "" if nothing changed. An unapproved plan
+    stays in plan mode: the user asked for a plan and has not agreed to anything,
+    so nothing about the session's permissions should have moved."""
+    global _plan_return_mode, _plan_approved, _plan_approved_text
+    if not _plan_approved:
+        return ""
+    target = _plan_return_mode or "readonly"
+    _plan_approved = False
+    _plan_approved_text = ""
+    _plan_return_mode = ""
+    set_permission_mode(target)
+    return target
+
+
+def plan_tool_ran() -> bool:
+    """True if a plan tool ran during the current turn. The CLI uses this to tell
+    an executed plan apart from a model that only described one."""
+    return _plan_tool_ran
+
+
+def reset_turn_counters() -> None:
+    """Clear the per-turn blast-radius counters. Called by run_agent at the start
+    of each turn; exposed so an embedder driving run_tool directly can reset too."""
+    global _turn_writes, _plan_tool_ran
+    _turn_writes = 0
+    _plan_tool_ran = False
+
+
+# ---------------------------------------------------------------------------
+# Denial circuit breaker
+# ---------------------------------------------------------------------------
+def reset_approval_state() -> None:
+    """Clear the consecutive-denial count."""
+    global _consecutive_denials
+    _consecutive_denials = 0
+
+
+def reset_turn_approval_state() -> None:
+    """Drop unspent grants before a new agent turn can use them."""
+    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
+    _pending_approval_key = ""
+
+
+def _tool_call_key(name: str, args: dict) -> str:
+    return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
+
+
+def _remember_escalation(name: str, args: dict, result: str) -> None:
+    global _pending_approval_key
+    if result.startswith("ESCALATION_REQUEST\x1f"):
+        _pending_approval_key = _tool_call_key(name, args)
+
+
+def note_denial() -> bool:
+    """Record a denied escalation. Returns True once the breaker has tripped."""
+    global _consecutive_denials
+    _consecutive_denials += 1
+    return breaker_tripped()
+
+
+def note_approval() -> None:
+    """Record a granted escalation — the operator is engaged, so start over."""
+    reset_approval_state()
+
+
+def breaker_tripped() -> bool:
+    return bool(DENIAL_BREAKER_THRESHOLD) and _consecutive_denials >= DENIAL_BREAKER_THRESHOLD
+
+
+def breaker_message() -> str:
+    """What the model is told once the breaker opens.
+
+    Without this the model re-proposes the same blocked action until max_turns,
+    which reads to the user as the agent ignoring them.
+    """
+    return (
+        f"You have been denied {_consecutive_denials} times in a row. Stop "
+        f"attempting this action. Tell the user plainly what you could not do "
+        f"and why, and do not call another tool for it. "
+        f"(denial_breaker_threshold={DENIAL_BREAKER_THRESHOLD}; set it to 0 in "
+        f"config.txt to disable this limit.)"
+    )
 
 # ---------------------------------------------------------------------------
 # Layer 1: Sensitive file read protection ÔÇö hardcoded blocklist + config override
@@ -192,6 +545,23 @@ SENSITIVE_FILE_EXTENSIONS = frozenset([".pem", ".key", ".rsa", ".p12"])
 SENSITIVE_FILE_GLOBS = ["*_KEY*", "*_SECRET*", "*_TOKEN*", "*_PASSWORD*",
                         "*_key*", "*_secret*", "*_token*", "*_password*"]
 
+# Shell startup files: writing one is arbitrary code execution on the user's
+# next shell launch, so writes are refused at the always-on floor — even in
+# full-auto and even after an approved one-shot escalation. Reads stay allowed
+# (matched on exact filename, so "profile.json" and ".editorconfig" are
+# unaffected) because inspecting a dotfile is a normal, safe request.
+SHELL_STARTUP_FILES = frozenset([
+    ".bashrc", ".bash_profile", ".bash_login", ".bash_logout",
+    ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout",
+    ".profile", ".login", ".cshrc", ".tcshrc", ".kshrc",
+    "config.fish", "fish.config",
+])
+
+
+def _is_shell_startup_file(filepath: str) -> bool:
+    """True if the path's filename is a shell startup file (write-blocked)."""
+    return Path(filepath).name.lower() in SHELL_STARTUP_FILES
+
 ALLOWED_SENSITIVE_FILES = set(
     p.strip() for p in APP_CONFIG.get("allowed_sensitive_files", "").split(",") if p.strip()
 )
@@ -202,9 +572,15 @@ def _is_sensitive_path(filepath: str) -> bool:
     fn = Path(filepath).name.lower()
     fp = str(filepath).lower()
 
-    # Config override ÔÇö user explicitly allowed this file
+    # Config override: only the exact declared path is allowed. A substring
+    # match here could turn `allowed_sensitive_files=test` into a broad bypass.
+    try:
+        path = Path(filepath)
+        resolved = path.expanduser().resolve() if hasattr(path, "expanduser") else path
+    except OSError:
+        resolved = Path(filepath).expanduser()
     for allowed in ALLOWED_SENSITIVE_FILES:
-        if allowed.lower() in fn or allowed.lower() in fp:
+        if _resolve_allowed_path(allowed) == resolved:
             return False
 
     # Exact filename match
@@ -239,6 +615,7 @@ def _resolve_path_list(config_key: str, default: str = "") -> list:
 NO_PROMPT_PATHS = _resolve_path_list("no_prompt_paths")
 PROMPT_PATHS = _resolve_path_list("prompt_paths", ".")
 BLOCKED_PATHS = _resolve_path_list("blocked_paths")
+READ_PATHS = _resolve_path_list("read_paths")  # optional: if set, reads outside these escalate
 
 
 def _check_path_zone(target: Path) -> str:
@@ -263,6 +640,11 @@ READONLY_SAFE_COMMANDS = frozenset([
     "dir", "type", "findstr", "where", "hostname", "ver", "vol",
     "tasklist", "systeminfo",
 ])
+# Config-extensible: merge user-supplied safe commands from config.txt
+_extra_safe = APP_CONFIG.get("readonly_safe_commands", "")
+if _extra_safe.strip():
+    READONLY_SAFE_COMMANDS = READONLY_SAFE_COMMANDS | frozenset(
+        c.strip().lower() for c in _extra_safe.split(",") if c.strip())
 
 _SHELL_CONTROL_RE = re.compile(r"[|&;<>\n`]|\$\(")
 _GIT_READ_COMMANDS = frozenset(["status", "diff", "log", "show"])
@@ -310,15 +692,215 @@ def _dangerous_git_args(tokens: list) -> bool:
     )
 
 
-def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
+# --- User-defined deny rules (config: deny_commands) ---
+# fnmatch globs matched case-insensitively against the whole command text.
+# Checked at the hardline floor, before any mode or approval — no override.
+_USER_DENY_GLOBS = [
+    g.strip() for g in APP_CONFIG.get("deny_commands", "").split(",") if g.strip()
+]
+
+
+def _matches_user_deny(command: str) -> bool:
+    if not _USER_DENY_GLOBS:
+        return False
+    import fnmatch
+    lowered = command.lower()
+    return any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_DENY_GLOBS)
+
+
+# --- User-defined allow rules (config: allow_commands) ---
+# The positive counterpart to deny_commands: a denylist only stops what you
+# thought of, an allowlist stops everything you did not. When non-empty, a shell
+# command must match one of these globs or it is refused at the hardline floor —
+# so it is not escalatable, the same as a deny rule. Empty (the default) means
+# no allowlist is in force and behaviour is unchanged.
+#
+# deny_commands still wins: a command on both lists is refused, because deny is
+# the more specific statement of intent. And neither list can re-enable the
+# unrecoverable floor (rm -rf /, mkfs, curl | sh) — allow_commands=* does not
+# unlock those.
+_USER_ALLOW_GLOBS = [
+    g.strip() for g in APP_CONFIG.get("allow_commands", "").split(",") if g.strip()
+]
+
+
+def _outside_user_allowlist(command: str) -> bool:
+    """True if an allowlist is in force and this command is not on it."""
+    if not _USER_ALLOW_GLOBS:
+        return False
+    import fnmatch
+    lowered = command.lower().strip()
+    return not any(fnmatch.fnmatch(lowered, g.lower()) for g in _USER_ALLOW_GLOBS)
+
+
+# --- Unrecoverable command floor (always-on, no override) ---
+# Catastrophic commands that are blocked in ALL permission modes, including
+# edit mode. These cause irreversible damage: filesystem wipes, disk formats,
+# fork bombs, and remote-code-execution via pipe-to-shell at the root level.
+_UNRECOVERABLE_PATTERNS = [
+    # rm -rf / — wipe filesystem root (any flag order, --no-preserve-root, long/short)
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
+    # rm -rf ~ — wipe home dir
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?~(?:\s|$)"),
+    re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
+    re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
+    # pipe remote content to shell (curl/wget ... | sh|bash)
+    re.compile(r"\b(?:curl|wget)\b[^|;&<>]*\|\s*(?:sh|bash|dash|zsh|ksh)\b"),
+    re.compile(r"\b(?:sh|bash|dash|zsh|ksh)\s*<\s*\(\s*(?:curl|wget)\s+"),
+]
+
+
+def _is_unrecoverable_command(command: str) -> bool:
+    """Return True if the command matches an unrecoverable pattern.
+
+    Checked before _hard_blocked_shell's git/wrapper logic so these patterns
+    are caught even when the command is wrapped (bash -c 'rm -rf /') — the
+    recursive _hard_blocked_shell call re-enters here for wrapped payloads.
+    """
+    for pattern in _UNRECOVERABLE_PATTERNS:
+        if pattern.search(command):
+            return True
+    return False
+
+
+def _git_read_targets_sensitive_file(command: str) -> bool:
+    """Detect git read commands (show/diff/log) that target sensitive files.
+
+    `git show HEAD:.env` and `git diff -- .env` bypass _is_sensitive_path
+    because that check only runs in the read_text tool, not shell commands.
+    Block these at the hardline floor so they're denied in ALL modes.
+    """
+    parts = _shell_parts(command)
+    if not parts or len(parts) < 3:
+        return False
+    if Path(parts[0]).stem.lower() != "git":
+        return False
+    action = parts[1].lower()
+    if action not in _GIT_READ_COMMANDS:
+        return False
+    # ponytail: scan non-flag tokens for sensitive paths.
+    # `git show HEAD:.env` -> tokens after action: ["HEAD:.env"]
+    # `git diff -- .env` -> tokens: ["--", ".env"]
+    for token in parts[2:]:
+        if token.startswith("-"):
+            continue
+        # `git show` uses `<rev>:<path>` form — extract the path part
+        path_candidate = token.split(":", 1)[-1] if ":" in token else token
+        if not path_candidate or path_candidate in ("--",):
+            continue
+        if _is_sensitive_path(path_candidate):
+            return True
+    return False
+
+
+def _shell_targets_credential_path(command: str) -> bool:
+    """Refuse shell access to the same protected paths as file tools.
+
+    Shell tokenisation is intentionally conservative: an `echo` mentioning a
+    protected path is refused too, because a model cannot safely distinguish a
+    display from a read/write use across shell wrappers and substitutions.
+    """
+    tokens = re.split(r"[\s;&|<>`$()'\"=]+", command.replace("\\", "/"))
+    return any(
+        token and (_is_sensitive_path(token) or _is_shell_startup_file(token))
+        for token in tokens
+    )
+
+
+_SHELL_WEB_CLIENT = re.compile(
+    r"(?<![\w./-])(?:curl|wget|httpie|lynx|w3m)(?![\w.-])|(?<![\w./-])https?(?=\s)",
+    re.IGNORECASE,
+)
+_SHELL_HTTP_URL = re.compile(r"https?://[^\s\"'`<>|;&]+", re.IGNORECASE)
+
+
+def _shell_web_urls(command: str):
+    """Return explicit web targets used by a shell client, or None if not a fetch.
+
+    Shell clients accept too many syntaxes to infer a missing destination safely.
+    A fetch-shaped command with no explicit HTTP(S) URL therefore returns an empty
+    list and is refused by run_tool instead of bypassing the URL policy.
+    """
+    if not _SHELL_WEB_CLIENT.search(command or ""):
+        return None
+    return [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
+
+
+# Beyond this length a command is not something a person is reasonably asking
+# for, and lexing quote-storms gets expensive. Past the limit the command is
+# treated as dangerous rather than skipped — see _command_parser_limit_exceeded.
+MAX_COMMAND_CHARS = int(APP_CONFIG.get("max_command_chars", "16384"))
+
+
+def _command_parser_limit_exceeded(command: str) -> bool:
+    """True if the command is too large or too quote-dense to analyse reliably.
+
+    Detection that gives up must refuse, not allow: a command nobody can parse
+    is exactly the shape an evasion attempt takes.
+    """
+    if len(command or "") > MAX_COMMAND_CHARS:
+        return True
+    return (command or "").count('"') + (command or "").count("'") > 256
+
+
+def _command_detection_variants(command: str):
+    """Yield forms of `command` to run detection against.
+
+    Every lexer-based check below depends on shlex succeeding. A single
+    unbalanced quote made shlex raise, and the whole git/wrapper analysis was
+    skipped — `git push origin main "` executed in a mode where `git push` is
+    always refused. Detection must not depend on the input being well-formed,
+    so a de-quoted variant is tried as well.
+
+    The variant is used ONLY to re-run detection; nothing is executed from it,
+    and `echo`/`printf` stay on the non-exec list, so `echo "git push"` does not
+    become a push.
+    """
+    yield command
+    dequoted = (command or "").replace('"', " ").replace("'", " ")
+    if dequoted != command:
+        yield dequoted
+
+
+def _lex_command(command: str):
+    """Lex a command into parts, or None if it cannot be lexed."""
     try:
         lexer = shlex.shlex(command, posix=sys.platform != "win32",
                             punctuation_chars=";&|")
         lexer.whitespace_split = True
         lexer.commenters = ""
-        parts = list(lexer)
+        return list(lexer)
     except ValueError:
-        return False
+        return None
+
+
+def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
+    if _is_unrecoverable_command(command):
+        return True
+    if _matches_user_deny(command):
+        return True
+    # Checked after deny so deny_commands wins on a command listed in both, and
+    # after the unrecoverable floor so allow_commands=* cannot unlock rm -rf /.
+    if _outside_user_allowlist(command):
+        return True
+    if _git_read_targets_sensitive_file(command):
+        return True
+    if _shell_targets_credential_path(command):
+        return True
+    if _command_parser_limit_exceeded(command):
+        return True
+    # Run the lexer-based analysis on the first variant that parses. If none do,
+    # refuse: previously this returned False and skipped every check below.
+    parts = None
+    for variant in _command_detection_variants(command):
+        parts = _lex_command(variant)
+        if parts is not None:
+            if variant != command and _hard_blocked_shell(variant, _depth + 1):
+                return True
+            break
+    if parts is None:
+        return True
     separators = {";", "&&", "||", "&", "|"}
     if _depth < 8:
         substitutions = re.findall(r"\$\(([^()]*)\)|`([^`]*)`", command)
@@ -398,28 +980,76 @@ def _local_shell_reads_files(command: str) -> bool:
     )
 
 
+def _is_fixed_host_tool_command(command: str) -> bool:
+    """Whether this is verbatim the command of a host tool that takes no arguments.
+
+    The host file-read guard exists for commands whose target the model chose —
+    `cat <path>`, `git show <ref>:<path>`. A tool declared with a fixed `command`
+    and no `args=` has no such target: the text is identical every time and comes
+    from tools.txt, not from the model. Refusing those made `git_status` demand
+    an approval in readonly, the mode it is most useful in.
+
+    Derived from the registry rather than hardcoded, so a tool that later gains
+    an argument drops out of the exemption by construction.
+    """
+    normalised = " ".join((command or "").split())
+    if not normalised:
+        return False
+    return normalised in {
+        " ".join(str(spec.get("command", "")).split())
+        for spec in TOOL_SPECS.values()
+        if spec.get("host") and spec.get("mode") == "shell"
+        and not spec.get("args") and spec.get("command")
+    }
+
+
 def check_permission(mode: str, command: str = "", path_zone: str = "default",
-                     host: bool = False) -> bool:
+                     host: bool = False, approval_key: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
-    if PERMISSION_MODE == "edit":
+    # Read-only subagents may execute verification commands only when the
+    # backend guarantees isolation. Their disposable workspace is prepared by
+    # _exec_sandbox_command; host execution never enters this exception.
+    if (_permission_floor_readonly and _sandbox_readonly and not host
+            and mode in ("shell", "docker")
+            and _resolve_sandbox_backend() in ("native", "docker")):
         return True
+    if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser", "search"):
+        return True  # temporary grant for approved plan steps — only in plan-only mode
+    if PERMISSION_MODE in ("edit", "full-auto"):
+        return True
+    if PERMISSION_MODE == "plan-only":
+        if mode == "plan":
+            return True
+        if mode in ("read_text", "last_output", "python_eval", "introspect"):
+            return True
+        if mode == "shell" and _readonly_shell(command):
+            return True
+        if mode == "cron" and command == "list":
+            return True
+        return False
     if mode == "write_text" and path_zone == "no_prompt":
         return True
     # readonly mode
-    if mode in ("read_text", "last_output", "python_eval", "plan"):
+    # `introspect` reports the agent's own tool list and limits — no filesystem,
+    # network, or process access, so it is safe in every mode. An agent that
+    # cannot say what it can do is worse than useless in the restrictive modes.
+    if mode in ("read_text", "last_output", "python_eval", "plan", "introspect"):
         return True
     if mode == "cron" and command == "list":
         return True
+    if mode == "read_text" and READ_PATHS:
+        return False  # read_paths zone active: reads outside zone escalate
     if mode == "shell" and _readonly_shell(command):
         if ((host or _resolve_sandbox_backend() == "local")
-                and _local_shell_reads_files(command)):
+                and _local_shell_reads_files(command)
+                and not _is_fixed_host_tool_command(command)):
             return False
         return True
     # One-shot grant: allow one blocked tool through, then revert
-    if _one_shot_grant:
+    if _one_shot_grant is True or _one_shot_grant == approval_key:
         _one_shot_grant = False
         return True
     return False
@@ -427,23 +1057,32 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
 
 def request_escalation(target_mode: str, paths: list, change_type: str, reason: str) -> str:
     """Return a structured escalation request string for the model to relay
-    to the user. The UI intercepts this and prompts the user for approval."""
+    to the user. The UI intercepts this and prompts the user for approval.
+
+    Fields are delimited by \\x1f (ASCII unit separator) instead of ':' so
+    Windows paths like C:\\Users\\... don't break the parser."""
     return (
-        f"ESCALATION_REQUEST:{target_mode}:{change_type}:{','.join(paths)}:{reason}"
+        f"ESCALATION_REQUEST\x1f{target_mode}\x1f{change_type}\x1f{','.join(paths)}\x1f{reason}"
     )
 
 
 def grant_escalation(change_type: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
     The user is prompted for every write/mutation - no session-wide grants."""
-    global _one_shot_grant, _local_fallback_grant, _remote_git_grant
+    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
     if change_type == "git_remote_write":
         _remote_git_grant = True
         _one_shot_grant = False
         _local_fallback_grant = False
+        _pending_approval_key = ""
         return
-    _one_shot_grant = True
-    _local_fallback_grant = change_type == "local_execution"
+    if change_type == "local_execution":
+        _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
+        _pending_approval_key = ""
+        return
+    _one_shot_grant = _pending_approval_key or True
+    _pending_approval_key = ""
+    _local_fallback_grant = False
     _remote_git_grant = False
 
 DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.md."
@@ -515,13 +1154,25 @@ ACTIVE_PROVIDER = ""
 
 
 def _provider_api_key(provider: dict) -> str:
-    """Resolve a provider key: direct api_key value first, then env var."""
+    """Resolve a provider key, most explicit source first:
+
+      1. the .env key store — where _migrate_keys_to_env puts secrets, so it is
+         the canonical location and outranks a leftover plaintext api_key
+      2. an explicit api_key in config.txt
+      3. os.environ — ambient, so it is the LAST resort: a stray shell export
+         (e.g. OPENAI_API_KEY set for another tool) must not silently redirect
+         an explicitly configured provider
+    """
+    env_name = provider.get("api_key_env", "").strip()
+    if env_name:
+        _env = load_env_file()
+        if env_name in _env:
+            return _env[env_name]
     direct = provider.get("api_key", "").strip()
     if direct:
         return direct
-    env_name = provider.get("api_key_env", "").strip()
-    if env_name:
-        return os.environ.get(env_name, "")
+    if env_name and os.environ.get(env_name):
+        return os.environ[env_name]
     return ""
 
 
@@ -656,9 +1307,32 @@ def _finish_interrupt_watcher(stop, watcher):
 
 def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                       temperature=0.1, on_token=None, interrupt_check=None,
-                      model_name: str = "", provider_name: str = ""):
+                      model_name: str = "", provider_name: str = "",
+                      telemetry_attempt: str = "direct"):
+    """Create one model response and record metadata-only local telemetry."""
+    started = time.monotonic()
     selected_model = model_name or MODEL_NAME
-    full_messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *messages]
+    provider = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    try:
+        response = _create_completion(
+            client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
+            temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
+            model_name=selected_model, provider_name=provider,
+        )
+    except Exception as exc:
+        _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
+                                max_tokens=max_tokens, error=exc)
+        raise
+    _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
+                            max_tokens=max_tokens, response=response)
+    return response
+
+
+def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
+                       temperature=0.1, on_token=None, interrupt_check=None,
+                       model_name: str = "", provider_name: str = ""):
+    selected_model = model_name or MODEL_NAME
+    full_messages = [{"role": "system", "content": system_prompt or current_system_prompt()}, *messages]
     penalties = {}
     if FREQUENCY_PENALTY:
         penalties["frequency_penalty"] = FREQUENCY_PENALTY
@@ -777,6 +1451,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+            telemetry_attempt="primary",
         )
     except AgentInterrupted:
         raise
@@ -801,7 +1476,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 fallback_client, messages, tools, temperature=temperature,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
-                provider_name=provider_name,
+                provider_name=provider_name, telemetry_attempt="fallback",
             )
         except AgentInterrupted:
             raise
@@ -869,7 +1544,7 @@ def build_image_message(text: str, images: list) -> dict:
     for ref in images or []:
         ref = str(ref).strip()
         if ref.startswith(("http://", "https://")):
-            blocked = _ssrf_check(ref)
+            blocked = _egress_check(ref) or _ssrf_check(ref)
             if blocked:
                 raise ValueError(blocked)
             parts.append({"type": "image_url", "image_url": {"url": ref}})
@@ -926,6 +1601,7 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "args": parse_csv(g("args", "tool_params")),
         "keywords": set(parse_csv(g("keywords", "tool_keywords"))),
         "command": g("command", "tool_command"),
+        "sandbox_image": g("sandbox_image", "tool_sandbox_image"),
         "url": g("url", "tool_url"),
         # http_get/http_post extras. jq filters and JSON bodies are pipe- and
         # comma-heavy, which collides with tools.txt's '|' field separator — so
@@ -944,7 +1620,19 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "path_arg": g("path_arg", "tool_path_arg", "filename"),
         "content_arg": g("content_arg", "tool_content_arg", "content"),
         "timeout": int(g("timeout", "tool_timeout", "25")),
+        "arg_types": _parse_arg_types(g("arg_types", "tool_arg_types")),
     }
+
+
+def _parse_arg_types(raw: str) -> dict:
+    """Parse 'steps:array,filename:string' into {'steps': 'array', 'filename': 'string'}."""
+    result = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            result[k.strip()] = v.strip()
+    return result
 
 
 def load_tool_specs(path: Path, config: dict) -> dict:
@@ -968,31 +1656,59 @@ def load_tool_specs(path: Path, config: dict) -> dict:
 
 
 def build_tools_def(tool_specs: dict) -> list:
-    return [{
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": spec["description"],
-            "parameters": {
-                "type": "object",
-                "properties": {param: {"type": "string"} for param in spec["args"]},
-                "required": list(spec["args"]),
+    result = []
+    for name, spec in tool_specs.items():
+        # MCP tools declare their own parameters schema; built-in tools use args + arg_types
+        if "parameters" in spec:
+            params = spec["parameters"]
+        else:
+            props = {}
+            for param in spec["args"]:
+                arg_types = spec.get("arg_types", {})
+                props[param] = {"type": arg_types.get(param, "string")}
+            params = {"type": "object", "properties": props,
+                      "required": list(spec["args"])}
+        result.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["description"],
+                "parameters": params,
             },
-        },
-    } for name, spec in tool_specs.items()]
+        })
+    return result
 
 
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
+MCP_RUNTIME = MCPRuntime(PROJECT_ROOT)
+TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
 TOOLS_DEF = build_tools_def(TOOL_SPECS)
 TOOL_NAMES = set(TOOL_SPECS.keys())
 TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+
+
+def reload_mcp_tools():
+    """Reconnect MCP servers and refresh their registered tools."""
+    global TOOLS_DEF, TOOL_NAMES, TOOL_REQUIRED_PARAMS, SYSTEM_PROMPT
+    for name, spec in list(TOOL_SPECS.items()):
+        if spec.get("mode") == "mcp":
+            TOOL_SPECS.pop(name)
+    TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
+    TOOLS_DEF = build_tools_def(TOOL_SPECS)
+    TOOL_NAMES = set(TOOL_SPECS)
+    TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+    SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS) + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE)
+    return MCP_RUNTIME.statuses
+
+
+atexit.register(MCP_RUNTIME.close)
 
 TOOL_ALIASES = {
     "bash": "execute_shell", "sh": "execute_shell",
     "shell": "execute_shell", "run": "execute_shell",
     "search": "web_search", "web": "web_search", "google": "web_search",
     "read": "read_text", "cat": "read_text",
-    "write": "write_file", "create_file": "write_file",
+    "write": "write_file", "create_file": "write_file", "writefile": "write_file",
     "calc": "calculate", "eval": "calculate", "math": "calculate",
     "last": "last_output", "prev_output": "last_output",
 }
@@ -1003,6 +1719,42 @@ def _resolve_tool_name(name):
     Canonical names pass through unchanged; unknown names pass through too
     (so the TOOL_NAMES check fails naturally and the call is skipped)."""
     return TOOL_ALIASES.get(name, name)
+
+
+RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
+
+
+def render_runtime_context(now=None) -> str:
+    """Tell the model what day it is.
+
+    Without this it has no clock — only a training cutoff — so "the next
+    election" silently means whatever was next while it was trained, and a
+    page from years ago reads as current. Every date-aware behaviour in the
+    search path depends on this block being present.
+
+    Rendered per turn rather than at import: a gateway or cron process runs
+    for days and would otherwise keep answering with the date it booted on.
+    """
+    moment = now or datetime.now().astimezone()
+    return (
+        f"{RUNTIME_CONTEXT_HEADING}"
+        f"- Today is {moment.strftime('%A, %d %B %Y')}.\n"
+        f"- Current year: {moment.year}. Current month: {moment.strftime('%B %Y')}.\n"
+        "- Your training data is older than today. For anything current, "
+        "time-sensitive, or scheduled, search rather than answering from memory.\n"
+    )
+
+
+def current_system_prompt() -> str:
+    """The default system prompt, carrying today's date rather than import day's.
+
+    SYSTEM_PROMPT is built once at module import. That is fine for a one-shot
+    CLI invocation and wrong for the gateway and cron, which stay up long
+    enough for the date to move underneath them. Splitting on the heading
+    keeps repeated calls from stacking context blocks.
+    """
+    base = SYSTEM_PROMPT.split(RUNTIME_CONTEXT_HEADING)[0]
+    return base + render_runtime_context()
 
 
 def render_tool_docs(specs: dict) -> str:
@@ -1030,6 +1782,13 @@ def render_tool_docs(specs: dict) -> str:
         "to the user. If a listed tool clearly does what's asked, use it rather than refusing.",
         "",
     ]
+    lines.append("Mandatory routing — call the matching tool before writing an answer:")
+    if "read_text" in specs:
+        lines.append("- A direct request to read a file MUST call read_text.")
+    if "execute_shell" in specs:
+        lines.append("- A direct request to run a command MUST call execute_shell.")
+    if "web_search" in specs:
+        lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
     for name, s in specs.items():
         args = ", ".join(s["args"]) or "no args"
         lines.append(f"- {name}({args}): {s['description']}")
@@ -1145,7 +1904,8 @@ if SKILL_PACKAGES:
 
 
 SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
-                 + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE))
+                 + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE)
+                 + render_runtime_context())
 
 _last_tool_output = ""
 _last_tool_name = ""
@@ -1164,6 +1924,7 @@ _DEFAULT_SUBAGENT_PROFILE = {
     "description": "General-purpose sub-agent for multi-step research, search, and code tasks.",
     "tools": sorted(n for n in TOOL_NAMES if n != "spawn_subagent"),
     "max_turns": 8,
+    "permission": "",
     "system_prompt": (
         "You are a focused sub-agent spawned to complete ONE delegated task with a "
         "fresh context. Use your tools actively. When done, reply with a concise final "
@@ -1183,6 +1944,10 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 "description": meta.get("description", default_tool_description(name)),
                 "tools": parse_csv(meta.get("tools", "")),
                 "max_turns": int(meta.get("max_turns", "8")),
+                # Optional permission floor for the sub-run. Only "readonly" is
+                # honoured: a profile may restrict itself below the caller's mode,
+                # never widen past it.
+                "permission": meta.get("permission", "").strip().lower(),
                 "system_prompt": body.strip() or _DEFAULT_SUBAGENT_PROFILE["system_prompt"],
             }
     if DEFAULT_SUBAGENT not in specs:
@@ -1206,11 +1971,63 @@ subagent_ui = None
 def resolve_user_path(raw_path: str) -> Path:
     p = Path(raw_path or "").expanduser()
     if not p.is_absolute():
-        p = PROJECT_ROOT / p
+        project_path = PROJECT_ROOT / p
+        artifact_path = ARTIFACTS_ROOT / p
+        p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
     resolved = p.resolve()
     if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
         raise ValueError(f"Path not allowed: {resolved}")
     return resolved
+
+
+def resolve_write_path(raw_path: str) -> Path:
+    """Store what the agent creates in artifacts/; honour a stated location.
+
+    A path that names a directory, or an absolute path to a file that is really
+    there, states where the write belongs and is written there. Everything else
+    is a file the agent is inventing, and it goes to artifacts/.
+
+    A *bare* filename is routed to artifacts/ even when the project root holds a
+    file of that name. Existence used to be read as "this is an edit, keep it in
+    place", which meant one leftover at the root pinned every later write to it:
+    a plan wrote `library.py` to the root because an earlier run had left one
+    there, while its new `library.json` went to artifacts/. The program was split
+    across two directories, could not run, and the auditor — which resolves a
+    bare name against the sandbox workspace — reported the source missing.
+    """
+    p = Path(raw_path or "").expanduser()
+    if p.is_absolute():
+        resolved = p.resolve()
+        if (not resolved.exists() and resolved != ARTIFACTS_ROOT
+                and PROJECT_ROOT in resolved.parents
+                and ARTIFACTS_ROOT not in resolved.parents):
+            resolved = (ARTIFACTS_ROOT / resolved.relative_to(PROJECT_ROOT)).resolve()
+    elif len(p.parts) == 1:
+        resolved = (ARTIFACTS_ROOT / p).resolve()
+    else:
+        project_path = (PROJECT_ROOT / p).resolve()
+        if project_path.exists() or project_path == ARTIFACTS_ROOT or ARTIFACTS_ROOT in project_path.parents:
+            resolved = project_path
+        else:
+            resolved = (ARTIFACTS_ROOT / p).resolve()
+    if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
+        raise ValueError(f"Path not allowed: {resolved}")
+    return resolved
+
+
+def _shadowed_project_file(raw_path: str, target: Path) -> Path | None:
+    """The existing project file a bare-name write was routed away from.
+
+    Diverting silently is the one thing that cannot be recovered from: a model
+    that meant the project's own README.md would report success and never learn
+    it wrote a copy. Naming the file it did not touch makes the write correctable
+    on the next call.
+    """
+    p = Path(raw_path or "").expanduser()
+    if p.is_absolute() or len(p.parts) != 1:
+        return None
+    project_path = (PROJECT_ROOT / p).resolve()
+    return project_path if project_path.exists() and project_path != target else None
 
 
 def _read_text_limited(path: Path, limit: int = MAX_READ_BYTES) -> str:
@@ -1232,7 +2049,11 @@ def classify_plan_component(step_text: str) -> str:
         score += len(words.intersection(spec.get("keywords", set())))
         if score > best_score:
             best_score, best_tool = score, name
-    return best_tool or next(iter(TOOL_NAMES), "")
+    # No signal means no answer. Guessing here used to pick whichever tool
+    # iterated first at score zero, and _infer_step_args then filled its single
+    # required argument with the step's own prose — which is how "Delete the old
+    # backups" became a literal shell command.
+    return best_tool if best_score > 0 else ""
 
 
 def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) -> dict:
@@ -1305,8 +2126,8 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     return text or "Command completed."
 
 
-def _exec_shell_command(command: str, timeout: int = 25) -> str:
-    return _exec_sandbox_command(command, timeout=timeout)
+def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str:
+    return _exec_sandbox_command(command, timeout=timeout, image=image)
 
 
 def _process_display(argv: list) -> str:
@@ -1397,6 +2218,19 @@ def _safe_calculate(expression: str):
     return evaluate(tree.body)
 
 
+class MissingToolArgument(ValueError):
+    """A command template placeholder had no value, and which one is known.
+
+    A ValueError subclass so every existing `except ValueError` around argument
+    formatting keeps behaving as it did; the parameter name rides along so the
+    caller can build a message that names the tool too.
+    """
+
+    def __init__(self, param: str):
+        super().__init__(f"Missing required argument: {param}")
+        self.param = param
+
+
 def _format_with_args(template: str, args: dict) -> str:
     import urllib.parse
     # Config supplies defaults like {project_root}; model args override and win.
@@ -1408,10 +2242,291 @@ def _format_with_args(template: str, args: dict) -> str:
     try:
         return (template or "").format(**safe)
     except KeyError as exc:
-        raise ValueError(f"Missing required argument: {exc.args[0]}") from None
+        raise MissingToolArgument(str(exc.args[0])) from None
+
+
+_UNTRUSTED_OPEN_RE = re.compile(r"^<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>\n?")
+_UNTRUSTED_CLOSE = "<<<END_UNTRUSTED_CONTENT>>>"
+
+
+def _unwrap_untrusted(text: str) -> str:
+    """Strip the untrusted-content boundary markers, if present.
+
+    Shell-mode results are wrapped before they reach the plan executor, so a
+    status prefix like `Error:` or `ESCALATION_REQUEST:` is no longer at the
+    start of the string. Checking the wrapped text meant an unapproved shell step
+    read as a success and the plan carried on past it.
+
+    Unwrapping rather than searching the whole string on purpose: a command's own
+    output may legitimately contain the word "Error:", and matching that would
+    halt plans on a passing step.
+    """
+    body = _UNTRUSTED_OPEN_RE.sub("", (text or "").lstrip(), count=1)
+    if body is not (text or "") and body.rstrip().endswith(_UNTRUSTED_CLOSE):
+        body = body.rstrip()[: -len(_UNTRUSTED_CLOSE)]
+    return body
+
+
+def _plan_step_failed(result: str) -> bool:
+    """True if a plan step did not do what the plan asked.
+
+    Two forms count: a tool that reported an error, and an escalation that went
+    unanswered or was denied (the request string survives only when nobody
+    approved it). Both mean the intended effect is absent, so every later step
+    is now standing on an assumption that is already false.
+    """
+    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+
+
+PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
+PLAN_AUDIT_REVERT = APP_CONFIG.get("plan_audit_revert", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+PLAN_REVERT_MAX_BYTES = int(APP_CONFIG.get("plan_audit_revert_max_bytes", str(1 << 20)))
+# Modes whose effect leaves something durable to inspect afterwards. `browser` is
+# deliberately absent: a rendered page closes over nothing, so auditing it buys an
+# inconclusive verdict at the price of a model call. Reads are absent for the
+# obvious reason — auditing a read tells you the read returned what it returned.
+_CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
+_VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
+
+
+def _plan_step_is_auditable(tool_name: str, acceptance: str) -> bool:
+    """Whether this step has an inspectable closure worth spending an audit on.
+
+    A declared `acceptance` always qualifies: the step's author has named what
+    done means, which is the strongest thing an auditor can be handed. Otherwise
+    fall back to modes that leave a durable trace.
+
+    So a browser step is audited only when the plan says what done means for it —
+    the reported page text is in the auditor's task, so "the page mentions pricing"
+    is checkable, while an invented criterion for a page nobody kept would not be.
+    """
+    if acceptance:
+        return True
+    return TOOL_SPECS.get(tool_name, {}).get("mode") in _CLOSURE_MODES
+
+
+def _capture_write_state(tool_name: str, tool_args: dict):
+    """Snapshot what a write step is about to overwrite, so a failed audit can
+    put it back. Returns (path, prior_bytes) with prior_bytes None when the file
+    did not exist, or None when no snapshot can be taken.
+
+    Bounded by plan_audit_revert_max_bytes: holding an arbitrarily large file in
+    memory to enable a maybe-revert is a worse trade than declining to revert and
+    saying so.
+    """
+    spec = TOOL_SPECS.get(tool_name, {})
+    if spec.get("mode") != "write_text":
+        return None
+    try:
+        path = resolve_write_path(_tool_path(spec, tool_args))
+    except Exception:
+        return None
+    try:
+        if not path.exists():
+            return (path, None)
+        if path.stat().st_size > PLAN_REVERT_MAX_BYTES:
+            return None
+        return (path, path.read_bytes())
+    except OSError:
+        return None
+
+
+def _revert_plan_write(snapshot) -> str:
+    """Undo one write step, returning the file to its exact pre-step bytes."""
+    path, prior = snapshot
+    try:
+        if prior is None:
+            if path.exists():
+                path.unlink()
+            return f"reverted — removed {path.name}"
+        path.write_bytes(prior)
+        return f"reverted — restored the previous contents of {path.name}"
+    except OSError as exc:
+        return f"REVERT FAILED for {path.name} ({exc}) — inspect this file by hand"
+
+
+def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
+                     result: str, depth: int,
+                     acceptance: str = "", evidence: str = "",
+                     plan_context: str = "") -> tuple:
+    """Check a completed step against the environment. Returns (halt_reason, note).
+
+    Off unless `plan_audit=1`. A step that reports success has only told us the
+    tool did not raise; the auditor looks at what is actually on disk. It runs
+    under the readonly floor its profile declares, so it cannot alter what it is
+    inspecting.
+
+    Skipped when the shared turn budget is already spent — the auditor spends the
+    parent's budget by design, and burning the remainder on verification would
+    starve the work being verified. A `fail` verdict halts the plan; anything
+    else is recorded but never halts, because an auditor that cannot run must not
+    be able to stop work on its own.
+    """
+    if _active_budget is not None and _active_budget.exceeded():
+        return "", "audit skipped — turn budget spent"
+    task = (
+        "Verify that the following step actually took effect. Inspect the real "
+        "environment; do not trust the reported output.\n\n"
+        f"Step: {step_text or tool_name}\n"
+        f"Tool: {tool_name}\n"
+        f"Arguments: {json.dumps(tool_args, default=str)[:500]}\n"
+        f"Reported result: {result[:500]}\n"
+    )
+    # A stated criterion beats the auditor inventing one. Without it the auditor
+    # has to guess what "worked" means and grades against its own guess.
+    if acceptance:
+        task += f"\nAcceptance criteria (the step is done only if this holds): {acceptance}\n"
+    if evidence:
+        task += f"Evidence to collect: {evidence}\n"
+    if plan_context:
+        task += (
+            "\nApproved plan context (use this to understand the current call, "
+            "but do not require later steps to be complete yet):\n"
+            f"{plan_context}\n"
+        )
+    # Without this the auditor has no idea where "the workspace" is, and a
+    # criterion naming a file it cannot locate was answered `pass` rather than
+    # `unknown` — a false pass, the one verdict that costs more than no auditing.
+    workspace = ", ".join(dict.fromkeys(
+        [str(ARTIFACTS_ROOT), *(str(p) for p in ALLOWED_PATHS)]
+    ))
+    task += f"\nWorkspace paths (resolve any relative name against these): {workspace}\n"
+
+    # The exact file the step touched, resolved the way the step resolved it.
+    # Without this the auditor is handed a bare name like "library.py", which
+    # read_text resolves against the project while execute_shell resolves inside
+    # a disposable copy of artifacts/ — two different files. It compared one
+    # against a claim about the other, correctly reported a mismatch, and a
+    # correct write was reverted on the strength of it.
+    spec = TOOL_SPECS.get(tool_name, {})
+    raw_path = _tool_path(spec, tool_args)
+    if raw_path:
+        try:
+            resolver = (resolve_write_path if spec.get("mode") == "write_text"
+                        else resolve_user_path)
+            task += f"The step touched exactly this path: {resolver(raw_path)}\n"
+        except Exception:
+            pass
+
+    task += ("\nYour two tools do not see the same filesystem:\n"
+             "- read_text reads the real file. Use it, with the absolute path "
+             "above, whenever the criteria concern a file's contents or size.\n"
+             "- execute_shell runs inside a DISPOSABLE COPY of the sandbox "
+             "workspace, not the project. A relative name there is a different "
+             "file, so `wc`, `ls` or `tail` on it is not evidence about the path "
+             "above.\n"
+             "If you cannot locate what the criteria refer to, the verdict is "
+             "'unknown'. Never answer 'pass' for something you did not observe, "
+             "and never answer 'fail' from a path you have not confirmed is the "
+             "one the step wrote.\n"
+             "\nReply with a single VERDICT line as instructed.")
+    answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
+    verdict = _VERDICT_RE.search(answer or "")
+    if verdict is None:
+        return "", f"audit inconclusive — no verdict returned ({(answer or '')[:120]})"
+    if verdict.group(1).lower() == "fail":
+        return f"{tool_name} failed verification", answer.strip()[:300]
+    return "", ""
+
+
+def _approved_plan_audit_applies(tool_name: str, depth: int) -> bool:
+    """Whether an ordinary tool call should be verified right now.
+
+    The auditor reached a plan's writes for a structural reason rather than a
+    deliberate one: plan mode forced every mutation through `execute_plan`, and
+    that is the only path the audit hooked. An approved plan now runs as ordinary
+    tool calls, so without this the default `/plan` path would be the one path
+    with no verification at all — the opposite of what the audit is for.
+
+    Depth 0 only. A sub-agent's writes are not the plan, and auditing inside the
+    auditor would set it verifying itself.
+    """
+    if not (PLAN_AUDIT and _plan_approved and depth == 0):
+        return False
+    return _plan_step_is_auditable(tool_name, "")
+
+
+def _audit_approved_plan_call(tool_name: str, tool_args: dict, result: str,
+                              depth: int, snapshot) -> str:
+    """Verify one post-approval call and put a failed write back.
+
+    `_exec_plan` halts its remaining steps on a failed verdict. There is no step
+    list to halt here, so the equivalent is to hand the model a result it cannot
+    read as success and to say plainly that nothing later should be built on top
+    of it. The same asymmetry holds as in plans: only a `fail` undoes anything —
+    an auditor that could not reach its model must not be able to destroy work.
+    """
+    step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
+    reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
+                                    plan_context=_plan_approved_text[:1500])
+    parts = [result]
+    if note:
+        parts.append(f"audit: {note}")
+    if reason:
+        if snapshot is not None:
+            parts.append(_revert_plan_write(snapshot))
+        elif PLAN_AUDIT_REVERT and TOOL_SPECS.get(tool_name, {}).get("mode") != "write_text":
+            parts.append(f"not reverted — {tool_name} has no undo; "
+                         "inspect the effect by hand")
+        parts.append(f"Error: verification failed — {reason}. Stop carrying out the plan "
+                     "and report what actually happened; do not assume any later step is "
+                     "safe to run.")
+    return "\n".join(parts)
+
+
+def _exec_present_plan(args: dict, depth: int = 0) -> str:
+    """Show a finished plan and ask the user to approve it.
+
+    This is plan mode's exit point, not an executor. Presentation and execution
+    were the same tool before, which forced every approvable plan to be a JSON
+    array of fully-specified tool calls — so a plan written the way a human reads
+    it halted on its first step, and a model that wrote prose instead had nothing
+    approved and nothing run while still sounding finished. Here the plan is
+    text, the user picks the mode the work runs in, and the ordinary tool path
+    does the work.
+    """
+    global _plan_approved, _plan_approved_text, _plan_tool_ran
+    if depth:
+        # The plan belongs to the main agent's turn. A sub-agent asking the user to
+        # approve *its* plan for a delegated sub-task would leave plan mode on the
+        # strength of an approval given for something else entirely.
+        return ("Error: a sub-agent cannot present a plan. Finish your task with the "
+                "tools you have and report back; the agent that delegated to you owns "
+                "the plan.")
+    _plan_tool_ran = True
+    plan_text = str(args.get("plan") or args.get("text") or args.get("steps") or "").strip()
+    if not plan_text:
+        return ("Error: present_plan requires a non-empty 'plan' — the plan itself, "
+                "as markdown text the user can read.")
+    if PERMISSION_MODE != "plan-only":
+        return (f"Error: present_plan only applies in plan mode; this session is in "
+                f"{PERMISSION_MODE} mode. Do the work with ordinary tool calls.")
+    if not callable(_plan_on_approval):
+        return ("Plan not approved: this session has no way to ask the user "
+                "(non-interactive). Nothing was written or run. Report the plan "
+                "to the user as your answer instead.")
+    chosen = _plan_on_approval(plan_text)
+    if not chosen:
+        return ("Plan not approved — still in plan mode. Revise the plan and call "
+                "present_plan again, or answer the user's questions about it. "
+                "Nothing has been written or run.")
+    set_permission_mode(chosen)
+    _plan_approved = True
+    _plan_approved_text = plan_text
+    message = (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
+               "in order, with ordinary tool calls, and report what each step actually "
+               "did. Do not call present_plan again for this plan.")
+    if PLAN_AUDIT:
+        message += (" Every mutating step will be verified against the real environment "
+                    "by a read-only auditor, and a step that fails verification is put "
+                    "back — so make each one do exactly what the plan said.")
+    return message
 
 
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
+    global _plan_execution_grant, _plan_tool_ran
+    _plan_tool_ran = True
     raw = args.get("steps") or args.get("plan") or ""
     steps = raw
     if isinstance(raw, str):
@@ -1422,22 +2537,69 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             steps = [s.strip(" -") for s in raw.splitlines() if s.strip()]
     if not isinstance(steps, list):
         return "Error: execute_plan requires a list of steps or newline plan text."
+    if not steps:
+        return ("Error: execute_plan requires a non-empty steps array. "
+                'Pass steps as a JSON array, e.g.: [{"tool":"write_file",'
+                '"arguments":{"filename":"C:/tmp/x.txt","content":"hi"}}]')
+
+    total = len(steps)
+
+    # In plan-only mode: show all steps as pending, then get approval BEFORE running.
+    # On approve: set _plan_execution_grant so steps run without per-step prompts,
+    # but PERMISSION_MODE stays plan-only (temporary grant, not a mode switch).
+    if PERMISSION_MODE == "plan-only" and on_step and on_escalation:
+        pre_parsed = []
+        has_gated = False
+        for idx, step in enumerate(steps, 1):
+            if isinstance(step, dict):
+                step_text = str(step.get("step") or step.get("text") or "")
+                tool_name = str(step.get("tool") or classify_plan_component(step_text))
+            else:
+                step_text = str(step)
+                tool_name = classify_plan_component(step_text)
+            spec = TOOL_SPECS.get(tool_name, {})
+            if spec.get("mode") in ("write_text", "shell", "docker", "cron", "browser"):
+                has_gated = True
+            pre_parsed.append((idx, step_text, tool_name or "(no tool)"))
+        for idx, step_text, tool_name in pre_parsed:
+            on_step(idx, total, step_text, tool_name, "pending", None)
+        if has_gated:
+            approved = on_escalation(
+                request_escalation(
+                    "edit", ["(plan)"], "plan_approval",
+                    f"Plan has {total} step(s). Review the checklist above and approve to execute."
+                )
+            )
+            if not approved:
+                return "Plan denied — staying in plan-only mode."
+            _plan_execution_grant = True
 
     outputs = []
-    total = len(steps)
+    halted = ""
+    stopped_at = 0
     for idx, step in enumerate(steps, 1):
         if isinstance(step, dict):
             step_text = str(step.get("step") or step.get("text") or "")
             tool_name = str(step.get("tool") or classify_plan_component(step_text))
             given = step.get("arguments") if isinstance(step.get("arguments"), dict) else {}
             tool_args = _infer_step_args(tool_name, step_text, given)
+            acceptance = str(step.get("acceptance") or step.get("acceptance_criteria") or "")
+            evidence = str(step.get("evidence") or "")
         else:
             step_text = str(step)
             tool_name = classify_plan_component(step_text)
             tool_args = _infer_step_args(tool_name, step_text, {})
+            acceptance = evidence = ""
+        if not tool_name:
+            outputs.append(f"[{idx}] Error: this step names no tool: {step_text[:120]!r}. "
+                           'Give every step an explicit "tool" and "arguments", or '
+                           "write the plan as prose and call present_plan instead.")
+            halted, stopped_at = f"step {idx} named no tool", idx
+            break
         if tool_name not in TOOL_SPECS:
             outputs.append(f"[{idx}] Error: unknown tool '{tool_name}'.")
-            continue
+            halted, stopped_at = f"unknown tool '{tool_name}'", idx
+            break
         missing = [param for param in TOOL_REQUIRED_PARAMS.get(tool_name, [])
                    if param not in tool_args]
         if missing:
@@ -1446,14 +2608,26 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             outputs.append(f"[{idx}] {tool_name}: {result}")
             if on_step:
                 on_step(idx, total, step_text, tool_name, "done", result)
-            continue
+            halted, stopped_at = f"{tool_name} was missing required arguments", idx
+            break
         if on_step:
             on_step(idx, total, step_text, tool_name, "running", None)
+        # Taken before the step runs: once it has written, the previous state is
+        # the one thing that cannot be reconstructed.
+        snapshot = None
+        will_audit = PLAN_AUDIT and _plan_step_is_auditable(tool_name, acceptance)
+        if will_audit and PLAN_AUDIT_REVERT:
+            snapshot = _capture_write_state(tool_name, tool_args)
         try:
             result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
         except Exception as exc:
             result = f"Error: {exc}"
-        if result.startswith("ESCALATION_REQUEST:") and callable(on_escalation):
+        _remember_escalation(tool_name, tool_args, result)
+        # Unwrapped: shell results arrive inside the untrusted-content markers, so
+        # matching the raw string meant a shell step in a plan never offered the
+        # approval prompt at all — it just came back blocked.
+        if (_unwrap_untrusted(result).lstrip().startswith("ESCALATION_REQUEST\x1f")
+                and callable(on_escalation)):
             if on_escalation(result):
                 try:
                     result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
@@ -1462,6 +2636,46 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         if on_step:
             on_step(idx, total, step_text, tool_name, "done", result[:500])
         outputs.append(f"[{idx}] {tool_name}: {result[:500]}")
+        # Stop at the first failed step. Continuing would run every later step
+        # against a state the plan no longer describes, and the caller would get
+        # back a transcript in which the failure is one line among many that all
+        # look alike — which is how a half-done plan gets reported as done.
+        if _plan_step_failed(result):
+            halted, stopped_at = f"{tool_name} did not complete", idx
+            break
+        if will_audit:
+            reason, note = _audit_plan_step(step_text, tool_name, tool_args, result,
+                                            depth, acceptance, evidence)
+            if note:
+                outputs.append(f"[{idx}] audit: {note}")
+            if reason:
+                # Only verified state persists. A write that failed verification
+                # is put back exactly as it was, so the plan leaves behind what
+                # it proved rather than what it attempted. Nothing outside this
+                # step is touched, and a step with no snapshot says so instead of
+                # implying a rollback that did not happen.
+                if snapshot is not None:
+                    outputs.append(f"[{idx}] {_revert_plan_write(snapshot)}")
+                elif PLAN_AUDIT_REVERT and TOOL_SPECS[tool_name].get("mode") != "write_text":
+                    outputs.append(f"[{idx}] not reverted — {tool_name} has no undo; "
+                                   "inspect the effect by hand")
+                halted, stopped_at = reason, idx
+                break
+    _plan_execution_grant = False  # clear temporary grant — back to plan-only
+    if PLAN_AUDIT and _active_budget is not None:
+        share = _active_budget.audit_share()
+        if share:
+            outputs.append(f"Verification cost this turn: {share * 100:.0f}% of tokens "
+                           f"({_active_budget.role_total('subagent:auditor')} of "
+                           f"{_active_budget.total_tokens}).")
+    if halted:
+        skipped = total - stopped_at
+        outputs.append(
+            f"Plan halted at step {stopped_at}/{total}: {halted}."
+            + (f" The remaining {skipped} step(s) were NOT run." if skipped else "")
+            + " Fix the cause, then issue a new plan for the work that is left —"
+              " do not assume any later step ran."
+        )
     return "\n".join(outputs)
 
 
@@ -1469,6 +2683,9 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
+    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
+    global _local_fallback_grant, _remote_git_grant, _active_role
+    global _sandbox_readonly
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -1496,8 +2713,39 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # Optional live presentation hooks for the sub-agent's own loop.
     ui = subagent_ui(type_name, task, depth) if callable(subagent_ui) else {}
 
+    # Permission floor. A profile declaring `permission: readonly` is pinned to
+    # readonly for the whole sub-run, whatever the caller was running as. This is
+    # a floor, not a mode switch: it can only restrict, never widen — there is no
+    # profile value that grants more than the caller already had.
+    #
+    # Pending grants are cleared too, and that is the point rather than a detail.
+    # An approval the *parent* obtained (a one-shot y/n, or the temporary grant
+    # `_exec_plan` holds while running an approved plan) would otherwise be live
+    # inside an agent whose whole contract is that it cannot change anything —
+    # so an auditor spawned mid-plan could write through the parent's grant.
+    #
+    # The pin also turns a blocked mutation into a flat refusal rather than an
+    # escalation. Escalations from a sub-agent do reach the user, so leaving them
+    # in place made "this agent only observes" a question the user could answer
+    # yes to — including for the very file the auditor was sent to inspect.
+    global _permission_floor_readonly
+    floor = profile.get("permission", "")
+    saved_permission = None
+    if floor == "readonly":
+        saved_permission = (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+                            _local_fallback_grant, _remote_git_grant,
+                            _permission_floor_readonly, _sandbox_readonly)
+        PERMISSION_MODE = "readonly"
+        _one_shot_grant = False
+        _plan_execution_grant = False
+        _local_fallback_grant = False
+        _remote_git_grant = False
+        _permission_floor_readonly = True
+        _sandbox_readonly = True
+
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
+    saved_role, _active_role = _active_role, f"subagent:{type_name}"
     try:
         answer = run_agent(
             [{"role": "user", "content": task}],
@@ -1507,11 +2755,19 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             spin=ui.get("spin"), on_calls=ui.get("on_calls"),
             on_tool=ui.get("on_tool"), on_result=ui.get("on_result"),
             on_escalation=ui.get("on_escalation"),
+            # Share the parent's ceiling. A fresh budget here would be a free
+            # bypass: delegate to a subagent and the limit starts over.
+            budget=_active_budget,
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
     finally:
         _last_tool_output, _last_tool_name, _last_write_diff = saved
+        _active_role = saved_role
+        if saved_permission is not None:
+            (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+             _local_fallback_grant, _remote_git_grant,
+             _permission_floor_readonly, _sandbox_readonly) = saved_permission
 
     if ui.get("done"):
         ui["done"](answer)
@@ -1575,7 +2831,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     placeholder_error = _http_placeholder_error(spec, url)
     if placeholder_error:
         return placeholder_error
-    blocked = _ssrf_check(url)
+    blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
 
@@ -1601,7 +2857,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 
     class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, response_headers, new_url):
-            redirect_blocked = _ssrf_check(new_url)
+            redirect_blocked = _egress_check(new_url) or _ssrf_check(new_url)
             if redirect_blocked:
                 raise urllib.error.URLError(redirect_blocked)
             return super().redirect_request(
@@ -1639,7 +2895,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     if spec.get("extract") == "title":
         match = re.search(r"<title[^>]*>(.*?)</title>", result, re.IGNORECASE | re.DOTALL)
         return re.sub(r"\s+", " ", match.group(1)).strip() if match else "No title"
-    return result
+    return _wrap_untrusted(_strip_special_tokens(result), url)
 
 
 # ---------------------------------------------------------------------------
@@ -1663,7 +2919,7 @@ def _exec_browser(args: dict) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
-    blocked = _ssrf_check(url)
+    blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
     if not _playwright_available():
@@ -1684,7 +2940,7 @@ def _exec_browser(args: dict) -> str:
                     if request_url.startswith(("data:", "blob:", "about:")):
                         route.continue_()
                         return
-                    reason = _ssrf_check(request_url)
+                    reason = _egress_check(request_url) or _ssrf_check(request_url)
                     if reason:
                         blocked_requests.append(reason)
                         route.abort()
@@ -1705,7 +2961,7 @@ def _exec_browser(args: dict) -> str:
     except Exception as e:
         return f"Browser error: {e}"
     text = re.sub(r'\n{3,}', '\n\n', (text or "").strip())
-    return f"Title: {title}\n\n{text[:5000]}"
+    return _wrap_untrusted(_strip_special_tokens(f"Title: {title}\n\n{text[:5000]}"), url)
 
 
 # ---------------------------------------------------------------------------
@@ -1714,7 +2970,7 @@ def _exec_browser(args: dict) -> str:
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
-_SANDBOX_BACKENDS = frozenset(("auto", "native", "docker", "local"))
+_SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
 
 
 def _agent_data_dir() -> Path:
@@ -1765,8 +3021,6 @@ def _docker_available() -> bool:
 def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
-    if requested == "local":
-        return "local"
     if requested == "native":
         return "native" if native_available else "unavailable"
     if requested == "docker":
@@ -1781,7 +3035,6 @@ def sandbox_status() -> dict:
     detail = {
         "native": "OS-native isolation via sandbox-runtime",
         "docker": "Docker fallback with no network and capped resources",
-        "local": "unsandboxed local execution (explicit opt-in)",
         "unavailable": "native runtime and Docker are unavailable",
     }[resolved]
     missing = _native_sandbox_missing_requirements()
@@ -1800,17 +3053,18 @@ def set_sandbox_backend(backend: str) -> dict:
     global SANDBOX_BACKEND
     backend = str(backend or "").strip().lower()
     if backend not in _SANDBOX_BACKENDS:
-        raise ValueError("Sandbox must be auto, native, docker, or local.")
+        raise ValueError("Sandbox must be auto, native, or docker.")
     update_simple_config(CONFIG_PATH, {"sandbox_backend": backend})
     APP_CONFIG["sandbox_backend"] = backend
     SANDBOX_BACKEND = backend
     return sandbox_status()
 
 
-def _sandbox_settings_data() -> dict:
+def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
     home = Path.home()
     denied = [
         CONFIG_PATH, _agent_data_dir() / "srt-settings.json",
+        _agent_data_dir() / "srt-settings-readonly.json",
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
@@ -1821,14 +3075,18 @@ def _sandbox_settings_data() -> dict:
         PROJECT_ROOT / "**" / "*_PASSWORD*",
     ]
     deny_paths = [str(path.expanduser().resolve()) for path in denied]
-    allow_write = [str(PROJECT_ROOT), tempfile.gettempdir()]
-    if sys.platform != "win32":
-        allow_write.append(str(Path("/tmp").resolve()))
-    allow_write.extend(str(path) for path in NO_PROMPT_PATHS)
+    sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    sandbox_tmp.mkdir(parents=True, exist_ok=True)
+    allow_write = [str(sandbox_tmp)]
+    if not readonly:
+        allow_write.append(str(ARTIFACTS_ROOT))
+    elif workspace is not None:
+        allow_write.append(str(workspace.resolve()))
     return {
         "network": {
             "allowedDomains": SANDBOX_ALLOWED_DOMAINS,
             "deniedDomains": [],
+            "strictAllowlist": True,
             "allowLocalBinding": False,
         },
         "filesystem": {
@@ -1843,62 +3101,157 @@ def _sandbox_settings_data() -> dict:
     }
 
 
-def _write_sandbox_settings() -> Path:
-    path = _agent_data_dir() / "srt-settings.json"
-    _write_private_text(path, json.dumps(_sandbox_settings_data(), indent=2) + "\n")
+def _write_sandbox_settings(readonly: bool = False, workspace: Path | None = None) -> Path:
+    name = "srt-settings-readonly.json" if readonly else "srt-settings.json"
+    path = _agent_data_dir() / name
+    _write_private_text(
+        path, json.dumps(_sandbox_settings_data(readonly, workspace), indent=2) + "\n"
+    )
     return path
 
 
-def _exec_native_sandbox(command: str, timeout: int) -> str:
+# Signatures of the native runtime failing BEFORE it runs anything: no sandbox
+# was started, so the command did not execute. Matched narrowly on purpose — a
+# generic "Error:" test would also match a command that ran and printed an error,
+# and re-running that under Docker would repeat whatever it had already done.
+_NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
+    "Native sandbox runtime is unavailable.",
+    "WFP egress fence could not be verified",
+    "CreateProcessWithLogonW",
+    "Secondary Logon service",
+    "srt-win: error:",
+)
+
+
+# Set once the native runtime has proved it cannot start a sandbox in this
+# process. A runtime that cannot log into its restricted account does not heal
+# between commands, so retrying it per command spends a node subprocess to reach
+# the same failure and reprints the same wall of stderr in the transcript.
+_native_sandbox_broken = False
+
+
+def _native_sandbox_repair_hint(result: str) -> str:
+    """Turn the runtime's pre-flight error into something the reader can act on.
+
+    Raw, it is 200 characters of WFP and CreateProcessWithLogonW detail whose own
+    suggestion — start the Secondary Logon service — is usually wrong: the
+    service is running and the sandbox account is enabled, but the credential the
+    runtime holds no longer opens it. Reprovisioning is what actually fixes that,
+    and it needs elevation, which is the part worth saying out loud.
+    """
+    text = result or ""
+    if "CreateProcessWithLogonW" in text or "Access is denied" in text:
+        return ("The sandbox account could not be logged into. Re-run "
+                "`agent8088 --sandbox-setup` from an elevated terminal to "
+                "reprovision it.")
+    if "Native sandbox runtime is unavailable" in text:
+        return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
+    return f"Reason: {text[:200]}"
+
+
+def _native_sandbox_unusable(result: str) -> bool:
+    """Whether the native runtime failed to start the command at all.
+
+    Distinguishing this from "the command ran and failed" is the whole point:
+    only the former is safe to retry on another backend. On Windows the give-away
+    is that a succeeding command and a deliberately failing one return the *same*
+    text — the runtime never got as far as either.
+    """
+    return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
+
+
+def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
+                         readonly: bool = False) -> str:
     argv = _native_sandbox_argv()
     if not argv:
         return "Native sandbox runtime is unavailable."
-    settings = _write_sandbox_settings()
+    cwd = (cwd or ARTIFACTS_ROOT).resolve()
+    settings = _write_sandbox_settings(readonly, cwd)
+    sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    command = (f"cd {shlex.quote(str(cwd))} && "
+               f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
     return _exec_process(
         argv + ["--settings", str(settings), "-c", command], timeout=timeout
     )
 
 
 def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
-    global _local_fallback_grant, _one_shot_grant
     backend = _resolve_sandbox_backend()
     if backend == "native":
         runtime = _native_sandbox_argv()
-        settings = _write_sandbox_settings()
+        settings = _write_sandbox_settings(readonly=True)
+        sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
         return _exec_process(
-            runtime + ["--settings", str(settings), *argv], timeout=timeout
+            runtime + ["--settings", str(settings), "-c",
+                       f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                       f"TMPDIR={shlex.quote(str(sandbox_tmp))} {_process_display(argv)}"],
+            timeout=timeout
         )
     if backend == "docker":
-        return _exec_docker_command(_process_display(argv), timeout)
-    using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
-        _local_fallback_grant = False
-        if using_fallback_grant:
-            _one_shot_grant = False
-        return _exec_process(argv, timeout=timeout)
-    return _local_execution_request(_process_display(argv))
+        return _exec_docker_command(_process_display(argv), timeout,
+                                    workspace=PROJECT_ROOT, readonly=True)
+    return _sandbox_required_error()
+
+
+DOCKER_PULL_TIMEOUT = int(APP_CONFIG.get("docker_pull_seconds", "300"))
+_docker_images_present = set()
+
+
+def _ensure_docker_image(image: str) -> str:
+    """Pull `image` if it is not already local. Returns "" or an error string.
+
+    `docker run` pulls a missing image itself, but it does so inside whatever
+    timeout the *tool* declared — 20s for the read-only git tools. On any machine
+    that does not already hold the image, the first call therefore dies with a
+    bare "Command timed out after 20s" that names neither Docker nor the pull.
+    Pull explicitly instead, on its own budget, so a slow download is slow rather
+    than fatal and a genuine pull failure says so.
+    """
+    if image in _docker_images_present:
+        return ""
+    probe = _exec_process(["docker", "image", "inspect", "--format", "present", image],
+                          timeout=30)
+    if "present" in probe and "exited with status" not in probe:
+        _docker_images_present.add(image)
+        return ""
+    pulled = _exec_process(["docker", "pull", image], timeout=DOCKER_PULL_TIMEOUT)
+    if "exited with status" in pulled or "timed out" in pulled:
+        return (f"Error: container image {image} is missing and could not be pulled. "
+                f"Run `docker pull {image}` and retry. Details: {pulled[:200]}")
+    _docker_images_present.add(image)
+    return ""
 
 
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
-                         image: str = "") -> str:
+                         image: str = "", workspace: Path | None = None,
+                         readonly: bool = False) -> str:
     selected_image = image or DOCKER_IMAGE
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
-    workspace = str(PROJECT_ROOT)
+    unavailable = _ensure_docker_image(selected_image)
+    if unavailable:
+        return unavailable
+    workspace_path = workspace or ARTIFACTS_ROOT
+    if hasattr(workspace_path, "resolve"):
+        workspace_path = workspace_path.resolve()
+    workspace = str(workspace_path)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-    container_command = ["python", "-c", command] if python_code else ["sh", "-lc", command]
+    git_image = selected_image.startswith("alpine/git:")
+    container_command = (["python", "-c", command] if python_code else
+                         (["-lc", command] if git_image else ["sh", "-lc", command]))
     argv = [
         "docker", "run", "--rm", "--name", container_name, "--network", DOCKER_NETWORK,
         "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--mount", f"type=bind,src={workspace},dst=/workspace",
+        "--mount", (f"type=bind,src={workspace},dst=/workspace"
+                    + (",readonly" if readonly else "")),
     ]
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
     skipped_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"}
     sensitive_mounts = 0
-    for root, dirs, files in os.walk(PROJECT_ROOT):
+    for root, dirs, files in os.walk(workspace_path):
         dirs[:] = [name for name in dirs if name not in skipped_dirs]
         for filename in files:
             path = Path(root) / filename
@@ -1907,11 +3260,13 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             sensitive_mounts += 1
             if sensitive_mounts > 128:
                 return "Error: too many sensitive workspace files to mask safely."
-            relative = path.relative_to(PROJECT_ROOT).as_posix()
+            relative = path.relative_to(workspace_path).as_posix()
             destination = f"/workspace/{relative}"
             argv.extend([
                 "--mount", f"type=bind,src={empty},dst={destination},readonly",
             ])
+    if git_image:
+        argv.extend(["--entrypoint", "/bin/sh"])
     argv.extend(["-w", "/workspace", selected_image, *container_command])
     result = _exec_process(argv, timeout=timeout)
     if "timed out" in result:
@@ -1925,39 +3280,65 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     return result
 
 
-def _local_execution_request(command: str) -> str:
-    return request_escalation(
-        target_mode="edit",
-        paths=[str(SHELL_CWD)],
-        change_type="local_execution",
-        reason=(
-            "No native sandbox or Docker fallback is available. "
-            f"Run this command locally without isolation? {_redact_secrets(command[:160])}"
-        ),
+def _sandbox_required_error() -> str:
+    return (
+        "Error: a sandbox is required to run code, but neither the native OS "
+        "sandbox nor Docker is available. Run `agent8088 --sandbox-setup` or "
+        "install and start Docker, then retry. Local execution is disabled."
     )
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
-    global _local_fallback_grant, _one_shot_grant
     backend = _resolve_sandbox_backend()
-    if backend == "native":
-        local_command = (
-            _process_display([sys.executable, "-c", command])
-            if python_code else command
-        )
-        return _exec_native_sandbox(local_command, timeout)
-    if backend == "docker":
-        return _exec_docker_command(command, timeout, python_code, image)
-    using_fallback_grant = _local_fallback_grant
-    if backend == "local" or using_fallback_grant or PERMISSION_MODE == "edit":
-        _local_fallback_grant = False
-        if using_fallback_grant:
-            _one_shot_grant = False
-        if python_code:
-            return _exec_process([sys.executable, "-c", command], timeout=timeout)
-        return _exec_process(command, timeout=timeout, shell=True)
-    return _local_execution_request(command)
+    if backend == "unavailable":
+        return _sandbox_required_error()
+    ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    workspace = ARTIFACTS_ROOT
+    if _sandbox_readonly:
+        temporary = tempfile.TemporaryDirectory(prefix="agent8088-audit-")
+        workspace = Path(temporary.name)
+        shutil.copytree(ARTIFACTS_ROOT, workspace, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(
+                            ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
+        command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
+    global _native_sandbox_broken
+    try:
+        # Already proved unusable this process: go straight to Docker rather than
+        # paying for the same failure again.
+        if backend == "native" and _native_sandbox_broken and _docker_available():
+            backend = "docker"
+        if backend == "native":
+            local_command = (
+                _process_display([sys.executable, "-c", command])
+                if python_code else command
+            )
+            result = _exec_native_sandbox(local_command, timeout, workspace,
+                                          readonly=_sandbox_readonly)
+            # `auto` documents native first, Docker when available — but that
+            # choice was only ever made at selection time, from the presence of
+            # the runtime binary. A runtime that is installed and still cannot
+            # start a sandbox (on Windows, a restricted account it cannot log
+            # into) left the command refused with a working Docker sitting idle.
+            # Retry only a pre-flight failure: the command has not run, so
+            # nothing can be done twice.
+            if not _native_sandbox_unusable(result):
+                return result
+            if not _docker_available():
+                return result  # keep the runtime's own error; it says more
+            # Once per process. The condition is permanent for this run, and
+            # repeating a 200-character stderr dump above every command turns a
+            # working fallback into visible breakage.
+            if not _native_sandbox_broken:
+                _log.warning("native sandbox could not start, using docker for the "
+                             "rest of this session. %s", _native_sandbox_repair_hint(result))
+            _native_sandbox_broken = True
+        return _exec_docker_command(command, timeout, python_code, image,
+                                    workspace=workspace)
+    finally:
+        if temporary:
+            temporary.cleanup()
 
 
 def install_native_sandbox() -> str:
@@ -1999,13 +3380,59 @@ def install_native_sandbox() -> str:
     return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed."
 
 
+def _tool_arg_parse_error(name: str, raw: str) -> str:
+    """Message for an argument block that arrived but could not be parsed.
+
+    Distinct from "the argument is missing" on purpose: telling the model an
+    argument is absent when it did send one sends it chasing the wrong problem.
+    """
+    return (f"Error: could not parse the arguments for '{name}'. Send valid "
+            f"JSON with newlines escaped as \\n, e.g. "
+            f'{{"code": "a = 1\\nprint(a)"}}. Received: {raw[:200]}')
+
+
+def _tool_arg_missing_error(name: str, missing: str) -> str:
+    """Message for a call whose argument block never arrived at all.
+
+    The mirror of _tool_arg_parse_error, and it needs the same care for the
+    opposite reason. "Missing required argument: command" is true, but it reads
+    as "the argument you sent is named wrong" — so a model that omitted the
+    block entirely re-sent the identical shape rather than adding one. Name the
+    block that is missing, and show one it can copy.
+    """
+    return (f"Error: '{name}' was called with no arguments. Send an ✿ARGS✿ "
+            f"block containing '{missing}', e.g. "
+            f'✿ARGS✿: {json.dumps({missing: "..."})}')
+
+
+_CODE_ARG_ALIASES = ("code", "script", "python", "source", "snippet", "command")
+_FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_+-]*\s*\n(.*?)\n?\s*```\s*$", re.DOTALL)
+
+
+def _strip_code_fences(code: str) -> str:
+    """Drop a surrounding ```lang ... ``` fence, which models often add."""
+    match = _FENCE_RE.match(code)
+    return match.group(1) if match else code
+
+
 def _exec_docker(args: dict) -> str:
     """Run a Python snippet through the configured sandbox backend."""
-    code = str(args.get("code") or "").strip()
+    if args.get("__parse_error__"):
+        return _tool_arg_parse_error("run_sandboxed", args["__parse_error__"])
+    # Accept the obvious synonyms — the model frequently names this argument
+    # 'script' or 'python'. 'code' wins when more than one is present.
+    code = ""
+    for alias in _CODE_ARG_ALIASES:
+        value = str(args.get(alias) or "").strip()
+        if value:
+            code = value
+            break
+    code = _strip_code_fences(code).strip()
     if not code:
-        return "Error: sandboxed execution requires 'code'."
+        return ("Error: sandboxed execution requires 'code'. Pass the Python "
+                "source as code=\"...\" (newlines escaped as \\n).")
     image = str(args.get("image") or DOCKER_IMAGE)
-    timeout = int(args.get("timeout") or 60)
+    timeout = min(max(1, int(args.get("timeout") or 60)), MAX_TOOL_TIMEOUT_SECONDS)
     return _exec_sandbox_command(code, timeout=timeout, python_code=True, image=image)
 
 
@@ -2083,6 +3510,8 @@ def _windows_task_script(identifier: str, task: str) -> Path:
     content = (
         "$ErrorActionPreference = 'Stop'\n"
         f"Set-Location -LiteralPath '{cwd}'\n"
+        # No operator is present for a scheduled run — see cron_mode.
+        "$env:AGENT8088_UNATTENDED = '1'\n"
         f"$prompt = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{prompt}'))\n"
         f"$prompt | & '{agent}'\n"
     )
@@ -2228,7 +3657,11 @@ def _exec_cron(args: dict) -> str:
 
     if action == "add":
         agent = shutil.which("agent8088") or "agent8088"
+        # AGENT8088_UNATTENDED tells the engine there is no operator to answer an
+        # approval prompt, so gated actions resolve from cron_mode instead of
+        # emitting an ESCALATION_REQUEST nobody will ever see.
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
+                 f"AGENT8088_UNATTENDED=1 "
                  f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
         current = read_crontab()
         payload = current + ("" if not current or current.endswith("\n") else "\n") + entry + "\n"
@@ -2257,14 +3690,43 @@ def _tool_path(spec: dict, args: dict) -> str:
             or args.get("file_path") or args.get("filepath") or args.get("path") or "")
 
 
+def _plan_mode_block_message() -> str:
+    """What a model is told when it reaches for a mutation inside plan mode.
+
+    It used to be told to call execute_plan with a JSON array of fully-specified
+    tool calls. Models do not reliably produce that, so they re-issued the direct
+    call until the loop gave up and the user saw "I wasn't able to produce an
+    answer". Naming the one tool that does work, and saying what happens after
+    approval, is what makes the block recoverable."""
+    return ("Error: plan mode — nothing is written or run until the user approves a "
+            "plan. Keep reading if you still need facts. Once you know what to do, "
+            "call present_plan(plan=\"...\") with the plan written out as markdown: "
+            "the goal, numbered steps, and the files each step touches. The user "
+            "approves it, the permission mode changes, and THEN you make this tool "
+            "call normally. Do not claim any of it is done before that happens.")
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
-    global _remote_git_grant
+    global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
     if not spec:
         return f"Unknown tool: {name}"
 
     mode = (spec.get("mode") or "").lower()
-    timeout = int(spec.get("timeout") or 25)
+    timeout = min(max(1, int(spec.get("timeout") or 25)), MAX_TOOL_TIMEOUT_SECONDS)
+    if args.get("__parse_error__"):
+        return _tool_arg_parse_error(name, str(args["__parse_error__"]))
+    approval_key = _tool_call_key(name, args)
+
+    # --- Plan-only early gate: block gated tools BEFORE arg validation ---
+    # Without this, write_file() with no args returns "write tool requires a file path"
+    # instead of telling the model how plan mode works — the model never learns why.
+    # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
+    # to the normal check_permission gate so it escalates properly.
+    plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
+    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled())
+    if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
+        return _plan_mode_block_message()
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
@@ -2274,6 +3736,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         except ValueError as exc:
             return f"Error: {exc}"
         if _is_sensitive_path(str(read_target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(read_target), reason="sensitive_path")
             return f"Error: Access to sensitive file denied: {read_target}"
 
     # --- Layer 2: Network access control ---
@@ -2282,55 +3746,159 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         placeholder_error = _http_placeholder_error(spec, url)
         if placeholder_error:
             return placeholder_error
-        blocked = _ssrf_check(url)
+        blocked = _egress_check(url) or _ssrf_check(url)
         if blocked:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=url[:200], reason="egress_policy")
             return blocked
-        if not check_permission(mode, url):
+        # Hard floor, checked before the permission gate: a credential in an
+        # outbound URL or body is never legitimate, so it is not escalatable.
+        leak = (_outbound_secret_check(url)
+                or _outbound_secret_check(json.dumps(args, default=str)))
+        if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=url[:200], reason="outbound_secret")
+            return leak
+        if not check_permission(mode, url, approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=url[:200],
+                   change_type="network_request")
             return request_escalation(
                 target_mode="edit",
                 paths=[url[:120]],
                 change_type="network_request",
                 reason=f"Tool '{name}' wants to make an HTTP request to: {url[:200]}",
             )
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=url[:200])
         return _exec_http(mode, spec, args, timeout)
+
+    # --- Layer 2b: web search (mode=search) ---
+    # Its own block rather than a branch of http_get: the destination URL is not
+    # known until the provider chain is resolved, and a fallback may contact a
+    # different host entirely. The egress/SSRF/secret guards are therefore
+    # applied per attempt INSIDE each provider, via the check_url injected by
+    # _search_context() — see web_search.SearchContext.
+    if mode == "search":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "Error: web_search requires 'query'."
+        # Date-qualify BEFORE the guards: they must inspect what actually
+        # leaves the machine, not the string the model happened to produce.
+        query = _augment_relative_time_query(query)
+        sensitive = _web_search_query_guard(query)
+        if sensitive:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=query[:120], reason="sensitive_query")
+            return sensitive
+        # Hard floor, checked before the permission gate: a search query is an
+        # outbound channel, so a credential in it is never legitimate and is not
+        # escalatable. The http path applies this to the URL and body; here the
+        # query is what leaves the machine — for ddgs/Tavily/Exa it never appears
+        # in a URL that check_url would see, so guarding the destination alone
+        # would leave the query itself as an exfiltration path.
+        leak = (_outbound_secret_check(query)
+                or _outbound_secret_check(json.dumps(args, default=str)))
+        if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=query[:120], reason="outbound_secret")
+            return leak
+        if (not _local_searxng_no_prompt_enabled()
+                and not check_permission(mode, f"web_search: {query[:80]}",
+                                         approval_key=approval_key)):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=query[:120],
+                   change_type="network_request")
+            return request_escalation(
+                target_mode="edit",
+                paths=[f"web_search: {query[:100]}"],
+                change_type="network_request",
+                reason=f"Tool '{name}' wants to search the web for: {query[:160]}",
+            )
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=query[:200])
+        return _frame_search_results(web_search.run_search(
+            query, _web_search_limit(), WEB_SEARCH_REGISTRY, _search_config(),
+            _search_context()))
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
     write_path = ""
     path_zone = "default"
+    shadowed = None
     if mode == "shell":
         try:
             argv = _structured_tool_argv(name, args)
         except ValueError as exc:
             return f"Error: {exc}"
-        command = _process_display(argv) if argv else _format_with_args(
-            spec.get("command") or "{command}", args)
+        try:
+            command = _process_display(argv) if argv else _format_with_args(
+                spec.get("command") or "{command}", args)
+        except MissingToolArgument as exc:
+            return _tool_arg_missing_error(name, exc.param)
     elif mode == "write_text":
         command = "write_file"
         write_path = _tool_path(spec, args)
         if not write_path:
             return "Error: write tool requires a file path."
         try:
-            target = resolve_user_path(write_path)
+            target = resolve_write_path(write_path)
         except ValueError as exc:
             return f"Error: {exc}"
+        shadowed = _shadowed_project_file(write_path, target)
         # Layer 1 applies to WRITES as well as reads. Without this a sensitive file
         # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
         # overwritten even though reading it is denied.
         if _is_sensitive_path(str(target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="sensitive_path")
             return f"Error: Writing to sensitive file denied: {target}"
+        # Writing a shell startup file is code execution on the next shell
+        # launch. Refused unconditionally — no mode and no grant unlocks it.
+        if _is_shell_startup_file(str(target)):
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="shell_startup_file")
+            return (f"Error: Writing to sensitive file denied: {target} "
+                    f"(shell startup file — this would execute code on the next shell launch)")
         path_zone = _check_path_zone(target)
         if path_zone == "blocked":
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="blocked_path")
             return f"Error: Write path is blocked: {target}"
+        # Blast radius. Checked here — before the permission gate — so an
+        # approved turn cannot be talked into writing 500 files, and so the
+        # refusal is not something the user can wave through by mistake.
+        if MAX_WRITES_PER_TURN and _turn_writes >= MAX_WRITES_PER_TURN:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="max_writes_per_turn")
+            return (f"Error: this turn has already written {_turn_writes} files, "
+                    f"the max_writes_per_turn limit. Stop writing and report what "
+                    f"you have done, or raise max_writes_per_turn in config.txt.")
+        write_size = len(str(args.get(spec.get("content_arg") or "content", "")))
+        if MAX_WRITE_BYTES and write_size > MAX_WRITE_BYTES:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=str(target), reason="max_write_bytes")
+            return (f"Error: refusing to write {write_size} bytes to {target} — "
+                    f"over the max_write_bytes limit of {MAX_WRITE_BYTES}. Write a "
+                    f"smaller file or raise max_write_bytes in config.txt.")
     elif mode == "cron":
         command = str(args.get("action") or "list").strip().lower()
     elif mode == "browser":
         command = str(args.get("url") or "").strip()
         if not command:
             return "Error: browser tool requires 'url'."
-        blocked = _ssrf_check(command)
+        blocked = _egress_check(command) or _ssrf_check(command)
         if blocked:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="egress_policy")
             return blocked
+        leak = _outbound_secret_check(command)
+        if leak:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="outbound_secret")
+            return leak
+    elif mode == "mcp":
+        command = f"{spec['mcp_server']}:{spec['mcp_tool']}"
 
     remote_git_approved = name == "git_push" and _remote_git_grant
     if name == "git_push" and not remote_git_approved:
@@ -2344,11 +3912,55 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         _remote_git_grant = False
 
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
-        return "Error: This git operation is forbidden by Agent8088's safety policy."
+        _audit("tool_call", tool=name, mode=mode, decision="denied",
+               detail=command[:200], reason="hard_blocked_shell")
+        return "Error: This shell operation is forbidden by Agent8088's safety policy."
 
-    gated_modes = ("write_text", "shell", "docker", "cron", "browser")
+    if mode == "shell":
+        web_urls = _shell_web_urls(command)
+        if web_urls == []:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200], reason="unverifiable_shell_egress")
+            return ("Blocked: shell web clients require an explicit http:// or https:// "
+                    "URL so the egress and SSRF policies can verify the destination.")
+        for url in web_urls or ():
+            blocked = _egress_check(url) or _ssrf_check(url)
+            if blocked:
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=url[:200], reason="egress_policy")
+                return blocked
+        if web_urls:
+            leak = _outbound_secret_check(command)
+            if leak:
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=command[:200], reason="outbound_secret")
+                return leak
+
+    if (mode in ("shell", "docker") and not spec.get("host")
+            and PERMISSION_MODE != "plan-only"
+            and _resolve_sandbox_backend() == "unavailable"):
+        _audit("tool_call", tool=name, mode=mode, decision="denied",
+               detail=command[:200], reason="sandbox_unavailable")
+        return _sandbox_required_error()
+
+    gated_modes = ("write_text", "shell", "docker", "cron", "browser", "mcp")
+    if mode == "mcp" and spec.get("mcp_read_only"):
+        gated_modes = tuple(item for item in gated_modes if item != "mcp")
     if mode in gated_modes and not remote_git_approved and not check_permission(
-            mode, command, path_zone, bool(spec.get("host"))):
+            mode, command, path_zone, bool(spec.get("host")), approval_key):
+        if PERMISSION_MODE == "plan-only" and allow_plan:
+            return _plan_mode_block_message()
+        # A profile pinned to readonly is refused outright. Escalations from a
+        # sub-agent do reach the user, so offering one here would make "this agent
+        # only observes" a question the user could answer yes to — for the very
+        # file the auditor was sent to inspect.
+        if _permission_floor_readonly:
+            _audit("tool_call", tool=name, mode=mode, decision="denied",
+                   detail=command[:200] or str(target), reason="readonly_floor")
+            return (f"Error: {name} is not available to you. This agent is pinned "
+                    "read-only for its whole run: it observes and reports, and it "
+                    "cannot change anything or ask for permission to. Report what "
+                    "you found instead.")
         paths_str = ""
         if mode == "write_text":
             paths_str = str(target)
@@ -2360,11 +3972,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             paths_str = command
         elif mode == "browser":
             paths_str = command[:120]
+        elif mode == "mcp":
+            paths_str = command
         sandbox_missing = mode in ("shell", "docker") and _resolve_sandbox_backend() == "unavailable"
         change_type = {
             "write_text": "new_file",
             "cron": "scheduled_task",
             "browser": "network_request",
+            "mcp": "mcp_tool",
         }.get(mode, "local_execution" if sandbox_missing else "filesystem_op")
         reason = (
             f"Tool '{name}' needs permission and no sandbox is available. "
@@ -2372,12 +3987,40 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             if sandbox_missing else
             f"Tool '{name}' requires {mode} access, which is blocked in readonly mode."
         )
-        return request_escalation(
-            target_mode="edit",
-            paths=[paths_str],
-            change_type=change_type,
-            reason=reason,
-        )
+        # Unattended run: there is no operator to answer the prompt, so an
+        # ESCALATION_REQUEST would just sit there until the turn dies. Resolve it
+        # from policy instead of pretending someone is watching.
+        if UNATTENDED:
+            if CRON_MODE == "deny":
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=paths_str, reason="unattended_deny")
+                return (
+                    f"Error: '{name}' needs approval, but this is an unattended run "
+                    f"with no one to ask, so it was refused. Report this to the user "
+                    f"in your answer. (cron_mode=deny; set cron_mode=approve in "
+                    f"config.txt to let scheduled runs proceed past this gate — the "
+                    f"always-on floor still applies either way.)"
+                )
+            _audit("tool_call", tool=name, mode=mode, decision="allowed",
+                   detail=paths_str, reason="unattended_approve")
+        else:
+            _audit("escalation_requested", tool=name, mode=mode, decision="blocked",
+                   detail=paths_str, change_type=change_type)
+            return request_escalation(
+                target_mode="edit",
+                paths=[paths_str],
+                change_type=change_type,
+                reason=reason,
+            )
+
+    # Past every gate: this call is going to run. Recorded here rather than at
+    # each execution branch so no mode can be added later without an audit line.
+    if mode in ("write_text", "shell", "docker", "cron", "browser", "mcp"):
+        _audit("tool_call", tool=name, mode=mode, decision="allowed",
+               detail=str(target) if mode == "write_text" else command[:200])
+
+    if mode == "introspect":
+        return describe_capabilities()
 
     if mode == "last_output":
         if not _last_tool_output:
@@ -2387,7 +4030,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "plan":
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
-        return _exec_plan(args, depth=depth)
+        if name == "present_plan":
+            return _exec_present_plan(args, depth=depth)
+        return _exec_plan(args, on_step=_plan_on_step,
+                          on_escalation=_plan_on_escalation, depth=depth)
 
     if mode == "subagent":
         return _exec_subagent(args, depth=depth)
@@ -2401,13 +4047,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "browser":
         return _exec_browser(args)
 
+    if mode == "mcp":
+        return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
+
     if mode == "read_text":
-        return _read_text_limited(read_target)
+        return _strip_special_tokens(_read_text_limited(read_target))
 
     if mode == "write_text":
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
         content = str(args.get(content_arg, ""))
+        _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             old_content = _read_text_limited(target) if target.exists() else ""
@@ -2416,9 +4066,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if args.get("_private") is True:
             _write_private_text(target, content)
         else:
-            target.write_text(content)
+            target.write_text(content, encoding="utf-8", newline="")
         _last_write_diff = _make_diff(old_content, content, str(target))
-        return f"Wrote {len(content)} bytes to {target}"
+        result = f"Wrote {len(content)} bytes to {target}"
+        if shadowed is not None:
+            result += (f" — NOT {shadowed}. A bare filename is stored in "
+                       f"artifacts/; pass that absolute path if you meant to "
+                       f"edit the project's own file.")
+        return result
 
     if mode == "python_eval":
         expression = spec.get("expression") or args.get("expression") or ""
@@ -2434,10 +4089,21 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return _exec_structured_tool(name, args, timeout)
         command = _format_with_args(spec.get("command") or "{command}", args)
         if spec.get("host"):
-            return _missing_binary_hint(
+            result = _missing_binary_hint(
                 command.split()[0] if command.split() else "",
                 _exec_process(command, timeout=timeout, shell=True))
-        return _exec_shell_command(command, timeout=timeout)
+        else:
+            result = _exec_shell_command(
+                command, timeout=timeout, image=spec.get("sandbox_image", ""))
+        text = str(result)
+        # An escalation request is a control signal for the UI, not output from
+        # the command — the command has not run yet. Wrapping it hid the
+        # "ESCALATION_REQUEST:" prefix every caller matches on, so the local
+        # -execution prompt never reached the user and the step came back
+        # blocked with no way to approve it.
+        if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
+            return text.strip()
+        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
@@ -2460,12 +4126,28 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except Exception:
         return "Invalid JSON"
 
+    # Taken before the call runs: once it has written, the previous state is the
+    # one thing that cannot be reconstructed.
+    will_audit = _approved_plan_audit_applies(name, depth)
+    snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
+
     try:
         result = run_tool(name, args, depth=depth)
     except subprocess.TimeoutExpired:
         result = "Command timed out"
     except Exception as e:
         result = f"Error: {e}"
+
+    # A blocked call has not done anything yet, so there is nothing to verify —
+    # it gets audited on the retry that follows approval. The prefix is
+    # \x1f-delimited (a Windows path splits on ':'); matching ':' here meant the
+    # check never fired, so the auditor was sent to inspect a write that had not
+    # happened and its fail verdict was appended to the escalation the user still
+    # had to answer.
+    if will_audit and not result.startswith("ESCALATION_REQUEST\x1f"):
+        result = _audit_approved_plan_call(name, args, result, depth, snapshot)
+
+    _remember_escalation(name, args, result)
 
     # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
     result = _redact_secrets(result)
@@ -2478,13 +4160,133 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
 # ---------------------------------------------------------------------------
 # Parsing model output for tool calls
 # ---------------------------------------------------------------------------
+_JSON_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _escape_control_chars_in_strings(raw: str) -> str:
+    """Escape literal newlines/tabs that appear inside JSON string values.
+
+    Models routinely emit real newlines inside an argument value when the value
+    is code or file content:
+
+        ✿ARGS✿: {"code": "a = 1
+        print(a)"}
+
+    That is invalid JSON, so json.loads raises. Rather than lose the call, walk
+    the text and escape control characters found inside string literals. Tracks
+    escape state so an already-escaped `\\n` is left alone and a literal
+    backslash is not mistaken for an escape of the following quote.
+    """
+    out = []
+    in_string = False
+    escaped = False
+    for char in raw:
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            out.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+            continue
+        out.append(_JSON_CONTROL_ESCAPES.get(char, char) if in_string else char)
+    return "".join(out)
+
+
+def _escape_invalid_backslashes(raw: str) -> str:
+    """Preserve Windows paths that models emit without JSON escaping."""
+    out = []
+    in_string = False
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == '"':
+            in_string = not in_string
+            out.append(char)
+        elif char == "\\" and in_string:
+            following = raw[index + 1:index + 2]
+            unicode_escape = (following == "u" and index + 5 < len(raw)
+                              and all(c in "0123456789abcdefABCDEF"
+                                      for c in raw[index + 2:index + 6]))
+            if following in '"\\/bfnrt' or unicode_escape:
+                out.append(char)
+            else:
+                out.append("\\\\")
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _loads_tool_args(raw: str):
+    """json.loads for model-emitted arguments, tolerant of unescaped newlines.
+
+    Raises the original JSONDecodeError if the text is broken beyond escaping,
+    so callers can distinguish "unparseable" from "no arguments given".
+    """
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+
+
+_MARKDOWN_FENCE_RE = re.compile(r"(^```[^\n]*\n.*?^```[ \t]*$)", re.MULTILINE | re.DOTALL)
+
+
+def _outside_fenced_code(text: str) -> str:
+    """Return only prose, so a tool-call example cannot execute itself."""
+    return "".join(part for index, part in enumerate(_MARKDOWN_FENCE_RE.split(text))
+                   if index % 2 == 0)
+
+
+def _scan_json_object(text: str, start: int, limit: int = None) -> str:
+    """Return the brace-balanced JSON object that begins at text[start].
+
+    A greedy regex spans from the first brace in the reply to the last one, which
+    merges several batched tool calls into a single unparseable blob and loses all
+    of them; a non-greedy one stops at the first '}', truncating nested JSON such
+    as {"steps": "[{...}]"}. Counting braces outside string literals is the only
+    thing that gets both right. Quote and backslash state are tracked so a brace
+    inside a string value does not close the object, and `limit` bounds the scan
+    so an unterminated string in one block cannot swallow the blocks after it.
+    """
+    limit = len(text) if limit is None else min(limit, len(text))
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, limit):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return text[start:limit]
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
+    text = _outside_fenced_code(text)
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
         try:
-            d = json.loads(m.group(1).strip())
+            d = _loads_tool_args(m.group(1).strip())
             resolved = _resolve_tool_name(d.get("name", ""))
             if resolved in allowed:
                 d["name"] = resolved
@@ -2492,17 +4294,44 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 calls.append(d)
         except Exception:
             pass
-    # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}
+    # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}, once per block
+    # Every block is taken, not just the first: models batch several calls into
+    # one reply — routinely so when working through an approved plan — and a
+    # single greedy re.search spanned all of them at once, so all of them were
+    # lost to one parse error. Each block's JSON extent is found by counting
+    # braces (see _scan_json_object) rather than by a regex, which is what keeps
+    # nested JSON like {"steps": "[{...}]"} intact while still ending the match
+    # at the right place.
     if not calls:
-        m = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(\{.*?\})', text, re.DOTALL)
-        if m:
+        headers = list(re.finditer(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(?=\{)', text))
+        for position, header in enumerate(headers):
+            resolved = _resolve_tool_name(header.group(1))
+            if resolved not in allowed:
+                continue
+            limit = (headers[position + 1].start()
+                     if position + 1 < len(headers) else len(text))
+            raw_args = _scan_json_object(text, header.end(), limit)
             try:
-                resolved = _resolve_tool_name(m.group(1))
-                if resolved in allowed:
-                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
+                calls.append({"name": resolved, "arguments": _loads_tool_args(raw_args)})
             except Exception:
-                pass
-        if not calls:  # loose ✿FUNCTION✿ line with no args
+                # An ARGS block was sent but is unparseable. Surfacing empty
+                # args here would make the tool report the argument as
+                # missing, which sends the model chasing the wrong problem.
+                # Flag the parse failure instead.
+                calls.append({"name": resolved,
+                              "arguments": {"__parse_error__": raw_args[:400]}})
+        # An ✿ARGS✿ block that is not a JSON object matches no header above (they
+        # require a '{'), and the loose-line branch below skips it because ✿ARGS✿
+        # IS present — so the call was dropped and the model saw no result at
+        # all, which is worse than a wrong one: there is nothing to react to.
+        if not calls and "✿ARGS✿" in text:
+            loose = re.search(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(.*)', text)
+            if loose:
+                resolved = _resolve_tool_name(loose.group(1))
+                if resolved in allowed:
+                    calls.append({"name": resolved,
+                                  "arguments": {"__parse_error__": loose.group(2).strip()[:400]}})
+        if not calls and "✿ARGS✿" not in text:  # loose ✿FUNCTION✿ line, genuinely no args
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
                 resolved = _resolve_tool_name(m2.group(1))
@@ -2531,18 +4360,34 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 if m and canonical in allowed:
                     calls.append({"name": canonical, "arguments": {"command": m.group(1).replace('\\"', '"')}})
                     break
+    # 5) <|mask_start|>{"tool": "...", "arguments": {...}}<|mask_end|>
+    if not calls:
+        m = re.search(r'<\|mask_start\|>\s*(\{.*?\})\s*<\|mask_end\|>', text, re.DOTALL)
+        if m:
+            try:
+                d = json.loads(m.group(1).strip())
+                tool_name = d.get("tool", d.get("name", ""))
+                resolved = _resolve_tool_name(tool_name)
+                if resolved in allowed:
+                    calls.append({"name": resolved, "arguments": d.get("arguments", {})})
+            except Exception:
+                pass
     return calls
 
 
 def strip_tool_json(text: str) -> str:
-    text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
-    text = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', text, flags=re.DOTALL)
-    text = re.sub(r'✿FUNCTION✿[^\n]*', '', text)
-    text = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', text, flags=re.DOTALL)
-    # Hard sanitize: strip any leftover ✿…✿ fragments and stray sentinels so raw
-    # tool-call markup can NEVER leak into a user-facing answer.
-    text = re.sub(r'✿[^✿\n]*✿', '', text)
-    text = text.replace('✿', '')
+    parts = _MARKDOWN_FENCE_RE.split(text)
+    for index in range(0, len(parts), 2):
+        part = parts[index]
+        part = re.sub(r'<tool_call>.*?</tool_call>', '', part, flags=re.DOTALL)
+        part = re.sub(r'<\|mask_start\|>.*?<\|mask_end\|>', '', part, flags=re.DOTALL)
+        part = re.sub(r'✿FUNCTION✿.*?✿ARGS✿\s*:\s*\{.*?\}', '', part, flags=re.DOTALL)
+        part = re.sub(r'✿FUNCTION✿[^\n]*', '', part)
+        part = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', part, flags=re.DOTALL)
+        # Hard sanitize: strip any leftover ✿…✿ fragments and stray sentinels so raw
+        # tool-call markup can NEVER leak into a user-facing answer.
+        parts[index] = re.sub(r'✿[^✿\n]*✿', '', part).replace('✿', '')
+    text = "".join(parts)
     # Tidy whitespace WITHOUT flattening newlines, so multi-line answers survive.
     text = re.sub(r'[ \t]+\n', '\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
@@ -2589,16 +4434,28 @@ def _strip_reasoning(text: str) -> str:
     return text.strip()
 
 
-def collect_secret_values(config: dict) -> list:
+def collect_secret_values(config: dict, env_values: dict = None) -> list:
     """Secret values from config (api keys / tokens, including per-provider ones)
     — redacted from any tool output or answer so `cat config.txt` / `env` etc.
     can't be used to exfiltrate them. Longest first, so overlapping values mask
-    completely rather than leaving a suffix behind."""
+    completely rather than leaving a suffix behind.
+
+    Any key ending in `_env` holds the NAME of an environment variable, not the
+    secret itself — resolve it before redacting. Check the .env key store first
+    (that is where _migrate_keys_to_env puts migrated secrets, and nothing
+    exports it into os.environ), then the process environment. This covers both
+    `provider.<name>.api_key_env` and the `*_bot_token_env` / `*_app_token_env`
+    pointers migration writes for gateway tokens."""
+    if env_values is None:
+        env_values = load_env_file(ENV_FILE_PATH) if "ENV_FILE_PATH" in globals() else {}
     values = set()
     for key, value in config.items():
         if not isinstance(value, str):
             continue
-        candidate = os.environ.get(value, "") if key.lower().endswith("api_key_env") else value
+        if key.lower().endswith("_env"):
+            candidate = env_values.get(value) or os.environ.get(value, "")
+        else:
+            candidate = value
         if (any(part in key.lower() for part in ("key", "token", "secret", "password"))
                 and len(candidate) >= 4
                 and candidate.lower() not in (
@@ -2611,6 +4468,22 @@ def collect_secret_values(config: dict) -> list:
 _SECRET_VALUES = collect_secret_values(APP_CONFIG)
 
 
+# ponytail: Special tokens that self-hosted chat templates tokenize as structural
+# role boundaries. If unstripped, a fetched page containing <|im_start|>system
+# could forge a system message. Covers Qwen/ChatML, Llama, Gemma, Mistral, Phi, GPT-OSS.
+_SPECIAL_TOKEN_RE = re.compile(
+    r"<\|im_start\|>|<\|im_end\|>|<\|start_header_id\|>|<\|end_header_id\|>"
+    r"|<\|eot_id\|>|<\|eom_id\|>|\[\/INST\]|\[\/SYS\]"
+    r"|<\|begin_of_text\|>|<\|end_of_text\|>|<start_of_turn\|>|<end_of_turn\|>"
+)
+
+
+def _strip_special_tokens(text: str) -> str:
+    if not text:
+        return text
+    return _SPECIAL_TOKEN_RE.sub("", text)
+
+
 def _redact_secrets(text: str) -> str:
     if not text:
         return text
@@ -2619,6 +4492,147 @@ def _redact_secrets(text: str) -> str:
         if v in text:
             text = text.replace(v, "[redacted]")
     return text
+
+
+# Below this length a "secret" is too generic to match on without constant
+# false positives (a 4-char config value would flag half of all payloads).
+_MIN_EXFIL_SECRET_LEN = 12
+
+
+def _outbound_secret_check(payload):
+    """Return an error string if `payload` carries a known secret value, else None.
+
+    _redact_secrets protects what comes BACK from a tool. This protects what
+    goes OUT: an http_post body, a browser URL. This is a hard refusal — a
+    secret in an outbound payload is never legitimate, so there is no
+    escalation path and no permission mode unlocks it, not even full-auto.
+
+    The reason string deliberately does not quote the matched value.
+    """
+    if not payload:
+        return None
+    text = str(payload)
+    for value in _SECRET_VALUES:
+        if len(value) >= _MIN_EXFIL_SECRET_LEN and value in text:
+            return ("Error: Blocked — this request contains a credential from your "
+                    "configuration. Sending secrets to an external service is never "
+                    "permitted, in any permission mode.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Append-only audit trail
+# ---------------------------------------------------------------------------
+# _log goes to a logger with no configured sink; this is the durable record of
+# what the agent was permitted to do. Off by default (a single-user CLI does not
+# need it); turn it on for any gateway deployment.
+AUDIT_ENABLED = APP_CONFIG.get("audit_log", "0") == "1"
+AUDIT_LOG_PATH = Path(APP_CONFIG.get(
+    "audit_log_path", str(_agent_data_dir() / "audit.jsonl"))).expanduser()
+AUDIT_MAX_DETAIL = int(APP_CONFIG.get("audit_max_detail", "512"))
+MODEL_TELEMETRY_ENABLED = APP_CONFIG.get("model_telemetry", "0") == "1"
+MODEL_TELEMETRY_PATH = Path(APP_CONFIG.get(
+    "model_telemetry_path", str(_agent_data_dir() / "model-telemetry.jsonl"))).expanduser()
+
+
+def _append_private_jsonl(path: Path, entry: dict) -> None:
+    """Append a local structured record without weakening the caller on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+    if not existed:
+        _protect_private_file(path)
+
+
+def _audit(event: str, **fields) -> None:
+    """Append one redacted JSON line to the audit log.
+
+    Never raises: this is a record, not a gate, so a broken or unwritable sink
+    must not break the agent turn. Every field value is passed through
+    _redact_secrets, so a blocked exfiltration attempt is recorded without
+    writing the credential to disk.
+    """
+    if not AUDIT_ENABLED:
+        return
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "permission_mode": PERMISSION_MODE,
+        }
+        for key, value in fields.items():
+            text = _redact_secrets(str(value))
+            entry[key] = text[:AUDIT_MAX_DETAIL] if key == "detail" else text
+        _append_private_jsonl(AUDIT_LOG_PATH, entry)
+    except Exception as exc:  # noqa: BLE001 — audit must never break a turn
+        _log.debug("audit write failed: %s", exc)
+
+
+def _model_usage(response) -> tuple[dict, str]:
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        return {
+            "input_tokens": getattr(usage, "prompt_tokens", None),
+            "output_tokens": getattr(usage, "completion_tokens", None),
+        }, "provider"
+    choices = getattr(response, "choices", ()) or ()
+    message = getattr(choices[0], "message", None) if choices else None
+    content = getattr(message, "content", "") or ""
+    return {"input_tokens": None, "output_tokens": len(content) // 4}, "output_estimate"
+
+
+def _record_model_telemetry(provider: str, model: str, attempt: str, started: float,
+                            *, max_tokens: int, response=None, error=None) -> None:
+    """Write local model-call health metadata; prompts and responses never leave memory."""
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        usage, token_source = _model_usage(response) if response is not None else (
+            {"input_tokens": None, "output_tokens": None}, "unavailable")
+        input_tokens = usage["input_tokens"] or 0
+        output_tokens = usage["output_tokens"] or 0
+        cost = None
+        if COST_PER_1K_INPUT or COST_PER_1K_OUTPUT:
+            cost = round((input_tokens / 1000) * COST_PER_1K_INPUT
+                         + (output_tokens / 1000) * COST_PER_1K_OUTPUT, 8)
+        choices = getattr(response, "choices", ()) or ()
+        finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
+        status = getattr(error, "status_code", None)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "model_call",
+            "provider": _redact_secrets(str(provider)),
+            "model": _redact_secrets(str(model)),
+            "attempt": attempt,
+            "role": _active_role,
+            "outcome": "error" if error else "success",
+            "latency_ms": round((time.monotonic() - started) * 1000),
+            "max_tokens": max_tokens,
+            "token_source": token_source,
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "cost_usd": cost,
+            "finish_reason": finish_reason,
+            "error_type": type(error).__name__ if error else None,
+            "error_status": status if isinstance(status, int) else None,
+        }
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, entry)
+    except Exception as exc:  # telemetry must never affect a model call
+        _log.debug("model telemetry write failed: %s", exc)
+
+
+_MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
+
+
+def _wrap_untrusted(text: str, source: str = "") -> str:
+    """Wrap external content (web pages, MCP tool responses) in boundary markers
+    so the model sees it as untrusted data, never instructions."""
+    if not text or not text.strip():
+        return text
+    text = _MCP_SPECIAL_TOKENS.sub("", text)
+    tag = f'<<<EXTERNAL_UNTRUSTED_CONTENT source="{source}">>>' if source else "<<<EXTERNAL_UNTRUSTED_CONTENT>>>"
+    return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
 
 
 # Distinctive lines of the base system prompt, used to detect a verbatim leak.
@@ -2648,9 +4662,16 @@ def _guard_answer(answer: str) -> str:
 
 # Requests that target the agent's own internals — refused instantly (no model
 # round-trip) rather than looping for 3k tokens before arriving at the same refusal.
+# `config`/`configuration` is deliberately NOT in this list. "what is your
+# configuration?" is an ordinary capability question, and refusing it made the
+# agent unable to describe itself — a worse outcome than the disclosure the
+# pattern was guarding, since the actual secrets are covered by
+# _is_sensitive_path, _redact_secrets, and _is_system_leak regardless. Asking
+# for config.txt by name is still refused; asking what the setup IS now routes
+# to describe_capabilities.
 _PROTECTED_TARGET_RE = re.compile(
-    r'\b(system\.md|config\.txt|system\s*(prompt|instructions|message)|'
-    r'your\s+(system\s*)?(prompt|instructions|rules|config|configuration|guidelines)|'
+    r'\b(system\.md|config\.txt|configb\.txt|system\s*(prompt|instructions|message)|'
+    r'your\s+(system\s*)?(prompt|instructions|rules|guidelines)|'
     r'initial\s+prompt|developer\s+(prompt|message)|the\s+prompt\s+you\s+were\s+given)\b',
     re.IGNORECASE)
 
@@ -2682,6 +4703,17 @@ SSRF_ALLOW_PRIVATE = APP_CONFIG.get("ssrf_allow_private", "0") == "1"
 SSRF_ALLOW_HOSTS = {h.strip().lower()
                     for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
                     if h.strip()}
+
+# --- Egress domain policy ---
+# _ssrf_check blocks INTERNAL addresses; this bounds which PUBLIC hosts the
+# agent may reach. Empty allowlist = allow all (unchanged default). The
+# blocklist is always enforced, allowlist or not.
+EGRESS_ALLOWED_DOMAINS = [d.strip().lower()
+                          for d in APP_CONFIG.get("allowed_domains", "").split(",")
+                          if d.strip()]
+EGRESS_BLOCKED_DOMAINS = [d.strip().lower()
+                          for d in APP_CONFIG.get("blocked_domains", "").split(",")
+                          if d.strip()]
 
 
 def _ssrf_check(url: str):
@@ -2735,6 +4767,292 @@ def _ssrf_check(url: str):
     return None
 
 
+def _host_matches(host: str, domain: str) -> bool:
+    """True if host is `domain` or a subdomain of it.
+
+    Suffix comparison must be dot-anchored: `evilpastebin.com` is not a
+    subdomain of `pastebin.com`, and a plain endswith() would say it is.
+    """
+    return host == domain or host.endswith("." + domain)
+
+
+def _egress_check(url: str):
+    """Return None if the URL's host is permitted by the egress policy, else
+    an error string. Runs alongside _ssrf_check, which handles internal
+    addresses — this one bounds which PUBLIC hosts are reachable.
+
+    blocked_domains=host,...   never reachable (checked first, wins over allow)
+    allowed_domains=host,...   if non-empty, ONLY these hosts are reachable
+
+    Deliberately ordered BEFORE _ssrf_check at every call site: this is a pure
+    string check, while _ssrf_check calls getaddrinfo. Resolving a host the
+    policy already rejects would leak the attempt to that domain's nameserver —
+    an outbound signal from a request that never should have started.
+    """
+    if not EGRESS_ALLOWED_DOMAINS and not EGRESS_BLOCKED_DOMAINS:
+        return None
+    import urllib.parse
+    try:
+        host = (urllib.parse.urlparse((url or "").strip()).hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return "Blocked: malformed URL — egress policy requires a resolvable host."
+    for domain in EGRESS_BLOCKED_DOMAINS:
+        if _host_matches(host, domain):
+            return (f"Blocked: '{host}' matches blocked_domains entry '{domain}'. "
+                    "Remove it from blocked_domains in config.txt to allow this.")
+    if EGRESS_ALLOWED_DOMAINS:
+        if not any(_host_matches(host, d) for d in EGRESS_ALLOWED_DOMAINS):
+            return (f"Blocked: '{host}' is not in allowed_domains. "
+                    "Add it to allowed_domains in config.txt to allow this request.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Web search — provider registry wiring (mode=search)
+# ---------------------------------------------------------------------------
+WEB_SEARCH_REGISTRY = web_search.default_registry()
+
+
+def _web_search_limit() -> int:
+    try:
+        return max(1, min(int(APP_CONFIG.get("web_search_results", "5")), 20))
+    except (TypeError, ValueError):
+        return 5
+
+
+_WEB_SEARCH_MAX_QUERY_CHARS = 500
+_WEB_SEARCH_SENSITIVE_PATTERNS = (
+    (re.compile(r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----", re.IGNORECASE),
+     "private-key material"),
+    (re.compile(r"\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
+                r"authorization|bearer|password|passwd|secret)\s*[:=]\s*"
+                r"(?:['\"])?\S{8,}", re.IGNORECASE), "credential-like value"),
+    (re.compile(r"\b(?:sk|rk|ghp|github_pat|xox[baprs]|AKIA)[-_]?"
+                r"[A-Za-z0-9_=-]{12,}\b"), "credential-like token"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
+                r"[A-Za-z0-9_-]{10,}\b"), "authentication token"),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+     "email address"),
+    (re.compile(r"(?<!\d)(?:\+?\d[\s().-]?){8,}\d(?!\d)"),
+     "phone number or identifier"),
+    (re.compile(r"\b(?:\d[ -]?){13,19}\b"), "payment-card-like number"),
+)
+
+
+# Markers that make a query mean "as of now" — the ones where an undated
+# search happily ranks a years-old page above this month's news.
+_RELATIVE_TIME_MARKERS = re.compile(
+    r"\b(?:today|todays|tonight|latest|newest|current|currently|now|recent|"
+    r"recently|upcoming|next|this\s+(?:week|month|year|season)|"
+    r"as\s+of\s+now|right\s+now|so\s+far)\b", re.IGNORECASE)
+
+# "today" or "this week" needs the month to be worth anything; "latest" only
+# needs the year.
+_MONTH_GRANULARITY = re.compile(
+    r"\b(?:today|todays|tonight|this\s+week|this\s+month|right\s+now|"
+    r"as\s+of\s+now)\b", re.IGNORECASE)
+
+_EXPLICIT_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _augment_relative_time_query(query: str, now=None) -> str:
+    """Add the current year (or month) to a query that means "as of now".
+
+    Search engines rank an undated "latest X" on popularity rather than
+    recency, so a well-linked old page beats this month's news. Naming the
+    year is the cheapest change that measurably shifts what comes back.
+
+    Deliberately narrow: fires only when the query carries a relative-time
+    marker AND names no year of its own, so "iPhone 2019 reviews" and "world
+    cup 1998" are never rewritten. That precondition also makes it idempotent
+    — once the year is appended, the query has an explicit year and stops
+    qualifying. Set search_date_augmentation=0 to disable.
+    """
+    if APP_CONFIG.get("search_date_augmentation", "1") != "1":
+        return query
+    if not _RELATIVE_TIME_MARKERS.search(query) or _EXPLICIT_YEAR.search(query):
+        return query
+    moment = now or datetime.now().astimezone()
+    suffix = (moment.strftime("%B %Y") if _MONTH_GRANULARITY.search(query)
+              else str(moment.year))
+    return f"{query} {suffix}"
+
+
+# Words carrying no search intent. Dropping them stops a reworded repeat from
+# reading as a fresh query.
+_SEARCH_FILLER = frozenset({
+    "the", "a", "an", "of", "in", "on", "at", "for", "to", "is", "are", "was",
+    "were", "what", "whats", "who", "whos", "when", "where", "which", "how",
+    "do", "does", "did", "tell", "me", "about", "please", "current",
+    "currently", "latest", "newest", "recent", "now",
+})
+
+
+_SEARCH_STAMP_PREFIX = "[Retrieved "
+
+
+def _search_signature(query: str) -> tuple:
+    """Reduce a query to its meaning-bearing tokens, order-independent.
+
+    The loop's existing guard compares json.dumps(args), so a single changed
+    character reads as a brand-new call — and a model that rephrases when it
+    dislikes an answer can spend its whole turn budget on one question.
+    Sorting the tokens catches word-order variants too.
+    """
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    return tuple(sorted(w for w in words if w not in _SEARCH_FILLER))
+
+
+def _search_was_usable(result: str) -> bool:
+    """Whether a completed search is worth reusing instead of re-running.
+
+    An error or an empty result is not an answer; trapping the agent with it
+    would be worse than letting it try once more.
+    """
+    stripped = (result or "").strip()
+    if not stripped or stripped.startswith("Error:"):
+        return False
+    # Framed results carry a stamp line; a stamp with nothing under it is empty.
+    if stripped.startswith(_SEARCH_STAMP_PREFIX):
+        _stamp, _, body = stripped.partition("]")
+        return bool(body.strip())
+    return True
+
+
+def _frame_search_results(results: str, now=None) -> str:
+    """Stamp results with when they were fetched.
+
+    Code cannot reliably date-check arbitrary snippets — every provider
+    formats dates differently, and dropping whatever fails to parse would lose
+    good answers. What it can do is hand the model the comparison point it
+    otherwise lacks, so "the next launch" gets checked against today rather
+    than against training.
+    """
+    # An error or an empty result set is not something to stamp — the stamp
+    # would be the only content, and would read as a result that has none.
+    if not results.strip() or results.startswith("Error:"):
+        return results
+    moment = now or datetime.now().astimezone()
+    return (f"{_SEARCH_STAMP_PREFIX}{moment:%Y-%m-%d}. Check each result's own date before "
+            f"calling anything current, latest, or upcoming — search results "
+            f"routinely include older pages.]\n\n{results}")
+
+
+def _web_search_query_guard(query: str) -> str | None:
+    """Refuse sensitive data in any outbound search query.
+
+    This runs before a query reaches even a trusted local SearXNG. It is a
+    hard floor rather than an approval decision: users can search for topics
+    such as password recovery, but no model-generated query may include an
+    actual credential or direct personal identifier.
+    """
+    if len(query) > _WEB_SEARCH_MAX_QUERY_CHARS:
+        return ("Error: Blocked — web search queries are limited to "
+                f"{_WEB_SEARCH_MAX_QUERY_CHARS} characters.")
+    for pattern, label in _WEB_SEARCH_SENSITIVE_PATTERNS:
+        if pattern.search(query):
+            return ("Error: Blocked — web search queries cannot include "
+                    f"{label}.")
+    return None
+
+
+def _local_searxng_no_prompt_enabled() -> bool:
+    """Whether the operator explicitly opted into a private SearXNG search.
+
+    The opt-in accepts loopback or an explicitly allowlisted private-LAN
+    SearXNG endpoint. It cannot silently switch to ddgs, an API-key provider,
+    or a public host, which would send model-derived queries to a third party
+    without a per-query approval.
+    """
+    if APP_CONFIG.get("web_search_no_prompt", "0") != "1":
+        return False
+    config = _search_config()
+    if config.get("web_search_provider") != "searxng":
+        return False
+    base_url = str(config.get("search_base_url") or "")
+    try:
+        import ipaddress
+        import urllib.parse
+        parts = urllib.parse.urlparse(base_url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme not in _ALLOWED_URL_SCHEMES or parts.path.rstrip("/") != "/search":
+            return False
+        if host == "localhost":
+            return True
+        address = ipaddress.ip_address(host)
+        if address.is_loopback:
+            return True
+        allowed_hosts = {value.strip().lower() for value in
+                         APP_CONFIG.get("ssrf_allow_hosts", "").split(",") if value.strip()}
+        return (address.is_private and (host in allowed_hosts
+                or f"{host}:{parts.port}" in allowed_hosts))
+    except ValueError:
+        return False
+
+
+def _search_config() -> dict:
+    """APP_CONFIG as the search registry should see it.
+
+    Strips the DEFAULTED search_base_url (see SEARCH_BASE_URL_CONFIGURED): the
+    default exists so tool URL templates always interpolate, but treating it as
+    user intent would mean the SearXNG backend claims availability everywhere.
+    """
+    config = dict(APP_CONFIG)
+    if not SEARCH_BASE_URL_CONFIGURED:
+        config.pop("search_base_url", None)
+    return config
+
+
+def _search_context():
+    """Build the guard bundle handed to every web search provider.
+
+    Providers live in web_search.py, which must not import this module (the
+    import would be circular). Passing the guards in keeps _egress_check /
+    _ssrf_check / _outbound_secret_check as the single enforcement point, so a
+    provider cannot accidentally skip them — including the ddgs backend, whose
+    library owns its own HTTP client and would otherwise sit outside the
+    egress policy entirely.
+
+    Credentials are read from the .env key store, never config.txt, matching
+    the migration at import time. The file is read once per call rather than
+    once per lookup.
+    """
+    try:
+        env_values = load_env_file(ENV_FILE_PATH)
+    except Exception:  # noqa: BLE001 — a missing/unreadable .env must not break search
+        env_values = {}
+
+    def check_url(url: str):
+        return (_egress_check(url) or _ssrf_check(url)
+                or _outbound_secret_check(url))
+
+    def get_secret(key_name: str) -> str:
+        return str(env_values.get(key_name) or os.environ.get(key_name, "") or "").strip()
+
+    return web_search.SearchContext(
+        config=_search_config(),
+        get_secret=get_secret,
+        check_url=check_url,
+        wrap=_wrap_untrusted,
+    )
+
+
+def _search_chain_summary() -> str:
+    """Which backends would serve web_search right now, in order.
+
+    Read from live state so /capabilities cannot drift from reality.
+    """
+    try:
+        chain = WEB_SEARCH_REGISTRY.chain(_search_config(), _search_context())
+    except Exception:  # noqa: BLE001 — /capabilities must never fail on a backend probe
+        return "unavailable"
+    if not chain:
+        return "none configured (run /search setup)"
+    return " -> ".join(provider.name for provider in chain)
+
+
 def _mask_system_content(text: str) -> str:
     """Sanitize text that will be SHOWN to the user (e.g. a reasoning preview):
     redact secrets and blank out any verbatim system-prompt lines. Chain-of-thought
@@ -2749,13 +5067,337 @@ def _mask_system_content(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Capability self-introspection
+# ---------------------------------------------------------------------------
+def _on_off(value, unit: str = "") -> str:
+    """Render a 0-means-disabled limit for the capability report."""
+    if not value:
+        return "not set"
+    return f"{value}{unit}"
+
+
+def describe_capabilities() -> str:
+    """Human-readable report of what this agent can actually do right now.
+
+    Built from live state — TOOL_SPECS, MCP_RUNTIME.statuses, the permission
+    mode, the resolved sandbox backend — so it cannot drift from reality the way
+    a hand-maintained list in the system prompt would.
+
+    Exposed as the `describe_capabilities` tool so the model can answer "what
+    tools / MCP servers / features do you have?" from fact instead of guessing,
+    and as `/capabilities` in the CLI. Passed through _redact_secrets because it
+    reads config, and deliberately reports no prompt text — this is a capability
+    channel, not a system-prompt disclosure channel.
+    """
+    lines = ["# Agent8088 capabilities", ""]
+
+    lines += [f"Model: {MODEL_NAME}",
+              f"Permission mode: {PERMISSION_MODE}",
+              f"Sandbox backend: {_resolve_sandbox_backend()}",
+              f"Max turns per request: {APP_CONFIG.get('max_turns', '10')}",
+              ""]
+
+    # --- Tools, grouped by what kind of access they need ---
+    by_mode = {}
+    for tool_name, spec in sorted(TOOL_SPECS.items()):
+        by_mode.setdefault((spec.get("mode") or "other").lower(), []).append(
+            (tool_name, spec.get("description") or default_tool_description(tool_name)))
+    lines.append(f"## Tools ({len(TOOL_SPECS)})")
+    for mode in sorted(by_mode):
+        lines.append(f"\n### {mode}")
+        for tool_name, description in by_mode[mode]:
+            lines.append(f"- {tool_name}: {description}")
+    lines.append("")
+
+    # --- MCP servers ---
+    statuses = getattr(MCP_RUNTIME, "statuses", {}) or {}
+    lines.append("## MCP servers")
+    if not statuses:
+        lines.append("- none configured")
+    else:
+        for server, info in sorted(statuses.items()):
+            state = info.get("state", "unknown")
+            tools = info.get("tools") or []
+            detail = f" — {info['error']}" if info.get("error") else ""
+            lines.append(f"- {server}: {state}, {len(tools)} tool(s){detail}")
+            for mcp_tool in tools:
+                lines.append(f"    - {mcp_tool}")
+    lines.append("")
+
+    # --- Skills and subagents ---
+    lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
+    lines += [f"- {s}" for s in sorted(SKILL_PACKAGES)] or ["- none installed"]
+    lines.append("")
+    lines.append(f"## Subagents ({len(SUBAGENT_SPECS)})")
+    lines += [f"- {a}" for a in sorted(SUBAGENT_SPECS)] or ["- none configured"]
+    lines.append("")
+
+    # --- Guardrails. Reporting what is OFF is as useful as what is on. ---
+    lines += [
+        "## Active guardrails",
+        f"- Unattended run: {'yes' if UNATTENDED else 'no'}"
+        + (f", cron_mode={CRON_MODE}" if UNATTENDED else ""),
+        f"- Denial circuit breaker: {_on_off(DENIAL_BREAKER_THRESHOLD, ' denials')}",
+        f"- Turn token budget: {_on_off(MAX_TURN_TOKENS, ' tokens')}",
+        f"- Turn wall-clock budget: {_on_off(MAX_TURN_SECONDS, 's')}",
+        f"- Plan-mode wall-clock budget: {PLAN_MODE_TIMEOUT_SECONDS}s when turn budget is unset",
+        f"- Plan invalid-mutation retry limit: {PLAN_MODE_RETRY_LIMIT}",
+        f"- Tool-call timeout ceiling: {MAX_TOOL_TIMEOUT_SECONDS}s",
+        f"- Turn cost budget: {_on_off(MAX_TURN_COST_USD, ' USD')}",
+        f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
+        f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
+        f"- New generated files: {ARTIFACTS_ROOT}",
+        f"- Web search: {_search_chain_summary()}",
+        f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
+        f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
+        f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
+        f"- Shell denylist: {', '.join(_USER_DENY_GLOBS) or 'not set'}",
+        f"- Audit log: {'on — ' + str(AUDIT_LOG_PATH) if AUDIT_ENABLED else 'off'}",
+        f"- Subagent max depth: {SUBAGENT_MAX_DEPTH}",
+        "",
+        "## Always-on protections (no mode or approval disables these)",
+        "- Unrecoverable commands refused (rm -rf /, mkfs, dd to a device, fork bombs, curl | sh)",
+        "- Arbitrary code requires the native sandbox or Docker; no local fallback",
+        "- Commands too long or too quote-dense to analyse are refused, not skipped",
+        "- Sensitive files refused for read and write (.env, SSH/GPG/AWS keys, *.pem)",
+        "- Shell startup files refused for write (would execute code on next shell launch)",
+        "- SSRF: requests to private, loopback, link-local, and cloud-metadata addresses refused",
+        "- Outbound requests carrying a configured credential refused",
+        "- Secrets redacted from all tool output and answers",
+        "- System prompt never disclosed",
+        "- External page and MCP content wrapped as untrusted, chat-template tokens stripped",
+    ]
+
+    return _redact_secrets("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Turn budget — resource ceiling for one run_agent() call
+# ---------------------------------------------------------------------------
+class _TurnBudget:
+    """Resource ceiling for one run_agent() call.
+
+    max_turns bounds how many ROUNDS the loop takes; this bounds what those
+    rounds may consume. Any limit set to 0 is disabled, so the default config
+    behaves exactly as before.
+    """
+
+    def __init__(self, max_seconds=0, max_tokens=0, max_cost=0.0,
+                 cost_in=0.0, cost_out=0.0):
+        self.max_seconds = max_seconds
+        self.max_tokens = max_tokens
+        self.max_cost = max_cost
+        self.cost_in = cost_in
+        self.cost_out = cost_out
+        self.started = time.monotonic()
+        self.input_tokens = 0
+        self.output_tokens = 0
+        # role -> [input, output]. Lets a caller answer "what did verification
+        # cost me" from its own workload instead of from a published average.
+        self.role_tokens = {}
+
+    def add_tokens(self, prompt: int, completion: int) -> None:
+        prompt, completion = int(prompt or 0), int(completion or 0)
+        self.input_tokens += prompt
+        self.output_tokens += completion
+        slot = self.role_tokens.setdefault(_active_role, [0, 0])
+        slot[0] += prompt
+        slot[1] += completion
+
+    def role_total(self, role: str) -> int:
+        spent = self.role_tokens.get(role)
+        return sum(spent) if spent else 0
+
+    def audit_share(self) -> float:
+        """Fraction of this turn's tokens spent on verification (0.0-1.0)."""
+        total = self.total_tokens
+        if not total:
+            return 0.0
+        audited = sum(sum(v) for k, v in self.role_tokens.items()
+                      if k.startswith("subagent:auditor"))
+        return audited / total
+
+    def add_usage(self, response, text: str = "") -> None:
+        """Record one model call. Streaming responses come from _build_response
+        and carry no usage object — fall back to a chars/4 estimate so a
+        streaming session is still bounded, just less precisely."""
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.add_tokens(getattr(usage, "prompt_tokens", 0),
+                            getattr(usage, "completion_tokens", 0))
+            return
+        if text:
+            self.add_tokens(0, len(text) // 4)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    @property
+    def cost_usd(self) -> float:
+        return ((self.input_tokens / 1000.0) * self.cost_in
+                + (self.output_tokens / 1000.0) * self.cost_out)
+
+    def exceeded(self):
+        """Return a human-readable reason string, or None if within budget."""
+        if self.max_seconds:
+            elapsed = time.monotonic() - self.started
+            if elapsed > self.max_seconds:
+                return (f"Turn budget exceeded: {elapsed:.0f} seconds elapsed "
+                        f"(limit {self.max_seconds}). Raise max_turn_seconds in "
+                        f"config.txt or split the task into smaller requests.")
+        if self.max_tokens and self.total_tokens >= self.max_tokens:
+            return (f"Turn budget exceeded: {self.total_tokens} tokens used "
+                    f"(limit {self.max_tokens}). Raise max_turn_tokens in config.txt.")
+        if self.max_cost and self.cost_usd >= self.max_cost:
+            return (f"Turn budget exceeded: ${self.cost_usd:.4f} spent "
+                    f"(limit ${self.max_cost:.4f}). Raise max_turn_cost_usd in config.txt.")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
-def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
-              on_calls=None, on_tool=None, on_result=None, on_answer=None,
-              on_escalation=None,
-              on_token=None, interrupt_check=None, trace=None,
-              system_prompt=None, tools_def=None, allowed_tools=None, depth=0):
+def run_agent(messages, *, budget=None, **kwargs):
+    """Run one agent turn under a resource budget. See _run_agent_loop for the
+    full hook documentation — every keyword is forwarded to it unchanged.
+
+    This thin wrapper exists so `_active_budget` is published for the duration
+    of the turn (subagents and plan steps read it, since there is no way to
+    thread a parameter through run_tool) and is always restored afterwards,
+    including on an exception or an AgentInterrupted.
+    """
+    global _active_budget
+    if budget is None:
+        max_seconds = (MAX_TURN_SECONDS or PLAN_MODE_TIMEOUT_SECONDS
+                       if PERMISSION_MODE == "plan-only" else MAX_TURN_SECONDS)
+        budget = _TurnBudget(
+            max_seconds=max_seconds, max_tokens=MAX_TURN_TOKENS,
+            max_cost=MAX_TURN_COST_USD,
+            cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
+        )
+    global _last_audit_share
+    previous, _active_budget = _active_budget, budget
+    # Only the outermost run_agent resets the blast-radius counters: a subagent
+    # must not hand itself a fresh write budget, same reasoning as the token one.
+    if previous is None:
+        reset_turn_counters()
+        reset_approval_state()
+        reset_turn_approval_state()
+    try:
+        return _run_agent_loop(messages, budget=budget, **kwargs)
+    finally:
+        # Read the share before the budget goes out of scope. Verification spends
+        # the parent's tokens, and an audit on the post-approval path reports no
+        # cost of its own — so without this the only unattributed verification
+        # spend would be the one the default /plan flow incurs.
+        if previous is None:
+            _last_audit_share = budget.audit_share() if budget is not None else 0.0
+        _active_budget = previous
+
+
+# Every tool result the loop feeds back starts with this. It is the marker that
+# separates "the human said it" from "a web page said it".
+_TOOL_RESULT_PREFIX = "Tool result ("
+
+
+def _genuine_user_turns(messages) -> list:
+    """The turns the human actually typed.
+
+    Tool output is fed back as role="user" (see the appends in the loop), so a
+    plain role check treats a fetched page or a search snippet as something the
+    user said. That let web content authorise the very tools these gates
+    restrict: a result containing the URL made browse_page look user-supplied,
+    and a page reading "run the command below" unlocked execute_shell.
+
+    Tool results are always prefixed by the loop, so the marker is reliable —
+    and a model echoing that prefix in its own text cannot help, because
+    assistant turns are excluded first.
+    """
+    return [m for m in messages
+            if m.get("role") == "user"
+            and not str(m.get("content", "")).startswith(_TOOL_RESULT_PREFIX)]
+
+
+def _user_supplied_url(messages, url: object) -> bool:
+    """Whether the exact page URL came from the user's request."""
+    return (isinstance(url, str) and bool(url) and any(
+        url in str(message.get("content", ""))
+        for message in _genuine_user_turns(messages)
+    ))
+
+
+# Phrases that mean the user asked for this class of tool themselves. Kept
+# literal on purpose: the gates below only fire on tools the model reached for
+# unprompted, and wrongly reading "the user asked" is far safer than refusing
+# something they explicitly requested.
+_EXPLICIT_TOOL_PHRASES = {
+    "execute_shell": ("run ", "execute ", "shell", "command", "terminal", "`"),
+    "browse_page": ("browse", "open the page", "visit", "inspect the page"),
+    "get_page_title": ("title of", "browse", "visit"),
+}
+
+
+def _user_requested_tool(messages, name: str) -> bool:
+    """Whether the user asked for this tool, by name or in plain language.
+
+    Only user turns count. The model must not be able to authorise its own
+    tool call by narrating it first.
+    """
+    phrases = (name, *_EXPLICIT_TOOL_PHRASES.get(name, ()))
+    for message in _genuine_user_turns(messages):
+        text = str(message.get("content", "")).lower()
+        if any(phrase in text for phrase in phrases):
+            return True
+    return False
+
+
+# Web fetching wearing a shell command as a disguise.
+_WEB_FETCH_SHELL = _SHELL_WEB_CLIENT
+
+# MCP tools whose name says they fetch. Name-based because MCP specs carry no
+# capability metadata to key off — see the docstring in _is_fetch_followup.
+_MCP_FETCH_NAME = re.compile(r"(?:search|fetch|browse|web|http|scrape)", re.IGNORECASE)
+
+
+def _is_fetch_followup(messages, name: str, args: dict) -> bool:
+    """Whether this call is an unsolicited fetch after a search already worked.
+
+    Narrow by design. The brief asks that shell and MCP not be used as
+    redundant follow-ups, but blocking them broadly is unsafe: after searching
+    for a library version the agent may legitimately need to install it, and
+    refusing that is a worse bug than one wasted fetch. So only fetch-shaped
+    calls qualify, and an explicit user request overrides all of it.
+
+    An approved plan overrides it too, and for the same reason only more so. A
+    plan-mode turn researches with a search and then runs the approved steps in
+    that same turn, so this gate would refuse work the user had just said yes to —
+    and `_user_requested_tool` cannot rescue it, because they approved a plan
+    rather than naming a tool. `_plan_approved` is true only between approval and
+    the end of that turn, so the widening lasts exactly as long as the work it
+    authorises.
+    """
+    if _plan_approved:
+        return False
+    if name in {"browse_page", "get_page_title"}:
+        return not (_user_supplied_url(messages, args.get("url"))
+                    or _user_requested_tool(messages, name))
+    if name == "execute_shell":
+        command = str(args.get("command") or "")
+        return bool(_WEB_FETCH_SHELL.search(command)) and not _user_requested_tool(
+            messages, "execute_shell")
+    if (TOOL_SPECS.get(name) or {}).get("mode") == "mcp":
+        return bool(_MCP_FETCH_NAME.search(name)) and not _user_requested_tool(
+            messages, name)
+    return False
+
+
+def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
+                    on_calls=None, on_tool=None, on_result=None, on_answer=None,
+                    on_escalation=None,
+                    on_token=None, interrupt_check=None, trace=None,
+                    system_prompt=None, tools_def=None, allowed_tools=None,
+                    depth=0, budget=None):
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -2774,9 +5416,13 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     seen = set()      # (name, args) signatures already run -> breaks loops
+    tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    plan_mutation_retries = 0
+    searched = False     # prevents speculative page browsing after search results
+    search_results = {}  # query signature -> that search's output, for reuse
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -2789,13 +5435,31 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         return refusal
 
     for turn in range(max_turns):
+        round_tools_def = tools_def() if callable(tools_def) else tools_def
+        round_allowed_tools = set(
+            allowed_tools() if callable(allowed_tools) else allowed_tools
+        )
+        round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
+        # Resource ceiling. Checked before the model call so an exhausted budget
+        # costs nothing, and the partial result is returned rather than discarded.
+        over = budget.exceeded() if budget else None
+        if over:
+            _log.warning("turn budget hit at turn %d: %s", turn, over)
+            answer = _guard_answer(
+                f"{over}\n\nPartial result so far:\n"
+                f"{_last_tool_output[:1000] if _last_tool_output else '(none)'}")
+            if on_answer:
+                on_answer(answer)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
+            return answer
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
-                    messages, tools_def, temperature=temperature,
-                    system_prompt=system_prompt, on_token=on_token,
+                    messages, round_tools_def, temperature=temperature,
+                    system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
                 )
         except AgentInterrupted:
@@ -2813,23 +5477,48 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
         # context window (the usual cause of the "loops in the reasoning block" crash)
         # and out of the user-facing answer.
         message = response.choices[0].message
+        if budget:
+            budget.add_usage(response, text=(message.content or ""))
         content = _strip_reasoning(message.content or "")
         native_text = _native_tool_text(message)
         if native_text:
             content = "\n".join(part for part in (content, native_text) if part)
         messages.append({"role": "assistant", "content": content})
 
-        calls = find_tool_calls(content, allowed_tools)
+        calls = find_tool_calls(content, round_allowed_tools)
+        if calls:
+            _log.info("model tool calls (turn %d): %s", turn,
+                      [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
+        else:
+            _log.debug("turn %d: no tool calls — model replied with text", turn)
         if not calls:
             # The model may have *tried* to call a tool that doesn't exist (a common
             # failure — e.g. `current_time`). Rather than leaking the raw ✿FUNCTION✿
             # markup as the "answer", tell the model what went wrong and loop so it can
             # recover (call a real tool or just answer). Bounded to avoid infinite loops.
-            unknown = [n for n in _attempted_tool_names(content)
-                       if _resolve_tool_name(n) not in allowed_tools]
+            attempted = _attempted_tool_names(content)
+            invalid_plan = [n for n in attempted
+                            if PERMISSION_MODE == "plan-only"
+                            and _resolve_tool_name(n) in TOOL_SPECS
+                            and _resolve_tool_name(n) not in round_allowed_tools]
+            if invalid_plan:
+                plan_mutation_retries += 1
+                if plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT:
+                    answer = _guard_answer(
+                        f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
+                        "attempts. Nothing was written or run. Present the plan with "
+                        "present_plan, or leave plan mode before retrying."
+                    )
+                    if on_answer:
+                        on_answer(answer)
+                    return answer
+                messages.append({"role": "user", "content": _plan_mode_block_message()})
+                continue
+            unknown = [n for n in attempted
+                       if _resolve_tool_name(n) not in round_allowed_tools]
             if unknown and unknown_retries < 2 and not forcing:
                 unknown_retries += 1
-                available = ", ".join(sorted(allowed_tools)) or "(none)"
+                available = ", ".join(sorted(round_allowed_tools)) or "(none)"
                 if on_result:
                     on_result("error", f"Unknown tool '{unknown[0]}' — not available.")
                 messages.append({"role": "user", "content":
@@ -2862,7 +5551,7 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # Stripping removed everything (the message was ONLY a tool-call
                 # attempt or pure reasoning) — never fall back to the raw markup.
                 answer = (f"I tried to use a tool that isn't available. "
-                          f"Available tools: {', '.join(sorted(allowed_tools)) or 'none'}."
+                          f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
             answer = _guard_answer(answer)
@@ -2882,7 +5571,41 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
 
-            if sig in seen:  # exact repeat -> feed cached output instead of re-running
+            if searched and _is_fetch_followup(messages, name, args):
+                result = ("Follow-up fetch was not run — the search already "
+                          "answered this. Use the web_search results, or ask the "
+                          "user for a specific page URL.")
+                tool_outputs.append(result)
+                if on_result:
+                    on_result(name, result)
+                if turn_tools is not None:
+                    turn_tools.append({"name": name, "arguments": args,
+                                       "result": result, "blocked": True})
+                messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                continue
+
+            # Equivalent-query guard. `sig` above is byte-exact, so rewording
+            # or reordering the same question slipped straight past it and the
+            # search ran again. A failed or empty first attempt stays
+            # retryable — trapping the agent with a dud result would be worse
+            # than one extra call.
+            if name == "web_search":
+                query_sig = _search_signature(str(args.get("query") or ""))
+                earlier = search_results.get(query_sig)
+                if earlier is not None and _search_was_usable(earlier):
+                    result = ("This search already ran. Answer from these results "
+                              f"instead of searching again:\n\n{earlier}")
+                    tool_outputs.append(result)
+                    if on_result:
+                        on_result(name, result)
+                    if turn_tools is not None:
+                        turn_tools.append({"name": name, "arguments": args,
+                                           "result": "(duplicate search)", "cached": True})
+                    messages.append({"role": "user",
+                                     "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                    continue
+
+            if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
                           if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
@@ -2890,16 +5613,41 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
 
-            seen.add(sig)
+            if "__parse_error__" not in args:
+                seen.add(sig)
+            # The user may have hit ESC while this response was still streaming.
+            # Without a check here the tool they just cancelled runs anyway, and
+            # the interrupt is only noticed at the top of the next turn — after
+            # the write has already landed.
+            _raise_if_interrupted(interrupt_check)
             if on_tool:
                 on_tool(name)
             with spin(f"running {name}..."):
                 result = exec_tool(name, json.dumps(args), depth=depth)
+            if (PERMISSION_MODE == "plan-only"
+                    and result.startswith("Error: plan mode")):
+                plan_mutation_retries += 1
             executed = True
+            tool_outputs.append(result)
+            if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
+                # Remember what this query returned so a reworded repeat can be
+                # answered from it. An escalation is not a result — recording it
+                # would make the approved retry look like a duplicate. The prefix
+                # is \x1f-delimited; matching ':' here meant a search blocked
+                # pending approval was filed as a completed one, so the retry the
+                # user had just authorised was answered from the escalation text.
+                search_results[_search_signature(str(args.get("query") or ""))] = result
+                if not _search_was_usable(result):
+                    # An errored or empty search must stay retryable, and the
+                    # byte-exact `seen` guard above would otherwise block the
+                    # identical retry before the equivalence check runs. Same
+                    # discard the escalation path uses.
+                    seen.discard(sig)
+            searched = searched or (name == "web_search" and _search_was_usable(result))
 
             # A granted escalation retries the exact call once; remove it from the
             # repeat guard before asking the UI for approval.
-            blocked = result.startswith("ESCALATION_REQUEST:")
+            blocked = result.startswith("ESCALATION_REQUEST\x1f")
             if blocked:
                 seen.discard(sig)
 
@@ -2908,13 +5656,25 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             if blocked and on_escalation:
                 if on_escalation(name, result):
+                    note_approval()
                     messages.append({"role": "user", "content":
                         "Permission granted. Retry the EXACT same tool call that was blocked. "
                         "Do not ask for permission again. Do not explain. Just call the tool again now."})
-                else:
-                    messages.append({"role": "user", "content":
-                        "Permission denied by the user. You remain in readonly mode. "
-                        "Tell the user what you could not do and why the task cannot be completed."})
+                    continue
+                # Denied. The breaker stops a model that would otherwise re-propose
+                # the same blocked action until max_turns — which reads to the user
+                # as the agent ignoring them.
+                if note_denial():
+                    answer = _guard_answer(breaker_message())
+                    if on_answer:
+                        on_answer(answer)
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "denial_breaker",
+                                      "content": answer})
+                    return answer
+                messages.append({"role": "user", "content":
+                    "Permission denied by the user. You remain in readonly mode. "
+                    "Tell the user what you could not do and why the task cannot be completed."})
                 continue
 
             if turn_tools is not None:
@@ -2928,7 +5688,21 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
             interactive_fail = "EOFError" in result or "EOF when reading" in result or "input()" in result.lower()
             note = ("\n\nThis script needs interactive input which is not available. "
                     "Do NOT retry it. Give your final answer now." if interactive_fail else "")
-            messages.append({"role": "user", "content": f"Tool result ({name}):\n{result[:3000]}{note}"})
+            messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result[:3000]}{note}"})
+
+        if (PERMISSION_MODE == "plan-only"
+                and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
+            answer = _guard_answer(
+                f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
+                "attempts. Nothing was written or run. Present the plan with "
+                "present_plan, or leave plan mode before retrying."
+            )
+            if on_answer:
+                on_answer(answer)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "plan_retry_limit",
+                              "content": answer})
+            return answer
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
@@ -2944,7 +5718,8 @@ def run_agent(messages, *, max_turns=10, temperature=0.1, spin=None,
                 "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
 
     # Max turns reached or forced stop: return the best answer we have.
-    fallback = _guard_answer(_last_tool_output[:1000] if _last_tool_output else "Could not complete the task.")
+    fallback_source = "\n\n".join(tool_outputs) or _last_tool_output
+    fallback = _guard_answer(fallback_source[:3000] if fallback_source else "Could not complete the task.")
     if on_answer:
         on_answer(fallback)
     if trace is not None:

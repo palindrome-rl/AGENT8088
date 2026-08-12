@@ -3,6 +3,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import prompt_toolkit
 from rich.console import Console
 
 import agent8088.cli as classic
@@ -10,17 +11,26 @@ import agent8088.cli as classic
 
 def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     output = io.StringIO()
-    monkeypatch.setattr(classic, "console", Console(file=output, width=180, color_system=None))
+    # legacy_windows=False pins which logo variant is under test. Left to the
+    # ambient console, this asserts the block logo on Linux and the ASCII one on
+    # a Windows terminal, so the same test passes or fails by platform rather
+    # than by behaviour. The ASCII branch has its own test below.
+    monkeypatch.setattr(classic, "console",
+                        Console(file=output, width=180, color_system=None,
+                                legacy_windows=False))
 
     classic.banner()
 
     rendered = output.getvalue()
     assert "AGENT8088" in rendered
     assert "█████╗  ██████╗" in rendered
+    assert "██╔═████╗" not in rendered
+    assert "██║██╔██║" not in rendered
+    assert classic._PALINDROME_ANSI_LOGO.is_file()
     assert classic._PALINDROME_LOGO.is_file()
     logo = classic._palindrome_logo().plain
-    assert "▀" in logo
-    assert max(map(len, logo.splitlines())) == 24
+    assert "▔" in logo
+    assert max(map(len, logo.splitlines())) == 30
     assert len(classic._classic_masthead().spans) == 6
     assert "Palindrome" in rendered
     assert "Research Labs" in rendered
@@ -29,8 +39,36 @@ def test_classic_banner_includes_brand_and_catalogues(monkeypatch):
     assert classic._catalog(["delta", "alpha"], columns=1) == "alpha\ndelta"
 
 
+def test_logo_falls_back_to_ascii_on_a_legacy_console(monkeypatch):
+    """A console that cannot render block characters must not emit them."""
+    monkeypatch.setattr(classic, "console",
+                        Console(file=io.StringIO(), width=180, color_system=None,
+                                legacy_windows=True))
+    logo = classic._palindrome_logo().plain
+    assert "▀" not in logo and "▄" not in logo
+    assert "#" in logo
+
+
+def test_palindrome_logo_colours_are_brightened():
+    assert classic._brighten_logo_colour((100, 150, 250)) == (130, 195, 255)
+
+
+def test_web_search_call_hides_the_query_in_the_cli(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(classic, "console", Console(file=output, width=180, color_system=None))
+    monkeypatch.setattr(classic.S, "verbose", "on")
+
+    classic.on_calls([{"name": "web_search", "arguments": {"query": "private search terms"}}])
+
+    rendered = output.getvalue()
+    assert "Searching the web" in rendered
+    assert "private search terms" not in rendered
+    assert "web_search(" not in rendered
+
+
 def test_palindrome_logo_falls_back_when_asset_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(classic, "_PALINDROME_LOGO", tmp_path / "missing.png")
+    monkeypatch.setattr(classic, "_PALINDROME_ANSI_LOGO", tmp_path / "missing.ansi")
 
     logo = classic._palindrome_logo().plain
     assert len(logo.splitlines()) == 8
@@ -52,13 +90,19 @@ def test_palindrome_logo_uses_ascii_on_legacy_windows(tmp_path, monkeypatch):
 
 def test_narrow_banner_keeps_the_palindrome_brand(monkeypatch):
     output = io.StringIO()
-    monkeypatch.setattr(classic, "console", Console(file=output, width=50, color_system=None))
+    # legacy_windows=False for the same reason as the test above: the braille
+    # logo has an ASCII fallback for consoles that cannot render it, so without
+    # pinning this the assertion passes on Linux and fails on a Windows terminal
+    # — by platform rather than by behaviour.
+    monkeypatch.setattr(classic, "console",
+                        Console(file=output, width=50, color_system=None,
+                                legacy_windows=False))
 
     classic.banner()
 
     rendered = output.getvalue()
     assert "Palindrome Research Labs" in rendered
-    assert any(pixel in rendered for pixel in ("#", "█", "▀", "▄"))
+    assert "▔" in rendered
 
 
 def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
@@ -72,10 +116,53 @@ def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
 def test_command_suggestions_cover_slash_and_bare_prefixes():
     assert "/help" in classic._command_matches("/")
     assert "/quit" in classic._command_matches("/")
-    assert classic._command_matches("m", slash=False) == ["maxturns", "model", "models"]
+    assert classic._command_matches("m", slash=False) == ["maxturns", "mcp", "mode", "model", "models"]
     assert classic._live_matches("/")[1] == classic._command_matches("/")
-    assert classic._live_matches("/m")[1] == ["/maxturns", "/model", "/models"]
-    assert classic._live_matches("m") == ("m", ["maxturns", "model", "models"])
+    assert classic._live_matches("/m")[1] == ["/maxturns", "/mcp", "/mode", "/model", "/models"]
+    assert classic._live_matches("m") == ("m", ["maxturns", "mcp", "mode", "model", "models"])
+
+
+def test_status_bar_summarizes_the_idle_session(monkeypatch):
+    monkeypatch.setattr(classic, "_estimate_context_pct", lambda: 50)
+    monkeypatch.setattr(classic, "_active_provider_name", lambda: "local")
+    monkeypatch.setattr(classic.A, "MODEL_NAME", "test-model")
+    monkeypatch.setattr(classic.A, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(classic.S, "name", "demo")
+    monkeypatch.setattr(classic.S, "last_usage", {"seconds": 2.5, "tokens": 12})
+
+    rendered = "".join(text for _, text in classic._status_bar_fragments())
+
+    assert rendered == " ◆ 8088 · local:test-model │ █████░░░░░ 50% ctx │ full-auto │ demo │ last 2.5s ↑12 │ ● ready "
+
+
+def test_interactive_prompt_uses_the_persistent_status_bar(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        prompt_toolkit, "prompt",
+        lambda message, **kwargs: captured.update(kwargs, message=message) or "hello",
+    )
+
+    assert classic._read_line() == "hello"
+    assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
+    assert captured["reserve_space_for_menu"] == 0
+    assert "\n" not in captured["message"].value
+
+
+def test_stream_view_hides_large_tool_wire_payloads():
+    output = io.StringIO()
+    console = Console(file=output, width=100, color_system=None)
+    stream = classic._StreamFilter()
+    stream.feed(
+        '✿FUNCTION✿: write_file ✿ARGS✿: {"content":"' + "x" * 20_000 + '"}'
+    )
+
+    console.print(classic._stream_view([], stream.prose_text()))
+
+    rendered = output.getvalue()
+    assert "x" * 100 not in rendered
+    assert "✿FUNCTION✿" not in rendered
+    assert "writing" in stream.status_label()
 
 
 def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):
@@ -88,6 +175,14 @@ def test_default_skills_are_loaded_into_the_agent_and_status(monkeypatch):
     monkeypatch.setattr(classic, "console", Console(file=output, width=120, color_system=None))
     classic.cmd_status("")
     assert "Session Status" in output.getvalue()
+
+
+def test_plan_command_is_covered_by_the_plan_mode_suite():
+    """`/plan` is a mode now, not a one-shot wrapper: see tests/test_plan_command.py.
+    Kept as a signpost so the deletion of the old one-shot tests is deliberate —
+    those tests asserted that /plan restored the previous mode when the turn ended,
+    which is exactly the behaviour that made plan → approve → run impossible."""
+    assert classic.cmd_plan.__doc__ and "plan mode" in classic.cmd_plan.__doc__
 
 
 def test_named_session_round_trips_skill_state(tmp_path, monkeypatch):
@@ -174,18 +269,28 @@ def test_save_export_uses_private_permission_gated_write(tmp_path, monkeypatch):
     monkeypatch.setattr(classic.S, "name", "")
     monkeypatch.setattr(classic.S, "disabled_skills", set())
     monkeypatch.setattr(classic.A, "ALLOWED_PATHS", [tmp_path])
-    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "PROMPT_PATHS", [tmp_path])
+    monkeypatch.setattr(classic.A, "NO_PROMPT_PATHS", [])
     monkeypatch.setattr(classic.A, "PERMISSION_MODE", "readonly")
+    prompts = []
 
     def capture_run_tool(name, args, *call_args, **call_kwargs):
         seen.update(args)
         return real_run_tool(name, args, *call_args, **call_kwargs)
 
+    def approve(payload):
+        prompts.append(payload)
+        classic.A.grant_escalation()
+        return True
+
     monkeypatch.setattr(classic.A, "run_tool", capture_run_tool)
+    monkeypatch.setattr(classic, "_handle_escalation", approve)
 
     classic.cmd_save(str(target))
 
     assert seen["_private"] is True
+    assert len(prompts) == 1
+    assert prompts[0].startswith("ESCALATION_REQUEST\x1f")
     assert json.loads(target.read_text())["messages"] == [
         {"role": "user", "content": "private"},
     ]
@@ -208,6 +313,7 @@ def test_trace_save_respects_write_permissions(tmp_path, monkeypatch):
 
     assert not target.exists()
     assert "could not save" in output.getvalue()
+    assert "ESCALATION_REQUEST" not in output.getvalue()
 
 
 def test_trace_on_creates_and_updates_a_default_export(tmp_path, monkeypatch):

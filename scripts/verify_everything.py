@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,11 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 os.environ.setdefault("AGENT8088_SANDBOX", "auto")
+# Verify the checkout, not the developer's machine. Without this the script reads
+# whatever ~/.agent8088/config.txt happens to say, so allowed_paths from someone's
+# setup wizard decides whether in-repo checks pass — the result then varies by
+# machine and says nothing about the code. setdefault keeps an explicit override.
+os.environ.setdefault("AGENT8088_CONFIG", str(ROOT / "src" / "agent8088" / "config.txt"))
 
 from agent8088 import engine as E          # noqa: E402
 from agent8088 import providers as P       # noqa: E402
@@ -104,8 +110,12 @@ atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 # =============================================================== 1. LOADING
 section("1. CONFIG, PATHS, AND LOADING")
 ok("engine imports", E is not None)
-ok("tools loaded", len(E.TOOL_NAMES) == 20, f"{len(E.TOOL_NAMES)} tools")
-ok("sub-agents loaded", len(E.SUBAGENT_SPECS) == 4, ", ".join(sorted(E.SUBAGENT_SPECS)))
+# Smoke check for the "0 tools loaded" regression this was written for —
+# a floor, not an exact count, so adding a tool doesn't fail the run.
+ok("tools loaded", len(E.TOOL_NAMES) >= 20, f"{len(E.TOOL_NAMES)} tools")
+ok("sub-agents loaded",
+   {"auditor", "coder", "explore", "general-purpose", "researcher"} <= set(E.SUBAGENT_SPECS),
+   ", ".join(sorted(E.SUBAGENT_SPECS)))
 ok("skills loaded", len(E.SKILL_PACKAGES) == 5, ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
@@ -257,7 +267,8 @@ with with_mode("readonly"):
     E._one_shot_grant = False
 
 req = E.request_escalation("edit", ["/tmp/x"], "file_write", "needs to write")
-ok("escalation request is structured", req.startswith("ESCALATION_REQUEST:edit:file_write:"))
+ok("escalation request is structured",
+   req.startswith("ESCALATION_REQUEST\x1fedit\x1ffile_write\x1f"))
 ok("escalation carries paths and reason", "/tmp/x" in req and "needs to write" in req)
 
 section("4c. PATH ZONES")
@@ -273,25 +284,32 @@ ok("blocked wins over others", E._check_path_zone(TMP / "blocked") == "blocked")
 E.BLOCKED_PATHS, E.NO_PROMPT_PATHS, E.PROMPT_PATHS = prev
 
 # ==================================================== 5. EVERY TOOL: SPECS
-section("5. TOOL INVENTORY — spec integrity for all 20")
+section("5. TOOL INVENTORY — spec integrity")
+# Keep this dict as the single source of truth for the expected inventory:
+# the count assertions below derive from it, so adding a tool means editing
+# one place instead of three hardcoded numbers.
 expected_tools = {
     "execute_shell": "shell", "write_file": "write_text", "read_text": "read_text",
-    "web_search": "http_get", "get_page_title": "http_get", "calculate": "python_eval",
+    "web_search": "search", "get_page_title": "http_get", "calculate": "python_eval",
     "last_output": "last_output", "spawn_subagent": "subagent",
+    "describe_capabilities": "introspect",
+    "present_plan": "plan", "execute_plan": "plan",
     "git_status": "shell", "git_diff": "shell", "git_log": "shell",
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
-    "browse_page": "browser", "web_search_tavily": "http_post",
-    "web_search_exa": "http_post",
+    "browse_page": "browser",
 }
-ok("exactly the expected 20 tools", set(E.TOOL_NAMES) == set(expected_tools),
+ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")
 for name, mode in sorted(expected_tools.items()):
     spec = E.TOOL_SPECS.get(name, {})
     ok(f"{name}: mode={mode}, has description",
        spec.get("mode") == mode and len(spec.get("description", "")) > 5,
        f"args={','.join(spec.get('args') or []) or '-'}")
-ok("every tool appears in TOOLS_DEF", len(E.TOOLS_DEF) == 20)
+# Assert the real invariant (every spec is exposed to the model), not a count.
+_def_names = {d["function"]["name"] for d in E.TOOLS_DEF}
+ok("every tool appears in TOOLS_DEF", _def_names == set(E.TOOL_NAMES),
+   str(_def_names ^ set(E.TOOL_NAMES)) if _def_names != set(E.TOOL_NAMES) else "")
 ok("every tool rendered into prompt",
    all(f"{n}(" in E.SYSTEM_PROMPT for n in E.TOOL_NAMES))
 ok("unknown tool handled", E.run_tool("no_such_tool", {}) == "Unknown tool: no_such_tool")
@@ -325,18 +343,23 @@ with with_mode("readonly"):
     # Shell-mode tools execute INSIDE the sandbox, so git availability depends on
     # the backend. Verify them on a host-capable backend, then record what the
     # container backend can and cannot do.
+    # Run them on whatever backend this machine actually resolves to. The old
+    # form forced SANDBOX_BACKEND="local" and granted local_execution per call;
+    # both are gone — unisolated execution was removed, so "local" now falls
+    # through to auto and the grant applies to nothing.
     _pb = E.SANDBOX_BACKEND
-    E.SANDBOX_BACKEND = "local"
-    with with_mode("edit"):
-        r = E.run_tool("git_status", {})
-        ok("git_status runs after explicit host approval",
-           "##" in r, r.splitlines()[0][:40] if r else "")
-        r = E.run_tool("git_log", {})
-        ok("git_log runs after explicit host approval",
-           len(r.splitlines()) > 3, f"{len(r.splitlines())} lines")
-        r = E.run_tool("git_diff", {})
-        ok("git_diff runs after explicit host approval", isinstance(r, str))
-    E.SANDBOX_BACKEND = _pb
+    if E._resolve_sandbox_backend() == "unavailable":
+        skip("git tools", "no sandbox backend available")
+    else:
+        with with_mode("edit"):
+            r = E.run_tool("git_status", {})
+            ok("git_status returns branch and status",
+               "##" in r, r.splitlines()[0][:40] if r else "")
+            r = E.run_tool("git_log", {})
+            ok("git_log returns commits",
+               len(r.splitlines()) > 3, f"{len(r.splitlines())} lines")
+            r = E.run_tool("git_diff", {})
+            ok("git_diff returns a string", isinstance(r, str))
     if E._resolve_sandbox_backend() == "docker":
         with with_mode("edit"):
             r = E.run_tool("git_status", {})
@@ -477,7 +500,10 @@ ok("network is blocked by default", st["network"] == "blocked", st["network"])
 ok("runtime version pinned", bool(st["runtime_version"]), st["runtime_version"])
 
 prev_backend = E.SANDBOX_BACKEND
-for req, expect_in in [("local", {"local"}), ("native", {"native", "unavailable"}),
+# "local" is no longer a backend: unisolated execution was removed outright, so
+# the name now falls through to auto rather than selecting anything.
+for req, expect_in in [("local", {"native", "docker", "unavailable"}),
+                       ("native", {"native", "unavailable"}),
                        ("docker", {"docker", "unavailable"}),
                        ("auto", {"native", "docker", "unavailable"})]:
     E.SANDBOX_BACKEND = req
@@ -499,7 +525,13 @@ _op = E._exec_process
 E._exec_process = cap.process
 E._exec_docker_command("print(1)", 30, python_code=True)
 E._exec_process = _op
-argv = cap.calls[0]["command"] if cap.calls else []
+# The container run, not merely the first subprocess: image provisioning probes
+# with `docker image inspect` and may `docker pull` before anything runs, so
+# calls[0] was the probe and every flag below read as missing — a hardening
+# regression that was not one.
+_docker_runs = [c["command"] for c in cap.calls
+                if isinstance(c["command"], list) and c["command"][:2] == ["docker", "run"]]
+argv = _docker_runs[0] if _docker_runs else (cap.calls[0]["command"] if cap.calls else [])
 argv_s = " ".join(argv) if isinstance(argv, list) else str(argv)
 for flag, why in [("--rm", "disposable"), ("--network none", "no network"),
                   ("--memory 512m", "memory cap"), ("--cpus 1", "cpu cap"),
@@ -570,6 +602,7 @@ if E._native_sandbox_missing_requirements():
 section("8d. SANDBOX — settings file hardening")
 data = E._sandbox_settings_data()
 ok("network isolation configured", data["network"]["allowLocalBinding"] is False)
+ok("network allowlist is enforced", data["network"]["strictAllowlist"] is True)
 ok("nested sandbox not weakened", data["enableWeakerNestedSandbox"] is False)
 ok("network isolation not weakened", data["enableWeakerNetworkIsolation"] is False)
 ok("apple events denied", data["allowAppleEvents"] is False)
@@ -577,7 +610,13 @@ deny = " ".join(data["filesystem"]["denyRead"])
 for p in (".ssh", ".aws", ".gnupg", ".kube", ".netrc"):
     ok(f"denies read of {p}", p in deny)
 ok("denies read of the active config", str(E.CONFIG_PATH.resolve()) in deny)
-ok("workspace is writable", str(E.PROJECT_ROOT) in data["filesystem"]["allowWrite"])
+# Writes are confined to artifacts/, not the whole checkout — the same rule
+# resolve_write_path applies on the host. Pinning the confinement is worth more
+# than pinning that "the workspace" is writable, which it deliberately is not.
+_allow_write = data["filesystem"]["allowWrite"]
+ok("artifacts dir is writable", str(E.ARTIFACTS_ROOT) in _allow_write)
+ok("project root is not blanket-writable", str(E.PROJECT_ROOT) not in _allow_write,
+   ", ".join(_allow_write))
 sp = E._write_sandbox_settings()
 ok("settings file written", sp.exists())
 if E.sys.platform == "win32":
@@ -597,32 +636,44 @@ if E.sys.platform == "win32":
         if acl_match and "(DENY)" not in acl_match.group(2):
             acl_entries.append(acl_match.group(1).lstrip("*"))
     owner_sid = sid_match.group(1) if sid_match else ""
+    # icacls resolves a granted SID back to an account name, so the listing shows
+    # DOMAIN\user where the grant said *S-1-5-.... Comparing entries to the raw
+    # SID can therefore never match on a machine where the name resolves.
+    owner_names = {owner_sid.lower()}
+    account = os.environ.get("USERNAME", "")
+    domain = os.environ.get("USERDOMAIN", "")
+    if account:
+        owner_names.add(account.lower())
+        if domain:
+            owner_names.add(f"{domain}\\{account}".lower())
     ok("settings file has a protected owner ACL",
        acl_result.returncode == 0 and bool(owner_sid) and bool(acl_entries)
-       and all(principal == owner_sid for principal in acl_entries)
+       and all(principal.lower() in owner_names for principal in acl_entries)
        and "(I)" not in acl_result.stdout,
        acl_result.stdout[:80].replace("\n", " "))
 else:
     ok("settings file is owner-only (0600)", oct(sp.stat().st_mode)[-3:] == "600",
        oct(sp.stat().st_mode)[-3:])
 
-section("8e. SANDBOX — local fallback requires consent")
+section("8e. SANDBOX — no backend means refusal, never an unisolated run")
+# Local execution used to be offered behind a one-shot consent prompt. It was
+# removed: a prompt is only a safeguard if the person answering knows what they
+# are agreeing to, and "run this without isolation?" mid-task is answered yes.
+# What matters now is that the absence of a sandbox refuses rather than degrades.
 E.SANDBOX_BACKEND = "docker"
-_da = E._docker_available
+_da, _nsb = E._docker_available, E._native_sandbox_broken
 E._docker_available = lambda: False
-E._local_fallback_grant = False
-r = E._exec_sandbox_command("echo hi", 5)
-ok("no backend -> escalation request, not silent local run",
-   "ESCALATION_REQUEST" in r and "local_execution" in r, r[:55])
-E.grant_escalation("local_execution")
-r = E._exec_sandbox_command("echo consented_run", 5)
-ok("after consent it runs locally once", "consented_run" in r, r.strip()[:40])
-E._local_fallback_grant = False
-r = E._exec_sandbox_command("echo second_try", 5)
-ok("consent is one-shot (second call re-escalates)", "ESCALATION_REQUEST" in r)
+E._native_sandbox_broken = False
+marker = TMP / "unisolated-run-happened"
+r = E._exec_sandbox_command(f"echo hi > {shlex.quote(str(marker))}", 5)
+ok("no backend -> refused", "Error:" in r and "sandbox is required" in r, r[:55])
+ok("refusal names the way out", "--sandbox-setup" in r or "Docker" in r)
+ok("nothing ran on the host", not marker.exists())
+ok("'local' is not a selectable backend", "local" not in E._SANDBOX_BACKENDS,
+   ", ".join(sorted(E._SANDBOX_BACKENDS)))
 E._docker_available = _da
+E._native_sandbox_broken = _nsb
 E.SANDBOX_BACKEND = prev_backend
-E._local_fallback_grant = False
 
 # ============================================================ 9. PROVIDERS
 section("9. PROVIDERS")
@@ -793,24 +844,26 @@ ok("_safe_format pulls from config", "192.168" in E._safe_format("{search_base_u
    or bool(E._safe_format("{search_base_url}", {})))
 with with_mode("edit"):
     r = E.run_tool("web_search", {})
-    ok("missing arg names itself", "unresolved placeholder" in r and "pass query=" in r, r[:50])
-    ok("no misleading scheme error", "scheme" not in r)
-    r = E.run_tool("web_search_tavily", {"query": "x"})
-    if "not configured" in r:
-        ok("tavily degrades clearly", "tavily_api_key" in r)
-        skip("tavily REAL query", "api key not configured")
-    elif r.startswith("HTTP "):
-        skip("tavily REAL query", r[:80])
+    ok("web_search names a missing query", "query" in r.lower(), r[:50])
+    ok("web_search declares mode=search", E.TOOL_SPECS["web_search"]["mode"] == "search")
+    # Tavily/Exa are backends now, not tools: they must stay OUT of the chain
+    # until a key exists, and the keyless fallback must always be in it.
+    ctx = E._search_context()
+    reg = E.WEB_SEARCH_REGISTRY
+    names = [p.name for p in reg.chain(E._search_config(), ctx)]
+    ok("chain is never empty (ddgs is bundled)", bool(names), str(names))
+    for backend in ("tavily", "exa"):
+        provider = reg.get(backend)
+        has_key = bool(ctx.get_secret(provider.env_var))
+        ok(f"{backend} in chain only with a key",
+           (backend in names) == has_key, f"key={has_key} chain={names}")
+    ok("ddgs importable", E.web_search._ddgs_installed())
+    r = E.run_tool("web_search", {"query": "python release notes"})
+    if "Every configured web search provider failed" in r or "rate limited" in r:
+        skip("web_search REAL query", r.splitlines()[0][:80])
     else:
-        ok("tavily REAL query returns content", bool(r.strip()), r[:45])
-    r = E.run_tool("web_search_exa", {"query": "x"})
-    if "not configured" in r:
-        ok("exa degrades clearly", "exa_api_key" in r)
-        skip("exa REAL query", "api key not configured")
-    elif r.startswith("HTTP "):
-        skip("exa REAL query", r[:80])
-    else:
-        ok("exa REAL query returns content", bool(r.strip()), r[:45])
+        ok("web_search REAL query returns content", bool(r.strip()), r[:45])
+        ok("results are wrapped untrusted", "EXTERNAL_UNTRUSTED_CONTENT" in r, r[:60])
     r = E.run_tool("get_page_title", {"url": "https://example.com"})
     if "Example" in r:
         ok("REAL http_get + title extraction", True, r[:40])
@@ -1012,11 +1065,20 @@ E.create_completion = _orig_cc
 section("18b. PLAN EXECUTOR")
 steps = []
 with with_mode("readonly"):
-    r = E._exec_plan({"steps": '["compute 2+2", "list files"]'},
-                     on_step=lambda *a: steps.append(a[3]))
+    # Structured steps, because free text is now refused rather than guessed into
+    # a tool — driving this with prose measured zero callbacks and read as a
+    # broken callback rather than a changed contract.
+    r = E._exec_plan({"steps": json.dumps([
+        {"tool": "calculate", "arguments": {"expression": "2+2"}},
+        {"tool": "calculate", "arguments": {"expression": "3+3"}},
+    ])}, on_step=lambda *a: steps.append(a[3]))
     ok("plan runs steps and reports", isinstance(r, str) and "[1]" in r, r[:45])
-    ok("plan step callback fires for each step", len(set(steps)) >= 1 and len(steps) >= 2,
+    ok("plan step callback fires for each step", len(steps) >= 2,
        f"{len(steps)} callbacks across {len(set(steps))} tools")
+    prose = E._exec_plan({"steps": json.dumps(["compute 2+2"])})
+    ok("free-text plan step is refused, not guessed into a tool",
+       "names no tool" in prose or "free text" in prose or "not a tool call" in prose,
+       prose[:60])
     ok("plan rejects a non-list", "requires a list" in E._exec_plan({"steps": "{}"})
        or isinstance(E._exec_plan({"steps": "not json"}), str))
     ok("nested plan blocked",

@@ -86,7 +86,20 @@ def test_docker_missing_is_graceful(engine, monkeypatch):
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
     out = engine._exec_docker({"code": "print(1)"})
-    assert "ESCALATION_REQUEST:edit:local_execution:" in out
+    assert "sandbox is required" in out.lower()
+    assert "ESCALATION_REQUEST" not in out
+
+
+def test_sandboxed_code_timeout_is_clamped(engine, monkeypatch):
+    seen = {}
+    engine.MAX_TOOL_TIMEOUT_SECONDS = 90
+    monkeypatch.setattr(
+        engine, "_exec_sandbox_command",
+        lambda _code, **kwargs: seen.update(kwargs) or "ok",
+    )
+
+    assert engine._exec_docker({"code": "print(1)", "timeout": 99_999}) == "ok"
+    assert seen["timeout"] == 90
 
 
 def test_docker_runs_code_isolated(engine, tmp_path, monkeypatch):
@@ -126,7 +139,7 @@ def test_docker_rejects_option_like_image(engine, tmp_path, monkeypatch):
     })
 
 
-def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
+def test_docker_quotes_code_safely(engine, docker_image_present, tmp_path, monkeypatch):
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
@@ -141,7 +154,7 @@ def test_docker_quotes_code_safely(engine, tmp_path, monkeypatch):
     assert seen["cmd"][-3:] == ["python", "-c", code]
 
 
-def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
+def test_docker_masks_workspace_secrets(engine, docker_image_present, tmp_path, monkeypatch):
     secret = tmp_path / ".env"
     secret.write_text("TOKEN=secret")
     skipped_secret = tmp_path / "node_modules" / ".env"
@@ -149,6 +162,7 @@ def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
     skipped_secret.write_text("DEPENDENCY_TOKEN=secret")
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path)
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     seen = {}
@@ -163,11 +177,12 @@ def test_docker_masks_workspace_secrets(engine, tmp_path, monkeypatch):
     assert not any("node_modules/.env" in mount for mount in mounts)
 
 
-def test_docker_refuses_unbounded_sensitive_mounts(engine, tmp_path, monkeypatch):
+def test_docker_refuses_unbounded_sensitive_mounts(engine, docker_image_present, tmp_path, monkeypatch):
     for index in range(129):
         (tmp_path / f".env-{index}").write_text("secret")
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path)
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     monkeypatch.setattr(
@@ -178,10 +193,11 @@ def test_docker_refuses_unbounded_sensitive_mounts(engine, tmp_path, monkeypatch
     assert "too many sensitive" in engine._exec_docker({"code": "print(1)"})
 
 
-def test_windows_docker_mounts_use_container_path_separators(engine, tmp_path, monkeypatch):
+def test_windows_docker_mounts_use_container_path_separators(engine, docker_image_present, tmp_path, monkeypatch):
     project = PureWindowsPath("C:/workspace")
     engine.SANDBOX_BACKEND = "docker"
     monkeypatch.setattr(engine, "PROJECT_ROOT", project)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", project)
     monkeypatch.setattr(engine, "Path", PureWindowsPath)
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-home")
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
@@ -195,7 +211,9 @@ def test_windows_docker_mounts_use_container_path_separators(engine, tmp_path, m
         lambda command, **_: seen.setdefault("command", command) and "done",
     )
 
-    assert engine._exec_docker({"code": "print(1)"}) == "done"
+    assert engine._exec_docker_command(
+        "print(1)", 60, python_code=True, workspace=project
+    ) == "done"
     mounts = [
         seen["command"][index + 1]
         for index, value in enumerate(seen["command"][:-1])
@@ -279,13 +297,16 @@ def test_auto_prefers_native_then_docker(engine, monkeypatch):
 
 
 def test_native_sandbox_writes_private_policy(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path / "artifacts")
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
     path = engine._write_sandbox_settings()
     settings = engine.json.loads(path.read_text())
     assert settings["network"]["allowedDomains"] == []
-    assert str(engine.PROJECT_ROOT) in settings["filesystem"]["allowWrite"]
+    assert settings["network"]["strictAllowlist"] is True
+    assert str(engine.ARTIFACTS_ROOT) in settings["filesystem"]["allowWrite"]
+    assert str(engine.PROJECT_ROOT) not in settings["filesystem"]["allowWrite"]
+    assert str((tmp_path / "sandbox-tmp").resolve()) in settings["filesystem"]["allowWrite"]
     if engine.sys.platform != "win32":
-        assert str(engine.Path("/tmp").resolve()) in settings["filesystem"]["allowWrite"]
         assert path.stat().st_mode & 0o777 == 0o600
 
 
@@ -303,28 +324,68 @@ def test_windows_sandbox_setup_handles_missing_runtime(engine, tmp_path, monkeyp
     assert "CLI could not be located" in engine.install_native_sandbox()
 
 
-def test_approved_local_fallback_runs_once(engine, monkeypatch):
+def test_missing_sandbox_never_falls_back_to_local_execution(engine, monkeypatch):
     engine.SANDBOX_BACKEND = "auto"
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
     monkeypatch.setattr(engine, "_docker_available", lambda: False)
-    monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: "ran locally")
-    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+    ran = []
+    monkeypatch.setattr(engine, "_exec_process", lambda *_, **__: ran.append(1) or "ran locally")
     engine.grant_escalation("local_execution")
-    assert engine._exec_sandbox_command("pwd") == "ran locally"
-    assert "ESCALATION_REQUEST" in engine._exec_sandbox_command("pwd")
+    out = engine._exec_sandbox_command("pwd")
+    assert "sandbox is required" in out.lower()
+    assert "ESCALATION_REQUEST" not in out
+    assert ran == []
+
+
+def test_auditor_absolute_artifact_paths_are_redirected_to_disposable_copy(
+        engine, tmp_path, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "library.py").write_text("print('ok')")
+    engine.ARTIFACTS_ROOT = artifacts
+    engine._sandbox_readonly = True
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    seen = {}
+
+    def fake_native(command, _timeout, cwd, readonly=False):
+        seen.update(command=command, cwd=cwd, readonly=readonly)
+        return "ok"
+
+    monkeypatch.setattr(engine, "_exec_native_sandbox", fake_native)
+
+    result = engine._exec_sandbox_command(f"cd {artifacts} && python library.py")
+
+    assert result == "ok"
+    assert str(artifacts) not in seen["command"]
+    assert seen["cwd"] != artifacts
+    assert seen["readonly"] is True
+
+
+@pytest.mark.parametrize("mode", ["edit", "full-auto"])
+def test_unsandboxed_execution_is_refused_in_every_mode(engine, monkeypatch, mode):
+    engine.SANDBOX_BACKEND = "auto"
+    engine.PERMISSION_MODE = mode
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "ran locally")
+
+    out = engine._exec_sandbox_command("pwd")
+    assert "sandbox is required" in out.lower()
+    assert "ESCALATION_REQUEST" not in out
 
 
 def test_sandbox_backend_setting_persists(engine, tmp_path, monkeypatch):
     config = tmp_path / "config.txt"
     monkeypatch.setattr(engine, "CONFIG_PATH", config)
     monkeypatch.setattr(engine, "APP_CONFIG", {})
-    status = engine.set_sandbox_backend("local")
-    assert status["requested"] == "local"
-    assert "sandbox_backend=local" in config.read_text()
+    with pytest.raises(ValueError, match="auto, native, or docker"):
+        engine.set_sandbox_backend("local")
+    assert not config.exists()
 
 
 def test_browser_missing_is_graceful(engine, monkeypatch):
     monkeypatch.setattr(engine, "_playwright_available", lambda: False)
+    monkeypatch.setattr(engine, "_ssrf_check", lambda _url: None)
     out = engine._exec_browser({"url": "https://example.com"})
     assert "Playwright is not installed" in out
     assert "pip install playwright" in out

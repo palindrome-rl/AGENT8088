@@ -1,9 +1,12 @@
 import os
+import sys
 import time
 from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+
+from tests.conftest import assert_owner_only
 
 
 def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monkeypatch):
@@ -18,7 +21,7 @@ def test_readonly_local_shell_file_read_requires_approval(engine, tmp_path, monk
 
     result = engine.run_tool("execute_shell", {"command": f"cat {fake_secret}"})
 
-    assert "ESCALATION_REQUEST" in result
+    assert "forbidden" in result.lower()
     assert "not-real" not in result
 
 
@@ -33,18 +36,29 @@ def test_resolve_user_path_accepts_path_objects(engine, tmp_path, monkeypatch):
     "git status",
     "git diff",
     "git log -p",
-    "git show HEAD:.env",
 ])
-def test_readonly_local_git_reads_require_approval(engine, monkeypatch, command):
+def test_readonly_git_reads_fail_closed_without_a_sandbox(engine, monkeypatch, command):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
-    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "local")
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+
+    result = engine.run_tool("execute_shell", {"command": command})
+    assert "sandbox is required" in result.lower()
+    assert "ESCALATION_REQUEST" not in result
+
+
+def test_git_read_of_sensitive_file_is_hard_blocked(engine, monkeypatch):
+    """git show/diff targeting a sensitive file (e.g. .env) is hard-blocked
+    at the always-on floor — no escalation possible, denied in ALL modes."""
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(
         engine, "_exec_sandbox_command",
-        lambda *_args, **_kwargs: pytest.fail("unapproved command must not execute"),
+        lambda *_args, **_kwargs: pytest.fail("sensitive git read must not execute"),
     )
-
-    assert "ESCALATION_REQUEST" in engine.run_tool(
-        "execute_shell", {"command": command})
+    result = engine.run_tool("execute_shell", {"command": "git show HEAD:.env"})
+    assert "ESCALATION_REQUEST" not in result
+    assert "forbidden" in result.lower() or "denied" in result.lower() or "safety policy" in result.lower()
 
 
 @pytest.mark.parametrize("command", [
@@ -129,6 +143,10 @@ def test_docker_timeout_forces_named_container_cleanup(engine, tmp_path, monkeyp
     seen = {}
 
     def fake_exec(argv, timeout=25, shell=False):
+        # The image-presence probe runs before the container does; report the
+        # image as local so this stays a test of the timeout cleanup path.
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return "present"
         seen["argv"] = argv
         return f"Command timed out after {timeout}s."
 
@@ -164,6 +182,8 @@ def test_git_clone_terminates_options_and_rejects_remote_helpers(engine, monkeyp
         ]
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="/bin/sh fallback is POSIX-only; Windows uses cmd.exe")
 def test_shell_uses_posix_fallback_when_bash_is_unavailable(engine, tmp_path, monkeypatch):
     seen = {}
 
@@ -378,15 +398,19 @@ def test_local_execution_grant_does_not_leak_to_later_action(engine, monkeypatch
     monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "ran")
     engine.grant_escalation("local_execution")
 
-    assert engine._exec_sandbox_command("echo fake") == "ran"
+    assert "sandbox is required" in engine._exec_sandbox_command("echo fake").lower()
     assert engine._one_shot_grant is False
     assert engine._local_fallback_grant is False
 
 
-def test_missing_http_argument_is_reported_before_ssrf(engine, monkeypatch):
+def test_missing_http_argument_is_reported_before_ssrf(engine, monkeypatch, register_tool):
+    # web_search is mode=search now, so this uses a test-local http tool to keep
+    # exercising _http_placeholder_error ahead of the SSRF guard.
+    register_tool("probe_get", mode="http_get", args="query",
+                  url="http://127.0.0.1:8888/search?q={query_q}")
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SSRF_ALLOW_HOSTS", set())
-    result = engine.run_tool("web_search", {})
+    result = engine.run_tool("probe_get", {})
     assert "unresolved placeholder" in result
     assert "pass query=" in result
 
@@ -401,7 +425,29 @@ def test_model_cache_is_owner_only(tmp_path, monkeypatch):
 
     providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
 
-    assert cache.stat().st_mode & 0o777 == 0o600
+    assert_owner_only(cache)
+
+
+def test_windows_model_cache_uses_private_acl(tmp_path, monkeypatch):
+    from agent8088 import providers
+
+    cache = tmp_path / "models_cache.json"
+    calls = []
+    monkeypatch.setattr(providers, "_CACHE_FILE", cache)
+    monkeypatch.setattr(providers.sys, "platform", "win32")
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        # Resolved absolutely so Git Bash's coreutils whoami cannot shadow it.
+        if command[0].lower().endswith("whoami.exe") or command[0] == "whoami":
+            return SimpleNamespace(returncode=0, stdout='"PC\\\\user","S-1-5-21-1"\r\n')
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+    providers._save_disk_cache({"fake": {"ts": 1, "models": ["m"]}})
+
+    assert calls[0][0].lower().endswith("system32\\whoami.exe")
+    assert any(command[0] == "icacls" for command in calls)
 
 
 def test_windows_private_files_use_current_user_sid(engine, tmp_path, monkeypatch):
@@ -412,7 +458,8 @@ def test_windows_private_files_use_current_user_sid(engine, tmp_path, monkeypatc
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
-        if command[0] == "whoami":
+        # Resolved absolutely so Git Bash's coreutils whoami cannot shadow it.
+        if command[0].lower().endswith("whoami.exe") or command[0] == "whoami":
             return SimpleNamespace(
                 returncode=0,
                 stdout='"FAKE-PC\\\\tester","S-1-5-21-100-200-300-400"\r\n',
@@ -446,7 +493,7 @@ def test_private_file_is_protected_before_content_is_written(
     assert private.read_text(encoding="utf-8") == "private content"
 
 
-def test_edit_mode_runs_shell_without_sandbox_consent(engine, monkeypatch):
+def test_edit_mode_refuses_shell_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -454,11 +501,11 @@ def test_edit_mode_runs_shell_without_sandbox_consent(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine._exec_sandbox_command("echo hi")
-    assert "ESCALATION_REQUEST" not in result
-    assert "ran:echo hi" in result
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
+def test_edit_mode_refuses_sandboxed_code_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -466,11 +513,11 @@ def test_edit_mode_runs_sandboxed_code_without_consent(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda command, **_: f"ran:{command}")
 
     result = engine.run_tool("run_sandboxed", {"code": "print(1)"})
-    assert "ESCALATION_REQUEST" not in result
-    assert "ran:" in result and "print(1)" in result
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")
 
 
-def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
+def test_edit_mode_refuses_sandbox_argv_when_no_sandbox_is_available(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "edit")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -482,11 +529,12 @@ def test_edit_mode_runs_sandbox_argv_without_consent(engine, monkeypatch):
     )
 
     result = engine._exec_sandbox_argv(["git", "status"])
-    assert "ESCALATION_REQUEST" not in result
-    assert seen["argv"] == ["git", "status"]
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")
+    assert seen == {}
 
 
-def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):
+def test_readonly_refuses_when_no_sandbox(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
@@ -494,4 +542,5 @@ def test_readonly_still_escalates_when_no_sandbox(engine, monkeypatch):
     monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: pytest.fail("must not run"))
 
     result = engine._exec_sandbox_command("mkdir x")
-    assert result.startswith("ESCALATION_REQUEST")
+    assert "sandbox is required" in result.lower()
+    assert not result.startswith("ESCALATION_REQUEST")

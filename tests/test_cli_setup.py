@@ -76,7 +76,7 @@ def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys
     fake = _FakeInquirer({
         "text": ["~", ""],
         "secret": [""],
-        "fuzzy": ["openai", "gpt-live"],
+        "fuzzy": ["openai", "gpt-live", "Keep current setting"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setenv("AGENT8088_CONFIG", str(config))
@@ -131,7 +131,7 @@ def test_setup_fetch_failure_asks_for_model_without_fallback_choices(tmp_path, m
     fake = _FakeInquirer({
         "text": ["~", "typed-model", ""],
         "secret": [""],
-        "fuzzy": ["openai"],
+        "fuzzy": ["openai", "None (disable web search)"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setenv("AGENT8088_CONFIG", str(config))
@@ -143,7 +143,8 @@ def test_setup_fetch_failure_asks_for_model_without_fallback_choices(tmp_path, m
 
     cli._run_setup()
 
-    fuzzy_calls = [kwargs for kind, kwargs in fake.calls if kind == "fuzzy"]
+    fuzzy_calls = [kwargs for kind, kwargs in fake.calls if kind == "fuzzy"
+                   and not str(kwargs.get("message", "")).startswith("Web search")]
     assert len(fuzzy_calls) == 1
     model_prompts = [
         kwargs for kind, kwargs in fake.calls
@@ -157,9 +158,12 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     config = tmp_path / "config.txt"
     config.write_text("allowed_paths=~\ndefault_provider=ollama\n", encoding="utf-8")
     fake = _FakeInquirer({
-        "text": ["~", "localai", "https://llm.example.test/v1/chat/completions", "custom-model", ""],
+        "text": [
+            "~", "invalid/name", "My Local AI", "",
+            "https://llm.example.test/v1/chat/completions", "", "custom-model", "",
+        ],
         "secret": ["secret-key"],
-        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE],
+        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE, "None (disable web search)"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setenv("AGENT8088_CONFIG", str(config))
@@ -168,16 +172,55 @@ def test_setup_custom_openai_compatible_provider(tmp_path, monkeypatch):
     cli._run_setup()
 
     saved = config.read_text(encoding="utf-8")
-    assert "default_provider=localai" in saved
-    assert "provider.localai.api_mode=openai" in saved
-    assert "provider.localai.base_url=https://llm.example.test/v1" in saved
-    assert "provider.localai.model=custom-model" in saved
-    assert "provider.localai.api_key=secret-key" in saved
+    assert "default_provider=my-local-ai" in saved
+    assert "provider.my-local-ai.api_mode=openai" in saved
+    assert "provider.my-local-ai.base_url=https://llm.example.test/v1" in saved
+    assert "provider.my-local-ai.model=custom-model" in saved
+    assert "provider.my-local-ai.api_key_env=MY_LOCAL_AI_API_KEY" in saved
+    env_file = config.parent / ".env"
+    if env_file.exists():
+        env_content = env_file.read_text(encoding="utf-8")
+        assert "MY_LOCAL_AI_API_KEY=secret-key" in env_content
     custom_prompts = [
         kwargs for kind, kwargs in fake.calls
         if kind == "text" and kwargs["message"] in {"Custom provider name:", "OpenAI-compatible URL:"}
     ]
     assert all("default" not in kwargs and "instruction" not in kwargs for kwargs in custom_prompts)
+    assert len([call for call in custom_prompts if call["message"] == "Custom provider name:"]) == 2
+    assert len([call for call in custom_prompts if call["message"] == "OpenAI-compatible URL:"]) == 2
+
+
+def test_model_setup_custom_provider_stays_in_wizard(tmp_path, monkeypatch):
+    config = tmp_path / "config.txt"
+    config.write_text("allowed_paths=~\ndefault_provider=ollama\n", encoding="utf-8")
+    fake = _FakeInquirer({
+        "text": ["My REPL Provider", "https://llm.example.test/v1", "repl-model"],
+        "secret": ["repl-key"],
+        "fuzzy": [cli.CUSTOM_PROVIDER_CHOICE, "None (disable web search)"],
+    })
+    _install_fake_inquirer(monkeypatch, fake)
+    monkeypatch.setattr(cli.A, "CONFIG_PATH", config)
+    monkeypatch.setattr(providers, "list_models", lambda *_args, **_kwargs: [])
+    activated = {}
+    monkeypatch.setattr(
+        cli,
+        "_reload_model_runtime",
+        lambda path, provider, model: activated.update(
+            path=path, provider=provider, model=model
+        ),
+    )
+    monkeypatch.setattr(cli, "banner", lambda: None)
+
+    cli.cmd_model("setup")
+
+    saved = config.read_text(encoding="utf-8")
+    assert "default_provider=my-repl-provider" in saved
+    assert "provider.my-repl-provider.model=repl-model" in saved
+    assert activated == {
+        "path": config,
+        "provider": "my-repl-provider",
+        "model": "repl-model",
+    }
 
 
 def test_model_setup_works_without_inquirerpy(tmp_path, monkeypatch):
@@ -198,14 +241,18 @@ def test_model_setup_works_without_inquirerpy(tmp_path, monkeypatch):
     saved = config.read_text(encoding="utf-8")
     assert "default_provider=ollama-cloud" in saved
     assert "provider.ollama-cloud.model=glm-5.2:cloud" in saved
-    assert "provider.ollama-cloud.api_key=cloud-key" in saved
+    assert "provider.ollama-cloud.api_key_env=OLLAMA_CLOUD_API_KEY" in saved
+    env_file = config.parent / ".env"
+    if env_file.exists():
+        env_content = env_file.read_text(encoding="utf-8")
+        assert "OLLAMA_CLOUD_API_KEY=cloud-key" in env_content
 
 
 def test_models_command_picks_and_switches_model(monkeypatch):
     fake = _FakeInquirer({
         "text": [],
         "secret": [],
-        "fuzzy": ["openai", "gpt-new"],
+        "fuzzy": ["openai", "gpt-new", "None (disable web search)"],
     })
     _install_fake_inquirer(monkeypatch, fake)
     monkeypatch.setattr(cli.A, "PROVIDERS", {"openai": {"model": "gpt-old", "base_url": "https://api.openai.com/v1"}})

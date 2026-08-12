@@ -29,7 +29,7 @@ unlimited model providers · 7 new security guardrails.
 | 19 | Image understanding | `/image` |
 | 20 | Skill marketplace | `skills_installed/`, `/skills` |
 | 21 | Test + verification suites | `pytest`, `scripts/verify_features.py` |
-| 22 | Web search overhaul (jq filters, Tavily/Exa, SSRF allowlist) | `web_search`, `web_search_tavily`, `web_search_exa` |
+| 22 | Web search overhaul (jq filters, Tavily/Exa, SSRF allowlist) | `web_search` (backends: searxng, tavily, exa, ddgs) |
 | 23 | Classic AGENT8088 UI | `agent8088` |
 | 24 | Responsive terminal branding | automatic at narrow widths |
 | 25 | Live slash-command suggestions | type `/`, then type or use `Tab` |
@@ -86,6 +86,7 @@ more tools are not required to add more sub-agents.
 | `explore` | 5 (read-only) | 6 | Searching/reading — **cannot write files** |
 | `coder` | 4 | 10 | Write code, then verify it runs |
 | `researcher` | 4 | 8 | Web research with citations |
+| `auditor` | 3 (readonly-pinned) | 6 | Verify a completed step against the environment |
 
 ```bash
 /agents        # list profiles with their tools, turn budgets, descriptions
@@ -329,13 +330,14 @@ that `curl | grep` cannot. SSRF-guarded.
 /tool browse_page url=https://example.com selector=h1
 ```
 
-Setup (optional):
+The Playwright Python package is installed with Agent8088. Install its Chromium
+browser once after setup:
 
 ```bash
-pip install playwright && playwright install chromium
+playwright install chromium
 ```
 
-`get_page_title` is kept as a curl-based fallback for when Playwright isn't installed.
+`get_page_title` remains available when the Chromium browser is not installed.
 
 ## 18. Multi-provider LLM
 
@@ -433,17 +435,17 @@ Available modes for package tools: `shell`, `http_get`, `read_text`, `write_text
 
 ## 21. Test + verification suites
 
-**84 unit tests** (hermetic — no model backend, no network):
+**627 unit tests** (hermetic — no model backend, no network):
 
 ```bash
-AGENT8088_CONFIG=/nonexistent python -m pytest tests/ -q
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
 ```
 
-**92 functional checks** against real dependencies (real git, real browser, real
+**89 functional checks** against real dependencies (real git, real browser, real
 containers). Reports `⊘ SKIP` with a reason rather than silently passing:
 
 ```bash
-python scripts/verify_features.py
+uv run python scripts/verify_features.py
 ```
 
 Full testing guide, including manual CLI checks and guardrail prompts to try by hand:
@@ -463,8 +465,8 @@ a large slice of the context window — costly for a small local model.
 
 ```bash
 /tool web_search "python 3.13 release notes"       # SearXNG (default, free, private)
-/tool web_search_tavily query="python 3.13 release notes"   # agent-optimized
-/tool web_search_exa query="papers on agent harness design" # semantic/neural
+/tool web_search query="python 3.13 release notes"          # routes to the active backend
+/search use exa                                             # pin a specific backend
 ```
 
 Add a key to `config.txt` to enable one (both are optional; without a key the tool
@@ -617,7 +619,8 @@ agent8088 --model-setup
 /usage [off|tokens|full]  Control post-turn usage summaries
 /tools                    List every tool with args, mode, description
 /tool <name> <args>       Invoke one tool directly (JSON or key=value)
-/plan <steps>             Run the plan-executor
+/plan [task]              Enter plan mode: propose, approve, then run
+/audit [on|off]           Show or change step verification
 /raw <text>               One raw model call (content, reasoning, tool_calls)
 /config                   Active configuration
 /doctor                   Check endpoint reachability and local capability state
@@ -654,8 +657,7 @@ agent8088                                   # Rich CLI (all features)
 | `read_text` | read_text | filename |
 | `write_file` | write_text | filename, content |
 | `web_search` | http_get | query |
-| `web_search_tavily` | http_post | query |
-| `web_search_exa` | http_post | query |
+
 | `get_page_title` | shell | url |
 | `calculate` | python_eval | expression |
 | `last_output` | last_output | — |
