@@ -4817,6 +4817,22 @@ MEMORY_DB_PATH = Path(APP_CONFIG.get(
     "memory_db_path", str(_agent_data_dir() / "memory.db"))).expanduser()
 MEMORY_EXTRACT_MODEL = APP_CONFIG.get("memory_extract_model", "").strip()
 
+# Embeddings resolve independently of whatever serves chat. Chat models and
+# embedding models are separate services in almost every real setup -- a 35B chat
+# model on a LAN box, embeddings from local Ollama -- so deriving the embeddings
+# endpoint from default_provider was wrong by construction: it paired the default
+# embed model (nomic-embed-text, an Ollama model, and the one both installers
+# pull) with whichever host happened to serve chat. A chat provider that does not
+# serve /embeddings, or serves it without that model, then reported the model as
+# unavailable and advised pulling it -- advice that could not help, because the
+# request was never going to Ollama.
+#
+# So the default is `ollama`, where the model actually lives. It is always
+# resolvable because PROVIDERS includes the built-ins. Point
+# memory_embed_provider at anything else to serve embeddings from there instead.
+MEMORY_EMBED_PROVIDER = (APP_CONFIG.get("memory_embed_provider", "").strip()
+                         or "ollama")
+
 
 def _memory_extract_completion(prompt: str):
     """One model call for fact extraction. Returns (text, usage).
@@ -4853,8 +4869,8 @@ def configure_memory() -> None:
     try:
         memory.configure(
             config=APP_CONFIG,
-            client_factory=lambda: get_client(
-                APP_CONFIG.get("memory_embed_provider", "").strip() or None)[0],
+            client_factory=lambda: get_client(MEMORY_EMBED_PROVIDER)[0],
+            embed_provider=MEMORY_EMBED_PROVIDER,
             completion=_memory_extract_completion,
             redact=_redact_secrets,
             db_path=MEMORY_DB_PATH,
@@ -4941,10 +4957,15 @@ def _memory_summary() -> str:
     if not memory.enabled():
         return "off (enable with /memory on)"
     report = memory.status()
+    where = report.get("embed_provider") or "the active provider"
     if report.get("embedder_ok"):
-        retrieval = f"hybrid keyword+semantic via {report['embed_model']}"
+        retrieval = f"hybrid keyword+semantic via {report['embed_model']} on {where}"
     else:
-        retrieval = f"keyword only — {report['embed_model']} unavailable"
+        # Naming the endpoint matters: the failure is usually that the request
+        # went somewhere that does not serve this model, and "pull the model" is
+        # useless advice when the host asked was never the one holding it.
+        retrieval = (f"keyword only — {report['embed_model']} unavailable "
+                     f"on {where}")
     capture = "recall+capture" if report.get("capture_enabled") else "recall only"
     return f"on — {report['count']} memories, {capture}, {retrieval}"
 

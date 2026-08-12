@@ -56,7 +56,7 @@ _LAST_CAPTURE = {}
 
 
 def configure(*, config=None, client_factory=None, completion=None, redact=None,
-              db_path=None, project=None, user_id=None):
+              db_path=None, project=None, user_id=None, embed_provider=""):
     """Wire the package to its host. Idempotent and safe to call again after a
     config reload; the store and embedder are rebuilt only when their inputs
     change, so a reload does not drop a warm connection for nothing."""
@@ -90,6 +90,11 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             user_id=user_id or str(config.get("memory_user_id") or "owner").strip(),
             scope_by_identity=_flag("memory_scope_by_identity"),
             embed_model=embed_model,
+            # Recorded for reporting only. The caller has already resolved which
+            # endpoint client_factory reaches; naming it is what lets /memory say
+            # *where* an embeddings request went, instead of advising a fix for a
+            # host that was never asked.
+            embed_provider=str(embed_provider or ""),
             extract_model=str(config.get("memory_extract_model") or "").strip(),
             recall_limit=max(1, _number("memory_recall_limit", 5)),
             rrf_k=max(1, _number("memory_rrf_k", 60)),
@@ -329,6 +334,7 @@ def status() -> dict:
         "db_path": str(_RUNTIME.get("db_path") or ""),
         "user_id": user_id(),
         "embed_model": _RUNTIME.get("embed_model", ""),
+        "embed_provider": _RUNTIME.get("embed_provider", ""),
         "extract_model": _RUNTIME.get("extract_model") or "(chat model)",
         "capture_enabled": bool(_RUNTIME.get("capture_enabled")),
         "recall_limit": _RUNTIME.get("recall_limit", 5),

@@ -2931,14 +2931,16 @@ def _show_memory_status():
     table.add_row("Memories", str(report["count"]))
     table.add_row("Scope", report["user_id"]
                   + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
+    where = report.get("embed_provider") or "active provider"
     if report["embedder_ok"]:
-        retrieval = f"keyword + semantic ({report['embed_model']})"
+        retrieval = f"keyword + semantic ({report['embed_model']} on {where})"
     else:
-        # Naming the reason matters: recall still works on keywords alone, and a
-        # user who thinks memory is broken will turn it off instead of pulling the
-        # model.
+        # Naming both the reason and the endpoint: recall still works on keywords
+        # alone, so a user who thinks memory is broken will switch it off instead
+        # of fixing it -- and the fix depends on *which* host was asked, since
+        # "pull the model" cannot help a host that never had the request.
         reason = report["embedder_error"] or "not reachable"
-        retrieval = f"keyword only — {report['embed_model']}: {reason}"
+        retrieval = f"keyword only — {report['embed_model']} on {where}: {reason}"
     table.add_row("Retrieval", retrieval)
     table.add_row("Learning", "on" if report["capture_enabled"] else "off (recall only)")
     table.add_row("Extractor", report["extract_model"])
@@ -2987,6 +2989,32 @@ def _show_memory_search(query):
     console.print("[dim]Words/Meaning are each leg's rank; the score fuses them (RRF)[/dim]")
 
 
+def _report_embedder_unavailable(report):
+    """Explain a failed embeddings probe in terms of the host that was asked.
+
+    The first version of this said "pull it with: ollama pull <model>" regardless
+    of where the request went. When embeddings resolve to something other than
+    Ollama, that advice cannot work -- the model was never going to be asked for
+    from the machine you pulled it onto -- and it reads like a command to type at
+    this prompt, which sends it to the model as a chat message instead.
+    """
+    where = report.get("embed_provider") or "your active provider"
+    console.print(f"[yellow]note:[/yellow] {where} could not serve embeddings for "
+                  f"[bold]{report['embed_model']}[/bold], so recall is keyword-only.")
+    if report.get("embedder_error"):
+        console.print(f"[dim]  {report['embedder_error']}[/dim]")
+    if where == "ollama":
+        console.print("[dim]  Fix it in a terminal (not at this prompt):[/dim]")
+        console.print(f"[dim]      ollama pull {report['embed_model']}[/dim]")
+    else:
+        # The common real setup: chat served by one host, embeddings by another.
+        console.print(f"[dim]  Embeddings are asked of [bold]{where}[/bold]. If your "
+                      "embedding model lives elsewhere, name that provider:[/dim]")
+        console.print("[dim]      memory_embed_provider=ollama    "
+                      f"(in {A.CONFIG_PATH})[/dim]")
+        console.print(f"[dim]  or set memory_embed_model to one {where} serves.[/dim]")
+
+
 def cmd_memory(rest):
     """Show or change persistent memory. Changes persist to config.txt."""
     parts = rest.strip().split(None, 1)
@@ -3008,10 +3036,7 @@ def cmd_memory(rest):
         console.print("[green]memory on[/green] "
                       f"[dim]— {report['count']} memories at {report['db_path']}[/dim]")
         if not report["embedder_ok"]:
-            console.print(f"[yellow]note:[/yellow] embedding model "
-                          f"{report['embed_model']} is not available, so recall is "
-                          f"keyword-only.")
-            console.print(f"[dim]pull it with:  ollama pull {report['embed_model']}[/dim]")
+            _report_embedder_unavailable(report)
         return
 
     if not A.memory.enabled():
@@ -3659,20 +3684,22 @@ def _backfill_memory_key(content, set_line):
     print("  One extra model call per turn, made after each answer. /memory off "
           "to disable.")
     if _embedding_model_present():
-        print(f"  Semantic recall: on ({DEFAULT_EMBED_MODEL} installed).")
+        print(f"  Semantic recall: on ({DEFAULT_EMBED_MODEL} in local Ollama).")
     else:
         # Recall still works on keywords alone. Saying so is the difference between
         # a user fixing it with one command and concluding memory is broken.
-        print(f"  Semantic recall: off — {DEFAULT_EMBED_MODEL} is not installed, so "
-              "recall uses")
-        print(f"  keyword search only. Enable it with:  ollama pull "
-              f"{DEFAULT_EMBED_MODEL}")
+        print(f"  Semantic recall: off — {DEFAULT_EMBED_MODEL} is not in local "
+              "Ollama, so recall")
+        print("  uses keyword search only. In a terminal:  "
+              f"ollama pull {DEFAULT_EMBED_MODEL}")
+        print("  Embeddings are asked of Ollama regardless of which provider serves")
+        print("  chat; set memory_embed_provider to serve them from somewhere else.")
     return content
 
 
 def _embedding_model_present() -> bool:
-    """Whether the embedding model is pulled. False for any doubt, including no
-    Ollama at all — a cloud provider serves /embeddings itself, and claiming a
+    """Whether the embedding model is pulled into local Ollama. False for any
+    doubt, including no Ollama at all — and claiming a
     local model is installed when it is not is the failure this reporting exists
     to prevent."""
     import subprocess
