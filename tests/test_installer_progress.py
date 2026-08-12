@@ -24,6 +24,7 @@ import re
 import runpy
 import subprocess
 import sys
+import threading
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -362,6 +363,99 @@ def test_response_footer_reserves_the_last_terminal_row(
     assert "\x1b[r" in rendered
 
 
+def test_response_footer_does_not_race_unchanged_live_updates(
+        tmp_path, monkeypatch):
+    """Rich owns a refresh thread; an unchanged footer must not keep moving the
+    same cursor after every streamed token. That race clipped line prefixes and
+    assembled the footer from fragments in Windows Terminal."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+    from rich.console import Console
+
+    output = StringIO()
+    output.isatty = lambda: True
+    monkeypatch.setattr(
+        cli, "console",
+        Console(file=output, width=100, height=30, force_terminal=True),
+    )
+
+    footer = cli._PersistentStatusBar()
+    footer.start("working")
+    first = output.getvalue()
+    for _ in range(100):
+        footer.refresh("working")
+
+    assert output.getvalue() == first
+
+
+def test_response_footer_serializes_cursor_controls_with_rich(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+
+    state = threading.local()
+    writes = []
+
+    class TrackingLock:
+        def __enter__(self):
+            state.held = True
+
+        def __exit__(self, *_args):
+            state.held = False
+
+    class Stream:
+        @staticmethod
+        def isatty():
+            return True
+
+        @staticmethod
+        def flush():
+            assert state.held
+
+        @staticmethod
+        def write(value):
+            assert state.held, "footer cursor controls raced Rich Live"
+            writes.append(value)
+
+    fake_console = SimpleNamespace(
+        file=Stream(), is_terminal=True, width=80, height=20,
+        _lock=TrackingLock(),
+    )
+    monkeypatch.setattr(cli, "console", fake_console)
+
+    footer = cli._PersistentStatusBar()
+    footer.start("working")
+    footer.stop()
+
+    assert writes
+
+
+def test_response_footer_resize_clears_its_former_row(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+    from rich.console import Console
+
+    output = StringIO()
+    output.isatty = lambda: True
+    terminal = Console(file=output, width=80, height=10, force_terminal=True)
+    monkeypatch.setattr(cli, "console", terminal)
+    footer = cli._PersistentStatusBar()
+    footer.start("working")
+    output.seek(0)
+    output.truncate(0)
+
+    terminal._height = 12
+    footer.refresh("working")
+
+    rendered = output.getvalue()
+    assert "\x1b[10;1H\x1b[2K" in rendered
+    assert "\x1b[1;11r" in rendered
+    assert "\x1b[12;1H" in rendered
+
+
 def test_live_response_updates_keep_the_footer_current(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
     monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
@@ -376,6 +470,78 @@ def test_live_response_updates_keep_the_footer_current(tmp_path, monkeypatch):
 
     assert updates == [("partial response", {"refresh": True})]
     assert refreshes == ["working"]
+
+
+@pytest.mark.parametrize(("width", "height"), [(60, 16), (100, 30), (190, 50)])
+def test_real_conpty_keeps_complete_text_above_the_footer(tmp_path, width, height):
+    """Exercise the real Prompt Toolkit -> Rich Live -> plan prompt sequence.
+
+    This is optional in the ordinary suite because pywinpty/pyte are test-only;
+    the release check runs it explicitly with those transient packages.
+    """
+    winpty = pytest.importorskip("winpty")
+    pyte = pytest.importorskip("pyte")
+    config = tmp_path / "config.txt"
+    config.write_text(f"allowed_paths={tmp_path}\n", encoding="utf-8")
+    child = """
+import time
+from rich.live import Live
+from rich.panel import Panel
+from agent8088 import cli
+
+answer = cli._read_line()
+cli._response_footer.start("working")
+with Live(console=cli.console, refresh_per_second=40, transient=True) as raw:
+    live = cli._LiveWithFooter(raw, cli._response_footer)
+    for index in range(4):
+        cli.console.print(f"Backend Role Ready row-{index:02d}")
+        live.update(Panel(f"response-{index:02d} complete text", title="Agent8088"), refresh=True)
+        time.sleep(0.01)
+    live.stop()
+    cli.console.print(Panel("1 Write library.py\\n2 Verify the script", title="Plan"))
+    choice = cli.console.input("[yellow]Approve plan?[/yellow] ")
+    live.start()
+    for index in range(4, 8):
+        cli.console.print(f"Verify complete line-{index:02d}")
+        live.update(Panel(f"working-{index:02d}", title="Agent8088"), refresh=True)
+        time.sleep(0.01)
+cli.console.print(f"FINAL ANSWER {answer} {choice}")
+cli._response_footer.refresh("ready")
+cli._response_footer.stop()
+"""
+    env = dict(__import__("os").environ)
+    env["AGENT8088_CONFIG"] = str(config)
+    env["AGENT8088_HOME"] = str(tmp_path)
+    process = winpty.PtyProcess.spawn(
+        [sys.executable, "-c", child], dimensions=(height, width), env=env,
+        cwd=str(INSTALLER.parent),
+    )
+    process.write("hi\r")
+    screen = pyte.Screen(width, height)
+    stream = pyte.Stream(screen)
+    raw_output = []
+    approved = False
+    while True:
+        try:
+            chunk = process.read(4096)
+        except EOFError:
+            break
+        if not chunk:
+            break
+        raw_output.append(chunk)
+        stream.feed(chunk)
+        if not approved and "Approve plan?" in "".join(raw_output):
+            process.write("a\r")
+            approved = True
+
+    visible = "\n".join(screen.display)
+    assert approved
+    assert "FINAL ANSWER hi a" in visible
+    assert "Verify complete line-07" in visible
+    assert screen.display[-1].lstrip().startswith("◆ 8088")
+    for line in screen.display:
+        if "complete line-" in line:
+            assert line.lstrip().startswith("Verify complete line-")
 
 
 def test_setup_model_discovery_has_a_short_timeout_and_no_retries(
@@ -471,6 +637,103 @@ def test_status_reports_docker_after_native_preflight_failure(
     monkeypatch.setattr(engine, "_native_sandbox_broken", True)
 
     assert engine.sandbox_status()["resolved"] == "docker"
+
+
+def test_windows_docker_probe_prefers_the_executable_over_the_unix_shim(
+        tmp_path, monkeypatch):
+    """Python 3.12.0 can return Docker Desktop's extensionless shell script.
+    CreateProcess rejects it with WinError 193 even while Docker is running."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    unix_shim = r"C:\Program Files\Docker\Docker\resources\bin\docker"
+    windows_exe = unix_shim + ".exe"
+    seen = []
+
+    def which(name):
+        return {"docker": unix_shim, "docker.exe": windows_exe}.get(name)
+
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setattr(engine.shutil, "which", which)
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda argv, **_kwargs: seen.append(argv) or SimpleNamespace(returncode=0),
+    )
+
+    assert engine._docker_available() is True
+    assert seen == [[windows_exe, "info"]]
+
+
+def test_configured_working_directory_is_used_outside_the_launch_directory(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    launch = tmp_path / "launch"
+    workspace = tmp_path / "workspace"
+    launch.mkdir()
+    workspace.mkdir()
+
+    assert engine._configured_project_root(
+        {"allowed_paths": str(workspace)}, launch
+    ) == workspace.resolve()
+
+
+def test_an_allowed_launch_subdirectory_remains_the_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    workspace = tmp_path / "workspace"
+    launch = workspace / "package"
+    launch.mkdir(parents=True)
+
+    assert engine._configured_project_root(
+        {"allowed_paths": str(workspace)}, launch
+    ) == launch.resolve()
+
+
+def test_installers_persist_the_selected_workspace_as_project_root():
+    windows = INSTALLER.read_text(encoding="utf-8")
+    unix = (INSTALLER.parent / "install.sh").read_text(encoding="utf-8")
+
+    assert '"project_root=$projectRoot"' in windows
+    assert 'echo "project_root=$project_root"' in unix
+
+
+def test_cli_setup_persists_the_selected_workspace_as_project_root(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli, providers
+
+    config = tmp_path / "config.txt"
+    config.write_text(
+        "allowed_paths=.\ndefault_provider=ollama\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    choices = iter(["ollama", "test-model", "None (disable web search)"])
+    saved = {}
+
+    monkeypatch.setattr(cli, "_prompt_workspace_paths", lambda _current: str(workspace))
+    monkeypatch.setattr(cli, "_choice_prompt", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr(cli, "_custom_prompt", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(cli, "_backfill_memory_key", lambda content, _set_line: content)
+    monkeypatch.setattr(providers, "list_models", lambda *_args, **_kwargs: ["test-model"])
+    monkeypatch.setattr(
+        cli, "_write_private_text",
+        lambda path, content: saved.update(path=path, content=content),
+    )
+
+    cli._run_setup(config_path=config)
+
+    assert saved["path"] == config
+    assert f"allowed_paths={workspace}" in saved["content"]
+    assert f"project_root={workspace}" in saved["content"]
 
 
 def test_installer_keeps_the_documented_docker_fallback():

@@ -255,7 +255,41 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
-PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
+def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
+    """Choose the workspace setup named, even when launched somewhere else.
+
+    Older installers stored the answer to "Working directory" only as
+    ``allowed_paths``.  PROJECT_ROOT still defaulted to the process CWD, so
+    launching ``agent8088`` from another directory routed new files there and
+    then rejected them against the configured allowlist.  Keep an allowed launch
+    directory when there is one; otherwise the first existing configured path is
+    the workspace those installers meant.
+    """
+    launch = Path(cwd or os.getcwd()).expanduser().resolve()
+    explicit = str(config.get("project_root", "")).strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        return (path if path.is_absolute() else launch / path).resolve()
+
+    candidates = []
+    for raw in str(config.get("allowed_paths", "")).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        candidate = (path if path.is_absolute() else launch / path).resolve()
+        try:
+            if not candidate.is_dir():
+                continue
+        except OSError:
+            continue
+        if launch == candidate or candidate in launch.parents:
+            return launch
+        candidates.append(candidate)
+    return candidates[0] if candidates else launch
+
+
+PROJECT_ROOT = _configured_project_root(APP_CONFIG)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -271,7 +305,7 @@ SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/searc
 SEARCH_BASE_URL_CONFIGURED = bool(str(APP_CONFIG.get("search_base_url", "")).strip())
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
-SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
+SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
 BANNER_FILE = Path(APP_CONFIG.get("banner_file", str(APP_DIR / "banner.txt"))).expanduser()
 SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).expanduser()
 
@@ -3190,6 +3224,22 @@ _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
 _native_sandbox_broken = False
 
 
+def _which_executable(name: str) -> str | None:
+    """Resolve a runnable Windows launcher, not an extensionless Unix shim.
+
+    Python 3.12.0's ``shutil.which('docker')`` may return Docker Desktop's
+    neighbouring ``docker`` shell script before ``docker.exe``.  Passing that
+    path to CreateProcess fails with WinError 193 and made a running Docker
+    daemon look unavailable.  Explicit PATHEXT spellings avoid that ambiguity.
+    """
+    if sys.platform == "win32" and not PureWindowsPath(name).suffix:
+        for suffix in (".exe", ".cmd", ".bat", ".com"):
+            executable = shutil.which(name + suffix)
+            if executable:
+                return executable
+    return shutil.which(name)
+
+
 def _agent_data_dir() -> Path:
     if os.environ.get("AGENT8088_HOME"):
         return Path(os.environ["AGENT8088_HOME"]).expanduser()
@@ -3204,10 +3254,10 @@ def _native_sandbox_argv():
         return shlex.split(override, posix=sys.platform != "win32")
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
-    node = shutil.which("node")
+    node = _which_executable("node")
     if node and cli.exists():
         return [node, str(cli)]
-    executable = shutil.which("srt")
+    executable = _which_executable("srt")
     return [executable] if executable else None
 
 
@@ -3224,7 +3274,7 @@ def _native_sandbox_missing_requirements() -> list:
 
 
 def _docker_available() -> bool:
-    docker = shutil.which("docker")
+    docker = _which_executable("docker")
     if not docker:
         return False
     try:
@@ -3601,8 +3651,8 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
 
 
 def install_native_sandbox() -> str:
-    node = shutil.which("node")
-    npm = shutil.which("npm")
+    node = _which_executable("node")
+    npm = _which_executable("npm")
     if not node or not npm:
         return "Node.js 20.11 or newer is required to install the native sandbox runtime."
     try:
@@ -3783,7 +3833,7 @@ def _windows_task_script(identifier: str, task: str) -> Path:
     script = scripts / f"{identifier}.ps1"
     prompt = base64.b64encode(task.encode("utf-8")).decode("ascii")
     cwd = str(SHELL_CWD).replace("'", "''")
-    agent = str(shutil.which("agent8088") or "agent8088").replace("'", "''")
+    agent = str(_which_executable("agent8088") or "agent8088").replace("'", "''")
     content = (
         "$ErrorActionPreference = 'Stop'\n"
         f"Set-Location -LiteralPath '{cwd}'\n"

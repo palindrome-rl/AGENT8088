@@ -3578,6 +3578,7 @@ class _PersistentStatusBar:
     def __init__(self):
         self.active = False
         self.rows = 0
+        self.columns = 0
         self.state = "working"
 
     def _stream(self):
@@ -3587,8 +3588,11 @@ class _PersistentStatusBar:
             return None
         return stream
 
-    def _render(self):
-        remaining = max(1, console.width)
+    def _render(self, columns):
+        # Leave the final cell untouched. Some ConPTY builds wrap immediately
+        # when it is filled, which scrolls the protected row and leaves fragments
+        # of the footer in the response above it.
+        remaining = max(1, columns - 1)
         parts = []
         for style, value in _status_bar_fragments(self.state):
             if remaining <= 0:
@@ -3608,26 +3612,46 @@ class _PersistentStatusBar:
         stream = self._stream()
         if not self.active or stream is None:
             return
-        self.state = state
         rows = max(3, console.height)
-        margins = ""
-        if rows != self.rows:
-            margins = f"\x1b[r\x1b[1;{rows - 1}r"
-            self.rows = rows
-        stream.write(
-            f"\x1b7{margins}\x1b[{rows};1H\x1b[2K{self._render()}\x1b8"
+        columns = max(2, console.width)
+        if rows == self.rows and columns == self.columns and state == self.state:
+            return
+
+        old_rows = self.rows
+        self.state = state
+        self.rows = rows
+        self.columns = columns
+        resized = old_rows and old_rows != rows
+        reset = ""
+        if old_rows != rows:
+            # Reset before moving to the old row: its former margin may no longer
+            # be valid after a resize. Clear the old footer so it cannot remain in
+            # the middle of a taller viewport.
+            old_clear = f"\x1b[{min(old_rows, rows)};1H\x1b[2K" if resized else ""
+            reset = f"\x1b[r{old_clear}\x1b[1;{rows - 1}r"
+        output = (
+            f"\x1b7{reset}\x1b[{rows};1H\x1b[2K{self._render(columns)}\x1b8"
         )
-        stream.flush()
+        # Rich Live refreshes on its own thread. Writing cursor controls outside
+        # the Console lock lets the two renderers move the same cursor at once,
+        # which clipped line prefixes and assembled the footer from fragments.
+        lock = getattr(console, "_lock", nullcontext())
+        with lock:
+            stream.write(output)
+            stream.flush()
 
     def stop(self):
         stream = self._stream()
         if self.active and stream is not None:
             # Do not erase the row: prompt_toolkit replaces it immediately, so
             # clearing it here would recreate the visible blink this fixes.
-            stream.write("\x1b7\x1b[r\x1b8")
-            stream.flush()
+            lock = getattr(console, "_lock", nullcontext())
+            with lock:
+                stream.write("\x1b7\x1b[r\x1b8")
+                stream.flush()
         self.active = False
         self.rows = 0
+        self.columns = 0
 
 
 class _LiveWithFooter:
@@ -4204,6 +4228,11 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     if paths:
         content = _set_line(content, "allowed_paths", paths)
+        # The prompt says "Working directory", so persist the first entry as
+        # the workspace too. Older setup code only changed the allowlist; a user
+        # launching Agent8088 elsewhere then wrote into that launch directory
+        # and immediately failed the configured path check.
+        content = _set_line(content, "project_root", paths.split(",", 1)[0].strip())
     content = _set_line(content, "default_provider", provider)
 
     # Write provider base_url + model. Endpoint defaults live in the provider registry.
