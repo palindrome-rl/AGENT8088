@@ -1,3 +1,4 @@
+import re
 import sys
 import stat
 import types
@@ -405,3 +406,73 @@ def test_models_custom_works_without_inquirerpy(monkeypatch):
 
     assert FakeEngine.PROVIDERS["custom"]["base_url"] == "http://127.0.0.1:8080/v1"
     assert FakeEngine.PROVIDERS["custom"]["api_key"] == "sk-local"
+
+
+# ---------------------------------------------------------------------------
+# keys introduced after a config was written
+#
+# Setup edits the config in place, so it can only ever update keys that are
+# already present. Observed live: a config predating web_search_no_prompt kept
+# defaulting to 0 while a fresh install shipped 1, so every search against a
+# working local SearXNG raised an approval prompt — and re-running setup, the
+# obvious remedy, could never add the missing key.
+# ---------------------------------------------------------------------------
+def _run_setup_over(config, monkeypatch, extra_lines=""):
+    config.write_text(
+        "\n".join([
+            "allowed_paths=~",
+            "default_provider=openai",
+            "provider.openai.base_url=https://api.openai.com/v1",
+            "provider.openai.model=gpt-4o",
+            "provider.openai.api_key=sk-placeholder-not-a-real-key",
+            "search_base_url=http://127.0.0.1:8888/search?q=",
+        ]) + extra_lines,
+        encoding="utf-8",
+    )
+    _install_fake_inquirer(monkeypatch, _FakeInquirer({
+        "text": ["~", ""],
+        "secret": [""],
+        "fuzzy": ["openai", "gpt-live", "Keep current setting"],
+    }))
+    monkeypatch.setenv("AGENT8088_CONFIG", str(config))
+    monkeypatch.setattr(providers, "list_models",
+                        lambda provider, client=None, fallback=True: ["gpt-live"])
+    cli._run_setup()
+    return config.read_text(encoding="utf-8")
+
+
+def _packaged_no_prompt():
+    packaged = (Path(__file__).resolve().parent.parent
+                / "src" / "agent8088" / "config.txt").read_text(encoding="utf-8")
+    return re.search(r'^\s*web_search_no_prompt=(.*)$',
+                     packaged, re.MULTILINE).group(1).strip()
+
+
+def test_setup_backfills_a_config_written_before_the_key_existed(tmp_path, monkeypatch):
+    saved = _run_setup_over(tmp_path / "config.txt", monkeypatch)
+
+    assert f"web_search_no_prompt={_packaged_no_prompt()}" in saved
+
+
+def test_the_backfilled_value_tracks_the_packaged_template(tmp_path, monkeypatch):
+    """Hardcoding the default here would let setup and the template drift."""
+    saved = _run_setup_over(tmp_path / "config.txt", monkeypatch)
+
+    match = re.search(r'^\s*web_search_no_prompt=(.*)$', saved, re.MULTILINE)
+    assert match.group(1).strip() == _packaged_no_prompt()
+
+
+def test_setup_does_not_overrule_a_deliberate_opt_out(tmp_path, monkeypatch):
+    """Backfill fills a gap; it must not reinstate a prompt the user turned off."""
+    saved = _run_setup_over(tmp_path / "config.txt", monkeypatch,
+                            extra_lines="\nweb_search_no_prompt=0\n")
+
+    assert "web_search_no_prompt=0" in saved
+    assert "web_search_no_prompt=1" not in saved
+
+
+def test_the_backfill_is_announced_rather_than_silent(tmp_path, monkeypatch, capsys):
+    """It relaxes an approval gate, so it must not happen without a word."""
+    _run_setup_over(tmp_path / "config.txt", monkeypatch)
+
+    assert "web_search_no_prompt" in capsys.readouterr().out
