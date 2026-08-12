@@ -224,6 +224,9 @@ class Session:
         self.usage_mode = config.get("usage_mode", "tokens")
         if self.usage_mode not in {"off", "tokens", "full"}:
             self.usage_mode = "tokens"
+        self.memory_notifications = config.get("memory_notifications", "on")
+        if self.memory_notifications not in {"off", "on", "verbose"}:
+            self.memory_notifications = "on"
         self.last_usage = None
 
 
@@ -328,6 +331,7 @@ def _save_preferences():
         "show_reasoning": int(S.show_reasoning),
         "verbose": S.verbose,
         "usage_mode": S.usage_mode,
+        "memory_notifications": S.memory_notifications,
         "disabled_skills": ",".join(sorted(S.disabled_skills)),
     }
     A.update_simple_config(A.CONFIG_PATH, values)
@@ -1559,6 +1563,86 @@ def _after_turn_plan_state():
 PLAN_MODE_MIN_TURNS = 25
 
 
+# How long the REPL will wait, after printing the answer, for the extraction call
+# to finish so its result can be reported in this turn. Past this the write still
+# completes in the background — only the notification is dropped, because a line
+# arriving after the prompt is drawn would land in the middle of what the user is
+# typing. Generous enough for a local model, short enough not to feel like a hang.
+MEMORY_NOTIFY_WAIT_SECONDS = 10
+
+
+# Captures that outlasted their report budget: [(thread, stored rows), ...].
+# Reported at the start of a later turn rather than dropped -- a local extraction
+# call routinely takes 15-20s, so dropping it means the common case is silence,
+# which is indistinguishable from memory not working at all.
+#
+# A list rather than one slot: two slow turns in a row both have a report owed, and
+# a single slot let the second overwrite the first. That was observed -- two facts
+# were stored and only the later one was ever mentioned, which reads as memory
+# having missed the first.
+_pending_captures = []
+
+
+def _report_pending_capture():
+    """Report every earlier capture that has finished since, oldest first."""
+    still_running = []
+    for thread, stored_ref in _pending_captures:
+        if thread.is_alive():
+            still_running.append((thread, stored_ref))
+            continue
+        _report_memory_capture(list(stored_ref), late=True)
+    _pending_captures[:] = still_running
+
+
+def _report_memory_capture(stored, late=False):
+    """Say what memory just learned. Mirrors Hermes' display.memory_notifications:
+    off is silent, on is a generic line, verbose previews the facts themselves.
+
+    Printed from the main thread once the capture thread is done, never from the
+    thread itself — see the note on memory.capture's on_stored.
+    """
+    level = S.memory_notifications
+    if level == "off":
+        return
+    suffix = " [dim](from your previous message)[/dim]" if late else ""
+    if not stored:
+        # Most turns teach nothing durable, so staying quiet is right at `on`.
+        # `verbose` says it anyway: "it ran and found nothing" and "it never ran"
+        # are different, and only one of them is a problem.
+        if level == "verbose":
+            console.print(f"[dim]⏺ memory · nothing new to remember[/dim]{suffix}")
+        return
+    noun = "memory" if len(stored) == 1 else "memories"
+    console.print(f"[dim]⏺ memory · stored {len(stored)} new {noun}[/dim]{suffix}")
+    if level == "verbose":
+        for row in stored:
+            console.print(f"[dim]    • {row['text'][:100]}[/dim]")
+
+
+def _await_memory_capture(stored_ref):
+    """Wait briefly for this turn's capture, then report it.
+
+    Capture is deliberately started after the answer is rendered, so by the time
+    this runs the user has already read the reply; the wait costs them nothing but
+    the prompt returning a moment later.
+    """
+    if S.memory_notifications == "off":
+        return
+    # Drain anything owed from earlier turns first, so reports stay in order.
+    _report_pending_capture()
+    thread = A.memory_capture_thread
+    if thread is not None and thread.is_alive():
+        with status_cm("remembering..."):
+            thread.join(timeout=MEMORY_NOTIFY_WAIT_SECONDS)
+        if thread.is_alive():
+            # Deferred rather than dropped. A local extraction call measured 17.7s
+            # against qwen3:8b, so exceeding this budget is the normal case, not the
+            # exception -- and silence is exactly what makes memory look broken.
+            _pending_captures.append((thread, stored_ref))
+            return
+    _report_memory_capture(list(stored_ref))
+
+
 def _turn_max_turns(mode):
     """Round budget for this turn. A plan-mode turn does three things in one turn —
     research, propose, then execute everything the user approved — so it needs more
@@ -1570,7 +1654,12 @@ def _turn_max_turns(mode):
 
 
 def do_chat(query):
+    # Anything last turn's capture stored after its report budget ran out.
+    _report_pending_capture()
     S.messages.append({"role": "user", "content": query})
+    # Filled by the capture thread via the engine hook; read back on this thread.
+    memory_stored = []
+    A.memory_on_capture = memory_stored.extend
     trace = [] if S.show_trace else None
     reasoning_parts = []
     stream = _StreamFilter()
@@ -1665,6 +1754,7 @@ def do_chat(query):
         except A.AgentInterrupted:
             answer = None
         finally:
+            A.memory_on_capture = None
             A.subagent_ui = None
             A._plan_on_step = None
             A._plan_on_escalation = None
@@ -1690,6 +1780,7 @@ def do_chat(query):
         active = _active_provider_name()
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
+    _await_memory_capture(memory_stored)
     if trace is not None:
         _record_trace(query, trace, elapsed)
         console.print(Panel(Text(json.dumps(trace, indent=2)), title="[#237dd7]trace[/#237dd7]",
@@ -1749,7 +1840,7 @@ def cmd_help(_):
         ("/reset", "Clear the active session while retaining its name"),
         ("/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)"),
         ("/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)"),
-        ("/memory [on|off|search|add|forget|clear]",
+        ("/memory [on|off|search|add|forget|notify|test|clear]",
          "Persistent memory across sessions — recalls facts each turn, learns from finished turns"),
         ("/config", "Show the active configuration (model, endpoint, paths)"),
         ("/history", "Show the current conversation"),
@@ -2943,6 +3034,7 @@ def _show_memory_status():
         retrieval = f"keyword only — {report['embed_model']} on {where}: {reason}"
     table.add_row("Retrieval", retrieval)
     table.add_row("Learning", "on" if report["capture_enabled"] else "off (recall only)")
+    table.add_row("Notifications", S.memory_notifications)
     table.add_row("Extractor", report["extract_model"])
     table.add_row("Injected per turn", str(report["recall_limit"]))
     table.add_row("Store", f"{report['db_path']}"
@@ -2960,7 +3052,8 @@ def _show_memory_status():
         table.add_row("Error", report["error"])
     console.print(table)
     console.print("[dim]/memory search <query> · /memory add <text> · "
-                  "/memory forget <id> · /memory clear · /memory off[/dim]")
+                  "/memory forget <id> · /memory notify off|on|verbose · "
+                  "/memory test · /memory clear · /memory off[/dim]")
 
 
 def _show_memory_search(query):
@@ -3043,6 +3136,72 @@ def cmd_memory(rest):
         console.print("[dim]memory is off — /memory on first[/dim]")
         return
 
+    if action == "test":
+        # "Is memory actually working?" is otherwise hard to answer: a model that
+        # cannot produce the JSON stores nothing and says nothing, which looks
+        # exactly like a turn that had nothing worth keeping. This runs the real
+        # extraction call on a fixed exchange and shows both what came back and
+        # what survived parsing, so the two cases are distinguishable.
+        from agent8088.memory import extract as _extract
+        sample_user = ("i work at five rivers technologies and i prefer uv over pip "
+                       "for python projects")
+        exchange = _extract.format_exchange([sample_user], "Understood, noted.")
+        console.print("[dim]Testing extraction with a sample exchange:[/dim]")
+        console.print(f"[dim]  \"{sample_user}\"[/dim]")
+        model = A.MEMORY_EXTRACT_MODEL or A.MODEL_NAME
+        console.print(f"[dim]  extractor: {model}[/dim]")
+        try:
+            started = time.time()
+            with status_cm("asking the model..."):
+                raw, usage = A._memory_extract_completion(
+                    _extract.build_prompt(exchange, []))
+            elapsed = time.time() - started
+        except Exception as exc:
+            console.print(f"[red]the extraction call failed:[/red] {exc}")
+            console.print("[dim]Memory recall still works; nothing new will be "
+                          "learned until this call succeeds.[/dim]")
+            return
+        parsed = _extract.parse_response(raw)
+        console.print(Panel(Text(raw.strip()[:1200] or "(empty reply)"),
+                            title="[#237dd7]raw model reply[/#237dd7]",
+                            box=box.MINIMAL, border_style="#0077B6"))
+        if parsed:
+            console.print(f"[green]extraction works[/green] [dim]— {len(parsed)} "
+                          "fact(s) parsed:[/dim]")
+            for row in parsed:
+                console.print(f"[dim]    • {row['text'][:100]}[/dim]")
+            console.print("[dim]Nothing was stored; this was a test.[/dim]")
+        elif raw.strip():
+            console.print("[yellow]the model replied, but not with usable JSON[/yellow]")
+            console.print("[dim]Nothing would be stored from a turn like this. Point "
+                          "memory_extract_model at a stronger model:[/dim]")
+            console.print(f"[dim]      memory_extract_model=<model>   (in {A.CONFIG_PATH})[/dim]")
+        else:
+            console.print("[yellow]the model returned an empty reply[/yellow]")
+            console.print("[dim]Nothing can be learned until the extractor answers. "
+                          "Try memory_extract_model=<a stronger model>.[/dim]")
+        tokens = (usage or {}).get("input_tokens", 0) or 0
+        tokens += (usage or {}).get("output_tokens", 0) or 0
+        console.print(f"[dim]took {elapsed:.1f}s, {tokens} tokens — this is the cost "
+                      "added to each turn that stores something[/dim]")
+        if elapsed > MEMORY_NOTIFY_WAIT_SECONDS:
+            console.print(f"[dim]Slower than the {MEMORY_NOTIFY_WAIT_SECONDS}s report "
+                          "budget, so the \"stored\" line will usually appear with your "
+                          "next message rather than this one.[/dim]")
+        return
+
+    if action == "notify":
+        level = argument.lower()
+        if level not in {"off", "on", "verbose"}:
+            console.print("[red]usage:[/red] /memory notify off|on|verbose")
+            console.print("[dim]off = silent · on = a line when something is stored · "
+                          "verbose = show the facts, and say when nothing was[/dim]")
+            return
+        S.memory_notifications = level
+        _save_preferences()
+        console.print(f"[green]memory notifications: {level}[/green]")
+        return
+
     if action == "search":
         if not argument:
             console.print("[red]usage:[/red] /memory search <query>")
@@ -3104,7 +3263,8 @@ def cmd_memory(rest):
         return
 
     console.print(f"[red]unknown:[/red] /memory {action}  "
-                  "[dim](status · on · off · search · add · forget · clear)[/dim]")
+                  "[dim](status · on · off · search · add · forget · notify · "
+                  "test · clear)[/dim]")
 
 
 def cmd_limits(rest):
