@@ -760,14 +760,17 @@ EOF
 drop_config() {
     if [ ! -f "$AGENT8088_HOME/config.txt" ]; then
         log_info "Dropping default config.txt to $AGENT8088_HOME/config.txt"
-        # The installed package ships a default config.txt next to engine.py.
-        # Copy it from the venv's site-packages if available, else from repo.
+        # The default config.txt ships at src/agent8088/config.txt in the repo.
+        # For an editable install (-e), site-packages only has a .pth pointer,
+        # so the venv glob misses; the repo source path is the reliable one.
         local src_config="$INSTALL_DIR/venv/lib/python*/site-packages/agent8088/config.txt"
         local found=$(ls $src_config 2>/dev/null | head -1)
         if [ -n "$found" ] && [ -f "$found" ]; then
             cp "$found" "$AGENT8088_HOME/config.txt"
         elif [ -f "$INSTALL_DIR/config.txt" ]; then
             cp "$INSTALL_DIR/config.txt" "$AGENT8088_HOME/config.txt"
+        elif [ -f "$INSTALL_DIR/src/agent8088/config.txt" ]; then
+            cp "$INSTALL_DIR/src/agent8088/config.txt" "$AGENT8088_HOME/config.txt"
         else
             log_warn "No default config.txt found; you'll need to create one"
             return 0

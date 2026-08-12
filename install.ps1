@@ -723,13 +723,18 @@ function Drop-Config {
     $configPath = Join-Path $Agent8088Home "config.txt"
     if (-not (Test-Path $configPath)) {
         Write-Info "Dropping default config.txt to $configPath"
-        # The installed package ships a default config.txt next to engine.py.
+        # The default config.txt ships at src/agent8088/config.txt in the repo.
+        # For an editable install (-e), site-packages only has a .pth pointer,
+        # so the venv path misses; the repo source path is the reliable one.
         $venvConfig = Join-Path $InstallDir "venv\Lib\site-packages\agent8088\config.txt"
         $repoConfig = Join-Path $InstallDir "config.txt"
+        $srcConfig = Join-Path $InstallDir "src\agent8088\config.txt"
         if (Test-Path $venvConfig) {
             Copy-Item $venvConfig $configPath
         } elseif (Test-Path $repoConfig) {
             Copy-Item $repoConfig $configPath
+        } elseif (Test-Path $srcConfig) {
+            Copy-Item $srcConfig $configPath
         } else {
             Write-Warn "No default config.txt found; you'll need to create one"
             return
