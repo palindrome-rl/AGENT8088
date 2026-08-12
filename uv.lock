@@ -22,11 +22,13 @@ dependencies = [
     { name = "mcp" },
     { name = "openai" },
     { name = "pillow" },
-    { name = "playwright" },
     { name = "rich" },
 ]
 
 [package.optional-dependencies]
+browser = [
+    { name = "playwright" },
+]
 dev = [
     { name = "pip-audit" },
     { name = "pytest" },
@@ -50,7 +52,7 @@ requires-dist = [
     { name = "openai", specifier = ">=1.0.0,<3" },
     { name = "pillow", specifier = ">=9,<13" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.7,<3" },
-    { name = "playwright", specifier = ">=1.40,<2" },
+    { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.40,<2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0,<10" },
     { name = "python-telegram-bot", marker = "extra == 'gateway'", specifier = ">=20,<23" },
     { name = "rich", specifier = ">=13.0.0,<16" },
@@ -58,7 +60,7 @@ requires-dist = [
     { name = "slack-bolt", marker = "extra == 'gateway'", specifier = ">=1.18.0,<2" },
     { name = "slack-sdk", marker = "extra == 'gateway'", specifier = ">=3.23.0,<4" },
 ]
-provides-extras = ["gateway", "dev"]
+provides-extras = ["gateway", "browser", "dev"]
 
 [[package]]
 name = "aiohappyeyeballs"

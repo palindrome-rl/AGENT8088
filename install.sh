@@ -427,13 +427,26 @@ install_deps() {
     fi
     [ "$GATEWAY_EXTRAS_INSTALLED" = true ] && log_success "Gateway adapters installed"
 
-    # --- Playwright Chromium browser binary (for browse_page) ---
-    # The playwright Python package is a core dep (already installed above);
-    # this downloads the Chromium binary it drives. ~280 MB download.
-    log_info "Installing Playwright Chromium browser (~280 MB)..."
-    "$_py" -m playwright install chromium >/dev/null 2>&1 && CHROMIUM_INSTALLED=true || \
-        log_warn "Chromium download failed - browse_page will show install instructions"
-    [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
+    # --- Playwright (optional [browser] extra) + Chromium binary ---
+    # playwright degrades gracefully at runtime (engine.py: _playwright_available()),
+    # so it's an optional extra, not a core dep - a platform/Python combo without
+    # wheels for it (e.g. Termux landing on a brand-new Python minor) shouldn't
+    # fail the whole install.
+    log_info "Installing Playwright (optional, for browse_page)..."
+    local _playwright_installed=false
+    if [ "$DISTRO" = "termux" ]; then
+        pip install -e ".[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
+            log_warn "Playwright install failed - browse_page will show install instructions"
+    else
+        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
+            log_warn "Playwright install failed - browse_page will show install instructions"
+    fi
+    if [ "$_playwright_installed" = true ]; then
+        log_info "Installing Playwright Chromium browser (~280 MB)..."
+        "$_py" -m playwright install chromium >/dev/null 2>&1 && CHROMIUM_INSTALLED=true || \
+            log_warn "Chromium download failed - browse_page will show install instructions"
+        [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
+    fi
 }
 
 # ----------------------------------------------------------------------------

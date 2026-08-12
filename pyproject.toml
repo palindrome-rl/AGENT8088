@@ -13,7 +13,6 @@ dependencies = [
     "InquirerPy>=0.3.4,<1",
     "mcp>=1.27,<2",
     "Pillow>=9,<13",
-    "playwright>=1.40,<2",
     # Keyless web search fallback. A hard dependency on purpose: web_search must
     # always have a backend that needs no Docker, no API key, and no setup step,
     # so a stopped or unreachable SearXNG still returns results instead of an
@@ -24,6 +23,11 @@ dependencies = [
 
 [project.optional-dependencies]
 gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
+# browse_page degrades gracefully without this (engine.py: _playwright_available()),
+# so it's optional rather than a hard dep - keeps install.sh's core install from
+# hard-failing on platforms/Python versions playwright hasn't shipped wheels for yet
+# (e.g. Termux's rolling `pkg install python`, which can land on a brand-new minor).
+browser = ["playwright>=1.40,<2"]
 dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
 
 [project.scripts]
