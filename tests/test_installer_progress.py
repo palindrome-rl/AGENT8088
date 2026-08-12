@@ -297,6 +297,157 @@ def test_agent_startup_repairs_only_missing_console_flags(tmp_path, monkeypatch)
     assert writes == [(10, 0x0007), (20, 0x0047)]
 
 
+def test_agent_startup_clears_newline_auto_return_console_flag(
+        tmp_path, monkeypatch):
+    """Inherited delayed wrapping corrupts full-width Rich/footer output."""
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+
+    modes = {10: 0x0007, 20: 0x004F}
+    writes = []
+    stream = lambda handle: SimpleNamespace(  # noqa: E731
+        fileno=lambda: handle, isatty=lambda: True)
+    monkeypatch.setattr(cli.os, "name", "nt")
+    monkeypatch.setattr(cli.sys, "stdin", stream(10))
+    monkeypatch.setattr(cli.sys, "stdout", stream(20))
+    monkeypatch.setattr(
+        cli, "_windows_console_functions",
+        lambda: (
+            lambda value: value.fileno(),
+            lambda handle: modes[handle],
+            lambda handle, mode: writes.append((handle, mode)),
+        ),
+    )
+
+    assert cli._repair_windows_console() is True
+    assert writes == [(20, 0x0047)]
+
+
+def test_normal_detail_renders_complete_code_and_new_file_diff(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import cli
+
+    source = "".join(f"line_{number} = {number}\n" for number in range(1, 121))
+    listing, total = cli._numbered_lines(source, path="library.py")
+    diff = list(__import__("difflib").unified_diff(
+        [], source.splitlines(keepends=True), fromfile="library.py", tofile="library.py"))
+
+    assert total == 120
+    assert "line_120 = 120" in listing.plain
+    assert "more lines" not in listing.plain
+    assert "line_120 = 120" in cli._diff_block(diff, path="library.py").plain
+
+
+def test_project_relative_artifacts_cd_uses_the_artifact_workspace(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    engine.ARTIFACTS_ROOT = tmp_path / "artifacts"
+    engine._sandbox_readonly = False
+    seen = {}
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "docker")
+    monkeypatch.setattr(
+        engine, "_exec_docker_command",
+        lambda command, *args, **kwargs: seen.update(command=command) or "ok",
+    )
+
+    cases = {
+        "cd artifacts && python library.py": "cd . && python library.py",
+        "cat > artifacts/library.py << 'EOF'": "cat > ./library.py << 'EOF'",
+        "cat > /workspace/artifacts/library.py": "cat > /workspace/library.py",
+        "ls /workspace/artifacts": "ls /workspace",
+        "python artifacts/library.py": "python ./library.py",
+        "ls -la artifacts/ || echo missing": "ls -la ./ || echo missing",
+        'test -d "artifacts"': 'test -d "."',
+    }
+    for command, expected in cases.items():
+        assert engine._exec_sandbox_command(command) == "ok"
+        assert seen["command"] == expected
+
+
+def test_failed_plan_shell_call_is_not_accepted_by_the_auditor(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    monkeypatch.setattr(
+        engine, "_audit_plan_step",
+        lambda *_args, **_kwargs: pytest.fail("a failed command is already conclusive"),
+    )
+    result = engine._audit_approved_plan_call(
+        "execute_shell", {"command": "python library.py"},
+        "Traceback: broken\nCommand exited with status 1.", 0, None,
+    )
+
+    assert "reported failure" in result
+    assert "Correct the failed call" in result
+    assert engine._plan_step_failed(
+        "A log quoted Command exited with status 1. before succeeding") is False
+
+
+def test_agent_rounds_allow_complete_code_and_reject_token_cut_tools(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    requests = []
+    responses = iter([
+        engine._build_response(
+            '✿FUNCTION✿: write_file ✿ARGS✿: '
+            '{"filename":"library.py","content":"cut mid-li"}',
+            finish_reason="length",
+        ),
+        engine._build_response("Stopped safely.", finish_reason="stop"),
+    ])
+
+    def complete(*_args, **kwargs):
+        requests.append(kwargs["max_tokens"])
+        return next(responses)
+
+    monkeypatch.setattr(engine, "create_completion", complete)
+    monkeypatch.setattr(
+        engine, "exec_tool",
+        lambda *_args, **_kwargs: pytest.fail("a token-cut tool call must not execute"),
+    )
+
+    answer = engine.run_agent(
+        [{"role": "user", "content": "build library.py"}], max_turns=2,
+        tools_def=[], allowed_tools={"write_file"},
+    )
+
+    assert answer == "Stopped safely."
+    assert requests == [engine.MAX_COMPLETION_TOKENS] * 2
+    assert engine.MAX_COMPLETION_TOKENS == 8192
+
+
+def test_stream_response_preserves_the_provider_finish_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "missing-config.txt"))
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    from agent8088 import engine
+
+    def chunk(content, finish_reason=None):
+        delta = SimpleNamespace(content=content, reasoning_content=None, tool_calls=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)])
+
+    stream = iter([chunk("partial"), chunk("", "length")])
+    completions = SimpleNamespace(create=lambda **_kwargs: stream)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    response = engine.create_completion(
+        client, [], [], on_token=lambda *_args: None)
+
+    assert response.choices[0].message.content == "partial"
+    assert response.choices[0].finish_reason == "length"
+
+
 def test_windows_repl_preserves_known_good_prompt_layout(
         tmp_path, monkeypatch):
     """The prompt must not add vertical space above the sticky footer."""

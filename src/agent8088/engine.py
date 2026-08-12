@@ -313,6 +313,9 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
+MAX_COMPLETION_TOKENS = max(
+    1, min(int(APP_CONFIG.get("max_completion_tokens", "8192")), CONTEXT_WINDOW)
+)
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
 # A sub-agent exists to keep work *out* of the parent's context, so an unbounded
 # answer defeats the delegation it was spawned for. 0 disables the cap.
@@ -1515,12 +1518,14 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         response = completion(**kwargs)
         if on_token is None:
             return response
-        collected, tool_chunks = [], {}
+        collected, tool_chunks, finish_reason = [], {}, None
         stop, watcher = _start_interrupt_watcher(response, interrupt_check)
         try:
             for chunk in response:
                 _raise_if_interrupted(interrupt_check, response)
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                delta = choice.delta
+                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
                     on_token("reasoning", reasoning)
@@ -1535,7 +1540,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             raise
         finally:
             _finish_interrupt_watcher(stop, watcher)
-        return _build_response("".join(collected), tool_chunks)
+        return _build_response("".join(collected), tool_chunks, finish_reason)
     request_options = dict(
         model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
@@ -1547,12 +1552,14 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         return client.chat.completions.create(**request_options)
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
     stream = client.chat.completions.create(**request_options, stream=True)
-    collected, tool_chunks = [], {}
+    collected, tool_chunks, finish_reason = [], {}, None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
     try:
         for chunk in stream:
             _raise_if_interrupted(interrupt_check, stream)
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
             rc = getattr(delta, "reasoning_content", None)
             if rc:
                 on_token("reasoning", rc)
@@ -1567,7 +1574,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         raise
     finally:
         _finish_interrupt_watcher(stop, watcher)
-    return _build_response("".join(collected), tool_chunks)
+    return _build_response("".join(collected), tool_chunks, finish_reason)
 
 
 def _fallback_targets() -> list:
@@ -1606,6 +1613,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     try:
         return create_completion(
             client, messages, tools, temperature=temperature,
+            max_tokens=MAX_COMPLETION_TOKENS,
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
@@ -1632,6 +1640,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 })
             return create_completion(
                 fallback_client, messages, tools, temperature=temperature,
+                max_tokens=MAX_COMPLETION_TOKENS,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
@@ -1656,7 +1665,7 @@ def _collect_stream_tool_calls(delta, chunks):
             entry["arguments"] += getattr(function, "arguments", None) or ""
 
 
-def _build_response(content, tool_chunks=None):
+def _build_response(content, tool_chunks=None, finish_reason=None):
     """Reconstruct a ChatCompletion-like object from streamed content
     so run_agent() can read .choices[0].message.content uniformly."""
     tool_calls = []
@@ -1670,7 +1679,7 @@ def _build_response(content, tool_chunks=None):
         })())
     return type("R", (), {"choices": [type("C", (), {
         "message": type("M", (), {"content": content, "tool_calls": tool_calls}),
-        "finish_reason": "tool_calls" if tool_calls else "stop",
+        "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
     })()]})
 
 
@@ -2478,7 +2487,11 @@ def _plan_step_failed(result: str) -> bool:
     approved it). Both mean the intended effect is absent, so every later step
     is now standing on an assumption that is already false.
     """
-    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+    plain = _unwrap_untrusted(result).strip()
+    return (plain.startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+            or bool(re.search(
+                r"(?:^|\n)Command exited with status [1-9]\d*\.$", plain))
+            or bool(re.search(r"(?:^|\n)Command timed out(?: after \d+s)?\.$", plain)))
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -2660,6 +2673,10 @@ def _audit_approved_plan_call(tool_name: str, tool_args: dict, result: str,
     of it. The same asymmetry holds as in plans: only a `fail` undoes anything —
     an auditor that could not reach its model must not be able to destroy work.
     """
+    if _plan_step_failed(result):
+        return (f"{result}\nError: {tool_name} reported failure, so verification was "
+                "not run. Correct the failed call before continuing the approved plan.")
+
     step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
     reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
                                     plan_context=_plan_approved_text[:1500])
@@ -3626,12 +3643,49 @@ def _sandbox_required_error() -> str:
     )
 
 
+_ARTIFACTS_CD_RE = re.compile(
+    r"(?i)(?<!\S)cd\s+([\"']?)(?:\.[\\/])?artifacts[\\/]?\1"
+    r"(?=\s*(?:&&|\|\||;|$))"
+)
+_CONTAINER_ARTIFACTS_RE = re.compile(
+    r"(?i)(?P<workspace>/workspace)[\\/]artifacts(?P<tail>[\\/]|(?=[\s\"';|&<>()]|$))"
+)
+_ARTIFACTS_PATH_RE = re.compile(
+    r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
+    r"(?:\.[\\/])?artifacts[\\/]"
+)
+_ARTIFACTS_WORD_RE = re.compile(
+    r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
+    r"(?:\.[\\/])?artifacts(?P=quote)(?=\s|[;|&<>()]|$)"
+)
+
+
+def _artifact_workspace_command(command: str) -> str:
+    """Map project-relative artifact paths into the mounted artifact directory."""
+    command = _CONTAINER_ARTIFACTS_RE.sub(
+        lambda match: match.group("workspace")
+        + ("/" if match.group("tail") in ("/", "\\") else ""),
+        command,
+    )
+    command = _ARTIFACTS_CD_RE.sub("cd .", command)
+    command = _ARTIFACTS_PATH_RE.sub(
+        lambda match: match.group("prefix") + match.group("quote") + "./",
+        command,
+    )
+    return _ARTIFACTS_WORD_RE.sub(
+        lambda match: match.group("prefix") + match.group("quote") + "."
+                      + match.group("quote"),
+        command,
+    )
+
+
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
     if backend == "unavailable":
         return _sandbox_required_error()
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
+    command = _artifact_workspace_command(command)
     temporary = None
     workspace = ARTIFACTS_ROOT
     if _sandbox_readonly:
@@ -6001,6 +6055,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     missing_args_retries = 0  # times a call arrived without its arguments
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    length_retries = 0   # token-limited calls are incomplete and must never execute
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
@@ -6067,6 +6122,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
+        finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
+        if finish_reason in {"length", "max_tokens"}:
+            warning = (
+                f"Model output reached its {MAX_COMPLETION_TOKENS}-token limit. "
+                "The partial response was not executed. Retry with one complete, "
+                "concise tool call; split large work across calls if needed."
+            )
+            if on_result:
+                on_result("error", warning)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "max_tokens", "content": warning})
+            if length_retries < 1:
+                length_retries += 1
+                messages.append({"role": "user", "content": warning})
+                continue
+            answer = _guard_answer(warning)
+            if on_answer:
+                on_answer(answer)
+            return answer
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])

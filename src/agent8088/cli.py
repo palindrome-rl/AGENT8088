@@ -90,14 +90,18 @@ def _repair_windows_console():
     try:
         get_handle, get_mode, set_mode = _windows_console_functions()
         # stdin: processed input, line input, echo input
-        # stdout: processed output, wrap-at-EOL, virtual-terminal processing
-        streams = ((sys.stdin, 0x0001 | 0x0002 | 0x0004),
-                   (sys.stdout, 0x0001 | 0x0002 | 0x0004))
+        # stdout: processed output, wrap-at-EOL, virtual-terminal processing.
+        # DISABLE_NEWLINE_AUTO_RETURN (0x0008) is not a harmless preference here:
+        # it leaves the cursor in the last column after a full-width Rich row.
+        # The response footer then restores that stale position and the next line
+        # loses its leading characters in Windows Terminal.
+        streams = ((sys.stdin, 0x0001 | 0x0002 | 0x0004, 0),
+                   (sys.stdout, 0x0001 | 0x0002 | 0x0004, 0x0008))
         repaired = False
-        for stream, required in streams:
+        for stream, required, forbidden in streams:
             handle = get_handle(stream)
             current = get_mode(handle)
-            wanted = current | required
+            wanted = (current | required) & ~forbidden
             if wanted != current:
                 set_mode(handle, wanted)
                 repaired = True
@@ -895,9 +899,9 @@ def _numbered_lines(text, limit=None, path=""):
     Returns (renderable, total_lines) — the total counts the whole file, not just
     the rows shown, so the caller can report "Read 108 lines" honestly.
     """
-    if limit is None:
-        limit = 200 if S.verbose == "full" else 40
     lines = _source_lines(text)
+    if limit is None:
+        limit = min(len(lines), 200)
     total = len(lines)
     shown = lines[:limit]
     width = max(len(str(len(shown))), 2)
@@ -981,11 +985,12 @@ def _diff_block(diff_lines, limit=None, path=""):
     header has not already said — so it renders as a plain listing of the file
     instead, and the '+' column is saved for edits, where it carries information.
     """
-    if limit is None:
-        limit = 200 if S.verbose == "full" else 60
     hunks = _parse_hunks(diff_lines)
     if not hunks:
         return Text()
+
+    if limit is None:
+        limit = min(sum(len(hunk["rows"]) for hunk in hunks), 200)
 
     if len(hunks) == 1 and hunks[0]["old_count"] == 0:
         listing, _ = _numbered_lines(
@@ -3606,15 +3611,19 @@ class _PersistentStatusBar:
         if self._stream() is None or console.height < 3:
             return
         self.active = True
-        self.refresh(state)
+        # A previous renderer may have just released the last row even when the
+        # state and dimensions are unchanged. Starting is an ownership handoff,
+        # so it must repaint rather than taking the ordinary dedupe path.
+        self.refresh(state, force=True)
 
-    def refresh(self, state="working"):
+    def refresh(self, state="working", force=False):
         stream = self._stream()
         if not self.active or stream is None:
             return
         rows = max(3, console.height)
         columns = max(2, console.width)
-        if rows == self.rows and columns == self.columns and state == self.state:
+        if (not force and rows == self.rows and columns == self.columns
+                and state == self.state):
             return
 
         old_rows = self.rows
@@ -3706,6 +3715,9 @@ def _live_matches(text):
 
 def _read_line():
     """Use a live completion menu in a TTY, with Rich/readline as a safe fallback."""
+    # prompt_toolkit owns the last row while input is active. Release the response
+    # scroll region first but leave its painted footer in place until the toolkit
+    # replaces it; retaining the 1..height-1 region shifts the toolbar up a row.
     _response_footer.stop()
     if not sys.stdin.isatty():
         return console.input(_prompt_label())
