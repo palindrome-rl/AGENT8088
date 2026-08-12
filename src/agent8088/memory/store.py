@@ -140,14 +140,18 @@ def dot(left, right) -> float:
 # about uv on the word "the", and on a small store BM25 has nothing better to
 # rank, so the irrelevant memory was injected into the prompt. The vector leg
 # handles meaning; the keyword leg only needs the words that carry any.
-_STOPWORDS = frozenset("""
-a about all also am an and any are as at be because been but by can cannot could
-did do does doing done for from get got had has have how however i if in into is
-it its just me my no nor not of off on once only or other our out over own please
-same should so some such than that the their them then there these they this
-those to too under until up us very was we were what when where which while who
-whom why will with would you your
-""".split())
+_STOPWORDS = frozenset((
+    "a", "about", "all", "also", "am", "an", "and", "any", "are", "as", "at",
+    "be", "because", "been", "but", "by", "can", "cannot", "could", "did", "do",
+    "does", "doing", "done", "for", "from", "get", "got", "had", "has", "have",
+    "how", "however", "i", "if", "in", "into", "is", "it", "its", "just", "me",
+    "my", "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other",
+    "our", "out", "over", "own", "please", "same", "should", "so", "some",
+    "such", "than", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "those", "to", "too", "under", "until", "up", "us", "very",
+    "was", "we", "were", "what", "when", "where", "which", "while", "who",
+    "whom", "why", "will", "with", "would", "you", "your",
+))
 
 
 def fts_query(text: str) -> str:
@@ -422,11 +426,11 @@ class MemoryStore:
                 entry["score"] += 1.0 / (rrf_k + position)
                 entry[f"{leg}_rank"] = position
 
+        placeholders = ",".join("?" * len(fused))
         rows = {
             row["id"]: dict(row)
             for row in self.connect().execute(
-                "SELECT * FROM memories WHERE id IN (%s)"
-                % ",".join("?" * len(fused)), tuple(fused)
+                f"SELECT * FROM memories WHERE id IN ({placeholders})", tuple(fused)
             ).fetchall()
         }
 

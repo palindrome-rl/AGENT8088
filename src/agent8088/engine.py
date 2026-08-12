@@ -4816,10 +4816,6 @@ MODEL_TELEMETRY_PATH = Path(APP_CONFIG.get(
 MEMORY_DB_PATH = Path(APP_CONFIG.get(
     "memory_db_path", str(_agent_data_dir() / "memory.db"))).expanduser()
 MEMORY_EXTRACT_MODEL = APP_CONFIG.get("memory_extract_model", "").strip()
-# The CLI renders its answer and then captures on a background thread, so the
-# user never waits. The gateway, MCP server and cron have nobody watching, so
-# they capture synchronously rather than risk a daemon thread dying at exit.
-MEMORY_CAPTURE_BACKGROUND = False
 
 
 def _memory_extract_completion(prompt: str):
@@ -4907,13 +4903,21 @@ def _recalled_memory_prompt(messages, system_prompt, identity=None):
     return with_memory
 
 
-def _capture_turn_memory(messages, answer, *, identity=None, run_id=None) -> None:
+def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
+                         in_background=False) -> None:
     """Store what this turn taught, after the answer is already the user's.
 
     Only the last genuine user turn is offered: earlier ones were captured when
     they happened, and re-extracting them every turn would pay for the same facts
     repeatedly. Tool output is excluded here for the same reason it is excluded
     from recall -- a web page must not be able to write the agent's memory.
+
+    `in_background` belongs to the caller, not to module state. The REPL renders
+    its answer and then extracts on a daemon thread so the user never waits; the
+    gateway, MCP server and cron capture synchronously, because nobody is
+    watching there and a daemon thread dying at process exit would drop the write
+    without a word. Synchronous is the default: it is the behaviour that cannot
+    lose data.
     """
     if not memory.enabled() or not str(answer or "").strip():
         return
@@ -4922,7 +4926,7 @@ def _capture_turn_memory(messages, answer, *, identity=None, run_id=None) -> Non
         return
     try:
         memory.capture([_message_text(turns[-1])], answer, identity=identity,
-                       run_id=run_id, in_background=MEMORY_CAPTURE_BACKGROUND)
+                       run_id=run_id, in_background=in_background)
     except Exception as exc:
         _log.debug("memory capture skipped: %s", exc)
 
@@ -5712,7 +5716,7 @@ class _TurnBudget:
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
 def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
-              **kwargs):
+              memory_background=False, **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
 
@@ -5761,7 +5765,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             # After the answer, never in front of it. An interrupted or failed
             # turn leaves `answer` None and teaches nothing.
             _capture_turn_memory(messages, answer, identity=memory_identity,
-                                 run_id=memory_run_id)
+                                 run_id=memory_run_id,
+                                 in_background=memory_background)
         _active_budget = previous
 
 

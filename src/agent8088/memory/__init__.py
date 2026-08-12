@@ -23,14 +23,19 @@ import logging
 import threading
 
 from .embed import Embedder
-from .extract import (DEFAULT_MAX_PER_TURN, build_prompt, format_exchange,
-                      parse_response, worth_extracting)
+from .extract import (
+    DEFAULT_MAX_PER_TURN,
+    build_prompt,
+    format_exchange,
+    parse_response,
+    worth_extracting,
+)
 from .store import MemoryStore, MemoryStoreError
 
 log = logging.getLogger("agent8088.memory")
 
-__all__ = ["configure", "enabled", "recall", "recall_block", "capture", "status",
-           "store", "embedder", "reset", "MemoryStore", "MemoryStoreError"]
+__all__ = ["MemoryStore", "MemoryStoreError", "capture", "configure", "embedder",
+           "enabled", "recall", "recall_block", "reset", "status", "store"]
 
 # The header the recalled block carries into the system prompt. The framing is
 # load-bearing rather than decorative: memory poisoning to privilege escalation
@@ -72,6 +77,13 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
         embed_model = str(config.get("memory_embed_model") or "nomic-embed-text").strip()
 
         _RUNTIME.update(
+            # On for every install, off for a bare import with no config at all.
+            # The shipped config.txt carries `memory=1` and the installers pull the
+            # embedder, so anyone who installed has working memory from the first
+            # turn. The code default stays 0 for the same reason audit_log's does:
+            # capture spends a model call per turn, and an import with no config --
+            # a test, a library use, a script -- must not start spending it
+            # unasked. `memory=1` in config.txt is the switch, not this line.
             enabled=_flag("memory"),
             capture_enabled=_flag("memory_capture", "1"),
             db_path=db_path,
@@ -93,8 +105,8 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             if existing is not None:
                 try:
                     existing.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug("closing the previous memory store failed: %s", exc)
         if previous_model != embed_model:
             _RUNTIME.pop("embedder", None)
 
@@ -106,8 +118,8 @@ def reset():
         if existing is not None:
             try:
                 existing.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("closing the memory store failed: %s", exc)
         _RUNTIME.clear()
         _LAST_CAPTURE.clear()
 
@@ -239,8 +251,8 @@ def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id
             if existing is not None:
                 try:
                     existing.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug("closing the previous memory store failed: %s", exc)
 
 
 def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None):

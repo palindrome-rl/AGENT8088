@@ -39,6 +39,9 @@ than a design choice.
 | `gateway/session.py` | Per-chat JSON session files |
 | `gateway/auth.py` | Allowlist, per-platform scoping, WhatsApp id normalisation |
 | `gateway/platforms/*.py` | Slack / WhatsApp / Discord / Telegram / Email adapters |
+| `memory/store.py` | Memory: SQLite schema, hybrid BM25 + vector search, RRF |
+| `memory/embed.py` | Memory: embeddings via the provider's `/embeddings` |
+| `memory/extract.py` | Memory: the fact-extraction prompt and its parsing |
 | `tools.txt` | Tool registry (data, not code) |
 | `system.md` | Base system prompt |
 | `config.txt` | Default settings |
@@ -47,6 +50,9 @@ than a design choice.
 
 Per user turn, `run_agent()` loops up to `max_turns`:
 
+0. **Recall memory** (outermost turn only) — the last *genuine* user turn is
+   searched against the memory store and the best few facts are appended to this
+   turn's system prompt. See [Memory](16-memory.md).
 1. **Call the model** with history + tool definitions.
 2. **Strip reasoning** from the content so chain-of-thought never leaks into the
    answer.
@@ -62,6 +68,15 @@ Per user turn, `run_agent()` loops up to `max_turns`:
    wrapped if it came from outside.
 8. **Guard the answer** before returning — system-prompt leak check, secret
    redaction, markup stripping.
+9. **Capture memory** (outermost turn only, after the answer) — one extraction
+   call distils durable facts from what the user said and what was answered.
+
+Steps 0 and 9 hang off `run_agent()` rather than the loop itself. The loop has
+seven return points, so a capture hook inside it would be silently skipped by the
+next one added; `run_agent`'s `finally` cannot be escaped. It also already
+distinguishes the outermost turn, which is the scope memory wants — a sub-agent is
+handed a delegated task rather than something a human said, so it neither recalls
+nor writes.
 
 If the model backend errors mid-turn, the loop returns the best output it has
 rather than crashing the session.

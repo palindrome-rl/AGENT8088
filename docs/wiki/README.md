@@ -41,6 +41,7 @@ Look things up here.
 | [CLI Reference](10-cli-reference.md) | Every flag, slash command, keybinding and exit code |
 | [Configuration](02-configuration.md) | Every config key, the `.env` store, key resolution order |
 | [Tools](04-tools.md) | All 21 built-in tools, their modes and arguments |
+| [Memory](16-memory.md) | Persistent memory: what it stores, how retrieval works, `/memory` |
 | [FAQ](15-faq.md) | Short answers to the common questions |
 | [Troubleshooting](13-troubleshooting.md) | Symptom-first fixes |
 
