@@ -227,6 +227,43 @@ def test_npm_is_resolved_to_something_start_process_can_launch():
     assert installer.count("$npmExe = Resolve-NpmLauncher") == 2
 
 
+def test_a_stage_is_given_no_access_to_the_console_input():
+    """Console modes belong to the console, not to a process.
+
+    A child that inherits the input handle and alters it leaves the console
+    altered for everything after it. Sharing it corrupted the setup wizard
+    running later in the same window -- keystrokes were dropped, so a typed
+    path arrived as "C   sers saa   a mi" and the API key arrived wrong -- and
+    left the agent's display broken in that window too. The piped form this
+    replaced never handed the child a console at all.
+    """
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert "-RedirectStandardInput $inLog" in installer, \
+        "stages are sharing the user's console input again"
+
+
+def test_a_stage_that_reads_stdin_fails_instead_of_hanging(tmp_path):
+    """Redirecting from an empty file, not NUL: a stage that reads gets EOF and
+    stops, rather than blocking forever on input nobody knows to type."""
+    reader = tmp_path / "reads_stdin.py"
+    reader.write_text(
+        "import sys\n"
+        "data = sys.stdin.read()\n"
+        "sys.exit(0 if data == '' else 1)\n",
+        encoding="ascii",
+    )
+
+    out = _powershell(
+        'function Test-ProgressAnimated { $true }\n'
+        f'$code = Invoke-WithProgress -Label "reader" -FilePath "{sys.executable}" '
+        f'-ArgumentList @("{str(reader).replace(chr(92), chr(92) * 2)}")\n'
+        'Write-Output "EXIT=$code"'
+    )
+
+    assert out.splitlines()[-1] == "EXIT=0", "stdin was not an immediate EOF"
+
+
 def test_a_missing_executable_does_not_abort_the_install():
     """These stages are optional; the progress display must never be fatal."""
     out = _powershell(

@@ -255,6 +255,18 @@ function Invoke-WithProgress {
     $stem = Join-Path ([IO.Path]::GetTempPath()) ("agent8088-" + [Guid]::NewGuid().ToString("N"))
     $outLog = "$stem.out"
     $errLog = "$stem.err"
+    # Stdin is redirected away from the console along with stdout and stderr.
+    # Console modes are a property of the console, not of a process: a child
+    # that inherits the input handle and alters it leaves the console altered
+    # for everything that runs afterwards. Sharing it here corrupted the setup
+    # wizard that runs later in the same window -- keystrokes were dropped, so
+    # a typed path arrived as "C   sers saa   a mi" and an API key arrived
+    # wrong -- and left the agent's own display broken in that window too. The
+    # piped form this replaced never handed the child a console to begin with.
+    # An empty file, not NUL: a stage that tries to read gets EOF and fails
+    # fast, rather than blocking forever on input nobody knows to type.
+    $inLog = "$stem.in"
+    New-Item -ItemType File -Path $inLog -Force | Out-Null
     $started = Get-Date
     $percent = -1
     $tick = 0
@@ -280,7 +292,8 @@ function Invoke-WithProgress {
             $exeToRun = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
         }
         $proc = Start-Process -FilePath $exeToRun -ArgumentList $argumentString `
-            -NoNewWindow -PassThru -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+            -NoNewWindow -PassThru -RedirectStandardInput $inLog `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
         # Touching .Handle caches it on the object. Without this .ExitCode reads
         # back as $null once the process ends, so every stage would look like a
         # failure and callers would get nothing back.
@@ -325,7 +338,7 @@ function Invoke-WithProgress {
         Write-Warn "could not start: $($_.Exception.Message)"
         return 1
     } finally {
-        Remove-Item $outLog, $errLog -Force -ErrorAction SilentlyContinue
+        Remove-Item $inLog, $outLog, $errLog -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1290,22 +1303,28 @@ function Verify-Install {
     } else {
         Write-Host "  Sandbox:  run 'agent8088 --sandbox-setup' from an elevated terminal"
     }
-    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.ps1)"
+    # $Branch, not a hardcoded one: this told everyone to update from
+    # feat/install-all-deps, a merged feature branch that can be deleted at any
+    # time -- and it printed that even for someone who had installed from main.
+    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$Branch/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }
 
 function Run-InitialSetup {
-    if (-not $script:FreshInstall) {
-        Write-Info "Existing installation updated - skipping first-run setup."
-        return
-    }
+    # Setup runs on an update too, not only on a fresh install. Skipping it left
+    # no way to change a model, endpoint or workspace through the installer: the
+    # only run that offered the wizard was the first one, and every run after it
+    # printed "skipping" whatever had changed. The wizard reads the existing
+    # config and offers each stored value back as the default, so re-running it
+    # and pressing Enter through the prompts leaves the file as it was.
+    # -SkipSetup and -NonInteractive remain the ways to opt out.
     if ($SkipSetup) {
-        Write-Info "Skipping first-run setup (--SkipSetup)"
+        Write-Info "Skipping setup (--SkipSetup)"
         return
     }
     if ($NonInteractive) {
-        Write-Info "Non-interactive mode - skipping first-run setup"
+        Write-Info "Non-interactive mode - skipping setup"
         Write-Info "Run agent8088 --setup later to configure your model."
         return
     }
@@ -1315,12 +1334,16 @@ function Run-InitialSetup {
         Write-Warn "agent8088 command is not ready yet; run agent8088 --setup later."
         return
     }
-    Write-Info "Starting first-run setup..."
+    if ($script:FreshInstall) {
+        Write-Info "Starting first-run setup..."
+    } else {
+        Write-Info "Starting setup - press Enter at any prompt to keep the current value..."
+    }
     & $agentExe --setup
     if ($LASTEXITCODE -eq 0) {
         $script:InitialSetupRan = $true
     } else {
-        Write-Warn "First-run setup did not complete; run agent8088 --setup later."
+        Write-Warn "Setup did not complete; run agent8088 --setup later."
     }
 }
 
