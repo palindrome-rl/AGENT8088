@@ -1647,6 +1647,13 @@ def do_chat(query):
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
                 temperature=S.temperature,
+                # The session names the run so a fact learned here can be told
+                # apart from one learned in another session.
+                memory_run_id=S.name or None,
+                # The REPL has already rendered its answer by the time the
+                # extraction call runs, so it goes on a background thread and the
+                # user never waits for it. The gateway and cron stay synchronous.
+                memory_background=True,
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
                 on_result=_on_result, on_escalation=_on_escalation,
                 on_answer=None, on_token=on_token,
@@ -1742,6 +1749,8 @@ def cmd_help(_):
         ("/reset", "Clear the active session while retaining its name"),
         ("/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)"),
         ("/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)"),
+        ("/memory [on|off|search|add|forget|clear]",
+         "Persistent memory across sessions — recalls facts each turn, learns from finished turns"),
         ("/config", "Show the active configuration (model, endpoint, paths)"),
         ("/history", "Show the current conversation"),
         ("/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace"),
@@ -2902,6 +2911,177 @@ def _show_limits():
                   "/limits tool <name> <seconds>[/dim]")
 
 
+def _memory_set_enabled(want: bool) -> None:
+    A.update_simple_config(A.CONFIG_PATH, {"memory": int(want)})
+    A.APP_CONFIG["memory"] = "1" if want else "0"
+    A.configure_memory()
+
+
+def _show_memory_status():
+    report = A.memory.status()
+    if not report["enabled"]:
+        console.print("[dim]memory: off[/dim]")
+        console.print("[dim]/memory on to enable — recalls relevant facts each turn "
+                      "and learns from finished turns[/dim]")
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+    table.add_column("Setting", style="#237dd7")
+    table.add_column("Value", style="#237dd7")
+    table.add_row("Memories", str(report["count"]))
+    table.add_row("Scope", report["user_id"]
+                  + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
+    if report["embedder_ok"]:
+        retrieval = f"keyword + semantic ({report['embed_model']})"
+    else:
+        # Naming the reason matters: recall still works on keywords alone, and a
+        # user who thinks memory is broken will turn it off instead of pulling the
+        # model.
+        reason = report["embedder_error"] or "not reachable"
+        retrieval = f"keyword only — {report['embed_model']}: {reason}"
+    table.add_row("Retrieval", retrieval)
+    table.add_row("Learning", "on" if report["capture_enabled"] else "off (recall only)")
+    table.add_row("Extractor", report["extract_model"])
+    table.add_row("Injected per turn", str(report["recall_limit"]))
+    table.add_row("Store", f"{report['db_path']}"
+                  + (f" ({report.get('db_bytes', 0) / 1024:.0f} KB)"
+                     if report.get("db_bytes") else ""))
+    if report["stale_vectors"]:
+        table.add_row("Needs re-embedding", f"{report['stale_vectors']} "
+                      "(embedding model changed)")
+    last = report.get("last_capture") or {}
+    if last:
+        cost = (last.get("input_tokens", 0) or 0) + (last.get("output_tokens", 0) or 0)
+        table.add_row("Last learning call", f"{cost} tokens, stored "
+                      f"{last.get('stored', 0)}")
+    if report["error"]:
+        table.add_row("Error", report["error"])
+    console.print(table)
+    console.print("[dim]/memory search <query> · /memory add <text> · "
+                  "/memory forget <id> · /memory clear · /memory off[/dim]")
+
+
+def _show_memory_search(query):
+    results = A.memory.recall(query, limit=10)
+    if not results:
+        console.print("[dim]no memories matched[/dim]")
+        return
+    table = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+    table.add_column("Score", style="#237dd7")
+    table.add_column("Words", style="dim")
+    table.add_column("Meaning", style="dim")
+    table.add_column("Memory", style="#237dd7")
+    table.add_column("Id", style="dim")
+    for row in results:
+        table.add_row(
+            f"{row['score']:.4f}",
+            str(row["bm25_rank"] or "—"),
+            str(row["vector_rank"] or "—"),
+            row["text"][:80],
+            row["id"][:8],
+        )
+    console.print(table)
+    # The per-leg ranks are the point of this view: they show whether a hit came
+    # from words, from meaning, or from both agreeing, which is the only way to
+    # tell a tuning problem from a missing embedder.
+    console.print("[dim]Words/Meaning are each leg's rank; the score fuses them (RRF)[/dim]")
+
+
+def cmd_memory(rest):
+    """Show or change persistent memory. Changes persist to config.txt."""
+    parts = rest.strip().split(None, 1)
+    action = parts[0].lower() if parts else ""
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    if not action:
+        _show_memory_status()
+        return
+
+    if action in {"on", "off"}:
+        want = action == "on"
+        _memory_set_enabled(want)
+        if not want:
+            console.print("[dim]memory off — nothing is recalled or learned. "
+                          "Stored memories are kept.[/dim]")
+            return
+        report = A.memory.status()
+        console.print("[green]memory on[/green] "
+                      f"[dim]— {report['count']} memories at {report['db_path']}[/dim]")
+        if not report["embedder_ok"]:
+            console.print(f"[yellow]note:[/yellow] embedding model "
+                          f"{report['embed_model']} is not available, so recall is "
+                          f"keyword-only.")
+            console.print(f"[dim]pull it with:  ollama pull {report['embed_model']}[/dim]")
+        return
+
+    if not A.memory.enabled():
+        console.print("[dim]memory is off — /memory on first[/dim]")
+        return
+
+    if action == "search":
+        if not argument:
+            console.print("[red]usage:[/red] /memory search <query>")
+            return
+        _show_memory_search(argument)
+        return
+
+    if action == "add":
+        if not argument:
+            console.print("[red]usage:[/red] /memory add <text>")
+            return
+        store = A.memory.store()
+        if store is None:
+            console.print("[red]error:[/red] memory store is not available")
+            return
+        embedder = A.memory.embedder()
+        vector = embedder.embed_one(argument) if embedder else []
+        memory_id = store.add(argument, user_id=A.memory.user_id(), embedding=vector,
+                              embed_model=A.memory._RUNTIME.get("embed_model", ""),
+                              project=str(A.PROJECT_ROOT), source="user")
+        if memory_id:
+            console.print(f"[green]remembered[/green] [dim]{memory_id[:8]}[/dim]")
+        else:
+            console.print("[dim]already remembered[/dim]")
+        return
+
+    if action == "forget":
+        if not argument:
+            console.print("[red]usage:[/red] /memory forget <id>   (see /memory search)")
+            return
+        store = A.memory.store()
+        # An 8-character prefix is what /memory search prints, so accept it rather
+        # than making the user retype a full uuid they were never shown.
+        rows = [row for row in store.get_all(user_id=A.memory.user_id(), limit=100000)
+                if row["id"].startswith(argument)]
+        if not rows:
+            console.print(f"[red]no memory starts with[/red] {argument}")
+            return
+        if len(rows) > 1:
+            console.print(f"[red]{argument} matches {len(rows)} memories[/red] "
+                          "[dim]— use a longer id[/dim]")
+            return
+        store.delete(rows[0]["id"])
+        console.print(f"[green]forgotten:[/green] [dim]{rows[0]['text'][:70]}[/dim]")
+        return
+
+    if action == "clear":
+        store = A.memory.store()
+        count = store.count(user_id=A.memory.user_id())
+        if not count:
+            console.print("[dim]nothing to clear[/dim]")
+            return
+        if not _confirm_destructive(f"Delete all {count} memories",
+                                    f"for {A.memory.user_id()}"):
+            console.print("[dim]kept[/dim]")
+            return
+        console.print(f"[green]cleared {store.delete_all(user_id=A.memory.user_id())}"
+                      "[/green]")
+        return
+
+    console.print(f"[red]unknown:[/red] /memory {action}  "
+                  "[dim](status · on · off · search · add · forget · clear)[/dim]")
+
+
 def cmd_limits(rest):
     """Show or change a limit. Changes persist to config.txt."""
     parts = rest.split()
@@ -3073,6 +3253,7 @@ COMMANDS = {
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
+    "memory": cmd_memory,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 
@@ -3441,6 +3622,68 @@ def _reload_model_runtime(config_path, provider="", model=""):
         A.activate_model(provider, model)
 
 
+DEFAULT_EMBED_MODEL = "nomic-embed-text"
+
+
+def _backfill_memory_key(content, set_line):
+    """Give an older config the `memory` key, and say so.
+
+    Memory ships on: the packaged template carries memory=1 and the installers
+    pull the embedding model. But setup edits a config in place, so one written
+    before this key existed never gains it and falls back to the conservative code
+    default — a user who upgrades would silently have no memory while a fresh
+    install has it, with no way to discover the key short of reading the source.
+    Same reasoning and same shape as the web_search_no_prompt backfill above.
+
+    Announced rather than silent, because it starts spending a model call per
+    turn. Backfilled only on an explicit reconfiguration, so `memory=0` set by
+    hand still sticks.
+    """
+    import re as _re
+    if _re.search(r'^\s*memory=', content, _re.MULTILINE):
+        return content
+    packaged = Path(__file__).with_name("config.txt")
+    try:
+        shipped = _re.search(r'^\s*memory=(.*)$',
+                             packaged.read_text(encoding="utf-8"), _re.MULTILINE)
+    except OSError:
+        shipped = None
+    if not (shipped and shipped.group(1).strip()):
+        return content
+    value = shipped.group(1).strip()
+    content = set_line(content, "memory", value)
+    if value == "0":
+        return content
+    print(f"\nAdded memory={value} — the agent now remembers durable facts across "
+          "sessions.")
+    print("  One extra model call per turn, made after each answer. /memory off "
+          "to disable.")
+    if _embedding_model_present():
+        print(f"  Semantic recall: on ({DEFAULT_EMBED_MODEL} installed).")
+    else:
+        # Recall still works on keywords alone. Saying so is the difference between
+        # a user fixing it with one command and concluding memory is broken.
+        print(f"  Semantic recall: off — {DEFAULT_EMBED_MODEL} is not installed, so "
+              "recall uses")
+        print(f"  keyword search only. Enable it with:  ollama pull "
+              f"{DEFAULT_EMBED_MODEL}")
+    return content
+
+
+def _embedding_model_present() -> bool:
+    """Whether the embedding model is pulled. False for any doubt, including no
+    Ollama at all — a cloud provider serves /embeddings itself, and claiming a
+    local model is installed when it is not is the failure this reporting exists
+    to prevent."""
+    import subprocess
+    try:
+        listing = subprocess.run(["ollama", "list"], capture_output=True, text=True,
+                                 timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return listing.returncode == 0 and DEFAULT_EMBED_MODEL in listing.stdout
+
+
 def _run_setup(config_path=None, include_workspace=True, activate_runtime=False, heading="Agent8088 setup"):
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
@@ -3639,6 +3882,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             content = _set_line(content, "web_search_no_prompt", value)
             print(f"Added web_search_no_prompt={value} "
                   "(approval-free search, local SearXNG only).")
+    content = _backfill_memory_key(content, _set_line)
     _write_private_text(config_path, content)
     if activate_runtime:
         _reload_model_runtime(config_path, provider, model_name)
