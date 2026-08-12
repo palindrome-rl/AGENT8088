@@ -2891,7 +2891,13 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
         if instruction:
             kwargs["instruction"] = instruction
         value = prompt(**kwargs).execute()
-    except ImportError:
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        # ImportError: InquirerPy not installed.
+        # EOFError/OSError: InquirerPy crashed at runtime (e.g. macOS Python
+        #   3.13 kqueue selector issue with prompt_toolkit, non-interactive
+        #   terminal, piped stdin).
+        # KeyboardInterrupt: user hit Ctrl-C during a prompt.
+        # All fall back to stdlib input()/getpass().
         suffix = ""
         if secret and instruction:
             suffix = f" {instruction}"
@@ -2918,7 +2924,8 @@ def _choice_prompt(message, choices, default=""):
         if default:
             kwargs["default"] = default
         return inquirer.fuzzy(**kwargs).execute()
-    except ImportError:
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        # See _custom_prompt for why these exceptions are grouped.
         print(message)
         for index, choice in enumerate(choices, 1):
             marker = " (default)" if choice == default else ""

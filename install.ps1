@@ -467,7 +467,7 @@ function Install-Deps {
     $prevEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        & $script:UvCmd venv $venvDir 2>&1 | Out-Null
+        & $script:UvCmd venv --python $script:PythonVersion $venvDir 2>&1 | Out-Null
         if (-not (Test-Path $py)) { throw "venv creation failed: $py not found" }
         & $script:UvCmd pip install --python $py --reinstall-package agent8088 -e $InstallDir 2>&1 | Out-Null
         $exit = $LASTEXITCODE

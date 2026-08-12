@@ -402,7 +402,7 @@ install_deps() {
         pip install --upgrade --force-reinstall -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
     else
         log_info "Creating venv and installing via uv..."
-        "$UV_CMD" venv "$INSTALL_DIR/venv" >/dev/null 2>&1
+        "$UV_CMD" venv --python "$PYTHON_PATH" "$INSTALL_DIR/venv" >/dev/null 2>&1
         "$UV_CMD" pip install --python "$_py" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
             log_error "uv pip install failed; trying with --all-extras"
             "$UV_CMD" pip install --python "$_py" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
