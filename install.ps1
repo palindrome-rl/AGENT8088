@@ -110,6 +110,174 @@ function Write-Success { param([string]$Message) Write-Host "[OK] $Message" -For
 function Write-Warn    { param([string]$Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -ForegroundColor Red }
 
+# ----------------------------------------------------------------------------
+# Progress display for the long stages
+# ----------------------------------------------------------------------------
+# These stages fetch tens to hundreds of megabytes -- Chromium alone is ~280 MB.
+# Piping them to Out-Null left the console parked on one line for minutes with
+# no output at all, which is indistinguishable from a hang, and threw away the
+# child's diagnostics so a failure surfaced only as an exit code.
+#
+# Invoke-WithProgress runs the child asynchronously, captures its output, and
+# animates a bar until it exits. Percentages are read back out of that captured
+# output when the tool reports them (uv and playwright both do), so the bar
+# tracks the real download rather than a timer; until a percentage appears it
+# shows an indeterminate sweep and the elapsed seconds. Nothing is invented.
+$script:ProgressBarWidth = 24
+
+# Animation needs a real console. Redirected output (a pipe, a log file, CI)
+# gets the plain one-line-per-stage form instead, because \r animation there
+# just accumulates thousands of junk lines in the log.
+function Test-ProgressAnimated {
+    if ($env:AGENT8088_NO_PROGRESS) { return $false }
+    try { return -not [Console]::IsOutputRedirected } catch { return $false }
+}
+
+function Format-ProgressBar {
+    param([int]$Percent)
+    $bounded = [Math]::Max(0, [Math]::Min(100, $Percent))
+    $filled = [int][Math]::Round(($script:ProgressBarWidth * $bounded) / 100.0)
+    return "[" + ("#" * $filled).PadRight($script:ProgressBarWidth, '.') + "]"
+}
+
+# An indeterminate sweep: a short block bouncing inside the same width as a real
+# bar, so the line does not change shape when a percentage finally appears.
+function Format-ProgressSweep {
+    param([int]$Tick)
+    $span = $script:ProgressBarWidth - 4
+    $cycle = $span * 2
+    $offset = $Tick % $cycle
+    if ($offset -ge $span) { $offset = $cycle - $offset }
+    $bar = ("." * $script:ProgressBarWidth).ToCharArray()
+    for ($i = 0; $i -lt 4; $i++) { $bar[$offset + $i] = '#' }
+    return "[" + (-join $bar) + "]"
+}
+
+# Latest percentage the child has reported, or -1 while it has not reported one.
+# Only the tail is read: these logs reach thousands of lines and this runs on a
+# ~8/second tick.
+function Get-ReportedPercent {
+    param([string[]]$Paths, [int]$Fallback)
+    $best = $Fallback
+    foreach ($path in $Paths) {
+        if (-not (Test-Path $path)) { continue }
+        try {
+            $tail = Get-Content -Path $path -Tail 4 -ErrorAction Stop
+        } catch {
+            # The child still holds the handle; this tick simply has no update.
+            continue
+        }
+        foreach ($line in $tail) {
+            $matched = [regex]::Matches([string]$line, '(\d{1,3})\s*%')
+            foreach ($match in $matched) {
+                $value = [int]$match.Groups[1].Value
+                # Monotonic: a tail can straddle two bars (pip finishing one
+                # package as another starts), and a bar must never run backwards.
+                if ($value -le 100 -and $value -ge $best) { $best = $value }
+            }
+        }
+    }
+    return $best
+}
+
+# Start-Process joins -ArgumentList with spaces and quotes nothing, so a path
+# containing a space arrives at the child split into separate arguments. Every
+# path here is derived from $env:LOCALAPPDATA, which contains a space whenever
+# the account name does.
+function ConvertTo-ArgumentString {
+    param([string[]]$ArgumentList)
+    $quoted = foreach ($argument in $ArgumentList) {
+        $text = [string]$argument
+        if ($text -eq "") { '""' }
+        elseif ($text -notmatch '[\s"]') { $text }
+        else {
+            $escaped = $text -replace '"', '\"'
+            # A trailing backslash would escape the closing quote and swallow it.
+            $escaped = $escaped -replace '(\\+)$', '$1$1'
+            '"' + $escaped + '"'
+        }
+    }
+    return ($quoted -join " ")
+}
+
+function Invoke-WithProgress {
+    <#
+    .SYNOPSIS
+    Run a command with a live progress bar, returning its exit code.
+    .DESCRIPTION
+    Returns the child's exit code so callers keep the same $LASTEXITCODE-shaped
+    control flow they had with Out-Null. On failure the tail of the captured
+    output is printed -- the Out-Null form discarded it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$ArgumentList
+    )
+
+    if (-not (Test-ProgressAnimated)) {
+        Write-Info "$Label..."
+        & $FilePath @ArgumentList 2>&1 | Out-Null
+        return $LASTEXITCODE
+    }
+
+    $stem = Join-Path ([IO.Path]::GetTempPath()) ("agent8088-" + [Guid]::NewGuid().ToString("N"))
+    $outLog = "$stem.out"
+    $errLog = "$stem.err"
+    $started = Get-Date
+    $percent = -1
+    $tick = 0
+
+    try {
+        # Start-Process rather than the call operator: the bar can only animate
+        # while the child runs, and a plain call blocks until it finishes.
+        # -RedirectStandardOutput needs two distinct paths; pointing both at one
+        # file fails outright.
+        $proc = Start-Process -FilePath $FilePath -ArgumentList (ConvertTo-ArgumentString $ArgumentList) `
+            -NoNewWindow -PassThru -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+        # Touching .Handle caches it on the object. Without this .ExitCode reads
+        # back as $null once the process ends, so every stage would look like a
+        # failure and callers would get nothing back.
+        $null = $proc.Handle
+
+        while (-not $proc.HasExited) {
+            Start-Sleep -Milliseconds 120
+            $percent = Get-ReportedPercent -Paths @($outLog, $errLog) -Fallback $percent
+            $bar = if ($percent -ge 0) { Format-ProgressBar $percent } else { Format-ProgressSweep $tick }
+            $suffix = if ($percent -ge 0) { "{0,3}%" -f $percent } else { "{0,4:0}s" -f ((Get-Date) - $started).TotalSeconds }
+            Write-Host ("`r  $bar $Label $suffix ".PadRight(78)) -NoNewline -ForegroundColor Cyan
+            $tick++
+        }
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+
+        # Clear the animated line so the [OK]/[!] the caller prints owns it.
+        Write-Host ("`r" + (" " * 78) + "`r") -NoNewline
+
+        if ($exitCode -ne 0) {
+            foreach ($path in @($errLog, $outLog)) {
+                if (-not (Test-Path $path)) { continue }
+                $tail = @(Get-Content -Path $path -Tail 12 -ErrorAction SilentlyContinue |
+                          Where-Object { $_ -and $_.Trim() })
+                if ($tail.Count) {
+                    Write-Host "    $($tail -join "`n    ")" -ForegroundColor DarkGray
+                    break
+                }
+            }
+        }
+        return $exitCode
+    } catch {
+        # Start-Process itself failed (missing executable, blocked by policy).
+        # Report it as a non-zero exit so the caller's warn-and-continue path
+        # runs, rather than aborting an install over the progress display.
+        Write-Host ("`r" + (" " * 78) + "`r") -NoNewline
+        Write-Warn "could not start: $($_.Exception.Message)"
+        return 1
+    } finally {
+        Remove-Item $outLog, $errLog -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Protect-ConfigFile {
     param([string]$Path)
     $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
@@ -239,11 +407,11 @@ function Test-Python {
         } catch { }
     }
 
-    Write-Info "Python not found, installing via uv..."
     $prevEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        & $script:UvCmd python install $PythonVersion 2>&1 | Out-Null
+        Invoke-WithProgress -Label "Python $PythonVersion (via uv)" `
+            -FilePath $script:UvCmd -ArgumentList @("python", "install", $PythonVersion) | Out-Null
         $ErrorActionPreference = $prevEAP
         $pythonPath = & $script:UvCmd python find $PythonVersion 2>$null
         if ($pythonPath) {
@@ -488,8 +656,9 @@ function Install-Deps {
                 throw "venv creation failed (uv exit $LASTEXITCODE)"
             }
         }
-        & $script:UvCmd pip install --python $py --reinstall-package agent8088 -e $InstallDir 2>&1 | Out-Null
-        $exit = $LASTEXITCODE
+        $exit = Invoke-WithProgress -Label "agent8088 and its dependencies" `
+            -FilePath $script:UvCmd `
+            -ArgumentList @("pip", "install", "--python", $py, "--reinstall-package", "agent8088", "-e", $InstallDir)
         $ErrorActionPreference = $prevEAP
         if ($exit -ne 0) {
             Write-Err "uv pip install failed (exit $exit)"
@@ -521,9 +690,10 @@ function Install-Gateway-Extras {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[gateway]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $code = Invoke-WithProgress -Label "Gateway adapters (Slack, Discord, WhatsApp, Telegram)" `
+            -FilePath $script:UvCmd `
+            -ArgumentList @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]")
+        if ($code -eq 0) {
             $script:GatewayExtrasInstalled = $true
             Write-Success "Gateway adapters installed"
         } else {
@@ -531,9 +701,10 @@ function Install-Gateway-Extras {
         }
 
         # Keyless web search backend ([search] extra - see pyproject.toml).
-        Write-Info "Installing keyless web search backend (ddgs)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[search]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $code = Invoke-WithProgress -Label "Keyless web search backend (ddgs)" `
+            -FilePath $script:UvCmd `
+            -ArgumentList @("pip", "install", "--python", $py, "-e", "$InstallDir[search]")
+        if ($code -eq 0) {
             $script:SearchExtrasInstalled = $true
             Write-Success "Keyless web search backend installed"
         } else {
@@ -542,12 +713,13 @@ function Install-Gateway-Extras {
 
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
-        Write-Info "Installing Playwright (optional, for browse_page)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[browser]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Info "Installing Playwright Chromium browser (~280 MB)..."
-            & $py -m playwright install chromium 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+        $code = Invoke-WithProgress -Label "Playwright (optional, for browse_page)" `
+            -FilePath $script:UvCmd `
+            -ArgumentList @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]")
+        if ($code -eq 0) {
+            $code = Invoke-WithProgress -Label "Playwright Chromium browser (~280 MB)" `
+                -FilePath $py -ArgumentList @("-m", "playwright", "install", "chromium")
+            if ($code -eq 0) {
                 $script:ChromiumInstalled = $true
                 Write-Success "Chromium installed for browse_page"
             } else {
@@ -666,16 +838,17 @@ function Install-Node-Bridge {
         return
     }
 
-    Write-Info "Installing WhatsApp bridge npm dependencies..."
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $npmExe install --prefix $bridgeDir --no-audit --no-fund 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $nodeModules)) {
+        $code = Invoke-WithProgress -Label "WhatsApp bridge npm dependencies" `
+            -FilePath $npmExe `
+            -ArgumentList @("install", "--prefix", $bridgeDir, "--no-audit", "--no-fund")
+        if ($code -eq 0 -and (Test-Path $nodeModules)) {
             $script:WhatsAppBridgeReady = $true
             Write-Success "WhatsApp bridge npm dependencies installed"
         } else {
-            Write-Warn "WhatsApp bridge npm install failed (exit $LASTEXITCODE)"
+            Write-Warn "WhatsApp bridge npm install failed (exit $code)"
         }
     } finally {
         $ErrorActionPreference = $prevEAP
