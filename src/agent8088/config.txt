@@ -147,7 +147,8 @@ memory=1
 # memory_scope_by_identity=0
 #
 # Embedding model for the semantic leg, served over the OpenAI-compatible
-# /embeddings endpoint of your provider. nomic-embed-text is 274MB, 768 dims:
+# /embeddings endpoint of the provider named below -- NOT of your chat provider.
+# nomic-embed-text is 274MB, 768 dims:
 #   ollama pull nomic-embed-text
 # Alternatives, larger and slightly stronger: embeddinggemma (622MB),
 # mxbai-embed-large (670MB), qwen3-embedding:0.6b (~1.2GB). Smallest usable:
@@ -156,8 +157,13 @@ memory=1
 # Changing this is detected rather than silently mixing incompatible vectors:
 # rows embedded by another model are excluded and counted in `/memory`.
 # memory_embed_model=nomic-embed-text
-# Use a different provider for embeddings than for chat (default: same one).
-# memory_embed_provider=
+# Which provider serves the embeddings request. Defaults to `ollama`, NOT to your
+# chat provider: chat and embeddings are separate services in almost every real
+# setup, and nomic-embed-text is an Ollama model, so deriving this from
+# default_provider asked the wrong host and reported the model as missing when it
+# was simply never requested from the machine holding it. Whatever serves your
+# chat does not matter here. Set this only if your embeddings live elsewhere.
+# memory_embed_provider=ollama
 #
 # Model for the fact-extraction call (default: your chat model). Point this at
 # something small if one extra call per turn on your main model is too slow.

@@ -4,6 +4,33 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Memory embeddings no longer depend on the chat provider
+
+### Fixed
+
+- **Embeddings were asked of whatever served chat.** `memory_embed_provider`
+  defaulted to `default_provider`, which is wrong by construction: chat models and
+  embedding models are separate services in almost every real setup, and the
+  default embed model (`nomic-embed-text`) is an Ollama model. A user chatting with
+  a 35B model on a LAN box had embeddings asked of that box, which answered **401**
+  — so `/memory` reported the model unavailable, semantic recall silently fell back
+  to keyword-only, and the advice printed was `ollama pull nomic-embed-text`, which
+  could not possibly help: the request was never going to Ollama. Pulling the model
+  changed nothing.
+- **The default is now `ollama`**, where the model actually lives and where both
+  installers put it, independent of `default_provider`. It is always resolvable
+  because `PROVIDERS` includes the built-ins. Whatever serves chat is irrelevant to
+  recall. `memory_embed_provider` still overrides for embeddings served elsewhere,
+  and the chat client is untouched.
+- **Failure messages now name the host that was asked.** `/memory` and
+  `describe_capabilities` report `<model> on <provider>`, and the unavailable hint
+  branches on it: a pull is suggested only when Ollama was the endpoint, otherwise
+  it points at `memory_embed_provider`. The pull hint also says "in a terminal",
+  because the previous wording read like something to type at the agent prompt —
+  where it goes to the model as a chat message and produces no answer.
+
+---
+
 ## Persistent memory: SQLite with hybrid BM25 + embedding retrieval
 
 ### Added

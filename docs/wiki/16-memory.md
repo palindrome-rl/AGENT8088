@@ -140,8 +140,16 @@ mixed**: every vector row records the model and dimension that produced it, so
 rows from another model are excluded from the vector leg and counted in
 `/memory` as needing re-embedding.
 
+**Embeddings do not go through your chat provider.** They are asked of `ollama`
+by default, because that is where `nomic-embed-text` lives and where the
+installers put it. Whatever serves your chat — a LAN box, OpenRouter, Cerebras —
+is irrelevant to recall. If your embeddings live somewhere else, point
+`memory_embed_provider` at it.
+
 **No embedder is not a failure.** If the model is missing or Ollama is down,
-recall runs on keyword search alone and the turn proceeds normally.
+recall runs on keyword search alone and the turn proceeds normally. `/memory`
+names the host that was asked and the error it gave, because "pull the model"
+cannot help a host that never received the request.
 
 ## Where it lives
 
@@ -237,7 +245,7 @@ Full reference in [Configuration](02-configuration.md). The keys:
 | `memory_user_id` | `owner` | Whose memories these are |
 | `memory_scope_by_identity` | `0` | Separate namespace per gateway identity |
 | `memory_embed_model` | `nomic-embed-text` | Embedding model |
-| `memory_embed_provider` | *(chat provider)* | Provider serving `/embeddings` |
+| `memory_embed_provider` | `ollama` | Provider asked for embeddings — independent of your chat provider |
 | `memory_extract_model` | *(chat model)* | Model doing the extraction |
 | `memory_capture` | `1` | Learn new facts |
 | `memory_recall_limit` | `5` | Facts injected per turn |
