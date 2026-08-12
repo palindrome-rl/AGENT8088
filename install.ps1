@@ -86,6 +86,7 @@ $FreshInstall = $false
 $InitialSetupRan = $false
 # Readiness flags set by the new stages so Verify-Install can report actual state.
 $GatewayExtrasInstalled = $false
+$SearchExtrasInstalled = $false
 $ChromiumInstalled = $false
 $NodeInstalled = $false
 $WhatsAppBridgeReady = $false
@@ -511,13 +512,31 @@ function Install-Gateway-Extras {
             Write-Warn "Gateway extras install failed (exit $LASTEXITCODE) - core agent still works"
         }
 
-        Write-Info "Installing Playwright Chromium browser (~280 MB)..."
-        & $py -m playwright install chromium 2>&1 | Out-Null
+        # Keyless web search backend ([search] extra - see pyproject.toml).
+        Write-Info "Installing keyless web search backend (ddgs)..."
+        & $script:UvCmd pip install --python $py -e "$InstallDir[search]" 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            $script:ChromiumInstalled = $true
-            Write-Success "Chromium installed for browse_page"
+            $script:SearchExtrasInstalled = $true
+            Write-Success "Keyless web search backend installed"
         } else {
-            Write-Warn "Chromium download failed - browse_page will show install instructions"
+            Write-Warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+        }
+
+        # Playwright is an optional [browser] extra, so install the package
+        # before asking it to fetch the Chromium binary.
+        Write-Info "Installing Playwright (optional, for browse_page)..."
+        & $script:UvCmd pip install --python $py -e "$InstallDir[browser]" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Info "Installing Playwright Chromium browser (~280 MB)..."
+            & $py -m playwright install chromium 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $script:ChromiumInstalled = $true
+                Write-Success "Chromium installed for browse_page"
+            } else {
+                Write-Warn "Chromium download failed - browse_page will show install instructions"
+            }
+        } else {
+            Write-Warn "Playwright install failed - browse_page will show install instructions"
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -951,6 +970,11 @@ function Verify-Install {
         Write-Host "  Adapters: Slack/Discord/Telegram/WhatsApp (Python deps installed)"
     } else {
         Write-Host "  Adapters: gateway extras not installed (run: uv pip install -e `".[gateway]`")"
+    }
+    if ($script:SearchExtrasInstalled) {
+        Write-Host "  Search:   keyless ddgs backend installed"
+    } else {
+        Write-Host "  Search:   ddgs unavailable - configure SearXNG or an API-key backend"
     }
     if ($script:ChromiumInstalled) {
         Write-Host "  Browser:  Chromium installed (browse_page ready)"

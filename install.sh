@@ -44,6 +44,7 @@ FRESH_INSTALL=false
 INITIAL_SETUP_RAN=false
 # Readiness flags set by the new stages so verify_install can report actual state.
 GATEWAY_EXTRAS_INSTALLED=false
+SEARCH_EXTRAS_INSTALLED=false
 CHROMIUM_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
@@ -427,6 +428,19 @@ install_deps() {
     fi
     [ "$GATEWAY_EXTRAS_INSTALLED" = true ] && log_success "Gateway adapters installed"
 
+    # --- Keyless web search backend (optional [search] extra) ---
+    # Installed everywhere so web_search keeps its no-key fallback; non-fatal
+    # because ddgs->primp has no Android wheel and cannot build under Termux.
+    log_info "Installing keyless web search backend (ddgs)..."
+    if [ "$DISTRO" = "termux" ]; then
+        pip install -e ".[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
+            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+    else
+        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
+            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+    fi
+    [ "$SEARCH_EXTRAS_INSTALLED" = true ] && log_success "Keyless web search backend installed"
+
     # --- Playwright (optional [browser] extra) + Chromium binary ---
     # playwright degrades gracefully at runtime (engine.py: _playwright_available()),
     # so it's an optional extra, not a core dep - a platform/Python combo without
@@ -546,15 +560,20 @@ install_node_bridge() {
                 *)            _arch="x64" ;;
             esac
             local _os_tag _ext
+            # .tar.gz on both: .tar.xz needs xz-utils, which minimal images
+            # (e.g. ubuntu:24.04) do not ship - tar then fails and, under
+            # `set -e`, took down the whole installer at an optional stage.
             case "$OS" in
                 macos) _os_tag="darwin"; _ext="tar.gz" ;;
-                linux) _os_tag="linux";  _ext="tar.xz" ;;
+                linux) _os_tag="linux";  _ext="tar.gz" ;;
             esac
             local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
             local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
             if curl -fsSL "$_url" -o "$_tmp" 2>/dev/null; then
                 mkdir -p "$AGENT8088_HOME/node"
-                tar -xf "$_tmp" -C "$AGENT8088_HOME/node" --strip-components=1 2>/dev/null
+                # Guarded: Node is optional (WhatsApp bridge only), so a bad
+                # tarball or missing decompressor must warn, not abort the run.
+                tar -xf "$_tmp" -C "$AGENT8088_HOME/node" --strip-components=1 2>/dev/null || true
                 rm -f "$_tmp"
                 if [ -x "$AGENT8088_HOME/node/bin/node" ]; then
                     export PATH="$AGENT8088_HOME/node/bin:$PATH"
@@ -1066,6 +1085,11 @@ verify_install() {
         echo "  Adapters: Slack/Discord/Telegram/WhatsApp (Python deps installed)"
     else
         echo "  Adapters: gateway extras not installed (run: uv pip install -e \".[gateway]\")"
+    fi
+    if [ "$SEARCH_EXTRAS_INSTALLED" = true ]; then
+        echo "  Search:   keyless ddgs backend installed"
+    else
+        echo "  Search:   ddgs unavailable - configure SearXNG or an API-key backend"
     fi
     if [ "$CHROMIUM_INSTALLED" = true ]; then
         echo "  Browser:  Chromium installed (browse_page ready)"
