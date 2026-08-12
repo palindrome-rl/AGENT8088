@@ -1003,6 +1003,15 @@ function Run-InitialSetup {
     }
 }
 
+function Start-InitialAgent {
+    if (-not $script:FreshInstall -or -not $script:InitialSetupRan) { return }
+
+    $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
+    Write-Host ""
+    Write-Info "Starting Agent8088..."
+    & $agentExe
+}
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -1019,3 +1028,4 @@ Setup-Path
 Drop-Config
 Run-InitialSetup
 Verify-Install
+Start-InitialAgent

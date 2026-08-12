@@ -1110,6 +1110,16 @@ run_initial_setup() {
     fi
 }
 
+launch_initial_agent() {
+    [ "$FRESH_INSTALL" = true ] || return 0
+    [ "$INITIAL_SETUP_RAN" = true ] || return 0
+
+    local shim="$(get_command_link_dir)/agent8088"
+    echo ""
+    log_info "Starting Agent8088..."
+    run_agent8088_command "$shim"
+}
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -1127,6 +1137,7 @@ main() {
     drop_config
     run_initial_setup
     verify_install
+    launch_initial_agent
 }
 
 main "$@"

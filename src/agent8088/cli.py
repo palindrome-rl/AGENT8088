@@ -2890,7 +2890,7 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
             kwargs["default"] = default
         if instruction:
             kwargs["instruction"] = instruction
-        return prompt(**kwargs).execute()
+        value = prompt(**kwargs).execute()
     except ImportError:
         suffix = ""
         if secret and instruction:
@@ -2901,9 +2901,14 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
             suffix += f" {instruction}"
         if secret:
             import getpass
-            return getpass.getpass(f"{message}{suffix} ") or ""
-        value = input(f"{message}{suffix} ").strip()
-        return value or default
+            value = getpass.getpass(f"{message}{suffix} ") or ""
+        else:
+            value = input(f"{message}{suffix} ").strip() or default
+    # Secrets read via getpass on Windows can carry a trailing \r; strip
+    # whitespace so a CRLF in the input doesn't crash update_env_file.
+    if secret:
+        return value.strip()
+    return value
 
 
 def _choice_prompt(message, choices, default=""):
@@ -3143,7 +3148,13 @@ def _remove_agent8088_shim(home):
         text = ""
     if str(home) not in text and "-m agent8088.cli" not in text:
         return False
-    shim.unlink()
+    try:
+        shim.unlink()
+    except PermissionError:
+        # On Windows the running agent8088.exe IS the shim - the OS holds a
+        # lock on it. The deferred cmd.exe rmtree in _run_uninstall will
+        # remove it after this process exits.
+        return False
     return True
 
 
