@@ -1741,6 +1741,7 @@ def cmd_help(_):
         ("/resume <name>", "Load a named session"),
         ("/reset", "Clear the active session while retaining its name"),
         ("/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)"),
+        ("/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)"),
         ("/config", "Show the active configuration (model, endpoint, paths)"),
         ("/history", "Show the current conversation"),
         ("/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace"),
@@ -2857,6 +2858,89 @@ def cmd_maxturns(rest):
     _save_preferences()
 
 
+def _fmt_limit(key, value):
+    """0 means 'no limit' for most budgets — printing a bare 0 reads as 'off by
+    accident' rather than 'deliberately unbounded'."""
+    if value == 0 and key in A.LIMITS_WHERE_ZERO_MEANS_UNLIMITED:
+        return "unlimited"
+    return str(value)
+
+
+def _report_limit_change(change):
+    arrow = f"{_fmt_limit(change['key'], change['old'])} → {_fmt_limit(change['key'], change['new'])}"
+    if change["direction"] == "looser":
+        console.print(f"[#e0a800]⚠ raised[/#e0a800] {change['key']}: {arrow}")
+    elif change["direction"] == "tighter":
+        console.print(f"[#237dd7]tightened[/#237dd7] {change['key']}: {arrow}")
+    else:
+        console.print(f"[dim]{change['key']} unchanged ({arrow})[/dim]")
+    if change["over_ceiling"]:
+        console.print(
+            f"  [#e0a800]above the recommended {change['ceiling']}[/#e0a800] — "
+            "one request can now run a long way before anything stops it.")
+    console.print(f"  [dim]saved to {A.CONFIG_PATH}[/dim]")
+
+
+def _show_limits():
+    t = Table(title="Limits", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Limit", style="#237dd7")
+    t.add_column("Value", style="#237dd7")
+    t.add_column("What it bounds", style="dim")
+    t.add_row("max_turns", str(S.max_turns), "Rounds the main agent may take")
+    for key, (const_name, _caster, blurb) in A.LIMIT_SPECS.items():
+        t.add_row(key, _fmt_limit(key, getattr(A, const_name)), blurb)
+    console.print(t)
+
+    st = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+    st.add_column("Sub-agent", style="#237dd7")
+    st.add_column("Turns", style="#237dd7")
+    for name in sorted(A.SUBAGENT_SPECS):
+        st.add_row(name, str(A.SUBAGENT_SPECS[name]["max_turns"]))
+    console.print(st)
+    console.print("[dim]/limits <key> <value> · /limits subagent <name> <turns> · "
+                  "/limits tool <name> <seconds>[/dim]")
+
+
+def cmd_limits(rest):
+    """Show or change a limit. Changes persist to config.txt."""
+    parts = rest.split()
+    if not parts:
+        _show_limits()
+        return
+
+    try:
+        if parts[0] == "subagent":
+            if len(parts) != 3:
+                console.print("[red]usage:[/red] /limits subagent <name> <turns>")
+                return
+            _report_limit_change(A.set_subagent_turns(parts[1], parts[2]))
+            return
+        if parts[0] == "tool":
+            if len(parts) != 3:
+                console.print("[red]usage:[/red] /limits tool <name> <seconds>")
+                return
+            _report_limit_change(A.set_tool_timeout(parts[1], parts[2]))
+            return
+        if len(parts) != 2:
+            console.print("[red]usage:[/red] /limits <key> <value>")
+            return
+        key, value = parts
+        if key == "max_turns":  # lives in the CLI session, not the engine
+            old, S.max_turns = S.max_turns, int(value)
+            _save_preferences()
+            _report_limit_change({"key": "max_turns", "old": old, "new": S.max_turns,
+                                  "direction": "looser" if S.max_turns > old
+                                  else "tighter" if S.max_turns < old else "same",
+                                  "over_ceiling": S.max_turns > 30, "ceiling": 30})
+            return
+        _report_limit_change(A.set_limit(key, value))
+    except KeyError as e:
+        console.print(f"[red]unknown:[/red] {e.args[0]}  (try /limits)")
+    except ValueError as e:
+        console.print(f"[red]invalid:[/red] {e}")
+
+
 def cmd_save(rest):
     path = rest.strip() or "agent8088_session.json"
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
@@ -2976,7 +3060,7 @@ COMMANDS = {
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
-    "maxturns": cmd_maxturns, "save": cmd_save, "clear": cmd_clear,
+    "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 

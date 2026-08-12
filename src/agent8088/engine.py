@@ -309,6 +309,127 @@ COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
 MAX_WRITES_PER_TURN = int(APP_CONFIG.get("max_writes_per_turn", "0"))
 MAX_WRITE_BYTES = int(APP_CONFIG.get("max_write_bytes", "0"))
 
+# --- Runtime-adjustable limits ---------------------------------------------
+# Every limit here lives in two places: a module constant the hot path reads,
+# and a config key that outlives the process. `/limits` writes both, because
+# writing only the constant loses the setting on exit and writing only the file
+# leaves the running process on the old value — and a limit you believe you set
+# but did not is worse than one you never touched.
+#
+# Constants are resolved through globals() at call time, so this table does not
+# depend on where it sits relative to the definitions above.
+LIMIT_SPECS = {
+    "max_turn_tokens":           ("MAX_TURN_TOKENS", int, "Tokens one request may spend"),
+    "max_turn_seconds":          ("MAX_TURN_SECONDS", int, "Wall-clock seconds per request"),
+    "max_turn_cost_usd":         ("MAX_TURN_COST_USD", float, "Spend per request (USD)"),
+    "max_writes_per_turn":       ("MAX_WRITES_PER_TURN", int, "Files written per request"),
+    "max_write_bytes":           ("MAX_WRITE_BYTES", int, "Bytes per single write"),
+    "max_subagent_answer_chars": ("MAX_SUBAGENT_ANSWER_CHARS", int, "Sub-agent answer cap"),
+    "subagent_max_depth":        ("SUBAGENT_MAX_DEPTH", int, "Nested sub-agent depth"),
+    "max_tool_output_bytes":     ("MAX_TOOL_OUTPUT_BYTES", int, "Bytes kept from one tool result"),
+}
+
+# For most of these 0 means "no limit", so the numeric direction of a change is
+# the opposite of its safety direction: 0 -> 50 *adds* a ceiling that was not
+# there, and 50 -> 0 removes it. Comparing the numbers alone would warn on every
+# tightening and stay silent on the one change worth announcing.
+LIMITS_WHERE_ZERO_MEANS_UNLIMITED = frozenset({
+    "max_turn_tokens", "max_turn_seconds", "max_turn_cost_usd",
+    "max_writes_per_turn", "max_write_bytes", "max_subagent_answer_chars",
+})
+
+# Above these a single runaway request stops being cheap to interrupt. Passing
+# one is allowed — it is the user's machine — but it is said out loud.
+LIMIT_SOFT_CEILINGS = {
+    "max_turn_tokens": 200_000,
+    "max_turn_seconds": 900,
+    "max_turn_cost_usd": 10.0,
+    "max_writes_per_turn": 100,
+    "max_write_bytes": 10 * 1024 * 1024,
+    "subagent_max_depth": 3,
+}
+
+
+def limit_direction(key: str, old, new) -> str:
+    """'looser', 'tighter' or 'same' — in safety terms, not numeric terms."""
+    if old == new:
+        return "same"
+    if key in LIMITS_WHERE_ZERO_MEANS_UNLIMITED:
+        if old == 0:
+            return "tighter"   # a ceiling now exists where none did
+        if new == 0:
+            return "looser"    # the ceiling was removed entirely
+    return "looser" if new > old else "tighter"
+
+
+def set_limit(key: str, value) -> dict:
+    """Apply a limit to the live process and persist it. Returns a change record.
+
+    Raises KeyError for an unknown key and ValueError for a value that is not a
+    number or is negative, so a typo cannot silently write a junk config entry.
+    """
+    if key not in LIMIT_SPECS:
+        raise KeyError(key)
+    const_name, caster, _ = LIMIT_SPECS[key]
+    try:
+        new = caster(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} takes a number, got {value!r}")
+    if new < 0:
+        raise ValueError(f"{key} cannot be negative")
+
+    old = globals()[const_name]
+    globals()[const_name] = new
+    APP_CONFIG[key] = str(new)
+    update_simple_config(CONFIG_PATH, {key: new})
+
+    ceiling = LIMIT_SOFT_CEILINGS.get(key)
+    return {
+        "key": key, "old": old, "new": new,
+        "direction": limit_direction(key, old, new),
+        "over_ceiling": bool(ceiling is not None and new > ceiling),
+        "ceiling": ceiling,
+    }
+
+
+def set_subagent_turns(profile: str, turns: int) -> dict:
+    """Cap the rounds one sub-agent profile may take. Persisted per profile."""
+    if profile not in SUBAGENT_SPECS:
+        raise KeyError(profile)
+    turns = int(turns)
+    if turns < 1:
+        raise ValueError("a sub-agent needs at least 1 turn")
+    old = SUBAGENT_SPECS[profile]["max_turns"]
+    SUBAGENT_SPECS[profile]["max_turns"] = turns
+    key = f"subagent_max_turns.{profile}"
+    APP_CONFIG[key] = str(turns)
+    update_simple_config(CONFIG_PATH, {key: turns})
+    return {"key": key, "old": old, "new": turns,
+            "direction": "looser" if turns > old else "tighter" if turns < old else "same",
+            "over_ceiling": turns > 20, "ceiling": 20}
+
+
+def set_tool_timeout(tool: str, seconds: int) -> dict:
+    """Change one tool's timeout. Persisted as tool_timeout.<name>.
+
+    The persisted key deliberately outranks the inline `timeout=` in tools.txt
+    (see load_tool_specs) — a runtime override that silently lost to the shipped
+    file after a restart would be a setting that only appears to work.
+    """
+    if tool not in TOOL_SPECS:
+        raise KeyError(tool)
+    seconds = int(seconds)
+    if not 1 <= seconds <= MAX_TOOL_TIMEOUT_SECONDS:
+        raise ValueError(f"timeout must be 1..{MAX_TOOL_TIMEOUT_SECONDS} seconds")
+    old = TOOL_SPECS[tool].get("timeout", 25)
+    TOOL_SPECS[tool]["timeout"] = seconds
+    key = f"tool_timeout.{tool}"
+    APP_CONFIG[key] = str(seconds)
+    update_simple_config(CONFIG_PATH, {key: seconds})
+    return {"key": key, "old": old, "new": seconds,
+            "direction": "looser" if seconds > old else "tighter" if seconds < old else "same",
+            "over_ceiling": False, "ceiling": None}
+
 # --- Approval policy ---
 # There is deliberately no separate "approval mode" axis: PERMISSION_MODE already
 # decides what is gated, and a second setting that could also wave a gate through
@@ -1622,7 +1743,11 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         "expression": g("expression", "tool_expression"),
         "path_arg": g("path_arg", "tool_path_arg", "filename"),
         "content_arg": g("content_arg", "tool_content_arg", "content"),
-        "timeout": int(g("timeout", "tool_timeout", "25")),
+        # A persisted `tool_timeout.<name>` outranks the inline tools.txt value,
+        # unlike every other field here. /limits writes that key, and an
+        # override the shipped file silently beat on the next start would be a
+        # setting that only appears to work.
+        "timeout": int(config.get(f"tool_timeout.{name}") or g("timeout", "tool_timeout", "25")),
         "arg_types": _parse_arg_types(g("arg_types", "tool_arg_types")),
     }
 
@@ -1946,7 +2071,11 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 "name": name,
                 "description": meta.get("description", default_tool_description(name)),
                 "tools": parse_csv(meta.get("tools", "")),
-                "max_turns": int(meta.get("max_turns", "8")),
+                # A persisted per-profile override (written by /limits) wins over
+                # the profile's own frontmatter, for the same reason as tool
+                # timeouts above.
+                "max_turns": int(APP_CONFIG.get(f"subagent_max_turns.{name}")
+                                 or meta.get("max_turns", "8")),
                 # Optional permission floor for the sub-run. Only "readonly" is
                 # honoured: a profile may restrict itself below the caller's mode,
                 # never widen past it.
