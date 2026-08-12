@@ -113,19 +113,37 @@ sandbox_runtime_version=0.0.67
 # model_telemetry_path=~/.agent8088/model-telemetry.jsonl
 
 # --- web search ---
-# One web_search tool, four interchangeable backends. With nothing set below,
-# the agent picks the first available: searxng -> tavily -> exa -> ddgs.
+# One web_search tool, four interchangeable backends, in priority order:
 #   searxng  default   self-hosted, no key   (`/search setup` provisions it)
-#   tavily   optional  needs TAVILY_API_KEY
-#   exa      optional  needs EXA_API_KEY
 #   ddgs     fallback  keyless, bundled — always available, needs no setup
+#   tavily   optional  needs TAVILY_API_KEY — takes first priority once set
+#   exa      optional  needs EXA_API_KEY — takes priority, behind tavily
+# Adding an API key is the signal to prefer that backend, so a configured
+# tavily/exa outranks both keyless ones.
 #
-# If the active backend fails (instance down, rate limited) the next available
-# one serves the request, so web search keeps working. Run `/search status` to
-# see the live chain and `/search doctor` to diagnose.
+# web_search_provider decides which one serves:
 #
-# Pin one backend (skips auto-selection AND the fallback chain):
-web_search_provider=searxng
+#   auto       (default) At startup, probe and pick the highest-priority
+#              backend that can actually serve: a keyed tavily/exa first, else
+#              SearXNG if it ANSWERS, else ddgs. The winner is then pinned for
+#              the session — auto decides *which* backend, it does not fall
+#              through mid-session.
+#   <name>     Pin exactly one of searxng/ddgs/tavily/exa. No auto-selection,
+#              no fallback. `/search use <name>` writes this for you.
+#   (unset)    Use the whole chain and fall through at call time: a backend
+#              that fails (instance down, rate limited) hands off to the next,
+#              so web search keeps working — at the cost of a prompt per
+#              search, since it may reach a public provider.
+#
+# Why auto pins instead of staying dynamic: web_search_no_prompt=1 below only
+# takes effect while a LOCAL SearXNG is pinned (see
+# _local_searxng_no_prompt_enabled), because approval-free search is safe only
+# when the query cannot leave your network. So with auto: SearXNG up means
+# silent searches, and SearXNG down means ddgs serves instead and each search
+# asks — because those queries do go to a third party.
+#
+# Run `/search status` to see the live chain and `/search doctor` to diagnose.
+web_search_provider=auto
 #
 # SearXNG instance. A remote instance must use https:// — plaintext http:// is
 # accepted only for loopback/private hosts. The host must appear in

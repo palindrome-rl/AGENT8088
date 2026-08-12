@@ -4,6 +4,56 @@ All notable changes to the Agent8088 project, organized by feature area.
 
 ---
 
+## Web search provider order: keyless first, keyed backends promoted on demand
+
+### Added
+
+- **`web_search_provider=auto`, now the shipped default.** At startup it probes and
+  pins the highest-priority backend that can actually serve — a keyed `tavily`/`exa`
+  first, else `searxng` *if it answers*, else `ddgs` — then behaves as a pin for the
+  rest of the session. `web_search.probe_searxng()` is the liveness check;
+  `Registry.startup_pick()` is the selection; `engine.resolve_auto_search_provider()`
+  writes the resolved name into `APP_CONFIG` once, called from `cli.main()`,
+  `run_mcp_server()`, and the gateway entry point.
+- **Why it pins instead of staying dynamic.** `web_search_no_prompt=1` only applies
+  while a *local* SearXNG is the effective pin (`_local_searxng_no_prompt_enabled`),
+  because approval-free search is safe only when the query cannot leave the network.
+  Resolving to a concrete pin is what lets auto-selection and silent local search
+  coexist: SearXNG up → silent; SearXNG down → `ddgs` serves and each search asks.
+  Silent *and* external is the one combination auto cannot produce, by design. An
+  unresolved `auto` never matches the exemption, so skipping startup resolution fails
+  closed to prompting rather than open.
+- **SearXNG must answer a probe before it is pinned.** `chain()` can afford to list a
+  dead instance because it falls through at call time; a pin cannot, so pinning a
+  stopped SearXNG would mean no web search at all. The probe runs once at startup,
+  never per search, and goes through `ctx.check_url` like any other outbound request.
+
+### Changed
+
+- **`PREFERENCE` is now `searxng -> ddgs -> tavily -> exa`**, and `Registry.chain()`
+  promotes a keyed backend (`tavily`, `exa`) to the *front* of the chain — ahead of
+  both keyless backends — as soon as its API key is configured. `tavily` wins the tie
+  when both keys are set. Previously the order was the static
+  `searxng -> tavily -> exa -> ddgs`, which put two vendors that most installs have
+  no key for ahead of the bundled keyless fallback: with no keys, a dead SearXNG fell
+  through `tavily` and `exa` (each failing on a missing credential) before reaching
+  `ddgs`. The keyless path is now the default spine, and adding a key is what opts a
+  vendor in *and* prefers it, in one action.
+- **Promotion reads `is_available()`** — the same check `chain()` already filters on —
+  so an optional backend with no key is skipped rather than reordered, and no new
+  notion of "configured" enters the module.
+- `web_search_provider=<name>` is unchanged: an explicit pin still selects exactly one
+  backend with no fallback, bypassing this ordering entirely.
+
+### Tests added
+
+`tests/test_web_search.py` — five stub-level ordering tests (base order, `tavily`
+promotion, `exa` promotion, the `tavily`-over-`exa` tie-break, and that promotion
+leaves `searxng` ahead of `ddgs`) plus four end-to-end tests that drive the real
+providers through their own `is_available()` paths.
+
+---
+
 ## Merge: feature work onto the fix work
 
 Two branches ran in parallel for a day — fixes and hardening on one, plan mode and

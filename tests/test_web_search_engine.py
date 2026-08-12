@@ -29,9 +29,107 @@ def test_web_search_is_the_only_search_tool(engine):
 def test_packaged_config_enables_the_temporary_lan_search_profile(engine):
     config = engine.load_simple_config(engine.APP_DIR / "config.txt")
     assert config["search_base_url"] == "http://127.0.0.1:8888/search?q="
-    assert config["web_search_provider"] == "searxng"
+    # `auto` resolves to a searxng PIN whenever the LAN instance answers, which
+    # is what keeps web_search_no_prompt in force (see
+    # test_auto_resolution_keeps_the_no_prompt_exemption_for_local_searxng).
+    assert config["web_search_provider"] == "auto"
     assert config["web_search_no_prompt"] == "1"
     assert "127.0.0.1:8888" in config["ssrf_allow_hosts"]
+
+
+# ---------------------------------------------------------------------------
+# web_search_provider=auto — startup resolution
+#
+# No test here touches the network: every probe is injected. The LAN profile's
+# real instance must never be contacted by the suite.
+# ---------------------------------------------------------------------------
+def _auto_engine(engine, *, base_url="http://127.0.0.1:8888/search?q=",
+                 keys=(), no_prompt="1"):
+    engine.APP_CONFIG["web_search_provider"] = "auto"
+    engine.APP_CONFIG["web_search_no_prompt"] = no_prompt
+    engine.APP_CONFIG["search_base_url"] = base_url
+    engine.SEARCH_BASE_URL_CONFIGURED = bool(base_url)
+    engine._search_context = lambda: engine.web_search.SearchContext(
+        config=engine._search_config(),
+        get_secret=lambda n: "k" if n in keys else "",
+        check_url=lambda url: None,
+        wrap=lambda text, source="": text)
+    return engine
+
+
+def test_auto_picks_searxng_when_the_instance_answers(engine, monkeypatch):
+    _auto_engine(engine)
+    monkeypatch.setattr(engine.web_search, "_ddgs_installed", lambda: True)
+    assert engine.resolve_auto_search_provider(probe=lambda ctx: True) == "searxng"
+    assert engine.APP_CONFIG["web_search_provider"] == "searxng"
+
+
+def test_auto_falls_to_ddgs_when_searxng_does_not_answer(engine, monkeypatch):
+    """The whole point of probing: a pinned dead instance would be no search."""
+    _auto_engine(engine)
+    monkeypatch.setattr(engine.web_search, "_ddgs_installed", lambda: True)
+    assert engine.resolve_auto_search_provider(probe=lambda ctx: False) == "ddgs"
+
+
+def test_auto_prefers_a_keyed_backend_without_probing_searxng(engine, monkeypatch):
+    """A tavily key outranks SearXNG, so the probe must not even run."""
+    _auto_engine(engine, keys=("TAVILY_API_KEY",))
+    monkeypatch.setattr(engine.web_search, "_ddgs_installed", lambda: True)
+    probed = []
+    resolved = engine.resolve_auto_search_provider(
+        probe=lambda ctx: probed.append(1) or True)
+    assert resolved == "tavily"
+    assert probed == []
+
+
+def test_auto_resolution_keeps_the_no_prompt_exemption_for_local_searxng(engine):
+    """The reason auto pins instead of staying dynamic: silent local search."""
+    _auto_engine(engine)
+    engine.APP_CONFIG["ssrf_allow_hosts"] = "127.0.0.1,localhost"
+    assert engine.resolve_auto_search_provider(probe=lambda ctx: True) == "searxng"
+    assert engine._local_searxng_no_prompt_enabled() is True
+
+
+def test_ddgs_resolution_does_not_get_the_no_prompt_exemption(engine, monkeypatch):
+    """Silent + external is the combination auto must never produce: a ddgs
+    query leaves the network, so it has to be approved per search."""
+    _auto_engine(engine)
+    monkeypatch.setattr(engine.web_search, "_ddgs_installed", lambda: True)
+    assert engine.resolve_auto_search_provider(probe=lambda ctx: False) == "ddgs"
+    assert engine._local_searxng_no_prompt_enabled() is False
+
+
+def test_auto_is_a_noop_when_a_backend_is_explicitly_pinned(engine):
+    """An operator's own pin is never overridden by startup probing."""
+    engine.APP_CONFIG["web_search_provider"] = "ddgs"
+    probed = []
+    resolved = engine.resolve_auto_search_provider(
+        probe=lambda ctx: probed.append(1) or True)
+    assert resolved == "ddgs" and probed == []
+    assert engine.APP_CONFIG["web_search_provider"] == "ddgs"
+
+
+def test_resolving_twice_does_not_probe_again(engine, monkeypatch):
+    _auto_engine(engine)
+    monkeypatch.setattr(engine.web_search, "_ddgs_installed", lambda: True)
+    calls = []
+    engine.resolve_auto_search_provider(probe=lambda ctx: calls.append(1) or True)
+    engine.resolve_auto_search_provider(probe=lambda ctx: calls.append(1) or True)
+    assert len(calls) == 1
+
+
+def test_auto_reports_empty_when_nothing_can_serve(engine, monkeypatch):
+    _auto_engine(engine, base_url="")
+    monkeypatch.setattr(engine.web_search, "_ddgs_installed", lambda: False)
+    assert engine.resolve_auto_search_provider(probe=lambda ctx: False) == ""
+
+
+def test_unresolved_auto_never_wins_the_no_prompt_exemption(engine):
+    """Fail-safe: an embedder that skips startup resolution must not get silent
+    searches just because the config says auto."""
+    _auto_engine(engine)
+    assert engine.APP_CONFIG["web_search_provider"] == "auto"
+    assert engine._local_searxng_no_prompt_enabled() is False
 
 
 # ---------------------------------------------------------------------------
