@@ -1066,7 +1066,7 @@ verify_install() {
     else
         echo "  Sandbox:  run 'agent8088 --sandbox-setup' to install the native runtime"
     fi
-    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash"
+    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
 }

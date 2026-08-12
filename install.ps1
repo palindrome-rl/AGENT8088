@@ -964,7 +964,7 @@ function Verify-Install {
     } else {
         Write-Host "  Sandbox:  run 'agent8088 --sandbox-setup' from an elevated terminal"
     }
-    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)"
+    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }

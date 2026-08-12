@@ -16,7 +16,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
-  <a href="https://github.com/tayyabimam1/AGENT8088/tree/development"><img src="https://img.shields.io/badge/branch-development-18a0fb" alt="Development branch"></a>
+  <a href="https://github.com/tayyabimam1/AGENT8088/tree/feat/install-all-deps"><img src="https://img.shields.io/badge/branch-feat/install--all--deps-18a0fb" alt="Latest branch"></a>
 </p>
 
 Agent8088 is a local-first agent for real work: it reads files, runs tools, researches the web, and can make changes only within a permission system you control. Run it against local Ollama or a hosted OpenAI-compatible model, use it from the terminal or a messaging gateway, and extend it with MCP servers, skills, and focused sub-agents.
@@ -40,18 +40,18 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 
 ## Quick start
 
-### Install the development branch
+### Install the latest branch
 
 **macOS, Linux, WSL2, or Termux**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | AGENT8088_BRANCH=feat/install-all-deps bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/development/install.ps1)
+$env:AGENT8088_BRANCH = "feat/install-all-deps"; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.ps1)
 ```
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
@@ -143,10 +143,10 @@ The versioned [documentation wiki](docs/wiki/README.md) is the source of truth f
 
 ## Contributing
 
-Develop against `development` and run the suite in an isolated configuration:
+Develop against `feat/install-all-deps` and run the suite in an isolated configuration:
 
 ```sh
-git clone --branch development https://github.com/tayyabimam1/AGENT8088.git
+git clone --branch feat/install-all-deps https://github.com/tayyabimam1/AGENT8088.git
 cd AGENT8088
 uv sync --all-extras
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
