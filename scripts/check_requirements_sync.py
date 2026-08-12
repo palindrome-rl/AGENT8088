@@ -48,7 +48,12 @@ def pyproject_dependencies(path: Path) -> set:
     block = re.search(r"^dependencies\s*=\s*\[(.*?)^\]", text, re.S | re.M)
     if not block:
         raise SystemExit(f"{path}: no [project.dependencies] block found")
-    return _names(re.findall(r'"([^"]+)"', block.group(1)))
+    # Comments are stripped before the quoted strings are collected. The block is
+    # heavily commented, and a comment that quotes a phrase would otherwise be
+    # read as a requirement: a line ending `... degraded to "no backend"` made
+    # this script report a missing package called `no`.
+    lines = [line.split("#", 1)[0] for line in block.group(1).splitlines()]
+    return _names(re.findall(r'"([^"]+)"', "\n".join(lines)))
 
 
 def requirements_dependencies(path: Path) -> set:

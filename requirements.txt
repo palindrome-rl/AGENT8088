@@ -22,29 +22,35 @@ Pillow>=9,<13
 # InquirerPy happen to pull them in. Both call sites fall back on ImportError,
 # so losing them upstream would not raise — Tab completion would disappear and
 # every syntax theme would validate as invalid, with no error either way.
-#
-# These stay here while playwright and ddgs moved to extras: both are pure
-# Python, so neither can fail an install on a platform with no wheel.
 prompt_toolkit>=3.0.1,<4
 Pygments>=2.13,<3
 
+# Headless browser behind browse_page. The Python package only — the browser
+# binary still needs `playwright install chromium`.
+playwright>=1.40,<2
+
+# Keyless web search fallback. web_search must always have a backend needing no
+# Docker, no API key and no setup, so an unreachable SearXNG still returns
+# results rather than an error.
+ddgs>=9,<10
+
 # --- Optional extras, NOT installed by this file ---------------------------
-#   pip install -e ".[search]"    ddgs keyless web search backend
-#   pip install -e ".[browser]"   playwright (browser binaries still need
-#                                 `playwright install chromium` afterwards)
+#   pip install -e ".[browser]"   alias — playwright is already a core dep; the
+#                                 browser binary still needs
+#                                 `playwright install chromium`
+#   pip install -e ".[search]"    alias — ddgs is already a core dep
 #   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
 #   pip install -e ".[dev]"       pytest, ruff, pip-audit
 #   pip install -e ".[litellm]"   litellm, for a provider with api_mode=litellm
 #
-# search and browser are extras rather than core deps so an install cannot be
-# failed outright by a platform that has no wheel for them: ddgs pulls in primp
-# (Rust), which publishes no Android wheel and cannot build under Termux. Both
-# degrade gracefully when absent, and install.sh/install.ps1 install them on
-# every platform, so a normal install still gets them.
+# browser and search are aliases for packages that are already core, kept so the
+# installers' existing steps and any documented command keep working. They were
+# briefly optional for Termux, which is no longer a supported target; optional
+# was the wrong trade everywhere else, because it made browse_page and the
+# keyless search fallback depend on whether a best-effort install step happened
+# to succeed, and both degrade silently when absent.
 #
 # Listed so the whole dependency surface is visible in one place:
-#   search:  ddgs>=9,<10
-#   browser: playwright>=1.40,<2
 #   gateway: slack-bolt>=1.18.0,<2  slack-sdk>=3.23.0,<4  httpx>=0.24.0,<1
 #            discord.py>=2.3.0,<3   python-telegram-bot>=20,<23
 #   dev:     pytest>=7.0.0,<10      ruff>=0.8,<1          pip-audit>=2.7,<3

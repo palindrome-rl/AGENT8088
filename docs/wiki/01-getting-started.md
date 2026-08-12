@@ -42,9 +42,15 @@ Install the extras you actually need:
 
 | Extra | Gives you |
 |---|---|
-| *(base)* | CLI, all 21 tools, MCP client and server |
+| *(base)* | CLI, all 21 tools, MCP client and server, `browse_page`, keyless web search |
 | `gateway` | Slack, WhatsApp, Discord, Telegram and Email adapters |
 | `dev` | `pytest` for the test suite |
+| `litellm` | Only for a provider profile with `api_mode=litellm` |
+
+Playwright and `ddgs` are **base** dependencies, not extras — `browse_page` and
+the keyless search fallback should not depend on how someone installed. The
+`browser` and `search` extras still exist as aliases so older install commands
+keep working.
 
 > Without the `gateway` extra the Slack/Discord tests fail at import rather
 > than skipping — see [Troubleshooting](13-troubleshooting.md).

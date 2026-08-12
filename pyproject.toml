@@ -19,29 +19,33 @@ dependencies = [
     # is silent rather than loud: both call sites fall back on ImportError, so
     # Tab completion would quietly disappear and every syntax theme would quietly
     # validate as invalid. Depend on what you import.
-    #
-    # These stay core while playwright and ddgs became extras below: both are
-    # pure Python with no compiled component, so neither can fail an install on
-    # a platform lacking a wheel — which is the only reason the other two moved.
     "prompt_toolkit>=3.0.1,<4",
     "Pygments>=2.13,<3",
+    # browse_page's engine. Core rather than optional: a browser that may or may
+    # not be there makes the tool's availability a property of how someone
+    # installed rather than of what the product is.
+    "playwright>=1.40,<2",
+    # Keyless web search fallback. web_search must always have a backend needing
+    # no Docker, no API key and no setup, so an unreachable SearXNG still
+    # returns results rather than an error. As an extra that guarantee held only
+    # when the installer's best-effort step happened to succeed, and its failure
+    # was silent: search degraded to having no backend at all, with nothing said.
+    "ddgs>=9,<10",
 ]
 
 [project.optional-dependencies]
 gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
-# browse_page degrades gracefully without this (engine.py: _playwright_available()),
-# so it's optional rather than a hard dep - keeps install.sh's core install from
-# hard-failing on platforms/Python versions playwright hasn't shipped wheels for yet
-# (e.g. Termux's rolling `pkg install python`, which can land on a brand-new minor).
+# browser and search are now aliases: both packages are core dependencies above.
+# They are kept so `pip install agent8088[browser]` and the installers' existing
+# best-effort steps stay valid instead of erroring on an unknown extra.
+#
+# They were briefly optional so that Termux, whose rolling `pkg install python`
+# lands on brand-new minors and which cannot build ddgs's primp (Rust, no
+# Android wheel), could install the core agent. Termux is no longer a supported
+# target, and optional was the wrong trade for every platform that is: it made
+# browse_page and the keyless search fallback a property of whether a
+# best-effort install step happened to succeed, and both degrade silently.
 browser = ["playwright>=1.40,<2"]
-# Keyless web search fallback: web_search should always have a backend needing
-# no Docker, no API key, and no setup, so an unreachable SearXNG still returns
-# results. install.sh/install.ps1 install this on every platform, so that holds
-# in practice. It is an extra rather than a core dep only because ddgs pulls in
-# primp (Rust), which publishes no Android wheel and cannot build under Termux
-# (rustup has no x86_64-unknown-linux-android target) - as a core dep it failed
-# the entire Termux install. web_search.DdgsProvider already degrades cleanly
-# when absent (_ddgs_installed() -> is_available() False -> SearchFailure).
 search = ["ddgs>=9,<10"]
 dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
 # Only needed for a provider profile with api_mode=litellm. Kept out of the base
