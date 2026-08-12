@@ -5065,7 +5065,11 @@ def _local_searxng_no_prompt_enabled() -> bool:
     if APP_CONFIG.get("web_search_no_prompt", "0") != "1":
         return False
     config = _search_config()
-    if config.get("web_search_provider") != "searxng":
+    # Normalized the same way Registry.chain() normalizes it. Without this, a
+    # hand-edited `SearXNG` or a trailing space would pin searxng in chain()
+    # while failing this check — safe (it only adds prompts), but the two must
+    # not disagree about what the configured value means.
+    if str(config.get("web_search_provider") or "").strip().lower() != "searxng":
         return False
     base_url = str(config.get("search_base_url") or "")
     try:
@@ -5133,6 +5137,41 @@ def _search_context():
         check_url=check_url,
         wrap=_wrap_untrusted,
     )
+
+
+def resolve_auto_search_provider(probe=None) -> str:
+    """Turn ``web_search_provider=auto`` into a concrete pin for this process.
+
+    Called once at startup. AUTO exists so the operator does not have to choose
+    between "picks the best backend" and "does not prompt on every search": it
+    picks, then pins, and the pin is what makes the approval-free local-SearXNG
+    path safe (see _local_searxng_no_prompt_enabled — it requires a searxng pin
+    precisely because a chain could fall through to a public provider).
+
+    Consequence worth stating: when SearXNG is down the pick lands on ddgs, so
+    searches keep working but DO prompt, because the query now leaves the
+    network. Silent + external is the one combination this cannot give.
+
+    Returns the resolved name ("" if nothing can serve). A no-op unless the
+    configured value is AUTO, so calling it twice is harmless.
+    """
+    configured = str(APP_CONFIG.get("web_search_provider") or "").strip().lower()
+    if configured != web_search.AUTO:
+        return configured
+    try:
+        # Safe to build from the live config even though it still says "auto":
+        # startup_pick ranks by availability via _dynamic_order and never reads
+        # the pin, so the unresolved value cannot feed back into the decision.
+        context = _search_context()
+        picked = WEB_SEARCH_REGISTRY.startup_pick(context, probe=probe)
+    except Exception as exc:  # noqa: BLE001 — startup must not die on a probe
+        _audit("search_provider_resolved", tool="web_search", mode="search",
+               decision="allowed", detail=f"auto -> unresolved ({exc})")
+        return web_search.AUTO
+    APP_CONFIG["web_search_provider"] = picked
+    _audit("search_provider_resolved", tool="web_search", mode="search",
+           decision="allowed", detail=f"auto -> {picked or 'none available'}")
+    return picked
 
 
 def _search_chain_summary() -> str:

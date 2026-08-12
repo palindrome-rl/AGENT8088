@@ -2372,13 +2372,21 @@ def cmd_search(rest):
     argument = parts[1].lower() if len(parts) > 1 else ""
 
     if action == "use":
-        known = A.web_search.PREFERENCE
+        known = (A.web_search.AUTO,) + A.web_search.PREFERENCE
         if argument not in known:
             console.print(f"[red]Unknown provider '{argument}'.[/red] "
                           f"Choose one of: {', '.join(known)}")
             return
         A.update_simple_config(A.CONFIG_PATH, {"web_search_provider": argument})
         A.APP_CONFIG["web_search_provider"] = argument
+        if argument == A.web_search.AUTO:
+            # Resolve now rather than at next launch, so the confirmation names
+            # the backend that will actually serve.
+            picked = A.resolve_auto_search_provider()
+            console.print("Web search set to [#237dd7]auto[/#237dd7] — picked "
+                          f"[#237dd7]{picked or 'none available'}[/#237dd7] "
+                          "for this session.")
+            return
         console.print(f"Pinned web search to [#237dd7]{argument}[/#237dd7].")
         provider = A.WEB_SEARCH_REGISTRY.get(argument)
         if provider and not provider.is_available(A._search_context()):
@@ -3886,6 +3894,13 @@ def main():
     if args.sandbox_setup:
         print(A.install_native_sandbox())
         return
+    # Resolve web_search_provider=auto once, here: every path below this line
+    # (gateway, MCP server, REPL) can search, and every path above it exits
+    # without searching, so a setup or uninstall run never pays for the probe.
+    _search_was_auto = (str(A.APP_CONFIG.get("web_search_provider") or "").strip().lower()
+                        == A.web_search.AUTO)
+    _search_pin = A.resolve_auto_search_provider()
+
     if args.gateway:
         from agent8088.gateway import main as gateway_main
         gateway_main()
@@ -3913,6 +3928,16 @@ def main():
     _install_completion()
     banner()
     warn_about_unknown_theme()
+    if _search_was_auto:
+        # Say which backend won and whether searches will prompt: with auto the
+        # answer changes between launches, and "why is it asking me now?" is
+        # otherwise invisible until the first search.
+        if _search_pin:
+            quiet = " · no prompt" if A._local_searxng_no_prompt_enabled() else " · asks per search"
+            console.print(f"[dim]web search: {_search_pin}{quiet}[/dim]")
+        else:
+            console.print("[dim]web search: no backend available "
+                          "(run /search setup)[/dim]")
     while True:
         try:
             line = _read_line().strip()
