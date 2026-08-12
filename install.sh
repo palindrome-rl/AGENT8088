@@ -1108,6 +1108,13 @@ run_setup_wizard() {
 
     # Write back
     sed -i.bak "s|^allowed_paths=.*|allowed_paths=$new_paths|" "$config"
+    local project_root="${new_paths%%,*}"
+    project_root="$(printf "%s" "$project_root" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if grep -q '^#*[[:space:]]*project_root=' "$config"; then
+        sed -i.bak "s|^#*[[:space:]]*project_root=.*|project_root=$project_root|" "$config"
+    else
+        echo "project_root=$project_root" >> "$config"
+    fi
     sed -i.bak "s|^default_provider=.*|default_provider=$new_provider|" "$config"
     grep -q "^default_provider=" "$config" || echo "default_provider=$new_provider" >> "$config"
     sed -i.bak "s|^provider\.${new_provider}\.base_url=.*|provider.${new_provider}.base_url=$base_url|" "$config"

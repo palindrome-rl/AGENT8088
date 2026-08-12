@@ -26,7 +26,12 @@ def _runtime_argv() -> list[str] | None:
     override = os.environ.get("AGENT8088_SRT")
     if override:
         return shlex.split(override, posix=sys.platform != "win32")
-    data_dir = Path(os.environ.get("AGENT8088_HOME", Path.home() / ".agent8088"))
+    if os.environ.get("AGENT8088_HOME"):
+        data_dir = Path(os.environ["AGENT8088_HOME"])
+    elif sys.platform == "win32":
+        data_dir = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "agent8088"
+    else:
+        data_dir = Path.home() / ".agent8088"
     cli = data_dir / "runtime" / "node_modules" / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js"
     node = shutil.which("node")
     if node and cli.exists():
@@ -107,8 +112,10 @@ def main() -> None:
             f"project_root={workspace}\nshell_cwd={workspace}\nallowed_paths=.\nsandbox_backend=native\n",
             encoding="utf-8",
         )
+        runtime_command = (subprocess.list2cmdline(runtime) if sys.platform == "win32"
+                           else shlex.join(runtime))
         env = dict(os.environ, AGENT8088_CONFIG=str(config), AGENT8088_HOME=str(home),
-                   AGENT8088_SANDBOX="native", AGENT8088_SRT=shlex.join(runtime), HOME=str(home))
+                   AGENT8088_SANDBOX="native", AGENT8088_SRT=runtime_command, HOME=str(home))
         source = str(ROOT / "src")
         env["PYTHONPATH"] = source + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(

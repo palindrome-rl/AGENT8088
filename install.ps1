@@ -1240,6 +1240,9 @@ function Run-SetupWizard {
     # Write back
     $content = Get-Content $config -Raw
     $content = $content -replace '(?m)^allowed_paths=.*', "allowed_paths=$newPaths"
+    $projectRoot = ($newPaths -split ',', 2)[0].Trim()
+    $content = $content -replace '(?m)^#?\s*project_root=.*', "project_root=$projectRoot"
+    if (-not ($content -match '(?m)^project_root=')) { $content += "`nproject_root=$projectRoot`n" }
     $content = $content -replace '(?m)^default_provider=.*', "default_provider=$newProvider"
     if (-not ($content -match '(?m)^default_provider=')) { $content += "`ndefault_provider=$newProvider`n" }
     $content = $content -replace "(?m)^provider\.$newProvider\.base_url=.*", "provider.$newProvider.base_url=$baseUrl"
