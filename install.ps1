@@ -81,8 +81,15 @@ if (-not $InstallDir) { $InstallDir = Join-Path $Agent8088Home "agent8088" }
 $RepoUrl = "https://github.com/tayyabimam1/AGENT8088.git"
 $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
+$NodeVersion = "22.11.0"
 $FreshInstall = $false
 $InitialSetupRan = $false
+# Readiness flags set by the new stages so Verify-Install can report actual state.
+$GatewayExtrasInstalled = $false
+$ChromiumInstalled = $false
+$NodeInstalled = $false
+$WhatsAppBridgeReady = $false
+$SandboxInstalled = $false
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -477,6 +484,219 @@ function Install-Deps {
 }
 
 # ----------------------------------------------------------------------------
+# Stage 5b: Gateway adapter Python extras + Playwright Chromium binary
+# ----------------------------------------------------------------------------
+# Installs the [gateway] optional extra (slack-bolt, slack-sdk, httpx,
+# discord.py, python-telegram-bot) into the existing venv so the messaging
+# adapters in runner.py are importable. Also downloads the Playwright
+# Chromium browser binary so browse_page works out of the box.
+# Both steps warn-on-fail and never abort: the core agent (chat, MCP, search,
+# file tools) does not depend on either.
+function Install-Gateway-Extras {
+    $py = Join-Path $InstallDir "venv\Scripts\python.exe"
+    if (-not (Test-Path $py)) {
+        Write-Warn "venv python not found at $py - skipping gateway extras"
+        return
+    }
+
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
+        & $script:UvCmd pip install --python $py -e "$InstallDir[gateway]" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $script:GatewayExtrasInstalled = $true
+            Write-Success "Gateway adapters installed"
+        } else {
+            Write-Warn "Gateway extras install failed (exit $LASTEXITCODE) - core agent still works"
+        }
+
+        Write-Info "Installing Playwright Chromium browser (~280 MB)..."
+        & $py -m playwright install chromium 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $script:ChromiumInstalled = $true
+            Write-Success "Chromium installed for browse_page"
+        } else {
+            Write-Warn "Chromium download failed - browse_page will show install instructions"
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Stage 5c: Node.js (portable, for WhatsApp bridge) + npm install
+# ----------------------------------------------------------------------------
+# WhatsApp's bridge is a Node.js process (Baileys). Without Node on PATH the
+# adapter errors at connect() time. We install a portable, user-scoped Node
+# (no admin needed) mirroring the PortableGit pattern. Then npm install in the
+# bridge dir so node_modules is materialized for the bridge to require().
+function Install-Node-Bridge {
+    # --- 1. Ensure Node >= 20.11 is available ------------------------------
+    $nodeExe = $null
+    $existingNode = Get-Command node -ErrorAction SilentlyContinue
+    if ($existingNode) {
+        try {
+            $ver = (& node --version 2>$null) -replace '^v', ''
+            $parts = $ver.Split('.')
+            if ($parts.Count -ge 2 -and [int]$parts[0] -ge 20 -and [int]$parts[1] -ge 11) {
+                $nodeExe = $existingNode.Source
+                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
+                Write-Success "Node $ver found on PATH"
+            } elseif ($parts.Count -ge 1 -and [int]$parts[0] -gt 20) {
+                $nodeExe = $existingNode.Source
+                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
+                Write-Success "Node $ver found on PATH"
+            } else {
+                Write-Warn "Node $ver found but < 20.11 - sandbox-runtime needs 20.11+; will install portable Node"
+            }
+        } catch {
+            Write-Warn "Could not determine Node version - will install portable Node"
+        }
+    }
+
+    if (-not $nodeExe) {
+        $managedNode = Join-Path $Agent8088Home "node\node.exe"
+        if (Test-Path $managedNode) {
+            $ver = & $managedNode --version 2>$null
+            if ($ver) {
+                $nodeExe = $managedNode
+                $npmExe = Join-Path $Agent8088Home "node\npm.cmd"
+                Write-Success "Managed Node found ($ver)"
+            }
+        }
+    }
+
+    if (-not $nodeExe) {
+        Write-Info "Installing portable Node $NodeVersion into $Agent8088Home\node ..."
+        $arch = Get-WindowsArch
+        $nodeArch = if ($arch -eq "arm64") { "arm64" } else { "x64" }
+        $assetName = "node-v$NodeVersion-win-$nodeArch.zip"
+        $downloadUrl = "https://nodejs.org/dist/v$NodeVersion/$assetName"
+        $tmpFile = "$env:TEMP\$assetName"
+        $nodeDir = "$Agent8088Home\node"
+
+        try {
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+            if (Test-Path $nodeDir) { Remove-Item -Recurse -Force $nodeDir }
+            New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
+            Expand-Archive -Path $tmpFile -DestinationPath $nodeDir -Force
+            Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
+
+            # Node ZIP extracts to a subfolder like node-v22.11.0-win-x64\node.exe
+            $extractedExe = Get-ChildItem -Path $nodeDir -Recurse -Filter "node.exe" | Select-Object -First 1
+            if (-not $extractedExe) { throw "Node extraction did not produce node.exe" }
+
+            # Move contents up one level so $nodeDir\node.exe exists
+            $extractedDir = Split-Path $extractedExe.FullName -Parent
+            if ($extractedDir -ne $nodeDir) {
+                Get-ChildItem -Path $extractedDir | Move-Item -Destination $nodeDir -Force
+                Remove-Item -Recurse -Force $extractedDir
+            }
+
+            $nodeExe = Join-Path $nodeDir "node.exe"
+            $npmExe = Join-Path $nodeDir "npm.cmd"
+            if (-not (Test-Path $nodeExe)) { throw "node.exe not found after extraction at $nodeExe" }
+
+            $env:Path = "$nodeDir;$env:Path"
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $userPathItems = if ($userPath) { $userPath -split ";" } else { @() }
+            if ($userPathItems -notcontains $nodeDir) {
+                $userPathItems += $nodeDir
+                [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
+            }
+            $ver = & $nodeExe --version
+            Write-Success "Node $ver installed to $nodeDir (portable, user-scoped)"
+        } catch {
+            Write-Warn "Could not install portable Node: $_"
+            Write-Info "WhatsApp bridge needs Node 20.11+ - install manually from https://nodejs.org/"
+            return
+        }
+    }
+
+    $script:NodeInstalled = $true
+
+    # --- 2. npm install in the WhatsApp bridge dir ------------------------
+    $bridgeDir = Join-Path $InstallDir "src\agent8088\gateway\platforms\whatsapp_bridge"
+    if (-not (Test-Path (Join-Path $bridgeDir "package.json"))) {
+        Write-Warn "WhatsApp bridge package.json not found at $bridgeDir - skipping npm install"
+        return
+    }
+    $nodeModules = Join-Path $bridgeDir "node_modules"
+    if (Test-Path $nodeModules) {
+        Write-Success "WhatsApp bridge node_modules already present"
+        $script:WhatsAppBridgeReady = $true
+        return
+    }
+
+    Write-Info "Installing WhatsApp bridge npm dependencies..."
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $npmExe install --prefix $bridgeDir --no-audit --no-fund 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $nodeModules)) {
+            $script:WhatsAppBridgeReady = $true
+            Write-Success "WhatsApp bridge npm dependencies installed"
+        } else {
+            Write-Warn "WhatsApp bridge npm install failed (exit $LASTEXITCODE)"
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Stage 5d: Native sandbox runtime (Windows - elevation-aware)
+# ----------------------------------------------------------------------------
+# install_native_sandbox() (engine.py:3344) needs Node+npm (installed by the
+# prior stage), then runs `npm install @anthropic-ai/sandbox-runtime@<ver>`
+# followed by the runtime's `windows-install` subcommand - which provisions a
+# restricted account + WFP egress filter and REQUIRES an elevated terminal.
+# This installer is user-scoped by design (no admin), so we only auto-run the
+# sandbox setup when elevated; otherwise we print a clear instruction.
+function Install-Native-Sandbox {
+    $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
+    if (-not (Test-Path $agentExe)) {
+        Write-Warn "agent8088 command not ready - skipping native sandbox setup"
+        return
+    }
+    if (-not $script:NodeInstalled) {
+        Write-Info "Node not available - native sandbox needs Node 20.11+. Skipping."
+        return
+    }
+
+    $elevated = $false
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal(
+            [Security.Principal.WindowsIdentity]::GetCurrent())
+        $elevated = $principal.IsInRole(
+            [Security.Principal.WindowsBuiltRole]::Administrator)
+    } catch { }
+
+    if ($elevated) {
+        Write-Info "Running native sandbox setup (elevated)..."
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $agentExe --sandbox-setup 2>&1 | Out-Host
+            if ($LASTEXITCODE -eq 0) {
+                $script:SandboxInstalled = $true
+            }
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
+        if ($script:SandboxInstalled) {
+            Write-Success "Native sandbox runtime installed"
+        } else {
+            Write-Warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' from an elevated terminal"
+        }
+    } else {
+        Write-Info "Native sandbox setup needs an elevated terminal (provisions a restricted account + WFP filter)."
+        Write-Info "To enable local code execution, open an elevated terminal and run: agent8088 --sandbox-setup"
+    }
+}
+
+# ----------------------------------------------------------------------------
 # Stage 6: Link the command (add venv\Scripts to User PATH)
 # ----------------------------------------------------------------------------
 function Setup-Path {
@@ -721,7 +941,29 @@ function Verify-Install {
     Write-Host ""
     Write-Success "Done. Run 'agent8088' to start."
     Write-Host "  Config: $Agent8088Home\config.txt"
-    Write-Host "  Native sandbox: agent8088 --sandbox-setup (Docker is the fallback)"
+    # Readiness summary - reflects what actually installed, not static text.
+    if ($script:GatewayExtrasInstalled) {
+        Write-Host "  Adapters: Slack/Discord/Telegram/WhatsApp (Python deps installed)"
+    } else {
+        Write-Host "  Adapters: gateway extras not installed (run: uv pip install -e `".[gateway]`")"
+    }
+    if ($script:ChromiumInstalled) {
+        Write-Host "  Browser:  Chromium installed (browse_page ready)"
+    } else {
+        Write-Host "  Browser:  Chromium missing (browse_page will show install instructions)"
+    }
+    if ($script:WhatsAppBridgeReady) {
+        Write-Host "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"
+    } elseif ($script:NodeInstalled) {
+        Write-Host "  WhatsApp: Node installed but bridge npm deps missing"
+    } else {
+        Write-Host "  WhatsApp: needs Node 20.11+ (install from https://nodejs.org/)"
+    }
+    if ($script:SandboxInstalled) {
+        Write-Host "  Sandbox:  native runtime installed"
+    } else {
+        Write-Host "  Sandbox:  run 'agent8088 --sandbox-setup' from an elevated terminal"
+    }
     Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
@@ -774,6 +1016,9 @@ if (-not (Test-Python)) { exit 1 }
 if (-not (Install-Git)) { exit 1 }
 Clone-Repo
 Install-Deps
+Install-Gateway-Extras
+Install-Node-Bridge
+Install-Native-Sandbox
 Setup-Path
 Drop-Config
 Run-InitialSetup

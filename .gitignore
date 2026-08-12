@@ -5,12 +5,16 @@ __pycache__/
 *.so
 .Python
 *.egg-info/
+dist/
 .DS_Store
 
 # Environment
 .env
 venv/
+.venv/
 env/
+# Local dev venvs live in the repo root; `venv/` alone does not cover them.
+agent/
 
 # Secrets
 *.key
@@ -27,6 +31,8 @@ qwen-tooluse-lora/
 
 # Logs
 *.log
+model-telemetry/
+*.model-telemetry.jsonl
 
 # Generated reports
 output/pdf/
@@ -41,6 +47,25 @@ skillopt_data/
 graphify-out/
 .opencode/
 
+# Local agent instructions. Both files stay tracked, so these entries only take
+# effect once a file is untracked with `git rm --cached <file>` — until then git
+# keeps reporting changes to them.
+AGENTS.md
+CLAUDE.md
+
 # Config snapshots (may contain secrets - never commit)
 backup.txt
 opencode.json
+
+# WhatsApp bridge npm deps
+src/agent8088/gateway/platforms/whatsapp_bridge/node_modules/
+
+# Test and run artifacts — generated files never belong in the repo root
+artifacts/*
+!artifacts/.gitkeep
+
+# Test cache
+.pytest_cache/
+
+# Claude / opencode local config
+.claude/
