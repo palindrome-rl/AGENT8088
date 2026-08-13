@@ -87,7 +87,7 @@ Run with no flags for the interactive REPL.
 
 | Command | Does |
 |---|---|
-| `/mode [readonly\|full-auto\|plan-only]` | Show or switch permission mode |
+| `/mode [readonly\|full-auto]` | Show or switch permission mode. Use `/plan` to enter plan mode |
 | `/reset`, `/clear` | Discard the conversation — asks first unless `destructive_slash_confirm=0` |
 | `/sandbox [auto\|native\|docker\|local\|setup]` | Show, select or install isolation |
 | `/search [status\|setup\|stop\|doctor\|use <backend>]` | Show, provision, or pin a web search backend |
@@ -149,7 +149,7 @@ message — otherwise `/help` would be a free channel for flooding the gateway.
 | `AGENT8088_CONFIG` | Config file path (`/nonexistent` forces packaged defaults) |
 | `AGENT8088_HOME` | Data directory |
 | `AGENT8088_PROVIDER` | Active provider |
-| `AGENT8088_PERMISSION` | Starting permission mode |
+| `AGENT8088_PERMISSION` | Starting permission mode (`readonly` or `full-auto`; `plan-only` falls back to `readonly`) |
 | `AGENT8088_SANDBOX` | Sandbox backend |
 
 ## Exit codes
