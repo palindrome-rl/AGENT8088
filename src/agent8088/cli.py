@@ -44,6 +44,12 @@ from rich import box
 APP_DIR = Path(__file__).resolve().parent
 console = Console()
 
+# Model discovery is a convenience in an interactive wizard, not a prerequisite
+# for configuration.  Keep it short and do not let the OpenAI SDK retry a dead
+# or mistyped custom endpoint behind an unchanging "Fetching model list..."
+# message.  The user can always type the model id when discovery is unavailable.
+MODEL_DISCOVERY_TIMEOUT_SECONDS = 5
+
 # A quiet pulsing sparkle for the "thinking" indicator — same idea as Claude Code's own
 # status spinner: a single soft-flashing glyph next to dim status text, not a novelty animation.
 SPINNERS["agent8088_pulse"] = {
@@ -832,9 +838,9 @@ def _numbered_lines(text, limit=None, path=""):
     Returns (renderable, total_lines) — the total counts the whole file, not just
     the rows shown, so the caller can report "Read 108 lines" honestly.
     """
+    lines = _source_lines(text)
     if limit is None:
         limit = 200 if S.verbose == "full" else 40
-    lines = _source_lines(text)
     total = len(lines)
     shown = lines[:limit]
     width = max(len(str(len(shown))), 2)
@@ -918,11 +924,12 @@ def _diff_block(diff_lines, limit=None, path=""):
     header has not already said — so it renders as a plain listing of the file
     instead, and the '+' column is saved for edits, where it carries information.
     """
-    if limit is None:
-        limit = 200 if S.verbose == "full" else 60
     hunks = _parse_hunks(diff_lines)
     if not hunks:
         return Text()
+
+    if limit is None:
+        limit = 200 if S.verbose == "full" else 60
 
     if len(hunks) == 1 and hunks[0]["old_count"] == 0:
         listing, _ = _numbered_lines(
@@ -1666,7 +1673,6 @@ def do_chat(query):
     tokens_ref = [0]
     turn_start = time.time()
     esc = EscListener()
-
     with esc, Live(console=console, refresh_per_second=20, transient=True) as live:
         def spin(msg):
             # Each round starts with "thinking..."; that is the boundary at which a
@@ -3513,6 +3519,22 @@ def _live_matches(text):
     return "", []
 
 
+def _completion_preview_has_space(app=None):
+    """Return whether two menu rows fit above the persistent toolbar."""
+    if app is None:
+        from prompt_toolkit.application.current import get_app
+        app = get_app()
+    screen = getattr(getattr(app, "renderer", None), "last_rendered_screen", None)
+    if screen is None:
+        return False
+    try:
+        cursor = screen.get_cursor_position(app.layout.current_window)
+    except (AttributeError, KeyError):
+        return False
+    free_rows = screen.height - cursor.y - 2  # input row and bottom toolbar
+    return free_rows >= 2
+
+
 def _read_line():
     """Use a live completion menu in a TTY, with Rich/readline as a safe fallback."""
     if not sys.stdin.isatty():
@@ -3527,6 +3549,8 @@ def _read_line():
 
     class AgentCompleter(Completer):
         def get_completions(self, document, complete_event):
+            if not _completion_preview_has_space():
+                return
             token, matches = _live_matches(document.text_before_cursor)
             for match in matches:
                 yield Completion(match, start_position=-len(token))
@@ -3535,6 +3559,7 @@ def _read_line():
     # the context percentage *and* A.PERMISSION_MODE, so repeating either here
     # would print `plan` an inch above a bar reading `plan-only`. The Rich
     # fallback `_prompt_label()` does keep both — that path has no toolbar.
+    # No leading newline: the blank line above the prompt was the spacing bug.
     label = "\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
     return prompt(
         ANSI(label),
@@ -3942,14 +3967,19 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         secret=True,
     )
     # Fetch models
-    print("\nFetching model list...")
+    print(f"\nFetching model list (up to {MODEL_DISCOVERY_TIMEOUT_SECONDS}s)...")
     try:
         from agent8088.providers import list_models
         from openai import OpenAI
         defaults = provider_registry.builtin_provider_defaults(provider)
         base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
         api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
-        fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
+        fetch_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
         models = list_models(provider, client=fetch_client, fallback=False)
     except Exception:
         models = []
@@ -3960,6 +3990,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             current_model if current_model in models else "",
         )
     else:
+        print("Model discovery unavailable; enter the model name manually.")
         model_name = ""
         while not model_name:
             model_name = _custom_prompt(
@@ -4025,6 +4056,11 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     if paths:
         content = _set_line(content, "allowed_paths", paths)
+        # The prompt says "Working directory", so persist the first entry as
+        # the workspace too. Older setup code only changed the allowlist; a user
+        # launching Agent8088 elsewhere then wrote into that launch directory
+        # and immediately failed the configured path check.
+        content = _set_line(content, "project_root", paths.split(",", 1)[0].strip())
     content = _set_line(content, "default_provider", provider)
 
     # Write provider base_url + model. Endpoint defaults live in the provider registry.
@@ -4444,9 +4480,13 @@ def main():
         epilog="Run with no flags to start the interactive REPL.",
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
-    parser.add_argument("--edit", action="store_true", help="start in full-auto mode (alias for --mode full-auto)")
     parser.add_argument("--full-auto", action="store_true", help="start in full-auto mode (no per-action permission prompts)")
-    parser.add_argument("--mode", choices=["readonly", "full-auto", "plan-only"],
+    # plan-only is deliberately not a choice here, for the same reason /mode
+    # rejects it: it is a session with a beginning and an end, entered through
+    # enter_plan_mode() so there is a mode to return to when the plan finishes.
+    # Setting it at startup skips that bookkeeping and strands the session in
+    # plan mode with nothing to restore. `/plan` is the only door.
+    parser.add_argument("--mode", choices=["readonly", "full-auto"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
@@ -4497,7 +4537,7 @@ def main():
         else:
             run_mcp_server(transport="stdio")
         return
-    if args.edit or args.full_auto:
+    if args.full_auto:
         A.PERMISSION_MODE = "full-auto"
     if args.mode:
         A.PERMISSION_MODE = args.mode

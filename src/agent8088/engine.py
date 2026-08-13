@@ -255,7 +255,41 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
-PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
+def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
+    """Choose the workspace setup named, even when launched somewhere else.
+
+    Older installers stored the answer to "Working directory" only as
+    ``allowed_paths``.  PROJECT_ROOT still defaulted to the process CWD, so
+    launching ``agent8088`` from another directory routed new files there and
+    then rejected them against the configured allowlist.  Keep an allowed launch
+    directory when there is one; otherwise the first existing configured path is
+    the workspace those installers meant.
+    """
+    launch = Path(cwd or os.getcwd()).expanduser().resolve()
+    explicit = str(config.get("project_root", "")).strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        return (path if path.is_absolute() else launch / path).resolve()
+
+    candidates = []
+    for raw in str(config.get("allowed_paths", "")).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        candidate = (path if path.is_absolute() else launch / path).resolve()
+        try:
+            if not candidate.is_dir():
+                continue
+        except OSError:
+            continue
+        if launch == candidate or candidate in launch.parents:
+            return launch
+        candidates.append(candidate)
+    return candidates[0] if candidates else launch
+
+
+PROJECT_ROOT = _configured_project_root(APP_CONFIG)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -271,7 +305,7 @@ SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/searc
 SEARCH_BASE_URL_CONFIGURED = bool(str(APP_CONFIG.get("search_base_url", "")).strip())
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
-SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
+SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
 BANNER_FILE = Path(APP_CONFIG.get("banner_file", str(APP_DIR / "banner.txt"))).expanduser()
 SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).expanduser()
 
@@ -279,6 +313,9 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
+MAX_COMPLETION_TOKENS = max(
+    1, min(int(APP_CONFIG.get("max_completion_tokens", "8192")), CONTEXT_WINDOW)
+)
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
 # A sub-agent exists to keep work *out* of the parent's context, so an unbounded
 # answer defeats the delegation it was spawned for. 0 disables the cap.
@@ -502,7 +539,13 @@ ALLOWED_PATHS = [
 # ---------------------------------------------------------------------------
 # Permission layer ÔÇö readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
-PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
+# plan-only is refused here for the same reason `/mode` and `--mode` refuse it: a
+# plan session must be entered through enter_plan_mode(), which records the mode to
+# come back to. Starting in plan-only skips that, so finish_plan_session() has
+# nothing to restore and the session is stranded in plan mode. Fall back to the
+# safe default instead of honouring it; `/plan` is the only door.
+_env_permission_mode = os.environ.get("AGENT8088_PERMISSION", "readonly")
+PERMISSION_MODE = "readonly" if _env_permission_mode == "plan-only" else _env_permission_mode
 _one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
 _pending_approval_key = ""
 _local_fallback_grant = False
@@ -1481,12 +1524,14 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         response = completion(**kwargs)
         if on_token is None:
             return response
-        collected, tool_chunks = [], {}
+        collected, tool_chunks, finish_reason = [], {}, None
         stop, watcher = _start_interrupt_watcher(response, interrupt_check)
         try:
             for chunk in response:
                 _raise_if_interrupted(interrupt_check, response)
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                delta = choice.delta
+                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
                     on_token("reasoning", reasoning)
@@ -1501,7 +1546,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             raise
         finally:
             _finish_interrupt_watcher(stop, watcher)
-        return _build_response("".join(collected), tool_chunks)
+        return _build_response("".join(collected), tool_chunks, finish_reason)
     request_options = dict(
         model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
@@ -1513,12 +1558,14 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         return client.chat.completions.create(**request_options)
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
     stream = client.chat.completions.create(**request_options, stream=True)
-    collected, tool_chunks = [], {}
+    collected, tool_chunks, finish_reason = [], {}, None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
     try:
         for chunk in stream:
             _raise_if_interrupted(interrupt_check, stream)
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
             rc = getattr(delta, "reasoning_content", None)
             if rc:
                 on_token("reasoning", rc)
@@ -1533,7 +1580,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         raise
     finally:
         _finish_interrupt_watcher(stop, watcher)
-    return _build_response("".join(collected), tool_chunks)
+    return _build_response("".join(collected), tool_chunks, finish_reason)
 
 
 def _fallback_targets() -> list:
@@ -1572,6 +1619,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     try:
         return create_completion(
             client, messages, tools, temperature=temperature,
+            max_tokens=MAX_COMPLETION_TOKENS,
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
@@ -1598,6 +1646,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 })
             return create_completion(
                 fallback_client, messages, tools, temperature=temperature,
+                max_tokens=MAX_COMPLETION_TOKENS,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
@@ -1622,7 +1671,7 @@ def _collect_stream_tool_calls(delta, chunks):
             entry["arguments"] += getattr(function, "arguments", None) or ""
 
 
-def _build_response(content, tool_chunks=None):
+def _build_response(content, tool_chunks=None, finish_reason=None):
     """Reconstruct a ChatCompletion-like object from streamed content
     so run_agent() can read .choices[0].message.content uniformly."""
     tool_calls = []
@@ -1636,7 +1685,7 @@ def _build_response(content, tool_chunks=None):
         })())
     return type("R", (), {"choices": [type("C", (), {
         "message": type("M", (), {"content": content, "tool_calls": tool_calls}),
-        "finish_reason": "tool_calls" if tool_calls else "stop",
+        "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
     })()]})
 
 
@@ -2444,7 +2493,11 @@ def _plan_step_failed(result: str) -> bool:
     approved it). Both mean the intended effect is absent, so every later step
     is now standing on an assumption that is already false.
     """
-    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+    plain = _unwrap_untrusted(result).strip()
+    return (plain.startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+            or bool(re.search(
+                r"(?:^|\n)Command exited with status [1-9]\d*\.$", plain))
+            or bool(re.search(r"(?:^|\n)Command timed out(?: after \d+s)?\.$", plain)))
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -3181,9 +3234,30 @@ def _exec_browser(args: dict) -> str:
 # Sandboxed execution — native OS isolation, with Docker as a fallback
 # ---------------------------------------------------------------------------
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
+GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
+# Set after a native pre-flight failure. The restricted account or OS policy
+# does not heal during the process, so both execution and status use Docker for
+# the rest of the session when it is available.
+_native_sandbox_broken = False
+
+
+def _which_executable(name: str) -> str | None:
+    """Resolve a runnable Windows launcher, not an extensionless Unix shim.
+
+    Python 3.12.0's ``shutil.which('docker')`` may return Docker Desktop's
+    neighbouring ``docker`` shell script before ``docker.exe``.  Passing that
+    path to CreateProcess fails with WinError 193 and made a running Docker
+    daemon look unavailable.  Explicit PATHEXT spellings avoid that ambiguity.
+    """
+    if sys.platform == "win32" and not PureWindowsPath(name).suffix:
+        for suffix in (".exe", ".cmd", ".bat", ".com"):
+            executable = shutil.which(name + suffix)
+            if executable:
+                return executable
+    return shutil.which(name)
 
 
 def _agent_data_dir() -> Path:
@@ -3197,13 +3271,17 @@ def _agent_data_dir() -> Path:
 def _native_sandbox_argv():
     override = os.environ.get("AGENT8088_SRT")
     if override:
-        return shlex.split(override, posix=sys.platform != "win32")
+        argv = shlex.split(override, posix=sys.platform != "win32")
+        if sys.platform == "win32":
+            argv = [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"'
+                    else part for part in argv]
+        return argv
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
-    node = shutil.which("node")
+    node = _which_executable("node")
     if node and cli.exists():
         return [node, str(cli)]
-    executable = shutil.which("srt")
+    executable = _which_executable("srt")
     return [executable] if executable else None
 
 
@@ -3220,7 +3298,7 @@ def _native_sandbox_missing_requirements() -> list:
 
 
 def _docker_available() -> bool:
-    docker = shutil.which("docker")
+    docker = _which_executable("docker")
     if not docker:
         return False
     try:
@@ -3235,10 +3313,14 @@ def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
     if requested == "native":
+        if native_available and _native_sandbox_broken and _docker_available():
+            return "docker"
         return "native" if native_available else "unavailable"
     if requested == "docker":
         return "docker" if _docker_available() else "unavailable"
     if native_available:
+        if _native_sandbox_broken and _docker_available():
+            return "docker"
         return "native"
     return "docker" if _docker_available() else "unavailable"
 
@@ -3336,13 +3418,6 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
 )
 
 
-# Set once the native runtime has proved it cannot start a sandbox in this
-# process. A runtime that cannot log into its restricted account does not heal
-# between commands, so retrying it per command spends a node subprocess to reach
-# the same failure and reprints the same wall of stderr in the transcript.
-_native_sandbox_broken = False
-
-
 def _native_sandbox_repair_hint(result: str) -> str:
     """Turn the runtime's pre-flight error into something the reader can act on.
 
@@ -3373,6 +3448,21 @@ def _native_sandbox_unusable(result: str) -> bool:
     return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
 
 
+def _native_or_docker(native, docker):
+    """Run native isolation, retrying only a proven pre-flight failure."""
+    global _native_sandbox_broken
+    if _native_sandbox_broken and _docker_available():
+        return docker()
+    result = native()
+    if not _native_sandbox_unusable(result) or not _docker_available():
+        return result
+    if not _native_sandbox_broken:
+        _log.warning("native sandbox could not start, using docker for the "
+                     "rest of this session. %s", _native_sandbox_repair_hint(result))
+    _native_sandbox_broken = True
+    return docker()
+
+
 def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
                          readonly: bool = False) -> str:
     argv = _native_sandbox_argv()
@@ -3390,19 +3480,32 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
 
 def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     backend = _resolve_sandbox_backend()
+    command = _process_display(argv)
+
+    def docker():
+        # Structured argv execution is the isolated Git-tool path. Preserve the
+        # pinned Git image introduced in fa4d77b; the general Python image has
+        # no git binary and turns a successful fallback into status 127.
+        return _exec_docker_command(
+            command, timeout, image=GIT_DOCKER_IMAGE,
+            workspace=PROJECT_ROOT, readonly=True,
+        )
+
     if backend == "native":
         runtime = _native_sandbox_argv()
         settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
-        return _exec_process(
-            runtime + ["--settings", str(settings), "-c",
-                       f"cd {shlex.quote(str(PROJECT_ROOT))} && "
-                       f"TMPDIR={shlex.quote(str(sandbox_tmp))} {_process_display(argv)}"],
-            timeout=timeout
+        native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                          f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+        return _native_or_docker(
+            lambda: _exec_process(
+                runtime + ["--settings", str(settings), "-c", native_command],
+                timeout=timeout,
+            ),
+            docker,
         )
     if backend == "docker":
-        return _exec_docker_command(_process_display(argv), timeout,
-                                    workspace=PROJECT_ROOT, readonly=True)
+        return docker()
     return _sandbox_required_error()
 
 
@@ -3542,12 +3645,49 @@ def _sandbox_required_error() -> str:
     )
 
 
+_ARTIFACTS_CD_RE = re.compile(
+    r"(?i)(?<!\S)cd\s+([\"']?)(?:\.[\\/])?artifacts[\\/]?\1"
+    r"(?=\s*(?:&&|\|\||;|$))"
+)
+_CONTAINER_ARTIFACTS_RE = re.compile(
+    r"(?i)(?P<workspace>/workspace)[\\/]artifacts(?P<tail>[\\/]|(?=[\s\"';|&<>()]|$))"
+)
+_ARTIFACTS_PATH_RE = re.compile(
+    r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
+    r"(?:\.[\\/])?artifacts[\\/]"
+)
+_ARTIFACTS_WORD_RE = re.compile(
+    r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
+    r"(?:\.[\\/])?artifacts(?P=quote)(?=\s|[;|&<>()]|$)"
+)
+
+
+def _artifact_workspace_command(command: str) -> str:
+    """Map project-relative artifact paths into the mounted artifact directory."""
+    command = _CONTAINER_ARTIFACTS_RE.sub(
+        lambda match: match.group("workspace")
+        + ("/" if match.group("tail") in ("/", "\\") else ""),
+        command,
+    )
+    command = _ARTIFACTS_CD_RE.sub("cd .", command)
+    command = _ARTIFACTS_PATH_RE.sub(
+        lambda match: match.group("prefix") + match.group("quote") + "./",
+        command,
+    )
+    return _ARTIFACTS_WORD_RE.sub(
+        lambda match: match.group("prefix") + match.group("quote") + "."
+                      + match.group("quote"),
+        command,
+    )
+
+
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
     if backend == "unavailable":
         return _sandbox_required_error()
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
+    command = _artifact_workspace_command(command)
     temporary = None
     workspace = ARTIFACTS_ROOT
     if _sandbox_readonly:
@@ -3557,37 +3697,20 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                         ignore=shutil.ignore_patterns(
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
-    global _native_sandbox_broken
     try:
-        # Already proved unusable this process: go straight to Docker rather than
-        # paying for the same failure again.
-        if backend == "native" and _native_sandbox_broken and _docker_available():
-            backend = "docker"
         if backend == "native":
             local_command = (
                 _process_display([sys.executable, "-c", command])
                 if python_code else command
             )
-            result = _exec_native_sandbox(local_command, timeout, workspace,
-                                          readonly=_sandbox_readonly)
-            # `auto` documents native first, Docker when available — but that
-            # choice was only ever made at selection time, from the presence of
-            # the runtime binary. A runtime that is installed and still cannot
-            # start a sandbox (on Windows, a restricted account it cannot log
-            # into) left the command refused with a working Docker sitting idle.
-            # Retry only a pre-flight failure: the command has not run, so
-            # nothing can be done twice.
-            if not _native_sandbox_unusable(result):
-                return result
-            if not _docker_available():
-                return result  # keep the runtime's own error; it says more
-            # Once per process. The condition is permanent for this run, and
-            # repeating a 200-character stderr dump above every command turns a
-            # working fallback into visible breakage.
-            if not _native_sandbox_broken:
-                _log.warning("native sandbox could not start, using docker for the "
-                             "rest of this session. %s", _native_sandbox_repair_hint(result))
-            _native_sandbox_broken = True
+            return _native_or_docker(
+                lambda: _exec_native_sandbox(
+                    local_command, timeout, workspace, readonly=_sandbox_readonly,
+                ),
+                lambda: _exec_docker_command(
+                    command, timeout, python_code, image, workspace=workspace,
+                ),
+            )
         return _exec_docker_command(command, timeout, python_code, image,
                                     workspace=workspace)
     finally:
@@ -3596,8 +3719,8 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
 
 
 def install_native_sandbox() -> str:
-    node = shutil.which("node")
-    npm = shutil.which("npm")
+    node = _which_executable("node")
+    npm = _which_executable("npm")
     if not node or not npm:
         return "Node.js 20.11 or newer is required to install the native sandbox runtime."
     try:
@@ -3778,7 +3901,7 @@ def _windows_task_script(identifier: str, task: str) -> Path:
     script = scripts / f"{identifier}.ps1"
     prompt = base64.b64encode(task.encode("utf-8")).decode("ascii")
     cwd = str(SHELL_CWD).replace("'", "''")
-    agent = str(shutil.which("agent8088") or "agent8088").replace("'", "''")
+    agent = str(_which_executable("agent8088") or "agent8088").replace("'", "''")
     content = (
         "$ErrorActionPreference = 'Stop'\n"
         f"Set-Location -LiteralPath '{cwd}'\n"
@@ -5934,6 +6057,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     missing_args_retries = 0  # times a call arrived without its arguments
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    length_retries = 0   # token-limited calls are incomplete and must never execute
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
@@ -6000,6 +6124,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
+        finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
+        if finish_reason in {"length", "max_tokens"}:
+            warning = (
+                f"Model output reached its {MAX_COMPLETION_TOKENS}-token limit. "
+                "The partial response was not executed. Retry with one complete, "
+                "concise tool call; split large work across calls if needed."
+            )
+            if on_result:
+                on_result("error", warning)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "max_tokens", "content": warning})
+            if length_retries < 1:
+                length_retries += 1
+                messages.append({"role": "user", "content": warning})
+                continue
+            answer = _guard_answer(warning)
+            if on_answer:
+                on_answer(answer)
+            return answer
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])

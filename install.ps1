@@ -765,11 +765,12 @@ function Install-Native-Sandbox {
         if ($script:SandboxInstalled) {
             Write-Success "Native sandbox runtime installed"
         } else {
-            Write-Warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' from an elevated terminal"
+            Write-Warn "Native sandbox setup did not complete - Docker will be used automatically when available"
         }
     } else {
         Write-Info "Native sandbox setup needs an elevated terminal (provisions a restricted account + WFP filter)."
-        Write-Info "To enable local code execution, open an elevated terminal and run: agent8088 --sandbox-setup"
+        Write-Info "Docker will be used automatically when Docker Desktop is running."
+        Write-Info "For native isolation, open an elevated terminal and run: agent8088 --sandbox-setup"
     }
 }
 
@@ -987,6 +988,9 @@ function Run-SetupWizard {
     # Write back
     $content = Get-Content $config -Raw
     $content = $content -replace '(?m)^allowed_paths=.*', "allowed_paths=$newPaths"
+    $projectRoot = ($newPaths -split ',', 2)[0].Trim()
+    $content = $content -replace '(?m)^#?\s*project_root=.*', "project_root=$projectRoot"
+    if (-not ($content -match '(?m)^project_root=')) { $content += "`nproject_root=$projectRoot`n" }
     $content = $content -replace '(?m)^default_provider=.*', "default_provider=$newProvider"
     if (-not ($content -match '(?m)^default_provider=')) { $content += "`ndefault_provider=$newProvider`n" }
     $content = $content -replace "(?m)^provider\.$newProvider\.base_url=.*", "provider.$newProvider.base_url=$baseUrl"
@@ -1049,9 +1053,10 @@ function Verify-Install {
     if ($script:SandboxInstalled) {
         Write-Host "  Sandbox:  native runtime installed"
     } else {
-        Write-Host "  Sandbox:  run 'agent8088 --sandbox-setup' from an elevated terminal"
+        Write-Host "  Sandbox:  Docker fallback is automatic when available"
+        Write-Host "            Native setup: elevated agent8088 --sandbox-setup"
     }
-    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.ps1)"
+    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$Branch/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }

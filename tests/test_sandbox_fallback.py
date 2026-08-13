@@ -10,6 +10,8 @@ could not verify its work and printed an invented "expected output" table.
 The retry is deliberately limited to PRE-FLIGHT failures. A command that ran and
 failed must never be retried on another backend: it may already have had effects.
 """
+from types import SimpleNamespace
+
 PREFLIGHT = (
     "Error: WFP egress fence could not be verified — `srt-win wfp verify` exited 1 "
     'with unparseable output "" (stderr: "srt-win: error: spawn runner for egress '
@@ -126,3 +128,53 @@ def test_python_code_still_reaches_docker_as_python(engine, monkeypatch):
 
     assert seen["python_code"] is True, "run_sandboxed must stay Python on the fallback"
     assert seen["command"] == "print(1)", "docker gets the raw code, not the native wrapper"
+
+
+def test_structured_git_fallback_keeps_the_pinned_git_image(engine, monkeypatch):
+    calls = []
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["node", "srt.js"])
+    monkeypatch.setattr(engine, "_write_sandbox_settings", lambda **_kwargs: "settings.json")
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: engine.PROJECT_ROOT)
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda *_args, **_kwargs: calls.append("native") or PREFLIGHT,
+    )
+    monkeypatch.setattr(
+        engine, "_exec_docker_command",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "ran in docker",
+    )
+
+    assert engine._exec_sandbox_argv(["git", "status"]) == "ran in docker"
+    _, docker = calls
+    assert docker[1]["image"] == engine.GIT_DOCKER_IMAGE
+    assert docker[1]["workspace"] == engine.PROJECT_ROOT
+    assert docker[1]["readonly"] is True
+
+
+def test_status_reports_docker_after_native_preflight_failure(engine, monkeypatch):
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["node", "srt.js"])
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(engine, "_native_sandbox_broken", True)
+
+    assert engine.sandbox_status()["resolved"] == "docker"
+
+
+def test_windows_docker_probe_prefers_the_executable(engine, monkeypatch):
+    unix_shim = r"C:\Program Files\Docker\Docker\resources\bin\docker"
+    windows_exe = unix_shim + ".exe"
+    seen = []
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setattr(
+        engine.shutil, "which",
+        lambda name: {"docker": unix_shim, "docker.exe": windows_exe}.get(name),
+    )
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda argv, **_kwargs: seen.append(argv) or SimpleNamespace(returncode=0),
+    )
+
+    assert engine._docker_available() is True
+    assert seen == [[windows_exe, "info"]]

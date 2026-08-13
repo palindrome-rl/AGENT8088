@@ -104,7 +104,9 @@ def test_model_telemetry_estimates_streamed_output_tokens(engine, monkeypatch, t
     monkeypatch.setattr(engine, "MODEL_TELEMETRY_PATH", path)
     delta = type("Delta", (), {"content": "streamed text", "reasoning_content": None,
                                 "tool_calls": []})()
-    chunk = type("Chunk", (), {"choices": [type("Choice", (), {"delta": delta})()]})()
+    chunk = type("Chunk", (), {"choices": [type("Choice", (), {
+        "delta": delta, "finish_reason": "length",
+    })()]})()
 
     class Completions:
         @staticmethod
@@ -118,6 +120,7 @@ def test_model_telemetry_estimates_streamed_output_tokens(engine, monkeypatch, t
     response = engine.create_completion(client, [], [], on_token=lambda *_: None)
 
     assert response.choices[0].message.content == "streamed text"
+    assert response.choices[0].finish_reason == "length"
     [entry] = _entries(path)
     assert entry["token_source"] == "output_estimate"
     assert entry["output_tokens"] == len("streamed text") // 4
@@ -148,3 +151,34 @@ def test_model_telemetry_marks_primary_and_fallback_attempts(engine, monkeypatch
     assert [(entry["attempt"], entry["outcome"]) for entry in entries] == [
         ("primary", "error"), ("fallback", "success"),
     ]
+
+
+def test_token_limited_tool_call_is_never_executed(engine, monkeypatch):
+    requests = []
+    responses = iter([
+        engine._build_response(
+            '✿FUNCTION✿: write_file ✿ARGS✿: '
+            '{"filename":"library.py","content":"cut mid-li"}',
+            finish_reason="length",
+        ),
+        engine._build_response("Stopped safely.", finish_reason="stop"),
+    ])
+
+    def complete(*_args, **kwargs):
+        requests.append(kwargs["max_tokens"])
+        return next(responses)
+
+    monkeypatch.setattr(engine.memory, "enabled", lambda: False)
+    monkeypatch.setattr(engine, "create_completion", complete)
+    monkeypatch.setattr(
+        engine, "exec_tool",
+        lambda *_args, **_kwargs: pytest.fail("a token-cut tool call must not execute"),
+    )
+
+    answer = engine.run_agent(
+        [{"role": "user", "content": "build library.py"}], max_turns=2,
+        tools_def=[], allowed_tools={"write_file"},
+    )
+
+    assert answer == "Stopped safely."
+    assert requests == [engine.MAX_COMPLETION_TOKENS] * 2

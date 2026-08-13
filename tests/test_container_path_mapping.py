@@ -119,3 +119,28 @@ def test_an_unknown_name_still_defaults_to_artifacts(engine, tmp_path, monkeypat
     monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
 
     assert engine.resolve_user_path("/workspace/new.txt") == (artifacts / "new.txt").resolve()
+
+
+def test_project_relative_artifact_commands_use_the_mounted_workspace(
+        engine, tmp_path, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", artifacts)
+    monkeypatch.setattr(engine, "_sandbox_readonly", False)
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "docker")
+    seen = {}
+    monkeypatch.setattr(
+        engine, "_exec_docker_command",
+        lambda command, *_args, **_kwargs: seen.update(command=command) or "ok",
+    )
+
+    cases = {
+        "cd artifacts && python library.py": "cd . && python library.py",
+        "cat > artifacts/library.py << 'EOF'": "cat > ./library.py << 'EOF'",
+        "cat > /workspace/artifacts/library.py": "cat > /workspace/library.py",
+        "python artifacts/library.py": "python ./library.py",
+        'test -d "artifacts"': 'test -d "."',
+    }
+    for command, expected in cases.items():
+        assert engine._exec_sandbox_command(command) == "ok"
+        assert seen["command"] == expected

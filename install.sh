@@ -784,7 +784,7 @@ install_native_sandbox() {
         SANDBOX_INSTALLED=true
         log_success "Native sandbox runtime installed"
     else
-        log_warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' manually"
+        log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
     fi
 }
 
@@ -1108,6 +1108,13 @@ run_setup_wizard() {
 
     # Write back
     sed -i.bak "s|^allowed_paths=.*|allowed_paths=$new_paths|" "$config"
+    local project_root="${new_paths%%,*}"
+    project_root="$(printf "%s" "$project_root" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if grep -q '^#*[[:space:]]*project_root=' "$config"; then
+        sed -i.bak "s|^#*[[:space:]]*project_root=.*|project_root=$project_root|" "$config"
+    else
+        echo "project_root=$project_root" >> "$config"
+    fi
     sed -i.bak "s|^default_provider=.*|default_provider=$new_provider|" "$config"
     grep -q "^default_provider=" "$config" || echo "default_provider=$new_provider" >> "$config"
     sed -i.bak "s|^provider\.${new_provider}\.base_url=.*|provider.${new_provider}.base_url=$base_url|" "$config"
@@ -1170,9 +1177,10 @@ verify_install() {
     if [ "$SANDBOX_INSTALLED" = true ]; then
         echo "  Sandbox:  native runtime installed"
     else
-        echo "  Sandbox:  run 'agent8088 --sandbox-setup' to install the native runtime"
+        echo "  Sandbox:  Docker fallback is automatic when available"
+        echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | bash"
+    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
 }
