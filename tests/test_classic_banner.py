@@ -146,8 +146,25 @@ def test_interactive_prompt_uses_the_persistent_status_bar(monkeypatch):
 
     assert classic._read_line() == "hello"
     assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
-    assert captured["reserve_space_for_menu"] == 0
+    assert captured["reserve_space_for_menu"] == 6
+    assert captured["pre_run"] is classic._schedule_initial_prompt_repaint
     assert "\n" not in captured["message"].value
+
+
+def test_prompt_repaints_once_after_the_terminal_renderer_attaches(monkeypatch):
+    scheduled = []
+    invalidations = []
+    app = SimpleNamespace(
+        loop=SimpleNamespace(
+            call_later=lambda delay, callback: scheduled.append((delay, callback))),
+        invalidate=lambda: invalidations.append(True),
+    )
+    monkeypatch.setattr("prompt_toolkit.application.current.get_app", lambda: app)
+
+    classic._schedule_initial_prompt_repaint()
+
+    assert scheduled == [(0.05, app.invalidate)]
+    assert invalidations == []
 
 
 @pytest.mark.parametrize(

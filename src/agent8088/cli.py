@@ -3535,6 +3535,23 @@ def _completion_preview_has_space(app=None):
     return free_rows >= 2
 
 
+def _schedule_initial_prompt_repaint():
+    """Repaint once after VS Code's ConPTY renderer has attached.
+
+    In the integrated terminal, prompt_toolkit's first frame can be emitted
+    before the renderer is ready and remain invisible until a key invalidates
+    the application. One delayed invalidation paints that frame without keeping
+    a refresh timer alive for the whole input session.
+    """
+    from prompt_toolkit.application.current import get_app
+
+    app = get_app()
+    try:
+        app.loop.call_later(0.05, app.invalidate)
+    except (AttributeError, RuntimeError):
+        app.invalidate()
+
+
 def _read_line():
     """Use a live completion menu in a TTY, with Rich/readline as a safe fallback."""
     if not sys.stdin.isatty():
@@ -3561,13 +3578,18 @@ def _read_line():
     # fallback `_prompt_label()` does keep both — that path has no toolbar.
     # No leading newline: the blank line above the prompt was the spacing bug.
     label = "\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
+    # Keep Tayyab's completion-menu reserve from 8ade804. Without it,
+    # prompt_toolkit can drop the menu once output has scrolled the cursor to the
+    # bottom of the terminal. The completer's two-row check above still prevents
+    # a preview from being offered when the rendered layout cannot fit it.
     return prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
-        reserve_space_for_menu=0,
+        reserve_space_for_menu=6,
+        pre_run=_schedule_initial_prompt_repaint,
     )
 
 
@@ -4519,9 +4541,7 @@ def main():
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.
-    _search_was_auto = (str(A.APP_CONFIG.get("web_search_provider") or "").strip().lower()
-                        == A.web_search.AUTO)
-    _search_pin = A.resolve_auto_search_provider()
+    A.resolve_auto_search_provider()
 
     if args.gateway:
         from agent8088.gateway import main as gateway_main
@@ -4550,16 +4570,6 @@ def main():
     _install_completion()
     banner()
     warn_about_unknown_theme()
-    if _search_was_auto:
-        # Say which backend won and whether searches will prompt: with auto the
-        # answer changes between launches, and "why is it asking me now?" is
-        # otherwise invisible until the first search.
-        if _search_pin:
-            quiet = " · no prompt" if A._local_searxng_no_prompt_enabled() else " · asks per search"
-            console.print(f"[dim]web search: {_search_pin}{quiet}[/dim]")
-        else:
-            console.print("[dim]web search: no backend available "
-                          "(run /search setup)[/dim]")
     while True:
         try:
             line = _read_line().strip()
