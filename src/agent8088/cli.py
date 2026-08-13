@@ -44,6 +44,12 @@ from rich import box
 APP_DIR = Path(__file__).resolve().parent
 console = Console()
 
+# Model discovery is a convenience in an interactive wizard, not a prerequisite
+# for configuration.  Keep it short and do not let the OpenAI SDK retry a dead
+# or mistyped custom endpoint behind an unchanging "Fetching model list..."
+# message.  The user can always type the model id when discovery is unavailable.
+MODEL_DISCOVERY_TIMEOUT_SECONDS = 5
+
 # A quiet pulsing sparkle for the "thinking" indicator — same idea as Claude Code's own
 # status spinner: a single soft-flashing glyph next to dim status text, not a novelty animation.
 SPINNERS["agent8088_pulse"] = {
@@ -224,6 +230,9 @@ class Session:
         self.usage_mode = config.get("usage_mode", "tokens")
         if self.usage_mode not in {"off", "tokens", "full"}:
             self.usage_mode = "tokens"
+        self.memory_notifications = config.get("memory_notifications", "on")
+        if self.memory_notifications not in {"off", "on", "verbose"}:
+            self.memory_notifications = "on"
         self.last_usage = None
 
 
@@ -328,6 +337,7 @@ def _save_preferences():
         "show_reasoning": int(S.show_reasoning),
         "verbose": S.verbose,
         "usage_mode": S.usage_mode,
+        "memory_notifications": S.memory_notifications,
         "disabled_skills": ",".join(sorted(S.disabled_skills)),
     }
     A.update_simple_config(A.CONFIG_PATH, values)
@@ -828,9 +838,9 @@ def _numbered_lines(text, limit=None, path=""):
     Returns (renderable, total_lines) — the total counts the whole file, not just
     the rows shown, so the caller can report "Read 108 lines" honestly.
     """
+    lines = _source_lines(text)
     if limit is None:
         limit = 200 if S.verbose == "full" else 40
-    lines = _source_lines(text)
     total = len(lines)
     shown = lines[:limit]
     width = max(len(str(len(shown))), 2)
@@ -914,11 +924,12 @@ def _diff_block(diff_lines, limit=None, path=""):
     header has not already said — so it renders as a plain listing of the file
     instead, and the '+' column is saved for edits, where it carries information.
     """
-    if limit is None:
-        limit = 200 if S.verbose == "full" else 60
     hunks = _parse_hunks(diff_lines)
     if not hunks:
         return Text()
+
+    if limit is None:
+        limit = 200 if S.verbose == "full" else 60
 
     if len(hunks) == 1 and hunks[0]["old_count"] == 0:
         listing, _ = _numbered_lines(
@@ -1559,6 +1570,86 @@ def _after_turn_plan_state():
 PLAN_MODE_MIN_TURNS = 25
 
 
+# How long the REPL will wait, after printing the answer, for the extraction call
+# to finish so its result can be reported in this turn. Past this the write still
+# completes in the background — only the notification is dropped, because a line
+# arriving after the prompt is drawn would land in the middle of what the user is
+# typing. Generous enough for a local model, short enough not to feel like a hang.
+MEMORY_NOTIFY_WAIT_SECONDS = 10
+
+
+# Captures that outlasted their report budget: [(thread, stored rows), ...].
+# Reported at the start of a later turn rather than dropped -- a local extraction
+# call routinely takes 15-20s, so dropping it means the common case is silence,
+# which is indistinguishable from memory not working at all.
+#
+# A list rather than one slot: two slow turns in a row both have a report owed, and
+# a single slot let the second overwrite the first. That was observed -- two facts
+# were stored and only the later one was ever mentioned, which reads as memory
+# having missed the first.
+_pending_captures = []
+
+
+def _report_pending_capture():
+    """Report every earlier capture that has finished since, oldest first."""
+    still_running = []
+    for thread, stored_ref in _pending_captures:
+        if thread.is_alive():
+            still_running.append((thread, stored_ref))
+            continue
+        _report_memory_capture(list(stored_ref), late=True)
+    _pending_captures[:] = still_running
+
+
+def _report_memory_capture(stored, late=False):
+    """Say what memory just learned. Mirrors Hermes' display.memory_notifications:
+    off is silent, on is a generic line, verbose previews the facts themselves.
+
+    Printed from the main thread once the capture thread is done, never from the
+    thread itself — see the note on memory.capture's on_stored.
+    """
+    level = S.memory_notifications
+    if level == "off":
+        return
+    suffix = " [dim](from your previous message)[/dim]" if late else ""
+    if not stored:
+        # Most turns teach nothing durable, so staying quiet is right at `on`.
+        # `verbose` says it anyway: "it ran and found nothing" and "it never ran"
+        # are different, and only one of them is a problem.
+        if level == "verbose":
+            console.print(f"[dim]⏺ memory · nothing new to remember[/dim]{suffix}")
+        return
+    noun = "memory" if len(stored) == 1 else "memories"
+    console.print(f"[dim]⏺ memory · stored {len(stored)} new {noun}[/dim]{suffix}")
+    if level == "verbose":
+        for row in stored:
+            console.print(f"[dim]    • {row['text'][:100]}[/dim]")
+
+
+def _await_memory_capture(stored_ref):
+    """Wait briefly for this turn's capture, then report it.
+
+    Capture is deliberately started after the answer is rendered, so by the time
+    this runs the user has already read the reply; the wait costs them nothing but
+    the prompt returning a moment later.
+    """
+    if S.memory_notifications == "off":
+        return
+    # Drain anything owed from earlier turns first, so reports stay in order.
+    _report_pending_capture()
+    thread = A.memory_capture_thread
+    if thread is not None and thread.is_alive():
+        with status_cm("remembering..."):
+            thread.join(timeout=MEMORY_NOTIFY_WAIT_SECONDS)
+        if thread.is_alive():
+            # Deferred rather than dropped. A local extraction call measured 17.7s
+            # against qwen3:8b, so exceeding this budget is the normal case, not the
+            # exception -- and silence is exactly what makes memory look broken.
+            _pending_captures.append((thread, stored_ref))
+            return
+    _report_memory_capture(list(stored_ref))
+
+
 def _turn_max_turns(mode):
     """Round budget for this turn. A plan-mode turn does three things in one turn —
     research, propose, then execute everything the user approved — so it needs more
@@ -1570,14 +1661,18 @@ def _turn_max_turns(mode):
 
 
 def do_chat(query):
+    # Anything last turn's capture stored after its report budget ran out.
+    _report_pending_capture()
     S.messages.append({"role": "user", "content": query})
+    # Filled by the capture thread via the engine hook; read back on this thread.
+    memory_stored = []
+    A.memory_on_capture = memory_stored.extend
     trace = [] if S.show_trace else None
     reasoning_parts = []
     stream = _StreamFilter()
     tokens_ref = [0]
     turn_start = time.time()
     esc = EscListener()
-
     with esc, Live(console=console, refresh_per_second=20, transient=True) as live:
         def spin(msg):
             # Each round starts with "thinking..."; that is the boundary at which a
@@ -1647,6 +1742,13 @@ def do_chat(query):
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
                 temperature=S.temperature,
+                # The session names the run so a fact learned here can be told
+                # apart from one learned in another session.
+                memory_run_id=S.name or None,
+                # The REPL has already rendered its answer by the time the
+                # extraction call runs, so it goes on a background thread and the
+                # user never waits for it. The gateway and cron stay synchronous.
+                memory_background=True,
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
                 on_result=_on_result, on_escalation=_on_escalation,
                 on_answer=None, on_token=on_token,
@@ -1658,6 +1760,7 @@ def do_chat(query):
         except A.AgentInterrupted:
             answer = None
         finally:
+            A.memory_on_capture = None
             A.subagent_ui = None
             A._plan_on_step = None
             A._plan_on_escalation = None
@@ -1683,6 +1786,7 @@ def do_chat(query):
         active = _active_provider_name()
         console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
+    _await_memory_capture(memory_stored)
     if trace is not None:
         _record_trace(query, trace, elapsed)
         console.print(Panel(Text(json.dumps(trace, indent=2)), title="[#237dd7]trace[/#237dd7]",
@@ -1742,6 +1846,8 @@ def cmd_help(_):
         ("/reset", "Clear the active session while retaining its name"),
         ("/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)"),
         ("/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)"),
+        ("/memory [on|off|search|add|forget|notify|test|clear]",
+         "Persistent memory across sessions — recalls facts each turn, learns from finished turns"),
         ("/config", "Show the active configuration (model, endpoint, paths)"),
         ("/history", "Show the current conversation"),
         ("/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace"),
@@ -2902,6 +3008,271 @@ def _show_limits():
                   "/limits tool <name> <seconds>[/dim]")
 
 
+def _memory_set_enabled(want: bool) -> None:
+    A.update_simple_config(A.CONFIG_PATH, {"memory": int(want)})
+    A.APP_CONFIG["memory"] = "1" if want else "0"
+    A.configure_memory()
+
+
+def _show_memory_status():
+    report = A.memory.status()
+    if not report["enabled"]:
+        console.print("[dim]memory: off[/dim]")
+        console.print("[dim]/memory on to enable — recalls relevant facts each turn "
+                      "and learns from finished turns[/dim]")
+        return
+
+    table = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+    table.add_column("Setting", style="#237dd7")
+    table.add_column("Value", style="#237dd7")
+    table.add_row("Memories", str(report["count"]))
+    table.add_row("Scope", report["user_id"]
+                  + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
+    where = report.get("embed_provider") or "active provider"
+    if report["embedder_ok"]:
+        retrieval = f"keyword + semantic ({report['embed_model']} on {where})"
+    else:
+        # Naming both the reason and the endpoint: recall still works on keywords
+        # alone, so a user who thinks memory is broken will switch it off instead
+        # of fixing it -- and the fix depends on *which* host was asked, since
+        # "pull the model" cannot help a host that never had the request.
+        reason = report["embedder_error"] or "not reachable"
+        retrieval = f"keyword only — {report['embed_model']} on {where}: {reason}"
+    table.add_row("Retrieval", retrieval)
+    table.add_row("Learning", "on" if report["capture_enabled"] else "off (recall only)")
+    table.add_row("Notifications", S.memory_notifications)
+    table.add_row("Extractor", report["extract_model"])
+    table.add_row("Injected per turn", str(report["recall_limit"]))
+    table.add_row("Store", f"{report['db_path']}"
+                  + (f" ({report.get('db_bytes', 0) / 1024:.0f} KB)"
+                     if report.get("db_bytes") else ""))
+    if report["stale_vectors"]:
+        table.add_row("Needs re-embedding", f"{report['stale_vectors']} "
+                      "(embedding model changed)")
+    last = report.get("last_capture") or {}
+    if last:
+        cost = (last.get("input_tokens", 0) or 0) + (last.get("output_tokens", 0) or 0)
+        table.add_row("Last learning call", f"{cost} tokens, stored "
+                      f"{last.get('stored', 0)}")
+    if report["error"]:
+        table.add_row("Error", report["error"])
+    console.print(table)
+    console.print("[dim]/memory search <query> · /memory add <text> · "
+                  "/memory forget <id> · /memory notify off|on|verbose · "
+                  "/memory test · /memory clear · /memory off[/dim]")
+
+
+def _show_memory_search(query):
+    results = A.memory.recall(query, limit=10)
+    if not results:
+        console.print("[dim]no memories matched[/dim]")
+        return
+    table = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+    table.add_column("Score", style="#237dd7")
+    table.add_column("Words", style="dim")
+    table.add_column("Meaning", style="dim")
+    table.add_column("Memory", style="#237dd7")
+    table.add_column("Id", style="dim")
+    for row in results:
+        table.add_row(
+            f"{row['score']:.4f}",
+            str(row["bm25_rank"] or "—"),
+            str(row["vector_rank"] or "—"),
+            row["text"][:80],
+            row["id"][:8],
+        )
+    console.print(table)
+    # The per-leg ranks are the point of this view: they show whether a hit came
+    # from words, from meaning, or from both agreeing, which is the only way to
+    # tell a tuning problem from a missing embedder.
+    console.print("[dim]Words/Meaning are each leg's rank; the score fuses them (RRF)[/dim]")
+
+
+def _report_embedder_unavailable(report):
+    """Explain a failed embeddings probe in terms of the host that was asked.
+
+    The first version of this said "pull it with: ollama pull <model>" regardless
+    of where the request went. When embeddings resolve to something other than
+    Ollama, that advice cannot work -- the model was never going to be asked for
+    from the machine you pulled it onto -- and it reads like a command to type at
+    this prompt, which sends it to the model as a chat message instead.
+    """
+    where = report.get("embed_provider") or "your active provider"
+    console.print(f"[yellow]note:[/yellow] {where} could not serve embeddings for "
+                  f"[bold]{report['embed_model']}[/bold], so recall is keyword-only.")
+    if report.get("embedder_error"):
+        console.print(f"[dim]  {report['embedder_error']}[/dim]")
+    if where == "ollama":
+        console.print("[dim]  Fix it in a terminal (not at this prompt):[/dim]")
+        console.print(f"[dim]      ollama pull {report['embed_model']}[/dim]")
+    else:
+        # The common real setup: chat served by one host, embeddings by another.
+        console.print(f"[dim]  Embeddings are asked of [bold]{where}[/bold]. If your "
+                      "embedding model lives elsewhere, name that provider:[/dim]")
+        console.print("[dim]      memory_embed_provider=ollama    "
+                      f"(in {A.CONFIG_PATH})[/dim]")
+        console.print(f"[dim]  or set memory_embed_model to one {where} serves.[/dim]")
+
+
+def cmd_memory(rest):
+    """Show or change persistent memory. Changes persist to config.txt."""
+    parts = rest.strip().split(None, 1)
+    action = parts[0].lower() if parts else ""
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    if not action:
+        _show_memory_status()
+        return
+
+    if action in {"on", "off"}:
+        want = action == "on"
+        _memory_set_enabled(want)
+        if not want:
+            console.print("[dim]memory off — nothing is recalled or learned. "
+                          "Stored memories are kept.[/dim]")
+            return
+        report = A.memory.status()
+        console.print("[green]memory on[/green] "
+                      f"[dim]— {report['count']} memories at {report['db_path']}[/dim]")
+        if not report["embedder_ok"]:
+            _report_embedder_unavailable(report)
+        return
+
+    if not A.memory.enabled():
+        console.print("[dim]memory is off — /memory on first[/dim]")
+        return
+
+    if action == "test":
+        # "Is memory actually working?" is otherwise hard to answer: a model that
+        # cannot produce the JSON stores nothing and says nothing, which looks
+        # exactly like a turn that had nothing worth keeping. This runs the real
+        # extraction call on a fixed exchange and shows both what came back and
+        # what survived parsing, so the two cases are distinguishable.
+        from agent8088.memory import extract as _extract
+        sample_user = ("i work at five rivers technologies and i prefer uv over pip "
+                       "for python projects")
+        exchange = _extract.format_exchange([sample_user], "Understood, noted.")
+        console.print("[dim]Testing extraction with a sample exchange:[/dim]")
+        console.print(f"[dim]  \"{sample_user}\"[/dim]")
+        model = A.MEMORY_EXTRACT_MODEL or A.MODEL_NAME
+        console.print(f"[dim]  extractor: {model}[/dim]")
+        try:
+            started = time.time()
+            with status_cm("asking the model..."):
+                raw, usage = A._memory_extract_completion(
+                    _extract.build_prompt(exchange, []))
+            elapsed = time.time() - started
+        except Exception as exc:
+            console.print(f"[red]the extraction call failed:[/red] {exc}")
+            console.print("[dim]Memory recall still works; nothing new will be "
+                          "learned until this call succeeds.[/dim]")
+            return
+        parsed = _extract.parse_response(raw)
+        console.print(Panel(Text(raw.strip()[:1200] or "(empty reply)"),
+                            title="[#237dd7]raw model reply[/#237dd7]",
+                            box=box.MINIMAL, border_style="#0077B6"))
+        if parsed:
+            console.print(f"[green]extraction works[/green] [dim]— {len(parsed)} "
+                          "fact(s) parsed:[/dim]")
+            for row in parsed:
+                console.print(f"[dim]    • {row['text'][:100]}[/dim]")
+            console.print("[dim]Nothing was stored; this was a test.[/dim]")
+        elif raw.strip():
+            console.print("[yellow]the model replied, but not with usable JSON[/yellow]")
+            console.print("[dim]Nothing would be stored from a turn like this. Point "
+                          "memory_extract_model at a stronger model:[/dim]")
+            console.print(f"[dim]      memory_extract_model=<model>   (in {A.CONFIG_PATH})[/dim]")
+        else:
+            console.print("[yellow]the model returned an empty reply[/yellow]")
+            console.print("[dim]Nothing can be learned until the extractor answers. "
+                          "Try memory_extract_model=<a stronger model>.[/dim]")
+        tokens = (usage or {}).get("input_tokens", 0) or 0
+        tokens += (usage or {}).get("output_tokens", 0) or 0
+        console.print(f"[dim]took {elapsed:.1f}s, {tokens} tokens — this is the cost "
+                      "added to each turn that stores something[/dim]")
+        if elapsed > MEMORY_NOTIFY_WAIT_SECONDS:
+            console.print(f"[dim]Slower than the {MEMORY_NOTIFY_WAIT_SECONDS}s report "
+                          "budget, so the \"stored\" line will usually appear with your "
+                          "next message rather than this one.[/dim]")
+        return
+
+    if action == "notify":
+        level = argument.lower()
+        if level not in {"off", "on", "verbose"}:
+            console.print("[red]usage:[/red] /memory notify off|on|verbose")
+            console.print("[dim]off = silent · on = a line when something is stored · "
+                          "verbose = show the facts, and say when nothing was[/dim]")
+            return
+        S.memory_notifications = level
+        _save_preferences()
+        console.print(f"[green]memory notifications: {level}[/green]")
+        return
+
+    if action == "search":
+        if not argument:
+            console.print("[red]usage:[/red] /memory search <query>")
+            return
+        _show_memory_search(argument)
+        return
+
+    if action == "add":
+        if not argument:
+            console.print("[red]usage:[/red] /memory add <text>")
+            return
+        store = A.memory.store()
+        if store is None:
+            console.print("[red]error:[/red] memory store is not available")
+            return
+        embedder = A.memory.embedder()
+        vector = embedder.embed_one(argument) if embedder else []
+        memory_id = store.add(argument, user_id=A.memory.user_id(), embedding=vector,
+                              embed_model=A.memory._RUNTIME.get("embed_model", ""),
+                              project=str(A.PROJECT_ROOT), source="user")
+        if memory_id:
+            console.print(f"[green]remembered[/green] [dim]{memory_id[:8]}[/dim]")
+        else:
+            console.print("[dim]already remembered[/dim]")
+        return
+
+    if action == "forget":
+        if not argument:
+            console.print("[red]usage:[/red] /memory forget <id>   (see /memory search)")
+            return
+        store = A.memory.store()
+        # An 8-character prefix is what /memory search prints, so accept it rather
+        # than making the user retype a full uuid they were never shown.
+        rows = [row for row in store.get_all(user_id=A.memory.user_id(), limit=100000)
+                if row["id"].startswith(argument)]
+        if not rows:
+            console.print(f"[red]no memory starts with[/red] {argument}")
+            return
+        if len(rows) > 1:
+            console.print(f"[red]{argument} matches {len(rows)} memories[/red] "
+                          "[dim]— use a longer id[/dim]")
+            return
+        store.delete(rows[0]["id"])
+        console.print(f"[green]forgotten:[/green] [dim]{rows[0]['text'][:70]}[/dim]")
+        return
+
+    if action == "clear":
+        store = A.memory.store()
+        count = store.count(user_id=A.memory.user_id())
+        if not count:
+            console.print("[dim]nothing to clear[/dim]")
+            return
+        if not _confirm_destructive(f"Delete all {count} memories",
+                                    f"for {A.memory.user_id()}"):
+            console.print("[dim]kept[/dim]")
+            return
+        console.print(f"[green]cleared {store.delete_all(user_id=A.memory.user_id())}"
+                      "[/green]")
+        return
+
+    console.print(f"[red]unknown:[/red] /memory {action}  "
+                  "[dim](status · on · off · search · add · forget · notify · "
+                  "test · clear)[/dim]")
+
+
 def cmd_limits(rest):
     """Show or change a limit. Changes persist to config.txt."""
     parts = rest.split()
@@ -3073,6 +3444,7 @@ COMMANDS = {
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
+    "memory": cmd_memory,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 
@@ -3147,6 +3519,39 @@ def _live_matches(text):
     return "", []
 
 
+def _completion_preview_has_space(app=None):
+    """Return whether two menu rows fit above the persistent toolbar."""
+    if app is None:
+        from prompt_toolkit.application.current import get_app
+        app = get_app()
+    screen = getattr(getattr(app, "renderer", None), "last_rendered_screen", None)
+    if screen is None:
+        return False
+    try:
+        cursor = screen.get_cursor_position(app.layout.current_window)
+    except (AttributeError, KeyError):
+        return False
+    free_rows = screen.height - cursor.y - 2  # input row and bottom toolbar
+    return free_rows >= 2
+
+
+def _schedule_initial_prompt_repaint():
+    """Repaint once after VS Code's ConPTY renderer has attached.
+
+    In the integrated terminal, prompt_toolkit's first frame can be emitted
+    before the renderer is ready and remain invisible until a key invalidates
+    the application. One delayed invalidation paints that frame without keeping
+    a refresh timer alive for the whole input session.
+    """
+    from prompt_toolkit.application.current import get_app
+
+    app = get_app()
+    try:
+        app.loop.call_later(0.05, app.invalidate)
+    except (AttributeError, RuntimeError):
+        app.invalidate()
+
+
 def _read_line():
     """Use a live completion menu in a TTY, with Rich/readline as a safe fallback."""
     if not sys.stdin.isatty():
@@ -3161,6 +3566,8 @@ def _read_line():
 
     class AgentCompleter(Completer):
         def get_completions(self, document, complete_event):
+            if not _completion_preview_has_space():
+                return
             token, matches = _live_matches(document.text_before_cursor)
             for match in matches:
                 yield Completion(match, start_position=-len(token))
@@ -3169,14 +3576,20 @@ def _read_line():
     # the context percentage *and* A.PERMISSION_MODE, so repeating either here
     # would print `plan` an inch above a bar reading `plan-only`. The Rich
     # fallback `_prompt_label()` does keep both — that path has no toolbar.
+    # No leading newline: the blank line above the prompt was the spacing bug.
     label = "\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
+    # Keep Tayyab's completion-menu reserve from 8ade804. Without it,
+    # prompt_toolkit can drop the menu once output has scrolled the cursor to the
+    # bottom of the terminal. The completer's two-row check above still prevents
+    # a preview from being offered when the rendered layout cannot fit it.
     return prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
-        reserve_space_for_menu=0,
+        reserve_space_for_menu=6,
+        pre_run=_schedule_initial_prompt_repaint,
     )
 
 
@@ -3441,6 +3854,70 @@ def _reload_model_runtime(config_path, provider="", model=""):
         A.activate_model(provider, model)
 
 
+DEFAULT_EMBED_MODEL = "nomic-embed-text"
+
+
+def _backfill_memory_key(content, set_line):
+    """Give an older config the `memory` key, and say so.
+
+    Memory ships on: the packaged template carries memory=1 and the installers
+    pull the embedding model. But setup edits a config in place, so one written
+    before this key existed never gains it and falls back to the conservative code
+    default — a user who upgrades would silently have no memory while a fresh
+    install has it, with no way to discover the key short of reading the source.
+    Same reasoning and same shape as the web_search_no_prompt backfill above.
+
+    Announced rather than silent, because it starts spending a model call per
+    turn. Backfilled only on an explicit reconfiguration, so `memory=0` set by
+    hand still sticks.
+    """
+    import re as _re
+    if _re.search(r'^\s*memory=', content, _re.MULTILINE):
+        return content
+    packaged = Path(__file__).with_name("config.txt")
+    try:
+        shipped = _re.search(r'^\s*memory=(.*)$',
+                             packaged.read_text(encoding="utf-8"), _re.MULTILINE)
+    except OSError:
+        shipped = None
+    if not (shipped and shipped.group(1).strip()):
+        return content
+    value = shipped.group(1).strip()
+    content = set_line(content, "memory", value)
+    if value == "0":
+        return content
+    print(f"\nAdded memory={value} — the agent now remembers durable facts across "
+          "sessions.")
+    print("  One extra model call per turn, made after each answer. /memory off "
+          "to disable.")
+    if _embedding_model_present():
+        print(f"  Semantic recall: on ({DEFAULT_EMBED_MODEL} in local Ollama).")
+    else:
+        # Recall still works on keywords alone. Saying so is the difference between
+        # a user fixing it with one command and concluding memory is broken.
+        print(f"  Semantic recall: off — {DEFAULT_EMBED_MODEL} is not in local "
+              "Ollama, so recall")
+        print("  uses keyword search only. In a terminal:  "
+              f"ollama pull {DEFAULT_EMBED_MODEL}")
+        print("  Embeddings are asked of Ollama regardless of which provider serves")
+        print("  chat; set memory_embed_provider to serve them from somewhere else.")
+    return content
+
+
+def _embedding_model_present() -> bool:
+    """Whether the embedding model is pulled into local Ollama. False for any
+    doubt, including no Ollama at all — and claiming a
+    local model is installed when it is not is the failure this reporting exists
+    to prevent."""
+    import subprocess
+    try:
+        listing = subprocess.run(["ollama", "list"], capture_output=True, text=True,
+                                 timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return listing.returncode == 0 and DEFAULT_EMBED_MODEL in listing.stdout
+
+
 def _run_setup(config_path=None, include_workspace=True, activate_runtime=False, heading="Agent8088 setup"):
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
@@ -3512,14 +3989,19 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         secret=True,
     )
     # Fetch models
-    print("\nFetching model list...")
+    print(f"\nFetching model list (up to {MODEL_DISCOVERY_TIMEOUT_SECONDS}s)...")
     try:
         from agent8088.providers import list_models
         from openai import OpenAI
         defaults = provider_registry.builtin_provider_defaults(provider)
         base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
         api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
-        fetch_client = OpenAI(base_url=base_url, api_key=api_key, timeout=15)
+        fetch_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
         models = list_models(provider, client=fetch_client, fallback=False)
     except Exception:
         models = []
@@ -3530,6 +4012,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             current_model if current_model in models else "",
         )
     else:
+        print("Model discovery unavailable; enter the model name manually.")
         model_name = ""
         while not model_name:
             model_name = _custom_prompt(
@@ -3595,6 +4078,11 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
 
     if paths:
         content = _set_line(content, "allowed_paths", paths)
+        # The prompt says "Working directory", so persist the first entry as
+        # the workspace too. Older setup code only changed the allowlist; a user
+        # launching Agent8088 elsewhere then wrote into that launch directory
+        # and immediately failed the configured path check.
+        content = _set_line(content, "project_root", paths.split(",", 1)[0].strip())
     content = _set_line(content, "default_provider", provider)
 
     # Write provider base_url + model. Endpoint defaults live in the provider registry.
@@ -3639,6 +4127,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             content = _set_line(content, "web_search_no_prompt", value)
             print(f"Added web_search_no_prompt={value} "
                   "(approval-free search, local SearXNG only).")
+    content = _backfill_memory_key(content, _set_line)
     _write_private_text(config_path, content)
     if activate_runtime:
         _reload_model_runtime(config_path, provider, model_name)
@@ -4013,9 +4502,13 @@ def main():
         epilog="Run with no flags to start the interactive REPL.",
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
-    parser.add_argument("--edit", action="store_true", help="start in full-auto mode (alias for --mode full-auto)")
     parser.add_argument("--full-auto", action="store_true", help="start in full-auto mode (no per-action permission prompts)")
-    parser.add_argument("--mode", choices=["readonly", "full-auto", "plan-only"],
+    # plan-only is deliberately not a choice here, for the same reason /mode
+    # rejects it: it is a session with a beginning and an end, entered through
+    # enter_plan_mode() so there is a mode to return to when the plan finishes.
+    # Setting it at startup skips that bookkeeping and strands the session in
+    # plan mode with nothing to restore. `/plan` is the only door.
+    parser.add_argument("--mode", choices=["readonly", "full-auto"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
@@ -4048,9 +4541,7 @@ def main():
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.
-    _search_was_auto = (str(A.APP_CONFIG.get("web_search_provider") or "").strip().lower()
-                        == A.web_search.AUTO)
-    _search_pin = A.resolve_auto_search_provider()
+    A.resolve_auto_search_provider()
 
     if args.gateway:
         from agent8088.gateway import main as gateway_main
@@ -4066,7 +4557,7 @@ def main():
         else:
             run_mcp_server(transport="stdio")
         return
-    if args.edit or args.full_auto:
+    if args.full_auto:
         A.PERMISSION_MODE = "full-auto"
     if args.mode:
         A.PERMISSION_MODE = args.mode
@@ -4079,16 +4570,6 @@ def main():
     _install_completion()
     banner()
     warn_about_unknown_theme()
-    if _search_was_auto:
-        # Say which backend won and whether searches will prompt: with auto the
-        # answer changes between launches, and "why is it asking me now?" is
-        # otherwise invisible until the first search.
-        if _search_pin:
-            quiet = " · no prompt" if A._local_searxng_no_prompt_enabled() else " · asks per search"
-            console.print(f"[dim]web search: {_search_pin}{quiet}[/dim]")
-        else:
-            console.print("[dim]web search: no backend available "
-                          "(run /search setup)[/dim]")
     while True:
         try:
             line = _read_line().strip()

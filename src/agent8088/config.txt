@@ -106,6 +106,104 @@ sandbox_runtime_version=0.0.67
 # output says so rather than implying otherwise.
 # plan_audit_revert_max_bytes=1048576
 
+# --- persistent memory ---
+# On by default. With memory=1 the agent does two extra things per turn:
+#
+#   before the turn  the last thing YOU typed is searched against stored
+#                    memories, and the top few are added to that turn's system
+#                    prompt as context
+#   after the answer one extra model call distils durable facts from the
+#                    exchange and stores them, deduped against what is known
+#
+# Retrieval runs two independent searches and fuses them with Reciprocal Rank
+# Fusion: SQLite FTS5/BM25 for words (exact flags, filenames, error strings) and
+# cosine similarity over embeddings for meaning (finds "uv" from "package
+# manager"). Their scores are not comparable, so RRF fuses the ranks instead --
+# which is why the vector leg only has to be roughly right, and why a 274MB
+# embedder is enough.
+#
+# The installers pull the embedding model, so semantic recall works from the
+# first turn. `/memory` shows what it holds and what the last learning call cost;
+# `/memory off` stops both habits without deleting anything, and
+# memory_capture=0 below keeps recall while stopping new writes.
+#
+# Only what YOU type can become a memory or trigger a recall. Tool output -- web
+# pages, shell results, file contents -- never does, and a recalled memory can
+# never authorise a tool call: check_permission does not read them.
+memory=1
+#
+# Where memories live. One SQLite file, mode 0600. Delete it and memory is gone;
+# nothing else is affected.
+# memory_db_path=~/.agent8088/memory.db
+#
+# Who owns the memories. One identity by default, so a fact learned in the
+# terminal is recalled in Slack, Discord, WhatsApp, Telegram and email too --
+# they are all the same person's accounts.
+# memory_user_id=owner
+#
+# Set to 1 to give each gateway identity its own separate memories. Only needed
+# if a *_allowed_users line holds more than one person; the filtering is done in
+# SQL, so an enabled scope cannot be bypassed.
+# memory_scope_by_identity=0
+#
+# Embedding model for the semantic leg, served over the OpenAI-compatible
+# /embeddings endpoint of the provider named below -- NOT of your chat provider.
+# nomic-embed-text is 274MB, 768 dims:
+#   ollama pull nomic-embed-text
+# Alternatives, larger and slightly stronger: embeddinggemma (622MB),
+# mxbai-embed-large (670MB), qwen3-embedding:0.6b (~1.2GB). Smallest usable:
+# all-minilm (46MB). If the model is missing or unreachable, recall degrades to
+# keyword-only instead of failing -- `/memory` says so when it happens.
+# Changing this is detected rather than silently mixing incompatible vectors:
+# rows embedded by another model are excluded and counted in `/memory`.
+# memory_embed_model=nomic-embed-text
+# Which provider serves the embeddings request. Defaults to `ollama`, NOT to your
+# chat provider: chat and embeddings are separate services in almost every real
+# setup, and nomic-embed-text is an Ollama model, so deriving this from
+# default_provider asked the wrong host and reported the model as missing when it
+# was simply never requested from the machine holding it. Whatever serves your
+# chat does not matter here. Set this only if your embeddings live elsewhere.
+# memory_embed_provider=ollama
+#
+# Model for the fact-extraction call (default: your chat model). Point this at
+# something small if one extra call per turn on your main model is too slow.
+# memory_extract_model=
+#
+# Set to 0 to recall existing memories but stop learning new ones.
+# memory_capture=1
+# Memories injected into a turn's prompt (default 5):
+# memory_recall_limit=5
+# RRF damping constant. 60 is from the original paper; lower makes rank 1
+# dominate, higher flattens the ranking.
+# memory_rrf_k=60
+# Drop fused hits below this score (default 0, keep everything that matched):
+# memory_min_score=0
+# Most memories one turn may create, so a single odd exchange cannot flood the
+# store:
+# memory_max_per_turn=10
+#
+# --- what you see when memory learns something ---
+# off      silent; memory still works, it just never says so
+# on       (default) one dim line when a turn stored something:
+#              memory - stored 2 new memories
+# verbose  the same line plus the facts themselves, and a line on the turns that
+#          stored nothing -- "it ran and found nothing" and "it never ran" are
+#          different, and only one of them is a problem
+# Change it live with `/memory notify off|on|verbose`.
+#
+# The report waits up to 10s after the answer for the extraction call to finish.
+# A local extraction call routinely takes 15-20s, so past that budget the line is
+# shown with your NEXT message instead, marked "(from your previous message)" --
+# deferred rather than dropped, because a line printed after the prompt is drawn
+# would land in the middle of your typing, and silence is indistinguishable from
+# memory not working.
+#
+# `/memory test` runs one real extraction call on a sample exchange and shows the
+# raw reply, what parsed out of it, and how long it took. Use it when memory seems
+# to be learning nothing: a model that cannot produce the JSON stores nothing and
+# says nothing, which looks exactly like a turn that had nothing worth keeping.
+# memory_notifications=on
+
 # --- local model telemetry ---
 # Writes metadata only (provider/model, timing, token/cost estimates, outcome).
 # Prompts, responses, paths, tool arguments, and credentials are never recorded.

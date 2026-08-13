@@ -9,7 +9,9 @@ model's opinion.
 
 ## The three permission modes
 
-Set at startup with `--mode`, or switched live with `/mode`.
+`readonly` and `full-auto` are set at startup with `--mode`, or switched live with
+`/mode`. `plan-only` is neither: it is a session you start with `/plan` and leave when
+the plan finishes, so it is not a value `--mode` or `/mode` accepts.
 
 | Mode | Reads | Writes / shell / network | How to get a mutation through |
 |---|---|---|---|
@@ -17,7 +19,7 @@ Set at startup with `--mode`, or switched live with `/mode`.
 | **`full-auto`** | allowed | allowed, no prompt | — |
 | **`plan-only`** | allowed | refused | approve a whole plan up front |
 
-`--edit` and `--full-auto` are aliases for `--mode full-auto`.
+`--full-auto` is a shorthand for `--mode full-auto`.
 
 ### What readonly actually allows
 

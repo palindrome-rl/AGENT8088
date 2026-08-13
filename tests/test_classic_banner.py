@@ -4,6 +4,7 @@ import sys
 from types import SimpleNamespace
 
 import prompt_toolkit
+import pytest
 from rich.console import Console
 
 import agent8088.cli as classic
@@ -116,10 +117,10 @@ def test_classic_masthead_compacts_on_narrow_terminals(monkeypatch):
 def test_command_suggestions_cover_slash_and_bare_prefixes():
     assert "/help" in classic._command_matches("/")
     assert "/quit" in classic._command_matches("/")
-    assert classic._command_matches("m", slash=False) == ["maxturns", "mcp", "mode", "model", "models"]
+    assert classic._command_matches("m", slash=False) == ["maxturns", "mcp", "memory", "mode", "model", "models"]
     assert classic._live_matches("/")[1] == classic._command_matches("/")
-    assert classic._live_matches("/m")[1] == ["/maxturns", "/mcp", "/mode", "/model", "/models"]
-    assert classic._live_matches("m") == ("m", ["maxturns", "mcp", "mode", "model", "models"])
+    assert classic._live_matches("/m")[1] == ["/maxturns", "/mcp", "/memory", "/mode", "/model", "/models"]
+    assert classic._live_matches("m") == ("m", ["maxturns", "mcp", "memory", "mode", "model", "models"])
 
 
 def test_status_bar_summarizes_the_idle_session(monkeypatch):
@@ -145,8 +146,57 @@ def test_interactive_prompt_uses_the_persistent_status_bar(monkeypatch):
 
     assert classic._read_line() == "hello"
     assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
-    assert captured["reserve_space_for_menu"] == 0
+    assert captured["reserve_space_for_menu"] == 6
+    assert captured["pre_run"] is classic._schedule_initial_prompt_repaint
     assert "\n" not in captured["message"].value
+
+
+def test_prompt_repaints_once_after_the_terminal_renderer_attaches(monkeypatch):
+    scheduled = []
+    invalidations = []
+    app = SimpleNamespace(
+        loop=SimpleNamespace(
+            call_later=lambda delay, callback: scheduled.append((delay, callback))),
+        invalidate=lambda: invalidations.append(True),
+    )
+    monkeypatch.setattr("prompt_toolkit.application.current.get_app", lambda: app)
+
+    classic._schedule_initial_prompt_repaint()
+
+    assert scheduled == [(0.05, app.invalidate)]
+    assert invalidations == []
+
+
+@pytest.mark.parametrize(
+    ("height", "cursor_y", "expected"),
+    [(4, 0, True), (3, 0, False), (2, 0, False)],
+)
+def test_completion_preview_requires_two_free_rows(height, cursor_y, expected):
+    screen = SimpleNamespace(
+        height=height,
+        get_cursor_position=lambda _window: SimpleNamespace(y=cursor_y),
+    )
+    app = SimpleNamespace(
+        renderer=SimpleNamespace(last_rendered_screen=screen),
+        layout=SimpleNamespace(current_window=object()),
+    )
+
+    assert classic._completion_preview_has_space(app) is expected
+
+
+def test_slash_completion_is_hidden_without_two_free_rows(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(classic, "_completion_preview_has_space", lambda: False)
+    monkeypatch.setattr(
+        prompt_toolkit, "prompt",
+        lambda message, **kwargs: captured.update(kwargs, message=message) or "hello",
+    )
+
+    assert classic._read_line() == "hello"
+    document = prompt_toolkit.document.Document("/he", cursor_position=3)
+
+    assert list(captured["completer"].get_completions(document, object())) == []
 
 
 def test_stream_view_hides_large_tool_wire_payloads():

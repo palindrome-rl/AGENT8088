@@ -5,6 +5,7 @@ tests below pin that separation, and pin the two ways it used to leak: a grant
 that outlived its mode, and a plan that was never run being reported as done.
 """
 import io
+import sys
 
 import pytest
 from rich.console import Console
@@ -12,6 +13,16 @@ from rich.console import Console
 import agent8088.cli as cli
 
 PLAN = "## Goal\nAdd a greeting file.\n\n1. Write a.txt containing 'a'\n2. Read it back"
+
+
+@pytest.mark.parametrize("args", [["--mode", "plan-only"], ["--edit"]])
+def test_startup_rejects_mode_shortcuts_that_bypass_plan_state(args, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["agent8088", *args])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
 
 
 # ---------------------------------------------------------------------------

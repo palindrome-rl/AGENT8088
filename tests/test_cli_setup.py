@@ -476,3 +476,36 @@ def test_the_backfill_is_announced_rather_than_silent(tmp_path, monkeypatch, cap
     _run_setup_over(tmp_path / "config.txt", monkeypatch)
 
     assert "web_search_no_prompt" in capsys.readouterr().out
+
+
+def test_setup_model_discovery_has_a_short_timeout_and_no_retries(
+        tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.txt"
+    config.write_text(
+        "default_provider=openai\nprovider.openai.model=typed-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.A, "ENV_FILE_PATH", tmp_path / ".env")
+    monkeypatch.setattr(cli, "_choice_prompt", lambda *_args, **_kwargs: "openai")
+    monkeypatch.setattr(
+        cli, "_custom_prompt",
+        lambda message, *_args, **_kwargs: (
+            "key" if message.startswith("API key") else "typed-model"
+        ),
+    )
+    monkeypatch.setattr(cli, "_backfill_memory_key", lambda content, _set: content)
+    created = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    monkeypatch.setattr(providers, "list_models", lambda *_args, **_kwargs: [])
+
+    cli._run_setup(config_path=config, include_workspace=False)
+
+    assert created["timeout"] == cli.MODEL_DISCOVERY_TIMEOUT_SECONDS
+    assert created["max_retries"] == 0
+    assert providers.MODEL_LIST_TIMEOUT_SECONDS == cli.MODEL_DISCOVERY_TIMEOUT_SECONDS
+    assert "enter the model name manually" in capsys.readouterr().out

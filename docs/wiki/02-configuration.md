@@ -130,6 +130,29 @@ See [Messaging Gateway](08-messaging-gateway.md).
 MCP *servers you connect to* are configured in `mcp.json`, not here. See
 [MCP](07-mcp.md).
 
+## Memory
+
+On by default. Full explanation in [Memory](16-memory.md).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `memory` | `1` | Master switch. `0` stops both recall and learning; stored memories are kept. |
+| `memory_db_path` | `~/.agent8088/memory.db` | The store. One SQLite file, mode `0600`. |
+| `memory_user_id` | `owner` | Whose memories these are. One identity by default, so memory carries across the CLI and every gateway platform. |
+| `memory_scope_by_identity` | `0` | `1` gives each gateway identity its own namespace. Needed only if a `*_allowed_users` line holds more than one person. |
+| `memory_embed_model` | `nomic-embed-text` | Embedding model for semantic recall (274 MB; the installers pull it). Missing or unreachable degrades recall to keyword-only rather than failing. |
+| `memory_embed_provider` | `ollama` | Provider asked for embeddings. Deliberately **not** your chat provider — chat and embeddings are separate services, and the default embed model is an Ollama model. Whatever serves chat is irrelevant here. |
+| `memory_extract_model` | *(chat model)* | Model for the fact-extraction call. Point at something small to spend less. |
+| `memory_capture` | `1` | `0` keeps recall and stops learning new facts. |
+| `memory_recall_limit` | `5` | Facts injected into a turn's prompt. |
+| `memory_rrf_k` | `60` | RRF damping constant. Lower makes rank 1 dominate; higher flattens. |
+| `memory_min_score` | `0` | Drop fused hits below this score. |
+| `memory_max_per_turn` | `10` | Cap on facts one turn may create. |
+| `memory_notifications` | `on` | What you see when a turn learns something: `off` silent, `on` a one-line count, `verbose` the facts themselves plus a line on turns that stored nothing. `/memory notify` changes it live. |
+
+Only what **you** type can become a memory or trigger a recall — tool output
+never does — and a recalled memory can never authorise a tool call.
+
 ## Limits
 
 | Key | Purpose |

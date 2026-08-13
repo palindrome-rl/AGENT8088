@@ -2,6 +2,8 @@
 
 No docker, no network: searxng_provision is patched throughout.
 """
+import sys
+
 import pytest
 
 from agent8088 import cli
@@ -26,6 +28,20 @@ def test_search_command_is_registered():
 
 def test_search_is_tab_completable():
     assert "search" in cli._COMPLETABLE_COMMANDS
+
+
+def test_repl_startup_does_not_print_search_backend(capsys, monkeypatch):
+    """Backend selection is available through /search, not startup clutter."""
+    monkeypatch.setattr(sys, "argv", ["agent8088"])
+    monkeypatch.setattr(cli.A, "resolve_auto_search_provider", lambda: "ddgs")
+    monkeypatch.setattr(cli, "_install_completion", lambda: None)
+    monkeypatch.setattr(cli, "banner", lambda: None)
+    monkeypatch.setattr(cli, "warn_about_unknown_theme", lambda: None)
+    monkeypatch.setattr(cli, "_read_line", lambda: "exit")
+
+    cli.main()
+
+    assert "web search:" not in capsys.readouterr().out.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,14 @@ def test_an_ordinary_failure_is_not_mistaken_for_one(engine):
         assert not engine._is_missing_argument_error(message), message
 
 
+def test_empty_read_is_rejected_before_it_resolves_to_the_workspace(engine):
+    result = engine.run_tool("read_text", {})
+
+    assert engine._is_missing_argument_error(result)
+    assert "filename" in result
+    assert "Permission denied" not in result
+
+
 def test_the_model_is_corrected_and_the_search_then_runs(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
     monkeypatch.setattr(engine, "_exec_search", lambda *a, **k: "Ronaldo, born 1976",

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import web_search
+from agent8088 import memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -255,7 +255,41 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
-PROJECT_ROOT = Path(APP_CONFIG.get("project_root", os.getcwd())).expanduser().resolve()
+def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
+    """Choose the workspace setup named, even when launched somewhere else.
+
+    Older installers stored the answer to "Working directory" only as
+    ``allowed_paths``.  PROJECT_ROOT still defaulted to the process CWD, so
+    launching ``agent8088`` from another directory routed new files there and
+    then rejected them against the configured allowlist.  Keep an allowed launch
+    directory when there is one; otherwise the first existing configured path is
+    the workspace those installers meant.
+    """
+    launch = Path(cwd or os.getcwd()).expanduser().resolve()
+    explicit = str(config.get("project_root", "")).strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        return (path if path.is_absolute() else launch / path).resolve()
+
+    candidates = []
+    for raw in str(config.get("allowed_paths", "")).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        candidate = (path if path.is_absolute() else launch / path).resolve()
+        try:
+            if not candidate.is_dir():
+                continue
+        except OSError:
+            continue
+        if launch == candidate or candidate in launch.parents:
+            return launch
+        candidates.append(candidate)
+    return candidates[0] if candidates else launch
+
+
+PROJECT_ROOT = _configured_project_root(APP_CONFIG)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -271,7 +305,7 @@ SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/searc
 SEARCH_BASE_URL_CONFIGURED = bool(str(APP_CONFIG.get("search_base_url", "")).strip())
 GEMMA_BASE_URL = APP_CONFIG.get("gemma_base_url", "http://localhost:8003/v1")
 TOOLS_FILE = Path(APP_CONFIG.get("tools_file", str(APP_DIR / "tools.txt"))).expanduser()
-SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", os.getcwd())).expanduser().resolve()
+SHELL_CWD = Path(APP_CONFIG.get("shell_cwd", str(PROJECT_ROOT))).expanduser().resolve()
 BANNER_FILE = Path(APP_CONFIG.get("banner_file", str(APP_DIR / "banner.txt"))).expanduser()
 SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).expanduser()
 
@@ -279,6 +313,9 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
+MAX_COMPLETION_TOKENS = max(
+    1, min(int(APP_CONFIG.get("max_completion_tokens", "8192")), CONTEXT_WINDOW)
+)
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
 # A sub-agent exists to keep work *out* of the parent's context, so an unbounded
 # answer defeats the delegation it was spawned for. 0 disables the cap.
@@ -502,7 +539,13 @@ ALLOWED_PATHS = [
 # ---------------------------------------------------------------------------
 # Permission layer ÔÇö readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
-PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
+# plan-only is refused here for the same reason `/mode` and `--mode` refuse it: a
+# plan session must be entered through enter_plan_mode(), which records the mode to
+# come back to. Starting in plan-only skips that, so finish_plan_session() has
+# nothing to restore and the session is stranded in plan mode. Fall back to the
+# safe default instead of honouring it; `/plan` is the only door.
+_env_permission_mode = os.environ.get("AGENT8088_PERMISSION", "readonly")
+PERMISSION_MODE = "readonly" if _env_permission_mode == "plan-only" else _env_permission_mode
 _one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
 _pending_approval_key = ""
 _local_fallback_grant = False
@@ -1481,12 +1524,14 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         response = completion(**kwargs)
         if on_token is None:
             return response
-        collected, tool_chunks = [], {}
+        collected, tool_chunks, finish_reason = [], {}, None
         stop, watcher = _start_interrupt_watcher(response, interrupt_check)
         try:
             for chunk in response:
                 _raise_if_interrupted(interrupt_check, response)
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                delta = choice.delta
+                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
                 reasoning = getattr(delta, "reasoning_content", None)
                 if reasoning:
                     on_token("reasoning", reasoning)
@@ -1501,7 +1546,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             raise
         finally:
             _finish_interrupt_watcher(stop, watcher)
-        return _build_response("".join(collected), tool_chunks)
+        return _build_response("".join(collected), tool_chunks, finish_reason)
     request_options = dict(
         model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
@@ -1513,12 +1558,14 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         return client.chat.completions.create(**request_options)
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
     stream = client.chat.completions.create(**request_options, stream=True)
-    collected, tool_chunks = [], {}
+    collected, tool_chunks, finish_reason = [], {}, None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
     try:
         for chunk in stream:
             _raise_if_interrupted(interrupt_check, stream)
-            delta = chunk.choices[0].delta
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
             rc = getattr(delta, "reasoning_content", None)
             if rc:
                 on_token("reasoning", rc)
@@ -1533,7 +1580,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         raise
     finally:
         _finish_interrupt_watcher(stop, watcher)
-    return _build_response("".join(collected), tool_chunks)
+    return _build_response("".join(collected), tool_chunks, finish_reason)
 
 
 def _fallback_targets() -> list:
@@ -1572,6 +1619,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     try:
         return create_completion(
             client, messages, tools, temperature=temperature,
+            max_tokens=MAX_COMPLETION_TOKENS,
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
@@ -1598,6 +1646,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 })
             return create_completion(
                 fallback_client, messages, tools, temperature=temperature,
+                max_tokens=MAX_COMPLETION_TOKENS,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
@@ -1622,7 +1671,7 @@ def _collect_stream_tool_calls(delta, chunks):
             entry["arguments"] += getattr(function, "arguments", None) or ""
 
 
-def _build_response(content, tool_chunks=None):
+def _build_response(content, tool_chunks=None, finish_reason=None):
     """Reconstruct a ChatCompletion-like object from streamed content
     so run_agent() can read .choices[0].message.content uniformly."""
     tool_calls = []
@@ -1636,7 +1685,7 @@ def _build_response(content, tool_chunks=None):
         })())
     return type("R", (), {"choices": [type("C", (), {
         "message": type("M", (), {"content": content, "tool_calls": tool_calls}),
-        "finish_reason": "tool_calls" if tool_calls else "stop",
+        "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
     })()]})
 
 
@@ -2444,7 +2493,11 @@ def _plan_step_failed(result: str) -> bool:
     approved it). Both mean the intended effect is absent, so every later step
     is now standing on an assumption that is already false.
     """
-    return _unwrap_untrusted(result).lstrip().startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+    plain = _unwrap_untrusted(result).strip()
+    return (plain.startswith(("Error:", "ESCALATION_REQUEST\x1f"))
+            or bool(re.search(
+                r"(?:^|\n)Command exited with status [1-9]\d*\.$", plain))
+            or bool(re.search(r"(?:^|\n)Command timed out(?: after \d+s)?\.$", plain)))
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -3181,9 +3234,30 @@ def _exec_browser(args: dict) -> str:
 # Sandboxed execution — native OS isolation, with Docker as a fallback
 # ---------------------------------------------------------------------------
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
+GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
+# Set after a native pre-flight failure. The restricted account or OS policy
+# does not heal during the process, so both execution and status use Docker for
+# the rest of the session when it is available.
+_native_sandbox_broken = False
+
+
+def _which_executable(name: str) -> str | None:
+    """Resolve a runnable Windows launcher, not an extensionless Unix shim.
+
+    Python 3.12.0's ``shutil.which('docker')`` may return Docker Desktop's
+    neighbouring ``docker`` shell script before ``docker.exe``.  Passing that
+    path to CreateProcess fails with WinError 193 and made a running Docker
+    daemon look unavailable.  Explicit PATHEXT spellings avoid that ambiguity.
+    """
+    if sys.platform == "win32" and not PureWindowsPath(name).suffix:
+        for suffix in (".exe", ".cmd", ".bat", ".com"):
+            executable = shutil.which(name + suffix)
+            if executable:
+                return executable
+    return shutil.which(name)
 
 
 def _agent_data_dir() -> Path:
@@ -3197,13 +3271,17 @@ def _agent_data_dir() -> Path:
 def _native_sandbox_argv():
     override = os.environ.get("AGENT8088_SRT")
     if override:
-        return shlex.split(override, posix=sys.platform != "win32")
+        argv = shlex.split(override, posix=sys.platform != "win32")
+        if sys.platform == "win32":
+            argv = [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"'
+                    else part for part in argv]
+        return argv
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
-    node = shutil.which("node")
+    node = _which_executable("node")
     if node and cli.exists():
         return [node, str(cli)]
-    executable = shutil.which("srt")
+    executable = _which_executable("srt")
     return [executable] if executable else None
 
 
@@ -3220,7 +3298,7 @@ def _native_sandbox_missing_requirements() -> list:
 
 
 def _docker_available() -> bool:
-    docker = shutil.which("docker")
+    docker = _which_executable("docker")
     if not docker:
         return False
     try:
@@ -3235,10 +3313,14 @@ def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
     if requested == "native":
+        if native_available and _native_sandbox_broken and _docker_available():
+            return "docker"
         return "native" if native_available else "unavailable"
     if requested == "docker":
         return "docker" if _docker_available() else "unavailable"
     if native_available:
+        if _native_sandbox_broken and _docker_available():
+            return "docker"
         return "native"
     return "docker" if _docker_available() else "unavailable"
 
@@ -3336,13 +3418,6 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
 )
 
 
-# Set once the native runtime has proved it cannot start a sandbox in this
-# process. A runtime that cannot log into its restricted account does not heal
-# between commands, so retrying it per command spends a node subprocess to reach
-# the same failure and reprints the same wall of stderr in the transcript.
-_native_sandbox_broken = False
-
-
 def _native_sandbox_repair_hint(result: str) -> str:
     """Turn the runtime's pre-flight error into something the reader can act on.
 
@@ -3373,6 +3448,21 @@ def _native_sandbox_unusable(result: str) -> bool:
     return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
 
 
+def _native_or_docker(native, docker):
+    """Run native isolation, retrying only a proven pre-flight failure."""
+    global _native_sandbox_broken
+    if _native_sandbox_broken and _docker_available():
+        return docker()
+    result = native()
+    if not _native_sandbox_unusable(result) or not _docker_available():
+        return result
+    if not _native_sandbox_broken:
+        _log.warning("native sandbox could not start, using docker for the "
+                     "rest of this session. %s", _native_sandbox_repair_hint(result))
+    _native_sandbox_broken = True
+    return docker()
+
+
 def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
                          readonly: bool = False) -> str:
     argv = _native_sandbox_argv()
@@ -3390,19 +3480,32 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
 
 def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     backend = _resolve_sandbox_backend()
+    command = _process_display(argv)
+
+    def docker():
+        # Structured argv execution is the isolated Git-tool path. Preserve the
+        # pinned Git image introduced in fa4d77b; the general Python image has
+        # no git binary and turns a successful fallback into status 127.
+        return _exec_docker_command(
+            command, timeout, image=GIT_DOCKER_IMAGE,
+            workspace=PROJECT_ROOT, readonly=True,
+        )
+
     if backend == "native":
         runtime = _native_sandbox_argv()
         settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
-        return _exec_process(
-            runtime + ["--settings", str(settings), "-c",
-                       f"cd {shlex.quote(str(PROJECT_ROOT))} && "
-                       f"TMPDIR={shlex.quote(str(sandbox_tmp))} {_process_display(argv)}"],
-            timeout=timeout
+        native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                          f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+        return _native_or_docker(
+            lambda: _exec_process(
+                runtime + ["--settings", str(settings), "-c", native_command],
+                timeout=timeout,
+            ),
+            docker,
         )
     if backend == "docker":
-        return _exec_docker_command(_process_display(argv), timeout,
-                                    workspace=PROJECT_ROOT, readonly=True)
+        return docker()
     return _sandbox_required_error()
 
 
@@ -3542,12 +3645,49 @@ def _sandbox_required_error() -> str:
     )
 
 
+_ARTIFACTS_CD_RE = re.compile(
+    r"(?i)(?<!\S)cd\s+([\"']?)(?:\.[\\/])?artifacts[\\/]?\1"
+    r"(?=\s*(?:&&|\|\||;|$))"
+)
+_CONTAINER_ARTIFACTS_RE = re.compile(
+    r"(?i)(?P<workspace>/workspace)[\\/]artifacts(?P<tail>[\\/]|(?=[\s\"';|&<>()]|$))"
+)
+_ARTIFACTS_PATH_RE = re.compile(
+    r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
+    r"(?:\.[\\/])?artifacts[\\/]"
+)
+_ARTIFACTS_WORD_RE = re.compile(
+    r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
+    r"(?:\.[\\/])?artifacts(?P=quote)(?=\s|[;|&<>()]|$)"
+)
+
+
+def _artifact_workspace_command(command: str) -> str:
+    """Map project-relative artifact paths into the mounted artifact directory."""
+    command = _CONTAINER_ARTIFACTS_RE.sub(
+        lambda match: match.group("workspace")
+        + ("/" if match.group("tail") in ("/", "\\") else ""),
+        command,
+    )
+    command = _ARTIFACTS_CD_RE.sub("cd .", command)
+    command = _ARTIFACTS_PATH_RE.sub(
+        lambda match: match.group("prefix") + match.group("quote") + "./",
+        command,
+    )
+    return _ARTIFACTS_WORD_RE.sub(
+        lambda match: match.group("prefix") + match.group("quote") + "."
+                      + match.group("quote"),
+        command,
+    )
+
+
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
     if backend == "unavailable":
         return _sandbox_required_error()
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
+    command = _artifact_workspace_command(command)
     temporary = None
     workspace = ARTIFACTS_ROOT
     if _sandbox_readonly:
@@ -3557,37 +3697,20 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                         ignore=shutil.ignore_patterns(
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
-    global _native_sandbox_broken
     try:
-        # Already proved unusable this process: go straight to Docker rather than
-        # paying for the same failure again.
-        if backend == "native" and _native_sandbox_broken and _docker_available():
-            backend = "docker"
         if backend == "native":
             local_command = (
                 _process_display([sys.executable, "-c", command])
                 if python_code else command
             )
-            result = _exec_native_sandbox(local_command, timeout, workspace,
-                                          readonly=_sandbox_readonly)
-            # `auto` documents native first, Docker when available — but that
-            # choice was only ever made at selection time, from the presence of
-            # the runtime binary. A runtime that is installed and still cannot
-            # start a sandbox (on Windows, a restricted account it cannot log
-            # into) left the command refused with a working Docker sitting idle.
-            # Retry only a pre-flight failure: the command has not run, so
-            # nothing can be done twice.
-            if not _native_sandbox_unusable(result):
-                return result
-            if not _docker_available():
-                return result  # keep the runtime's own error; it says more
-            # Once per process. The condition is permanent for this run, and
-            # repeating a 200-character stderr dump above every command turns a
-            # working fallback into visible breakage.
-            if not _native_sandbox_broken:
-                _log.warning("native sandbox could not start, using docker for the "
-                             "rest of this session. %s", _native_sandbox_repair_hint(result))
-            _native_sandbox_broken = True
+            return _native_or_docker(
+                lambda: _exec_native_sandbox(
+                    local_command, timeout, workspace, readonly=_sandbox_readonly,
+                ),
+                lambda: _exec_docker_command(
+                    command, timeout, python_code, image, workspace=workspace,
+                ),
+            )
         return _exec_docker_command(command, timeout, python_code, image,
                                     workspace=workspace)
     finally:
@@ -3596,8 +3719,8 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
 
 
 def install_native_sandbox() -> str:
-    node = shutil.which("node")
-    npm = shutil.which("npm")
+    node = _which_executable("node")
+    npm = _which_executable("npm")
     if not node or not npm:
         return "Node.js 20.11 or newer is required to install the native sandbox runtime."
     try:
@@ -3778,7 +3901,7 @@ def _windows_task_script(identifier: str, task: str) -> Path:
     script = scripts / f"{identifier}.ps1"
     prompt = base64.b64encode(task.encode("utf-8")).decode("ascii")
     cwd = str(SHELL_CWD).replace("'", "''")
-    agent = str(shutil.which("agent8088") or "agent8088").replace("'", "''")
+    agent = str(_which_executable("agent8088") or "agent8088").replace("'", "''")
     content = (
         "$ErrorActionPreference = 'Stop'\n"
         f"Set-Location -LiteralPath '{cwd}'\n"
@@ -4003,8 +4126,11 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
     if mode == "read_text":
+        raw_path = _tool_path(spec, args)
+        if not raw_path:
+            return _tool_arg_missing_error(name, spec.get("path_arg", "filename"))
         try:
-            read_target = resolve_user_path(_tool_path(spec, args))
+            read_target = resolve_user_path(raw_path)
         except ValueError as exc:
             return f"Error: {exc}"
         if _is_sensitive_path(str(read_target)):
@@ -4416,7 +4542,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # check never fired, so the auditor was sent to inspect a write that had not
     # happened and its fail verdict was appended to the escalation the user still
     # had to answer.
-    if will_audit and not result.startswith("ESCALATION_REQUEST\x1f"):
+    if (will_audit and not result.startswith("ESCALATION_REQUEST\x1f")
+            and not _plan_step_failed(result)):
         result = _audit_approved_plan_call(name, args, result, depth, snapshot)
 
     _remember_escalation(name, args, result)
@@ -4805,6 +4932,188 @@ AUDIT_MAX_DETAIL = int(APP_CONFIG.get("audit_max_detail", "512"))
 MODEL_TELEMETRY_ENABLED = APP_CONFIG.get("model_telemetry", "0") == "1"
 MODEL_TELEMETRY_PATH = Path(APP_CONFIG.get(
     "model_telemetry_path", str(_agent_data_dir() / "model-telemetry.jsonl"))).expanduser()
+
+
+# ---------------------------------------------------------------------------
+# Persistent memory
+# ---------------------------------------------------------------------------
+# Off by default. Enabling costs one extra model call per turn and a 274MB
+# embedding model pull, and an upgrade must not start doing either silently --
+# `agent8088 --setup` and `/memory on` are the places that ask.
+MEMORY_DB_PATH = Path(APP_CONFIG.get(
+    "memory_db_path", str(_agent_data_dir() / "memory.db"))).expanduser()
+MEMORY_EXTRACT_MODEL = APP_CONFIG.get("memory_extract_model", "").strip()
+
+# Embeddings resolve independently of whatever serves chat. Chat models and
+# embedding models are separate services in almost every real setup -- a 35B chat
+# model on a LAN box, embeddings from local Ollama -- so deriving the embeddings
+# endpoint from default_provider was wrong by construction: it paired the default
+# embed model (nomic-embed-text, an Ollama model, and the one both installers
+# pull) with whichever host happened to serve chat. A chat provider that does not
+# serve /embeddings, or serves it without that model, then reported the model as
+# unavailable and advised pulling it -- advice that could not help, because the
+# request was never going to Ollama.
+#
+# So the default is `ollama`, where the model actually lives. It is always
+# resolvable because PROVIDERS includes the built-ins. Point
+# memory_embed_provider at anything else to serve embeddings from there instead.
+MEMORY_EMBED_PROVIDER = (APP_CONFIG.get("memory_embed_provider", "").strip()
+                         or "ollama")
+
+# Presentation hook, set by a front end that wants to show what memory stored.
+# Same shape as subagent_ui and _plan_on_step: the loop stays free of rendering,
+# and a front end that sets nothing sees no change in behaviour.
+#
+# It is handed the stored rows rather than printing them, because capture runs on
+# a background thread in the REPL -- writing to the console from there would
+# interleave with whatever the user is typing.
+memory_on_capture = None
+
+# The capture thread of the most recent turn, so a front end can wait for it
+# before reporting. None when capture ran synchronously or did not run.
+memory_capture_thread = None
+
+
+def _memory_extract_completion(prompt: str):
+    """One model call for fact extraction. Returns (text, usage).
+
+    Deliberately not given the agent's own system prompt: the extractor is not
+    the agent, it needs none of the tool documentation, and paying for that
+    prompt on every turn is the difference between memory being cheap and memory
+    being the most expensive thing in a session.
+    """
+    model = MEMORY_EXTRACT_MODEL or MODEL_NAME
+    response = create_completion(
+        client, [{"role": "user", "content": prompt}], [],
+        max_tokens=800,
+        system_prompt="You extract durable facts for long-term memory. "
+                      "You reply with JSON only.",
+        temperature=0.0, model_name=model,
+        telemetry_attempt="memory_extract",
+    )
+    text = _strip_reasoning(response.choices[0].message.content or "")
+    usage, _source = _model_usage(response)
+    return text, {
+        "model": model,
+        "input_tokens": usage.get("input_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+    }
+
+
+def configure_memory() -> None:
+    """Wire the memory package to this engine's config, client and redactor.
+
+    Called at import and again whenever config changes (`/memory on`, a reload),
+    so the store follows the live settings rather than import-time ones.
+    """
+    try:
+        memory.configure(
+            config=APP_CONFIG,
+            client_factory=lambda: get_client(MEMORY_EMBED_PROVIDER)[0],
+            embed_provider=MEMORY_EMBED_PROVIDER,
+            completion=_memory_extract_completion,
+            redact=_redact_secrets,
+            db_path=MEMORY_DB_PATH,
+            project=str(PROJECT_ROOT),
+        )
+    except Exception as exc:
+        _log.debug("memory configuration skipped: %s", exc)
+
+
+def _message_text(message) -> str:
+    """The text of a message, whether its content is a string or image parts."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return str(content or "")
+
+
+def _recalled_memory_prompt(messages, system_prompt, identity=None):
+    """Wrap `system_prompt` so this turn's rounds carry the recalled block.
+
+    The recall query is the last GENUINE user turn. That distinction is the whole
+    security story: tool output is fed back into the loop as role="user", so
+    using the last user message would let a fetched web page choose what the
+    agent recalls -- and, with capture, what it believes it learned.
+
+    Recall runs once per turn, not once per round: the query cannot change
+    mid-turn, so re-running it per round would buy nothing and cost an embedding
+    call each time.
+    """
+    if not memory.enabled():
+        return system_prompt
+    turns = _genuine_user_turns(messages)
+    if not turns:
+        return system_prompt
+    block = memory.recall_block(_message_text(turns[-1]), identity=identity)
+    if not block:
+        return system_prompt
+
+    def with_memory():
+        base = system_prompt() if callable(system_prompt) else system_prompt
+        return (base or current_system_prompt()) + "\n\n" + block
+
+    return with_memory
+
+
+def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
+                         in_background=False) -> None:
+    global memory_capture_thread
+    """Store what this turn taught, after the answer is already the user's.
+
+    Only the last genuine user turn is offered: earlier ones were captured when
+    they happened, and re-extracting them every turn would pay for the same facts
+    repeatedly. Tool output is excluded here for the same reason it is excluded
+    from recall -- a web page must not be able to write the agent's memory.
+
+    `in_background` belongs to the caller, not to module state. The REPL renders
+    its answer and then extracts on a daemon thread so the user never waits; the
+    gateway, MCP server and cron capture synchronously, because nobody is
+    watching there and a daemon thread dying at process exit would drop the write
+    without a word. Synchronous is the default: it is the behaviour that cannot
+    lose data.
+    """
+    if not memory.enabled() or not str(answer or "").strip():
+        return
+    turns = _genuine_user_turns(messages)
+    if not turns:
+        return
+    try:
+        result = memory.capture([_message_text(turns[-1])], answer, identity=identity,
+                               run_id=run_id, in_background=in_background,
+                               on_stored=memory_on_capture)
+        memory_capture_thread = result if in_background else None
+    except Exception as exc:
+        _log.debug("memory capture skipped: %s", exc)
+
+
+def _memory_summary() -> str:
+    """One line for describe_capabilities, from live state rather than config.
+
+    Reports the embedder honestly: with memory on but no embedder pulled, recall
+    still works on keywords alone, and saying so is the difference between a user
+    tuning it and a user assuming it is broken.
+    """
+    if not memory.enabled():
+        return "off (enable with /memory on)"
+    report = memory.status()
+    where = report.get("embed_provider") or "the active provider"
+    if report.get("embedder_ok"):
+        retrieval = f"hybrid keyword+semantic via {report['embed_model']} on {where}"
+    else:
+        # Naming the endpoint matters: the failure is usually that the request
+        # went somewhere that does not serve this model, and "pull the model" is
+        # useless advice when the host asked was never the one holding it.
+        retrieval = (f"keyword only — {report['embed_model']} unavailable "
+                     f"on {where}")
+    capture = "recall+capture" if report.get("capture_enabled") else "recall only"
+    return f"on — {report['count']} memories, {capture}, {retrieval}"
+
+
+configure_memory()
 
 
 def _append_private_jsonl(path: Path, entry: dict) -> None:
@@ -5464,6 +5773,7 @@ def describe_capabilities() -> str:
         f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
         f"- Shell denylist: {', '.join(_USER_DENY_GLOBS) or 'not set'}",
         f"- Audit log: {'on — ' + str(AUDIT_LOG_PATH) if AUDIT_ENABLED else 'off'}",
+        f"- Persistent memory: {_memory_summary()}",
         f"- Subagent max depth: {SUBAGENT_MAX_DEPTH}",
         "",
         "## Always-on protections (no mode or approval disables these)",
@@ -5569,7 +5879,8 @@ class _TurnBudget:
 # ---------------------------------------------------------------------------
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
-def run_agent(messages, *, budget=None, **kwargs):
+def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
+              memory_background=False, **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
 
@@ -5577,6 +5888,13 @@ def run_agent(messages, *, budget=None, **kwargs):
     of the turn (subagents and plan steps read it, since there is no way to
     thread a parameter through run_tool) and is always restored afterwards,
     including on an exception or an AgentInterrupted.
+
+    Memory hangs off this seam rather than off the loop, for two reasons. The
+    loop has seven return points and a new one would silently skip capture,
+    whereas `finally` here cannot be escaped. And `previous is None` already
+    marks the outermost turn, which is exactly the scope memory wants: a
+    subagent is handed a delegated task rather than something a human said, so it
+    neither recalls nor writes.
     """
     global _active_budget
     if budget is None:
@@ -5595,8 +5913,14 @@ def run_agent(messages, *, budget=None, **kwargs):
         reset_turn_counters()
         reset_approval_state()
         reset_turn_approval_state()
+        global memory_capture_thread
+        memory_capture_thread = None
+        kwargs["system_prompt"] = _recalled_memory_prompt(
+            messages, kwargs.get("system_prompt"), identity=memory_identity)
+    answer = None
     try:
-        return _run_agent_loop(messages, budget=budget, **kwargs)
+        answer = _run_agent_loop(messages, budget=budget, **kwargs)
+        return answer
     finally:
         # Read the share before the budget goes out of scope. Verification spends
         # the parent's tokens, and an audit on the post-approval path reports no
@@ -5604,12 +5928,28 @@ def run_agent(messages, *, budget=None, **kwargs):
         # spend would be the one the default /plan flow incurs.
         if previous is None:
             _last_audit_share = budget.audit_share() if budget is not None else 0.0
+            # After the answer, never in front of it. An interrupted or failed
+            # turn leaves `answer` None and teaches nothing.
+            _capture_turn_memory(messages, answer, identity=memory_identity,
+                                 run_id=memory_run_id,
+                                 in_background=memory_background)
         _active_budget = previous
 
 
 # Every tool result the loop feeds back starts with this. It is the marker that
 # separates "the human said it" from "a web page said it".
 _TOOL_RESULT_PREFIX = "Tool result ("
+
+
+def _tool_result_for_model(name: str, result: str) -> str:
+    """Keep ordinary tool context small while letting the auditor inspect files."""
+    limit = 12_000 if _active_role == "subagent:auditor" and name in {
+        "read_text", "last_output"
+    } else 3_000
+    if len(result) <= limit:
+        return result
+    return (result[:limit]
+            + f"\n[tool result truncated: {len(result) - limit} more characters]")
 
 
 def _genuine_user_turns(messages) -> list:
@@ -5732,6 +6072,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     missing_args_retries = 0  # times a call arrived without its arguments
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    length_retries = 0   # token-limited calls are incomplete and must never execute
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
@@ -5798,6 +6139,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
+        finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
+        if finish_reason in {"length", "max_tokens"}:
+            warning = (
+                f"Model output reached its {MAX_COMPLETION_TOKENS}-token limit. "
+                "The partial response was not executed. Retry with one complete, "
+                "concise tool call; split large work across calls if needed."
+            )
+            if on_result:
+                on_result("error", warning)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "max_tokens", "content": warning})
+            if length_retries < 1:
+                length_retries += 1
+                messages.append({"role": "user", "content": warning})
+                continue
+            answer = _guard_answer(warning)
+            if on_answer:
+                on_answer(answer)
+            return answer
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -5918,7 +6278,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     continue
 
             if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
-                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
+                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, _last_tool_output)}"
                           if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
                 if turn_tools is not None:
@@ -6014,7 +6374,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             interactive_fail = "EOFError" in result or "EOF when reading" in result or "input()" in result.lower()
             note = ("\n\nThis script needs interactive input which is not available. "
                     "Do NOT retry it. Give your final answer now." if interactive_fail else "")
-            messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result[:3000]}{note}"})
+            model_result = _tool_result_for_model(name, result)
+            messages.append({"role": "user", "content":
+                             f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
 
         if (PERMISSION_MODE == "plan-only"
                 and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):

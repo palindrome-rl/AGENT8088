@@ -159,6 +159,17 @@ def test_audit_is_off_unless_plan_audit_is_set(engine, tmp_path):
     assert seen == []
 
 
+def test_a_failed_call_is_not_sent_to_the_auditor(engine, tmp_path):
+    """There is no effect to verify, and missing-argument recovery owns the error."""
+    seen = _audit_on(engine, tmp_path)
+    _approve(engine)
+
+    out = engine.exec_tool("execute_shell", "{}")
+
+    assert engine._is_missing_argument_error(out)
+    assert seen == []
+
+
 def test_reads_are_not_audited(engine, tmp_path):
     seen = _audit_on(engine, tmp_path)
     _approve(engine)

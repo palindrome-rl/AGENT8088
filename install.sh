@@ -644,6 +644,46 @@ install_node_bridge() {
 }
 
 # ----------------------------------------------------------------------------
+# Stage 5b2: Embedding model for persistent memory
+# ----------------------------------------------------------------------------
+# Memory is on by default, and its semantic recall needs an embedding model. This
+# pulls it here rather than leaving it to first use, because the failure mode
+# otherwise is silent: recall quietly degrades to keyword-only and the user has no
+# reason to suspect the store is working at half strength.
+#
+# nomic-embed-text: 274 MB, 768 dimensions, 8192-token context. Chosen over the
+# top-of-leaderboard qwen3-embedding:0.6b (~1.2 GB) because memories are one-line
+# facts and short queries, and BM25 carries half the ranking through RRF - paying
+# 4x the disk to sharpen a signal that is already cross-checked is the wrong
+# trade. See docs/wiki/16-memory.md.
+#
+# Not fatal if it cannot be pulled: an install that dies because a 274 MB model
+# download failed is worse than one that says memory will use keyword search
+# until the model is there. The message names the exact command to fix it.
+EMBED_MODEL="nomic-embed-text"
+
+install_embedding_model() {
+    if ! command -v ollama >/dev/null 2>&1; then
+        # A cloud provider (OpenAI, Gemini, Cerebras...) serves /embeddings itself,
+        # so there is nothing to pull. Only say something if memory would be worse
+        # off, which is when Ollama is the configured provider.
+        log_info "Ollama not found - memory will embed through your configured provider"
+        return 0
+    fi
+    if ollama list 2>/dev/null | grep -q "^${EMBED_MODEL}"; then
+        log_success "Embedding model $EMBED_MODEL already present"
+        return 0
+    fi
+    log_info "Pulling embedding model $EMBED_MODEL (274 MB, for memory recall)..."
+    if ollama pull "$EMBED_MODEL" >/dev/null 2>&1; then
+        log_success "Embedding model $EMBED_MODEL installed"
+    else
+        log_warn "Could not pull $EMBED_MODEL - memory recall will use keyword search only"
+        log_warn "Fix it later with:  ollama pull $EMBED_MODEL"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # Stage 5c: Native sandbox runtime (Linux/macOS - auto-setup, Option B)
 # ----------------------------------------------------------------------------
 # install_native_sandbox() (engine.py:3344) needs Node+npm (installed by the
@@ -744,7 +784,7 @@ install_native_sandbox() {
         SANDBOX_INSTALLED=true
         log_success "Native sandbox runtime installed"
     else
-        log_warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' manually"
+        log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
     fi
 }
 
@@ -1068,6 +1108,13 @@ run_setup_wizard() {
 
     # Write back
     sed -i.bak "s|^allowed_paths=.*|allowed_paths=$new_paths|" "$config"
+    local project_root="${new_paths%%,*}"
+    project_root="$(printf "%s" "$project_root" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if grep -q '^#*[[:space:]]*project_root=' "$config"; then
+        sed -i.bak "s|^#*[[:space:]]*project_root=.*|project_root=$project_root|" "$config"
+    else
+        echo "project_root=$project_root" >> "$config"
+    fi
     sed -i.bak "s|^default_provider=.*|default_provider=$new_provider|" "$config"
     grep -q "^default_provider=" "$config" || echo "default_provider=$new_provider" >> "$config"
     sed -i.bak "s|^provider\.${new_provider}\.base_url=.*|provider.${new_provider}.base_url=$base_url|" "$config"
@@ -1130,9 +1177,10 @@ verify_install() {
     if [ "$SANDBOX_INSTALLED" = true ]; then
         echo "  Sandbox:  native runtime installed"
     else
-        echo "  Sandbox:  run 'agent8088 --sandbox-setup' to install the native runtime"
+        echo "  Sandbox:  Docker fallback is automatic when available"
+        echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.sh | bash"
+    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
 }
@@ -1195,6 +1243,7 @@ main() {
     clone_repo
     install_deps
     install_node_bridge
+    install_embedding_model
     install_native_sandbox
     setup_path
     drop_config

@@ -7,8 +7,8 @@
 Verified from the argument parser in `src/agent8088/cli.py`:
 
 ```
-usage: agent8088 [-h] [--version] [--edit] [--full-auto]
-                 [--mode {readonly,full-auto,plan-only}] [--uninstall]
+usage: agent8088 [-h] [--version] [--full-auto]
+                 [--mode {readonly,full-auto}] [--uninstall]
                  [--update] [--setup] [--model-setup] [--sandbox-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
@@ -18,9 +18,8 @@ usage: agent8088 [-h] [--version] [--edit] [--full-auto]
 |---|---|
 | `-h`, `--help` | Show help and exit |
 | `-V`, `--version` | Show version and exit |
-| `--mode {readonly,full-auto,plan-only}` | Permission mode at startup |
+| `--mode {readonly,full-auto}` | Permission mode at startup. Plan mode is not settable here — start it with `/plan` |
 | `--full-auto` | Start in full-auto (no per-action prompts) |
-| `--edit` | Alias for `--mode full-auto` |
 | `--setup` | Interactive config wizard, then exit |
 | `--model-setup` | Configure a model provider profile |
 | `--sandbox-setup` | Install the native sandbox runtime |
@@ -88,7 +87,7 @@ Run with no flags for the interactive REPL.
 
 | Command | Does |
 |---|---|
-| `/mode [readonly\|full-auto\|plan-only]` | Show or switch permission mode |
+| `/mode [readonly\|full-auto]` | Show or switch permission mode. Use `/plan` to enter plan mode |
 | `/reset`, `/clear` | Discard the conversation — asks first unless `destructive_slash_confirm=0` |
 | `/sandbox [auto\|native\|docker\|local\|setup]` | Show, select or install isolation |
 | `/search [status\|setup\|stop\|doctor\|use <backend>]` | Show, provision, or pin a web search backend |
@@ -150,7 +149,7 @@ message — otherwise `/help` would be a free channel for flooding the gateway.
 | `AGENT8088_CONFIG` | Config file path (`/nonexistent` forces packaged defaults) |
 | `AGENT8088_HOME` | Data directory |
 | `AGENT8088_PROVIDER` | Active provider |
-| `AGENT8088_PERMISSION` | Starting permission mode |
+| `AGENT8088_PERMISSION` | Starting permission mode (`readonly` or `full-auto`; `plan-only` falls back to `readonly`) |
 | `AGENT8088_SANDBOX` | Sandbox backend |
 
 ## Exit codes
