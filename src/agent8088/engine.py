@@ -4123,6 +4123,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
 
+    required = TOOL_REQUIRED_PARAMS.get(name, [])
+    if required and not args:
+        return _tool_arg_missing_error(name, required[0])
+
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
     if mode == "read_text":
@@ -4539,7 +4543,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # check never fired, so the auditor was sent to inspect a write that had not
     # happened and its fail verdict was appended to the escalation the user still
     # had to answer.
-    if will_audit and not result.startswith("ESCALATION_REQUEST\x1f"):
+    if (will_audit and not result.startswith("ESCALATION_REQUEST\x1f")
+            and not _plan_step_failed(result)):
         result = _audit_approved_plan_call(name, args, result, depth, snapshot)
 
     _remember_escalation(name, args, result)
@@ -5937,6 +5942,17 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
 _TOOL_RESULT_PREFIX = "Tool result ("
 
 
+def _tool_result_for_model(name: str, result: str) -> str:
+    """Keep ordinary tool context small while letting the auditor inspect files."""
+    limit = 12_000 if _active_role == "subagent:auditor" and name in {
+        "read_text", "last_output"
+    } else 3_000
+    if len(result) <= limit:
+        return result
+    return (result[:limit]
+            + f"\n[tool result truncated: {len(result) - limit} more characters]")
+
+
 def _genuine_user_turns(messages) -> list:
     """The turns the human actually typed.
 
@@ -6263,7 +6279,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     continue
 
             if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
-                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_last_tool_output[:3000]}"
+                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, _last_tool_output)}"
                           if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
                 if turn_tools is not None:
@@ -6359,7 +6375,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             interactive_fail = "EOFError" in result or "EOF when reading" in result or "input()" in result.lower()
             note = ("\n\nThis script needs interactive input which is not available. "
                     "Do NOT retry it. Give your final answer now." if interactive_fail else "")
-            messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result[:3000]}{note}"})
+            model_result = _tool_result_for_model(name, result)
+            messages.append({"role": "user", "content":
+                             f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
 
         if (PERMISSION_MODE == "plan-only"
                 and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
