@@ -110,238 +110,6 @@ function Write-Success { param([string]$Message) Write-Host "[OK] $Message" -For
 function Write-Warn    { param([string]$Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -ForegroundColor Red }
 
-# ----------------------------------------------------------------------------
-# Progress display for the long stages
-# ----------------------------------------------------------------------------
-# These stages fetch tens to hundreds of megabytes -- Chromium alone is ~280 MB.
-# Piping them to Out-Null left the console parked on one line for minutes with
-# no output at all, which is indistinguishable from a hang, and threw away the
-# child's diagnostics so a failure surfaced only as an exit code.
-#
-# Invoke-WithProgress runs the child asynchronously, captures its output, and
-# animates a bar until it exits. Percentages are read back out of that captured
-# output when the tool reports them (uv and playwright both do), so the bar
-# tracks the real download rather than a timer; until a percentage appears it
-# shows an indeterminate sweep and the elapsed seconds. Nothing is invented.
-$script:ProgressBarWidth = 24
-
-# Animation needs a real console. Redirected output (a pipe, a log file, CI)
-# gets the plain one-line-per-stage form instead, because \r animation there
-# just accumulates thousands of junk lines in the log.
-function Test-ProgressAnimated {
-    if ($env:AGENT8088_NO_PROGRESS) { return $false }
-    try { return -not [Console]::IsOutputRedirected } catch { return $false }
-}
-
-function Format-ProgressBar {
-    param([int]$Percent)
-    $bounded = [Math]::Max(0, [Math]::Min(100, $Percent))
-    $filled = [int][Math]::Round(($script:ProgressBarWidth * $bounded) / 100.0)
-    return "[" + ("#" * $filled).PadRight($script:ProgressBarWidth, '.') + "]"
-}
-
-# An indeterminate sweep: a short block bouncing inside the same width as a real
-# bar, so the line does not change shape when a percentage finally appears.
-function Format-ProgressSweep {
-    param([int]$Tick)
-    $span = $script:ProgressBarWidth - 4
-    $cycle = $span * 2
-    $offset = $Tick % $cycle
-    if ($offset -ge $span) { $offset = $cycle - $offset }
-    $bar = ("." * $script:ProgressBarWidth).ToCharArray()
-    for ($i = 0; $i -lt 4; $i++) { $bar[$offset + $i] = '#' }
-    return "[" + (-join $bar) + "]"
-}
-
-# Latest percentage the child has reported, or -1 while it has not reported one.
-# Only the tail is read: these logs reach thousands of lines and this runs on a
-# ~8/second tick.
-function Get-ReportedPercent {
-    param([string[]]$Paths, [int]$Fallback)
-    $best = $Fallback
-    foreach ($path in $Paths) {
-        if (-not (Test-Path $path)) { continue }
-        try {
-            $tail = Get-Content -Path $path -Tail 4 -ErrorAction Stop
-        } catch {
-            # The child still holds the handle; this tick simply has no update.
-            continue
-        }
-        foreach ($line in $tail) {
-            $matched = [regex]::Matches([string]$line, '(\d{1,3})\s*%')
-            foreach ($match in $matched) {
-                $value = [int]$match.Groups[1].Value
-                # Monotonic: a tail can straddle two bars (pip finishing one
-                # package as another starts), and a bar must never run backwards.
-                if ($value -le 100 -and $value -ge $best) { $best = $value }
-            }
-        }
-    }
-    return $best
-}
-
-# The animated line is erased by overwriting it with spaces, so the erase has to
-# be exactly as wide as the widest line drawn. A fixed 78 was too narrow: the
-# gateway stage renders an 88-character line, and the 10 characters past the end
-# were never cleared, stranding "ram)    2s" -- the tail of "...Telegram)    2s"
-# -- on the completed [OK] line above.
-#
-# Overrunning the console is worse than leaving residue: a line wider than the
-# window wraps, and \r then only returns to the start of the final screen row,
-# so the earlier rows can never be erased at all. Lines are therefore truncated
-# to the window rather than allowed to wrap.
-function Get-ProgressLineWidth {
-    try {
-        $width = $Host.UI.RawUI.WindowSize.Width
-        # -1 keeps the cursor off the last column, where some terminals wrap
-        # eagerly. The cap stops a maximised window drawing a 300-wide bar.
-        if ($width -gt 24) { return [Math]::Min($width - 1, 100) }
-    } catch {
-        # No RawUI (a redirected or non-console host); the caller is on the
-        # plain path anyway, so any sane width will do.
-    }
-    return 78
-}
-
-# Built as its own function so the width rule is testable without a console.
-function Format-ProgressLine {
-    param([string]$Bar, [string]$Label, [string]$Suffix, [int]$Width)
-    $line = "  $Bar $Label $Suffix"
-    if ($line.Length -gt $Width) { $line = $line.Substring(0, $Width) }
-    return $line.PadRight($Width)
-}
-
-# Start-Process joins -ArgumentList with spaces and quotes nothing, so a path
-# containing a space arrives at the child split into separate arguments. Every
-# path here is derived from $env:LOCALAPPDATA, which contains a space whenever
-# the account name does.
-function ConvertTo-ArgumentString {
-    param([string[]]$ArgumentList)
-    $quoted = foreach ($argument in $ArgumentList) {
-        $text = [string]$argument
-        if ($text -eq "") { '""' }
-        elseif ($text -notmatch '[\s"]') { $text }
-        else {
-            $escaped = $text -replace '"', '\"'
-            # A trailing backslash would escape the closing quote and swallow it.
-            $escaped = $escaped -replace '(\\+)$', '$1$1'
-            '"' + $escaped + '"'
-        }
-    }
-    return ($quoted -join " ")
-}
-
-function Invoke-WithProgress {
-    <#
-    .SYNOPSIS
-    Run a command with a live progress bar, returning its exit code.
-    .DESCRIPTION
-    Returns the child's exit code so callers keep the same $LASTEXITCODE-shaped
-    control flow they had with Out-Null. On failure the tail of the captured
-    output is printed -- the Out-Null form discarded it.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Label,
-        [Parameter(Mandatory)][string]$FilePath,
-        [Parameter(Mandatory)][string[]]$ArgumentList
-    )
-
-    if (-not (Test-ProgressAnimated)) {
-        Write-Info "$Label..."
-        & $FilePath @ArgumentList 2>&1 | Out-Null
-        return $LASTEXITCODE
-    }
-
-    $stem = Join-Path ([IO.Path]::GetTempPath()) ("agent8088-" + [Guid]::NewGuid().ToString("N"))
-    $outLog = "$stem.out"
-    $errLog = "$stem.err"
-    # Stdin is redirected away from the console along with stdout and stderr.
-    # Console modes are a property of the console, not of a process: a child
-    # that inherits the input handle and alters it leaves the console altered
-    # for everything that runs afterwards. Sharing it here corrupted the setup
-    # wizard that runs later in the same window -- keystrokes were dropped, so
-    # a typed path arrived as "C   sers saa   a mi" and an API key arrived
-    # wrong -- and left the agent's own display broken in that window too. The
-    # piped form this replaced never handed the child a console to begin with.
-    # An empty file, not NUL: a stage that tries to read gets EOF and fails
-    # fast, rather than blocking forever on input nobody knows to type.
-    $inLog = "$stem.in"
-    New-Item -ItemType File -Path $inLog -Force | Out-Null
-    $started = Get-Date
-    $percent = -1
-    $tick = 0
-
-    try {
-        # Start-Process rather than the call operator: the bar can only animate
-        # while the child runs, and a plain call blocks until it finishes.
-        # -RedirectStandardOutput needs two distinct paths; pointing both at one
-        # file fails outright.
-        # A script is not an image CreateProcess can load, and redirected
-        # streams force UseShellExecute=false, so handing one straight to
-        # Start-Process fails with "%1 is not a valid Win32 application". The
-        # call operator this replaced ran scripts in-process and had no such
-        # limit, which is how the WhatsApp bridge stage broke: Get-Command npm
-        # resolves to npm.ps1 on a standard Node install, not npm.cmd.
-        # Resolve-NpmLauncher now prefers the .cmd, and this is the safety net
-        # for anything else that arrives as a script.
-        $exeToRun = $FilePath
-        $argumentString = ConvertTo-ArgumentString $ArgumentList
-        if ($FilePath -match '\.ps1$') {
-            $argumentString = ConvertTo-ArgumentString (
-                @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $FilePath) + $ArgumentList)
-            $exeToRun = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-        }
-        $proc = Start-Process -FilePath $exeToRun -ArgumentList $argumentString `
-            -WindowStyle Hidden -PassThru -RedirectStandardInput $inLog `
-            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
-        # Touching .Handle caches it on the object. Without this .ExitCode reads
-        # back as $null once the process ends, so every stage would look like a
-        # failure and callers would get nothing back.
-        $null = $proc.Handle
-
-        # Re-read each tick so a window resized mid-download still erases fully.
-        $width = Get-ProgressLineWidth
-        while (-not $proc.HasExited) {
-            Start-Sleep -Milliseconds 120
-            $width = Get-ProgressLineWidth
-            $percent = Get-ReportedPercent -Paths @($outLog, $errLog) -Fallback $percent
-            $bar = if ($percent -ge 0) { Format-ProgressBar $percent } else { Format-ProgressSweep $tick }
-            $suffix = if ($percent -ge 0) { "{0,3}%" -f $percent } else { "{0,4:0}s" -f ((Get-Date) - $started).TotalSeconds }
-            Write-Host ("`r" + (Format-ProgressLine -Bar $bar -Label $Label -Suffix $suffix -Width $width)) `
-                -NoNewline -ForegroundColor Cyan
-            $tick++
-        }
-        $proc.WaitForExit()
-        $exitCode = $proc.ExitCode
-
-        # Clear the animated line so the [OK]/[!] the caller prints owns it.
-        # Same width as the render above, or the overflow is left on screen.
-        Write-Host ("`r" + (" " * $width) + "`r") -NoNewline
-
-        if ($exitCode -ne 0) {
-            foreach ($path in @($errLog, $outLog)) {
-                if (-not (Test-Path $path)) { continue }
-                $tail = @(Get-Content -Path $path -Tail 12 -ErrorAction SilentlyContinue |
-                          Where-Object { $_ -and $_.Trim() })
-                if ($tail.Count) {
-                    Write-Host "    $($tail -join "`n    ")" -ForegroundColor DarkGray
-                    break
-                }
-            }
-        }
-        return $exitCode
-    } catch {
-        # Start-Process itself failed (missing executable, blocked by policy).
-        # Report it as a non-zero exit so the caller's warn-and-continue path
-        # runs, rather than aborting an install over the progress display.
-        Write-Host ("`r" + (" " * (Get-ProgressLineWidth)) + "`r") -NoNewline
-        Write-Warn "could not start: $($_.Exception.Message)"
-        return 1
-    } finally {
-        Remove-Item $inLog, $outLog, $errLog -Force -ErrorAction SilentlyContinue
-    }
-}
-
 function Protect-ConfigFile {
     param([string]$Path)
     $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
@@ -471,11 +239,11 @@ function Test-Python {
         } catch { }
     }
 
+    Write-Info "Python not found, installing via uv..."
     $prevEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        Invoke-WithProgress -Label "Python $PythonVersion (via uv)" `
-            -FilePath $script:UvCmd -ArgumentList @("python", "install", $PythonVersion) | Out-Null
+        & $script:UvCmd python install $PythonVersion 2>&1 | Out-Null
         $ErrorActionPreference = $prevEAP
         $pythonPath = & $script:UvCmd python find $PythonVersion 2>$null
         if ($pythonPath) {
@@ -720,9 +488,8 @@ function Install-Deps {
                 throw "venv creation failed (uv exit $LASTEXITCODE)"
             }
         }
-        $exit = Invoke-WithProgress -Label "agent8088 and its dependencies" `
-            -FilePath $script:UvCmd `
-            -ArgumentList @("pip", "install", "--python", $py, "--reinstall-package", "agent8088", "-e", $InstallDir)
+        & $script:UvCmd pip install --python $py --reinstall-package agent8088 -e $InstallDir 2>&1 | Out-Null
+        $exit = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
         if ($exit -ne 0) {
             Write-Err "uv pip install failed (exit $exit)"
@@ -754,23 +521,19 @@ function Install-Gateway-Extras {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        # Kept short deliberately: at 80 columns the longer spelling overran the
-        # line and had to be truncated mid-word. The [OK] below names them.
-        $code = Invoke-WithProgress -Label "Gateway adapters" `
-            -FilePath $script:UvCmd `
-            -ArgumentList @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]")
-        if ($code -eq 0) {
+        Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
+        & $script:UvCmd pip install --python $py -e "$InstallDir[gateway]" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
             $script:GatewayExtrasInstalled = $true
-            Write-Success "Gateway adapters installed (Slack, Discord, WhatsApp, Telegram)"
+            Write-Success "Gateway adapters installed"
         } else {
             Write-Warn "Gateway extras install failed (exit $LASTEXITCODE) - core agent still works"
         }
 
         # Keyless web search backend ([search] extra - see pyproject.toml).
-        $code = Invoke-WithProgress -Label "Keyless web search backend (ddgs)" `
-            -FilePath $script:UvCmd `
-            -ArgumentList @("pip", "install", "--python", $py, "-e", "$InstallDir[search]")
-        if ($code -eq 0) {
+        Write-Info "Installing keyless web search backend (ddgs)..."
+        & $script:UvCmd pip install --python $py -e "$InstallDir[search]" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
             $script:SearchExtrasInstalled = $true
             Write-Success "Keyless web search backend installed"
         } else {
@@ -779,13 +542,12 @@ function Install-Gateway-Extras {
 
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
-        $code = Invoke-WithProgress -Label "Playwright (optional, for browse_page)" `
-            -FilePath $script:UvCmd `
-            -ArgumentList @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]")
-        if ($code -eq 0) {
-            $code = Invoke-WithProgress -Label "Playwright Chromium browser (~280 MB)" `
-                -FilePath $py -ArgumentList @("-m", "playwright", "install", "chromium")
-            if ($code -eq 0) {
+        Write-Info "Installing Playwright (optional, for browse_page)..."
+        & $script:UvCmd pip install --python $py -e "$InstallDir[browser]" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Info "Installing Playwright Chromium browser (~280 MB)..."
+            & $py -m playwright install chromium 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
                 $script:ChromiumInstalled = $true
                 Write-Success "Chromium installed for browse_page"
             } else {
@@ -806,19 +568,6 @@ function Install-Gateway-Extras {
 # adapter errors at connect() time. We install a portable, user-scoped Node
 # (no admin needed) mirroring the PortableGit pattern. Then npm install in the
 # bridge dir so node_modules is materialized for the bridge to require().
-# Node ships npm three ways side by side: npm (a bash script), npm.cmd, and
-# npm.ps1. Get-Command resolves to npm.ps1, which the call operator could run
-# in-process but Start-Process cannot -- CreateProcess rejects a .ps1 with
-# "%1 is not a valid Win32 application". npm.cmd is the launcher meant for
-# starting a process, so prefer it and fall back only if it is absent.
-function Resolve-NpmLauncher {
-    $npm = Get-Command npm -ErrorAction SilentlyContinue
-    if (-not $npm) { return $null }
-    $sibling = Join-Path (Split-Path $npm.Source -Parent) "npm.cmd"
-    if (Test-Path $sibling) { return $sibling }
-    return $npm.Source
-}
-
 function Install-Node-Bridge {
     # --- 1. Ensure Node >= 20.11 is available ------------------------------
     $nodeExe = $null
@@ -829,11 +578,11 @@ function Install-Node-Bridge {
             $parts = $ver.Split('.')
             if ($parts.Count -ge 2 -and [int]$parts[0] -ge 20 -and [int]$parts[1] -ge 11) {
                 $nodeExe = $existingNode.Source
-                $npmExe = Resolve-NpmLauncher
+                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
                 Write-Success "Node $ver found on PATH"
             } elseif ($parts.Count -ge 1 -and [int]$parts[0] -gt 20) {
                 $nodeExe = $existingNode.Source
-                $npmExe = Resolve-NpmLauncher
+                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
                 Write-Success "Node $ver found on PATH"
             } else {
                 Write-Warn "Node $ver found but < 20.11 - sandbox-runtime needs 20.11+; will install portable Node"
@@ -917,60 +666,19 @@ function Install-Node-Bridge {
         return
     }
 
+    Write-Info "Installing WhatsApp bridge npm dependencies..."
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $code = Invoke-WithProgress -Label "WhatsApp bridge npm dependencies" `
-            -FilePath $npmExe `
-            -ArgumentList @("install", "--prefix", $bridgeDir, "--no-audit", "--no-fund")
-        if ($code -eq 0 -and (Test-Path $nodeModules)) {
+        & $npmExe install --prefix $bridgeDir --no-audit --no-fund 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $nodeModules)) {
             $script:WhatsAppBridgeReady = $true
             Write-Success "WhatsApp bridge npm dependencies installed"
         } else {
-            Write-Warn "WhatsApp bridge npm install failed (exit $code)"
+            Write-Warn "WhatsApp bridge npm install failed (exit $LASTEXITCODE)"
         }
     } finally {
         $ErrorActionPreference = $prevEAP
-    }
-}
-
-# ----------------------------------------------------------------------------
-# Stage 5c2: Embedding model for persistent memory
-# ----------------------------------------------------------------------------
-# Memory is on by default, and its semantic recall needs an embedding model. This
-# pulls it here rather than leaving it to first use, because the failure mode
-# otherwise is silent: recall quietly degrades to keyword-only and the user has no
-# reason to suspect the store is working at half strength.
-#
-# nomic-embed-text: 274 MB, 768 dimensions. Chosen over the top-of-leaderboard
-# qwen3-embedding:0.6b (~1.2 GB) because memories are one-line facts and short
-# queries, and BM25 carries half the ranking through RRF. See
-# docs/wiki/16-memory.md.
-#
-# Not fatal if it cannot be pulled: an install that dies because a 274 MB model
-# download failed is worse than one that says memory will use keyword search until
-# the model is there. The message names the exact command to fix it.
-$EmbedModel = "nomic-embed-text"
-
-function Install-Embedding-Model {
-    $ollama = Get-Command ollama -ErrorAction SilentlyContinue
-    if (-not $ollama) {
-        # A cloud provider serves /embeddings itself, so there is nothing to pull.
-        Write-Info "Ollama not found - memory will embed through your configured provider"
-        return
-    }
-    $installed = & ollama list 2>$null | Select-String -Pattern "^$EmbedModel" -Quiet
-    if ($installed) {
-        Write-Success "Embedding model $EmbedModel already present"
-        return
-    }
-    Write-Info "Pulling embedding model $EmbedModel (274 MB, for memory recall)..."
-    & ollama pull $EmbedModel *> $null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Success "Embedding model $EmbedModel installed"
-    } else {
-        Write-Warn "Could not pull $EmbedModel - memory recall will use keyword search only"
-        Write-Warn "Fix it later with:  ollama pull $EmbedModel"
     }
 }
 
@@ -1017,12 +725,11 @@ function Install-Native-Sandbox {
         if ($script:SandboxInstalled) {
             Write-Success "Native sandbox runtime installed"
         } else {
-            Write-Warn "Native sandbox setup did not complete - Docker will be used automatically when available"
+            Write-Warn "Native sandbox setup did not complete - run 'agent8088 --sandbox-setup' from an elevated terminal"
         }
     } else {
         Write-Info "Native sandbox setup needs an elevated terminal (provisions a restricted account + WFP filter)."
-        Write-Info "Docker will be used automatically when Docker Desktop is running."
-        Write-Info "For native isolation, open an elevated terminal and run: agent8088 --sandbox-setup"
+        Write-Info "To enable local code execution, open an elevated terminal and run: agent8088 --sandbox-setup"
     }
 }
 
@@ -1240,9 +947,6 @@ function Run-SetupWizard {
     # Write back
     $content = Get-Content $config -Raw
     $content = $content -replace '(?m)^allowed_paths=.*', "allowed_paths=$newPaths"
-    $projectRoot = ($newPaths -split ',', 2)[0].Trim()
-    $content = $content -replace '(?m)^#?\s*project_root=.*', "project_root=$projectRoot"
-    if (-not ($content -match '(?m)^project_root=')) { $content += "`nproject_root=$projectRoot`n" }
     $content = $content -replace '(?m)^default_provider=.*', "default_provider=$newProvider"
     if (-not ($content -match '(?m)^default_provider=')) { $content += "`ndefault_provider=$newProvider`n" }
     $content = $content -replace "(?m)^provider\.$newProvider\.base_url=.*", "provider.$newProvider.base_url=$baseUrl"
@@ -1305,31 +1009,24 @@ function Verify-Install {
     if ($script:SandboxInstalled) {
         Write-Host "  Sandbox:  native runtime installed"
     } else {
-        Write-Host "  Sandbox:  Docker fallback is automatic when available"
-        Write-Host "            Native setup: elevated agent8088 --sandbox-setup"
+        Write-Host "  Sandbox:  run 'agent8088 --sandbox-setup' from an elevated terminal"
     }
-    # $Branch, not a hardcoded one: this told everyone to update from
-    # feat/install-all-deps, a merged feature branch that can be deleted at any
-    # time -- and it printed that even for someone who had installed from main.
-    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$Branch/install.ps1)"
+    Write-Host "  Update: iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/feat/install-all-deps/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
 }
 
 function Run-InitialSetup {
-    # Setup runs on an update too, not only on a fresh install. Skipping it left
-    # no way to change a model, endpoint or workspace through the installer: the
-    # only run that offered the wizard was the first one, and every run after it
-    # printed "skipping" whatever had changed. The wizard reads the existing
-    # config and offers each stored value back as the default, so re-running it
-    # and pressing Enter through the prompts leaves the file as it was.
-    # -SkipSetup and -NonInteractive remain the ways to opt out.
+    if (-not $script:FreshInstall) {
+        Write-Info "Existing installation updated - skipping first-run setup."
+        return
+    }
     if ($SkipSetup) {
-        Write-Info "Skipping setup (--SkipSetup)"
+        Write-Info "Skipping first-run setup (--SkipSetup)"
         return
     }
     if ($NonInteractive) {
-        Write-Info "Non-interactive mode - skipping setup"
+        Write-Info "Non-interactive mode - skipping first-run setup"
         Write-Info "Run agent8088 --setup later to configure your model."
         return
     }
@@ -1339,16 +1036,12 @@ function Run-InitialSetup {
         Write-Warn "agent8088 command is not ready yet; run agent8088 --setup later."
         return
     }
-    if ($script:FreshInstall) {
-        Write-Info "Starting first-run setup..."
-    } else {
-        Write-Info "Starting setup - press Enter at any prompt to keep the current value..."
-    }
+    Write-Info "Starting first-run setup..."
     & $agentExe --setup
     if ($LASTEXITCODE -eq 0) {
         $script:InitialSetupRan = $true
     } else {
-        Write-Warn "Setup did not complete; run agent8088 --setup later."
+        Write-Warn "First-run setup did not complete; run agent8088 --setup later."
     }
 }
 
@@ -1372,7 +1065,6 @@ Clone-Repo
 Install-Deps
 Install-Gateway-Extras
 Install-Node-Bridge
-Install-Embedding-Model
 Install-Native-Sandbox
 Setup-Path
 Drop-Config

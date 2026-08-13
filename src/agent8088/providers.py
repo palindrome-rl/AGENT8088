@@ -43,7 +43,6 @@ import csv, hashlib, json, os, stat, subprocess, sys, tempfile, time
 from pathlib import Path, PureWindowsPath
 
 _CACHE_FILE = Path(os.environ.get("AGENT8088_HOME", str(Path.home() / ".agent8088"))) / "models_cache.json"
-MODEL_LIST_TIMEOUT_SECONDS = 5
 
 
 def _protect_private_file(path: Path) -> None:
@@ -121,7 +120,7 @@ def builtin_provider_choice_label(name):
     return f"{info['label']} ({name}) - default: {info['default_model']}"
 
 
-def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, fallback=True):
+def list_models(provider_name, client=None, timeout=15, fallback=True):
     """Fetch available models from provider's /v1/models endpoint.
     Disk-cached for 1 hour. Falls back to FALLBACK_MODELS on error."""
     now = time.time()

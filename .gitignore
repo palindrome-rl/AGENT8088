@@ -47,14 +47,6 @@ skillopt_data/
 graphify-out/
 .opencode/
 
-# Claude Code project configuration (agents, skills, session plans).
-.claude/
-
-# Test suite. Kept on disk and still runnable locally — see AGENTS.md for the
-# command — but no longer tracked. Note there is no CI, so nothing verifies a
-# change once the suite is out of the repo; run it before every release.
-tests/
-
 # Local agent instructions. Both files stay tracked, so these entries only take
 # effect once a file is untracked with `git rm --cached <file>` — until then git
 # keeps reporting changes to them.

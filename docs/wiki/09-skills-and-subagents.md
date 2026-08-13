@@ -37,7 +37,7 @@ model decides.
 
 A profile may add `permission: readonly` to its frontmatter. The sub-run is then
 pinned to readonly for its whole lifetime, whatever mode the caller was in —
-including `full-auto`. `auditor` is the one bundled profile that uses it.
+including `--edit`. `auditor` is the one bundled profile that uses it.
 
 The floor only ever restricts. There is no frontmatter value that grants a
 sub-agent more than the caller already had, so a profile cannot widen its own
