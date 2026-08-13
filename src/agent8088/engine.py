@@ -539,7 +539,13 @@ ALLOWED_PATHS = [
 # ---------------------------------------------------------------------------
 # Permission layer ÔÇö readonly by default, escalates to edit on user approval
 # ---------------------------------------------------------------------------
-PERMISSION_MODE = os.environ.get("AGENT8088_PERMISSION", "readonly")
+# plan-only is refused here for the same reason `/mode` and `--mode` refuse it: a
+# plan session must be entered through enter_plan_mode(), which records the mode to
+# come back to. Starting in plan-only skips that, so finish_plan_session() has
+# nothing to restore and the session is stranded in plan mode. Fall back to the
+# safe default instead of honouring it; `/plan` is the only door.
+_env_permission_mode = os.environ.get("AGENT8088_PERMISSION", "readonly")
+PERMISSION_MODE = "readonly" if _env_permission_mode == "plan-only" else _env_permission_mode
 _one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
 _pending_approval_key = ""
 _local_fallback_grant = False
