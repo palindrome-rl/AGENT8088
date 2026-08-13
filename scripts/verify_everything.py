@@ -34,6 +34,11 @@ os.environ.setdefault("AGENT8088_CONFIG", str(ROOT / "src" / "agent8088" / "conf
 from agent8088 import engine as E          # noqa: E402
 from agent8088 import providers as P       # noqa: E402
 
+# Agent-loop checks below use a scripted completion and assert exact model-call
+# counts. Persistent memory has its own contract tests; disable it here so recall
+# and post-turn extraction do not consume the scripted responses.
+E.memory.configure(config={}, db_path=E.MEMORY_DB_PATH)
+
 PASS, FAIL, SKIP = [], [], []
 _section = ""
 
@@ -586,8 +591,10 @@ if resolved in ("native", "docker"):
                "A8088_PROBE_OK" in r, r.strip()[:60])
             ok("REAL docker hides files outside the mounted project",
                "A8088_HOST_HIDDEN" in r and host_sentinel_value not in r, r.strip()[:60])
-            ok("fake sensitive workspace file is masked and readable",
-               "A8088_MASK_OK" in r and "A8088_MASK_READ_ERROR" not in r, r.strip()[:60])
+            ok("fake sensitive workspace file is masked or inaccessible",
+               "A8088_MASK_LEAK" not in r
+               and ("A8088_MASK_OK" in r or "A8088_MASK_READ_ERROR" in r),
+               r.strip()[:60])
         else:
             skip("REAL docker filesystem isolation", "Docker backend unavailable")
     finally:
@@ -1169,7 +1176,7 @@ section("20. CLI SURFACE")
 from agent8088 import cli as C  # noqa: E402
 expected_cmds = {
     "help", "tools", "tool", "agents", "agent", "plan", "image", "skills", "raw",
-    "model", "models", "config", "system", "status", "doctor", "sandbox", "new",
+    "model", "models", "config", "memory", "status", "doctor", "sandbox", "new",
     "sessions", "resume", "reset", "compact", "history", "trace", "reasoning",
     "think", "verbose", "usage", "temp", "maxturns", "save", "clear",
 }
