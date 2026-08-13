@@ -480,7 +480,10 @@ def test_windows_repl_preserves_known_good_prompt_layout(
 
     assert cli._read_line() == "hello"
     assert "ready" in "".join(text for _, text in captured["bottom_toolbar"]())
-    assert captured["reserve_space_for_menu"] == 0
+    # Rows are reserved for the completion menu. With 0 the menu float has
+    # nowhere to draw, so it showed on the first prompt of a session and
+    # vanished for every prompt after output scrolled the view to the bottom.
+    assert captured["reserve_space_for_menu"] > 0
     assert not captured["message"].value.startswith("\n")
     assert footer_events == ["stop", ("start", "ready")]
 

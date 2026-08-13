@@ -3739,16 +3739,21 @@ def _read_line():
     # the context percentage *and* A.PERMISSION_MODE, so repeating either here
     # would print `plan` an inch above a bar reading `plan-only`. The Rich
     # fallback `_prompt_label()` does keep both — that path has no toolbar.
-    # Match the last known-good prompt layout: do not insert a blank line or
-    # reserve extra rows above the toolbar for the completion menu.
+    # No leading newline: the blank line above the prompt was the spacing bug.
     label = "\x1b[1;38;2;35;125;215m8088\x1b[0m \x1b[38;2;35;125;215m›\x1b[0m "
+    # Keep a menu reserve. The completion menu is a float drawn *below* the input,
+    # so with reserve_space_for_menu=0 it only appears while the terminal still
+    # happens to have blank rows under the cursor — it renders on the first
+    # prompt of a session and silently vanishes for every prompt after output
+    # has scrolled the view to the bottom. Reserving rows makes prompt_toolkit
+    # scroll to create the space instead of dropping the menu.
     answer = prompt(
         ANSI(label),
         completer=AgentCompleter(),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
-        reserve_space_for_menu=0,
+        reserve_space_for_menu=6,
     )
     # prompt_toolkit releases its toolbar as soon as Enter is accepted. Reclaim
     # that row here, before command dispatch, so there is no blank-frame gap.
@@ -4665,9 +4670,13 @@ def main():
         epilog="Run with no flags to start the interactive REPL.",
     )
     parser.add_argument("--version", "-V", action="version", version=f"agent8088 {__version__}")
-    parser.add_argument("--edit", action="store_true", help="start in full-auto mode (alias for --mode full-auto)")
     parser.add_argument("--full-auto", action="store_true", help="start in full-auto mode (no per-action permission prompts)")
-    parser.add_argument("--mode", choices=["readonly", "full-auto", "plan-only"],
+    # plan-only is deliberately not a choice here, for the same reason /mode
+    # rejects it: it is a session with a beginning and an end, entered through
+    # enter_plan_mode() so there is a mode to return to when the plan finishes.
+    # Setting it at startup skips that bookkeeping and strands the session in
+    # plan mode with nothing to restore. `/plan` is the only door.
+    parser.add_argument("--mode", choices=["readonly", "full-auto"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
     parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
@@ -4722,7 +4731,7 @@ def main():
         else:
             run_mcp_server(transport="stdio")
         return
-    if args.edit or args.full_auto:
+    if args.full_auto:
         A.PERMISSION_MODE = "full-auto"
     if args.mode:
         A.PERMISSION_MODE = args.mode

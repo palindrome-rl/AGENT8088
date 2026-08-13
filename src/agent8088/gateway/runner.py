@@ -20,7 +20,7 @@ SLASH_COMMANDS = {
     "/capabilities": "Show tools, MCP servers, skills, limits, and active guardrails",
     "/approve": "Approve a pending action (once/session)",
     "/deny": "Deny a pending action",
-    "/mode": "Show or set the permission mode (readonly/full-auto/plan-only)",
+    "/mode": "Show or set the permission mode (readonly/full-auto)",
     "/plan": "Enter plan mode and (optionally) propose a plan for the given task",
 }
 
