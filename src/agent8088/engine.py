@@ -4123,15 +4123,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
 
-    required = TOOL_REQUIRED_PARAMS.get(name, [])
-    if required and not args:
-        return _tool_arg_missing_error(name, required[0])
-
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
     if mode == "read_text":
+        raw_path = _tool_path(spec, args)
+        if not raw_path:
+            return _tool_arg_missing_error(name, spec.get("path_arg", "filename"))
         try:
-            read_target = resolve_user_path(_tool_path(spec, args))
+            read_target = resolve_user_path(raw_path)
         except ValueError as exc:
             return f"Error: {exc}"
         if _is_sensitive_path(str(read_target)):
