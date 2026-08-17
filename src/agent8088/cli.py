@@ -3918,8 +3918,49 @@ def _run_uninstall():
     return True
 
 
-def _run_update():
-    """Pull latest code + reinstall the package in the venv."""
+# The branch releases come from. Change this one line when that moves; the
+# resolver below copes with it having been renamed or retired in the meantime.
+UPDATE_BRANCH = "development"
+
+
+def _git(install_dir, *args):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=str(install_dir),
+                          capture_output=True, text=True)
+
+
+def _resolve_update_branch(install_dir):
+    """Return (branch, note) — the branch --update should move the install to.
+
+    UPDATE_BRANCH names today's release branch, but branches get renamed and
+    retired. An install pointed at one that no longer exists should still
+    update, and say why it went somewhere else, rather than fail on git's raw
+    'couldn't find remote ref'. So the remote is asked whether the branch is
+    still there, and if it is not, its own default branch is used instead.
+    """
+    probe = _git(install_dir, "ls-remote", "--heads", "origin", UPDATE_BRANCH)
+    if probe.returncode == 0 and probe.stdout.strip():
+        return UPDATE_BRANCH, ""
+    head = _git(install_dir, "ls-remote", "--symref", "origin", "HEAD")
+    if head.returncode == 0:
+        for line in head.stdout.splitlines():
+            if line.startswith("ref:"):  # "ref: refs/heads/main\tHEAD"
+                fallback = line.split()[1].rsplit("/", 1)[-1]
+                return fallback, (
+                    f"Branch '{UPDATE_BRANCH}' is no longer on the remote; "
+                    f"updating to its default branch '{fallback}' instead.")
+    return None, (f"Branch '{UPDATE_BRANCH}' is not on the remote, and the remote's "
+                  "default branch could not be determined. Nothing was changed.")
+
+
+def _run_update(force=False):
+    """Move the install to the tip of UPDATE_BRANCH, then reinstall the package.
+
+    Deliberately not `git pull`: pull moves whatever branch happens to be checked
+    out, against whatever upstream it happens to have, so an install that had
+    drifted onto another branch would quietly update the wrong thing. Fetching
+    the wanted branch by name and checking it out says what it means.
+    """
     import subprocess
     home = _agent8088_home()
     install_dir = home / "agent8088"
@@ -3933,20 +3974,46 @@ def _run_update():
     if not uv_cmd.exists():
         uv_cmd = "uv"
     print(f"Updating {install_dir} ...")
-    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(install_dir),
-                            capture_output=True, text=True)
+    status = _git(install_dir, "status", "--porcelain")
     if status.returncode != 0:
         print(status.stderr.strip() or "Could not inspect the install directory.")
         return False
-    if status.stdout.strip():
+    dirty = [line for line in status.stdout.splitlines() if line.strip()]
+    if dirty and not force:
+        # Naming the files matters: the old message said only that there were
+        # local changes, and pointed at a /update command that does not exist.
         print("Update stopped: the install directory has local changes.")
-        print("Commit or remove them, then run /update again.")
+        for line in dirty[:10]:
+            print(f"  {line}")
+        if len(dirty) > 10:
+            print(f"  ... and {len(dirty) - 10} more")
+        print("Re-run with --force to discard them, or move them somewhere safe first.")
         return False
-    r = subprocess.run(["git", "pull", "--ff-only"], cwd=str(install_dir), capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stderr.strip() or "Update failed; no local files were changed.")
+
+    branch, note = _resolve_update_branch(install_dir)
+    if note:
+        print(note)
+    if branch is None:
         return False
-    print(r.stdout.strip() or "Already up to date.")
+
+    before = _git(install_dir, "rev-parse", "--short", "HEAD").stdout.strip()
+    fetch = _git(install_dir, "fetch", "--depth", "1", "origin", branch)
+    if fetch.returncode != 0:
+        print(fetch.stderr.strip() or "Update failed; no local files were changed.")
+        return False
+    if force and dirty:
+        _git(install_dir, "reset", "--hard")
+        _git(install_dir, "clean", "-fd")
+    # The same two commands install.sh's clone_repo uses, so the shallow checkout
+    # the installer creates is moved by the path already known to work on it.
+    checkout = _git(install_dir, "checkout", "-B", branch, "FETCH_HEAD")
+    if checkout.returncode != 0:
+        print(checkout.stderr.strip() or "Update failed; could not move to the fetched commit.")
+        return False
+    after = _git(install_dir, "rev-parse", "--short", "HEAD").stdout.strip()
+    print(f"Already at the latest commit of {branch} ({after})."
+          if before == after else f"Updated {branch}: {before} -> {after}")
+
     install = subprocess.run(
         [str(uv_cmd), "pip", "install", "--python", str(venv_python),
          "--reinstall-package", "agent8088", "-e", str(install_dir)],
@@ -4682,7 +4749,10 @@ def main():
     parser.add_argument("--mode", choices=["readonly", "full-auto"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
-    parser.add_argument("--update", action="store_true", help="pull latest code + reinstall, then exit")
+    parser.add_argument("--update", action="store_true",
+                        help=f"update to the latest commit of {UPDATE_BRANCH} + reinstall, then exit")
+    parser.add_argument("--force", action="store_true",
+                        help="with --update: discard local changes in the install dir first")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
@@ -4698,7 +4768,7 @@ def main():
         _run_uninstall()
         return
     if args.update:
-        _run_update()
+        _run_update(force=args.force)
         return
     if args.setup:
         _run_setup()
