@@ -577,19 +577,23 @@ function Install-Gateway-Extras {
 function Install-Node-Bridge {
     # --- 1. Ensure Node >= 20.11 is available ------------------------------
     $nodeExe = $null
-    $existingNode = Get-Command node -ErrorAction SilentlyContinue
+    $existingNode = Get-Command node -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($existingNode) {
         try {
-            $ver = (& node --version 2>$null) -replace '^v', ''
+            $ver = (& $existingNode.Source --version 2>$null) -replace '^v', ''
             $parts = $ver.Split('.')
-            if ($parts.Count -ge 2 -and [int]$parts[0] -ge 20 -and [int]$parts[1] -ge 11) {
-                $nodeExe = $existingNode.Source
-                $npmExe = (Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue).Source
-                Write-Success "Node $ver found on PATH"
-            } elseif ($parts.Count -ge 1 -and [int]$parts[0] -gt 20) {
-                $nodeExe = $existingNode.Source
-                $npmExe = (Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue).Source
-                Write-Success "Node $ver found on PATH"
+            $major = [int]$parts[0]
+            $minor = if ($parts.Count -ge 2) { [int]$parts[1] } else { 0 }
+            if ($major -gt 20 -or ($major -eq 20 -and $minor -ge 11)) {
+                $candidateNpm = Join-Path (Split-Path $existingNode.Source -Parent) "npm.cmd"
+                if (Test-Path $candidateNpm) {
+                    $nodeExe = $existingNode.Source
+                    $npmExe = $candidateNpm
+                    Write-Success "Node $ver found on PATH"
+                } else {
+                    Write-Warn "Node $ver has no matching npm.cmd at $candidateNpm - will install portable Node"
+                }
             } else {
                 Write-Warn "Node $ver found but < 20.11 - sandbox-runtime needs 20.11+; will install portable Node"
             }
