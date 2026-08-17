@@ -109,8 +109,8 @@ connection state.
 Expose Agent8088's tools to another agent.
 
 ```sh
-agent8088 --mcp-serve                                   # stdio (local)
-agent8088 --mcp-serve --mcp-http --mcp-port 8931        # Streamable HTTP
+agent8088 --mcp-serve                # stdio (local)
+agent8088 --mcp-http --mcp-port 8931 # Streamable HTTP — --mcp-http/--mcp-port/--mcp-host imply --mcp-serve
 ```
 
 Client config:

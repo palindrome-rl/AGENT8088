@@ -4671,10 +4671,19 @@ def main():
     parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp/Discord/Email/Telegram) instead of the REPL")
     parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp/Discord/Email/Telegram messaging gateways, then exit")
     parser.add_argument("--mcp-serve", action="store_true", help="run Agent8088 as an MCP server (expose tools to external AI agents)")
-    parser.add_argument("--mcp-http", action="store_true", help="use HTTP transport for MCP server (with --mcp-serve)")
-    parser.add_argument("--mcp-port", type=int, default=8931, help="MCP server HTTP port (default 8931)")
-    parser.add_argument("--mcp-host", default="127.0.0.1", help="MCP server bind host (default localhost)")
+    parser.add_argument("--mcp-http", action="store_true", help="use HTTP transport for MCP server (implies --mcp-serve)")
+    parser.add_argument("--mcp-port", type=int, default=None, help="MCP server HTTP port (default 8931); implies --mcp-serve --mcp-http")
+    parser.add_argument("--mcp-host", default=None, help="MCP server bind host (default 127.0.0.1, loopback only); implies --mcp-serve --mcp-http")
     args = parser.parse_args()
+
+    # The transport flags are meaningless without --mcp-serve, and argparse happily
+    # accepts them alone — which used to fall through to the REPL with no server and
+    # no message, looking like the flags were broken. Nobody types --mcp-http meaning
+    # "open the REPL", so honour the obvious intent instead of erroring on it.
+    if args.mcp_port is not None or args.mcp_host is not None:
+        args.mcp_http = True
+    if args.mcp_http:
+        args.mcp_serve = True
 
     if args.uninstall:
         _run_uninstall()
@@ -4706,7 +4715,7 @@ def main():
     if args.mcp_serve:
         from agent8088.mcp_server import run_mcp_server
         if args.mcp_http:
-            run_mcp_server(transport="streamable-http", host=args.mcp_host, port=args.mcp_port)
+            run_mcp_server(transport="streamable-http", host=args.mcp_host or "127.0.0.1", port=args.mcp_port or 8931)
         else:
             run_mcp_server(transport="stdio")
         return
