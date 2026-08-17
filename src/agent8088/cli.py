@@ -1343,8 +1343,11 @@ def _stream_budget():
     """Rows the live region may occupy. Kept short of the terminal height because
     Live is transient and Rich can only erase what is still inside the viewport:
     anything taller scrolls away, burns into the scrollback permanently, and is
-    then printed a second time by render_answer at the end of the turn."""
-    return max(4, console.height - 8)
+    then printed a second time by render_answer at the end of the turn.
+
+    One further row is reserved for the session footer _FooterLive pins to the
+    bottom of every frame."""
+    return max(4, console.height - 9)
 
 
 def _stream_view(reasoning_parts, content):
@@ -1673,7 +1676,11 @@ def do_chat(query):
     tokens_ref = [0]
     turn_start = time.time()
     esc = EscListener()
-    with esc, Live(console=console, refresh_per_second=20, transient=True) as live:
+    # auto_refresh is off on purpose: _FooterLive drives refresh() itself so the
+    # region is only repainted when something actually changed, and it appends
+    # the session footer to every frame so the bar stays put for the whole turn.
+    with esc, Live(console=console, auto_refresh=False, transient=True) as _rich_live, \
+            _FooterLive(_rich_live) as live:
         def spin(msg):
             # Each round starts with "thinking..."; that is the boundary at which a
             # finished tool call stops being the thing on screen, so the filter is
@@ -3479,8 +3486,15 @@ def _prompt_label():
             f"[#237dd7]({pct}% ctx) ›[/#237dd7] ")
 
 
-def _status_bar_fragments():
-    """Persistent session summary shown by prompt_toolkit while waiting for input."""
+def _status_bar_fragments(state="ready"):
+    """Persistent session summary, in prompt_toolkit (style, text) fragment form.
+
+    Two renderers share this one definition so the bar cannot drift between the
+    two halves of a turn: prompt_toolkit draws it as its bottom_toolbar while
+    waiting for input, and _footer_line draws the same fragments as Rich markup
+    while the agent works. `state` is the only thing that differs between them —
+    'ready' at the prompt, 'working' during a turn.
+    """
     pct = _estimate_context_pct()
     filled = min(10, max(0, pct // 10))
     last = S.last_usage or {}
@@ -3495,8 +3509,147 @@ def _status_bar_fragments():
         ("fg:#237dd7", (S.name or "ephemeral")[:18]),
         ("", " │ "),
         ("fg:#237dd7", f"last {last.get('seconds', 0):.1f}s ↑{last.get('tokens', 0)}"),
-        ("fg:#00edff bold", " │ ● ready "),
+        ("fg:#00edff bold", f" │ ● {state} "),
     ]
+
+
+# prompt_toolkit style strings -> the Rich equivalents, so _footer_line can draw
+# the fragments above without a second copy of the bar's layout.
+_FOOTER_STYLES = {
+    "": "",
+    "fg:#237dd7": "#237dd7",
+    "fg:#237dd7 bold": "bold #237dd7",
+    "fg:#00edff bold": "bold #00edff",
+}
+
+
+def _footer_line(state="working"):
+    """The status bar as a single Rich line, clipped to exactly one row.
+
+    The bar already runs past 100 columns with a long provider:model, so it has
+    to be clipped somewhere, and where matters. Rich's own overflow trims the
+    right-hand end, which drops '● working' — the one fragment that has to
+    survive, because it is how the bar shows the turn is still running. So the
+    head and the state are reserved first and the middle detail gives way
+    instead. Wrapping is not an option either: a two-row footer would quietly
+    eat a second line out of the live region on every frame.
+    """
+    fragments = _status_bar_fragments(state)
+    head, tail = fragments[0], fragments[-1]
+    budget = console.width - len(head[1]) - len(tail[1])
+    kept = []
+    for style, value in fragments[1:-1]:
+        if len(value) > budget:
+            break
+        kept.append((style, value))
+        budget -= len(value)
+    # Dropping a detail leaves its separator behind as a stray '│'.
+    while kept and not kept[-1][1].strip(" │"):
+        kept.pop()
+
+    line = Text(no_wrap=True, end="")
+    for style, value in [head, *kept, tail]:
+        line.append(value, style=_FOOTER_STYLES.get(style, ""))
+    # Backstop for a terminal too narrow to hold even head + state.
+    line.truncate(console.width, overflow="ellipsis")
+    return line
+
+
+class _FooterLive:
+    """Rich Live with the session footer pinned to the bottom of every frame.
+
+    Solves two things in one place.
+
+    The footer used to disappear for the whole turn: prompt_toolkit owns its
+    bottom_toolbar only while reading input and tears it down the moment Enter
+    is accepted. Here the footer is simply the last row of the live renderable,
+    so Rich paints it and the content above it as one frame — they cannot tear
+    apart, and no scrolling region or absolute cursor addressing is involved.
+    That matters because ConPTY mishandles both, and this repo has repeatedly
+    had to undo Windows breakage caused by reaching for them.
+
+    The flicker is the other. Rich's refresh thread calls refresh()
+    unconditionally at refresh_per_second and never diffs, so a tall streaming
+    panel was erased and rewritten twenty times a second whether or not a token
+    had arrived. Auto-refresh is therefore off and this class drives refresh()
+    itself: only when the content actually changed, or when a spinner is on
+    screen and owes it an animation tick, and never faster than _FPS. Each frame
+    is bracketed in DEC 2026 synchronized output so the terminal presents
+    finished frames rather than half-erased ones; terminals that do not know the
+    mode ignore it, which is why there is no fallback branch here.
+    """
+
+    _FPS = 10
+
+    def __init__(self, live):
+        self.live = live
+        self._body = Text("")
+        self._dirty = True
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def _animates(body):
+        """Whether `body` owes the screen a repaint even when no content changed."""
+        return isinstance(body, (_StatusLine, _SubStatusLine))
+
+    def update(self, renderable, **_kwargs):
+        """Record what to draw. The refresh loop decides when to draw it."""
+        with self._lock:
+            self._body = renderable
+            self._dirty = True
+
+    def _paint(self):
+        with self._lock:
+            body = self._body
+            self._dirty = False
+        self.live.update(Group(body, _footer_line("working")), refresh=False)
+        stream = getattr(console, "file", None)
+        synced = (console.is_terminal and not console.is_dumb_terminal
+                  and stream is not None)
+        # Written straight to the file so they bracket the frame Rich flushes
+        # from its own buffer between them.
+        if synced:
+            stream.write("\x1b[?2026h")
+        try:
+            self.live.refresh()
+        finally:
+            if synced:
+                stream.write("\x1b[?2026l")
+                stream.flush()
+
+    def _run(self):
+        while not self._stop.wait(1 / self._FPS):
+            with self._lock:
+                due = self._dirty or self._animates(self._body)
+            # _handle_escalation stops the Live to ask a question on a clean
+            # screen; painting under it would overwrite the prompt.
+            if due and self.live.is_started:
+                self._paint()
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        return False
+
+    def start(self):
+        result = self.live.start()
+        with self._lock:
+            self._dirty = True
+        return result
+
+    def __getattr__(self, name):
+        # Only reached for names this wrapper does not define (stop, console,
+        # is_started, …). self.live is set first in __init__, so this cannot
+        # recurse for any attribute accessed after construction.
+        return getattr(self.live, name)
 
 
 def _command_matches(text, slash=True):
