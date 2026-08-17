@@ -27,15 +27,39 @@ def test_web_search_is_the_only_search_tool(engine):
     assert search_tools == ["web_search"]
 
 
-def test_packaged_config_enables_the_temporary_lan_search_profile(engine):
+def test_packaged_config_ships_no_hardcoded_search_endpoint(engine):
+    """The shipped template must not pin anyone else's SearXNG.
+
+    A private LAN address (127.0.0.1:8888) shipped here and install.sh copies
+    this file into every install, so web search pointed at a host the user does
+    not have and their SSRF allowlist was pre-widened to a third party. The
+    endpoint is the operator's to choose, via `/search`.
+    """
+    import ipaddress
+    import re
+    import urllib.parse
+
+    text = (engine.APP_DIR / "config.txt").read_text(encoding="utf-8")
     config = engine.load_simple_config(engine.APP_DIR / "config.txt")
-    assert config["search_base_url"] == "http://127.0.0.1:8888/search?q="
-    # `auto` resolves to a searxng PIN whenever the LAN instance answers, which
-    # is what keeps web_search_no_prompt in force (see
-    # test_auto_resolution_keeps_the_no_prompt_exemption_for_local_searxng).
+
+    # No uncommented search_base_url at all — not even loopback.
+    assert not re.search(r'^\s*search_base_url=', text, re.MULTILINE)
+    assert not str(config.get("search_base_url") or "").strip()
+
+    # The SSRF allowlist ships loopback only; no routable host.
+    for entry in str(config.get("ssrf_allow_hosts") or "").split(","):
+        host = urllib.parse.urlsplit(f"//{entry.strip()}").hostname or ""
+        if not host or host == "localhost":
+            continue
+        assert ipaddress.ip_address(host).is_loopback, f"non-loopback host shipped: {entry}"
+
+    # Whole file free of the leaked LAN address.
+    assert "127.0.0.1" not in text
+
+    # web_search_no_prompt stays, and stays inert: it requires a pinned
+    # loopback/allowlisted SearXNG, which the shipped config no longer provides.
     assert config["web_search_provider"] == "auto"
     assert config["web_search_no_prompt"] == "1"
-    assert "127.0.0.1:8888" in config["ssrf_allow_hosts"]
 
 
 # ---------------------------------------------------------------------------
