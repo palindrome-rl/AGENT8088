@@ -12,6 +12,8 @@ failed must never be retried on another backend: it may already have had effects
 """
 from types import SimpleNamespace
 
+import pytest
+
 PREFLIGHT = (
     "Error: WFP egress fence could not be verified — `srt-win wfp verify` exited 1 "
     'with unparseable output "" (stderr: "srt-win: error: spawn runner for egress '
@@ -228,14 +230,179 @@ def test_docker_creates_a_fresh_workspace_before_mounting(engine, tmp_path, monk
 
 
 def test_docker_container_and_daemon_failures_are_not_command_output(engine, tmp_path, monkeypatch):
-    monkeypatch.setattr(engine, "_running_in_container", lambda: True)
-    assert "host-visible" in engine._exec_docker_command("echo ok", 10)
-
-    monkeypatch.setattr(engine, "_running_in_container", lambda: False)
     monkeypatch.setattr(engine, "_ensure_docker_image", lambda _image: "")
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-data")
     monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "Cannot connect to the Docker daemon")
-    assert engine._exec_docker_command("echo ok", 10, workspace=tmp_path / "workspace") == engine._sandbox_required_error()
+    result = engine._exec_docker_command("echo ok", 10, workspace=tmp_path / "workspace")
+    assert "Cannot connect" not in result
+    assert "Docker sandbox is unavailable" in result
+
+
+def test_running_in_a_container_does_not_by_itself_refuse_docker(engine, tmp_path, monkeypatch):
+    """Being in a container is not the question; whether the mount resolves is.
+
+    Refusing on /.dockerenv alone broke the one configuration where
+    docker-in-docker does work — the project mounted at the same absolute path
+    inside and outside — and told the operator the workspace was not
+    host-visible when it demonstrably was.
+    """
+    workspace = tmp_path / "shared"
+    monkeypatch.setattr(engine, "_running_in_container", lambda: True)
+    monkeypatch.setattr(engine, "_ensure_docker_image", lambda _image: "")
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-data")
+    monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "mounted fine")
+
+    assert engine._exec_docker_command("echo ok", 10, workspace=workspace) == "mounted fine"
+    assert engine._docker_sandbox_broken is False
+
+
+def test_an_unmountable_workspace_is_diagnosed_and_latched(engine, tmp_path, monkeypatch):
+    daemon_refusal = ('docker: Error response from daemon: invalid mount config for '
+                      'type "bind": bind source path does not exist: /work/artifacts')
+    monkeypatch.setattr(engine, "_running_in_container", lambda: True)
+    monkeypatch.setattr(engine, "_ensure_docker_image", lambda _image: "")
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-data")
+    monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: daemon_refusal)
+
+    result = engine._exec_docker_command("echo ok", 10, workspace=tmp_path / "ws")
+    # The daemon's own words must not reach the model as command output.
+    assert "Error response from daemon" not in result
+    assert "same absolute path" in result
+    assert "identical path" in result  # the in-container remedy
+    assert engine._docker_sandbox_broken is True
+    # Latched: docker is out of the running everywhere, not retried per call.
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    assert engine._docker_usable() is False
+
+
+def test_a_latched_docker_failure_makes_the_backend_unavailable(engine, monkeypatch):
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "docker")
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    assert engine._resolve_sandbox_backend() == "docker"
+
+    engine._mark_docker_sandbox_broken("bind source path does not exist: /work")
+    assert engine._resolve_sandbox_backend() == "unavailable"
+
+
+def test_no_sandbox_refusal_names_the_real_obstacle(engine, monkeypatch):
+    """"Install and start Docker" is wrong when Docker is running and mounted wrong.
+
+    The refusal is the only thing the operator and the model get to read, so it
+    has to carry what the probes learned rather than a generic remedy.
+    """
+    generic = engine._sandbox_required_error()
+    assert "install and start Docker" in generic
+
+    engine._mark_native_sandbox_broken("bwrap: No permissions to create new namespace")
+    engine._mark_docker_sandbox_broken(
+        'invalid mount config for type "bind": bind source path does not exist: /work')
+    detailed = engine._sandbox_required_error()
+    assert "same absolute path" in detailed
+    assert "install and start Docker" not in detailed
+
+    monkeypatch.setattr(engine, "_docker_available", lambda: False)
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    status = engine.sandbox_status()
+    assert status["resolved"] == "unavailable"
+    assert "same absolute path" in status["detail"]
+
+
+def test_status_verification_describes_docker_when_docker_is_active(engine, monkeypatch):
+    """A docker-backed session showed native's verdict, which said nothing."""
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "docker")
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(engine, "_docker_sandbox_verified", True)
+    monkeypatch.setattr(engine, "_native_sandbox_broken", True)
+
+    status = engine.sandbox_status()
+    assert status["resolved"] == "docker"
+    assert status["verification"] == "verified"
+
+
+def test_docker_probe_is_cached_per_workspace(engine, tmp_path, monkeypatch):
+    """artifacts/ and the project root are mounted separately; one can fail."""
+    calls = []
+    engine._docker_images_present.add(engine.DOCKER_IMAGE)
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda argv, **_kwargs: calls.append(argv) or SimpleNamespace(
+            returncode=0, stdout="", stderr=""),
+    )
+
+    first, second = tmp_path / "a", tmp_path / "b"
+    assert engine._docker_sandbox_ready(first) is True
+    assert engine._docker_sandbox_ready(first) is True  # served from cache
+    assert len(calls) == 1
+    assert engine._docker_sandbox_ready(second) is True
+    assert len(calls) == 2
+
+
+def test_docker_probe_does_not_pull_a_missing_image(engine, tmp_path, monkeypatch):
+    """A startup probe must never trigger a 300s download."""
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(engine, "_exec_process",
+                        lambda *_args, **_kwargs: "exited with status 1")
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("probe ran a container without the image"),
+    )
+
+    assert engine._docker_sandbox_ready(tmp_path / "ws") is False
+    assert engine._docker_sandbox_broken is False  # unverified, not broken
+
+
+def test_startup_verification_prefers_native_and_never_probes_docker(engine, tmp_path, monkeypatch):
+    """Native first is the design: a healthy machine must not pay for docker."""
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path / "artifacts")
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *_a, **_k: True)
+    monkeypatch.setattr(engine, "_native_sandbox_verified", True)
+    monkeypatch.setattr(
+        engine, "_docker_sandbox_ready",
+        lambda *_a, **_k: pytest.fail("docker probed while native was healthy"),
+    )
+    monkeypatch.setattr(
+        engine, "_docker_available",
+        lambda: pytest.fail("docker probed while native was healthy"),
+    )
+
+    assert engine.verify_sandbox_backend()["resolved"] == "native"
+
+
+def test_startup_verification_probes_docker_only_after_native_fails(engine, tmp_path, monkeypatch):
+    probed = []
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path / "artifacts")
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["srt"])
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(engine, "_docker_sandbox_ready",
+                        lambda *_a, **_k: probed.append(True) or True)
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="",
+            stderr="bwrap: No permissions to create new namespace"),
+    )
+
+    status = engine.verify_sandbox_backend()
+    assert probed == [True]
+    assert status["resolved"] == "docker"
+
+
+def test_startup_verification_with_docker_requested_skips_the_native_probe(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "SANDBOX_BACKEND", "docker")
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path / "artifacts")
+    monkeypatch.setattr(engine, "_docker_available", lambda: True)
+    monkeypatch.setattr(engine, "_docker_sandbox_ready", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        engine, "_native_sandbox_ready",
+        lambda *_a, **_k: pytest.fail("native probed when docker was requested"),
+    )
+
+    assert engine.verify_sandbox_backend()["resolved"] == "docker"
 
 
 def test_status_reports_docker_after_native_preflight_failure(engine, monkeypatch):
@@ -246,7 +413,12 @@ def test_status_reports_docker_after_native_preflight_failure(engine, monkeypatc
 
     status = engine.sandbox_status()
     assert status["resolved"] == "docker"
-    assert status["verification"] == "failed"
+    # `verification` describes the backend that would actually run, so with
+    # docker active it reports on docker — which has not been probed yet here.
+    # Native's failure is the reason we are on docker, so it stays in `detail`
+    # rather than being dropped.
+    assert status["verification"] == "unverified"
+    assert "native failed verification" in status["detail"]
 
 
 def test_windows_docker_probe_prefers_the_executable(engine, monkeypatch):

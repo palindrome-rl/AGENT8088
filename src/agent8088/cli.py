@@ -4785,6 +4785,14 @@ def main():
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.
     A.resolve_auto_search_provider()
+    # Settle the sandbox on the same terms and for the same reason: every path
+    # below can run tools, every path above exits without running any. Native is
+    # tried first and Docker is only probed if native cannot run, so a healthy
+    # machine never pays for a Docker check. Doing it here rather than on first
+    # use means /sandbox, /doctor and describe_capabilities report a tested
+    # answer from the first prompt, and a broken sandbox is announced while the
+    # operator is still watching instead of midway through a turn.
+    A.verify_sandbox_backend()
 
     if args.gateway:
         from agent8088.gateway import main as gateway_main
