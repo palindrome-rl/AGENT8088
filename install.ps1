@@ -113,8 +113,14 @@ function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -Fore
 function Protect-ConfigFile {
     param([string]$Path)
     $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-    icacls $Path /grant:r "*$sid`:(R,W)" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not grant config access to the current user: $Path" }
+    icacls $Path /grant:r "*$sid`:(F)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $owner = try { (Get-Acl -LiteralPath $Path).Owner } catch { "unknown" }
+        throw ("Could not secure config.txt for the current user. " +
+               "Current owner: $owner. Open PowerShell as Administrator and run: " +
+               "takeown.exe /F `"$Path`"; " +
+               "icacls.exe `"$Path`" /grant:r `"*$sid`:(F)`"")
+    }
     icacls $Path /inheritance:r | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not remove inherited config permissions: $Path" }
 }

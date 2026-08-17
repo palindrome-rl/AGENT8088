@@ -113,9 +113,11 @@ def test_setup_hides_existing_key_and_url_defaults(tmp_path, monkeypatch, capsys
 def test_windows_installer_restricts_config_by_sid():
     installer = (Path(__file__).resolve().parent.parent / "install.ps1").read_text()
     assert "WindowsIdentity]::GetCurrent()" in installer
-    assert 'icacls $Path /grant:r "*$sid`:(R,W)"' in installer
+    assert 'icacls $Path /grant:r "*$sid`:(F)"' in installer
     assert installer.index("/grant:r") < installer.index("/inheritance:r")
     assert "$env:USERNAME`:(R,W)" not in installer
+    assert "Get-Acl -LiteralPath $Path" in installer
+    assert "takeown.exe /F" in installer
 
 
 def test_windows_installer_uses_npm_cmd_instead_of_blocked_powershell_shim():
