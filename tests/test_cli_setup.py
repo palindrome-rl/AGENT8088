@@ -118,6 +118,12 @@ def test_windows_installer_restricts_config_by_sid():
     assert "$env:USERNAME`:(R,W)" not in installer
 
 
+def test_windows_installer_uses_npm_cmd_instead_of_blocked_powershell_shim():
+    installer = (Path(__file__).resolve().parent.parent / "install.ps1").read_text()
+    assert "Get-Command npm.cmd -CommandType Application" in installer
+    assert "Get-Command npm -ErrorAction" not in installer
+
+
 def test_setup_fetch_failure_asks_for_model_without_fallback_choices(tmp_path, monkeypatch):
     config = tmp_path / "config.txt"
     config.write_text(

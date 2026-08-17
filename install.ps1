@@ -578,11 +578,11 @@ function Install-Node-Bridge {
             $parts = $ver.Split('.')
             if ($parts.Count -ge 2 -and [int]$parts[0] -ge 20 -and [int]$parts[1] -ge 11) {
                 $nodeExe = $existingNode.Source
-                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
+                $npmExe = (Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue).Source
                 Write-Success "Node $ver found on PATH"
             } elseif ($parts.Count -ge 1 -and [int]$parts[0] -gt 20) {
                 $nodeExe = $existingNode.Source
-                $npmExe = (Get-Command npm -ErrorAction SilentlyContinue).Source
+                $npmExe = (Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue).Source
                 Write-Success "Node $ver found on PATH"
             } else {
                 Write-Warn "Node $ver found but < 20.11 - sandbox-runtime needs 20.11+; will install portable Node"
