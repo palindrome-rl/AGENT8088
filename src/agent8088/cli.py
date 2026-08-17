@@ -1343,11 +1343,8 @@ def _stream_budget():
     """Rows the live region may occupy. Kept short of the terminal height because
     Live is transient and Rich can only erase what is still inside the viewport:
     anything taller scrolls away, burns into the scrollback permanently, and is
-    then printed a second time by render_answer at the end of the turn.
-
-    One further row is reserved for the session footer _FooterLive pins to the
-    bottom of every frame."""
-    return max(4, console.height - 9)
+    then printed a second time by render_answer at the end of the turn."""
+    return max(4, console.height - 8)
 
 
 def _stream_view(reasoning_parts, content):
@@ -1676,11 +1673,10 @@ def do_chat(query):
     tokens_ref = [0]
     turn_start = time.time()
     esc = EscListener()
-    # auto_refresh is off on purpose: _FooterLive drives refresh() itself so the
-    # region is only repainted when something actually changed, and it appends
-    # the session footer to every frame so the bar stays put for the whole turn.
+    # auto_refresh is off on purpose: _ThrottledLive drives refresh() itself so
+    # the region is only repainted when something actually changed.
     with esc, Live(console=console, auto_refresh=False, transient=True) as _rich_live, \
-            _FooterLive(_rich_live) as live:
+            _ThrottledLive(_rich_live) as live:
         def spin(msg):
             # Each round starts with "thinking..."; that is the boundary at which a
             # finished tool call stops being the thing on screen, so the filter is
@@ -3486,14 +3482,15 @@ def _prompt_label():
             f"[#237dd7]({pct}% ctx) ›[/#237dd7] ")
 
 
-def _status_bar_fragments(state="ready"):
-    """Persistent session summary, in prompt_toolkit (style, text) fragment form.
+def _status_bar_fragments():
+    """Persistent session summary shown by prompt_toolkit while waiting for input.
 
-    Two renderers share this one definition so the bar cannot drift between the
-    two halves of a turn: prompt_toolkit draws it as its bottom_toolbar while
-    waiting for input, and _footer_line draws the same fragments as Rich markup
-    while the agent works. `state` is the only thing that differs between them —
-    'ready' at the prompt, 'working' during a turn.
+    Deliberately only rendered by prompt_toolkit's bottom_toolbar. Drawing a
+    second copy inside Rich's Live region during a turn was tried and reverted:
+    Live sits at the bottom of the *output*, not the bottom of the *terminal*, so
+    on a fresh session the bar appeared halfway up the screen beside the spinner
+    rather than pinned to the last row. Pinning it there for real needs a DEC
+    scrolling region, which ConPTY mishandles.
     """
     pct = _estimate_context_pct()
     filled = min(10, max(0, pct // 10))
@@ -3509,74 +3506,25 @@ def _status_bar_fragments(state="ready"):
         ("fg:#237dd7", (S.name or "ephemeral")[:18]),
         ("", " │ "),
         ("fg:#237dd7", f"last {last.get('seconds', 0):.1f}s ↑{last.get('tokens', 0)}"),
-        ("fg:#00edff bold", f" │ ● {state} "),
+        ("fg:#00edff bold", " │ ● ready "),
     ]
 
 
-# prompt_toolkit style strings -> the Rich equivalents, so _footer_line can draw
-# the fragments above without a second copy of the bar's layout.
-_FOOTER_STYLES = {
-    "": "",
-    "fg:#237dd7": "#237dd7",
-    "fg:#237dd7 bold": "bold #237dd7",
-    "fg:#00edff bold": "bold #00edff",
-}
+class _ThrottledLive:
+    """Rich Live that repaints only when the screen would actually change.
 
+    Rich's refresh thread calls refresh() unconditionally at refresh_per_second
+    and never diffs, so a tall streaming panel was erased and rewritten twenty
+    times a second whether or not a token had arrived — measured at 2012
+    erase-line operations and 391 KB of terminal output in one 12s turn, which is
+    what read as flicker. Auto-refresh is therefore off and this class drives
+    refresh() itself: only when the content actually changed, or when a spinner
+    is on screen and owes it an animation tick, and never faster than _FPS.
 
-def _footer_line(state="working"):
-    """The status bar as a single Rich line, clipped to exactly one row.
-
-    The bar already runs past 100 columns with a long provider:model, so it has
-    to be clipped somewhere, and where matters. Rich's own overflow trims the
-    right-hand end, which drops '● working' — the one fragment that has to
-    survive, because it is how the bar shows the turn is still running. So the
-    head and the state are reserved first and the middle detail gives way
-    instead. Wrapping is not an option either: a two-row footer would quietly
-    eat a second line out of the live region on every frame.
-    """
-    fragments = _status_bar_fragments(state)
-    head, tail = fragments[0], fragments[-1]
-    budget = console.width - len(head[1]) - len(tail[1])
-    kept = []
-    for style, value in fragments[1:-1]:
-        if len(value) > budget:
-            break
-        kept.append((style, value))
-        budget -= len(value)
-    # Dropping a detail leaves its separator behind as a stray '│'.
-    while kept and not kept[-1][1].strip(" │"):
-        kept.pop()
-
-    line = Text(no_wrap=True, end="")
-    for style, value in [head, *kept, tail]:
-        line.append(value, style=_FOOTER_STYLES.get(style, ""))
-    # Backstop for a terminal too narrow to hold even head + state.
-    line.truncate(console.width, overflow="ellipsis")
-    return line
-
-
-class _FooterLive:
-    """Rich Live with the session footer pinned to the bottom of every frame.
-
-    Solves two things in one place.
-
-    The footer used to disappear for the whole turn: prompt_toolkit owns its
-    bottom_toolbar only while reading input and tears it down the moment Enter
-    is accepted. Here the footer is simply the last row of the live renderable,
-    so Rich paints it and the content above it as one frame — they cannot tear
-    apart, and no scrolling region or absolute cursor addressing is involved.
-    That matters because ConPTY mishandles both, and this repo has repeatedly
-    had to undo Windows breakage caused by reaching for them.
-
-    The flicker is the other. Rich's refresh thread calls refresh()
-    unconditionally at refresh_per_second and never diffs, so a tall streaming
-    panel was erased and rewritten twenty times a second whether or not a token
-    had arrived. Auto-refresh is therefore off and this class drives refresh()
-    itself: only when the content actually changed, or when a spinner is on
-    screen and owes it an animation tick, and never faster than _FPS. Each frame
-    is bracketed in DEC 2026 synchronized output so the terminal presents
-    finished frames rather than half-erased ones; terminals that do not know the
-    mode ignore it, which is why there is no fallback branch here.
+    Each frame is additionally bracketed in DEC 2026 synchronized output so the
+    terminal presents finished frames rather than half-erased ones. Rich emits no
+    such guard of its own. Terminals that do not know the mode ignore it, which
+    is why there is no fallback branch here.
     """
 
     _FPS = 10
@@ -3604,7 +3552,7 @@ class _FooterLive:
         with self._lock:
             body = self._body
             self._dirty = False
-        self.live.update(Group(body, _footer_line("working")), refresh=False)
+        self.live.update(body, refresh=False)
         stream = getattr(console, "file", None)
         synced = (console.is_terminal and not console.is_dumb_terminal
                   and stream is not None)
