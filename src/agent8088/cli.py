@@ -3965,8 +3965,10 @@ def _run_update(force=False):
     install_argv = [str(uv_cmd), "pip", "install", "--python", str(venv_python),
                     "--reinstall-package", "agent8088", "-e", str(install_dir)]
     agent_exe = install_dir / "venv" / venv_subdir / "agent8088.exe"
-    launched_from_agent_exe = (os.name == "nt" and
-                               Path(sys.argv[0]).resolve() == agent_exe.resolve())
+    launcher_path = Path(sys.argv[0]).resolve()
+    launched_from_agent_exe = (os.name == "nt" and launcher_path in {
+        agent_exe.resolve(), agent_exe.with_suffix("").resolve(),
+    })
     if launched_from_agent_exe:
         # Windows cannot replace the console launcher while this process has it
         # open. Reuse uninstall's detached-cmd pattern, retrying long enough for

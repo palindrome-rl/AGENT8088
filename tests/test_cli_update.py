@@ -81,7 +81,9 @@ def test_windows_update_defers_reinstall_until_launcher_exits(
     launcher.parent.mkdir(parents=True)
     monkeypatch.setattr(cli, "_agent8088_home", lambda: tmp_path)
     monkeypatch.setattr(cli.os, "name", "nt")
-    monkeypatch.setattr(cli.sys, "argv", [str(launcher), "--update"])
+    # distlib's Windows console launcher strips its own .exe suffix before
+    # invoking the entry point, so this is the value production actually sees.
+    monkeypatch.setattr(cli.sys, "argv", [str(launcher.with_suffix("")), "--update"])
     monkeypatch.setattr("subprocess.run", _fake_git([], head_commits=("a", "b")))
     popen_calls = []
     monkeypatch.setattr("subprocess.Popen",
