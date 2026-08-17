@@ -1,0 +1,10 @@
+/doctor
+/status
+/capabilities
+/help
+/tools
+/agents
+/config
+/limits
+/usage
+/exit

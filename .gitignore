@@ -63,3 +63,6 @@ src/agent8088/gateway/platforms/whatsapp_bridge/node_modules/
 # Test and run artifacts — generated files never belong in the repo root
 artifacts/*
 !artifacts/.gitkeep
+
+# E2E run output (per-scenario logs, summary, PDF) — never committed
+logs/

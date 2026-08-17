@@ -2396,7 +2396,10 @@ def cmd_doctor(_):
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
     key_env = provider.get("api_key_env", "")
     if key_env:
-        auth = f"{key_env}: {'set' if os.environ.get(key_env) else 'missing'}"
+        # Route through the same resolver model calls use (.env store -> config
+        # api_key -> os.environ). Reading os.environ directly reported "missing"
+        # for keys that live in the .env key store the wizard writes to.
+        auth = f"{key_env}: {'set' if A._provider_api_key(provider) else 'missing'}"
     elif provider.get("api_mode", "").lower() == "litellm":
         auth = "provider-managed / not configured"
     else:
