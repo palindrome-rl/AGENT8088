@@ -4,6 +4,7 @@ The registry itself is covered by tests/test_web_search.py. These tests assert
 that engine.py hands it the right config and the right guards, and that the
 permission layer treats a search like the network action it is.
 """
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +338,7 @@ def test_search_requires_permission_in_readonly_without_local_opt_in(engine, mon
 def test_local_searxng_search_runs_without_permission_in_readonly(engine, monkeypatch):
     _enable_local_searxng_without_prompt(engine)
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
-    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
+    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: ("OK", ()))
 
     result = engine.run_tool("web_search", {"query": "hi"})
 
@@ -348,7 +349,7 @@ def test_local_searxng_search_runs_without_permission_in_readonly(engine, monkey
 def test_local_searxng_search_runs_without_permission_in_plan_only(engine, monkeypatch):
     _enable_local_searxng_without_prompt(engine)
     monkeypatch.setattr(engine, "PERMISSION_MODE", "plan-only")
-    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
+    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: ("OK", ()))
 
     result = engine.run_tool("web_search", {"query": "hi"})
 
@@ -365,13 +366,36 @@ def test_allowlisted_private_lan_searxng_runs_without_permission(engine, monkeyp
         "ssrf_allow_hosts": "127.0.0.1,localhost,127.0.0.1:8888",
     })
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
-    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: "OK")
+    monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: ("OK", ()))
     assert engine._local_searxng_no_prompt_enabled() is True
 
     result = engine.run_tool("web_search", {"query": "Pakistan public holidays"})
 
     assert "OK" in result
     assert not result.startswith("ESCALATION_REQUEST\x1f")
+
+
+def test_local_searxng_miss_requires_approval_before_ddgs_fallback(engine, monkeypatch):
+    _enable_local_searxng_without_prompt(engine)
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    calls = []
+
+    def search(query, limit, registry, config, context, **kwargs):
+        calls.append((config["web_search_provider"], kwargs))
+        if config["web_search_provider"] == "searxng":
+            return "Every configured web search provider failed", ("searxng",)
+        return "DDGS results"
+
+    monkeypatch.setattr(engine.web_search, "run_search", search)
+    args = {"query": "ferran torres current club"}
+    blocked = engine.exec_tool("web_search", json.dumps(args))
+    assert "network_fallback" in blocked
+    assert calls == [("searxng", {"return_failures": True})]
+
+    engine.grant_escalation("network_fallback")
+    result = engine.exec_tool("web_search", json.dumps(args))
+    assert "DDGS results" in result
+    assert calls[-1] == ("ddgs", {})
 
 
 def test_no_prompt_search_cannot_use_a_nonlocal_or_unpinned_provider(engine):
