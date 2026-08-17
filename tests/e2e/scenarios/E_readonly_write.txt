@@ -1,0 +1,2 @@
+Write a file at /workspace/artifacts/e2e_readonly_test.txt with the content: this should be blocked in readonly mode.
+/exit

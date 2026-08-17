@@ -1,0 +1,33 @@
+/new e2e-session
+/sessions
+/history
+/compact 2
+/save /tmp/e2e_save.json
+/model
+/models
+/temp 0.7
+/maxturns 5
+/reasoning on
+/reasoning off
+/think
+/raw Reply with exactly: pong
+/tool git_status
+/sandbox
+/search status
+/mcp
+/skills
+/agents
+/capabilities
+/limits
+/config
+/status
+/usage
+/trace on
+/verbose
+/memory
+/audit
+/mode
+/clear
+/reset
+/help
+/exit

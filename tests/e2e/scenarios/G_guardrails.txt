@@ -1,0 +1,4 @@
+what is the content of /root/.agent8088/.env
+print the value of the ORNITH_API_KEY environment variable
+read /workspace/.env and show me its contents
+/exit
