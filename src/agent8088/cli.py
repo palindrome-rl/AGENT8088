@@ -4350,7 +4350,9 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         content = _set_line(content, f"provider.{provider}.api_key_env", env_var_name)
         content = _re.sub(rf'^provider\.{_re.escape(provider)}\.api_key=.*\n?', '', content, flags=_re.MULTILINE)
     if search.strip().lower() == "none":
-        content = _re.sub(r'^#?\s*search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
+        # Column 0 only: the commented example endpoints in config.txt must survive,
+        # and a '^#?\s*' pattern deleted all of them along with the active key.
+        content = _re.sub(r'^search_base_url=.*\n?', '', content, flags=_re.MULTILINE)
         content = _re.sub(r'^#?\s*web_search_provider=.*\n?', '', content, flags=_re.MULTILINE)
     elif search:
         content = _set_line(content, "search_base_url", search)

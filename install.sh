@@ -1142,10 +1142,15 @@ run_setup_wizard() {
         sed -i.bak "s|^provider\.${new_provider}\.api_key=.*|provider.${new_provider}.api_key=$new_key|" "$config"
         grep -q "^provider\.${new_provider}\.api_key=" "$config" || echo "provider.${new_provider}.api_key=$new_key" >> "$config"
     fi
+    # Anchored at column 0 so ONLY an active key is touched. config.txt documents
+    # several commented `#   search_base_url=<example>` lines; a `^#*[[:space:]]*`
+    # pattern matched every one of them and rewrote all four into duplicate active
+    # keys, wiping the examples. No active line to replace is fine — the grep below
+    # appends one.
     if [ "$(printf "%s" "$new_search" | tr '[:upper:]' '[:lower:]')" = "none" ]; then
-        sed -i.bak '/^#*[[:space:]]*search_base_url=.*/d' "$config"
+        sed -i.bak '/^search_base_url=.*/d' "$config"
     elif [ -n "$new_search" ]; then
-        sed -i.bak "s|^#*[[:space:]]*search_base_url=.*|search_base_url=$new_search|" "$config"
+        sed -i.bak "s|^search_base_url=.*|search_base_url=$new_search|" "$config"
         grep -q "^search_base_url=" "$config" || echo "search_base_url=$new_search" >> "$config"
     fi
     rm -f "$config.bak"
