@@ -54,10 +54,11 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `deny_commands` | (empty) | Shell commands to refuse (fnmatch globs). Refused in every mode. |
 | `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
-| `ssrf_allow_hosts` | `127.0.0.1,localhost,127.0.0.1:8888` | Temporary LAN deployment allowlist for the shared SearXNG; replace before public distribution. |
+| `ssrf_allow_hosts` | `127.0.0.1,localhost` | Private/internal hosts the agent may reach, as `host` or `host:port`. Loopback only by default. Add a LAN SearXNG here — `/search setup` does it for you. See [Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng). |
 | `web_search_provider` | `auto` | At startup, selects a verified SearXNG when available, otherwise a fallback. |
-| `web_search_no_prompt` | `1` | Temporary LAN no-prompt opt-in; only an effective pinned, allowlisted private SearXNG is permitted. |
-| `search_base_url` | `http://127.0.0.1:8888/search?q=` | Temporary LAN SearXNG endpoint; replace before public distribution. `https://` is required for public hosts. |
+| `web_search_no_prompt` | `1` | Approval-free search, permitted **only** while the effective pin is a loopback or allowlisted-private SearXNG. Inert with no endpoint configured, so a fresh install still prompts on every `ddgs` search. |
+| `search_base_url` | (unset) | SearXNG endpoint, ending at `search?q=`. No default — nothing is assumed about your network. `https://` is required for public hosts. See [Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng). |
+| `searxng_host_port` | `8888` | Loopback port for the container `/search setup` provisions. Change it if 8888 is taken. Always published to `127.0.0.1` only. |
 | `search_date_augmentation` | `1` | Append the current year (or month, for "today"/"this week" questions) to a search query that means "as of now" and names no year of its own. Set `0` to send queries exactly as the model wrote them. |
 | `web_search_results` | `5` | Results per search (max 20). |
 | `ssrf_allow_private` | `0` | `1` opens the entire private network. Prefer the allowlist. |
