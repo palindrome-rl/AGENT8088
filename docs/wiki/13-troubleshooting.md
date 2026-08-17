@@ -179,7 +179,22 @@ the chain. Provision SearXNG (`/search setup`) or add a `TAVILY_API_KEY` /
 
 Plaintext `http://` is only accepted for loopback and private hosts; a public
 instance must use `https://`. Its host must also be in `ssrf_allow_hosts` if it
-resolves to an internal address.
+resolves to an internal address. See
+[Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng)
+for the exact settings per case.
+
+### `search_base_url` shows as "not set (using fallback)"
+
+That is the shipped default, not a fault: no endpoint is assumed for you, so
+`ddgs` serves until you configure one. Run `/search setup` to provision a local
+instance, or set `search_base_url` by hand — see
+[Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng).
+
+### Port 8888 is already in use
+
+Set `searxng_host_port` in `config.txt` and re-run `/search setup`. The bind host
+stays `127.0.0.1` either way — the unauthenticated JSON API is never published to
+the network.
 
 ### Search worked, then stopped after a redirect
 

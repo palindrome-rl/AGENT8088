@@ -397,10 +397,10 @@ def test_local_searxng_search_runs_without_permission_in_plan_only(engine, monke
 def test_allowlisted_private_lan_searxng_runs_without_permission(engine, monkeypatch):
     engine.SEARCH_BASE_URL_CONFIGURED = True
     engine.APP_CONFIG.update({
-        "search_base_url": "http://127.0.0.1:8888/search?q=",
+        "search_base_url": "http://192.168.1.10:8888/search?q=",
         "web_search_provider": "searxng",
         "web_search_no_prompt": "1",
-        "ssrf_allow_hosts": "127.0.0.1,localhost,127.0.0.1:8888",
+        "ssrf_allow_hosts": "127.0.0.1,localhost,192.168.1.10:8888",
     })
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     monkeypatch.setattr(engine.web_search, "run_search", lambda *a, **k: ("OK", ()))

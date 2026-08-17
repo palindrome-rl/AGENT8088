@@ -209,6 +209,106 @@ Because `ddgs` needs no key, no hosting, and no setup, web search works on a
 fresh install. Run `/search status` for the live chain, `/search doctor` to
 diagnose, and `/search use <backend>` to pin one.
 
+## Pointing web search at a SearXNG
+
+`search_base_url` ships **unset**. Nothing is assumed about your network, so a
+fresh install searches through the keyless `ddgs` fallback until you choose an
+endpoint. There are three ways to set one.
+
+### 1. Provision a local instance (recommended)
+
+Needs Docker. From the REPL:
+
+```
+/search setup
+```
+
+That writes a `settings.yml` with JSON output enabled and a random
+`secret_key`, starts the container on `127.0.0.1:8888`, waits for the JSON API
+to answer, then saves `search_base_url` and allowlists the host for you. Nothing
+else to do. If the container never answers, nothing is saved — a backend that
+cannot serve must not be recorded, or the chain would try it first on every
+search.
+
+To move it off port 8888:
+
+```
+searxng_host_port=8888
+```
+
+The **host** is not configurable. SearXNG's JSON API has no authentication, so
+the container is always published to `127.0.0.1` only — binding it to `0.0.0.0`
+would put an open search proxy on your network.
+
+`/search stop` removes the container.
+
+### 2. Point at an instance you already run
+
+Set the endpoint by hand in `config.txt`. It must end at `search?q=` with no
+placeholder — the query is appended for you:
+
+```
+# on this machine
+search_base_url=http://127.0.0.1:8888/search?q=
+
+# elsewhere on your LAN — the host must also be allowlisted
+search_base_url=http://192.168.1.10:8888/search?q=
+ssrf_allow_hosts=127.0.0.1,localhost,192.168.1.10:8888
+```
+
+A private address the agent has not been told about is blocked as internal, which
+is why the LAN case needs the second line. Add the port when the instance runs on
+one: `ssrf_allow_hosts` entries match `host` or `host:port`.
+
+Your instance must have JSON output enabled — upstream SearXNG **disables it by
+default**, and without it every search fails with a parse error. In its
+`settings.yml`:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+### 3. Point at a public instance
+
+`https://` is **required** for a public host. Plaintext `http://` is accepted
+only for loopback and private addresses, so queries never cross the internet in
+the clear:
+
+```
+search_base_url=https://searx.example.org/search?q=
+```
+
+Most public instances rate-limit or block API clients, so expect HTTP 429 and
+keep `ddgs` available as the fallback. Approval-free search is never granted to
+a public host, no matter what `web_search_no_prompt` says.
+
+### Verify it
+
+```
+/search status    # which backend is pinned right now, and the whole chain
+/search doctor    # container state, endpoint, SSRF coverage, JSON check
+```
+
+`/search doctor` reports `search_base_url` as `not set (using fallback)` when no
+endpoint is configured, which is the normal state on a fresh install.
+
+### Using an API-key backend instead
+
+If you would rather not host anything, add a key to the `.env` store next to
+`config.txt` and that backend joins the chain automatically, outranking both
+keyless ones:
+
+```
+TAVILY_API_KEY=...   # agent-optimized results with citations
+EXA_API_KEY=...      # semantic/neural search
+```
+
+Keys never go in `config.txt`. `/search setup` prompts for them if you pick one
+of those backends.
+
 ## How the agent chooses a tool
 
 Tool choice is enforced in three places, each doing only what it is good at.
