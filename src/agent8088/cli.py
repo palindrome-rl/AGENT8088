@@ -3962,11 +3962,33 @@ def _run_update(force=False):
     print(f"Already at the latest commit of {branch} ({after})."
           if before == after else f"Updated {branch}: {before} -> {after}")
 
-    install = subprocess.run(
-        [str(uv_cmd), "pip", "install", "--python", str(venv_python),
-         "--reinstall-package", "agent8088", "-e", str(install_dir)],
-        cwd=str(install_dir),
-    )
+    install_argv = [str(uv_cmd), "pip", "install", "--python", str(venv_python),
+                    "--reinstall-package", "agent8088", "-e", str(install_dir)]
+    agent_exe = install_dir / "venv" / venv_subdir / "agent8088.exe"
+    launched_from_agent_exe = (os.name == "nt" and
+                               Path(sys.argv[0]).resolve() == agent_exe.resolve())
+    if launched_from_agent_exe:
+        # Windows cannot replace the console launcher while this process has it
+        # open. Reuse uninstall's detached-cmd pattern, retrying long enough for
+        # this launcher (and a briefly overlapping session) to release the file.
+        log_path = home / "update.log"
+        install_cmd = subprocess.list2cmdline(install_argv)
+        deferred_cmd = (
+            f'timeout /t 2 /nobreak >nul & '
+            f'for /L %i in (1,1,30) do @('
+            f'{install_cmd} >>"{log_path}" 2>&1 && exit /b 0 || '
+            f'timeout /t 1 /nobreak >nul) & exit /b 1'
+        )
+        subprocess.Popen(
+            ["cmd", "/d", "/c", deferred_cmd], cwd=str(install_dir),
+            close_fds=True, creationflags=0x00000008,  # DETACHED_PROCESS
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print("Code updated. Package reinstall will finish after this process exits.")
+        print(f"If it does not, check {log_path}")
+        return True
+
+    install = subprocess.run(install_argv, cwd=str(install_dir))
     if install.returncode != 0:
         print("Code updated, but package reinstall failed.")
         return False

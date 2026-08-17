@@ -74,6 +74,32 @@ def test_update_reports_when_already_at_the_tip(tmp_path, monkeypatch, capsys):
     assert "Already at the latest commit" in capsys.readouterr().out
 
 
+def test_windows_update_defers_reinstall_until_launcher_exits(
+        tmp_path, monkeypatch, capsys):
+    install = tmp_path / "agent8088"
+    launcher = install / "venv" / "Scripts" / "agent8088.exe"
+    launcher.parent.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_agent8088_home", lambda: tmp_path)
+    monkeypatch.setattr(cli.os, "name", "nt")
+    monkeypatch.setattr(cli.sys, "argv", [str(launcher), "--update"])
+    monkeypatch.setattr("subprocess.run", _fake_git([], head_commits=("a", "b")))
+    popen_calls = []
+    monkeypatch.setattr("subprocess.Popen",
+                        lambda command, **kwargs: popen_calls.append((command, kwargs)))
+
+    assert cli._run_update() is True
+
+    command, kwargs = popen_calls[0]
+    assert command[:3] == ["cmd", "/d", "/c"]
+    assert "--reinstall-package agent8088" in command[3]
+    assert "timeout /t 2" in command[3]
+    assert "for /L %i in (1,1,30)" in command[3]
+    assert kwargs["creationflags"] == 0x00000008
+    output = capsys.readouterr().out
+    assert "after this process exits" in output
+    assert "update.log" in output
+
+
 def test_update_names_the_files_in_the_way_and_offers_force(tmp_path, monkeypatch, capsys):
     """The old message said only that there were local changes, and pointed at a
     /update command that does not exist."""
