@@ -1016,9 +1016,11 @@ function Run-SetupWizard {
         if (-not ($content -match "(?m)^provider\.$newProvider\.api_key=")) { $content += "`nprovider.$newProvider.api_key=$newKey`n" }
     }
     if ($newSearch -and $newSearch.Trim().ToLowerInvariant() -eq "none") {
-        $content = $content -replace '(?m)^#?\s*search_base_url=.*\r?\n?', ''
+        $content = $content -replace '(?m)^search_base_url=.*\r?\n?', ''
     } elseif ($newSearch) {
-        $content = $content -replace '(?m)^#?\s*search_base_url=.*', "search_base_url=$newSearch"
+        # Anchored at column 0: config.txt documents commented example endpoints,
+        # and a '^#?\s*' pattern rewrote every one of them into a duplicate key.
+        $content = $content -replace '(?m)^search_base_url=.*', "search_base_url=$newSearch"
         if (-not ($content -match '(?m)^search_base_url=')) { $content += "`nsearch_base_url=$newSearch`n" }
     }
     Set-Content -Path $config -Value $content -NoNewline:$false
