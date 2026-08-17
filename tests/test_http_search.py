@@ -158,23 +158,34 @@ def test_search_tools_declared(engine):
 
 def test_config_defaults_are_visible_to_templates(engine, register_tool):
     # Regression: tool URL templates interpolate from APP_CONFIG, so engine
-    # defaults must be seeded there. Otherwise {search_base_url} stayed literal
+    # defaults must be seeded there. Otherwise a {placeholder} stayed literal
     # and the tool failed with "Blocked: scheme '' is not allowed".
     #
-    # web_search no longer carries a URL template (it routes through the provider
-    # registry), so this uses a test-local tool to keep the interpolation
-    # mechanism itself under test.
-    assert "search_base_url" in engine.APP_CONFIG
+    # Anchored on model_base_url rather than search_base_url: search_base_url is
+    # deliberately seeded EMPTY now (no endpoint is assumed for the operator), so
+    # it can no longer demonstrate that a seeded default reaches a template.
+    assert engine.APP_CONFIG.get("model_base_url", "").startswith("http")
     spec = register_tool("probe_get", mode="http_get", args="query",
-                         url="{search_base_url}{query_q}&format=json")
+                         url="{model_base_url}/x?q={query_q}")
     url = engine._safe_format(spec["url"], {"query": "x"})
     assert url.startswith(("http://", "https://")), url
     assert "{" not in url, f"unresolved placeholder in {url}"
 
 
-def test_default_search_base_url_has_no_trailing_placeholder(engine):
-    # tools.txt appends {query_q}; a trailing {query} in the base would double it.
-    assert "{query}" not in engine.SEARCH_BASE_URL
+def test_documented_search_base_url_examples_have_no_trailing_placeholder(engine):
+    """The commented examples users copy must be pasteable as-is.
+
+    The SearXNG backend appends the query itself, so an example carrying a
+    trailing {query} would double the placeholder in the final URL.
+    """
+    import re
+
+    text = (engine.APP_DIR / "config.txt").read_text(encoding="utf-8")
+    examples = re.findall(r'^#\s*search_base_url=(\S+)$', text, re.MULTILINE)
+    assert examples, "the config should document at least one example endpoint"
+    for example in examples:
+        assert "{" not in example, example
+        assert example.endswith("search?q="), example
 
 
 def test_unresolved_placeholder_names_the_missing_arg(engine):

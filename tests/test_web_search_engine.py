@@ -62,6 +62,19 @@ def test_packaged_config_ships_no_hardcoded_search_endpoint(engine):
     assert config["web_search_no_prompt"] == "1"
 
 
+def test_engine_seeds_no_default_search_endpoint(engine):
+    """No endpoint is invented when the operator configured none.
+
+    The old loopback default existed so tools.txt could interpolate
+    {search_base_url}; web_search is now mode=search with no URL template, so
+    the default only made every machine look like it was running SearXNG — the
+    registry then tried and failed a local request before reaching ddgs.
+    """
+    assert engine.SEARCH_BASE_URL == ""
+    assert engine.APP_CONFIG.get("search_base_url", "") == ""
+    assert engine.SEARCH_BASE_URL_CONFIGURED is False
+
+
 # ---------------------------------------------------------------------------
 # web_search_provider=auto — startup resolution
 #

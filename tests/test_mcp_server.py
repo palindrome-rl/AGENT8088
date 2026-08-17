@@ -237,10 +237,12 @@ def _ssrf_widening(monkeypatch, *, configured, base_url):
 
 
 def test_mcp_does_not_widen_ssrf_for_a_defaulted_search_url(monkeypatch):
-    """The engine seeds a DEFAULT search_base_url so tool templates interpolate.
+    """An endpoint the operator did not choose must not widen the allowlist.
 
-    Widening the SSRF allowlist off that default handed every MCP run loopback
-    access it had no use for, in a process that runs unattended in full-auto.
+    Widening it off a seeded value handed every MCP run loopback access it had
+    no use for, in a process that runs unattended in full-auto. SEARCH_BASE_URL
+    is empty by default now, but the gate stays keyed on
+    SEARCH_BASE_URL_CONFIGURED so a stale or inherited value cannot re-open it.
     """
     assert _ssrf_widening(monkeypatch, configured=False,
                           base_url="http://127.0.0.1:8888/search?q=") == set()
