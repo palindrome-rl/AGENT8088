@@ -1,0 +1,32 @@
+# Run the Agent8088 messaging gateway as a persistent Docker service — the
+# container alternative to the systemd/launchd setup in
+# docs/wiki/08-messaging-gateway.md#running-as-a-background-service.
+#
+# Reuses the E2E test image (./Dockerfile): it already has the [gateway]
+# extra installed. Its ENTRYPOINT is `sleep infinity` for docker-exec-driven
+# tests, so this overrides entrypoint+command to run the gateway directly.
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# Setup: run `agent8088 --gateway-setup` on the host first (or hand-edit
+# ~/.agent8088/config.txt) — the mounted volume below is the same directory,
+# so config, tokens, and sessions all land where the CLI already expects them.
+#
+# AGENT8088_HOME must be an absolute path (Compose does not expand `~`):
+#   Linux/macOS: export AGENT8088_HOME="$HOME/.agent8088"
+#   Windows:     $env:AGENT8088_HOME = "$env:LOCALAPPDATA\agent8088"
+services:
+  gateway:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["agent8088"]
+    command: ["--gateway"]
+    volumes:
+      - ${AGENT8088_HOME:?set AGENT8088_HOME to an absolute path, e.g. $HOME/.agent8088}:/root/.agent8088
+      # Only needed if config.txt sets sandbox_backend=docker (sibling
+      # containers for run_sandboxed). Omit if the gateway stays readonly.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      AGENT8088_HOME: /root/.agent8088
+      AGENT8088_CONFIG: /root/.agent8088/config.txt

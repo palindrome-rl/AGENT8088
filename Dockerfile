@@ -4,9 +4,10 @@ FROM python:3.11-slim
 
 # Build deps for a few transitive wheels (Pillow, playwright, ddgs/primp),
 # plus curl for in-container endpoint probes, git for the git_* tools,
+# nodejs+npm for the WhatsApp bridge (whatsapp_enabled=1 spawns `node bridge.js`),
 # and the shared libs Playwright's Chromium needs at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential curl git ca-certificates \
+        build-essential curl git ca-certificates nodejs npm \
         libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
         libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 \
         libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
@@ -37,6 +38,10 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # Playwright Chromium for browse_page. --with-deps would re-run apt; we
 # installed the libs above already to keep one apt layer.
 RUN playwright install chromium
+
+# WhatsApp bridge deps (Baileys/express). The bridge ships in the wheel
+# (pyproject force-include) but its node_modules do not, so install them here.
+RUN cd src/agent8088/gateway/platforms/whatsapp_bridge && npm install --omit=dev
 
 # Non-root user keeps file-tool permission tests honest (writes to /root
 # should be refused). We still run as root for the Docker-socket mount
