@@ -3971,18 +3971,24 @@ def _run_update(force=False):
     })
     if launched_from_agent_exe:
         # Windows cannot replace the console launcher while this process has it
-        # open. Reuse uninstall's detached-cmd pattern, retrying long enough for
-        # this launcher (and a briefly overlapping session) to release the file.
+        # open. A detached Python helper preserves argv boundaries (unlike a
+        # compound cmd /c string) and retries long enough for this launcher (and
+        # a briefly overlapping session) to release the file.
         log_path = home / "update.log"
-        install_cmd = subprocess.list2cmdline(install_argv)
-        deferred_cmd = (
-            f'timeout /t 2 /nobreak >nul & '
-            f'for /L %i in (1,1,30) do @('
-            f'{install_cmd} >>"{log_path}" 2>&1 && exit /b 0 || '
-            f'timeout /t 1 /nobreak >nul) & exit /b 1'
+        helper = (
+            "import subprocess,sys,time\n"
+            "time.sleep(2)\n"
+            "argv,log=sys.argv[1:-1],sys.argv[-1]\n"
+            "with open(log,'a',encoding='utf-8') as stream:\n"
+            " for _ in range(30):\n"
+            "  if subprocess.run(argv,stdout=stream,stderr=subprocess.STDOUT).returncode==0:\n"
+            "   raise SystemExit(0)\n"
+            "  time.sleep(1)\n"
+            "raise SystemExit(1)\n"
         )
         subprocess.Popen(
-            ["cmd", "/d", "/c", deferred_cmd], cwd=str(install_dir),
+            [str(venv_python), "-c", helper, *install_argv, str(log_path)],
+            cwd=str(install_dir),
             close_fds=True, creationflags=0x00000008,  # DETACHED_PROCESS
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )

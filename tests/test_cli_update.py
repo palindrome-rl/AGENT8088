@@ -92,10 +92,11 @@ def test_windows_update_defers_reinstall_until_launcher_exits(
     assert cli._run_update() is True
 
     command, kwargs = popen_calls[0]
-    assert command[:3] == ["cmd", "/d", "/c"]
-    assert "--reinstall-package agent8088" in command[3]
-    assert "timeout /t 2" in command[3]
-    assert "for /L %i in (1,1,30)" in command[3]
+    assert command[:2] == [str(launcher.parent / "python.exe"), "-c"]
+    assert "time.sleep(2)" in command[2]
+    assert "range(30)" in command[2]
+    assert "--reinstall-package" in command
+    assert command[-1] == str(tmp_path / "update.log")
     assert kwargs["creationflags"] == 0x00000008
     output = capsys.readouterr().out
     assert "after this process exits" in output
