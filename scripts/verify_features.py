@@ -438,7 +438,12 @@ del A.TOOL_SPECS["_probe"]
 
 # is the configured search backend actually reachable?
 sb = A.APP_CONFIG.get("search_base_url", "")
-if sb:
+if not sb:
+    # Expected on a default install: the shipped config no longer pins an
+    # endpoint. Named rather than silent, so the check count cannot drift
+    # downward without a visible reason.
+    skip("configured search backend reachable", "no search_base_url configured")
+else:
     live = A.run_tool("web_search", {"query": "test"})
     dead = (live.startswith("HTTP ") or "timed out" in live.lower()
             or live.startswith("Blocked:") or "No response from" in live
