@@ -3705,17 +3705,34 @@ def _schedule_initial_prompt_repaint():
         app.invalidate()
 
 
+# Up-arrow recall, held for the life of the process and never written to disk:
+# a prompt is as likely to hold a key or a customer name as a question, and a
+# history file would outlive the session that produced it. prompt_toolkit fills
+# this in for us and already declines to store blank input or to repeat the
+# entry it just stored (Buffer.append_to_history), so the terminal behaviour
+# comes for free. Module level on purpose — a history built inside _read_line
+# would be a fresh empty one on every prompt, which is why up-arrow did nothing.
+_prompt_history = None
+
+
 def _read_line():
     """Use a live completion menu in a TTY, with Rich/readline as a safe fallback."""
+    global _prompt_history
     if not sys.stdin.isatty():
         return console.input(_prompt_label())
     try:
         from prompt_toolkit import prompt
         from prompt_toolkit.completion import Completer, Completion
         from prompt_toolkit.formatted_text import ANSI, FormattedText
+        from prompt_toolkit.history import InMemoryHistory
         from prompt_toolkit.shortcuts import CompleteStyle
     except ImportError:
+        # The readline fallback below keeps its own history, so up-arrow still
+        # recalls there; only the prompt_toolkit path needed wiring.
         return console.input(_prompt_label())
+
+    if _prompt_history is None:
+        _prompt_history = InMemoryHistory()
 
     class AgentCompleter(Completer):
         def get_completions(self, document, complete_event):
@@ -3743,6 +3760,7 @@ def _read_line():
         bottom_toolbar=lambda: FormattedText(_status_bar_fragments()),
         reserve_space_for_menu=6,
         pre_run=_schedule_initial_prompt_repaint,
+        history=_prompt_history,
     )
 
 

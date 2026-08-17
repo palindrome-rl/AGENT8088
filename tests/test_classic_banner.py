@@ -439,3 +439,43 @@ def test_preferences_persist_across_launches(tmp_path, monkeypatch):
     classic.cmd_trace("off")
     monkeypatch.setattr(classic.A, "APP_CONFIG", classic.A.load_simple_config(config))
     assert classic.Session().show_trace is False
+
+
+# ---------------------------------------------------------------------------
+# Up-arrow recall — one history for the life of the process, never on disk
+# ---------------------------------------------------------------------------
+def test_prompt_history_is_shared_across_prompts(monkeypatch):
+    """A history built inside _read_line is a fresh empty one on every prompt,
+    which is exactly why up-arrow used to recall nothing."""
+    seen = []
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(classic, "_prompt_history", None)
+    monkeypatch.setattr(
+        prompt_toolkit, "prompt",
+        lambda message, **kwargs: seen.append(kwargs["history"]) or "hello",
+    )
+
+    classic._read_line()
+    seen[0].append_string("what does this repo do?")
+    classic._read_line()
+
+    assert seen[1] is seen[0], "every prompt must be handed the same history"
+    assert seen[1].get_strings() == ["what does this repo do?"]
+
+
+def test_prompt_history_is_never_written_to_disk(monkeypatch):
+    """Prompts hold questions, but also keys and customer names. The history is
+    deliberately in-memory so it cannot outlive the session that produced it."""
+    from prompt_toolkit.history import InMemoryHistory
+
+    captured = {}
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(classic, "_prompt_history", None)
+    monkeypatch.setattr(
+        prompt_toolkit, "prompt",
+        lambda message, **kwargs: captured.update(kwargs) or "hello",
+    )
+
+    classic._read_line()
+
+    assert isinstance(captured["history"], InMemoryHistory)
