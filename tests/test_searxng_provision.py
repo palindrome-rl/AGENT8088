@@ -64,6 +64,45 @@ def test_start_binds_loopback_only(tmp_path, monkeypatch):
     assert "0.0.0.0" not in " ".join(argv)
 
 
+def test_host_port_is_configurable_but_bind_stays_loopback():
+    """The port is the operator's; the interface is not.
+
+    8888 is a common collision, so the port has to be movable. The host must not
+    be: SearXNG's JSON API has no authentication, so publishing the container to
+    anything but 127.0.0.1 would put an open search proxy on the LAN.
+    """
+    assert sp.base_url() == f"http://127.0.0.1:{sp.DEFAULT_HOST_PORT}/search?q="
+    assert sp.base_url(port=9999) == "http://127.0.0.1:9999/search?q="
+
+
+def test_start_publishes_the_requested_port_on_loopback(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")
+    monkeypatch.setattr(sp, "status", lambda: {"running": False, "detail": "container does not exist"})
+    monkeypatch.setattr(sp, "_run",
+                        lambda argv, **kw: seen.setdefault("argv", argv) and _ok() or _ok())
+
+    result = sp.start(tmp_path, port=9999)
+
+    argv = seen["argv"]
+    assert argv[argv.index("-p") + 1] == "127.0.0.1:9999:8080"
+    assert "0.0.0.0" not in " ".join(argv)
+    assert result["base_url"] == "http://127.0.0.1:9999/search?q="
+
+
+def test_wait_ready_probes_the_requested_port(monkeypatch):
+    probed = {}
+
+    def _fake_probe(url, timeout):
+        probed["url"] = url
+        return {"results": []}
+
+    monkeypatch.setattr(sp, "_probe_json", _fake_probe)
+
+    assert sp.wait_ready(port=9999)["ok"] is True
+    assert probed["url"].startswith("http://127.0.0.1:9999/search?q=")
+
+
 def test_start_mounts_the_generated_settings_dir(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(sp.shutil, "which", lambda n: "/usr/bin/docker")

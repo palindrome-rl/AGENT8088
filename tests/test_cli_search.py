@@ -123,8 +123,8 @@ def test_search_setup_with_docker_provisions_and_persists(capsys, monkeypatch):
     written = {}
     monkeypatch.setattr(cli.A, "_docker_available", lambda: True)
     monkeypatch.setattr(cli.searxng_provision, "start",
-                        lambda home: {"ok": True, "detail": "started",
-                                      "base_url": "http://127.0.0.1:8888/search?q="})
+                        lambda home, **kw: {"ok": True, "detail": "started",
+                                           "base_url": "http://127.0.0.1:8888/search?q="})
     monkeypatch.setattr(cli.searxng_provision, "wait_ready",
                         lambda **kw: {"ok": True, "detail": "JSON API responding"})
     monkeypatch.setattr(cli.A, "update_simple_config",
@@ -140,8 +140,8 @@ def test_search_setup_does_not_persist_when_readiness_fails(capsys, monkeypatch)
     written = {}
     monkeypatch.setattr(cli.A, "_docker_available", lambda: True)
     monkeypatch.setattr(cli.searxng_provision, "start",
-                        lambda home: {"ok": True, "detail": "started",
-                                      "base_url": "http://127.0.0.1:8888/search?q="})
+                        lambda home, **kw: {"ok": True, "detail": "started",
+                                           "base_url": "http://127.0.0.1:8888/search?q="})
     monkeypatch.setattr(cli.searxng_provision, "wait_ready",
                         lambda **kw: {"ok": False, "detail": "did not become ready"})
     monkeypatch.setattr(cli.A, "update_simple_config",
@@ -149,6 +149,41 @@ def test_search_setup_does_not_persist_when_readiness_fails(capsys, monkeypatch)
     cli.cmd_search("setup")
     assert written == {}
     assert "did not become ready" in capsys.readouterr().out
+
+
+def test_searxng_host_port_reads_config_and_ignores_junk(monkeypatch):
+    """A typo must not make `/search setup` unusable — it falls back to default."""
+    for raw, expected in (("9999", 9999), ("", None), ("  8080 ", 8080),
+                          ("not-a-port", None), ("0", None), ("70000", None)):
+        monkeypatch.setitem(cli.A.APP_CONFIG, "searxng_host_port", raw)
+        assert cli._searxng_host_port() == expected, raw
+
+
+def test_search_setup_provisions_on_the_configured_port(capsys, monkeypatch):
+    """searxng_host_port must reach both the container and the readiness probe."""
+    seen = {}
+    written = {}
+    monkeypatch.setitem(cli.A.APP_CONFIG, "searxng_host_port", "9999")
+    monkeypatch.setattr(cli.A, "_docker_available", lambda: True)
+    def _start(home, **kw):
+        seen["start"] = kw.get("port")
+        return {"ok": True, "detail": "started",
+                "base_url": "http://127.0.0.1:9999/search?q="}
+
+    def _wait_ready(**kw):
+        seen["ready"] = kw.get("port")
+        return {"ok": True, "detail": "JSON API responding"}
+
+    monkeypatch.setattr(cli.searxng_provision, "start", _start)
+    monkeypatch.setattr(cli.searxng_provision, "wait_ready", _wait_ready)
+    monkeypatch.setattr(cli.A, "update_simple_config",
+                        lambda path, values: written.update(values))
+    monkeypatch.setattr(cli.A, "resolve_auto_search_provider", lambda: "searxng")
+
+    cli.cmd_search("setup")
+
+    assert seen == {"start": 9999, "ready": 9999}
+    assert written.get("search_base_url") == "http://127.0.0.1:9999/search?q="
 
 
 def test_search_stop_reports_result(capsys, monkeypatch):

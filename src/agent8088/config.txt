@@ -267,6 +267,11 @@ web_search_provider=auto
 # upstream SearXNG disables by default; `/search doctor` reports it if not.
 # search_base_url=
 #
+# Host port for the container `/search` provisions (default 8888). Change it if
+# 8888 is already taken. Always published to 127.0.0.1 only — the JSON API is
+# unauthenticated, so it is never exposed to the network.
+# searxng_host_port=8888
+#
 # Skip approval only for explicitly pinned loopback or explicitly allowlisted
 # private-LAN SearXNG. It never permits a fallback to a public provider.
 # Credentials and direct personal identifiers in search queries remain blocked.

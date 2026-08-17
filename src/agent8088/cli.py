@@ -2448,6 +2448,23 @@ def cmd_sandbox(rest):
     console.print(t)
 
 
+def _searxng_host_port():
+    """Loopback port for the provisioned SearXNG, or None for the default.
+
+    Exists so 8888 being taken is a config edit rather than a dead end. A
+    non-numeric or out-of-range value falls back to the default instead of
+    raising: a typo here should not make `/search setup` unusable.
+    """
+    raw = str(A.APP_CONFIG.get("searxng_host_port") or "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except ValueError:
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
 def _search_setup_options():
     """Web search choices, ordered so the best available one is first.
 
@@ -2535,13 +2552,14 @@ def cmd_search(rest):
                 "TAVILY_API_KEY / EXA_API_KEY to the .env store.")
             cmd_search("status")
             return
+        port = _searxng_host_port()
         with status_cm("starting SearXNG container..."):
-            started = searxng_provision.start(_agent8088_home())
+            started = searxng_provision.start(_agent8088_home(), port=port)
         console.print(started["detail"])
         if not started["ok"]:
             return
         with status_cm("waiting for the SearXNG JSON API..."):
-            ready = searxng_provision.wait_ready()
+            ready = searxng_provision.wait_ready(port=port)
         console.print(ready["detail"])
         if not ready["ok"]:
             # Do not record a backend that cannot answer — the chain would try it
@@ -2549,7 +2567,7 @@ def cmd_search(rest):
             console.print("[yellow]Not saved to config.[/yellow] Fix the instance, "
                           "then re-run `/search setup`.")
             return
-        base_url = started.get("base_url") or searxng_provision.BASE_URL
+        base_url = started.get("base_url") or searxng_provision.base_url(port)
         A.update_simple_config(A.CONFIG_PATH, {
             "search_base_url": base_url,
             "web_search_provider": A.web_search.AUTO,
@@ -4269,13 +4287,15 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         if choice.startswith("keep current"):
             pass  # leave search_base_url / web_search_provider untouched
         elif choice.startswith("searxng ("):
-            provisioned = searxng_provision.start(_agent8088_home())
+            searxng_port = _searxng_host_port()
+            provisioned = searxng_provision.start(_agent8088_home(), port=searxng_port)
             print(provisioned["detail"])
             if provisioned["ok"]:
-                ready = searxng_provision.wait_ready()
+                ready = searxng_provision.wait_ready(port=searxng_port)
                 print(ready["detail"])
                 if ready["ok"]:
-                    search = provisioned.get("base_url") or searxng_provision.BASE_URL
+                    search = (provisioned.get("base_url")
+                              or searxng_provision.base_url(searxng_port))
                     search_provider = "searxng"
                 else:
                     print("Leaving web search on the bundled ddgs fallback.")
