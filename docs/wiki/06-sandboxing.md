@@ -11,7 +11,7 @@ command can't reach your whole filesystem or network.
 
 | Value | Behaviour |
 |---|---|
-| `auto` *(default)* | Native runtime first, Docker if unavailable, otherwise refuse execution |
+| `auto` *(default)* | Native runtime first, Docker if it is missing or fails its one-time probe, otherwise refuse execution |
 | `native` | Force the free OS-level sandbox |
 | `docker` | Force the Docker fallback |
 
@@ -20,6 +20,11 @@ Check what's active:
 ```
 /sandbox
 ```
+
+The status includes whether native isolation is `verified`, still `unverified`,
+or has `failed`. The first sandbox use runs one harmless command and caches that
+result for the rest of the process, so merely having `bwrap` or `sandbox-exec`
+on `PATH` is not treated as proof that it works.
 
 ## Native sandbox (recommended)
 
@@ -43,7 +48,7 @@ commands run as — that's why it's a one-time elevation.
 
 ## Docker fallback
 
-Used automatically under `auto` when the native runtime is missing:
+Used automatically under `auto` when native isolation is missing or cannot run:
 
 ```ini
 docker_image=python:3.11-slim
@@ -52,6 +57,11 @@ docker_network=none
 
 `docker_network=none` is the safer default — no network from inside the
 container at all.
+
+Docker's bind mounts are resolved by the Docker daemon. If Agent8088 itself is
+running in a container, its workspace path is normally not visible to that
+daemon, so the fallback is refused with a diagnosis rather than returning a raw
+Docker error. Run Agent8088 on the Docker host or use native isolation there.
 
 ## Network egress
 
@@ -107,6 +117,6 @@ rm -rf -- "$VERIFY_HOME"
 ```
 
 Section 3 covers sandboxing and reports the resolved backend. If the native
-runtime isn't installed you get an explicit `⊘ SKIP` naming the missing
-dependency rather than a silent pass — see
+runtime isn't installed or cannot pass its probe you get an explicit `⊘ SKIP`
+naming the missing dependency or failed backend rather than a silent pass — see
 [Testing & Verification](12-testing-and-verification.md).

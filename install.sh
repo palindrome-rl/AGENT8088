@@ -483,6 +483,13 @@ install_deps() {
         log_info "Installing Playwright Chromium browser (~280 MB)..."
         "$_py" -m playwright install chromium >/dev/null 2>&1 && CHROMIUM_INSTALLED=true || \
             log_warn "Chromium download failed - browse_page will show install instructions"
+        if [ "$CHROMIUM_INSTALLED" = true ] && [ "$OS" = "linux" ]; then
+            log_info "Installing Playwright Chromium system dependencies..."
+            local _playwright_sudo=""
+            [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _playwright_sudo="sudo"
+            $_playwright_sudo "$_py" -m playwright install-deps chromium >/dev/null 2>&1 || \
+                log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
+        fi
         [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
     fi
 }
@@ -722,11 +729,12 @@ install_native_sandbox() {
         linux)
             local sudo_cmd=""
             [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
-            # engine.py:3003 requires: bwrap, socat, rg
+            # Native execution and its scheduled-task tool require these binaries.
             local _missing=()
             command -v bwrap >/dev/null 2>&1 || _missing+=("bubblewrap")  # Debian/Ubuntu pkg name
             command -v socat >/dev/null 2>&1 || _missing+=("socat")
             command -v rg >/dev/null 2>&1 || _missing+=("ripgrep")
+            command -v crontab >/dev/null 2>&1 || _missing+=("crontab")
             if [ "${#_missing[@]}" -gt 0 ]; then
                 log_info "Installing sandbox OS helpers: ${_missing[*]}..."
                 case "$DISTRO" in
@@ -738,6 +746,7 @@ install_native_sandbox() {
                                 bubblewrap) _apt_pkgs+=("bubblewrap") ;;
                                 socat)      _apt_pkgs+=("socat") ;;
                                 ripgrep)    _apt_pkgs+=("ripgrep") ;;
+                                crontab)    _apt_pkgs+=("cron") ;;
                             esac
                         done
                         $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_apt_pkgs[@]}" >/dev/null 2>&1 || true
@@ -749,6 +758,7 @@ install_native_sandbox() {
                                 bubblewrap) _dnf_pkgs+=("bubblewrap") ;;
                                 socat)      _dnf_pkgs+=("socat") ;;
                                 ripgrep)    _dnf_pkgs+=("ripgrep") ;;
+                                crontab)    _dnf_pkgs+=("cronie") ;;
                             esac
                         done
                         $sudo_cmd dnf install -y "${_dnf_pkgs[@]}" >/dev/null 2>&1 || true
@@ -760,6 +770,7 @@ install_native_sandbox() {
                                 bubblewrap) _pacman_pkgs+=("bubblewrap") ;;
                                 socat)      _pacman_pkgs+=("socat") ;;
                                 ripgrep)    _pacman_pkgs+=("ripgrep") ;;
+                                crontab)    _pacman_pkgs+=("cronie") ;;
                             esac
                         done
                         $sudo_cmd pacman -S --noconfirm "${_pacman_pkgs[@]}" >/dev/null 2>&1 || true
@@ -780,10 +791,12 @@ install_native_sandbox() {
 
     # Invoke the engine's install_native_sandbox() via the CLI flag.
     log_info "Running native sandbox setup..."
-    if "$_py" -m agent8088.cli --sandbox-setup >/dev/null 2>&1; then
+    local _sandbox_setup
+    if _sandbox_setup=$("$_py" -m agent8088.cli --sandbox-setup 2>&1); then
         SANDBOX_INSTALLED=true
-        log_success "Native sandbox runtime installed"
+        log_success "Native sandbox runtime installed and verified"
     else
+        [ -n "$_sandbox_setup" ] && log_warn "$_sandbox_setup"
         log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
     fi
 }

@@ -190,9 +190,19 @@ class MCPRuntime:
                 pass
 
     def reload(self, reserved=()):
+        teardown_error = ""
         if self._sessions:
-            self._run(self._close_all())
+            try:
+                self._run(self._close_all())
+            except Exception as exc:
+                teardown_error = str(exc)
+                logging.getLogger("agent8088.mcp").warning("MCP teardown failed: %s", exc)
         self._tools, self.statuses = {}, {}
+        if teardown_error:
+            self.statuses["teardown"] = {
+                "state": "error", "error": f"could not close prior sessions: {teardown_error}",
+                "tools": [],
+            }
         used = set(reserved)
         for name, config in self._load_config().items():
             try:
@@ -259,7 +269,10 @@ class MCPRuntime:
 
     def close(self):
         if self._sessions:
-            self._run(self._close_all())
+            try:
+                self._run(self._close_all())
+            except Exception as exc:
+                logging.getLogger("agent8088.mcp").warning("MCP shutdown teardown failed: %s", exc)
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=1)

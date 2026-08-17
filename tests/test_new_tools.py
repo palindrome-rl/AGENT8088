@@ -345,6 +345,7 @@ def test_auditor_absolute_artifact_paths_are_redirected_to_disposable_copy(
     engine.ARTIFACTS_ROOT = artifacts
     engine._sandbox_readonly = True
     monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *_args, **_kwargs: True)
     seen = {}
 
     def fake_native(command, _timeout, cwd, readonly=False):

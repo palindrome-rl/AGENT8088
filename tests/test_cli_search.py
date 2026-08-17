@@ -129,9 +129,10 @@ def test_search_setup_with_docker_provisions_and_persists(capsys, monkeypatch):
                         lambda **kw: {"ok": True, "detail": "JSON API responding"})
     monkeypatch.setattr(cli.A, "update_simple_config",
                         lambda path, values: written.update(values))
+    monkeypatch.setattr(cli.A, "resolve_auto_search_provider", lambda: "searxng")
     cli.cmd_search("setup")
     assert written.get("search_base_url") == "http://127.0.0.1:8888/search?q="
-    assert written.get("web_search_provider") == "searxng"
+    assert written.get("web_search_provider") == "auto"
 
 
 def test_search_setup_does_not_persist_when_readiness_fails(capsys, monkeypatch):
@@ -179,6 +180,19 @@ def test_search_doctor_flags_a_host_missing_from_ssrf_allowlist(capsys, monkeypa
     cli.cmd_search("doctor")
     out = capsys.readouterr().out
     assert "searx.internal" in out and "ssrf_allow_hosts" in out
+
+
+def test_search_doctor_accepts_host_and_port_ssrf_allowlist_entry(capsys, monkeypatch):
+    monkeypatch.setattr(cli.searxng_provision, "status",
+                        lambda: {"running": True, "detail": "running"})
+    monkeypatch.setitem(cli.A.APP_CONFIG, "search_base_url",
+                        "http://searx.internal:8888/search?q=")
+    monkeypatch.setattr(cli.A, "SEARCH_BASE_URL_CONFIGURED", True)
+    monkeypatch.setattr(cli.A, "SSRF_ALLOW_HOSTS", {"searx.internal:8888"})
+
+    cli.cmd_search("doctor")
+
+    assert "does not include searx.internal" not in capsys.readouterr().out.lower()
 
 
 # ---------------------------------------------------------------------------

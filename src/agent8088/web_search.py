@@ -384,8 +384,8 @@ def probe_searxng(ctx: SearchContext, timeout: int = STARTUP_PROBE_TIMEOUT) -> b
     if ctx.check_url(url):
         return False
     try:
-        _http_get_json(url, timeout=timeout)
-        return True
+        payload = _http_get_json(url, timeout=timeout)
+        return isinstance(payload, dict) and isinstance(payload.get("results"), list)
     except Exception:  # noqa: BLE001 — any failure means "not usable right now"
         return False
 

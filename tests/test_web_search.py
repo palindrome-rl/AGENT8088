@@ -165,6 +165,13 @@ def test_probe_reports_true_on_a_json_answer(monkeypatch):
     assert web_search.probe_searxng(ctx) is True
 
 
+def test_probe_rejects_json_that_is_not_a_searxng_search_response(monkeypatch):
+    monkeypatch.setattr(web_search, "_http_get_json", lambda *a, **k: {"status": "ok"})
+    ctx = web_search.SearchContext(
+        config={"search_base_url": "http://127.0.0.1:8888/search?q="})
+    assert web_search.probe_searxng(ctx) is False
+
+
 def test_probe_reports_false_when_the_instance_errors(monkeypatch):
     def _boom(*a, **k):
         raise urllib.error.URLError("connection refused")

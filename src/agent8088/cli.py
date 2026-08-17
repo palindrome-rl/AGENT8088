@@ -1922,7 +1922,11 @@ def cmd_mcp(rest):
                 "Reload MCP servers", "(drops the tool cache and reconnects)"):
             console.print("[#237dd7]kept[/#237dd7]")
             return
-        A.reload_mcp_tools()
+        try:
+            A.reload_mcp_tools()
+        except Exception as exc:
+            console.print(f"[red]MCP reload failed:[/red] {exc}")
+            return
     elif action == "add" and len(parts) >= 3:
         name, transport, target, *extra = parts
         project = "--project" in extra
@@ -2370,7 +2374,7 @@ def cmd_status(_):
     t.add_row("MCP", f"{connected} connected · {sum(len(item.get('tools', [])) for item in A.MCP_RUNTIME.statuses.values())} tools")
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
     sandbox = A.sandbox_status()
-    t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['requested']}) · network {sandbox['network']}")
+    t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}; {sandbox['requested']}) · network {sandbox['network']}")
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
     t.add_row("Detail", f"verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
@@ -2411,7 +2415,7 @@ def cmd_doctor(_):
     t.add_row("Authentication", auth)
     t.add_row("Configuration", f"{A.CONFIG_PATH} ({'found' if A.CONFIG_PATH.exists() else 'missing'})")
     sandbox = A.sandbox_status()
-    t.add_row("Sandbox", f"{sandbox['resolved']} · {sandbox['detail']}")
+    t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
     console.print(t)
 
@@ -2434,6 +2438,7 @@ def cmd_sandbox(rest):
     t.add_column("Value", style="#237dd7")
     t.add_row("Configured", status["requested"])
     t.add_row("Active", status["resolved"])
+    t.add_row("Verification", status["verification"])
     t.add_row("Isolation", status["detail"])
     t.add_row("Network", status["network"])
     t.add_row("Runtime", status["runtime_version"])
@@ -2544,10 +2549,12 @@ def cmd_search(rest):
         base_url = started.get("base_url") or searxng_provision.BASE_URL
         A.update_simple_config(A.CONFIG_PATH, {
             "search_base_url": base_url,
-            "web_search_provider": "searxng",
+            "web_search_provider": A.web_search.AUTO,
         })
         A.APP_CONFIG["search_base_url"] = base_url
         A.SEARCH_BASE_URL_CONFIGURED = True
+        A.APP_CONFIG["web_search_provider"] = A.web_search.AUTO
+        A.resolve_auto_search_provider()
         console.print(f"Saved [#237dd7]search_base_url={base_url}[/#237dd7]")
         cmd_search("status")
         return
@@ -2565,8 +2572,9 @@ def cmd_search(rest):
         t.add_row("search_base_url", base_url if configured else "not set (using fallback)")
         if configured and base_url:
             import urllib.parse as _up
-            host = (_up.urlparse(base_url).hostname or "").lower()
-            covered = host in A.SSRF_ALLOW_HOSTS or A.SSRF_ALLOW_PRIVATE
+            parsed = _up.urlparse(base_url)
+            host = (parsed.hostname or "").lower()
+            covered = A.SSRF_ALLOW_PRIVATE or A._ssrf_host_allowlisted(host, parsed.port)
             t.add_row("SSRF allowlist",
                       f"{host} allowed" if covered
                       else f"[red]{host} NOT in ssrf_allow_hosts[/red] — internal "
@@ -3811,7 +3819,11 @@ def _run_uninstall():
     import stat
     home = _agent8088_home()
     print(f"This will permanently remove Agent8088 from: {home}")
-    answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
+    try:
+        answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
+    except EOFError:
+        print("Uninstall cancelled.")
+        return False
     if answer.strip() != "yes":
         print("Uninstall cancelled.")
         return False
@@ -4765,7 +4777,7 @@ def main():
         return
     if args.sandbox_setup:
         print(A.install_native_sandbox())
-        return
+        return 0 if A.native_sandbox_verified() else 1
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.
@@ -4843,4 +4855,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

@@ -45,6 +45,16 @@ def test_uninstall_cancel_keeps_install_dir(tmp_path, monkeypatch, capsys):
     assert "Uninstall cancelled" in capsys.readouterr().out
 
 
+def test_uninstall_eof_cancels_cleanly(tmp_path, monkeypatch, capsys):
+    home, shim = _fake_install(tmp_path, monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda prompt: (_ for _ in ()).throw(EOFError))
+
+    assert cli._run_uninstall() is False
+
+    assert home.exists() and shim.exists()
+    assert "Uninstall cancelled" in capsys.readouterr().out
+
+
 def test_uninstall_requires_exact_yes_and_removes_install_dir(tmp_path, monkeypatch, capsys):
     home, shim = _fake_install(tmp_path, monkeypatch)
     rc = tmp_path / ".zshrc"

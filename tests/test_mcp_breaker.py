@@ -129,3 +129,17 @@ def test_threshold_zero_disables_the_breaker(runtime, monkeypatch):
     _always_fail(runtime, monkeypatch)
     for _ in range(20):
         assert "do not retry" not in runtime.call("mcp_x_do", {}).lower()
+
+
+def test_reload_reports_teardown_failure_without_raising(runtime, monkeypatch):
+    runtime._sessions = {"old": object()}
+
+    def _broken_teardown(coroutine, timeout=35):
+        coroutine.close()
+        raise RuntimeError("transport already closed")
+
+    monkeypatch.setattr(runtime, "_run", _broken_teardown)
+
+    assert runtime.reload() == {}
+    assert runtime.statuses["teardown"]["state"] == "error"
+    assert "transport already closed" in runtime.statuses["teardown"]["error"]
