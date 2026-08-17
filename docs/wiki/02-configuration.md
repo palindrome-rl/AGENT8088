@@ -55,8 +55,8 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
 | `ssrf_allow_hosts` | `127.0.0.1,localhost,127.0.0.1:8888` | Temporary LAN deployment allowlist for the shared SearXNG; replace before public distribution. |
-| `web_search_provider` | `searxng` | Temporary LAN deployment pin; replace before public distribution. |
-| `web_search_no_prompt` | `1` | Temporary LAN no-prompt opt-in; only pinned, allowlisted private SearXNG is permitted. |
+| `web_search_provider` | `auto` | At startup, selects a verified SearXNG when available, otherwise a fallback. |
+| `web_search_no_prompt` | `1` | Temporary LAN no-prompt opt-in; only an effective pinned, allowlisted private SearXNG is permitted. |
 | `search_base_url` | `http://127.0.0.1:8888/search?q=` | Temporary LAN SearXNG endpoint; replace before public distribution. `https://` is required for public hosts. |
 | `search_date_augmentation` | `1` | Append the current year (or month, for "today"/"this week" questions) to a search query that means "as of now" and names no year of its own. Set `0` to send queries exactly as the model wrote them. |
 | `web_search_results` | `5` | Results per search (max 20). |

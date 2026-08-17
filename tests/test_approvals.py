@@ -276,6 +276,16 @@ def test_mcp_reload_asks_before_dropping_the_tool_cache(monkeypatch):
     cli.cmd_mcp("reload")
 
 
+def test_mcp_reload_reports_an_internal_failure(monkeypatch, capsys):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "MCP_RELOAD_CONFIRM", False)
+    monkeypatch.setattr(cli.A, "reload_mcp_tools", lambda: (_ for _ in ()).throw(RuntimeError("teardown failed")))
+
+    cli.cmd_mcp("reload")
+
+    assert "MCP reload failed" in capsys.readouterr().out
+
+
 # --- The removed axis must stay removed -------------------------------------
 
 def test_there_is_no_second_axis_that_can_wave_a_gate_through(engine):

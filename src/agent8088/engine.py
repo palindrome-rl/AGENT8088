@@ -3238,10 +3238,13 @@ GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
-# Set after a native pre-flight failure. The restricted account or OS policy
-# does not heal during the process, so both execution and status use Docker for
-# the rest of the session when it is available.
+# Native availability has two stages: binaries on PATH, then one real no-op
+# execution. A restricted account, locked-down kernel, or container can pass the
+# first check but fail the second for the whole process lifetime.
 _native_sandbox_broken = False
+_native_sandbox_verified = None
+_native_sandbox_failure = ""
+_NATIVE_SANDBOX_PROBE_TIMEOUT = 10
 
 
 def _which_executable(name: str) -> str | None:
@@ -3313,14 +3316,14 @@ def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
     if requested == "native":
-        if native_available and _native_sandbox_broken and _docker_available():
-            return "docker"
+        if native_available and _native_sandbox_broken:
+            return "docker" if _docker_available() else "unavailable"
         return "native" if native_available else "unavailable"
     if requested == "docker":
         return "docker" if _docker_available() else "unavailable"
     if native_available:
-        if _native_sandbox_broken and _docker_available():
-            return "docker"
+        if _native_sandbox_broken:
+            return "docker" if _docker_available() else "unavailable"
         return "native"
     return "docker" if _docker_available() else "unavailable"
 
@@ -3335,12 +3338,23 @@ def sandbox_status() -> dict:
     missing = _native_sandbox_missing_requirements()
     if resolved == "unavailable" and missing:
         detail += f" (missing: {', '.join(missing)})"
+    if _native_sandbox_broken:
+        verification = "failed"
+    elif missing:
+        verification = "unavailable"
+    elif _native_sandbox_verified:
+        verification = "verified"
+    else:
+        verification = "unverified"
+    if resolved == "native" and verification == "unverified":
+        detail += " (candidate; not yet verified by a sandboxed command)"
     return {
         "requested": SANDBOX_BACKEND,
         "resolved": resolved,
         "detail": detail,
         "network": ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked",
         "runtime_version": SANDBOX_RUNTIME_VERSION,
+        "verification": verification,
     }
 
 
@@ -3415,6 +3429,12 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
     "CreateProcessWithLogonW",
     "Secondary Logon service",
     "srt-win: error:",
+    "bwrap: No permissions to create new namespace",
+    "bwrap: Creating new namespace failed",
+    "bwrap: Can't mount proc",
+    "apply-seccomp:",
+    "sandbox-exec: sandbox_init:",
+    "sandbox-exec: sandbox_apply:",
 )
 
 
@@ -3448,19 +3468,76 @@ def _native_sandbox_unusable(result: str) -> bool:
     return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
 
 
+def _mark_native_sandbox_broken(result: str) -> None:
+    """Latch a runtime failure and retain only a local diagnostic."""
+    global _native_sandbox_broken, _native_sandbox_verified, _native_sandbox_failure
+    first_failure = not _native_sandbox_broken
+    _native_sandbox_broken = True
+    _native_sandbox_verified = False
+    _native_sandbox_failure = result or "Native sandbox probe failed."
+    if first_failure:
+        _log.warning("native sandbox could not start. %s",
+                     _native_sandbox_repair_hint(_native_sandbox_failure))
+
+
+def _native_sandbox_ready(cwd: Path, readonly: bool = False) -> bool:
+    """Run one real native no-op before trusting presence checks."""
+    global _native_sandbox_verified
+    if _native_sandbox_broken:
+        return False
+    if _native_sandbox_verified is not None:
+        return bool(_native_sandbox_verified)
+
+    runtime = _native_sandbox_argv()
+    if not runtime:
+        _mark_native_sandbox_broken("Native sandbox runtime is unavailable.")
+        return False
+    try:
+        cwd = cwd.resolve()
+        cwd.mkdir(parents=True, exist_ok=True)
+        settings = _write_sandbox_settings(readonly, cwd)
+        sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    except OSError as exc:
+        _mark_native_sandbox_broken(f"Native sandbox probe could not prepare: {exc}")
+        return False
+    probe = _process_display([sys.executable, "-c", "pass"])
+    command = (f"cd {shlex.quote(str(cwd))} && "
+               f"TMPDIR={shlex.quote(str(sandbox_tmp))} {probe}")
+    try:
+        result = subprocess.run(
+            runtime + ["--settings", str(settings), "-c", command],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=_NATIVE_SANDBOX_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _mark_native_sandbox_broken(
+            f"Native sandbox probe timed out after {_NATIVE_SANDBOX_PROBE_TIMEOUT}s.")
+        return False
+    except OSError as exc:
+        _mark_native_sandbox_broken(f"Native sandbox probe could not start: {exc}")
+        return False
+    if result.returncode:
+        _mark_native_sandbox_broken((result.stderr or result.stdout or
+                                     f"Native sandbox probe exited {result.returncode}.").strip())
+        return False
+    _native_sandbox_verified = True
+    return True
+
+
+def native_sandbox_verified() -> bool:
+    """Whether this process has successfully executed the native probe."""
+    return _native_sandbox_verified is True
+
+
 def _native_or_docker(native, docker):
     """Run native isolation, retrying only a proven pre-flight failure."""
-    global _native_sandbox_broken
-    if _native_sandbox_broken and _docker_available():
-        return docker()
+    if _native_sandbox_broken:
+        return docker() if _docker_available() else _sandbox_required_error()
     result = native()
-    if not _native_sandbox_unusable(result) or not _docker_available():
+    if not _native_sandbox_unusable(result):
         return result
-    if not _native_sandbox_broken:
-        _log.warning("native sandbox could not start, using docker for the "
-                     "rest of this session. %s", _native_sandbox_repair_hint(result))
-    _native_sandbox_broken = True
-    return docker()
+    _mark_native_sandbox_broken(result)
+    return docker() if _docker_available() else _sandbox_required_error()
 
 
 def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
@@ -3492,6 +3569,8 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
         )
 
     if backend == "native":
+        if not _native_sandbox_ready(PROJECT_ROOT, readonly=True):
+            return docker() if _docker_available() else _sandbox_required_error()
         runtime = _native_sandbox_argv()
         settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
@@ -3575,18 +3654,30 @@ def _to_container_path(command: str, workspace: Path) -> str:
         rewritten)
 
 
+def _running_in_container() -> bool:
+    return os.path.exists("/.dockerenv")
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "", workspace: Path | None = None,
                          readonly: bool = False) -> str:
     selected_image = image or DOCKER_IMAGE
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
-    unavailable = _ensure_docker_image(selected_image)
-    if unavailable:
-        return unavailable
-    workspace_path = workspace or ARTIFACTS_ROOT
+    if _running_in_container():
+        return ("Error: Docker fallback is unavailable because Agent8088 is already "
+                "running in a container and its workspace path is not host-visible. "
+                "Use the native sandbox or run Agent8088 on the Docker host.")
+    workspace_path = Path(workspace or ARTIFACTS_ROOT)
     if hasattr(workspace_path, "resolve"):
         workspace_path = workspace_path.resolve()
+    if hasattr(workspace_path, "mkdir"):
+        workspace_path.mkdir(parents=True, exist_ok=True)
+    unavailable = _ensure_docker_image(selected_image)
+    if unavailable:
+        _log.warning("Docker sandbox image is unavailable: %s", unavailable)
+        return (f"Error: container image {selected_image} is unavailable or missing. "
+                "Install and start Docker, then retry.")
     workspace = str(workspace_path)
     container_name = f"agent8088-{os.getpid()}-{uuid.uuid4().hex[:12]}"
     git_image = selected_image.startswith("alpine/git:")
@@ -3634,6 +3725,11 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
+    if any(marker in result.lower() for marker in (
+            "cannot connect to the docker daemon", "is the docker daemon running",
+            "error during connect", "permission denied while trying to connect")):
+        _log.warning("Docker sandbox could not start: %s", result[:500])
+        return _sandbox_required_error()
     return result
 
 
@@ -3699,6 +3795,10 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
     try:
         if backend == "native":
+            if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
+                return (_exec_docker_command(command, timeout, python_code, image,
+                                             workspace=workspace)
+                        if _docker_available() else _sandbox_required_error())
             local_command = (
                 _process_display([sys.executable, "-c", command])
                 if python_code else command
@@ -3754,7 +3854,11 @@ def install_native_sandbox() -> str:
             f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed. "
             f"Install the remaining OS packages: {', '.join(missing)}."
         )
-    return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed."
+    if not _native_sandbox_ready(ARTIFACTS_ROOT):
+        return (f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed but could not "
+                f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
+                "Docker will be used when available.")
+    return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed and verified."
 
 
 def _tool_arg_parse_error(name: str, raw: str) -> str:
@@ -4222,6 +4326,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
     write_path = ""
+    target = None
     path_zone = "default"
     shadowed = None
     if mode == "shell":
@@ -4374,7 +4479,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             paths_str = command
         sandbox_missing = mode in ("shell", "docker") and _resolve_sandbox_backend() == "unavailable"
         change_type = {
-            "write_text": "new_file",
+            "write_text": "overwrite" if target is not None and target.exists() else "new_file",
             "cron": "scheduled_task",
             "browser": "network_request",
             "mcp": "mcp_tool",
@@ -5327,11 +5432,8 @@ def _ssrf_check(url: str):
     if not host:
         return "Blocked: URL has no host."
     # Explicitly allowlisted internal host (match on host and on host:port).
-    if SSRF_ALLOW_HOSTS:
-        hl = host.lower()
-        if hl in SSRF_ALLOW_HOSTS or (
-                parts.port and f"{hl}:{parts.port}" in SSRF_ALLOW_HOSTS):
-            return None
+    if _ssrf_host_allowlisted(host, parts.port):
+        return None
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -5346,6 +5448,13 @@ def _ssrf_check(url: str):
             return (f"Blocked: '{host}' resolves to internal address {ip}. "
                     "Requests to private/loopback/link-local networks are not allowed.")
     return None
+
+
+def _ssrf_host_allowlisted(host: str, port: int | None = None) -> bool:
+    """Match the narrow SSRF allowlist without performing DNS."""
+    host = (host or "").lower()
+    return bool(host and (host in SSRF_ALLOW_HOSTS or
+                          (port and f"{host}:{port}" in SSRF_ALLOW_HOSTS)))
 
 
 def _host_matches(host: str, domain: str) -> bool:

@@ -25,6 +25,18 @@ def test_preflight_failures_are_recognised(engine):
     assert engine._native_sandbox_unusable("Native sandbox runtime is unavailable.") is True
 
 
+def test_linux_and_macos_preflight_failures_are_recognised(engine):
+    for failure in (
+        "bwrap: No permissions to create new namespace",
+        "bwrap: Creating new namespace failed",
+        "bwrap: Can't mount proc",
+        "apply-seccomp: Operation not permitted",
+        "sandbox-exec: sandbox_init: Operation not permitted",
+        "sandbox-exec: sandbox_apply: Operation not permitted",
+    ):
+        assert engine._native_sandbox_unusable(failure) is True
+
+
 def test_a_command_that_ran_and_failed_is_not_a_preflight_failure(engine):
     """The critical distinction: this one must never be retried elsewhere."""
     assert engine._native_sandbox_unusable(
@@ -42,6 +54,7 @@ def test_command_output_mentioning_error_is_not_a_preflight_failure(engine):
 def _wire(engine, monkeypatch, native_result, docker_available=True):
     calls = []
     monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(engine, "_docker_available", lambda: docker_available)
     monkeypatch.setattr(
         engine, "_exec_native_sandbox",
@@ -72,12 +85,13 @@ def test_a_failing_command_is_not_re_run_on_docker(engine, monkeypatch):
     assert calls == ["native"], "command failure is a result, not an infrastructure fault"
 
 
-def test_without_docker_the_runtime_error_is_kept(engine, monkeypatch):
-    """The runtime's message names the cause; a generic one would lose it."""
+def test_without_docker_hides_the_runtime_error(engine, monkeypatch):
+    """Infrastructure diagnostics must not be presented as command output."""
     calls = _wire(engine, monkeypatch, PREFLIGHT, docker_available=False)
     result = engine._exec_sandbox_command("python demo.py")
     assert calls == ["native"]
-    assert "Secondary Logon" in result, "the actionable detail must survive"
+    assert "sandbox is required" in result.lower()
+    assert "Secondary Logon" not in result
 
 
 def test_a_broken_native_runtime_is_only_attempted_once(engine, monkeypatch):
@@ -117,6 +131,7 @@ def test_a_healthy_native_runtime_is_never_marked_broken(engine, monkeypatch):
 def test_python_code_still_reaches_docker_as_python(engine, monkeypatch):
     seen = {}
     monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     monkeypatch.setattr(engine, "_exec_native_sandbox", lambda *a, **k: PREFLIGHT)
     monkeypatch.setattr(
@@ -133,6 +148,7 @@ def test_python_code_still_reaches_docker_as_python(engine, monkeypatch):
 def test_structured_git_fallback_keeps_the_pinned_git_image(engine, monkeypatch):
     calls = []
     monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["node", "srt.js"])
     monkeypatch.setattr(engine, "_write_sandbox_settings", lambda **_kwargs: "settings.json")
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: engine.PROJECT_ROOT)
@@ -153,13 +169,84 @@ def test_structured_git_fallback_keeps_the_pinned_git_image(engine, monkeypatch)
     assert docker[1]["readonly"] is True
 
 
+def test_native_probe_is_cached_after_a_success(engine, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["srt"])
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(engine, "_write_sandbox_settings", lambda *_args: tmp_path / "settings.json")
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    assert engine._native_sandbox_ready(tmp_path / "workspace") is True
+    assert engine._native_sandbox_ready(tmp_path / "workspace") is True
+    assert len(calls) == 1
+    assert engine.native_sandbox_verified() is True
+
+
+def test_failed_native_probe_latches_before_any_user_command(engine, tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["srt"])
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(engine, "_write_sandbox_settings", lambda *_args: tmp_path / "settings.json")
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(
+            returncode=1, stdout="", stderr="bwrap: Creating new namespace failed"),
+    )
+
+    assert engine._native_sandbox_ready(tmp_path / "workspace") is False
+    assert engine._native_sandbox_ready(tmp_path / "workspace") is False
+    assert len(calls) == 1
+    assert engine._native_sandbox_broken is True
+
+
+def test_native_probe_latches_a_workspace_preparation_failure(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["srt"])
+    monkeypatch.setattr(engine, "_write_sandbox_settings",
+                        lambda *_args: (_ for _ in ()).throw(PermissionError("denied")))
+
+    assert engine._native_sandbox_ready(tmp_path / "workspace") is False
+    assert engine._native_sandbox_broken is True
+
+
+def test_docker_creates_a_fresh_workspace_before_mounting(engine, tmp_path, monkeypatch):
+    workspace = tmp_path / "fresh-workspace"
+    seen = {}
+    monkeypatch.setattr(engine, "_running_in_container", lambda: False)
+    monkeypatch.setattr(engine, "_ensure_docker_image", lambda _image: "")
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-data")
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda argv, **_kwargs: seen.update(argv=argv) or "ok",
+    )
+
+    assert engine._exec_docker_command("echo ok", 10, workspace=workspace) == "ok"
+    assert workspace.is_dir()
+    assert f"type=bind,src={workspace.resolve()},dst=/workspace" in seen["argv"]
+
+
+def test_docker_container_and_daemon_failures_are_not_command_output(engine, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "_running_in_container", lambda: True)
+    assert "host-visible" in engine._exec_docker_command("echo ok", 10)
+
+    monkeypatch.setattr(engine, "_running_in_container", lambda: False)
+    monkeypatch.setattr(engine, "_ensure_docker_image", lambda _image: "")
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent-data")
+    monkeypatch.setattr(engine, "_exec_process", lambda *_args, **_kwargs: "Cannot connect to the Docker daemon")
+    assert engine._exec_docker_command("echo ok", 10, workspace=tmp_path / "workspace") == engine._sandbox_required_error()
+
+
 def test_status_reports_docker_after_native_preflight_failure(engine, monkeypatch):
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", "auto")
     monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: ["node", "srt.js"])
     monkeypatch.setattr(engine, "_docker_available", lambda: True)
     monkeypatch.setattr(engine, "_native_sandbox_broken", True)
 
-    assert engine.sandbox_status()["resolved"] == "docker"
+    status = engine.sandbox_status()
+    assert status["resolved"] == "docker"
+    assert status["verification"] == "failed"
 
 
 def test_windows_docker_probe_prefers_the_executable(engine, monkeypatch):

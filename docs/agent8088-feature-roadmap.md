@@ -32,7 +32,7 @@ Agent8088 is the **open-source execution engine** inside Palindrome Runtime.
 |---|---|---|
 | One-command install (macOS/Linux/Windows) | ✅ Done | `install.sh` + `install.ps1` |
 | CLI setup wizard (`--setup`) | ✅ Done | Prompts for working dir, model, API key, web search |
-| CLI flags (`--help`, `--version`, `--edit`, `--uninstall`, `--update`, `--setup`) | ✅ Done | argparse-based |
+| CLI flags (`--help`, `--version`, `--full-auto`, `--mode`, `--uninstall`, `--update`, `--setup`) | ✅ Done | argparse-based; plan sessions start with `/plan` |
 | Cross-platform shell execution | ✅ Done | Windows `cmd.exe` + Linux `bash` |
 | Permission layer (readonly → edit escalation) | ✅ Done | Per-action y/n prompts, one-shot grants |
 | Security layers (sensitive files, network gate, path zones) | ✅ Done | 3 layers, config-driven |

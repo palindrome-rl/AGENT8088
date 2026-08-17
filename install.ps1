@@ -769,7 +769,7 @@ function Install-Native-Sandbox {
             $ErrorActionPreference = $prevEAP
         }
         if ($script:SandboxInstalled) {
-            Write-Success "Native sandbox runtime installed"
+            Write-Success "Native sandbox runtime installed and verified"
         } else {
             Write-Warn "Native sandbox setup did not complete - Docker will be used automatically when available"
         }

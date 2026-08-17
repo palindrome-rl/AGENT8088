@@ -95,6 +95,17 @@ def test_run_tool_blocks_write_in_readonly(tmp_path, monkeypatch):
     assert "ESCALATION_REQUEST" in result
 
 
+def test_write_escalation_labels_existing_files_as_overwrites(tmp_path, monkeypatch):
+    target = tmp_path / "existing.txt"
+    target.write_text("old")
+    A.PERMISSION_MODE = "readonly"
+    monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])
+
+    result = A.run_tool("write_file", {"filename": str(target), "content": "new"})
+
+    assert result.split("\x1f")[2] == "overwrite"
+
+
 def test_parse_error_never_performs_a_write(tmp_path, monkeypatch):
     A.PERMISSION_MODE = "full-auto"
     monkeypatch.setattr(A, "ALLOWED_PATHS", [tmp_path])

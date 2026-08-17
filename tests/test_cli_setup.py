@@ -517,3 +517,12 @@ def test_setup_model_discovery_has_a_short_timeout_and_no_retries(
     assert created["max_retries"] == 0
     assert providers.MODEL_LIST_TIMEOUT_SECONDS == cli.MODEL_DISCOVERY_TIMEOUT_SECONDS
     assert "enter the model name manually" in capsys.readouterr().out
+
+
+def test_sandbox_setup_returns_failure_when_the_probe_fails(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["agent8088", "--sandbox-setup"])
+    monkeypatch.setattr(cli.A, "install_native_sandbox", lambda: "installed but could not be verified")
+    monkeypatch.setattr(cli.A, "native_sandbox_verified", lambda: False)
+
+    assert cli.main() == 1
+    assert "could not be verified" in capsys.readouterr().out
