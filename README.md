@@ -1,7 +1,7 @@
 <p align="center">
-  <img src="assets/palindrome-research-labs-agent8088.png" alt="Palindrome Research Labs" width="180">
+  <img src="assets/palindrome-research-labs-agent8088.png" alt="Palindrome Research Labs" width="420">
   <br>
-  <img src="assets/agent8088-wordmark.png" alt="Agent8088" width="540">
+  <img src="assets/agent8088-wordmark-readme.png" alt="Agent8088" width="540">
 </p>
 
 <p align="center">
