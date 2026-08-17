@@ -261,3 +261,129 @@ def test_stream_view_says_where_the_earlier_lines_went(monkeypatch):
     rendered = output.getvalue()
     assert "the full answer prints below" in rendered
     assert "line 499" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Persistent footer — the bar must survive the whole turn, and cost one row
+# ---------------------------------------------------------------------------
+def test_footer_state_word_distinguishes_working_from_ready():
+    """The prompt and the turn share one bar definition; only the state differs.
+
+    A second copy of the layout is how the two halves drifted apart before."""
+    ready = "".join(text for _, text in cli._status_bar_fragments())
+    working = "".join(text for _, text in cli._status_bar_fragments("working"))
+
+    assert ready.endswith("● ready ")
+    assert working.endswith("● working ")
+    # Everything up to the state word is byte-identical between the two.
+    assert ready[:ready.rindex("●")] == working[:working.rindex("●")]
+
+
+def test_footer_line_renders_every_fragment_style():
+    """An unmapped prompt_toolkit style would silently render as default text."""
+    styles = {style for style, _ in cli._status_bar_fragments("working")}
+    assert styles <= set(cli._FOOTER_STYLES), (
+        f"unmapped footer styles: {styles - set(cli._FOOTER_STYLES)}")
+
+
+def test_footer_line_stays_one_row_when_the_model_name_is_long(monkeypatch):
+    """The bar runs past 100 columns with a long provider:model. Wrapped, it
+    would quietly eat a second row out of the live region on every frame."""
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "console",
+                        Console(file=output, width=60, height=24, color_system=None,
+                                legacy_windows=False))
+    monkeypatch.setattr(cli.A, "MODEL_NAME", "a-very-long-model-name-that-overflows")
+
+    cli.console.print(cli._footer_line("working"))
+
+    assert len(output.getvalue().rstrip("\n").splitlines()) == 1
+
+
+def test_stream_budget_reserves_a_row_for_the_footer(monkeypatch):
+    """_stream_view fills the budget exactly, so the footer needs its own row
+    carved out of it or the live region grows one line past the viewport."""
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "console",
+                        Console(file=output, width=80, height=24, color_system=None,
+                                legacy_windows=False))
+
+    body = cli._stream_view([], "\n".join(f"line {i}" for i in range(500)))
+    cli.console.print(cli.Group(body, cli._footer_line("working")))
+
+    assert len(output.getvalue().rstrip("\n").splitlines()) <= 24
+
+
+def test_footer_live_appends_the_footer_to_whatever_it_is_given(monkeypatch):
+    """The footer is part of the frame, not a separately addressed row — that is
+    what stops it tearing away from the content above it."""
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "console",
+                        Console(file=output, width=100, height=24, color_system=None,
+                                legacy_windows=False))
+
+    class _FakeLive:
+        is_started = True
+        def __init__(self): self.renderable = None
+        def update(self, renderable, refresh=False): self.renderable = renderable
+        def refresh(self): cli.console.print(self.renderable)
+
+    fake = _FakeLive()
+    footer_live = cli._FooterLive(fake)
+    footer_live.update(cli.Text("streaming answer"))
+    footer_live._paint()
+
+    rendered = output.getvalue()
+    assert "streaming answer" in rendered
+    assert "● working" in rendered
+
+
+def test_footer_live_repaints_only_when_something_changed():
+    """Rich's own refresh thread repaints unconditionally; that churn is the
+    flicker. Only new content or a spinner owed a tick may trigger a frame."""
+    footer_live = cli._FooterLive(object())
+
+    footer_live.update(cli.Text("prose"))
+    assert footer_live._dirty is True
+
+    footer_live._body, footer_live._dirty = cli.Text("prose"), False
+    assert cli._FooterLive._animates(footer_live._body) is False, (
+        "a static prose panel must not schedule a repaint on its own")
+
+    spinner = cli._StatusLine("thinking", 0.0, [0], interruptible=True)
+    assert cli._FooterLive._animates(spinner) is True, (
+        "the spinner still has to animate while the model is quiet")
+
+
+def test_footer_keeps_the_state_word_when_the_bar_does_not_fit(monkeypatch):
+    """Rich's own overflow trims the right-hand end, which drops '● working' —
+    the one fragment that has to survive, since it is how the bar shows the turn
+    is still running. The middle detail gives way instead."""
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "console",
+                        Console(file=output, width=44, height=24, color_system=None,
+                                legacy_windows=False))
+    monkeypatch.setattr(cli.A, "MODEL_NAME", "a-very-long-model-name-that-overflows")
+
+    cli.console.print(cli._footer_line("working"))
+
+    rendered = output.getvalue().rstrip("\n")
+    assert len(rendered.splitlines()) == 1
+    assert rendered.startswith(" ◆ 8088 ")
+    assert rendered.endswith("● working ")
+
+
+def test_footer_drops_a_details_separator_with_it(monkeypatch):
+    """Dropping a detail must take its '│' with it, or the bar shows a stray
+    separator fencing off nothing: 'readonly │  │ ● working'."""
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "console",
+                        Console(file=output, width=70, height=24, color_system=None,
+                                legacy_windows=False))
+
+    cli.console.print(cli._footer_line("working"))
+
+    rendered = output.getvalue().rstrip("\n")
+    assert len(rendered.splitlines()) == 1
+    assert "│  │" not in rendered
+    assert rendered.endswith("● working ")
