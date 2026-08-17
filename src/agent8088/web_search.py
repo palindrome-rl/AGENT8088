@@ -267,35 +267,47 @@ def format_results(success: SearchSuccess, ctx: SearchContext) -> str:
 
 
 def run_search(query: str, limit: int, registry: Registry, config: dict,
-               ctx: SearchContext) -> str:
+               ctx: SearchContext, *, return_failures: bool = False):
+    """Search the configured chain, optionally returning retryable failures.
+
+    The opt-in failure list lets engine.py distinguish a local SearXNG outage
+    from a policy denial without parsing text that may be shown to the model.
+    """
+    failed_providers = []
+
+    def finish(message: str):
+        return (message, tuple(failed_providers)) if return_failures else message
+
     query = (query or "").strip()
     if not query:
-        return "Error: web_search requires a non-empty 'query'."
+        return finish("Error: web_search requires a non-empty 'query'.")
 
     chain = registry.chain(config, ctx)
     if not chain:
         configured = str(config.get("web_search_provider") or "").strip()
         if configured:
-            return (f"web_search_provider={configured} is not a known provider. "
-                    f"Known: {', '.join(PREFERENCE)}.")
+            return finish(f"web_search_provider={configured} is not a known provider. "
+                          f"Known: {', '.join(PREFERENCE)}.")
         hints = "\n".join(f"  - {p.setup_hint()}" for p in registry.all())
-        return ("No web search provider is configured. Run `/search setup` to "
-                f"provision a local SearXNG, or enable one of:\n{hints}")
+        return finish("No web search provider is configured. Run `/search setup` to "
+                      f"provision a local SearXNG, or enable one of:\n{hints}")
 
     failures = []
     for provider in chain:
         outcome = provider.search(query, limit, ctx)
         if isinstance(outcome, SearchSuccess) and outcome.results:
-            return format_results(outcome, ctx)
+            return finish(format_results(outcome, ctx))
         if isinstance(outcome, SearchFailure):
             if not outcome.retryable:
-                return outcome.error
+                return finish(outcome.error)
+            failed_providers.append(provider.name)
             failures.append(f"{provider.name}: {outcome.error}")
         else:
+            failed_providers.append(provider.name)
             failures.append(f"{provider.name}: no results")
-    return ("Every configured web search provider failed:\n"
-            + "\n".join(f"  - {f}" for f in failures)
-            + "\nRun `/search doctor` to diagnose.")
+    return finish("Every configured web search provider failed:\n"
+                  + "\n".join(f"  - {f}" for f in failures)
+                  + "\nRun `/search doctor` to diagnose.")
 
 
 # ---------------------------------------------------------------------------

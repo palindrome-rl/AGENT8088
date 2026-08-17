@@ -661,6 +661,15 @@ def reset_turn_approval_state() -> None:
     _pending_approval_key = ""
 
 
+def _take_search_fallback_grant(approval_key: str) -> bool:
+    """Spend the exact approval that permits a local search to use DDGS."""
+    global _one_shot_grant
+    if _one_shot_grant != approval_key:
+        return False
+    _one_shot_grant = False
+    return True
+
+
 def _tool_call_key(name: str, args: dict) -> str:
     return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
 
@@ -4305,7 +4314,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=query[:120], reason="outbound_secret")
             return leak
-        if (not _local_searxng_no_prompt_enabled()
+        local_no_prompt = _local_searxng_no_prompt_enabled()
+        if (not local_no_prompt
                 and not check_permission(mode, f"web_search: {query[:80]}",
                                          approval_key=approval_key)):
             _audit("escalation_requested", tool=name, mode=mode,
@@ -4317,11 +4327,42 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 change_type="network_request",
                 reason=f"Tool '{name}' wants to search the web for: {query[:160]}",
             )
+        config = _search_config()
+        context = _search_context()
+        if local_no_prompt and _take_search_fallback_grant(approval_key):
+            # The operator approved this exact query leaving the local instance.
+            # Do not reopen the whole chain: DDGS is the requested fallback.
+            config["web_search_provider"] = "ddgs"
+            _audit("tool_call", tool=name, mode=mode, decision="allowed",
+                   detail=query[:200], change_type="network_fallback")
+            return _frame_search_results(web_search.run_search(
+                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
+
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=query[:200])
-        return _frame_search_results(web_search.run_search(
-            query, _web_search_limit(), WEB_SEARCH_REGISTRY, _search_config(),
-            _search_context()))
+        if not local_no_prompt:
+            return _frame_search_results(web_search.run_search(
+                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
+        outcome = web_search.run_search(
+            query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
+            return_failures=True)
+        # Embedders may supply an older custom registry implementation. A plain
+        # string is still a valid result; it simply cannot request this fallback.
+        if not isinstance(outcome, tuple):
+            return _frame_search_results(outcome)
+        result, failures = outcome
+        if failures == ("searxng",):
+            _audit("escalation_requested", tool=name, mode=mode,
+                   decision="blocked", detail=query[:120],
+                   change_type="network_fallback")
+            return request_escalation(
+                target_mode="edit",
+                paths=[f"web_search (DDGS): {query[:100]}"],
+                change_type="network_fallback",
+                reason=("Local SearXNG returned no results. Retry this exact query "
+                        "with public DuckDuckGo search?"),
+            )
+        return _frame_search_results(result)
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""

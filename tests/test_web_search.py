@@ -212,6 +212,14 @@ def test_run_search_reports_every_failure_when_all_fail():
     assert "unreachable" in out and "rate limited" in out
 
 
+def test_run_search_can_report_retryable_failure_providers():
+    registry = web_search.Registry([_Stub("searxng", results=[])])
+    out, failures = web_search.run_search(
+        "q", 5, registry, {"web_search_provider": "searxng"},
+        web_search.SearchContext(), return_failures=True)
+    assert "no results" in out and failures == ("searxng",)
+
+
 def test_run_search_with_no_providers_names_setup_command():
     registry = web_search.Registry([_Stub("searxng", available=False)])
     out = web_search.run_search("q", 5, registry, {}, web_search.SearchContext())
