@@ -91,6 +91,8 @@ $ChromiumInstalled = $false
 $NodeInstalled = $false
 $WhatsAppBridgeReady = $false
 $SandboxInstalled = $false
+$EmbedModelReady = $false
+$EmbedViaProvider = $false
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -109,6 +111,193 @@ function Write-Info    { param([string]$Message) Write-Host "-> $Message" -Foreg
 function Write-Success { param([string]$Message) Write-Host "[OK] $Message" -ForegroundColor Green }
 function Write-Warn    { param([string]$Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -ForegroundColor Red }
+
+# ----------------------------------------------------------------------------
+# Timeouts for the optional network stages
+# ----------------------------------------------------------------------------
+# Every optional stage already tolerates a *failure* (Write-Warn + return), but
+# nothing protected them from a *hang*. A stalled `ollama pull`, an npm registry
+# that accepts the connection and then goes quiet, or a wedged Ollama daemon left
+# the installer waiting forever with no way out but Ctrl-C.
+#
+# Limits are deliberately moderate rather than maximally generous: every stage
+# guarded here is optional and degrades to a "run this to fix it later" message,
+# so the cost of cutting a slow-but-working download short is one rerun, while
+# the cost of waiting too long is an installer that looks frozen. Roughly sized
+# so a ~4 Mbps link finishes comfortably.
+#
+# Scale them all for a slow connection:
+#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm <url>)
+$TimeoutScale = 1
+if ($env:AGENT8088_TIMEOUT_SCALE -match '^\d+$' -and [int]$env:AGENT8088_TIMEOUT_SCALE -ge 1) {
+    $TimeoutScale = [int]$env:AGENT8088_TIMEOUT_SCALE
+}
+
+$TOllamaCheck = 15  * $TimeoutScale   # local socket call - instant unless the daemon is wedged
+$TOllamaPull  = 600 * $TimeoutScale   # 274 MB embedding model
+$TNpm         = 300 * $TimeoutScale   # 142 small packages, mostly round-trips
+$TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
+$TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
+$TPip         = 300 * $TimeoutScale   # tens of MB of wheels
+
+# Run an external command under a wall-clock limit.
+#
+# PowerShell has no `timeout`, so this uses Start-Process -PassThru plus
+# WaitForExit(ms). That also solves a second problem: -WorkingDirectory sets the
+# child's directory without touching the caller's location, which is what the
+# WhatsApp bridge stage needs (see Install-Node-Bridge).
+#
+# Output goes to temp files rather than the console to preserve the quiet install
+# the previous `2>&1 | Out-Null` calls had. Returns a hashtable so callers can
+# tell a hang from an ordinary non-zero exit:
+#   @{ ExitCode = <int>; TimedOut = <bool>; Output = <string> }
+# Output is only populated with -CaptureOutput, for callers that need to read what
+# the command printed (e.g. `ollama list`).
+#
+# Built on System.Diagnostics.Process rather than Start-Process -PassThru: the
+# latter does not reliably surface .ExitCode or honour WaitForExit(ms) on a
+# redirected child, which made a "timeout" that never fired and an exit code that
+# always read 0.
+function Invoke-WithTimeout {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [string]$WorkingDirectory,
+        [switch]$CaptureOutput
+    )
+
+    $result = @{ ExitCode = -1; TimedOut = $false; Output = "" }
+    $proc = $null
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $FilePath
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+
+        if ($Arguments.Count -gt 0) {
+            if ($null -ne $psi.PSObject.Properties['ArgumentList']) {
+                # PowerShell 7 / .NET Core: pass argv directly, no quoting needed.
+                foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+            } else {
+                # Windows PowerShell 5.1 / .NET Framework has no ArgumentList, so
+                # build the command line by hand. Quoting matters here: install
+                # paths routinely contain spaces (C:\Users\First Last\...).
+                $quoted = $Arguments | ForEach-Object {
+                    if ($_ -match '[\s"]') {
+                        '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+                    } else { $_ }
+                }
+                $psi.Arguments = ($quoted -join ' ')
+            }
+        }
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+
+        # Drain both pipes asynchronously. A child that fills its stdout buffer
+        # while nobody reads it blocks forever, which would reintroduce the exact
+        # hang this function exists to prevent (npm is chatty enough to hit it).
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+
+        if ($proc.WaitForExit($TimeoutSec * 1000)) {
+            # Second, argument-less wait: lets the async readers finish flushing
+            # before the exit code is read (documented .NET requirement).
+            try { $proc.WaitForExit() } catch { }
+            $result.ExitCode = $proc.ExitCode
+            if ($CaptureOutput) {
+                try { $result.Output = $outTask.GetAwaiter().GetResult() } catch { }
+            }
+        } else {
+            $result.TimedOut = $true
+            # Kill($true) takes the whole process tree but is .NET Core only, so
+            # 5.1 falls back to killing just the launched process. A stray child
+            # (npm's node, say) is a better outcome than a frozen installer.
+            try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
+            try { [void]$proc.WaitForExit(5000) } catch { }
+        }
+        if ($null -eq $result.Output) { $result.Output = "" }
+    } catch {
+        $result.ExitCode = -1
+        $result.Error = $_.Exception.Message
+    } finally {
+        if ($proc) { try { $proc.Dispose() } catch { } }
+    }
+
+    return $result
+}
+
+# Skipped-stage ledger, printed as one block at the end of the run.
+#
+# Warnings are emitted as each stage runs, which on a multi-minute install means
+# they have scrolled well out of view by the time it finishes - the WhatsApp
+# bridge failing was reported and still went unnoticed. Recording them lets the
+# final summary state plainly what did not install and how to fix each one.
+$SkippedStages = New-Object System.Collections.ArrayList
+
+function Register-SkippedStage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Fix = ""
+    )
+    # Create the list on first use rather than relying on the top-level
+    # declaration alone. This installer is normally run as `iex (irm ...)`, where
+    # $script: does not always resolve to the scope holding that declaration -
+    # and unlike the boolean readiness flags, where `$script:X = $true` creates
+    # the variable on assignment, calling .Add() on an unresolved name throws.
+    if ($null -eq $script:SkippedStages) {
+        $script:SkippedStages = New-Object System.Collections.ArrayList
+    }
+    [void]$script:SkippedStages.Add([pscustomobject]@{
+        Label  = $Label
+        Reason = $Reason
+        Fix    = $Fix
+    })
+}
+
+# Warn about an optional stage that did not complete, naming a hang as a hang.
+# "timed out after 10m" and "failed" point at different fixes. -Fix is the command
+# that repairs it, surfaced again in the final summary.
+function Write-StageWarning {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Result,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$Consequence,
+        [string]$Fix = ""
+    )
+    if ($Result.TimedOut) {
+        $reason = "timed out after $([int]($TimeoutSec / 60))m"
+        Write-Warn "$What timed out after $([int]($TimeoutSec / 60))m - $Consequence"
+        Write-Warn 'On a slow connection, rerun with: $env:AGENT8088_TIMEOUT_SCALE = 3'
+    } else {
+        $reason = "failed (exit $($Result.ExitCode))"
+        Write-Warn "$What failed (exit $($Result.ExitCode)) - $Consequence"
+    }
+    Register-SkippedStage -Label $What -Reason $reason -Fix $Fix
+}
+
+# Final block: what did not install, why, and the command that fixes it. Silent
+# when everything succeeded.
+function Write-SkippedSummary {
+    if ($null -eq $script:SkippedStages -or $script:SkippedStages.Count -eq 0) { return }
+    Write-Host ""
+    Write-Host "$($script:SkippedStages.Count) optional component(s) did not install:" -ForegroundColor Yellow
+    foreach ($s in $script:SkippedStages) {
+        Write-Host "  * " -ForegroundColor Yellow -NoNewline
+        Write-Host "$($s.Label) - $($s.Reason)"
+        if ($s.Fix) { Write-Host "      fix: $($s.Fix)" }
+    }
+    Write-Host ""
+    Write-Host "  The core agent is installed and works without these."
+}
 
 function Protect-ConfigFile {
     param([string]$Path)
@@ -339,7 +528,7 @@ function Install-Git {
         $gitDir = "$Agent8088Home\git"
 
         Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec $TDownload
 
         if (Test-Path $gitDir) { Remove-Item -Recurse -Force $gitDir }
         New-Item -ItemType Directory -Path $gitDir -Force | Out-Null
@@ -440,7 +629,7 @@ function Clone-Repo {
             Write-Warn "git clone failed; falling back to ZIP archive..."
             $zipUrl = "https://github.com/palindrome-rl/AGENT8088/archive/refs/heads/$Branch.zip"
             $tmpZip = "$env:TEMP\agent8088-$Branch.zip"
-            Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing
+            Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing -TimeoutSec $TDownload
             $tmpExtract = "$env:TEMP\agent8088-extract"
             if (Test-Path $tmpExtract) { Remove-Item -Recurse -Force $tmpExtract }
             Expand-Archive -Path $tmpZip -DestinationPath $tmpExtract -Force
@@ -528,39 +717,59 @@ function Install-Gateway-Extras {
     $ErrorActionPreference = "Continue"
     try {
         Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[gateway]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $gwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]") `
+            -TimeoutSec $TPip
+        if ($gwResult.ExitCode -eq 0) {
             $script:GatewayExtrasInstalled = $true
             Write-Success "Gateway adapters installed"
         } else {
-            Write-Warn "Gateway extras install failed (exit $LASTEXITCODE) - core agent still works"
+            Write-StageWarning -Result $gwResult -TimeoutSec $TPip `
+                -What "Gateway adapters (Slack/Discord/Telegram)" `
+                -Consequence "core agent still works" `
+                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[gateway]`""
         }
 
         # Keyless web search backend ([search] extra - see pyproject.toml).
         Write-Info "Installing keyless web search backend (ddgs)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[search]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $searchResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[search]") `
+            -TimeoutSec $TPip
+        if ($searchResult.ExitCode -eq 0) {
             $script:SearchExtrasInstalled = $true
             Write-Success "Keyless web search backend installed"
         } else {
-            Write-Warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+            Write-StageWarning -Result $searchResult -TimeoutSec $TPip `
+                -What "Keyless web search (ddgs)" `
+                -Consequence "configure SearXNG or an API-key backend for web_search" `
+                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[search]`""
         }
 
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
         Write-Info "Installing Playwright (optional, for browse_page)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[browser]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $pwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]") `
+            -TimeoutSec $TPip
+        if ($pwResult.ExitCode -eq 0) {
             Write-Info "Installing Playwright Chromium browser (~280 MB)..."
-            & $py -m playwright install chromium 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            $chromiumResult = Invoke-WithTimeout -FilePath $py `
+                -Arguments @("-m", "playwright", "install", "chromium") `
+                -TimeoutSec $TChromium
+            if ($chromiumResult.ExitCode -eq 0) {
                 $script:ChromiumInstalled = $true
                 Write-Success "Chromium installed for browse_page"
             } else {
-                Write-Warn "Chromium download failed - browse_page will show install instructions"
+                Write-StageWarning -Result $chromiumResult -TimeoutSec $TChromium `
+                    -What "Chromium browser" `
+                    -Consequence "browse_page will show install instructions" `
+                    -Fix "`"$py`" -m playwright install chromium"
             }
         } else {
-            Write-Warn "Playwright install failed - browse_page will show install instructions"
+            Write-StageWarning -Result $pwResult -TimeoutSec $TPip `
+                -What "Playwright (browse_page)" `
+                -Consequence "browse_page will show install instructions" `
+                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[browser]`""
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -624,7 +833,7 @@ function Install-Node-Bridge {
         $nodeDir = "$Agent8088Home\node"
 
         try {
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec $TDownload
             if (Test-Path $nodeDir) { Remove-Item -Recurse -Force $nodeDir }
             New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
             Expand-Archive -Path $tmpFile -DestinationPath $nodeDir -Force
@@ -657,6 +866,9 @@ function Install-Node-Bridge {
         } catch {
             Write-Warn "Could not install portable Node: $_"
             Write-Info "WhatsApp bridge needs Node 20.11+ - install manually from https://nodejs.org/"
+            Register-SkippedStage -Label "WhatsApp bridge (Node runtime)" `
+                -Reason "portable Node install failed" `
+                -Fix "install Node 20.11+ from https://nodejs.org/ then rerun this installer"
             return
         }
     }
@@ -680,12 +892,34 @@ function Install-Node-Bridge {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $npmExe install --prefix $bridgeDir --no-audit --no-fund 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $nodeModules)) {
+        # Run npm *from inside* the bridge directory instead of pointing --prefix
+        # at it. npm 10 (bundled with the portable Node 22.11.0 this installer
+        # fetches) reads its config from --prefix but still resolves package.json
+        # by walking up from the current directory. With the installer's own
+        # location as that directory, npm found no package.json and aborted with
+        # ENOENT / errno -4058, "Could not read package.json" - so the bridge was
+        # left without node_modules on every affected machine.
+        #
+        # -WorkingDirectory sets it for the child process only; the caller's
+        # location is untouched, so nothing leaks into later stages.
+        $npmResult = Invoke-WithTimeout -FilePath $npmExe `
+            -Arguments @("install", "--no-audit", "--no-fund") `
+            -TimeoutSec $TNpm -WorkingDirectory $bridgeDir
+
+        if ($npmResult.ExitCode -eq 0 -and (Test-Path $nodeModules)) {
             $script:WhatsAppBridgeReady = $true
             Write-Success "WhatsApp bridge npm dependencies installed"
+        } elseif ($npmResult.ExitCode -eq 0) {
+            Write-Warn "WhatsApp bridge npm install reported success but node_modules missing"
+            Register-SkippedStage -Label "WhatsApp bridge npm deps" `
+                -Reason "npm exited 0 but node_modules is missing" `
+                -Fix "cd `"$bridgeDir`"; npm install"
         } else {
-            Write-Warn "WhatsApp bridge npm install failed (exit $LASTEXITCODE)"
+            Write-StageWarning -Result $npmResult -TimeoutSec $TNpm `
+                -What "WhatsApp bridge npm deps" `
+                -Consequence "the WhatsApp gateway will be unavailable until you rerun it" `
+                -Fix "cd `"$bridgeDir`"; npm install"
+            Write-Warn "Fix it later with:  cd `"$bridgeDir`"; npm install"
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -715,19 +949,31 @@ function Install-Embedding-Model {
     if (-not $ollama) {
         # A cloud provider serves /embeddings itself, so there is nothing to pull.
         Write-Info "Ollama not found - memory will embed through your configured provider"
+        $script:EmbedViaProvider = $true
         return
     }
-    $installed = & ollama list 2>$null | Select-String -Pattern "^$EmbedModel" -Quiet
-    if ($installed) {
+    # `ollama list` talks to the daemon on :11434. It answers instantly when that
+    # daemon is healthy and never when it is wedged, so it needs a bound too -
+    # otherwise the installer hangs here, before the download it was guarding.
+    $listResult = Invoke-WithTimeout -FilePath $ollama.Source `
+        -Arguments @("list") -TimeoutSec $TOllamaCheck -CaptureOutput
+    if ($listResult.Output -match "(?m)^$([regex]::Escape($EmbedModel))") {
         Write-Success "Embedding model $EmbedModel already present"
+        $script:EmbedModelReady = $true
         return
     }
+
     Write-Info "Pulling embedding model $EmbedModel (274 MB, for memory recall)..."
-    & ollama pull $EmbedModel *> $null
-    if ($LASTEXITCODE -eq 0) {
+    $pullResult = Invoke-WithTimeout -FilePath $ollama.Source `
+        -Arguments @("pull", $EmbedModel) -TimeoutSec $TOllamaPull
+    if ($pullResult.ExitCode -eq 0) {
         Write-Success "Embedding model $EmbedModel installed"
+        $script:EmbedModelReady = $true
     } else {
-        Write-Warn "Could not pull $EmbedModel - memory recall will use keyword search only"
+        Write-StageWarning -Result $pullResult -TimeoutSec $TOllamaPull `
+            -What "Embedding model ($EmbedModel)" `
+            -Consequence "memory recall will use keyword search only" `
+            -Fix "ollama pull $EmbedModel"
         Write-Warn "Fix it later with:  ollama pull $EmbedModel"
     }
 }
@@ -1044,9 +1290,20 @@ function Verify-Install {
         Write-Host "            Native is not set up on Windows yet (optional, may fail):"
         Write-Host "            elevated agent8088 --sandbox-setup"
     }
+    # Memory: semantic recall needs an embedder; keyword search works without one.
+    # No local Ollama is not a downgrade - the configured provider serves
+    # /embeddings itself - so that case must not read as a failure.
+    if ($script:EmbedModelReady) {
+        Write-Host "  Memory:   $EmbedModel ready (keyword + semantic recall)"
+    } elseif ($script:EmbedViaProvider) {
+        Write-Host "  Memory:   embeddings served by your configured provider"
+    } else {
+        Write-Host "  Memory:   keyword recall only ($EmbedModel not installed)"
+    }
     Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$Branch/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
+    Write-SkippedSummary
 }
 
 function Run-InitialSetup {
