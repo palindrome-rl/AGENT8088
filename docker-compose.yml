@@ -1,0 +1,38 @@
+# Agent8088 — run in Docker without a system-wide install.
+#
+# Interactive REPL (one-off, container removed on exit):
+#   docker compose run --rm agent8088
+#
+# Messaging gateway (persistent background service):
+#   docker compose up -d gateway
+#   docker compose logs -f gateway
+#
+# First-time setup (config wizard, writes to the named volume):
+#   docker compose run --rm agent8088 --setup
+#
+# Config, tokens, sessions and memory all live in the `agent8088-data`
+# named volume, mounted at the container's AGENT8088_HOME. Run `--setup`
+# once to configure a provider and model; after that `--gateway` works
+# headless.
+services:
+  agent8088:
+    build: .
+    stdin_open: true
+    tty: true
+    volumes:
+      - agent8088-data:/home/a8088/.agent8088
+      # Docker socket for run_sandboxed (sandbox_backend=docker). Omit if
+      # the agent stays readonly — the socket gives the container access to
+      # spawn sibling containers on the host.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  gateway:
+    build: .
+    restart: unless-stopped
+    command: ["--gateway"]
+    volumes:
+      - agent8088-data:/home/a8088/.agent8088
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  agent8088-data:

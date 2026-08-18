@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent8088"
+version = "0.2.0"
+description = "Agent8088 - Local AI Assistant"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0,<3",
+    "rich>=13.0.0,<16",
+    "InquirerPy>=0.3.4,<1",
+    "mcp>=1.27,<2",
+    "Pillow>=9,<13",
+    # Both are imported directly by cli.py and were reaching the install only as
+    # transitive dependencies -- prompt_toolkit via InquirerPy, Pygments via
+    # rich. That works until an upstream drops or re-bounds them, and the failure
+    # is silent rather than loud: both call sites fall back on ImportError, so
+    # Tab completion would quietly disappear and every syntax theme would quietly
+    # validate as invalid. Depend on what you import.
+    "prompt_toolkit>=3.0.1,<4",
+    "Pygments>=2.13,<3",
+    # browse_page's engine. Core rather than optional: a browser that may or may
+    # not be there makes the tool's availability a property of how someone
+    # installed rather than of what the product is.
+    "playwright>=1.40,<2",
+    # Keyless web search fallback. web_search must always have a backend needing
+    # no Docker, no API key and no setup, so an unreachable SearXNG still
+    # returns results rather than an error. As an extra that guarantee held only
+    # when the installer's best-effort step happened to succeed, and its failure
+    # was silent: search degraded to having no backend at all, with nothing said.
+    "ddgs>=9,<10",
+]
+
+[project.optional-dependencies]
+gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
+# browser and search are now aliases: both packages are core dependencies above.
+# They are kept so `pip install agent8088[browser]` and the installers' existing
+# best-effort steps stay valid instead of erroring on an unknown extra.
+#
+# They were briefly optional so that Termux, whose rolling `pkg install python`
+# lands on brand-new minors and which cannot build ddgs's primp (Rust, no
+# Android wheel), could install the core agent. Termux is no longer a supported
+# target, and optional was the wrong trade for every platform that is: it made
+# browse_page and the keyless search fallback a property of whether a
+# best-effort install step happened to succeed, and both degrade silently.
+browser = ["playwright>=1.40,<2"]
+search = ["ddgs>=9,<10"]
+dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
+# Only needed for a provider profile with api_mode=litellm. Kept out of the base
+# install because it is a large dependency serving one optional backend, but
+# declared so `pip install agent8088[litellm]` works instead of leaving the user
+# to discover the package name from a runtime error.
+litellm = ["litellm>=1,<2"]
+
+[project.scripts]
+agent8088 = "agent8088.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent8088"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"assets/palindrome-research-labs.png" = "agent8088/assets/palindrome-research-labs.png"
+"assets/palindrome-research-labs.ansi" = "agent8088/assets/palindrome-research-labs.ansi"
+"src/agent8088/gateway/platforms/whatsapp_bridge/bridge.js" = "agent8088/gateway/platforms/whatsapp_bridge/bridge.js"
+"src/agent8088/gateway/platforms/whatsapp_bridge/package.json" = "agent8088/gateway/platforms/whatsapp_bridge/package.json"
+"src/agent8088/gateway/platforms/whatsapp_bridge/package-lock.json" = "agent8088/gateway/platforms/whatsapp_bridge/package-lock.json"

@@ -1,0 +1,307 @@
+# Agent8088 config.txt
+#
+# Multi-model provider support. Set default_provider to pick your active
+# provider, then configure provider.<name>.* keys below.
+#
+# Built-in providers: ollama, openrouter, openai, gemini, cerebras,
+# deepseek, groq, mistral, moonshot, qwen, ollama-cloud, copilot
+
+# --- paths --- Leave commented to use built-in defaults.
+# project_root=. (defaults to CWD)
+# shell_cwd=. (defaults to CWD)
+# tools_file=tools.txt (defaults to APP_DIR/tools.txt)
+# system_file=system.md (defaults to APP_DIR/system.md)
+
+# write_file / read_file are restricted to these paths.
+# Defaults to the launch workspace. Add `~` only when the agent truly needs
+# full access to user files, or name a specific additional path.
+allowed_paths=.
+
+# --- Permission Layer 1: Sensitive file read protection ---
+# Exact paths only; relative paths resolve from the workspace.
+# allowed_sensitive_files=.env,secrets.yaml
+
+# --- Permission Layer 2: Network access control ---
+# get_page_title prompts the user (y/n) on every request. web_search does too
+# unless the narrow local-SearXNG opt-in below is enabled.
+
+# --- SSRF protection ---
+# Requests to private/internal addresses are blocked unless the host appears
+# here. Loopback only by default — nothing on your LAN is assumed reachable.
+#
+# To reach a SearXNG on another machine on your network, add its host:port:
+#   ssrf_allow_hosts=127.0.0.1,localhost,192.168.1.10:8888
+# `/search` adds the entry itself when it provisions a local instance.
+ssrf_allow_hosts=127.0.0.1,localhost
+
+# --- Permission Layer 3: Path-based write restrictions ---
+# Writes to these paths run without a prompt (auto-approved):
+# no_prompt_paths=/tmp
+# Writes to these paths show the y/n escalation prompt:
+prompt_paths=~
+# Writes to these paths are always blocked, even in edit mode:
+# blocked_paths=/etc,/home,~/.ssh
+
+# --- model ---
+# Active provider (built-in base URLs are used automatically):
+default_provider=ollama
+
+# Provider config (base_url is built-in, only set api_key + model):
+# provider.ollama.model=qwen14b-tooluse-v3
+# provider.ollama.api_key=ollama
+
+# Example: Cerebras
+# default_provider=cerebras
+# provider.cerebras.model=gpt-oss-120b
+# provider.cerebras.api_key=csk-...
+
+# Example: Groq
+# default_provider=groq
+# provider.groq.model=llama-3.3-70b-versatile
+# provider.groq.api_key=gsk-...
+
+# Example: OpenRouter
+# default_provider=openrouter
+# provider.openrouter.model=anthropic/claude-sonnet-4
+# provider.openrouter.api_key=sk-or-...
+
+timeout_seconds=120
+# max_tool_timeout_seconds=300
+
+# --- display ---
+# Pygments theme for the code the agent reads and writes: file listings, diffs
+# and fenced code blocks in its answers. Any Pygments style name works —
+# monokai, dracula, nord, one-dark, github-dark, gruvbox-dark, or solarized-light
+# and friends for a light terminal. The theme's own background is never painted,
+# so only its foreground colours apply.
+# Set to `none` for plain, uncoloured output.
+# syntax_theme=monokai
+
+# --- sandbox ---
+# auto uses free native OS isolation first, then Docker when available.
+# If neither is available, shell and code execution are refused.
+sandbox_backend=auto
+sandbox_runtime_version=0.0.73
+# sandbox_allowed_domains=api.example.com
+# Seconds allowed for pulling a missing container image. This is deliberately
+# separate from a tool's own timeout: the read-only git tools allow 20s, and a
+# first-run image pull inside that budget fails as an unexplained timeout.
+# docker_pull_seconds=300
+
+# Plan mode gets a wall-clock ceiling even when max_turn_seconds is unset, and
+# stops after repeated mutation attempts instead of looping until max_turns.
+# plan_mode_timeout_seconds=300
+# plan_mode_retry_limit=2
+
+# --- plan step auditing ---
+# With plan_audit=1, every mutating execute_plan step is verified against the
+# real environment by the readonly `auditor` sub-agent before the plan moves on,
+# and a failed verification halts the plan. Off by default: it costs one extra
+# model call per mutating step, drawn from the same turn budget as the work
+# itself. Worth enabling for unattended runs (gateway, cron) where no operator
+# is watching, which is exactly where a silently half-done plan does damage.
+# plan_audit=0
+# With auditing on, a write that FAILS verification is restored to its exact
+# pre-step bytes: only verified state persists. Nothing outside the failed step
+# is touched, and tools with no undo (shell, docker, cron) say so instead of
+# implying a rollback that did not happen.
+# plan_audit_revert=1
+# Files larger than this are not snapshotted, so they are not reverted — the plan
+# output says so rather than implying otherwise.
+# plan_audit_revert_max_bytes=1048576
+
+# --- persistent memory ---
+# On by default. With memory=1 the agent does two extra things per turn:
+#
+#   before the turn  the last thing YOU typed is searched against stored
+#                    memories, and the top few are added to that turn's system
+#                    prompt as context
+#   after the answer one extra model call distils durable facts from the
+#                    exchange and stores them, deduped against what is known
+#
+# Retrieval runs two independent searches and fuses them with Reciprocal Rank
+# Fusion: SQLite FTS5/BM25 for words (exact flags, filenames, error strings) and
+# cosine similarity over embeddings for meaning (finds "uv" from "package
+# manager"). Their scores are not comparable, so RRF fuses the ranks instead --
+# which is why the vector leg only has to be roughly right, and why a 274MB
+# embedder is enough.
+#
+# The installers pull the embedding model, so semantic recall works from the
+# first turn. `/memory` shows what it holds and what the last learning call cost;
+# `/memory off` stops both habits without deleting anything, and
+# memory_capture=0 below keeps recall while stopping new writes.
+#
+# Only what YOU type can become a memory or trigger a recall. Tool output -- web
+# pages, shell results, file contents -- never does, and a recalled memory can
+# never authorise a tool call: check_permission does not read them.
+memory=1
+#
+# Where memories live. One SQLite file, mode 0600. Delete it and memory is gone;
+# nothing else is affected.
+# memory_db_path=~/.agent8088/memory.db
+#
+# Who owns the memories. One identity by default, so a fact learned in the
+# terminal is recalled in Slack, Discord, WhatsApp, Telegram and email too --
+# they are all the same person's accounts.
+# memory_user_id=owner
+#
+# Set to 1 to give each gateway identity its own separate memories. Only needed
+# if a *_allowed_users line holds more than one person; the filtering is done in
+# SQL, so an enabled scope cannot be bypassed.
+# memory_scope_by_identity=0
+#
+# Embedding model for the semantic leg, served over the OpenAI-compatible
+# /embeddings endpoint of the provider named below -- NOT of your chat provider.
+# nomic-embed-text is 274MB, 768 dims:
+#   ollama pull nomic-embed-text
+# Alternatives, larger and slightly stronger: embeddinggemma (622MB),
+# mxbai-embed-large (670MB), qwen3-embedding:0.6b (~1.2GB). Smallest usable:
+# all-minilm (46MB). If the model is missing or unreachable, recall degrades to
+# keyword-only instead of failing -- `/memory` says so when it happens.
+# Changing this is detected rather than silently mixing incompatible vectors:
+# rows embedded by another model are excluded and counted in `/memory`.
+# memory_embed_model=nomic-embed-text
+# Which provider serves the embeddings request. Defaults to `ollama`, NOT to your
+# chat provider: chat and embeddings are separate services in almost every real
+# setup, and nomic-embed-text is an Ollama model, so deriving this from
+# default_provider asked the wrong host and reported the model as missing when it
+# was simply never requested from the machine holding it. Whatever serves your
+# chat does not matter here. Set this only if your embeddings live elsewhere.
+# memory_embed_provider=ollama
+#
+# Model for the fact-extraction call (default: your chat model). Point this at
+# something small if one extra call per turn on your main model is too slow.
+# memory_extract_model=
+#
+# Set to 0 to recall existing memories but stop learning new ones.
+# memory_capture=1
+# Memories injected into a turn's prompt (default 5):
+# memory_recall_limit=5
+# RRF damping constant. 60 is from the original paper; lower makes rank 1
+# dominate, higher flattens the ranking.
+# memory_rrf_k=60
+# Drop fused hits below this score (default 0, keep everything that matched):
+# memory_min_score=0
+# Most memories one turn may create, so a single odd exchange cannot flood the
+# store:
+# memory_max_per_turn=10
+#
+# --- what you see when memory learns something ---
+# off      silent; memory still works, it just never says so
+# on       (default) one dim line when a turn stored something:
+#              memory - stored 2 new memories
+# verbose  the same line plus the facts themselves, and a line on the turns that
+#          stored nothing -- "it ran and found nothing" and "it never ran" are
+#          different, and only one of them is a problem
+# Change it live with `/memory notify off|on|verbose`.
+#
+# The report waits up to 10s after the answer for the extraction call to finish.
+# A local extraction call routinely takes 15-20s, so past that budget the line is
+# shown with your NEXT message instead, marked "(from your previous message)" --
+# deferred rather than dropped, because a line printed after the prompt is drawn
+# would land in the middle of your typing, and silence is indistinguishable from
+# memory not working.
+#
+# `/memory test` runs one real extraction call on a sample exchange and shows the
+# raw reply, what parsed out of it, and how long it took. Use it when memory seems
+# to be learning nothing: a model that cannot produce the JSON stores nothing and
+# says nothing, which looks exactly like a turn that had nothing worth keeping.
+# memory_notifications=on
+
+# --- local model telemetry ---
+# Writes metadata only (provider/model, timing, token/cost estimates, outcome).
+# Prompts, responses, paths, tool arguments, and credentials are never recorded.
+# model_telemetry=0
+# model_telemetry_path=~/.agent8088/model-telemetry.jsonl
+
+# --- web search ---
+# One web_search tool, four interchangeable backends, in priority order:
+#   searxng  default   self-hosted, no key   (`/search setup` provisions it)
+#   ddgs     fallback  keyless, bundled — always available, needs no setup
+#   tavily   optional  needs TAVILY_API_KEY — takes first priority once set
+#   exa      optional  needs EXA_API_KEY — takes priority, behind tavily
+# Adding an API key is the signal to prefer that backend, so a configured
+# tavily/exa outranks both keyless ones.
+#
+# web_search_provider decides which one serves:
+#
+#   auto       (default) At startup, probe and pick the highest-priority
+#              backend that can actually serve: a keyed tavily/exa first, else
+#              SearXNG if it ANSWERS, else ddgs. The winner is then pinned for
+#              the session — auto decides *which* backend, it does not fall
+#              through mid-session.
+#   <name>     Pin exactly one of searxng/ddgs/tavily/exa. No auto-selection,
+#              no fallback. `/search use <name>` writes this for you.
+#   (unset)    Use the whole chain and fall through at call time: a backend
+#              that fails (instance down, rate limited) hands off to the next,
+#              so web search keeps working — at the cost of a prompt per
+#              search, since it may reach a public provider.
+#
+# Why auto pins instead of staying dynamic: web_search_no_prompt=1 below only
+# takes effect while a LOCAL SearXNG is pinned (see
+# _local_searxng_no_prompt_enabled), because approval-free search is safe only
+# when the query cannot leave your network. So with auto: SearXNG up means
+# silent searches, and SearXNG down means ddgs serves instead and each search
+# asks — because those queries do go to a third party.
+#
+# Run `/search status` to see the live chain and `/search doctor` to diagnose.
+web_search_provider=auto
+#
+# SearXNG instance. UNSET by default — no endpoint is assumed for you, so a
+# fresh install searches via the keyless ddgs fallback until you choose one.
+#
+# Three ways to set it:
+#   1. `/search` in the REPL — provisions a local container (needs Docker),
+#      writes the URL here, and allowlists it. Nothing else to do.
+#   2. Point at an instance you already run, on this machine or your LAN:
+#        search_base_url=http://127.0.0.1:8888/search?q=
+#        search_base_url=http://192.168.1.10:8888/search?q=
+#      A LAN host must also be added to ssrf_allow_hosts above.
+#   3. Point at a public instance — https:// is REQUIRED (plaintext http:// is
+#      accepted only for loopback/private hosts, so queries never cross the
+#      internet in the clear):
+#        search_base_url=https://searx.example.org/search?q=
+#
+# The URL must end at `search?q=` with no placeholder — the query is appended.
+# The instance must have JSON output enabled (`json` in search.formats), which
+# upstream SearXNG disables by default; `/search doctor` reports it if not.
+# search_base_url=
+#
+# Host port for the container `/search` provisions (default 8888). Change it if
+# 8888 is already taken. Always published to 127.0.0.1 only — the JSON API is
+# unauthenticated, so it is never exposed to the network.
+# searxng_host_port=8888
+#
+# Skip approval only for explicitly pinned loopback or explicitly allowlisted
+# private-LAN SearXNG. It never permits a fallback to a public provider.
+# Credentials and direct personal identifiers in search queries remain blocked.
+# With no search_base_url set (the default above) this key does nothing: ddgs
+# serves instead, and each of those searches asks — they reach a third party.
+web_search_no_prompt=1
+#
+# Results per search (default 5, max 20):
+# web_search_results=5
+#
+# Optional backends. Add a key and they join the chain automatically; leave them
+# unset and they stay out of it entirely. Keys live in the .env store next to
+# this file, NEVER here:
+#   TAVILY_API_KEY   agent-optimized results with citations  (https://tavily.com)
+#   EXA_API_KEY      semantic/neural search                  (https://exa.ai)
+#
+# The keyless ddgs fallback needs nothing: it ships with agent8088 and is used
+# automatically whenever SearXNG is unset, unreachable, or failing.
+
+# --- gateway allowlist scoping ---
+# User ids are scoped to the platform whose *_allowed_users line they appear
+# on. An id found on another platform's line is denied by default. Set to 0
+# only for a temporary migration after confirming the identity cannot exist on
+# another platform; it logs a warning that names the line to fix.
+# strict_platform_allowlist=1
+
+# --- MCP server mode (agent8088 --mcp-serve) ---
+# The tools exposed to external MCP clients are read-only by default, because
+# MCP has no approval channel: a write would run unattended with no prompt.
+# Set to 1 to also expose write_file. Narrow allowed_paths and set
+# blocked_paths first. Sensitive files and shell startup files (.zshrc etc.)
+# are refused regardless of this setting.
+# mcp_server_allow_writes=0
