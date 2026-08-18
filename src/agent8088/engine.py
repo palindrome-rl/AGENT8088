@@ -501,7 +501,23 @@ MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
-SANDBOX_RUNTIME_VERSION = APP_CONFIG.get("sandbox_runtime_version", "0.0.67")
+_SANDBOX_RUNTIME_DEFAULT = "0.0.73"
+
+
+def _sandbox_runtime_version(config: dict) -> str:
+    """Upgrade the one Windows runtime version Agent8088 previously shipped.
+
+    0.0.67 kept the shared sandbox account credential in each installing user's
+    profile. Elevating as another administrator or rotating the account from a
+    second user stranded the credential and made CreateProcessWithLogonW fail.
+    0.0.73 moved install state to a machine-wide store. Preserve any deliberate
+    custom pin; only migrate Agent8088's former default.
+    """
+    configured = str(config.get("sandbox_runtime_version", "")).strip()
+    return _SANDBOX_RUNTIME_DEFAULT if configured in ("", "0.0.67") else configured
+
+
+SANDBOX_RUNTIME_VERSION = _sandbox_runtime_version(APP_CONFIG)
 SANDBOX_ALLOWED_DOMAINS = [
     value.strip()
     for value in APP_CONFIG.get("sandbox_allowed_domains", "").split(",")
@@ -3263,6 +3279,17 @@ _native_sandbox_broken = False
 _native_sandbox_verified = None
 _native_sandbox_failure = ""
 _NATIVE_SANDBOX_PROBE_TIMEOUT = 10
+# Docker gets the same two stages, for the same reason. `docker info` succeeding
+# does not mean the daemon can bind-mount our workspace: when Agent8088 itself
+# runs in a container the daemon resolves that path against the *host*, so the
+# mount fails unless the workspace sits at the same absolute path on both sides.
+# Presence was previously assumed from `docker info` alone, and later assumed
+# absent from /.dockerenv alone — both guesses, and both wrong in one direction.
+_docker_sandbox_broken = False
+_docker_sandbox_verified = None
+_docker_sandbox_failure = ""
+_docker_workspace_verified = {}
+_DOCKER_SANDBOX_PROBE_TIMEOUT = 30
 
 
 def _which_executable(name: str) -> str | None:
@@ -3330,20 +3357,30 @@ def _docker_available() -> bool:
         return False
 
 
+def _docker_usable() -> bool:
+    """Docker is installed, reachable, and has not failed a real sandbox run.
+
+    Separate from `_docker_available` so a latched mount or daemon failure takes
+    Docker out of the running everywhere at once, the way `_native_sandbox_broken`
+    does for native. Otherwise status keeps offering a backend that cannot run.
+    """
+    return not _docker_sandbox_broken and _docker_available()
+
+
 def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     native_available = not _native_sandbox_missing_requirements()
     if requested == "native":
         if native_available and _native_sandbox_broken:
-            return "docker" if _docker_available() else "unavailable"
+            return "docker" if _docker_usable() else "unavailable"
         return "native" if native_available else "unavailable"
     if requested == "docker":
-        return "docker" if _docker_available() else "unavailable"
+        return "docker" if _docker_usable() else "unavailable"
     if native_available:
         if _native_sandbox_broken:
-            return "docker" if _docker_available() else "unavailable"
+            return "docker" if _docker_usable() else "unavailable"
         return "native"
-    return "docker" if _docker_available() else "unavailable"
+    return "docker" if _docker_usable() else "unavailable"
 
 
 def sandbox_status() -> dict:
@@ -3356,16 +3393,42 @@ def sandbox_status() -> dict:
     missing = _native_sandbox_missing_requirements()
     if resolved == "unavailable" and missing:
         detail += f" (missing: {', '.join(missing)})"
-    if _native_sandbox_broken:
-        verification = "failed"
-    elif missing:
-        verification = "unavailable"
-    elif _native_sandbox_verified:
-        verification = "verified"
+    elif resolved == "unavailable" and _docker_sandbox_broken:
+        # "unavailable" with nothing missing reads as unexplained. Docker being
+        # installed and running but unable to mount the workspace is the case
+        # that most needs naming, because nothing looks wrong from outside.
+        detail += f" — {_docker_sandbox_repair_hint(_docker_sandbox_failure)}"
+    # Report on the backend that would actually run, not always on native. A
+    # docker-backed session showing native's verdict read as "docker
+    # (unverified)", which says nothing about docker and is wrong wherever
+    # docker is the one that cannot run.
+    if resolved == "docker":
+        if _docker_sandbox_broken:
+            verification = "failed"
+        elif _docker_sandbox_verified:
+            verification = "verified"
+        else:
+            verification = "unverified"
+        failure = _docker_sandbox_failure
+        # `verification` now describes docker, so why we are on docker at all has
+        # to be said somewhere or it is lost: native is the preferred backend and
+        # its failure is the more interesting half of the answer.
+        if _native_sandbox_broken:
+            detail += " (native failed verification)"
     else:
-        verification = "unverified"
-    if resolved == "native" and verification == "unverified":
+        if _native_sandbox_broken:
+            verification = "failed"
+        elif missing:
+            verification = "unavailable"
+        elif _native_sandbox_verified:
+            verification = "verified"
+        else:
+            verification = "unverified"
+        failure = _native_sandbox_failure
+    if resolved in ("native", "docker") and verification == "unverified":
         detail += " (candidate; not yet verified by a sandboxed command)"
+    if resolved == "unavailable" and (_native_sandbox_failure or _docker_sandbox_failure):
+        failure = _native_sandbox_failure or _docker_sandbox_failure
     return {
         "requested": SANDBOX_BACKEND,
         "resolved": resolved,
@@ -3373,6 +3436,7 @@ def sandbox_status() -> dict:
         "network": ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked",
         "runtime_version": SANDBOX_RUNTIME_VERSION,
         "verification": verification,
+        "failure": (failure or "")[:300],
     }
 
 
@@ -3464,12 +3528,23 @@ def _native_sandbox_repair_hint(result: str) -> str:
     service is running and the sandbox account is enabled, but the credential the
     runtime holds no longer opens it. Reprovisioning is what actually fixes that,
     and it needs elevation, which is the part worth saying out loud.
+
+    Elevation alone is not the whole answer though, and on its own it reads as a
+    dead end to the reader who is already running as admin: the account was
+    provisioned, and the logon is being refused from outside. Creating a local
+    account and then calling CreateProcessWithLogonW against it is what lateral
+    movement looks like, so antivirus behaviour shields block it by design. That
+    cause has to be named or the reader loops on the step they already did.
     """
     text = result or ""
     if "CreateProcessWithLogonW" in text or "Access is denied" in text:
         return ("The sandbox account could not be logged into. Re-run "
                 "`agent8088 --sandbox-setup` from an elevated terminal to "
-                "reprovision it.")
+                "reprovision it. If it already was elevated, something is "
+                "blocking the logon: allow agent8088 in your antivirus's "
+                "behaviour shield (this looks like lateral movement to Avast, "
+                "AVG and Defender ASR), and check the Secondary Logon service "
+                "(seclogon) is running.")
     if "Native sandbox runtime is unavailable" in text:
         return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
     return f"Reason: {text[:200]}"
@@ -3547,15 +3622,163 @@ def native_sandbox_verified() -> bool:
     return _native_sandbox_verified is True
 
 
+# Signatures of the daemon refusing BEFORE the container ran, so the command did
+# not execute and retrying elsewhere repeats nothing. The mount entries are the
+# in-container case: the daemon resolves a bind source against the host, so a
+# path that exists only inside this container does not exist as far as it is
+# concerned.
+_DOCKER_SANDBOX_PREFLIGHT_ERRORS = (
+    "bind source path does not exist",
+    "invalid mount config",
+    "cannot connect to the docker daemon",
+    "is the docker daemon running",
+    "error during connect",
+    "permission denied while trying to connect",
+)
+
+
+def _docker_sandbox_unusable(result: str) -> bool:
+    lowered = (result or "").lower()
+    return any(marker in lowered for marker in _DOCKER_SANDBOX_PREFLIGHT_ERRORS)
+
+
+def _mark_docker_sandbox_broken(result: str) -> None:
+    """Latch a docker pre-flight failure and keep a local diagnostic."""
+    global _docker_sandbox_broken, _docker_sandbox_verified, _docker_sandbox_failure
+    first_failure = not _docker_sandbox_broken
+    _docker_sandbox_broken = True
+    _docker_sandbox_verified = False
+    _docker_sandbox_failure = (result or "Docker sandbox probe failed.").strip()
+    if first_failure:
+        _log.warning("docker sandbox could not start. %s",
+                     _docker_sandbox_repair_hint(_docker_sandbox_failure))
+
+
+def _docker_sandbox_repair_hint(result: str) -> str:
+    """Say which of the two docker failures this is, and what fixes it."""
+    lowered = (result or "").lower()
+    if "bind source path does not exist" in lowered or "invalid mount config" in lowered:
+        hint = ("The Docker daemon cannot see the workspace directory. It resolves "
+                "bind mounts on the host, so the workspace must exist at the same "
+                "absolute path there.")
+        if _running_in_container():
+            hint += (" Agent8088 is running in a container: mount the project at an "
+                     "identical path inside and outside it, or run Agent8088 on the "
+                     "Docker host.")
+        return hint
+    return "Install and start Docker, then retry."
+
+
+def _docker_image_present(image: str) -> bool:
+    """Whether `image` is already local. Never pulls.
+
+    The startup probe must not trigger a 300s image download; a missing image is
+    reported as unverified so the first real call can pull on its own budget.
+    """
+    if image in _docker_images_present:
+        return True
+    probe = _exec_process(
+        ["docker", "image", "inspect", "--format", "present", image], timeout=30)
+    if "present" in probe and "exited with status" not in probe:
+        _docker_images_present.add(image)
+        return True
+    return False
+
+
+def _docker_sandbox_ready(workspace: Path, image: str = "") -> bool:
+    """Run one real docker no-op with the workspace mounted, before trusting it.
+
+    Cached per workspace: `execute_shell` mounts artifacts/ while the git tools
+    mount the project root, and one can be host-visible when the other is not.
+    Returning False here is not fatal on its own — an unpulled image is reported
+    unverified rather than broken, so the real call can still try.
+    """
+    global _docker_sandbox_verified
+    if _docker_sandbox_broken:
+        return False
+    if not _docker_available():
+        return False
+    try:
+        workspace = Path(workspace).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _mark_docker_sandbox_broken(f"Docker sandbox probe could not prepare: {exc}")
+        return False
+    key = str(workspace)
+    if key in _docker_workspace_verified:
+        return _docker_workspace_verified[key]
+    selected_image = image or DOCKER_IMAGE
+    if not _DOCKER_IMAGE_RE.fullmatch(selected_image) or not _docker_image_present(selected_image):
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none",
+             "--memory", "128m", "--cap-drop", "ALL",
+             "--security-opt", "no-new-privileges",
+             "--mount", f"type=bind,src={key},dst=/workspace,readonly",
+             "--entrypoint", "/bin/sh", selected_image, "-c", "true"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=_DOCKER_SANDBOX_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _mark_docker_sandbox_broken(
+            f"Docker sandbox probe timed out after {_DOCKER_SANDBOX_PROBE_TIMEOUT}s.")
+        return False
+    except OSError as exc:
+        _mark_docker_sandbox_broken(f"Docker sandbox probe could not start: {exc}")
+        return False
+    if result.returncode:
+        detail = (result.stderr or result.stdout or
+                  f"Docker sandbox probe exited {result.returncode}.").strip()
+        if _docker_sandbox_unusable(detail):
+            _mark_docker_sandbox_broken(detail)
+        else:
+            # An image or entrypoint quirk, not a structural failure. Leave the
+            # backend in play and let the real call speak for itself.
+            _docker_workspace_verified[key] = False
+        return False
+    _docker_workspace_verified[key] = True
+    if _docker_sandbox_verified is None:
+        _docker_sandbox_verified = True
+    return True
+
+
+def docker_sandbox_verified() -> bool:
+    """Whether this process has successfully executed the docker probe."""
+    return _docker_sandbox_verified is True
+
+
+def verify_sandbox_backend() -> dict:
+    """Settle which sandbox this process will use, once, before anything runs.
+
+    Native first, docker only when native cannot run — so on a healthy machine
+    docker is never probed at all. Called from startup so `/sandbox`, `/doctor`
+    and describe_capabilities report a tested answer from the first prompt
+    instead of "unverified", and so the failure is announced while the operator
+    is still looking, not midway through a turn.
+
+    Platform-neutral by design: Windows, macOS and Linux all arrive at the same
+    two checks. The only platform-specific step is provisioning, which stays in
+    install_native_sandbox().
+    """
+    requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
+    if requested != "docker" and not _native_sandbox_missing_requirements():
+        if _native_sandbox_ready(ARTIFACTS_ROOT):
+            return sandbox_status()
+    if requested != "native" or _native_sandbox_broken:
+        _docker_sandbox_ready(ARTIFACTS_ROOT)
+    return sandbox_status()
+
+
 def _native_or_docker(native, docker):
     """Run native isolation, retrying only a proven pre-flight failure."""
     if _native_sandbox_broken:
-        return docker() if _docker_available() else _sandbox_required_error()
+        return docker() if _docker_usable() else _sandbox_required_error()
     result = native()
     if not _native_sandbox_unusable(result):
         return result
     _mark_native_sandbox_broken(result)
-    return docker() if _docker_available() else _sandbox_required_error()
+    return docker() if _docker_usable() else _sandbox_required_error()
 
 
 def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
@@ -3588,7 +3811,7 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
 
     if backend == "native":
         if not _native_sandbox_ready(PROJECT_ROOT, readonly=True):
-            return docker() if _docker_available() else _sandbox_required_error()
+            return docker() if _docker_usable() else _sandbox_required_error()
         runtime = _native_sandbox_argv()
         settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
@@ -3682,10 +3905,8 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     selected_image = image or DOCKER_IMAGE
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
-    if _running_in_container():
-        return ("Error: Docker fallback is unavailable because Agent8088 is already "
-                "running in a container and its workspace path is not host-visible. "
-                "Use the native sandbox or run Agent8088 on the Docker host.")
+    if _docker_sandbox_broken:
+        return _docker_unavailable_error()
     workspace_path = Path(workspace or ARTIFACTS_ROOT)
     if hasattr(workspace_path, "resolve"):
         workspace_path = workspace_path.resolve()
@@ -3743,20 +3964,49 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
-    if any(marker in result.lower() for marker in (
-            "cannot connect to the docker daemon", "is the docker daemon running",
-            "error during connect", "permission denied while trying to connect")):
-        _log.warning("Docker sandbox could not start: %s", result[:500])
-        return _sandbox_required_error()
+    # The daemon refusing before the container started is a pre-flight failure:
+    # nothing ran, so latching it and answering with a diagnosis repeats no work.
+    # Raw daemon text must not reach the model as though the command printed it.
+    if _docker_sandbox_unusable(result):
+        _mark_docker_sandbox_broken(result)
+        return _docker_unavailable_error()
     return result
 
 
 def _sandbox_required_error() -> str:
+    """Why no sandbox is usable, using what the probes actually found.
+
+    The generic wording tells the reader to install Docker, which is wrong — and
+    misleading — when Docker is installed, running, and merely unable to see the
+    workspace. Whatever a probe learned is the most useful thing to say, so say
+    that instead and keep the generic text for the case where nothing is known.
+    """
+    reasons = []
+    if _native_sandbox_broken and _native_sandbox_failure:
+        reasons.append(f"Native sandbox: {_native_sandbox_repair_hint(_native_sandbox_failure)}")
+    if _docker_sandbox_broken and _docker_sandbox_failure:
+        reasons.append(f"Docker: {_docker_sandbox_repair_hint(_docker_sandbox_failure)}")
+    if reasons:
+        return ("Error: a sandbox is required to run code and none is usable. "
+                + " ".join(reasons) + " Local execution is disabled.")
     return (
         "Error: a sandbox is required to run code, but neither the native OS "
         "sandbox nor Docker is available. Run `agent8088 --sandbox-setup` or "
         "install and start Docker, then retry. Local execution is disabled."
     )
+
+
+def _docker_unavailable_error() -> str:
+    """Why the docker backend refused, and what would make it work.
+
+    Carries the probe's own diagnosis rather than a guess. The previous version
+    asserted the workspace "is not host-visible" purely from /.dockerenv, which
+    was false whenever the project was mounted at a matching path — the one
+    configuration in which docker-in-docker does work.
+    """
+    hint = _docker_sandbox_repair_hint(_docker_sandbox_failure)
+    return (f"Error: the Docker sandbox is unavailable. {hint} "
+            "Local execution is disabled.")
 
 
 _ARTIFACTS_CD_RE = re.compile(
@@ -3816,7 +4066,7 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
             if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
                 return (_exec_docker_command(command, timeout, python_code, image,
                                              workspace=workspace)
-                        if _docker_available() else _sandbox_required_error())
+                        if _docker_usable() else _sandbox_required_error())
             local_command = (
                 _process_display([sys.executable, "-c", command])
                 if python_code else command

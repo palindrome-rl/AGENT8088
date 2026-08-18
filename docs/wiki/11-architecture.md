@@ -237,11 +237,9 @@ interactive tool. Two exceptions:
 
 Honest list, for anyone extending this:
 
-- **No persistent memory.** `USER.md` is read, never written. There is no
-  cross-session recall, and nothing layers short-term against archival storage.
 - **No cross-run cost accounting.** `/usage` reports session tokens and
   `max_turn_cost_usd` bounds a single turn, but nothing aggregates spend across
-  runs. Enabling `model_telemetry` writes the per-call records that would make
-  that possible; nothing reads them back.
+  runs. `model_telemetry=1` writes per-call records to a local JSONL file; the
+  gap is that nothing reads them back for aggregation.
 - **`browse_page` is read-only.** It renders and extracts text; it can't click
   or fill forms.
