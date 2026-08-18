@@ -41,6 +41,7 @@ SKIP_SETUP=false
 BRANCH="$REPO_BRANCH"
 IS_INTERACTIVE=true
 FRESH_INSTALL=false
+CONFIG_CREATED=false
 INITIAL_SETUP_RAN=false
 # Readiness flags set by the new stages so verify_install can report actual state.
 GATEWAY_EXTRAS_INSTALLED=false
@@ -1066,6 +1067,7 @@ drop_config() {
             return 0
         fi
         chmod 600 "$AGENT8088_HOME/config.txt"
+        CONFIG_CREATED=true
         log_success "Default config.txt copied"
     else
         log_info "config.txt already exists at $AGENT8088_HOME/config.txt — preserving"
@@ -1402,8 +1404,8 @@ run_agent8088_command() {
 }
 
 run_initial_setup() {
-    if [ "$FRESH_INSTALL" != true ]; then
-        log_info "Existing installation updated — skipping first-run setup."
+    if [ "$FRESH_INSTALL" != true ] && [ "$CONFIG_CREATED" != true ]; then
+        log_info "Existing installation and config found — skipping first-run setup."
         return 0
     fi
     if [ "$SKIP_SETUP" = true ]; then
