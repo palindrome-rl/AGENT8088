@@ -296,6 +296,17 @@ def test_auto_prefers_native_then_docker(engine, monkeypatch):
     assert engine._resolve_sandbox_backend() == "docker"
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [({}, "0.0.73"),
+     ({"sandbox_runtime_version": "0.0.67"}, "0.0.73"),
+     ({"sandbox_runtime_version": "0.0.73"}, "0.0.73"),
+     ({"sandbox_runtime_version": "custom-build"}, "custom-build")],
+)
+def test_sandbox_runtime_upgrades_the_shipped_legacy_pin(engine, configured, expected):
+    assert engine._sandbox_runtime_version(configured) == expected
+
+
 def test_native_sandbox_writes_private_policy(engine, tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path / "artifacts")
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path)

@@ -498,7 +498,23 @@ MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
 SANDBOX_BACKEND = os.environ.get(
     "AGENT8088_SANDBOX", APP_CONFIG.get("sandbox_backend", "auto")
 ).strip().lower()
-SANDBOX_RUNTIME_VERSION = APP_CONFIG.get("sandbox_runtime_version", "0.0.67")
+_SANDBOX_RUNTIME_DEFAULT = "0.0.73"
+
+
+def _sandbox_runtime_version(config: dict) -> str:
+    """Upgrade the one Windows runtime version Agent8088 previously shipped.
+
+    0.0.67 kept the shared sandbox account credential in each installing user's
+    profile. Elevating as another administrator or rotating the account from a
+    second user stranded the credential and made CreateProcessWithLogonW fail.
+    0.0.73 moved install state to a machine-wide store. Preserve any deliberate
+    custom pin; only migrate Agent8088's former default.
+    """
+    configured = str(config.get("sandbox_runtime_version", "")).strip()
+    return _SANDBOX_RUNTIME_DEFAULT if configured in ("", "0.0.67") else configured
+
+
+SANDBOX_RUNTIME_VERSION = _sandbox_runtime_version(APP_CONFIG)
 SANDBOX_ALLOWED_DOMAINS = [
     value.strip()
     for value in APP_CONFIG.get("sandbox_allowed_domains", "").split(",")
