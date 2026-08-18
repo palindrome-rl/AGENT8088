@@ -31,6 +31,7 @@ Read these to understand how a subsystem behaves.
 | [MCP](07-mcp.md) | Connecting MCP servers, and exposing Agent8088 as one |
 | [Messaging Gateway](08-messaging-gateway.md) | Slack, WhatsApp, Discord, Telegram and Email |
 | [Skills & Sub-agents](09-skills-and-subagents.md) | Bundled profiles, isolation, skills, personas |
+| [Docker](17-docker.md) | Run in a container without a system-wide install |
 
 ## Reference
 

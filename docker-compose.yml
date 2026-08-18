@@ -1,32 +1,38 @@
-# Run the Agent8088 messaging gateway as a persistent Docker service — the
-# container alternative to the systemd/launchd setup in
-# docs/wiki/08-messaging-gateway.md#running-as-a-background-service.
+# Agent8088 — run in Docker without a system-wide install.
 #
-# Reuses the E2E test image (./Dockerfile): it already has the [gateway]
-# extra installed. Its ENTRYPOINT is `sleep infinity` for docker-exec-driven
-# tests, so this overrides entrypoint+command to run the gateway directly.
+# Interactive REPL (one-off, container removed on exit):
+#   docker compose run --rm agent8088
 #
-#   docker compose up -d --build
-#   docker compose logs -f
+# Messaging gateway (persistent background service):
+#   docker compose up -d gateway
+#   docker compose logs -f gateway
 #
-# Setup: run `agent8088 --gateway-setup` on the host first (or hand-edit
-# ~/.agent8088/config.txt) — the mounted volume below is the same directory,
-# so config, tokens, and sessions all land where the CLI already expects them.
+# First-time setup (config wizard, writes to the named volume):
+#   docker compose run --rm agent8088 --setup
 #
-# AGENT8088_HOME must be an absolute path (Compose does not expand `~`):
-#   Linux/macOS: export AGENT8088_HOME="$HOME/.agent8088"
-#   Windows:     $env:AGENT8088_HOME = "$env:LOCALAPPDATA\agent8088"
+# Config, tokens, sessions and memory all live in the `agent8088-data`
+# named volume, mounted at the container's AGENT8088_HOME. Run `--setup`
+# once to configure a provider and model; after that `--gateway` works
+# headless.
 services:
+  agent8088:
+    build: .
+    stdin_open: true
+    tty: true
+    volumes:
+      - agent8088-data:/home/a8088/.agent8088
+      # Docker socket for run_sandboxed (sandbox_backend=docker). Omit if
+      # the agent stays readonly — the socket gives the container access to
+      # spawn sibling containers on the host.
+      - /var/run/docker.sock:/var/run/docker.sock
+
   gateway:
     build: .
     restart: unless-stopped
-    entrypoint: ["agent8088"]
     command: ["--gateway"]
     volumes:
-      - ${AGENT8088_HOME:?set AGENT8088_HOME to an absolute path, e.g. $HOME/.agent8088}:/root/.agent8088
-      # Only needed if config.txt sets sandbox_backend=docker (sibling
-      # containers for run_sandboxed). Omit if the gateway stays readonly.
+      - agent8088-data:/home/a8088/.agent8088
       - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      AGENT8088_HOME: /root/.agent8088
-      AGENT8088_CONFIG: /root/.agent8088/config.txt
+
+volumes:
+  agent8088-data:

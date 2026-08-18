@@ -50,6 +50,7 @@ PAGES = [
     ("13-troubleshooting.md", "Troubleshooting"),
     ("14-contributing.md", "Contributing"),
     ("15-faq.md", "FAQ"),
+    ("17-docker.md", "Docker"),
 ]
 
 # Sidebar grouping: guides first, then a Reference section split by kind, then
@@ -64,6 +65,7 @@ SIDEBAR_SECTIONS = [
         "MCP",
         "Messaging-Gateway",
         "Skills-and-Subagents",
+        "Docker",
     ]),
     ("Reference", [
         "CLI-Reference",
