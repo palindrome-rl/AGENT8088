@@ -739,8 +739,25 @@ function Install-Embedding-Model {
 # prior stage), then runs `npm install @anthropic-ai/sandbox-runtime@<ver>`
 # followed by the runtime's `windows-install` subcommand - which provisions a
 # restricted account + WFP egress filter and REQUIRES an elevated terminal.
-# This installer is user-scoped by design (no admin), so we only auto-run the
-# sandbox setup when elevated; otherwise we print a clear instruction.
+# This installer is user-scoped by design (no admin), so rather than requiring
+# the whole run to be elevated we elevate only this one call, via the single UAC
+# prompt the wiki already tells users to expect.
+#
+# The enum is WindowsBuiltInRole, not WindowsBuiltRole. Spelled wrong the type
+# lookup throws, the catch swallowed it, and $elevated was false on every machine
+# -- so the setup never ran automatically even for an administrator, and every
+# install ended by asking the reader to go run --sandbox-setup by hand.
+function Test-Elevated {
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal(
+            [Security.Principal.WindowsIdentity]::GetCurrent())
+        return $principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
 function Install-Native-Sandbox {
     $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
     if (-not (Test-Path $agentExe)) {
@@ -752,15 +769,7 @@ function Install-Native-Sandbox {
         return
     }
 
-    $elevated = $false
-    try {
-        $principal = New-Object Security.Principal.WindowsPrincipal(
-            [Security.Principal.WindowsIdentity]::GetCurrent())
-        $elevated = $principal.IsInRole(
-            [Security.Principal.WindowsBuiltRole]::Administrator)
-    } catch { }
-
-    if ($elevated) {
+    if (Test-Elevated) {
         Write-Info "Running native sandbox setup (elevated)..."
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
@@ -772,15 +781,40 @@ function Install-Native-Sandbox {
         } finally {
             $ErrorActionPreference = $prevEAP
         }
-        if ($script:SandboxInstalled) {
-            Write-Success "Native sandbox runtime installed and verified"
-        } else {
-            Write-Warn "Native sandbox setup did not complete - Docker will be used automatically when available"
-        }
     } else {
-        Write-Info "Native sandbox setup needs an elevated terminal (provisions a restricted account + WFP filter)."
-        Write-Info "Docker will be used automatically when Docker Desktop is running."
-        Write-Info "For native isolation, open an elevated terminal and run: agent8088 --sandbox-setup"
+        Write-Info "Native sandbox setup needs administrator rights - it provisions a"
+        Write-Info "restricted account + WFP egress filter. Approve the Windows prompt."
+        # -Verb RunAs and -RedirectStandard* sit in different Start-Process
+        # parameter sets and cannot be combined, so the elevated child is a
+        # PowerShell that tees to a file. Without that the setup's own diagnosis
+        # -- which names antivirus and seclogon -- dies with the second window.
+        $log = Join-Path $env:TEMP "agent8088-sandbox-setup.log"
+        Remove-Item $log -Force -ErrorAction SilentlyContinue
+        $exeQuoted = $agentExe -replace "'", "''"
+        $logQuoted = $log -replace "'", "''"
+        $inner = "& '$exeQuoted' --sandbox-setup *>&1 | " +
+                 "Tee-Object -FilePath '$logQuoted'; exit `$LASTEXITCODE"
+        try {
+            # -ErrorAction Stop because this file sets $ErrorActionPreference to
+            # Continue: a declined UAC prompt raises a non-terminating Win32
+            # exception, which would skip the catch and leave $proc null.
+            $proc = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru `
+                -ErrorAction Stop `
+                -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $inner)
+            if ($proc -and $proc.ExitCode -eq 0) { $script:SandboxInstalled = $true }
+        } catch {
+            Write-Warn "Administrator approval was declined or unavailable."
+        }
+        if (Test-Path $log) {
+            Get-Content $log | ForEach-Object { Write-Host "   $_" }
+        }
+    }
+
+    if ($script:SandboxInstalled) {
+        Write-Success "Native sandbox runtime installed and verified"
+    } else {
+        Write-Warn "Native sandbox setup did not complete - Docker will be used automatically when available"
+        Write-Info "To retry later, run from an elevated terminal: agent8088 --sandbox-setup"
     }
 }
 

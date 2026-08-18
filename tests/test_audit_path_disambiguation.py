@@ -87,6 +87,23 @@ def test_a_logon_failure_names_the_command_that_fixes_it(engine):
     assert "elevated" in hint
 
 
+def test_a_logon_failure_names_what_blocks_it_from_outside(engine):
+    """Elevation is only half the answer, and the wrong half when already elevated.
+
+    Re-running `--sandbox-setup` from an admin terminal is the first thing to try,
+    but when that was already done the account exists and the logon is being
+    refused by something else. Antivirus behaviour shields are the usual cause —
+    CreateProcessWithLogonW against a freshly created local account is a textbook
+    lateral-movement signature — and naming them is what stops the reader looping
+    on "run it elevated" they have already done.
+    """
+    hint = engine._native_sandbox_repair_hint(
+        'srt-win: error: spawn runner for egress probe: '
+        'CreateProcessWithLogonW(srt-sandbox): Access is denied. (0x80070005)')
+    assert "antivirus" in hint.lower()
+    assert "seclogon" in hint.lower()
+
+
 def test_a_missing_runtime_names_setup_too(engine):
     assert "--sandbox-setup" in engine._native_sandbox_repair_hint(
         "Native sandbox runtime is unavailable.")
