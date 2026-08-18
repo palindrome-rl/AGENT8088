@@ -83,6 +83,7 @@ $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
 $NodeVersion = "22.11.0"
 $FreshInstall = $false
+$ConfigCreated = $false
 $InitialSetupRan = $false
 # Readiness flags set by the new stages so Verify-Install can report actual state.
 $GatewayExtrasInstalled = $false
@@ -1049,6 +1050,7 @@ function Drop-Config {
             return
         }
         Protect-ConfigFile $configPath
+        $script:ConfigCreated = $true
         Write-Success "Default config.txt copied"
     } else {
         Write-Info "config.txt already exists at $configPath - preserving"
@@ -1307,8 +1309,8 @@ function Verify-Install {
 }
 
 function Run-InitialSetup {
-    if (-not $script:FreshInstall) {
-        Write-Info "Existing installation updated - skipping first-run setup."
+    if (-not $script:FreshInstall -and -not $script:ConfigCreated) {
+        Write-Info "Existing installation and config found - skipping first-run setup."
         return
     }
     if ($SkipSetup) {
