@@ -49,6 +49,8 @@ CHROMIUM_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
 SANDBOX_INSTALLED=false
+EMBED_MODEL_READY=false
+EMBED_VIA_PROVIDER=false
 
 # Detect non-interactive mode (curl | bash). When stdin is not a terminal,
 # read -p fails with EOF, causing set -e to abort.
@@ -85,6 +87,125 @@ log_info()    { echo -e "\033[0;36m→\033[0m $1"; }
 log_success() { echo -e "\033[0;32m✓\033[0m $1"; }
 log_warn()    { echo -e "\033[0;33m⚠\033[0m $1"; }
 log_error()   { echo -e "\033[0;31m✗\033[0m $1"; }
+
+# ----------------------------------------------------------------------------
+# Timeouts for the optional network stages
+# ----------------------------------------------------------------------------
+# Every optional stage already tolerates a *failure* (`|| true` + log_warn), but
+# nothing protected them from a *hang*. A stalled `ollama pull`, an npm registry
+# that accepts the connection and then goes quiet, or a wedged Ollama daemon left
+# the installer waiting forever with no way out but Ctrl-C.
+#
+# Limits are deliberately moderate rather than maximally generous: every stage
+# guarded here is optional and degrades to a "run this to fix it later" message,
+# so the cost of cutting a slow-but-working download short is one rerun, while
+# the cost of waiting too long is an installer that looks frozen. Roughly sized
+# so a ~4 Mbps link finishes comfortably.
+#
+# Scale them all for a slow connection:
+#   curl -fsSL <url> | AGENT8088_TIMEOUT_SCALE=3 bash
+TIMEOUT_SCALE="${AGENT8088_TIMEOUT_SCALE:-1}"
+case "$TIMEOUT_SCALE" in
+    ''|*[!0-9]*) TIMEOUT_SCALE=1 ;;
+esac
+[ "$TIMEOUT_SCALE" -lt 1 ] && TIMEOUT_SCALE=1
+
+T_OLLAMA_CHECK=$((15  * TIMEOUT_SCALE))   # local socket call - instant unless the daemon is wedged
+T_OLLAMA_PULL=$((600  * TIMEOUT_SCALE))   # 274 MB embedding model
+T_NPM=$((300          * TIMEOUT_SCALE))   # 142 small packages, mostly round-trips
+T_CHROMIUM=$((600     * TIMEOUT_SCALE))   # ~150 MB browser download
+T_NODE_DL=$((180      * TIMEOUT_SCALE))   # ~30 MB tarball
+T_PIP=$((300          * TIMEOUT_SCALE))   # tens of MB of wheels
+
+# Run a command under a wall-clock limit. macOS ships no `timeout` (it is GNU
+# coreutils), so prefer timeout/gtimeout where they exist and fall back to a
+# background watchdog that escalates TERM -> KILL.
+#
+# Returns 124 on timeout, matching GNU timeout, so callers can tell a hang from
+# an ordinary failure. Must not let `wait` trip `set -e`.
+run_with_timeout() {
+    local _secs="$1"; shift
+    local _rc=0
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$_secs" "$@" || _rc=$?
+        return $_rc
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$_secs" "$@" || _rc=$?
+        return $_rc
+    fi
+
+    "$@" &
+    local _pid=$!
+    (
+        _waited=0
+        while [ "$_waited" -lt "$_secs" ]; do
+            kill -0 "$_pid" 2>/dev/null || exit 0
+            sleep 1
+            _waited=$((_waited + 1))
+        done
+        kill -TERM "$_pid" 2>/dev/null || true
+        sleep 3
+        kill -KILL "$_pid" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
+    local _watchdog=$!
+
+    wait "$_pid" 2>/dev/null || _rc=$?
+    kill -KILL "$_watchdog" 2>/dev/null || true
+    wait "$_watchdog" 2>/dev/null || true
+
+    # A watchdog-killed child surfaces as 143 (TERM) or 137 (KILL); normalize both
+    # to 124 so callers see one "timed out" code regardless of which path ran.
+    case "$_rc" in 137|143) _rc=124 ;; esac
+    return $_rc
+}
+
+# Skipped-stage ledger, printed as one block at the end of the run.
+#
+# Warnings are emitted as each stage runs, which on a multi-minute install means
+# they have scrolled well out of view by the time it finishes - the WhatsApp
+# bridge failing was reported and still went unnoticed. Recording them lets the
+# final summary state plainly what did not install and how to fix each one.
+# Fields are tab-separated: label, reason, fix command.
+SKIPPED_STAGES=()
+
+record_skip() {
+    SKIPPED_STAGES+=("$1"$'\t'"$2"$'\t'"${3:-}")
+}
+
+# Warn about an optional stage that did not complete, naming a hang as a hang.
+# "timed out after 10m" and "failed" point at different fixes. The optional 5th
+# argument is the command that fixes it, surfaced again in the final summary.
+warn_stage() {
+    local _rc="$1" _secs="$2" _what="$3" _consequence="$4" _fix="${5:-}"
+    local _reason
+    if [ "$_rc" -eq 124 ]; then
+        _reason="timed out after $((_secs / 60))m"
+        log_warn "$_what timed out after $((_secs / 60))m - $_consequence"
+        log_warn "On a slow connection, rerun the installer with AGENT8088_TIMEOUT_SCALE=3"
+    else
+        _reason="failed (exit $_rc)"
+        log_warn "$_what failed - $_consequence"
+    fi
+    record_skip "$_what" "$_reason" "$_fix"
+}
+
+# Final block: what did not install, why, and the command that fixes it. Silent
+# when everything succeeded.
+print_skipped_summary() {
+    [ "${#SKIPPED_STAGES[@]}" -eq 0 ] && return 0
+    local _entry _label _reason _fix
+    echo ""
+    echo -e "\033[0;33m${#SKIPPED_STAGES[@]} optional component(s) did not install:\033[0m"
+    for _entry in "${SKIPPED_STAGES[@]}"; do
+        IFS=$'\t' read -r _label _reason _fix <<< "$_entry"
+        echo -e "  \033[0;33m•\033[0m $_label — $_reason"
+        [ -n "$_fix" ] && echo "      fix: $_fix"
+    done
+    echo ""
+    echo "  The core agent is installed and works without these."
+}
 
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
@@ -443,12 +564,18 @@ install_deps() {
     # discord.py, python-telegram-bot. Without these, runner.py:463-497 guards
     # each adapter with try/except ImportError and silently no-ops.
     log_info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
+    local _gw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
-            log_warn "Gateway extras install failed - core agent still works"
+        run_with_timeout "$T_PIP" pip install -e ".[gateway]" >/dev/null 2>&1 || _gw_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
-            log_warn "Gateway extras install failed - core agent still works"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 || _gw_rc=$?
+    fi
+    if [ "$_gw_rc" -eq 0 ]; then
+        GATEWAY_EXTRAS_INSTALLED=true
+    else
+        warn_stage "$_gw_rc" "$T_PIP" "Gateway adapters (Slack/Discord/Telegram)" \
+            "core agent still works" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[gateway]\""
     fi
     [ "$GATEWAY_EXTRAS_INSTALLED" = true ] && log_success "Gateway adapters installed"
 
@@ -456,12 +583,18 @@ install_deps() {
     # Installed everywhere so web_search keeps its no-key fallback; non-fatal
     # because ddgs->primp has no Android wheel and cannot build under Termux.
     log_info "Installing keyless web search backend (ddgs)..."
+    local _search_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
-            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+        run_with_timeout "$T_PIP" pip install -e ".[search]" >/dev/null 2>&1 || _search_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
-            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[search]" >/dev/null 2>&1 || _search_rc=$?
+    fi
+    if [ "$_search_rc" -eq 0 ]; then
+        SEARCH_EXTRAS_INSTALLED=true
+    else
+        warn_stage "$_search_rc" "$T_PIP" "Keyless web search (ddgs)" \
+            "configure SearXNG or an API-key backend for web_search" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[search]\""
     fi
     [ "$SEARCH_EXTRAS_INSTALLED" = true ] && log_success "Keyless web search backend installed"
 
@@ -472,22 +605,37 @@ install_deps() {
     # fail the whole install.
     log_info "Installing Playwright (optional, for browse_page)..."
     local _playwright_installed=false
+    local _pw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
-            log_warn "Playwright install failed - browse_page will show install instructions"
+        run_with_timeout "$T_PIP" pip install -e ".[browser]" >/dev/null 2>&1 || _pw_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
-            log_warn "Playwright install failed - browse_page will show install instructions"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 || _pw_rc=$?
+    fi
+    if [ "$_pw_rc" -eq 0 ]; then
+        _playwright_installed=true
+    else
+        warn_stage "$_pw_rc" "$T_PIP" "Playwright (browse_page)" \
+            "browse_page will show install instructions" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[browser]\""
     fi
     if [ "$_playwright_installed" = true ]; then
         log_info "Installing Playwright Chromium browser (~280 MB)..."
-        "$_py" -m playwright install chromium >/dev/null 2>&1 && CHROMIUM_INSTALLED=true || \
-            log_warn "Chromium download failed - browse_page will show install instructions"
+        local _chromium_rc=0
+        run_with_timeout "$T_CHROMIUM" "$_py" -m playwright install chromium >/dev/null 2>&1 || _chromium_rc=$?
+        if [ "$_chromium_rc" -eq 0 ]; then
+            CHROMIUM_INSTALLED=true
+        else
+            warn_stage "$_chromium_rc" "$T_CHROMIUM" "Chromium browser" \
+                "browse_page will show install instructions" \
+                "$_py -m playwright install chromium"
+        fi
         if [ "$CHROMIUM_INSTALLED" = true ] && [ "$OS" = "linux" ]; then
             log_info "Installing Playwright Chromium system dependencies..."
             local _playwright_sudo=""
             [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _playwright_sudo="sudo"
-            $_playwright_sudo "$_py" -m playwright install-deps chromium >/dev/null 2>&1 || \
+            # Bounded because a sudo password prompt has nowhere to draw with output
+            # redirected, so without a limit this waits on input that never comes.
+            run_with_timeout "$T_PIP" $_playwright_sudo "$_py" -m playwright install-deps chromium >/dev/null 2>&1 || \
                 log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
         fi
         [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
@@ -600,7 +748,7 @@ install_node_bridge() {
             esac
             local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
             local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
-            if curl -fsSL "$_url" -o "$_tmp" 2>/dev/null; then
+            if run_with_timeout "$T_NODE_DL" curl -fsSL "$_url" -o "$_tmp" 2>/dev/null; then
                 mkdir -p "$AGENT8088_HOME/node"
                 # Guarded: Node is optional (WhatsApp bridge only), so a bad
                 # tarball or missing decompressor must warn, not abort the run.
@@ -619,6 +767,8 @@ install_node_bridge() {
         if [ "$_node_ok" = false ]; then
             log_warn "Could not install Node $NODE_VERSION automatically."
             log_info "WhatsApp bridge needs Node 20.11+ - install manually from https://nodejs.org/"
+            record_skip "WhatsApp bridge (Node runtime)" "Node 20.11+ unavailable" \
+                "install Node 20.11+ from https://nodejs.org/ then rerun this installer"
             return 0
         fi
     fi
@@ -638,15 +788,29 @@ install_node_bridge() {
     fi
 
     log_info "Installing WhatsApp bridge npm dependencies..."
-    if npm install --prefix "$_bridge_dir" --no-audit --no-fund >/dev/null 2>&1; then
+    # Run npm *from inside* the bridge directory rather than pointing --prefix at
+    # it. npm 10 (bundled with Node 22.11) reads its config from --prefix but
+    # still resolves package.json by walking up from the current directory, so
+    # --prefix alone installs to the right place while failing to find anything
+    # to install: ENOENT / errno -4058, "Could not read package.json".
+    # The subshell keeps the directory change from leaking into later stages.
+    local _npm_rc=0
+    ( cd "$_bridge_dir" && run_with_timeout "$T_NPM" npm install --no-audit --no-fund ) \
+        >/dev/null 2>&1 || _npm_rc=$?
+    if [ "$_npm_rc" -eq 0 ]; then
         if [ -d "$_bridge_dir/node_modules" ]; then
             WHATSAPP_BRIDGE_READY=true
             log_success "WhatsApp bridge npm dependencies installed"
         else
             log_warn "WhatsApp bridge npm install reported success but node_modules missing"
+            record_skip "WhatsApp bridge npm deps" "npm exited 0 but node_modules is missing" \
+                "cd $_bridge_dir && npm install"
         fi
     else
-        log_warn "WhatsApp bridge npm install failed"
+        warn_stage "$_npm_rc" "$T_NPM" "WhatsApp bridge npm deps" \
+            "the WhatsApp gateway will be unavailable until you rerun it" \
+            "cd $_bridge_dir && npm install"
+        log_warn "Fix it later with:  cd $_bridge_dir && npm install"
     fi
 }
 
@@ -675,17 +839,30 @@ install_embedding_model() {
         # so there is nothing to pull. Only say something if memory would be worse
         # off, which is when Ollama is the configured provider.
         log_info "Ollama not found - memory will embed through your configured provider"
+        EMBED_VIA_PROVIDER=true
         return 0
     fi
-    if ollama list 2>/dev/null | grep -q "^${EMBED_MODEL}"; then
+    # `ollama list` talks to the daemon on :11434. It answers instantly when that
+    # daemon is healthy and never when it is wedged, so it needs a bound too -
+    # otherwise the installer hangs here, before the download it was guarding.
+    local _list_out=""
+    _list_out="$(run_with_timeout "$T_OLLAMA_CHECK" ollama list 2>/dev/null || true)"
+    if echo "$_list_out" | grep -q "^${EMBED_MODEL}"; then
         log_success "Embedding model $EMBED_MODEL already present"
+        EMBED_MODEL_READY=true
         return 0
     fi
+
     log_info "Pulling embedding model $EMBED_MODEL (274 MB, for memory recall)..."
-    if ollama pull "$EMBED_MODEL" >/dev/null 2>&1; then
+    local _pull_rc=0
+    run_with_timeout "$T_OLLAMA_PULL" ollama pull "$EMBED_MODEL" >/dev/null 2>&1 || _pull_rc=$?
+    if [ "$_pull_rc" -eq 0 ]; then
         log_success "Embedding model $EMBED_MODEL installed"
+        EMBED_MODEL_READY=true
     else
-        log_warn "Could not pull $EMBED_MODEL - memory recall will use keyword search only"
+        warn_stage "$_pull_rc" "$T_OLLAMA_PULL" "Embedding model ($EMBED_MODEL)" \
+            "memory recall will use keyword search only" \
+            "ollama pull $EMBED_MODEL"
         log_warn "Fix it later with:  ollama pull $EMBED_MODEL"
     fi
 }
@@ -798,6 +975,8 @@ install_native_sandbox() {
     else
         [ -n "$_sandbox_setup" ] && log_warn "$_sandbox_setup"
         log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
+        record_skip "Native sandbox runtime" "setup did not complete" \
+            "agent8088 --sandbox-setup   (Docker is used automatically meanwhile)"
     fi
 }
 
@@ -1198,9 +1377,20 @@ verify_install() {
         echo "  Sandbox:  Docker fallback is automatic when available"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
+    # Memory: semantic recall needs an embedder; keyword search works without one.
+    # No local Ollama is not a downgrade - the configured provider serves
+    # /embeddings itself - so that case must not read as a failure.
+    if [ "$EMBED_MODEL_READY" = true ]; then
+        echo "  Memory:   $EMBED_MODEL ready (keyword + semantic recall)"
+    elif [ "$EMBED_VIA_PROVIDER" = true ]; then
+        echo "  Memory:   embeddings served by your configured provider"
+    else
+        echo "  Memory:   keyword recall only ($EMBED_MODEL not installed)"
+    fi
     echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
+    print_skipped_summary
 }
 
 run_agent8088_command() {
