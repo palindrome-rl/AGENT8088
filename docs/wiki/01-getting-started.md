@@ -153,5 +153,5 @@ On Windows, `config.txt` lives at `%LOCALAPPDATA%\agent8088\config.txt`.
 ## Next
 
 - [Configuration](02-configuration.md) — every key explained
-- [CLI Reference](10-cli-reference.md) — all flags and 33 slash commands
+- [CLI Reference](10-cli-reference.md) — all flags and 37 slash commands
 - [Tools](04-tools.md) — what the agent can actually do
