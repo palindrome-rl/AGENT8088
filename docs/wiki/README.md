@@ -69,7 +69,7 @@ At a glance, verified against the current tree:
 | Permission modes | **3** — `readonly`, `full-auto`, `plan-only` |
 | Sub-agent profiles | **5** — `auditor`, `coder`, `explore`, `general-purpose`, `researcher` |
 | Bundled skills | **5** installed, plus **20** behaviour skills in `skills/*.yaml` |
-| Slash commands | **36** |
+| Slash commands | **37** |
 | Gateway platforms | **5** — Slack, WhatsApp, Discord, Telegram, Email |
 | Python | **3.10+** |
 
@@ -100,11 +100,15 @@ derive them from the tree rather than trusting this page:
 export AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$(mktemp -d)"   # never import bare
 
 grep -c '^[a-z]' src/agent8088/tools.txt                             # 21 tools
-uv run python -c "import agent8088.cli as c; print(len(c.COMMANDS))" # 36 commands
+uv run python -c "import agent8088.cli as c; print(len(c.COMMANDS))" # 37 commands
 ls src/agent8088/gateway/platforms/*.py | grep -vc 'base\|__init__'  # 5 platforms
 ls src/agent8088/agents/ | wc -l                                     # 5 sub-agents
 uv run python -c "import agent8088.providers as p; print(len(p.BUILTIN_PROVIDERS))"  # 12
 ```
+
+The snippet is POSIX (`export`, `grep -c`, `ls`, `wc -l`); on Windows run it under
+WSL or Git Bash, or use the PowerShell equivalents (`$env:`, `Select-String`,
+`Get-ChildItem | Measure-Object`).
 
 The `AGENT8088_CONFIG` / `AGENT8088_HOME` line is not decoration: importing
 `agent8088.cli` bare reads — and can migrate — your real `~/.agent8088/config.txt`.
