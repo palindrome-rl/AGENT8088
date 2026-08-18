@@ -3503,12 +3503,23 @@ def _native_sandbox_repair_hint(result: str) -> str:
     service is running and the sandbox account is enabled, but the credential the
     runtime holds no longer opens it. Reprovisioning is what actually fixes that,
     and it needs elevation, which is the part worth saying out loud.
+
+    Elevation alone is not the whole answer though, and on its own it reads as a
+    dead end to the reader who is already running as admin: the account was
+    provisioned, and the logon is being refused from outside. Creating a local
+    account and then calling CreateProcessWithLogonW against it is what lateral
+    movement looks like, so antivirus behaviour shields block it by design. That
+    cause has to be named or the reader loops on the step they already did.
     """
     text = result or ""
     if "CreateProcessWithLogonW" in text or "Access is denied" in text:
         return ("The sandbox account could not be logged into. Re-run "
                 "`agent8088 --sandbox-setup` from an elevated terminal to "
-                "reprovision it.")
+                "reprovision it. If it already was elevated, something is "
+                "blocking the logon: allow agent8088 in your antivirus's "
+                "behaviour shield (this looks like lateral movement to Avast, "
+                "AVG and Defender ASR), and check the Secondary Logon service "
+                "(seclogon) is running.")
     if "Native sandbox runtime is unavailable" in text:
         return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
     return f"Reason: {text[:200]}"

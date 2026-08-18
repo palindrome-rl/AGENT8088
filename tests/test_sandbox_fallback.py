@@ -88,12 +88,20 @@ def test_a_failing_command_is_not_re_run_on_docker(engine, monkeypatch):
 
 
 def test_without_docker_hides_the_runtime_error(engine, monkeypatch):
-    """Infrastructure diagnostics must not be presented as command output."""
+    """Infrastructure diagnostics must not be presented as command output.
+
+    Asserted against the runtime's own vocabulary — WFP internals, the Win32 API
+    name, the hex status — because that is what "raw" means here. The repair hint
+    is curated text and is meant to come through; it names seclogon deliberately,
+    so "Secondary Logon" no longer distinguishes a leak from the summary.
+    """
     calls = _wire(engine, monkeypatch, PREFLIGHT, docker_available=False)
     result = engine._exec_sandbox_command("python demo.py")
     assert calls == ["native"]
     assert "sandbox is required" in result.lower()
-    assert "Secondary Logon" not in result
+    for raw in ("WFP egress fence", "CreateProcessWithLogonW", "0x80070005",
+                "srt-win: error:"):
+        assert raw not in result
 
 
 def test_a_broken_native_runtime_is_only_attempted_once(engine, monkeypatch):
