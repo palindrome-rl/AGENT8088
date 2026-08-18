@@ -16,7 +16,7 @@ copied from the README. Where the two disagree, the wiki notes it explicitly.
 ## Start here
 
 New to Agent8088? [Getting Started](01-getting-started.md) takes you from
-install to your first prompt. In a hurry, [the FAQ](15-faq.md) answers most
+install to your first prompt. In a hurry, [the FAQ](15-FAQ.md) answers most
 first-day questions.
 
 ## Guides
@@ -43,7 +43,7 @@ Look things up here.
 | [Configuration](02-configuration.md) | Every config key, the `.env` store, key resolution order |
 | [Tools](04-tools.md) | All 21 built-in tools, their modes and arguments |
 | [Memory](16-memory.md) | Persistent memory: what it stores, how retrieval works, `/memory` |
-| [FAQ](15-faq.md) | Short answers to the common questions |
+| [FAQ](15-FAQ.md) | Short answers to the common questions |
 | [Troubleshooting](13-troubleshooting.md) | Symptom-first fixes |
 
 ## Development

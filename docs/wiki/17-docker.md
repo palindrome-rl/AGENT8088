@@ -10,7 +10,7 @@ adapters, Playwright Chromium, the WhatsApp bridge, and the Docker CLI for
 ## Quick start
 
 ```sh
-cd /path/to/AGENT8088        # docker-compose.yml lives here
+cd /path/to/AGENT8088                       # docker-compose.yml lives here
 
 docker compose run --rm agent8088 --setup    # first-time config wizard
 docker compose run --rm agent8088            # interactive REPL
