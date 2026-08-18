@@ -79,29 +79,65 @@ def test_the_auditor_profile_states_the_two_filesystems(engine):
 # Native sandbox repair hint
 # ---------------------------------------------------------------------------
 
-def test_a_logon_failure_names_the_command_that_fixes_it(engine):
+def test_a_logon_failure_leads_with_the_runtime_error(engine):
+    """The runtime's own error is the only text that identifies the failure.
+
+    The wording this replaces asserted a cause instead: reprovision from an
+    elevated terminal, or antivirus is blocking you. On a machine where the
+    account was provisioned, seclogon was running, the terminal was elevated,
+    the antivirus had been uninstalled and the runtime had been upgraded, it went
+    on asserting all of them — while the one string that pinned the failure never
+    reached the reader. A confident wrong answer is worse than the raw text it
+    displaced, so the reason leads and the guesses come after it.
+    """
+    raw = ('srt-win: error: spawn runner for egress probe: '
+           'CreateProcessWithLogonW(srt-sandbox): Access is denied. (0x80070005)')
+    hint = engine._native_sandbox_repair_hint(raw)
+    assert hint.startswith("Reason:")
+    assert "CreateProcessWithLogonW(srt-sandbox)" in hint
+
+
+def test_a_logon_failure_offers_checks_rather_than_a_diagnosis(engine):
+    """Name what is worth checking, and name when it is not the reader's machine."""
     hint = engine._native_sandbox_repair_hint(
-        'srt-win: error: spawn runner for egress probe: '
         'CreateProcessWithLogonW(srt-sandbox): Access is denied. (0x80070005)')
-    assert "--sandbox-setup" in hint
-    assert "elevated" in hint
+    lowered = hint.lower()
+    assert "seclogon" in lowered
+    assert "antivirus" in lowered
+    assert "policy" in lowered
+    # Provisioning succeeding while the spawn keeps failing is an upstream bug.
+    # Saying so is what stops the reader re-running setup forever.
+    assert "sandbox-runtime" in hint
 
 
-def test_a_logon_failure_names_what_blocks_it_from_outside(engine):
-    """Elevation is only half the answer, and the wrong half when already elevated.
+def test_the_model_facing_error_keeps_runtime_text_out(engine):
+    """`_sandbox_required_error` reaches the model as a tool result.
 
-    Re-running `--sandbox-setup` from an admin terminal is the first thing to try,
-    but when that was already done the account exists and the logon is being
-    refused by something else. Antivirus behaviour shields are the usual cause —
-    CreateProcessWithLogonW against a freshly created local account is a textbook
-    lateral-movement signature — and naming them is what stops the reader looping
-    on "run it elevated" they have already done.
+    Raw runtime stderr there reads as command output — the failure that had the
+    agent report it could not verify its work and print an invented expected-
+    output table. Human-facing callers want the reason; this one must not carry
+    it, so the reason is opt-out rather than unconditional.
     """
     hint = engine._native_sandbox_repair_hint(
-        'srt-win: error: spawn runner for egress probe: '
-        'CreateProcessWithLogonW(srt-sandbox): Access is denied. (0x80070005)')
-    assert "antivirus" in hint.lower()
+        'srt-win: error: CreateProcessWithLogonW(srt-sandbox): Access is denied.',
+        include_reason=False)
+    assert "srt-win" not in hint
     assert "seclogon" in hint.lower()
+
+
+def test_a_latched_failure_logs_the_reason_and_not_the_advice(engine, caplog):
+    """One `--sandbox-setup` run printed the same paragraph twice.
+
+    `_mark_native_sandbox_broken` logged the full hint and then
+    `install_native_sandbox` returned it again. The warning carries the reason,
+    the command's return value carries the guidance, and neither repeats.
+    """
+    raw = 'CreateProcessWithLogonW(srt-sandbox): Access is denied. (0x80070005)'
+    with caplog.at_level("WARNING"):
+        engine._mark_native_sandbox_broken(raw)
+    logged = caplog.text
+    assert raw in logged
+    assert "antivirus" not in logged.lower()
 
 
 def test_a_missing_runtime_names_setup_too(engine):
@@ -113,3 +149,21 @@ def test_an_unrecognised_failure_still_reports_the_reason(engine):
     """Never swallow a cause we do not have a hint for."""
     hint = engine._native_sandbox_repair_hint("something entirely new went wrong")
     assert "something entirely new went wrong" in hint
+
+
+def test_the_probe_stays_quiet_for_a_caller_that_reports_it_itself(
+        engine, caplog, tmp_path, monkeypatch):
+    """`--sandbox-setup` returns the failure, so the latch must not also log it."""
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    with caplog.at_level("WARNING"):
+        assert engine._native_sandbox_ready(tmp_path, quiet=True) is False
+    assert caplog.text == ""
+
+
+def test_the_probe_still_warns_for_every_other_caller(
+        engine, caplog, tmp_path, monkeypatch):
+    """Startup has no return value to carry it, so that path must keep warning."""
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: None)
+    with caplog.at_level("WARNING"):
+        assert engine._native_sandbox_ready(tmp_path) is False
+    assert "native sandbox could not start" in caplog.text
