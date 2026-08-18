@@ -9,7 +9,7 @@ Verified from the argument parser in `src/agent8088/cli.py`:
 ```
 usage: agent8088 [-h] [--version] [--full-auto]
                  [--mode {readonly,full-auto}] [--uninstall]
-                 [--update] [--setup] [--model-setup] [--sandbox-setup]
+                 [--update] [--force] [--setup] [--model-setup] [--sandbox-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
 ```
@@ -30,6 +30,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mcp-port PORT` | MCP HTTP port (default `8931`) |
 | `--mcp-host HOST` | MCP bind host (default `127.0.0.1`) |
 | `--update` | Pull latest code + reinstall, then exit |
+| `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove install dir + env vars, then exit |
 
 Run with no flags for the interactive REPL.
