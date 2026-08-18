@@ -733,89 +733,30 @@ function Install-Embedding-Model {
 }
 
 # ----------------------------------------------------------------------------
-# Stage 5d: Native sandbox runtime (Windows - elevation-aware)
+# Stage 5d: Native sandbox runtime (Windows - deliberately not run)
 # ----------------------------------------------------------------------------
-# install_native_sandbox() (engine.py:3344) needs Node+npm (installed by the
-# prior stage), then runs `npm install @anthropic-ai/sandbox-runtime@<ver>`
-# followed by the runtime's `windows-install` subcommand - which provisions a
-# restricted account + WFP egress filter and REQUIRES an elevated terminal.
-# This installer is user-scoped by design (no admin), so rather than requiring
-# the whole run to be elevated we elevate only this one call, via the single UAC
-# prompt the wiki already tells users to expect.
+# `agent8088 --sandbox-setup` is intentionally NOT invoked here.
 #
-# The enum is WindowsBuiltInRole, not WindowsBuiltRole. Spelled wrong the type
-# lookup throws, the catch swallowed it, and $elevated was false on every machine
-# -- so the setup never ran automatically even for an administrator, and every
-# install ended by asking the reader to go run --sandbox-setup by hand.
-function Test-Elevated {
-    try {
-        $principal = New-Object Security.Principal.WindowsPrincipal(
-            [Security.Principal.WindowsIdentity]::GetCurrent())
-        return $principal.IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch {
-        return $false
-    }
-}
-
+# On Windows the runtime provisions a restricted `srt-sandbox` account and spawns
+# sandboxed children as it through CreateProcessWithLogonW. On at least one
+# machine that spawn is refused with ERROR_ACCESS_DENIED and Windows writes no
+# Security audit event at all, and it stayed refused after ruling out antivirus,
+# an architecture mismatch, the Node version, per-user credential scoping
+# (runtime 0.0.73 moved install state machine-wide) and a clean reprovision. It
+# reproduces with agent8088 out of the picture, driving the runtime CLI directly,
+# so it is not ours to fix from here. Running setup during install only ends an
+# otherwise successful install with an alarming failure the reader cannot act on.
+#
+# Docker carries Windows sandboxing meanwhile, and it is a real sandbox: no
+# network, capped memory and CPU, every capability dropped. Little is lost by not
+# provisioning native, because `sandbox_allowed_domains` ships empty and native's
+# egress allowlist is the one thing Docker cannot express.
+#
+# To restore: `agent8088 --sandbox-setup` from an elevated terminal still works
+# and is unchanged. Git history holds the self-elevating version of this stage for
+# when the upstream spawn failure is understood.
 function Install-Native-Sandbox {
-    $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
-    if (-not (Test-Path $agentExe)) {
-        Write-Warn "agent8088 command not ready - skipping native sandbox setup"
-        return
-    }
-    if (-not $script:NodeInstalled) {
-        Write-Info "Node not available - native sandbox needs Node 20.11+. Skipping."
-        return
-    }
-
-    if (Test-Elevated) {
-        Write-Info "Running native sandbox setup (elevated)..."
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            & $agentExe --sandbox-setup 2>&1 | Out-Host
-            if ($LASTEXITCODE -eq 0) {
-                $script:SandboxInstalled = $true
-            }
-        } finally {
-            $ErrorActionPreference = $prevEAP
-        }
-    } else {
-        Write-Info "Native sandbox setup needs administrator rights - it provisions a"
-        Write-Info "restricted account + WFP egress filter. Approve the Windows prompt."
-        # -Verb RunAs and -RedirectStandard* sit in different Start-Process
-        # parameter sets and cannot be combined, so the elevated child is a
-        # PowerShell that tees to a file. Without that the setup's own diagnosis
-        # -- which names antivirus and seclogon -- dies with the second window.
-        $log = Join-Path $env:TEMP "agent8088-sandbox-setup.log"
-        Remove-Item $log -Force -ErrorAction SilentlyContinue
-        $exeQuoted = $agentExe -replace "'", "''"
-        $logQuoted = $log -replace "'", "''"
-        $inner = "& '$exeQuoted' --sandbox-setup *>&1 | " +
-                 "Tee-Object -FilePath '$logQuoted'; exit `$LASTEXITCODE"
-        try {
-            # -ErrorAction Stop because this file sets $ErrorActionPreference to
-            # Continue: a declined UAC prompt raises a non-terminating Win32
-            # exception, which would skip the catch and leave $proc null.
-            $proc = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru `
-                -ErrorAction Stop `
-                -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $inner)
-            if ($proc -and $proc.ExitCode -eq 0) { $script:SandboxInstalled = $true }
-        } catch {
-            Write-Warn "Administrator approval was declined or unavailable."
-        }
-        if (Test-Path $log) {
-            Get-Content $log | ForEach-Object { Write-Host "   $_" }
-        }
-    }
-
-    if ($script:SandboxInstalled) {
-        Write-Success "Native sandbox runtime installed and verified"
-    } else {
-        Write-Warn "Native sandbox setup did not complete - Docker will be used automatically when available"
-        Write-Info "To retry later, run from an elevated terminal: agent8088 --sandbox-setup"
-    }
+    Write-Info "Native sandbox not set up - Docker will be used for sandboxing if available."
 }
 
 # ----------------------------------------------------------------------------
@@ -1099,8 +1040,9 @@ function Verify-Install {
     if ($script:SandboxInstalled) {
         Write-Host "  Sandbox:  native runtime installed"
     } else {
-        Write-Host "  Sandbox:  Docker fallback is automatic when available"
-        Write-Host "            Native setup: elevated agent8088 --sandbox-setup"
+        Write-Host "  Sandbox:  Docker is used when available"
+        Write-Host "            Native is not set up on Windows yet (optional, may fail):"
+        Write-Host "            elevated agent8088 --sandbox-setup"
     }
     Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$Branch/install.ps1)"
     Write-Host ""
