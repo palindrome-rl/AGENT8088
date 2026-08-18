@@ -102,8 +102,8 @@ There is **no hosted CI**. Local runs are the gate.
 
 ## Branch and PR conventions
 
-- Branch from `development`, not `main`.
-- **Never push to `main` or `development` directly.** Open a PR.
+- Create a topic branch from `main`.
+- **Never push directly to `main`.** Open a PR.
 - Conventional commit prefixes: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`.
 - In the PR body, state: what changed, the repro that proves it, verification
   output, and anything you deliberately left out.
