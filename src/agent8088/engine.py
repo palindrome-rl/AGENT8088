@@ -3520,34 +3520,42 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
 )
 
 
-def _native_sandbox_repair_hint(result: str) -> str:
-    """Turn the runtime's pre-flight error into something the reader can act on.
+def _native_sandbox_repair_hint(result: str, include_reason: bool = True) -> str:
+    """State what the runtime reported, then what is worth checking.
 
-    Raw, it is 200 characters of WFP and CreateProcessWithLogonW detail whose own
-    suggestion — start the Secondary Logon service — is usually wrong: the
-    service is running and the sandbox account is enabled, but the credential the
-    runtime holds no longer opens it. Reprovisioning is what actually fixes that,
-    and it needs elevation, which is the part worth saying out loud.
+    The wording this replaces named reprovisioning, antivirus and seclogon as the
+    causes, and returned them *instead of* the runtime's error. Traced on one
+    machine: the account was provisioned and enabled, seclogon was running, the
+    terminal was elevated, the antivirus had been uninstalled and the runtime
+    upgraded past the release that moved install state machine-wide — and the
+    message went on asserting all of them while the only string that identified
+    the failure was discarded. A confident wrong answer is worse than the raw
+    text it displaced.
 
-    Elevation alone is not the whole answer though, and on its own it reads as a
-    dead end to the reader who is already running as admin: the account was
-    provisioned, and the logon is being refused from outside. Creating a local
-    account and then calling CreateProcessWithLogonW against it is what lateral
-    movement looks like, so antivirus behaviour shields block it by design. That
-    cause has to be named or the reader loops on the step they already did.
+    So the reason leads, and what follows is explicitly a list of things to check
+    rather than a diagnosis. The logon branch also says outright that a
+    provisioned account plus a refused spawn is a sandbox-runtime problem rather
+    than the reader's configuration, because without that the reader keeps
+    re-running setup steps that cannot help.
+
+    `include_reason=False` is for `_sandbox_required_error`, whose text reaches
+    the model as a tool result: raw runtime stderr there reads as command output.
     """
-    text = result or ""
-    if "CreateProcessWithLogonW" in text or "Access is denied" in text:
-        return ("The sandbox account could not be logged into. Re-run "
-                "`agent8088 --sandbox-setup` from an elevated terminal to "
-                "reprovision it. If it already was elevated, something is "
-                "blocking the logon: allow agent8088 in your antivirus's "
-                "behaviour shield (this looks like lateral movement to Avast, "
-                "AVG and Defender ASR), and check the Secondary Logon service "
-                "(seclogon) is running.")
+    text = (result or "").strip()
     if "Native sandbox runtime is unavailable" in text:
         return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
-    return f"Reason: {text[:200]}"
+    checks = ""
+    if "CreateProcessWithLogonW" in text or "Access is denied" in text:
+        checks = ("Windows refused the spawn as the sandbox account. Worth "
+                  "checking: the Secondary Logon service (seclogon) is running, "
+                  "local policy grants that account a logon right, and no "
+                  "antivirus behaviour shield is blocking it. If the account "
+                  "already exists and reprovisioning does not change this, it is "
+                  "a sandbox-runtime issue rather than your configuration.")
+    if not include_reason:
+        return checks or "The native sandbox could not start."
+    reason = f"Reason: {text[:200]}" if text else "Reason: not reported."
+    return f"{reason} {checks}" if checks else reason
 
 
 def _native_sandbox_unusable(result: str) -> bool:
@@ -3561,20 +3569,31 @@ def _native_sandbox_unusable(result: str) -> bool:
     return any(marker in (result or "") for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS)
 
 
-def _mark_native_sandbox_broken(result: str) -> None:
-    """Latch a runtime failure and retain only a local diagnostic."""
+def _mark_native_sandbox_broken(result: str, quiet: bool = False) -> None:
+    """Latch a runtime failure and retain only a local diagnostic.
+
+    `quiet` is for callers that return the same failure to the reader
+    themselves, so one command does not report it twice.
+    """
     global _native_sandbox_broken, _native_sandbox_verified, _native_sandbox_failure
     first_failure = not _native_sandbox_broken
     _native_sandbox_broken = True
     _native_sandbox_verified = False
     _native_sandbox_failure = result or "Native sandbox probe failed."
-    if first_failure:
-        _log.warning("native sandbox could not start. %s",
-                     _native_sandbox_repair_hint(_native_sandbox_failure))
+    if first_failure and not quiet:
+        # The reason only. `install_native_sandbox` returns the guidance, and one
+        # `--sandbox-setup` run used to print the identical paragraph twice.
+        _log.warning("native sandbox could not start. Reason: %s",
+                     _native_sandbox_failure[:200])
 
 
-def _native_sandbox_ready(cwd: Path, readonly: bool = False) -> bool:
-    """Run one real native no-op before trusting presence checks."""
+def _native_sandbox_ready(cwd: Path, readonly: bool = False,
+                          quiet: bool = False) -> bool:
+    """Run one real native no-op before trusting presence checks.
+
+    `quiet` suppresses the latch warning for a caller that reports the failure
+    in its own return value.
+    """
     global _native_sandbox_verified
     if _native_sandbox_broken:
         return False
@@ -3583,7 +3602,7 @@ def _native_sandbox_ready(cwd: Path, readonly: bool = False) -> bool:
 
     runtime = _native_sandbox_argv()
     if not runtime:
-        _mark_native_sandbox_broken("Native sandbox runtime is unavailable.")
+        _mark_native_sandbox_broken("Native sandbox runtime is unavailable.", quiet)
         return False
     try:
         cwd = cwd.resolve()
@@ -3591,7 +3610,7 @@ def _native_sandbox_ready(cwd: Path, readonly: bool = False) -> bool:
         settings = _write_sandbox_settings(readonly, cwd)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     except OSError as exc:
-        _mark_native_sandbox_broken(f"Native sandbox probe could not prepare: {exc}")
+        _mark_native_sandbox_broken(f"Native sandbox probe could not prepare: {exc}", quiet)
         return False
     probe = _process_display([sys.executable, "-c", "pass"])
     command = (f"cd {shlex.quote(str(cwd))} && "
@@ -3604,14 +3623,16 @@ def _native_sandbox_ready(cwd: Path, readonly: bool = False) -> bool:
         )
     except subprocess.TimeoutExpired:
         _mark_native_sandbox_broken(
-            f"Native sandbox probe timed out after {_NATIVE_SANDBOX_PROBE_TIMEOUT}s.")
+            f"Native sandbox probe timed out after {_NATIVE_SANDBOX_PROBE_TIMEOUT}s.",
+            quiet)
         return False
     except OSError as exc:
-        _mark_native_sandbox_broken(f"Native sandbox probe could not start: {exc}")
+        _mark_native_sandbox_broken(f"Native sandbox probe could not start: {exc}", quiet)
         return False
     if result.returncode:
         _mark_native_sandbox_broken((result.stderr or result.stdout or
-                                     f"Native sandbox probe exited {result.returncode}.").strip())
+                                     f"Native sandbox probe exited {result.returncode}.").strip(),
+                                    quiet)
         return False
     _native_sandbox_verified = True
     return True
@@ -3983,7 +4004,8 @@ def _sandbox_required_error() -> str:
     """
     reasons = []
     if _native_sandbox_broken and _native_sandbox_failure:
-        reasons.append(f"Native sandbox: {_native_sandbox_repair_hint(_native_sandbox_failure)}")
+        reasons.append("Native sandbox: " + _native_sandbox_repair_hint(
+            _native_sandbox_failure, include_reason=False))
     if _docker_sandbox_broken and _docker_sandbox_failure:
         reasons.append(f"Docker: {_docker_sandbox_repair_hint(_docker_sandbox_failure)}")
     if reasons:
@@ -4122,7 +4144,7 @@ def install_native_sandbox() -> str:
             f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed. "
             f"Install the remaining OS packages: {', '.join(missing)}."
         )
-    if not _native_sandbox_ready(ARTIFACTS_ROOT):
+    if not _native_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
         return (f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed but could not "
                 f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
                 "Docker will be used when available.")
