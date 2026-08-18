@@ -12,7 +12,7 @@ Verified from `BUILTIN_PROVIDERS` in `src/agent8088/providers.py`:
 | Provider | Base URL | Key env var |
 |---|---|---|
 | `ollama` | `http://localhost:11434/v1` | — (local) |
-| `ollama-cloud` | `https://ollama.com/v1` | `OLLAMA_CLOUD_API_KEY` |
+| `ollama-cloud` | `https://ollama.com/v1` | `OLLAMA_API_KEY` |
 | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `gemini` | `https://generativelanguage.googleapis.com/v1beta/...` | `GEMINI_API_KEY` |
@@ -22,7 +22,7 @@ Verified from `BUILTIN_PROVIDERS` in `src/agent8088/providers.py`:
 | `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
 | `moonshot` | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
 | `qwen` | `https://dashscope.aliyuncs.com/compatible-mode/...` | `QWEN_API_KEY` |
-| `copilot` | `https://api.githubcopilot.com` | `COPILOT_API_KEY` |
+| `copilot` | `https://api.githubcopilot.com` | `GH_TOKEN` |
 
 > **Correction to the README.** It advertises "13 model providers" and lists
 > **Anthropic** among them. There is no `anthropic` built-in. Claude is still

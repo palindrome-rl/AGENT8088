@@ -9,7 +9,7 @@ Verified from the argument parser in `src/agent8088/cli.py`:
 ```
 usage: agent8088 [-h] [--version] [--full-auto]
                  [--mode {readonly,full-auto}] [--uninstall]
-                 [--update] [--setup] [--model-setup] [--sandbox-setup]
+                 [--update] [--force] [--setup] [--model-setup] [--sandbox-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
 ```
@@ -30,13 +30,14 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mcp-port PORT` | MCP HTTP port (default `8931`) |
 | `--mcp-host HOST` | MCP bind host (default `127.0.0.1`) |
 | `--update` | Pull latest code + reinstall, then exit |
+| `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove install dir + env vars, then exit |
 
 Run with no flags for the interactive REPL.
 
 ## Slash commands
 
-**36 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
+**37 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
 `/models`.
 
 ### Session
@@ -115,6 +116,21 @@ Run with no flags for the interactive REPL.
 | `/doctor` | Environment health check |
 | `/trace [on\|off]` | Toggle JSON trace capture |
 | `/verbose` | Toggle verbose output |
+
+### Memory
+
+| Command | Does |
+|---|---|
+| `/memory` | Status: count, embedder, store size, last call's cost |
+| `/memory search <query>` | Run the search and show each leg's rank (words vs meaning) |
+| `/memory add <text>` | Store a fact by hand |
+| `/memory forget <id>` | Delete one (the short id from `/memory search` works) |
+| `/memory notify off\|on\|verbose` | Change what memory prints when it learns something |
+| `/memory test` | Run one extraction call and show the raw reply, parsed facts, and elapsed time |
+| `/memory clear` | Delete all memories, with confirmation |
+| `/memory off` | Stop recalling and learning; keeps what is stored |
+
+See [Memory](16-memory.md) for what each does and when to reach for them.
 
 ## Gateway commands
 
