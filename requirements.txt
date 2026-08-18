@@ -1,0 +1,57 @@
+# Runtime dependencies, mirroring [project.dependencies] in pyproject.toml.
+#
+# pyproject.toml is the source of truth: the installers, `pip install -e .` and
+# uv.lock all resolve from it. This file serves `pip install -r` only, and is
+# kept in step by hand — it had drifted to three packages while the engine had
+# gained two more, and because both are imported lazily the result was not an
+# error but a quietly reduced agent: MCP servers failed to connect, and the
+# keyless search fallback reported itself unavailable, so web_search had nothing
+# to fall back to when SearXNG was down.
+
+openai>=1.0.0,<3
+rich>=13.0.0,<16
+InquirerPy>=0.3.4,<1
+
+# MCP client and server runtime (external servers, and --mcp-serve).
+mcp>=1.27,<2
+
+# Terminal logo rendering.
+Pillow>=9,<13
+
+# Imported directly by cli.py, and previously present only because rich and
+# InquirerPy happen to pull them in. Both call sites fall back on ImportError,
+# so losing them upstream would not raise — Tab completion would disappear and
+# every syntax theme would validate as invalid, with no error either way.
+prompt_toolkit>=3.0.1,<4
+Pygments>=2.13,<3
+
+# Headless browser behind browse_page. The Python package only — the browser
+# binary still needs `playwright install chromium`.
+playwright>=1.40,<2
+
+# Keyless web search fallback. web_search must always have a backend needing no
+# Docker, no API key and no setup, so an unreachable SearXNG still returns
+# results rather than an error.
+ddgs>=9,<10
+
+# --- Optional extras, NOT installed by this file ---------------------------
+#   pip install -e ".[browser]"   alias — playwright is already a core dep; the
+#                                 browser binary still needs
+#                                 `playwright install chromium`
+#   pip install -e ".[search]"    alias — ddgs is already a core dep
+#   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
+#   pip install -e ".[dev]"       pytest, ruff, pip-audit
+#   pip install -e ".[litellm]"   litellm, for a provider with api_mode=litellm
+#
+# browser and search are aliases for packages that are already core, kept so the
+# installers' existing steps and any documented command keep working. They were
+# briefly optional for Termux, which is no longer a supported target; optional
+# was the wrong trade everywhere else, because it made browse_page and the
+# keyless search fallback depend on whether a best-effort install step happened
+# to succeed, and both degrade silently when absent.
+#
+# Listed so the whole dependency surface is visible in one place:
+#   gateway: slack-bolt>=1.18.0,<2  slack-sdk>=3.23.0,<4  httpx>=0.24.0,<1
+#            discord.py>=2.3.0,<3   python-telegram-bot>=20,<23
+#   dev:     pytest>=7.0.0,<10      ruff>=0.8,<1          pip-audit>=2.7,<3
+#   litellm: litellm>=1,<2

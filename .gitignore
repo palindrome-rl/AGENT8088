@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+.DS_Store
+
+# Environment
+.env
+venv/
+.venv/
+env/
+# Local dev venvs live in the repo root; `venv/` alone does not cover them.
+agent/
+
+# Secrets
+*.key
+*.pem
+*_secret*
+*_password*
+
+# Large files
+*.db
+*.safetensors
+*.bin
+*.gguf
+qwen-tooluse-lora/
+
+# Logs
+*.log
+model-telemetry/
+*.model-telemetry.jsonl
+
+# Generated reports
+output/pdf/
+
+# Benchmark outputs (contain dynamic system state)
+benchmark_results.json
+.a8088_verify.png
+traces/
+skillopt_data/
+
+# Local tooling (graphify knowledge graph + opencode config)
+graphify-out/
+.opencode/
+
+# Local agent instructions. Both files stay tracked, so these entries only take
+# effect once a file is untracked with `git rm --cached <file>` — until then git
+# keeps reporting changes to them.
+AGENTS.md
+CLAUDE.md
+
+# Config snapshots (may contain secrets - never commit)
+backup.txt
+opencode.json
+
+# WhatsApp bridge npm deps
+src/agent8088/gateway/platforms/whatsapp_bridge/node_modules/
+
+# Test and run artifacts — generated files never belong in the repo root
+artifacts/*
+!artifacts/.gitkeep
+
+# E2E run output (per-scenario logs, summary, PDF) — never committed
+logs/
