@@ -33,7 +33,7 @@ default `config.txt` pointing at localhost Ollama.
 
 ```sh
 git clone https://github.com/palindrome-rl/AGENT8088.git
-cd Agent8088-Features-added
+cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
 ```

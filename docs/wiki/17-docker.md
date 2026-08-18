@@ -10,7 +10,7 @@ adapters, Playwright Chromium, the WhatsApp bridge, and the Docker CLI for
 ## Quick start
 
 ```sh
-cd /path/to/Agent8088-Features-added        # docker-compose.yml lives here
+cd /path/to/AGENT8088                       # docker-compose.yml lives here
 
 docker compose run --rm agent8088 --setup    # first-time config wizard
 docker compose run --rm agent8088            # interactive REPL
@@ -94,7 +94,7 @@ Everything persists in the `agent8088-data` named volume, mounted at
 Inspect or back it up:
 
 ```sh
-docker volume inspect agent8088-features-added-development_agent8088-data
+docker volume inspect agent8088_agent8088-data
 ```
 
 ## Starting fresh

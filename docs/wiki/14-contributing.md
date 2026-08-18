@@ -6,7 +6,7 @@
 
 ```sh
 git clone https://github.com/palindrome-rl/AGENT8088.git
-cd Agent8088-Features-added
+cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
 AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest tests/ -q
@@ -105,9 +105,8 @@ account. Local runs are the gate.
 
 ## Branch and PR conventions
 
-- Branch from `development`, not `main`.
-- **Never push to `main` or `development` directly.** Open a PR.
-  (`.claude/hooks/guard-protected-push.sh` enforces this from the Bash tool.)
+- Create a topic branch from `main`.
+- **Never push directly to `main`.** Open a PR.
 - Conventional commit prefixes: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`.
 - In the PR body, state: what changed, the repro that proves it, verification
   output, and anything you deliberately left out.

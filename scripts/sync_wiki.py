@@ -49,7 +49,8 @@ PAGES = [
     ("12-testing-and-verification.md", "Testing-and-Verification"),
     ("13-troubleshooting.md", "Troubleshooting"),
     ("14-contributing.md", "Contributing"),
-    ("15-faq.md", "FAQ"),
+    ("15-FAQ.md", "FAQ"),
+    ("16-memory.md", "Memory"),
     ("17-docker.md", "Docker"),
 ]
 
@@ -71,6 +72,7 @@ SIDEBAR_SECTIONS = [
         "CLI-Reference",
         "Configuration",
         "Tools",
+        "Memory",
         "FAQ",
         "Troubleshooting",
     ]),
@@ -85,7 +87,7 @@ BANNER = (
 
 SOURCE_NOTE = (
     "\n\n---\n\n*Source of truth: [`docs/wiki/`](https://github.com/"
-    f"{REPO}/tree/development/docs/wiki) in the main repository. "
+    f"{REPO}/tree/main/docs/wiki) in the main repository. "
     "Edits here are overwritten by the next sync.*\n"
 )
 

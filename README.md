@@ -148,11 +148,11 @@ The versioned [documentation wiki](docs/wiki/README.md) is the source of truth f
 
 ## Contributing
 
-Develop against `development` and run the suite in an isolated configuration:
+Create a topic branch from `main` and run the suite in an isolated configuration:
 
 ```sh
 git clone https://github.com/palindrome-rl/AGENT8088.git
-cd Agent8088-Features-added
+cd AGENT8088
 uv sync --all-extras
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
 ```
