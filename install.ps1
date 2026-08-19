@@ -237,6 +237,11 @@ $TCoreInstall = 600 * $TimeoutScale
 $TVenv        = 300 * $TimeoutScale   # uv may download a CPython build
 $TUvBoot      = 300 * $TimeoutScale   # uv self-installer
 $TExtract     = 300 * $TimeoutScale   # PortableGit self-extractor
+# npm-installs one small package (dsh-sandbox-windows-acl + koffi), then runs one
+# short no-op probe to verify the sandbox actually starts - not a large download,
+# but npm registry round-trips and the probe both count as network/process calls
+# nothing here should be allowed to hang forever.
+$TSandboxSetup = 180 * $TimeoutScale
 
 # Run an external command under a wall-clock limit.
 #
@@ -1414,30 +1419,51 @@ function Install-Embedding-Model {
 }
 
 # ----------------------------------------------------------------------------
-# Stage 5d: Native sandbox runtime (Windows - deliberately not run)
+# Stage 5d: Native sandbox runtime
 # ----------------------------------------------------------------------------
-# `agent8088 --sandbox-setup` is intentionally NOT invoked here.
+# `agent8088 --sandbox-setup` now runs unattended during install.
 #
-# On Windows the runtime provisions a restricted `srt-sandbox` account and spawns
-# sandboxed children as it through CreateProcessWithLogonW. On at least one
-# machine that spawn is refused with ERROR_ACCESS_DENIED and Windows writes no
-# Security audit event at all, and it stayed refused after ruling out antivirus,
-# an architecture mismatch, the Node version, per-user credential scoping
-# (runtime 0.0.73 moved install state machine-wide) and a clean reprovision. It
-# reproduces with agent8088 out of the picture, driving the runtime CLI directly,
-# so it is not ours to fix from here. Running setup during install only ends an
-# otherwise successful install with an alarming failure the reader cannot act on.
+# It used to be skipped deliberately: the runtime provisioned a restricted
+# `srt-sandbox` account and spawned sandboxed children through
+# CreateProcessWithLogonW, which on at least one machine was refused with
+# ERROR_ACCESS_DENIED (no Security audit event, ruled out antivirus, arch
+# mismatch, Node version, and a clean reprovision) - an upstream
+# sandbox-runtime issue, not ours to fix, and not safe to run unattended
+# because a failure there ended an otherwise successful install looking
+# broken.
 #
-# Docker carries Windows sandboxing meanwhile, and it is a real sandbox: no
-# network, capped memory and CPU, every capability dropped. Little is lost by not
-# provisioning native, because `sandbox_allowed_domains` ships empty and native's
-# egress allowlist is the one thing Docker cannot express.
+# `install_native_sandbox()` (engine.py) now provisions the DSH Windows ACL
+# backend instead on win32: a restricted-token + NTFS ACL write-confinement
+# scheme that duplicates the CURRENT user's own token rather than switching to
+# a second account, so it never calls CreateProcessWithLogonW and needs no
+# UAC prompt. Safe to run every install, same as the embedding-model pull
+# above - bounded by Invoke-WithTimeout so a wedged npm registry or a stuck
+# sandbox probe degrades to a skipped-stage warning instead of a hung
+# installer.
 #
-# To restore: `agent8088 --sandbox-setup` from an elevated terminal still works
-# and is unchanged. Git history holds the self-elevating version of this stage for
-# when the upstream spawn failure is understood.
+# Docker remains the fallback whenever native isn't available or fails to
+# verify - sandbox_status() picks it automatically, nothing here needs to
+# arrange that.
 function Install-Native-Sandbox {
-    Write-Info "Native sandbox not set up - Docker will be used for sandboxing if available."
+    $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
+    if (-not (Test-Path -LiteralPath $agentExe)) {
+        Write-Warn "Agent8088 executable not found - skipping native sandbox setup"
+        Register-SkippedStage -Label "Native sandbox" `
+            -Reason "agent8088 executable not found" `
+            -Fix "agent8088 --sandbox-setup"
+        return
+    }
+    Write-Info "Setting up native sandbox..."
+    $result = Invoke-WithTimeout -FilePath $agentExe `
+        -Arguments @("--sandbox-setup") -TimeoutSec $TSandboxSetup -CaptureOutput
+    if ($result.ExitCode -eq 0) {
+        Write-Success "Native sandbox installed and verified"
+    } else {
+        Write-StageWarning -Result $result -TimeoutSec $TSandboxSetup `
+            -What "Native sandbox setup" `
+            -Consequence "Docker will be used for sandboxing if available" `
+            -Fix "agent8088 --sandbox-setup"
+    }
 }
 
 # ----------------------------------------------------------------------------
