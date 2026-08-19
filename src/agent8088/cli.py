@@ -2605,6 +2605,16 @@ def cmd_search(rest):
                       f"ssrf_allow_hosts={', '.join(sorted(A.SSRF_ALLOW_HOSTS)) or 'not set'}")
         t.add_row("ddgs importable",
                   "yes" if A.web_search._ddgs_installed() else "[red]no[/red]")
+        # Which engines the egress policy actually permits. Worth its own row: the
+        # check is per-engine and fails closed, so "importable: yes" with an
+        # allowlist that blocks every engine is a real and otherwise invisible state.
+        try:
+            _engines, _block = A.web_search._ddgs_allowed_engines(A._search_context())
+            t.add_row("ddgs engines allowed",
+                      ", ".join(_engines) if _engines
+                      else f"[red]none — {_block}[/red]")
+        except Exception as exc:  # noqa: BLE001 — a doctor row must never break the report
+            t.add_row("ddgs engines allowed", f"[red]could not determine ({exc})[/red]")
         console.print(t)
         cmd_search("status")
         return
