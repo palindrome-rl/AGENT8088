@@ -3,12 +3,21 @@ from agent8088.engine import _strip_special_tokens
 from agent8088.gateway.session import SessionStore
 
 
-def build_system_prompt() -> str:
-    """Build the gateway system prompt: base + tool docs + permission mode,
-    mirroring the CLI's _session_system_prompt() so the model knows what
-    tools exist and whether writes need approval."""
+def build_system_prompt(platform: str = "", chat_type: str = "") -> str:
+    """Build the gateway system prompt: base + tool docs + skills + permission
+    mode + channel-aware runtime context, mirroring the CLI's
+    _session_system_prompt() so the model knows what tools exist and whether
+    writes need approval.
+
+    Deliberately skips render_persona(): USER.md is one local human's profile,
+    and the gateway can be serving many different chat users across several
+    platforms — folding it in here would leak the primary user's personal
+    details into every other sender's conversation. Skill docs carry no such
+    per-user data, so they're included.
+    """
     prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(A.TOOL_SPECS)
-              + A.render_runtime_context())
+              + A.render_skill_docs(A.SKILL_PACKAGES)
+              + A.render_runtime_context(channel=platform, chat_type=chat_type))
     prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
     if A.PERMISSION_MODE in ("edit", "full-auto"):
         prompt += ("You are in full-auto mode. All tools are allowed without prompts. "
@@ -36,7 +45,7 @@ def _turn_max_turns(mode: str) -> int:
 
 
 def run_turn(session_key: str, user_text: str, session_store: SessionStore,
-             on_escalation=None) -> str:
+             on_escalation=None, platform: str = "", chat_type: str = "") -> str:
     """Load a JSON session, run the agent loop, save it, return the answer.
 
     If on_escalation is provided, it is called as on_escalation(name, result)
@@ -65,7 +74,7 @@ def run_turn(session_key: str, user_text: str, session_store: SessionStore,
         messages,
         max_turns=_turn_max_turns(A.PERMISSION_MODE),
         temperature=float(A.APP_CONFIG.get("temperature", "0.1")),
-        system_prompt=build_system_prompt(),
+        system_prompt=build_system_prompt(platform=platform, chat_type=chat_type),
         tools_def=A.build_tools_def(A.TOOL_SPECS),
         allowed_tools=set(A.TOOL_SPECS),
         on_escalation=on_escalation,
