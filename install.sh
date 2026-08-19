@@ -229,6 +229,10 @@ run_with_timeout() {
 # Fields are tab-separated: label, reason, fix command.
 SKIPPED_STAGES=()
 
+# NOTE for future edits: this appends to a shell array, so it must be called at
+# statement level. A call inside a pipeline or `( ... )` runs in a subshell, the
+# append is discarded when that subshell exits, and the stage then vanishes from
+# the final summary while still printing its warning -- a silent half-failure.
 record_skip() {
     SKIPPED_STAGES+=("$1"$'\t'"$2"$'\t'"${3:-}")
 }
@@ -370,7 +374,17 @@ install_uv() {
         rm -f "$_uv_installer"
         exit 1
     fi
-    if UV_UNMANAGED_INSTALL="$AGENT8088_HOME/bin" sh "$_uv_installer" >/dev/null 2>&1; then
+    _uv_boot_rc=0
+    run_with_timeout "$T_UV_BOOT" \
+        env UV_UNMANAGED_INSTALL="$AGENT8088_HOME/bin" sh "$_uv_installer" >/dev/null 2>&1 \
+        || _uv_boot_rc=$?
+    if [ "$_uv_boot_rc" -eq 124 ]; then
+        log_error "The uv installer timed out after $((T_UV_BOOT / 60))m"
+        log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+        rm -f "$_uv_installer"
+        exit 1
+    fi
+    if [ "$_uv_boot_rc" -eq 0 ]; then
         rm -f "$_uv_installer"
         if [ -x "$_managed_uv" ]; then
             UV_CMD="$_managed_uv"
@@ -553,14 +567,24 @@ clone_repo() {
             git stash push --include-untracked -m "agent8088-install-autostash-$(date -u +%Y%m%d-%H%M%S)" >/dev/null 2>&1 || true
         fi
         git remote set-url origin "$REPO_URL" 2>/dev/null || true
-        git fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1
+        # GIT_HTTP_LOW_SPEED_* bounds the byte-moving part; this bounds the rest
+        # (ref negotiation, local object write), which those variables do not cover.
+        run_with_timeout "$T_GIT" git fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1 || {
+            log_error "git fetch timed out or failed after $((T_GIT / 60))m"
+            log_error "Check your connection, then rerun. On a slow link: AGENT8088_TIMEOUT_SCALE=3"
+            exit 1
+        }
         git checkout -B "$BRANCH" FETCH_HEAD >/dev/null 2>&1
         git reset --hard FETCH_HEAD >/dev/null 2>&1
     else
         log_info "Cloning Agent8088 repository..."
         rm -rf "$INSTALL_DIR"
         mkdir -p "$AGENT8088_HOME"
-        git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+        run_with_timeout "$T_GIT" git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR" || {
+            log_error "git clone timed out or failed after $((T_GIT / 60))m"
+            log_error "Check your connection, then rerun. On a slow link: AGENT8088_TIMEOUT_SCALE=3"
+            exit 1
+        }
         cd "$INSTALL_DIR"
         git config core.autocrlf false
         FRESH_INSTALL=true
@@ -577,11 +601,23 @@ install_deps() {
     local _py="$INSTALL_DIR/venv/bin/python"
     if [ "$DISTRO" = "termux" ]; then
         log_info "Creating venv (stdlib) and installing via pip..."
-        python -m venv "$INSTALL_DIR/venv"
+        run_with_timeout "$T_VENV" python -m venv "$INSTALL_DIR/venv" || {
+            log_error "venv creation timed out or failed"; exit 1; }
         # shellcheck disable=SC1091
-        source "$INSTALL_DIR/venv/bin/activate"
-        pip install --upgrade pip >/dev/null 2>&1
-        pip install --upgrade --force-reinstall -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
+        . "$INSTALL_DIR/venv/bin/activate"
+        # Cosmetic, and it failing must not abort an otherwise-fine install.
+        run_with_timeout "$T_CORE_INSTALL" pip install --upgrade pip >/dev/null 2>&1 || true
+        _core_rc=0
+        run_with_timeout "$T_CORE_INSTALL" pip install --upgrade --force-reinstall -e . \
+            >/dev/null 2>&1 || _core_rc=$?
+        if [ "$_core_rc" -eq 124 ]; then
+            log_error "pip install timed out after $((T_CORE_INSTALL / 60))m - a package download stalled."
+            log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+            exit 1
+        elif [ "$_core_rc" -ne 0 ]; then
+            log_error "pip install failed (exit $_core_rc)"
+            exit 1
+        fi
     else
         log_info "Creating venv and installing via uv..."
         # Re-running the installer over an existing install is a supported path —
@@ -593,14 +629,16 @@ install_deps() {
         #
         # --allow-existing reuses the venv, so an update keeps the packages it
         # already has instead of re-downloading them.
-        if ! "$UV_CMD" venv --python "$PYTHON_PATH" --allow-existing "$INSTALL_DIR/venv" >/dev/null 2>&1 \
+        if ! run_with_timeout "$T_VENV" "$UV_CMD" venv --python "$PYTHON_PATH" \
+                --allow-existing "$INSTALL_DIR/venv" >/dev/null 2>&1 \
                 || [ ! -x "$_py" ]; then
             # Reuse can legitimately fail: a venv built by a Python that has
             # since been removed or upgraded, or one left half-written by an
             # interrupted run. That is not something to hand back to the user as
             # a decision — rebuild it.
             log_warn "Existing virtualenv is not usable — rebuilding it"
-            "$UV_CMD" venv --python "$PYTHON_PATH" --clear "$INSTALL_DIR/venv" >/dev/null 2>&1 || {
+            run_with_timeout "$T_VENV" "$UV_CMD" venv --python "$PYTHON_PATH" \
+                    --clear "$INSTALL_DIR/venv" >/dev/null 2>&1 || {
                 log_error "Could not create the virtualenv at $INSTALL_DIR/venv"
                 log_error "Run this to see the underlying error:"
                 log_error "  $UV_CMD venv --python $PYTHON_PATH --clear $INSTALL_DIR/venv"
@@ -609,13 +647,33 @@ install_deps() {
                 exit 1
             }
         fi
-        "$UV_CMD" pip install --python "$_py" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
-            log_error "uv pip install failed; trying with --all-extras"
-            "$UV_CMD" pip install --python "$_py" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
-                log_error "Failed to install agent8088"
+        # This is the stage that actually hangs: playwright's and ddgs's native
+        # wheels plus mcp and Pillow. Mandatory, so a timeout is a hard failure
+        # with a specific message rather than a skip.
+        _core_rc=0
+        run_with_timeout "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
+            --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || _core_rc=$?
+        if [ "$_core_rc" -eq 124 ]; then
+            log_error "uv pip install timed out after $((T_CORE_INSTALL / 60))m - a package download stalled."
+            log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+            log_error "Or see the underlying error with:"
+            log_error "  $UV_CMD pip install --python $_py -e \"$INSTALL_DIR\""
+            exit 1
+        elif [ "$_core_rc" -ne 0 ]; then
+            log_error "uv pip install failed (exit $_core_rc); retrying with --reinstall"
+            _core_rc=0
+            run_with_timeout "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
+                --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || _core_rc=$?
+            if [ "$_core_rc" -ne 0 ]; then
+                if [ "$_core_rc" -eq 124 ]; then
+                    log_error "Retry also timed out after $((T_CORE_INSTALL / 60))m"
+                    log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+                else
+                    log_error "Failed to install agent8088 (exit $_core_rc)"
+                fi
                 exit 1
-            }
-        }
+            fi
+        fi
     fi
     log_success "agent8088 installed (editable)"
 
@@ -624,12 +682,19 @@ install_deps() {
     # discord.py, python-telegram-bot. Without these, runner.py:463-497 guards
     # each adapter with try/except ImportError and silently no-ops.
     log_info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
+    _gw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
-            log_warn "Gateway extras install failed - core agent still works"
+        run_with_timeout "$T_PIP" pip install -e ".[gateway]" >/dev/null 2>&1 || _gw_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
-            log_warn "Gateway extras install failed - core agent still works"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 || _gw_rc=$?
+    fi
+    if [ "$_gw_rc" -eq 0 ]; then
+        GATEWAY_EXTRAS_INSTALLED=true
+    else
+        warn_stage "$_gw_rc" "$T_PIP" "Gateway adapter extras" \
+            "Slack/Discord/Telegram adapters unavailable" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[gateway]\""
     fi
     [ "$GATEWAY_EXTRAS_INSTALLED" = true ] && log_success "Gateway adapters installed"
 
@@ -637,12 +702,19 @@ install_deps() {
     # Installed everywhere so web_search keeps its no-key fallback; non-fatal
     # because ddgs->primp has no Android wheel and cannot build under Termux.
     log_info "Installing keyless web search backend (ddgs)..."
+    _search_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
-            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+        run_with_timeout "$T_PIP" pip install -e ".[search]" >/dev/null 2>&1 || _search_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
-            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[search]" >/dev/null 2>&1 || _search_rc=$?
+    fi
+    if [ "$_search_rc" -eq 0 ]; then
+        SEARCH_EXTRAS_INSTALLED=true
+    else
+        warn_stage "$_search_rc" "$T_PIP" "Keyless web search backend (ddgs)" \
+            "configure SearXNG or an API-key backend for web_search" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[search]\""
     fi
     [ "$SEARCH_EXTRAS_INSTALLED" = true ] && log_success "Keyless web search backend installed"
 
@@ -653,22 +725,38 @@ install_deps() {
     # fail the whole install.
     log_info "Installing Playwright (optional, for browse_page)..."
     local _playwright_installed=false
+    _pw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
-            log_warn "Playwright install failed - browse_page will show install instructions"
+        run_with_timeout "$T_PIP" pip install -e ".[browser]" >/dev/null 2>&1 || _pw_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
-            log_warn "Playwright install failed - browse_page will show install instructions"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 || _pw_rc=$?
+    fi
+    if [ "$_pw_rc" -eq 0 ]; then
+        _playwright_installed=true
+    else
+        warn_stage "$_pw_rc" "$T_PIP" "Playwright" \
+            "browse_page will show install instructions" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[browser]\""
     fi
     if [ "$_playwright_installed" = true ]; then
         log_info "Installing Playwright Chromium browser (~280 MB)..."
-        "$_py" -m playwright install chromium >/dev/null 2>&1 && CHROMIUM_INSTALLED=true || \
-            log_warn "Chromium download failed - browse_page will show install instructions"
+        _chromium_rc=0
+        run_with_timeout "$T_CHROMIUM" "$_py" -m playwright install chromium \
+            >/dev/null 2>&1 || _chromium_rc=$?
+        if [ "$_chromium_rc" -eq 0 ]; then
+            CHROMIUM_INSTALLED=true
+        else
+            warn_stage "$_chromium_rc" "$T_CHROMIUM" "Chromium browser" \
+                "browse_page will show install instructions" \
+                "$_py -m playwright install chromium"
+        fi
         if [ "$CHROMIUM_INSTALLED" = true ] && [ "$OS" = "linux" ]; then
             log_info "Installing Playwright Chromium system dependencies..."
             local _playwright_sudo=""
             [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _playwright_sudo="sudo"
-            $_playwright_sudo "$_py" -m playwright install-deps chromium >/dev/null 2>&1 || \
+            run_with_timeout "$T_PIP" $_playwright_sudo "$_py" -m playwright install-deps chromium \
+                >/dev/null 2>&1 || \
                 log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
         fi
         [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
@@ -819,15 +907,22 @@ install_node_bridge() {
     fi
 
     log_info "Installing WhatsApp bridge npm dependencies..."
-    if npm install --prefix "$_bridge_dir" --no-audit --no-fund >/dev/null 2>&1; then
+    _npm_rc=0
+    run_with_timeout "$T_NPM" npm install --prefix "$_bridge_dir" --no-audit --no-fund \
+        >/dev/null 2>&1 || _npm_rc=$?
+    if [ "$_npm_rc" -eq 0 ]; then
         if [ -d "$_bridge_dir/node_modules" ]; then
             WHATSAPP_BRIDGE_READY=true
             log_success "WhatsApp bridge npm dependencies installed"
         else
             log_warn "WhatsApp bridge npm install reported success but node_modules missing"
+            record_skip "WhatsApp bridge" "npm reported success but node_modules missing" \
+                "npm install --prefix $_bridge_dir"
         fi
     else
-        log_warn "WhatsApp bridge npm install failed"
+        warn_stage "$_npm_rc" "$T_NPM" "WhatsApp bridge npm dependencies" \
+            "WhatsApp adapter unavailable" \
+            "npm install --prefix $_bridge_dir"
     fi
 }
 
@@ -858,16 +953,22 @@ install_embedding_model() {
         log_info "Ollama not found - memory will embed through your configured provider"
         return 0
     fi
-    if ollama list 2>/dev/null | grep -q "^${EMBED_MODEL}"; then
+    # `ollama list` talks to the daemon on :11434. It answers instantly when that
+    # daemon is healthy and never when it is wedged, which is why it is guarded at
+    # all despite being a local call.
+    if run_with_timeout "$T_OLLAMA_CHECK" ollama list 2>/dev/null | grep -q "^${EMBED_MODEL}"; then
         log_success "Embedding model $EMBED_MODEL already present"
         return 0
     fi
     log_info "Pulling embedding model $EMBED_MODEL (274 MB, for memory recall)..."
-    if ollama pull "$EMBED_MODEL" >/dev/null 2>&1; then
+    _pull_rc=0
+    run_with_timeout "$T_OLLAMA_PULL" ollama pull "$EMBED_MODEL" >/dev/null 2>&1 || _pull_rc=$?
+    if [ "$_pull_rc" -eq 0 ]; then
         log_success "Embedding model $EMBED_MODEL installed"
     else
-        log_warn "Could not pull $EMBED_MODEL - memory recall will use keyword search only"
-        log_warn "Fix it later with:  ollama pull $EMBED_MODEL"
+        warn_stage "$_pull_rc" "$T_OLLAMA_PULL" "Embedding model $EMBED_MODEL" \
+            "memory recall will use keyword search only" \
+            "ollama pull $EMBED_MODEL"
     fi
 }
 
@@ -1383,6 +1484,10 @@ verify_install() {
     echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
+    # Last, so it is the final thing on screen: per-stage warnings scrolled out of
+    # view minutes ago on a multi-minute install, which is how a failed WhatsApp
+    # bridge got reported and still went unnoticed.
+    print_skipped_summary
 }
 
 run_agent8088_command() {
