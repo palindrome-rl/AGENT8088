@@ -131,6 +131,259 @@ function Write-Success { param([string]$Message) Write-Host "[OK] $Message" -For
 function Write-Warn    { param([string]$Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -ForegroundColor Red }
 
+# ----------------------------------------------------------------------------
+# Timeouts for the network stages
+# ----------------------------------------------------------------------------
+# Nothing in this installer had a time limit, so any of its network calls could
+# hang forever: a stalled `ollama pull`, an npm registry that accepts the
+# connection and then goes quiet, a wedged Ollama daemon, or a package download
+# that dribbles bytes left the installer waiting with no way out but Ctrl-C.
+#
+# Limits are deliberately moderate rather than maximally generous: an optional
+# stage degrades to a "run this to fix it later" message, so the cost of cutting
+# a slow-but-working download short is one rerun, while the cost of waiting too
+# long is an installer that looks frozen. Sized so a ~4 Mbps link finishes
+# comfortably.
+#
+# Scale them all for a slow connection:
+#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm <url>)
+$TimeoutScale = 1
+if ($env:AGENT8088_TIMEOUT_SCALE -match '^\d+$' -and [int]$env:AGENT8088_TIMEOUT_SCALE -ge 1) {
+    $TimeoutScale = [int]$env:AGENT8088_TIMEOUT_SCALE
+}
+
+$TOllamaCheck = 15  * $TimeoutScale   # nothing, local - instant unless the daemon is wedged
+$TOllamaPull  = 600 * $TimeoutScale   # 274 MB embedding model
+$TNpm         = 300 * $TimeoutScale   # 142 small packages, mostly round-trips
+$TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
+$TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
+$TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
+# The core editable install is the stage that actually hangs: it pulls
+# playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
+# premature cut fails the install outright -- but it is still the largest
+# download set here, so it gets the same 10m ceiling as Chromium.
+$TCoreInstall = 600 * $TimeoutScale
+$TVenv        = 300 * $TimeoutScale   # uv may download a CPython build
+$TUvBoot      = 300 * $TimeoutScale   # uv self-installer
+$TExtract     = 300 * $TimeoutScale   # PortableGit self-extractor
+
+# Run an external command under a wall-clock limit.
+#
+# PowerShell has no `timeout`, so this uses System.Diagnostics.Process plus
+# WaitForExit(ms). That also solves a second problem: -WorkingDirectory sets the
+# child's directory without touching the caller's location.
+#
+# Output goes to pipes rather than the console to preserve the quiet install the
+# previous `2>&1 | Out-Null` calls had. Returns a hashtable so callers can tell a
+# hang from an ordinary non-zero exit:
+#   @{ ExitCode = <int>; TimedOut = <bool>; Output = <string> }
+# Output is only populated with -CaptureOutput, for callers that need to read what
+# the command printed (e.g. `ollama list`).
+#
+# Built on System.Diagnostics.Process rather than Start-Process -PassThru: the
+# latter does not reliably surface .ExitCode or honour WaitForExit(ms) on a
+# redirected child, which made a "timeout" that never fired and an exit code that
+# always read 0.
+function Invoke-WithTimeout {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [string]$WorkingDirectory,
+        [switch]$CaptureOutput
+    )
+
+    $result = @{ ExitCode = -1; TimedOut = $false; Output = "" }
+    $proc = $null
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $FilePath
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+
+        if ($Arguments.Count -gt 0) {
+            if ($null -ne $psi.PSObject.Properties['ArgumentList']) {
+                # PowerShell 7 / .NET Core: pass argv directly, no quoting needed.
+                foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+            } else {
+                # Windows PowerShell 5.1 / .NET Framework has no ArgumentList, so
+                # build the command line by hand. Quoting matters here: install
+                # paths routinely contain spaces (C:\Users\First Last\...).
+                $quoted = $Arguments | ForEach-Object {
+                    if ($_ -match '[\s"]') {
+                        '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+                    } else { $_ }
+                }
+                $psi.Arguments = ($quoted -join ' ')
+            }
+        }
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+
+        # Drain both pipes asynchronously. A child that fills its stdout buffer
+        # while nobody reads it blocks forever, which would reintroduce the exact
+        # hang this function exists to prevent (npm is chatty enough to hit it).
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+
+        if ($proc.WaitForExit($TimeoutSec * 1000)) {
+            # Second, argument-less wait: lets the async readers finish flushing
+            # before the exit code is read (documented .NET requirement).
+            try { $proc.WaitForExit() } catch { }
+            $result.ExitCode = $proc.ExitCode
+            if ($CaptureOutput) {
+                try { $result.Output = $outTask.GetAwaiter().GetResult() } catch { }
+            }
+        } else {
+            $result.TimedOut = $true
+            # Kill($true) takes the whole process tree but is .NET Core only, so
+            # 5.1 falls back to killing just the launched process. A stray child
+            # (npm's node, say) is a better outcome than a frozen installer.
+            try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
+            try { [void]$proc.WaitForExit(5000) } catch { }
+        }
+        if ($null -eq $result.Output) { $result.Output = "" }
+    } catch {
+        $result.ExitCode = -1
+        $result.Error = $_.Exception.Message
+    } finally {
+        if ($proc) { try { $proc.Dispose() } catch { } }
+    }
+
+    return $result
+}
+
+# Download one file under a hard wall-clock limit covering the BODY transfer.
+#
+# Invoke-WebRequest cannot do this on either edition, with or without -TimeoutSec.
+# On Windows PowerShell 5.1 that parameter maps to HttpWebRequest.Timeout, which
+# covers only up to the response headers -- the body is governed by a separate
+# per-read ReadWriteTimeout. On PowerShell 7 it maps to HttpClient.Timeout, which
+# stops applying once headers arrive and the stream copy to -OutFile begins.
+# Either way a server that accepts, sends headers, then dribbles bytes forever
+# hangs the installer with no way out but Ctrl-C.
+#
+# WebClient.DownloadFileTaskAsync + Task.Wait(ms) bounds the whole operation and
+# is the only API with one code path on 5.1 and 7.x. Obsolete in .NET Core, not
+# removed. Returns a hashtable shaped like Invoke-WithTimeout's:
+#   @{ Success = <bool>; TimedOut = <bool>; Error = <string> }
+#
+# -Proxy is a parameter rather than a read of script scope so the function stays
+# runnable in isolation by tests/test_installer_timeouts.py.
+function Invoke-BoundedDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [System.Net.IWebProxy]$Proxy
+    )
+
+    $result = @{ Success = $false; TimedOut = $false; Error = "" }
+    $client = $null
+    try {
+        $client = New-Object System.Net.WebClient
+        # GitHub release assets 403 an absent User-Agent.
+        $client.Headers.Add('User-Agent', 'agent8088-installer')
+        if ($Proxy) { $client.Proxy = $Proxy }
+
+        $task = $client.DownloadFileTaskAsync($Uri, $OutFile)
+        if ($task.Wait($TimeoutSec * 1000)) {
+            if ($task.IsFaulted) {
+                $result.Error = $task.Exception.GetBaseException().Message
+            } else {
+                $result.Success = $true
+            }
+        } else {
+            $result.TimedOut = $true
+            try { $client.CancelAsync() } catch { }
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { } }
+    }
+
+    # A cancelled or faulted transfer leaves a truncated file. Removing it matters:
+    # every caller's next step is Expand-Archive or a self-extractor, and a partial
+    # archive fails there with a corruption error that names the wrong cause.
+    if (-not $result.Success) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $OutFile
+    }
+    return $result
+}
+
+# Skipped-stage ledger, printed as one block at the end of the run.
+#
+# Warnings are emitted as each stage runs, which on a multi-minute install means
+# they have scrolled well out of view by the time it finishes - the WhatsApp
+# bridge failing was reported and still went unnoticed. Recording them lets the
+# final summary state plainly what did not install and how to fix each one.
+$SkippedStages = New-Object System.Collections.ArrayList
+
+function Register-SkippedStage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Fix = ""
+    )
+    # Create the list on first use rather than relying on the top-level
+    # declaration alone. This installer is normally run as `iex (irm ...)`, where
+    # $script: does not always resolve to the scope holding that declaration -
+    # and unlike the boolean readiness flags, where `$script:X = $true` creates
+    # the variable on assignment, calling .Add() on an unresolved name throws.
+    if ($null -eq $script:SkippedStages) {
+        $script:SkippedStages = New-Object System.Collections.ArrayList
+    }
+    [void]$script:SkippedStages.Add([pscustomobject]@{
+        Label  = $Label
+        Reason = $Reason
+        Fix    = $Fix
+    })
+}
+
+# Warn about a stage that did not complete, naming a hang as a hang. "timed out
+# after 10m" and "failed" point at different fixes. -Fix is the command that
+# repairs it, surfaced again in the final summary.
+function Write-StageWarning {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Result,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$Consequence,
+        [string]$Fix = ""
+    )
+    if ($Result.TimedOut) {
+        $reason = "timed out after $([int]($TimeoutSec / 60))m"
+        Write-Warn "$What timed out after $([int]($TimeoutSec / 60))m - $Consequence"
+        Write-Warn 'On a slow connection, rerun with: $env:AGENT8088_TIMEOUT_SCALE = 3'
+    } else {
+        $reason = "failed (exit $($Result.ExitCode))"
+        Write-Warn "$What failed (exit $($Result.ExitCode)) - $Consequence"
+    }
+    Register-SkippedStage -Label $What -Reason $reason -Fix $Fix
+}
+
+# Final block: what did not install, why, and the command that fixes it. Silent
+# when everything succeeded.
+function Write-SkippedSummary {
+    if ($null -eq $script:SkippedStages -or $script:SkippedStages.Count -eq 0) { return }
+    Write-Host ""
+    Write-Host "$($script:SkippedStages.Count) optional component(s) did not install:" -ForegroundColor Yellow
+    foreach ($s in $script:SkippedStages) {
+        Write-Host "  * " -ForegroundColor Yellow -NoNewline
+        Write-Host "$($s.Label) - $($s.Reason)"
+        if ($s.Fix) { Write-Host "      fix: $($s.Fix)" }
+    }
+    Write-Host ""
+    Write-Host "  The core agent is installed and works without these."
+}
+
 function Protect-ConfigFile {
     param([string]$Path)
     $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
