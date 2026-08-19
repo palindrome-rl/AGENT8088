@@ -3956,84 +3956,187 @@ def _remove_windows_user_environment(*owned_path_entries):
     return removed_path if environment_ok else None
 
 
+def _purge_install_tree(target):
+    """Delete everything under `target` that this process can still remove.
+
+    The uninstall normally runs from an executable that lives inside `target`,
+    so the tree can never be emptied from here: Windows keeps a lock on the
+    running image and on the interpreter DLL beside it. Everything else can go
+    right now, which leaves the deferred helper a handful of locked binaries
+    instead of a whole install, and means that even a helper that never runs
+    leaves behind something visibly uninstalled rather than half working.
+
+    Returns the paths that survived.
+    """
+    import shutil
+    import stat
+
+    def _clear_readonly(func, path, _exc):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+
+    if not target.exists():
+        return []
+    leftovers = []
+    try:
+        children = sorted(target.iterdir(), key=lambda item: item.name.lower())
+    except OSError:
+        return [target]
+    # The subtree holding the running interpreter goes last, so that every other
+    # part of the uninstall is already done by the time this process starts
+    # deleting the library it is running out of.
+    running = Path(sys.executable).resolve(strict=False)
+
+    def _holds_interpreter(child):
+        try:
+            return child.resolve(strict=False) in running.parents
+        except OSError:
+            return False
+    children.sort(key=_holds_interpreter)
+    # onerror was renamed to onexc in 3.12 and goes away after that; the handler
+    # ignores the third argument, which is all that differs between the two.
+    on_error = (
+        {"onexc": _clear_readonly} if sys.version_info >= (3, 12)
+        else {"onerror": _clear_readonly}
+    )
+    for child in children:
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, **on_error)
+            else:
+                child.unlink()
+        except OSError:
+            pass
+        if child.exists():
+            leftovers.append(child)
+    if not leftovers:
+        try:
+            target.rmdir()
+        except OSError:
+            leftovers.append(target)
+    return leftovers
+
+
+# `rd /s /q` is what makes this work at all. A rename needs every handle in the
+# subtree closed, so moving the install aside fails outright when one file in it
+# is still locked; deleting where it stands only needs each file to be
+# individually deletable, so it keeps making progress. The rename is still tried
+# first, because it frees the install path for an immediate reinstall, but it is
+# only an optimisation and its failure must never end the uninstall.
+#
+# Only cmdlets and `cmd` are used below - no .NET calls, no methods on objects.
+# Those are unavailable under the Constrained Language Mode that application
+# control policies impose, and this script has to run on locked-down machines.
+_WINDOWS_CLEANUP_HELPER = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$comspec = $env:ComSpec
+if (-not $comspec) { $comspec = 'cmd.exe' }
+
+function Write-CleanupLog {
+  param([string]$Message)
+  # The launcher `type`s this log, so it is written in the console's own
+  # encoding: -Encoding UTF8 prepends a BOM, which shows up there as mojibake.
+  Set-Content -LiteralPath $LogPath -Value $Message -Encoding Default -ErrorAction SilentlyContinue
+}
+
+function Remove-CleanupTree {
+  param([string]$Path)
+  for ($attempt = 0; $attempt -lt 30; $attempt++) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    if ($attempt -gt 0) { Start-Sleep -Seconds 1 }
+    & $comspec /d /c attrib -r -s -h "$Path\*" /s /d | Out-Null
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $Path) { & $comspec /d /c rd /s /q "$Path" | Out-Null }
+  }
+  return (-not (Test-Path -LiteralPath $Path))
+}
+
+Write-CleanupLog "RUNNING: waiting for Agent8088 process $ParentPid to exit."
+for ($tick = 0; $tick -lt 300; $tick++) {
+  if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+  Start-Sleep -Milliseconds 200
+}
+
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.ExecutablePath -and $_.ExecutablePath -ilike ($Target + '\*')
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+for ($attempt = 0; $attempt -lt 5; $attempt++) {
+  if (-not (Test-Path -LiteralPath $Target)) { break }
+  if ($attempt -gt 0) { Start-Sleep -Seconds 1 }
+  Move-Item -LiteralPath $Target -Destination $Quarantine -ErrorAction SilentlyContinue
+}
+
+$targetParent = Split-Path -Parent $Target
+$quarantinePrefix = (Split-Path -Leaf $Target) + '.uninstalling-'
+$cleanupPaths = @()
+if (Test-Path -LiteralPath $targetParent) {
+  $cleanupPaths += @(Get-ChildItem -LiteralPath $targetParent -Directory -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like ($quarantinePrefix + '*') } | ForEach-Object { $_.FullName })
+}
+if (Test-Path -LiteralPath $Target) { $cleanupPaths += $Target }
+
+$remaining = @()
+foreach ($cleanupPath in $cleanupPaths) {
+  if (-not (Remove-CleanupTree $cleanupPath)) { $remaining += $cleanupPath }
+}
+
+if ($remaining.Count -eq 0) {
+  Write-CleanupLog 'SUCCESS: Agent8088 files removed.'
+} else {
+  # Reaching here means something outside this uninstall's reach has the file
+  # mapped - a security scanner, most often - and no retry will beat that. A
+  # restart releases it, which is the only remedy worth printing.
+  Write-CleanupLog ('FAILED: another program still has these files open; a restart releases them: ' + ($remaining -join ', '))
+}
+# The marker means "cleanup is in flight" and nothing more. Leaving it behind
+# after a failed run wedged both the next uninstall, which waited on it, and the
+# next install, which refused to start while it existed - so it always goes. How
+# the run ended is the log's job to record.
+Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+if ($remaining.Count -ne 0) { exit 1 }
+"""
+
+
+def _powershell_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _start_windows_cleanup_helper(target, parent_pid):
-    """Move and delete an install after its running executable exits."""
+    """Delete what is left of an install once its running executable exits."""
+    import base64
     import subprocess
-    import tempfile
     import uuid
 
     token = uuid.uuid4().hex
-    temp_dir = Path(tempfile.gettempdir())
-    helper_path = temp_dir / f"agent8088-uninstall-{token}.ps1"
+    temp_dir = Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".")
     log_path = temp_dir / f"agent8088-uninstall-{token}.log"
     quarantine = target.with_name(f"{target.name}.uninstalling-{token[:12]}")
     marker_path = target.with_name(f"{target.name}.uninstall-pending")
-    helper_path.write_text(
-        r"""param(
-  [string]$Target,
-  [string]$Quarantine,
-  [int]$ParentPid,
-  [string]$LogPath,
-  [string]$MarkerPath
-)
-$ErrorActionPreference = 'SilentlyContinue'
-$deadline = (Get-Date).AddSeconds(60)
-while ((Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
-  Start-Sleep -Milliseconds 200
-}
-if (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) {
-  Set-Content -LiteralPath $LogPath -Value ('FAILED: uninstall process did not exit: ' + $ParentPid) -Encoding UTF8
-  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-  exit 1
-}
-for ($attempt = 0; $attempt -lt 60 -and (Test-Path -LiteralPath $Target); $attempt++) {
-  Move-Item -LiteralPath $Target -Destination $Quarantine -ErrorAction SilentlyContinue
-  if (Test-Path -LiteralPath $Target) { Start-Sleep -Seconds 1 }
-}
-$targetParent = [IO.Path]::GetDirectoryName($Target)
-$quarantinePrefix = [IO.Path]::GetFileName($Target) + '.uninstalling-'
-$cleanupTargets = @()
-if (Test-Path -LiteralPath $targetParent) {
-  $cleanupTargets = @(Get-ChildItem -LiteralPath $targetParent -Directory -Force | Where-Object {
-    $_.Name.StartsWith($quarantinePrefix, [StringComparison]::OrdinalIgnoreCase)
-  })
-}
-foreach ($cleanupTarget in $cleanupTargets) {
-  $cleanupPath = $cleanupTarget.FullName
-  for ($attempt = 0; $attempt -lt 60 -and (Test-Path -LiteralPath $cleanupPath); $attempt++) {
-    Get-ChildItem -LiteralPath $cleanupPath -Recurse -Force | ForEach-Object {
-      try { $_.IsReadOnly = $false } catch {}
-    }
-    Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path -LiteralPath $cleanupPath) { Start-Sleep -Seconds 1 }
-  }
-}
-$remaining = @()
-if (Test-Path -LiteralPath $Target) { $remaining += $Target }
-if (Test-Path -LiteralPath $targetParent) {
-  $remaining += @(Get-ChildItem -LiteralPath $targetParent -Directory -Force | Where-Object {
-    $_.Name.StartsWith($quarantinePrefix, [StringComparison]::OrdinalIgnoreCase)
-  } | ForEach-Object { $_.FullName })
-}
-$removed = $remaining.Count -eq 0
-$message = if ($removed) { 'SUCCESS: Agent8088 files removed.' } else { 'FAILED: files remain at ' + ($remaining -join ', ') }
-Set-Content -LiteralPath $LogPath -Value $message -Encoding UTF8
-if ($removed) { Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue }
-Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-if (-not $removed) { exit 1 }
-""",
-        encoding="utf-8",
-    )
-    marker_path.write_text(str(log_path), encoding="utf-8")
+    # Passed as an encoded command rather than a .ps1 on disk: -Command and
+    # -EncodedCommand are exempt from the script execution policy, which a
+    # machine policy can otherwise pin somewhere -ExecutionPolicy Bypass cannot
+    # override, and there is no temp script left to fail to write or delete.
+    script = "\n".join((
+        f"$Target = {_powershell_literal(target)}",
+        f"$Quarantine = {_powershell_literal(quarantine)}",
+        f"$ParentPid = {int(parent_pid)}",
+        f"$LogPath = {_powershell_literal(log_path)}",
+        f"$MarkerPath = {_powershell_literal(marker_path)}",
+        _WINDOWS_CLEANUP_HELPER,
+    ))
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     system_root = os.environ.get("SystemRoot", r"C:\Windows")
     powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
     executable = str(powershell) if powershell.exists() else "powershell.exe"
+    marker_path.write_text(str(log_path), encoding="utf-8")
     try:
         subprocess.Popen(
             [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-             "-File", str(helper_path), "-Target", str(target),
-             "-Quarantine", str(quarantine), "-ParentPid", str(parent_pid),
-             "-LogPath", str(log_path), "-MarkerPath", str(marker_path)],
+             "-EncodedCommand", encoded],
             close_fds=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             stdout=subprocess.DEVNULL,
@@ -4041,61 +4144,202 @@ if (-not $removed) { exit 1 }
         )
     except OSError:
         marker_path.unlink(missing_ok=True)
-        helper_path.unlink(missing_ok=True)
         raise
     return log_path
 
 
+def _remove_windows_launcher_dir(link_dir):
+    """Remove the launcher directory when this run did not come through it.
+
+    The launcher is a .cmd, and cmd.exe reads a batch file as it goes: deleting
+    one mid-run makes the shell fail on its next line. So when the launcher
+    started us, deleting it is left to the launcher itself, once it is done.
+    """
+    import shutil
+
+    if os.environ.get("AGENT8088_LINK_DIR") or not link_dir.exists():
+        return False
+    shutil.rmtree(link_dir, ignore_errors=True)
+    return not link_dir.exists()
+
+
+def _run_powershell_capture(script, timeout=20):
+    """Run a short PowerShell snippet and return its stdout, or None."""
+    import base64
+    import subprocess
+
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    executable = str(powershell) if powershell.exists() else "powershell.exe"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        done = subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", encoded],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _windows_processes_in_tree(target):
+    """Live processes holding a file inside `target`, as (pid, name).
+
+    Windows cannot delete a running executable or a loaded DLL, so anything
+    still holding one will survive every retry the cleanup makes. A loaded
+    module counts as much as the executable: `python.exe <script in the
+    install>` runs from outside the tree but still maps the install's .pyd
+    files. Nothing in the standard library reports another process's image or
+    module paths, and matching on process name alone would catch unrelated
+    pythons, so this asks the OS.
+
+    This process and everything that launched it are excluded. The launcher
+    chain runs from inside the install too, and stopping a process tree that
+    contains this one takes the uninstall down with it - silently, because a
+    piped stdout is block buffered and dies unflushed.
+
+    Best effort by nature - module enumeration is refused for processes at a
+    higher integrity level, so a file a security scanner has mapped stays
+    invisible here.
+    """
+    listing = _run_powershell_capture(
+        "$prefix = " + _powershell_literal(Path(str(target)) / "*") + "\n"
+        f"$selfPid = {os.getpid()}\n"
+        # One CIM query for the definitive case, then module lists for the few
+        # runtimes that could be hosting install code from outside the tree.
+        # Enumerating modules for every process on the box costs a minute.
+        "$hosts = @('python.exe', 'pythonw.exe', 'node.exe', 'agent8088.exe')\n"
+        "$all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)\n"
+        "$byId = @{}\n"
+        "foreach ($proc in $all) { $byId[[int]$proc.ProcessId] = $proc }\n"
+        "$mine = @{}\n"
+        "$walk = [int]$selfPid\n"
+        "for ($step = 0; $step -lt 64; $step++) {\n"
+        "  if (-not $walk) { break }\n"
+        "  if ($mine.ContainsKey($walk)) { break }\n"
+        "  $mine[$walk] = $true\n"
+        "  if (-not $byId.ContainsKey($walk)) { break }\n"
+        "  $walk = [int]$byId[$walk].ParentProcessId\n"
+        "}\n"
+        "foreach ($proc in $all) {\n"
+        "  if ($mine.ContainsKey([int]$proc.ProcessId)) { continue }\n"
+        "  if (-not (($proc.ExecutablePath -and $proc.ExecutablePath -ilike $prefix) -or ($hosts -contains $proc.Name))) { continue }\n"
+        "  $found = $proc.ExecutablePath -and $proc.ExecutablePath -ilike $prefix\n"
+        "  if (-not $found) {\n"
+        "    try {\n"
+        "      foreach ($module in (Get-Process -Id $proc.ProcessId -ErrorAction Stop).Modules) {\n"
+        "        if ($module.FileName -ilike $prefix) { $found = $true; break }\n"
+        "      }\n"
+        "    } catch { }\n"
+        "  }\n"
+        "  if ($found) { \"$($proc.ProcessId)`t$($proc.Name)\" }\n"
+        "}\n",
+        timeout=60,
+    )
+    if not listing:
+        return []
+    found = []
+    for line in listing.splitlines():
+        pid, _, name = line.partition("\t")
+        try:
+            pid = int(pid.strip())
+        except ValueError:
+            continue
+        if pid and pid != os.getpid():
+            found.append((pid, name.strip() or "unknown"))
+    return found
+
+
+def _stop_windows_processes(processes):
+    """Terminate processes, with their children, and report how many went."""
+    import subprocess
+
+    stopped = 0
+    for pid, _name in processes:
+        try:
+            done = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            stopped += 1
+    return stopped
+
+
 def _run_windows_uninstall(home):
+    # Everything the rest of this run needs is imported up front. The purge below
+    # deletes the library this interpreter is running out of - a managed Python
+    # lives inside the install too - so any later import could land on a file
+    # that is already gone. These are the modules the helpers below import.
+    import base64  # noqa: F401
+    import shutil  # noqa: F401
+    import stat  # noqa: F401
+    import subprocess  # noqa: F401
+    import uuid  # noqa: F401
+
+    def _say(message):
+        # Piped stdout is block buffered, and everything below can take this
+        # process down - stopping a stray, or deleting its own library. Whatever
+        # has been reported so far has to be on screen before that happens.
+        print(message, flush=True)
+
     link_dir = _agent8088_link_dir()
     managed_bin = home / "bin"
     legacy_scripts = home / "agent8088" / "venv" / "Scripts"
-    if not home.exists():
-        environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
-        if environment_result:
-            print("Removed Agent8088 entries from the user PATH.")
-        print(f"Install directory not found: {home}")
-        if environment_result is not None:
-            print("Agent8088 user environment entries removed.")
-            return True
+
+    environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
+    if environment_result is None:
+        _say("Uninstall stopped: the Windows user environment could not be updated.")
         return False
+    if environment_result:
+        _say("Removed Agent8088 entries from the user PATH.")
+
+    if not home.exists():
+        _say(f"Install directory not found: {home}")
+        _remove_windows_launcher_dir(link_dir)
+        _say("Agent8088 user environment entries removed.")
+        return True
+
+    blockers = _windows_processes_in_tree(home)
+    if blockers:
+        _say(f"{len(blockers)} Agent8088 process(es) are still running from the install:")
+        for pid, name in blockers:
+            _say(f"  {name} (pid {pid})")
+        _say("Stopping them; Windows cannot delete a running program.")
+        _stop_windows_processes(blockers)
+
+    leftovers = _purge_install_tree(home)
+    if not leftovers:
+        _say(f"Removed {home}")
+        # Nothing is deferred, so nothing may look pending: a marker left by an
+        # earlier failed attempt would send the launcher into its wait.
+        home.with_name(f"{home.name}.uninstall-pending").unlink(missing_ok=True)
+        _remove_windows_launcher_dir(link_dir)
+        _say("Open a NEW terminal for PATH to refresh.")
+        return True
 
     try:
         log_path = _start_windows_cleanup_helper(home, os.getpid())
     except OSError as exc:
-        print("Uninstall stopped before deleting any files.")
-        print(f"Could not schedule final cleanup: {exc}")
+        _say(f"Could not schedule final cleanup: {exc}")
+        _say(f"{len(leftovers)} locked item(s) remain. Delete this folder by hand: {home}")
         return False
 
-    environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
-    if environment_result:
-        print("Removed Agent8088 entries from the user PATH.")
-    print("Agent8088 uninstall has been scheduled.")
-    print("Final cleanup will begin after this process exits.")
-    print(f"Cleanup log: {log_path}")
-    return environment_result is not None
-
-
-def _require_windows_uninstall_launcher(home):
-    """Refuse an async uninstall when an old shell bypasses the launcher."""
-    if os.environ.get("AGENT8088_LINK_DIR"):
-        return True
-    launcher = home.with_name(f"{home.name}-launcher") / "agent8088.cmd"
-    print("Uninstall has not started: this terminal resolved the internal Agent8088 executable.")
-    if launcher.exists():
-        print("Run the blocking uninstaller instead:")
-        print(f'  & "{launcher}" --uninstall')
-    else:
-        print("Install the latest Agent8088 version first so the blocking Windows uninstaller is available.")
-    return False
+    _say("Removed the Agent8088 install contents.")
+    _say("The files this program is running from go as soon as it exits.")
+    _say(f"Cleanup log: {log_path}")
+    return True
 
 
 def _run_uninstall():
     import shutil
     import stat
     home = _agent8088_home()
-    if os.name == "nt" and not _require_windows_uninstall_launcher(home):
-        return False
     print(f"This will permanently remove Agent8088 from: {home}")
     try:
         answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
@@ -4116,30 +4360,13 @@ def _run_uninstall():
     if os.name == "nt":
         return _run_windows_uninstall(home)
 
-    _deferred = False
     if home.exists():
         try:
             shutil.rmtree(home, onerror=_clear_readonly)
             print(f"Removed {home}")
-        except PermissionError:
-            # On Windows the running agent8088.exe lives inside `home`, so the
-            # OS holds a lock and rmtree cannot delete it from this process.
-            # Hand the actual deletion to a detached cmd.exe that waits for
-            # this process to exit, then deletes the directory tree.
-            import subprocess
-            del_cmd = (
-                f'timeout /t 2 /nobreak >nul & '
-                f'rmdir /s /q "{home}" 2>nul || '
-                f'(timeout /t 2 /nobreak >nul & rmdir /s /q "{home}" 2>nul) || '
-                f'(timeout /t 3 /nobreak >nul & rmdir /s /q "{home}")'
-            )
-            subprocess.Popen(
-                ["cmd", "/c", del_cmd],
-                close_fds=True, creationflags=0x00000008,  # DETACHED_PROCESS
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            _deferred = True
-            print(f"Scheduled removal of {home} (will complete after this process exits).")
+        except OSError as exc:
+            print(f"Could not remove {home}: {exc}")
+            return False
     else:
         print(f"Install directory not found: {home}")
 

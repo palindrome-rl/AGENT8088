@@ -774,16 +774,25 @@ function Wait-ForPendingUninstall {
 
     Write-Info "Waiting for a previous Agent8088 uninstall to finish..."
     $deadline = (Get-Date).AddSeconds($PendingUninstallWaitSeconds)
-    while ((Test-Path -LiteralPath $pendingMarker) -and (Get-Date) -lt $deadline) {
+    while ((Test-Path -LiteralPath $pendingMarker) -and (Test-Path -LiteralPath $Agent8088Home) -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 250
     }
     if (-not (Test-Path -LiteralPath $pendingMarker)) { return $true }
+    if (-not (Test-Path -LiteralPath $Agent8088Home)) {
+        Remove-Item -LiteralPath $pendingMarker -Force -ErrorAction SilentlyContinue
+        return $true
+    }
 
+    # The cleanup helper clears this marker on its way out whether it succeeded
+    # or not, so a marker still sitting here means that helper died without
+    # finishing. Waiting longer cannot help it, and refusing to install left
+    # people with no way forward at all, so the stale marker goes and the
+    # install proceeds over whatever the helper could not delete.
     $cleanupLog = Get-Content -LiteralPath $pendingMarker -Raw -ErrorAction SilentlyContinue
-    Write-Err "A previous Agent8088 uninstall has not completed."
-    Write-Err "Close every Agent8088 session, then run the installer again."
-    if ($cleanupLog) { Write-Err "Cleanup log: $($cleanupLog.Trim())" }
-    return $false
+    Remove-Item -LiteralPath $pendingMarker -Force -ErrorAction SilentlyContinue
+    Write-Warn "A previous Agent8088 uninstall did not finish; installing over what it left behind."
+    if ($cleanupLog) { Write-Warn "Cleanup log: $($cleanupLog.Trim())" }
+    return $true
 }
 
 function Install-Uv {
@@ -1598,23 +1607,29 @@ if /I "%~1"=="-uninstall" goto agent8088_wait_for_uninstall
 exit /b %_agent8088_exit%
 
 :agent8088_wait_for_uninstall
+rem A non-zero exit means the uninstaller cancelled, or stopped before it
+rem scheduled any cleanup, so there is nothing here to wait for. Without this,
+rem a marker left behind by an earlier run turns a cancelled uninstall into a
+rem full wait and then reports a failure that never happened.
+if not "%_agent8088_exit%"=="0" exit /b %_agent8088_exit%
 set "_agent8088_home=$Agent8088Home"
 set "_agent8088_marker=${Agent8088Home}.uninstall-pending"
 set "_agent8088_log="
 set /a _agent8088_attempts=0
-if exist "%_agent8088_marker%" set /p "_agent8088_log="<"%_agent8088_marker%"
+if not exist "%_agent8088_marker%" goto agent8088_uninstall_finished
+set /p "_agent8088_log="<"%_agent8088_marker%"
+echo Finishing Agent8088 cleanup...
 
 :agent8088_wait_loop
+if not exist "%_agent8088_home%" goto agent8088_uninstall_finished
 if not exist "%_agent8088_marker%" goto agent8088_uninstall_finished
-if defined _agent8088_log if exist "%_agent8088_log%" findstr /b /c:"FAILED:" "%_agent8088_log%" >nul && goto agent8088_uninstall_failed
 set /a _agent8088_attempts+=1
-if %_agent8088_attempts% GEQ 150 goto agent8088_uninstall_failed
+if %_agent8088_attempts% GEQ 60 goto agent8088_uninstall_failed
 >nul 2>&1 ping -n 2 127.0.0.1
 goto agent8088_wait_loop
 
 :agent8088_uninstall_finished
 if exist "%_agent8088_home%" goto agent8088_uninstall_failed
-if not "%_agent8088_exit%"=="0" goto agent8088_uninstall_failed
 echo.
 echo [OK] Agent8088 was completely uninstalled.
 set "_agent8088_self=%~f0"
@@ -1623,9 +1638,9 @@ for %%I in ("%~dp0.") do set "_agent8088_launcher=%%~fI"
 
 :agent8088_uninstall_failed
 echo.
-echo [X] Agent8088 uninstall did not complete.
-if not "%_agent8088_exit%"=="0" echo The Agent8088 uninstaller exited with code %_agent8088_exit%.
+echo [X] Agent8088 uninstall did not remove every file.
 if defined _agent8088_log if exist "%_agent8088_log%" type "%_agent8088_log%"
+echo Delete this folder by hand to finish: %_agent8088_home%
 exit /b 1
 "@
     [System.IO.File]::WriteAllText($launcher, $content, [System.Text.UTF8Encoding]::new($false))
