@@ -82,6 +82,7 @@ $RepoUrl = "https://github.com/tayyabimam1/AGENT8088.git"
 $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
 $NodeVersion = "22.11.0"
+$WindowsTerminalMinVersion = [version]"1.19.0.0"
 $FreshInstall = $false
 $ConfigCreated = $false
 $InitialSetupRan = $false
@@ -147,6 +148,143 @@ function Get-PowerShellHostExe {
         if ($cmd -and $cmd.Source) { return $cmd.Source }
     }
     return "powershell"
+}
+
+# ----------------------------------------------------------------------------
+# Require a modern Windows terminal host before installation. Windows
+# PowerShell 5.1 itself remains supported when hosted by Windows Terminal or
+# VS Code; the unsupported component is the legacy Windows Console Host.
+# ----------------------------------------------------------------------------
+function Get-WindowsTerminalPackage {
+    try {
+        return Get-AppxPackage -Name Microsoft.WindowsTerminal -ErrorAction Stop |
+            Sort-Object { [version]$_.Version } -Descending |
+            Select-Object -First 1
+    } catch {
+        return $null
+    }
+}
+
+function Test-SupportedTerminalHost {
+    if ($env:TERM_PROGRAM -eq "vscode") { return $true }
+    if (-not $env:WT_SESSION) { return $false }
+
+    $package = Get-WindowsTerminalPackage
+    return ($package -and ([version]$package.Version -ge $WindowsTerminalMinVersion))
+}
+
+function Install-WindowsTerminal {
+    param($ExistingPackage)
+
+    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $winget) {
+        Write-Err "WinGet is required to install Windows Terminal automatically."
+        Write-Info "Install App Installer from Microsoft Store, then re-run this installer."
+        Write-Info "https://aka.ms/getwinget"
+        return $false
+    }
+
+    $operation = if ($ExistingPackage) { "upgrade" } else { "install" }
+    Write-Info "$($operation.Substring(0, 1).ToUpper())$($operation.Substring(1))ing Windows Terminal..."
+    & $winget.Source $operation --id Microsoft.WindowsTerminal --exact --source winget `
+        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
+    $wingetExit = $LASTEXITCODE
+
+    $package = Get-WindowsTerminalPackage
+    if ($package -and ([version]$package.Version -ge $WindowsTerminalMinVersion)) {
+        Write-Success "Windows Terminal $($package.Version) is ready"
+        return $true
+    }
+
+    Write-Err "Windows Terminal installation did not reach version $WindowsTerminalMinVersion (WinGet exit $wingetExit)."
+    return $false
+}
+
+function ConvertTo-PowerShellLiteral {
+    param([AllowNull()][string]$Value)
+    return "'" + ([string]$Value).Replace("'", "''") + "'"
+}
+
+function Start-InstallerInWindowsTerminal {
+    $package = Get-WindowsTerminalPackage
+    $terminalCommand = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $terminalExe = if ($terminalCommand) { $terminalCommand.Source } else { $null }
+    if (-not $terminalExe -and $package.InstallLocation) {
+        $candidate = Join-Path $package.InstallLocation "WindowsTerminal.exe"
+        if (Test-Path $candidate) { $terminalExe = $candidate }
+    }
+    if (-not $terminalExe) {
+        Write-Err "Windows Terminal is installed, but its executable could not be found."
+        Write-Info "Enable the 'wt.exe' App execution alias in Windows Settings, then re-run this installer."
+        return $false
+    }
+
+    $launcherPath = Join-Path ([IO.Path]::GetTempPath()) ("agent8088-install-{0}.ps1" -f [guid]::NewGuid())
+    $branchLiteral = ConvertTo-PowerShellLiteral $Branch
+    $homeLiteral = ConvertTo-PowerShellLiteral $Agent8088Home
+    $installLiteral = ConvertTo-PowerShellLiteral $InstallDir
+    $skipSetupLiteral = if ($SkipSetup) { '$true' } else { '$false' }
+
+    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+        $scriptLiteral = ConvertTo-PowerShellLiteral $PSCommandPath
+        $installCommand = "& $scriptLiteral -Branch $branchLiteral -Agent8088Home $homeLiteral -InstallDir $installLiteral -SkipSetup`:$skipSetupLiteral"
+    } else {
+        $escapedBranch = [Uri]::EscapeDataString($Branch).Replace('%2F', '/')
+        $installerUrl = "https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$escapedBranch/install.ps1"
+        $urlLiteral = ConvertTo-PowerShellLiteral $installerUrl
+        $installCommand = "`$source = Invoke-RestMethod -Uri $urlLiteral`r`n& ([scriptblock]::Create(`$source)) -Branch $branchLiteral -Agent8088Home $homeLiteral -InstallDir $installLiteral -SkipSetup`:$skipSetupLiteral"
+    }
+
+    @"
+Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
+$installCommand
+"@ | Set-Content -LiteralPath $launcherPath -Encoding UTF8
+
+    $powerShellExe = Get-PowerShellHostExe
+    $terminalArgs = @(
+        "-w", "new", "`"$powerShellExe`"", "-NoExit", "-ExecutionPolicy", "Bypass",
+        "-File", "`"$launcherPath`""
+    )
+    try {
+        Start-Process -FilePath $terminalExe -ArgumentList $terminalArgs | Out-Null
+        Write-Success "Continuing installation in Windows Terminal..."
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $launcherPath -Force -ErrorAction SilentlyContinue
+        Write-Err "Could not launch Windows Terminal: $_"
+        return $false
+    }
+}
+
+function Ensure-SupportedTerminal {
+    if (Test-SupportedTerminalHost) { return "continue" }
+
+    $package = Get-WindowsTerminalPackage
+    $versionLabel = if ($package) { $package.Version } else { "not installed" }
+    Write-Warn "This terminal host is not supported by Agent8088."
+    Write-Host "  Windows Terminal required: $WindowsTerminalMinVersion or newer"
+    Write-Host "  Windows Terminal detected: $versionLabel"
+
+    if (-not $package -or ([version]$package.Version -lt $WindowsTerminalMinVersion)) {
+        if ($NonInteractive) {
+            Write-Err "Interactive confirmation is required to install or update Windows Terminal."
+            return "failed"
+        }
+        do {
+            $answer = (Read-Host "Install/update Windows Terminal and continue? [y/n]").Trim().ToLowerInvariant()
+        } while ($answer -notin @("y", "n"))
+        if ($answer -eq "n") {
+            Write-Info "Installation cancelled. Agent8088 was not installed."
+            return "failed"
+        }
+        if (-not (Install-WindowsTerminal $package)) { return "failed" }
+    }
+
+    if (-not (Start-InstallerInWindowsTerminal)) { return "failed" }
+    # The replacement installer owns the remaining work; stop this legacy-host run.
+    return "relaunched"
 }
 
 # ----------------------------------------------------------------------------
@@ -1093,6 +1231,9 @@ function Start-InitialAgent {
 # Main
 # ----------------------------------------------------------------------------
 Write-Banner
+$terminalAction = Ensure-SupportedTerminal
+if ($terminalAction -eq "relaunched") { exit 0 }
+if ($terminalAction -ne "continue") { exit 1 }
 if (-not (Install-Uv)) { exit 1 }
 if (-not (Test-Python)) { exit 1 }
 if (-not (Install-Git)) { exit 1 }
