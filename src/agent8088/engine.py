@@ -3316,6 +3316,26 @@ def _agent_data_dir() -> Path:
     return Path.home() / ".agent8088"
 
 
+_DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
+
+
+def _native_sandbox_shell_argv(command: str) -> list:
+    """Wrap a shell command string for cmd.exe.
+
+    The Windows ACL runner execs argv directly and has no shell semantics of
+    its own (no &&, no VAR=value env-prefix syntax) - cmd.exe does the
+    interpreting instead of the runner.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    cmd_exe = str(Path(system_root) / "System32" / "cmd.exe")
+    return [cmd_exe, "/d", "/s", "/c", command]
+
+
+def _dsh_runner_path() -> Path:
+    return (_agent_data_dir() / "runtime" / "node_modules" / "@deepseek-ai"
+            / "dsh-sandbox-windows-acl" / "lib" / "runner.js")
+
+
 def _native_sandbox_argv():
     override = os.environ.get("AGENT8088_SRT")
     if override:
@@ -3324,6 +3344,12 @@ def _native_sandbox_argv():
             argv = [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"'
                     else part for part in argv]
         return argv
+    if sys.platform == "win32":
+        node = _which_executable("node")
+        runner = _dsh_runner_path()
+        if not node or not runner.exists():
+            return None
+        return [node, str(runner)]
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
     node = _which_executable("node")
@@ -3340,6 +3366,12 @@ def _native_sandbox_missing_requirements() -> list:
         required = ("sandbox-exec", "rg")
     elif sys.platform.startswith("linux"):
         required = ("bwrap", "socat", "rg")
+    elif sys.platform == "win32":
+        missing = []
+        koffi_dir = _agent_data_dir() / "runtime" / "node_modules" / "koffi"
+        if not koffi_dir.is_dir():
+            missing.append("koffi native addon")
+        return missing
     else:
         required = ()
     return [command for command in required if not shutil.which(command)]
@@ -3511,6 +3543,7 @@ _NATIVE_SANDBOX_PREFLIGHT_ERRORS = (
     "CreateProcessWithLogonW",
     "Secondary Logon service",
     "srt-win: error:",
+    "windows-acl-run:",
     "bwrap: No permissions to create new namespace",
     "bwrap: Creating new namespace failed",
     "bwrap: Can't mount proc",
@@ -3545,13 +3578,12 @@ def _native_sandbox_repair_hint(result: str, include_reason: bool = True) -> str
     if "Native sandbox runtime is unavailable" in text:
         return "The runtime is not installed. Run `agent8088 --sandbox-setup`."
     checks = ""
-    if "CreateProcessWithLogonW" in text or "Access is denied" in text:
-        checks = ("Windows refused the spawn as the sandbox account. Worth "
-                  "checking: the Secondary Logon service (seclogon) is running, "
-                  "local policy grants that account a logon right, and no "
-                  "antivirus behaviour shield is blocking it. If the account "
-                  "already exists and reprovisioning does not change this, it is "
-                  "a sandbox-runtime issue rather than your configuration.")
+    if "windows-acl-run:" in text:
+        checks = ("The Windows ACL sandbox runner refused to start. Run "
+                  "`agent8088 --sandbox-setup` to reinstall it.")
+    elif "CreateProcessWithLogonW" in text or "Access is denied" in text:
+        checks = ("Windows refused the spawn. Run `agent8088 --sandbox-setup` "
+                  "to reinstall the native sandbox.")
     if not include_reason:
         return checks or "The native sandbox could not start."
     reason = f"Reason: {text[:200]}" if text else "Reason: not reported."
@@ -3613,11 +3645,17 @@ def _native_sandbox_ready(cwd: Path, readonly: bool = False,
         _mark_native_sandbox_broken(f"Native sandbox probe could not prepare: {exc}", quiet)
         return False
     probe = _process_display([sys.executable, "-c", "pass"])
-    command = (f"cd {shlex.quote(str(cwd))} && "
-               f"TMPDIR={shlex.quote(str(sandbox_tmp))} {probe}")
+    if sys.platform == "win32":
+        mode = "read-only" if readonly else "workspace-write"
+        probe_argv = runtime + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
+                                "--mode", mode, "--"] + _native_sandbox_shell_argv(probe)
+    else:
+        command = (f"cd {shlex.quote(str(cwd))} && "
+                   f"TMPDIR={shlex.quote(str(sandbox_tmp))} {probe}")
+        probe_argv = runtime + ["--settings", str(settings), "-c", command]
     try:
         result = subprocess.run(
-            runtime + ["--settings", str(settings), "-c", command],
+            probe_argv,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             timeout=_NATIVE_SANDBOX_PROBE_TIMEOUT,
         )
@@ -3808,8 +3846,14 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     if not argv:
         return "Native sandbox runtime is unavailable."
     cwd = (cwd or ARTIFACTS_ROOT).resolve()
-    settings = _write_sandbox_settings(readonly, cwd)
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    if sys.platform == "win32":
+        mode = "read-only" if readonly else "workspace-write"
+        wrapped = _native_sandbox_shell_argv(command)
+        full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
+                            "--mode", mode, "--"] + wrapped
+        return _exec_process(full_argv, timeout=timeout)
+    settings = _write_sandbox_settings(readonly, cwd)
     command = (f"cd {shlex.quote(str(cwd))} && "
                f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
     return _exec_process(
@@ -3834,15 +3878,18 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
         if not _native_sandbox_ready(PROJECT_ROOT, readonly=True):
             return docker() if _docker_usable() else _sandbox_required_error()
         runtime = _native_sandbox_argv()
-        settings = _write_sandbox_settings(readonly=True)
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
-        native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
-                          f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+        if sys.platform == "win32":
+            wrapped = _native_sandbox_shell_argv(command)
+            native_argv = runtime + ["--workspace", str(PROJECT_ROOT), "--temp",
+                                     str(sandbox_tmp), "--mode", "read-only", "--"] + wrapped
+        else:
+            settings = _write_sandbox_settings(readonly=True)
+            native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
+                              f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+            native_argv = runtime + ["--settings", str(settings), "-c", native_command]
         return _native_or_docker(
-            lambda: _exec_process(
-                runtime + ["--settings", str(settings), "-c", native_command],
-                timeout=timeout,
-            ),
+            lambda: _exec_process(native_argv, timeout=timeout),
             docker,
         )
     if backend == "docker":
@@ -4125,30 +4172,30 @@ def install_native_sandbox() -> str:
 
     runtime_dir = _agent_data_dir() / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    result = _exec_process([
-        npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
-        f"@anthropic-ai/sandbox-runtime@{SANDBOX_RUNTIME_VERSION}",
-    ], timeout=300)
+    if sys.platform == "win32":
+        result = _exec_process([
+            npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
+            "--legacy-peer-deps",
+            f"@deepseek-ai/dsh-sandbox-windows-acl@{_DSH_SANDBOX_ACL_VERSION}",
+        ], timeout=300)
+    else:
+        result = _exec_process([
+            npm, "install", "--prefix", str(runtime_dir), "--no-audit", "--no-fund",
+            f"@anthropic-ai/sandbox-runtime@{SANDBOX_RUNTIME_VERSION}",
+        ], timeout=300)
     if "exited with status" in result or "timed out" in result:
         return result
-    if sys.platform == "win32":
-        runtime = _native_sandbox_argv()
-        if not runtime:
-            return "Native sandbox runtime installed but its CLI could not be located."
-        setup = _exec_process([*runtime, "windows-install"], timeout=300)
-        if "exited with status" in setup or "timed out" in setup:
-            return setup
     missing = _native_sandbox_missing_requirements()
     if missing:
         return (
-            f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed. "
+            "Native sandbox runtime installed. "
             f"Install the remaining OS packages: {', '.join(missing)}."
         )
     if not _native_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
-        return (f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed but could not "
+        return ("Native sandbox runtime installed but could not "
                 f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
                 "Docker will be used when available.")
-    return f"Native sandbox runtime {SANDBOX_RUNTIME_VERSION} installed and verified."
+    return "Native sandbox runtime installed and verified."
 
 
 def _tool_arg_parse_error(name: str, raw: str) -> str:
