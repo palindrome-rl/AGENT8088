@@ -1640,8 +1640,10 @@ def _retryable_model_error(error: Exception) -> bool:
 
 
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
-                                     on_token, interrupt_check, trace, turn):
+                                     on_token, interrupt_check, trace, turn,
+                                     max_tokens=None):
     emitted = False
+    max_tokens = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
 
     def tracked_token(kind, delta):
         nonlocal emitted
@@ -1653,7 +1655,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     try:
         return create_completion(
             client, messages, tools, temperature=temperature,
-            max_tokens=MAX_COMPLETION_TOKENS,
+            max_tokens=max_tokens,
             system_prompt=system_prompt, on_token=token_handler,
             interrupt_check=interrupt_check,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
@@ -1680,7 +1682,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 })
             return create_completion(
                 fallback_client, messages, tools, temperature=temperature,
-                max_tokens=MAX_COMPLETION_TOKENS,
+                max_tokens=max_tokens,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
@@ -6602,12 +6604,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
+        # After a length cutoff, the one retry gets a bigger budget (capped by
+        # the model's context window) — the same fixed budget would just
+        # reproduce the same cutoff if the model reasons a similar amount again.
+        turn_max_tokens = (
+            min(MAX_COMPLETION_TOKENS * 2, CONTEXT_WINDOW)
+            if length_retries else MAX_COMPLETION_TOKENS
+        )
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
                     messages, round_tools_def, temperature=temperature,
                     system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
+                    max_tokens=turn_max_tokens,
                 )
         except AgentInterrupted:
             raise
@@ -6636,17 +6646,32 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
             warning = (
-                f"Model output reached its {MAX_COMPLETION_TOKENS}-token limit. "
-                "The partial response was not executed. Retry with one complete, "
-                "concise tool call; split large work across calls if needed."
+                f"Model output reached its {turn_max_tokens}-token limit. "
+                "The partial response was not executed."
             )
+            if content:
+                # A genuinely large answer/tool call was in progress.
+                retry_instruction = (
+                    f"{warning} Retry with one complete, concise tool call; "
+                    "split large work across calls if needed."
+                )
+            else:
+                # The whole budget was spent on reasoning before any answer or
+                # tool call appeared — "split work into calls" doesn't address
+                # that, so it reliably repeats the same failure.
+                retry_instruction = (
+                    f"{warning} That budget was spent entirely on reasoning "
+                    "with no answer produced. Stop reasoning now and reply "
+                    "immediately in plain text, or call one tool — do not "
+                    "think out loud."
+                )
             if on_result:
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
             if length_retries < 1:
                 length_retries += 1
-                messages.append({"role": "user", "content": warning})
+                messages.append({"role": "user", "content": retry_instruction})
                 continue
             answer = _guard_answer(warning)
             if on_answer:
