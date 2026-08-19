@@ -1935,25 +1935,41 @@ def _resolve_tool_name(name):
 RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
 
 
-def render_runtime_context(now=None) -> str:
-    """Tell the model what day it is.
+def render_runtime_context(now=None, channel: str = "", chat_type: str = "") -> str:
+    """Tell the model what day it is, and which model/channel it's running as.
 
-    Without this it has no clock — only a training cutoff — so "the next
-    election" silently means whatever was next while it was trained, and a
-    page from years ago reads as current. Every date-aware behaviour in the
+    Without the date block it has no clock — only a training cutoff — so "the
+    next election" silently means whatever was next while it was trained, and
+    a page from years ago reads as current. Every date-aware behaviour in the
     search path depends on this block being present.
 
     Rendered per turn rather than at import: a gateway or cron process runs
-    for days and would otherwise keep answering with the date it booted on.
+    for days and would otherwise keep answering with the date it booted on,
+    the model it booted with (after a live /model switch), and no channel.
+
+    `channel`/`chat_type` are supplied by the gateway (platform + whether the
+    message is a direct message or a group/channel one) and left blank for
+    the CLI, which has no such notion.
     """
     moment = now or datetime.now().astimezone()
-    return (
+    model_line = f"- You are Agent8088, currently running on model `{MODEL_NAME}`"
+    if ACTIVE_PROVIDER:
+        model_line += f" via the `{ACTIVE_PROVIDER}` provider"
+    model_line += (". If asked what model or provider is powering you, answer plainly "
+                    "and accurately from this line — it is not confidential.\n")
+    lines = [
         f"{RUNTIME_CONTEXT_HEADING}"
         f"- Today is {moment.strftime('%A, %d %B %Y')}.\n"
         f"- Current year: {moment.year}. Current month: {moment.strftime('%B %Y')}.\n"
         "- Your training data is older than today. For anything current, "
-        "time-sensitive, or scheduled, search rather than answering from memory.\n"
-    )
+        "time-sensitive, or scheduled, search rather than answering from memory.\n",
+        model_line,
+    ]
+    if channel:
+        kind = "a direct message" if chat_type == "private" else "a group/channel"
+        lines.append(f"- You are replying over the messaging gateway, on {channel}, in "
+                      f"{kind}. Keep formatting light here — see Messaging Gateway below.\n")
+    return "".join(lines)
 
 
 def current_system_prompt() -> str:
