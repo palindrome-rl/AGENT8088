@@ -84,7 +84,8 @@ def test_windows_cleanup_helper_preserves_argument_boundaries(tmp_path, monkeypa
     assert marker == target.with_name("Agent Home with spaces.uninstall-pending")
     assert marker.read_text(encoding="utf-8") == str(log_path)
     assert "Move-Item -LiteralPath $Target -Destination $Quarantine" in source
-    assert "Remove-Item -LiteralPath $Quarantine -Recurse -Force" in source
+    assert ".StartsWith($quarantinePrefix" in source
+    assert "Remove-Item -LiteralPath $cleanupPath -Recurse -Force" in source
     assert "$attempt -lt 60" in source
 
 
@@ -133,9 +134,31 @@ def test_windows_environment_removes_only_agent8088_entries(monkeypatch):
     assert "AGENT8088_CONFIG" not in os.environ
 
 
+def test_windows_uninstall_rejects_shell_that_bypasses_launcher(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "Agent Home"
+    launcher = home.with_name("Agent Home-launcher") / "agent8088.cmd"
+    launcher.parent.mkdir()
+    launcher.write_text("@echo off", encoding="utf-8")
+    monkeypatch.delenv("AGENT8088_LINK_DIR", raising=False)
+
+    assert not cli._require_windows_uninstall_launcher(home)
+
+    output = capsys.readouterr().out
+    assert "Uninstall has not started" in output
+    assert str(launcher) in output
+
+
+def test_windows_uninstall_accepts_blocking_launcher(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT8088_LINK_DIR", str(tmp_path / "launcher"))
+    assert cli._require_windows_uninstall_launcher(tmp_path / "agent8088")
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows executable locking")
 def test_windows_helper_moves_and_removes_locked_home_after_process_exits(tmp_path):
     home = tmp_path / "agent8088"
+    stale_quarantine = tmp_path / "agent8088.uninstalling-stale"
+    stale_quarantine.mkdir()
+    (stale_quarantine / "leftover.txt").write_text("old", encoding="utf-8")
     bin_dir = home / "bin"
     bin_dir.mkdir(parents=True)
     executable = bin_dir / "ping.exe"

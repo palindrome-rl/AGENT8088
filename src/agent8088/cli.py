@@ -3925,15 +3925,33 @@ for ($attempt = 0; $attempt -lt 60 -and (Test-Path -LiteralPath $Target); $attem
   Move-Item -LiteralPath $Target -Destination $Quarantine -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath $Target) { Start-Sleep -Seconds 1 }
 }
-for ($attempt = 0; $attempt -lt 60 -and (Test-Path -LiteralPath $Quarantine); $attempt++) {
-  Get-ChildItem -LiteralPath $Quarantine -Recurse -Force | ForEach-Object {
-    try { $_.IsReadOnly = $false } catch {}
-  }
-  Remove-Item -LiteralPath $Quarantine -Recurse -Force -ErrorAction SilentlyContinue
-  if (Test-Path -LiteralPath $Quarantine) { Start-Sleep -Seconds 1 }
+$targetParent = [IO.Path]::GetDirectoryName($Target)
+$quarantinePrefix = [IO.Path]::GetFileName($Target) + '.uninstalling-'
+$cleanupTargets = @()
+if (Test-Path -LiteralPath $targetParent) {
+  $cleanupTargets = @(Get-ChildItem -LiteralPath $targetParent -Directory -Force | Where-Object {
+    $_.Name.StartsWith($quarantinePrefix, [StringComparison]::OrdinalIgnoreCase)
+  })
 }
-$removed = -not (Test-Path -LiteralPath $Target) -and -not (Test-Path -LiteralPath $Quarantine)
-$message = if ($removed) { 'SUCCESS: Agent8088 files removed.' } else { 'FAILED: files remain at ' + $Target + ' or ' + $Quarantine }
+foreach ($cleanupTarget in $cleanupTargets) {
+  $cleanupPath = $cleanupTarget.FullName
+  for ($attempt = 0; $attempt -lt 60 -and (Test-Path -LiteralPath $cleanupPath); $attempt++) {
+    Get-ChildItem -LiteralPath $cleanupPath -Recurse -Force | ForEach-Object {
+      try { $_.IsReadOnly = $false } catch {}
+    }
+    Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $cleanupPath) { Start-Sleep -Seconds 1 }
+  }
+}
+$remaining = @()
+if (Test-Path -LiteralPath $Target) { $remaining += $Target }
+if (Test-Path -LiteralPath $targetParent) {
+  $remaining += @(Get-ChildItem -LiteralPath $targetParent -Directory -Force | Where-Object {
+    $_.Name.StartsWith($quarantinePrefix, [StringComparison]::OrdinalIgnoreCase)
+  } | ForEach-Object { $_.FullName })
+}
+$removed = $remaining.Count -eq 0
+$message = if ($removed) { 'SUCCESS: Agent8088 files removed.' } else { 'FAILED: files remain at ' + ($remaining -join ', ') }
 Set-Content -LiteralPath $LogPath -Value $message -Encoding UTF8
 if ($removed) { Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue }
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
@@ -3993,10 +4011,26 @@ def _run_windows_uninstall(home):
     return environment_result is not None
 
 
+def _require_windows_uninstall_launcher(home):
+    """Refuse an async uninstall when an old shell bypasses the launcher."""
+    if os.environ.get("AGENT8088_LINK_DIR"):
+        return True
+    launcher = home.with_name(f"{home.name}-launcher") / "agent8088.cmd"
+    print("Uninstall has not started: this terminal resolved the internal Agent8088 executable.")
+    if launcher.exists():
+        print("Run the blocking uninstaller instead:")
+        print(f'  & "{launcher}" --uninstall')
+    else:
+        print("Install the latest Agent8088 version first so the blocking Windows uninstaller is available.")
+    return False
+
+
 def _run_uninstall():
     import shutil
     import stat
     home = _agent8088_home()
+    if os.name == "nt" and not _require_windows_uninstall_launcher(home):
+        return False
     print(f"This will permanently remove Agent8088 from: {home}")
     try:
         answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
