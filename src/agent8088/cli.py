@@ -3840,7 +3840,7 @@ def _remove_agent8088_config_exports():
     return removed
 
 
-def _remove_windows_user_environment(link_dir):
+def _remove_windows_user_environment(*owned_path_entries):
     """Remove only the Windows user-environment entries Agent8088 owns."""
     import winreg
 
@@ -3849,6 +3849,9 @@ def _remove_windows_user_environment(link_dir):
             value = os.path.expandvars(str(value).strip().strip('"'))
             return os.path.normcase(os.path.normpath(value))
         return _normal(left) == _normal(right)
+
+    def _owned_path(value):
+        return any(_same_path(value, owned) for owned in owned_path_entries)
 
     removed_path = False
     try:
@@ -3862,7 +3865,7 @@ def _remove_windows_user_environment(link_dir):
             except FileNotFoundError:
                 user_path, value_type = "", winreg.REG_EXPAND_SZ
             entries = [entry for entry in user_path.split(";") if entry.strip()]
-            kept = [entry for entry in entries if not _same_path(entry, link_dir)]
+            kept = [entry for entry in entries if not _owned_path(entry)]
             if kept != entries:
                 winreg.SetValueEx(key, "Path", 0, value_type, ";".join(kept))
                 removed_path = True
@@ -3881,22 +3884,14 @@ def _remove_windows_user_environment(link_dir):
     current_path = os.environ.get("PATH", "")
     os.environ["PATH"] = os.pathsep.join(
         entry for entry in current_path.split(os.pathsep)
-        if entry and not _same_path(entry, link_dir)
+        if entry and not _owned_path(entry)
     )
     os.environ.pop("AGENT8088_CONFIG", None)
     return removed_path if environment_ok else None
 
 
-def _quarantine_windows_home(home):
-    """Atomically move a live install aside before attempting any deletion."""
-    import uuid
-    quarantine = home.with_name(f"{home.name}.uninstalling-{uuid.uuid4().hex[:12]}")
-    home.rename(quarantine)
-    return quarantine
-
-
 def _start_windows_cleanup_helper(target, parent_pid):
-    """Delete a quarantined install after this process releases its DLLs."""
+    """Move and delete an install after its running executable exits."""
     import subprocess
     import tempfile
     import uuid
@@ -3905,51 +3900,75 @@ def _start_windows_cleanup_helper(target, parent_pid):
     temp_dir = Path(tempfile.gettempdir())
     helper_path = temp_dir / f"agent8088-uninstall-{token}.ps1"
     log_path = temp_dir / f"agent8088-uninstall-{token}.log"
+    quarantine = target.with_name(f"{target.name}.uninstalling-{token[:12]}")
+    marker_path = target.with_name(f"{target.name}.uninstall-pending")
     helper_path.write_text(
-        r"""param([string]$Target, [int]$ParentPid, [string]$LogPath)
+        r"""param(
+  [string]$Target,
+  [string]$Quarantine,
+  [int]$ParentPid,
+  [string]$LogPath,
+  [string]$MarkerPath
+)
 $ErrorActionPreference = 'SilentlyContinue'
 $deadline = (Get-Date).AddSeconds(60)
 while ((Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
   Start-Sleep -Milliseconds 200
 }
+if (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) {
+  Set-Content -LiteralPath $LogPath -Value ('FAILED: uninstall process did not exit: ' + $ParentPid) -Encoding UTF8
+  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+  exit 1
+}
 for ($attempt = 0; $attempt -lt 60 -and (Test-Path -LiteralPath $Target); $attempt++) {
-  Get-ChildItem -LiteralPath $Target -Recurse -Force | ForEach-Object {
-    try { $_.IsReadOnly = $false } catch {}
-  }
-  Remove-Item -LiteralPath $Target -Recurse -Force -ErrorAction SilentlyContinue
+  Move-Item -LiteralPath $Target -Destination $Quarantine -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath $Target) { Start-Sleep -Seconds 1 }
 }
-$removed = -not (Test-Path -LiteralPath $Target)
-$message = if ($removed) { 'SUCCESS: Agent8088 files removed.' } else { 'FAILED: files remain at ' + $Target }
+for ($attempt = 0; $attempt -lt 60 -and (Test-Path -LiteralPath $Quarantine); $attempt++) {
+  Get-ChildItem -LiteralPath $Quarantine -Recurse -Force | ForEach-Object {
+    try { $_.IsReadOnly = $false } catch {}
+  }
+  Remove-Item -LiteralPath $Quarantine -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $Quarantine) { Start-Sleep -Seconds 1 }
+}
+$removed = -not (Test-Path -LiteralPath $Target) -and -not (Test-Path -LiteralPath $Quarantine)
+$message = if ($removed) { 'SUCCESS: Agent8088 files removed.' } else { 'FAILED: files remain at ' + $Target + ' or ' + $Quarantine }
 Set-Content -LiteralPath $LogPath -Value $message -Encoding UTF8
+if ($removed) { Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue }
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 if (-not $removed) { exit 1 }
 """,
         encoding="utf-8",
     )
+    marker_path.write_text(str(log_path), encoding="utf-8")
     system_root = os.environ.get("SystemRoot", r"C:\Windows")
     powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
     executable = str(powershell) if powershell.exists() else "powershell.exe"
-    subprocess.Popen(
-        [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-         "-File", str(helper_path), "-Target", str(target),
-         "-ParentPid", str(parent_pid), "-LogPath", str(log_path)],
-        close_fds=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.Popen(
+            [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(helper_path), "-Target", str(target),
+             "-Quarantine", str(quarantine), "-ParentPid", str(parent_pid),
+             "-LogPath", str(log_path), "-MarkerPath", str(marker_path)],
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        marker_path.unlink(missing_ok=True)
+        helper_path.unlink(missing_ok=True)
+        raise
     return log_path
 
 
-def _run_windows_uninstall(home, clear_readonly):
-    import shutil
-
+def _run_windows_uninstall(home):
     link_dir = _agent8088_link_dir()
+    managed_bin = home / "bin"
     if not home.exists():
-        environment_result = _remove_windows_user_environment(link_dir)
+        environment_result = _remove_windows_user_environment(link_dir, managed_bin)
         if environment_result:
-            print(f"Removed {link_dir} from the user PATH.")
+            print("Removed Agent8088 entries from the user PATH.")
         print(f"Install directory not found: {home}")
         if environment_result is not None:
             print("Agent8088 user environment entries removed.")
@@ -3957,33 +3976,18 @@ def _run_windows_uninstall(home, clear_readonly):
         return False
 
     try:
-        quarantine = _quarantine_windows_home(home)
+        log_path = _start_windows_cleanup_helper(home, os.getpid())
     except OSError as exc:
         print("Uninstall stopped before deleting any files.")
-        print(f"Could not move the installation out of service: {exc}")
-        print("Close other Agent8088 sessions and run --uninstall again.")
+        print(f"Could not schedule final cleanup: {exc}")
         return False
 
-    environment_result = _remove_windows_user_environment(link_dir)
+    environment_result = _remove_windows_user_environment(link_dir, managed_bin)
     if environment_result:
-        print(f"Removed {link_dir} from the user PATH.")
-
-    try:
-        if sys.version_info >= (3, 12):
-            shutil.rmtree(quarantine, onexc=clear_readonly)
-        else:
-            shutil.rmtree(quarantine, onerror=clear_readonly)
-        print(f"Removed {home}")
-    except OSError:
-        try:
-            log_path = _start_windows_cleanup_helper(quarantine, os.getpid())
-        except OSError as exc:
-            print(f"Agent8088 was disabled, but final cleanup could not be scheduled: {exc}")
-            print(f"Remove this directory after closing Agent8088: {quarantine}")
-            return False
-        print("Agent8088 has been disabled.")
-        print("Final file cleanup will complete after this process exits.")
-        print(f"Cleanup log: {log_path}")
+        print("Removed Agent8088 entries from the user PATH.")
+    print("Agent8088 uninstall has been scheduled.")
+    print("Final cleanup will begin after this process exits.")
+    print(f"Cleanup log: {log_path}")
     return environment_result is not None
 
 
@@ -4009,7 +4013,7 @@ def _run_uninstall():
         func(path)
 
     if os.name == "nt":
-        return _run_windows_uninstall(home, _clear_readonly)
+        return _run_windows_uninstall(home)
 
     _deferred = False
     if home.exists():

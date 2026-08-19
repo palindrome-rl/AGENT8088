@@ -83,6 +83,7 @@ $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
 $NodeVersion = "22.11.0"
 $WindowsTerminalMinVersion = [version]"1.19.0.0"
+$PendingUninstallWaitSeconds = 65
 $FreshInstall = $false
 $ConfigCreated = $false
 $InitialSetupRan = $false
@@ -315,6 +316,31 @@ function Get-WindowsArch {
 # ----------------------------------------------------------------------------
 # Stage 1: Install uv (managed, into $Agent8088Home\bin)
 # ----------------------------------------------------------------------------
+function Wait-ForPendingUninstall {
+    $pendingMarker = "${Agent8088Home}.uninstall-pending"
+    if (-not (Test-Path -LiteralPath $pendingMarker)) { return $true }
+
+    # Once the live directory has been moved aside, a new install cannot race
+    # the helper because cleanup is restricted to its unique quarantine path.
+    if (-not (Test-Path -LiteralPath $Agent8088Home)) {
+        Remove-Item -LiteralPath $pendingMarker -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+
+    Write-Info "Waiting for a previous Agent8088 uninstall to finish..."
+    $deadline = (Get-Date).AddSeconds($PendingUninstallWaitSeconds)
+    while ((Test-Path -LiteralPath $pendingMarker) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not (Test-Path -LiteralPath $pendingMarker)) { return $true }
+
+    $cleanupLog = Get-Content -LiteralPath $pendingMarker -Raw -ErrorAction SilentlyContinue
+    Write-Err "A previous Agent8088 uninstall has not completed."
+    Write-Err "Close every Agent8088 session, then run the installer again."
+    if ($cleanupLog) { Write-Err "Cleanup log: $($cleanupLog.Trim())" }
+    return $false
+}
+
 function Install-Uv {
     $managedUv = Join-Path $Agent8088Home "bin\uv.exe"
 
@@ -1286,6 +1312,7 @@ Write-Banner
 $terminalAction = Ensure-SupportedTerminal
 if ($terminalAction -eq "relaunched") { exit 0 }
 if ($terminalAction -ne "continue") { exit 1 }
+if (-not (Wait-ForPendingUninstall)) { exit 1 }
 if (-not (Install-Uv)) { exit 1 }
 if (-not (Test-Python)) { exit 1 }
 if (-not (Install-Git)) { exit 1 }
