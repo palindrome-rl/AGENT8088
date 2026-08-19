@@ -1072,9 +1072,36 @@ _BOX_DRAWING_CHARS = set(
 )
 
 
+def _normalize_box_row_widths(lines):
+    """Re-pad bordered content rows to match the width of the block's own
+    frame lines.
+
+    A model asked to hand-draw a box usually gets the frame right (a run of
+    ═/─ is trivial to count) but often under-pads an individual content row
+    by a character or two, leaving its right-hand border short of every
+    other line. Fencing the block preserves that mistake verbatim — this
+    pass corrects it using the frame's own width as ground truth, without
+    needing to understand the row's internal column layout: any line whose
+    length falls short of the frame gets extra spaces inserted just before
+    its closing border character.
+    """
+    frame_widths = [len(ln) for ln in lines if ln and all(ch in _BOX_DRAWING_CHARS for ch in ln)]
+    if not frame_widths:
+        return lines
+
+    width = max(frame_widths)
+    fixed = []
+    for line in lines:
+        if (len(line) < width and line
+                and line[0] in _BOX_DRAWING_CHARS and line[-1] in _BOX_DRAWING_CHARS):
+            line = line[:-1] + " " * (width - len(line)) + line[-1]
+        fixed.append(line)
+    return fixed
+
+
 def _fence_ascii_art(text):
     """Wrap hand-drawn box-drawing art in fenced code blocks before markdown
-    rendering.
+    rendering, and repair its row widths either way.
 
     Rich's Markdown renders real ``|``-delimited tables and fenced code blocks
     by computing their layout itself, so those always come out aligned. But a
@@ -1082,7 +1109,10 @@ def _fence_ascii_art(text):
     bare paragraph gets reflowed like any other prose: Rich collapses the
     padding and wraps the line, destroying the shape. Detecting box-drawing
     characters outside an existing fence and fencing them preserves the
-    manual spacing verbatim, the same way a real code block would.
+    manual spacing verbatim, the same way a real code block would — and
+    since "verbatim" can still mean the model miscounted a row's padding,
+    _normalize_box_row_widths runs on every box-art block, fenced by the
+    model itself or by us, to straighten any row that came in short.
     """
     if not text or not any(ch in _BOX_DRAWING_CHARS for ch in text):
         return text
@@ -1091,11 +1121,12 @@ def _fence_ascii_art(text):
     in_fence = False
     fence_marker = None
     art_run = []
+    fence_buffer = None
 
     def flush_run():
         if art_run:
             out.append("```")
-            out.extend(art_run)
+            out.extend(_normalize_box_row_widths(art_run))
             out.append("```")
             art_run.clear()
 
@@ -1106,17 +1137,26 @@ def _fence_ascii_art(text):
             in_fence = True
             fence_marker = stripped[:3]
             out.append(line)
+            fence_buffer = []
             continue
         if in_fence:
-            out.append(line)
             if stripped.startswith(fence_marker):
+                out.extend(_normalize_box_row_widths(fence_buffer))
+                out.append(line)
                 in_fence = False
+                fence_buffer = None
+                continue
+            fence_buffer.append(line)
             continue
         if any(ch in _BOX_DRAWING_CHARS for ch in line):
             art_run.append(line)
             continue
         flush_run()
         out.append(line)
+    if in_fence:
+        # Unterminated fence (output cut off mid-block) — emit what we
+        # buffered as-is rather than guessing at a width to normalize to.
+        out.extend(fence_buffer or [])
     flush_run()
     return "\n".join(out)
 
