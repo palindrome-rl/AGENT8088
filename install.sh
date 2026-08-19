@@ -10,6 +10,61 @@
 # editable install, PATH/shim, config drop, and a setup wizard.
 # ============================================================================
 
+# ----------------------------------------------------------------------------
+# CRLF guard -- must be the very first executable code, and must stay one line
+# ----------------------------------------------------------------------------
+# A checkout made on Windows with core.autocrlf=true and then run under WSL or Git
+# Bash gives every line a trailing CR. bash reports that as `$'\r': command not
+# found`, or a syntax error, on a line that looks perfectly fine -- which sends
+# people hunting the wrong bug entirely.
+#
+# This is written as a single pipeline-and-list of simple commands, on purpose and
+# tested: under CRLF, bash still executes simple commands (the stray CR just ends
+# up inside an argument) but fails to parse ANY compound keyword. `case ... in` and
+# both forms of `if ... then ... fi` die with a syntax error before running, so a
+# guard written with either can never fire on the file it is meant to diagnose.
+# Keep this on one line, before everything else, and do not "tidy" it into an if.
+#
+# .gitattributes (install.sh text eol=lf) is the actual prevention; this is the
+# diagnostic for a checkout that predates it. `exit 1` picks up the stray CR and
+# so exits 255 with a "numeric argument required" note -- cosmetic, still non-zero.
+head -n 1 "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | grep -q "$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"${BASH_SOURCE[0]}\"" "  Or:   curl -fsSL <url> | bash   (always LF)" >&2 && exit 1
+
+# ----------------------------------------------------------------------------
+# Shell preflight -- must be the first executable code in this file
+# ----------------------------------------------------------------------------
+# This script uses bash arrays in ~30 places. Under dash, busybox ash or zsh those
+# are either a syntax error or silently wrong (zsh arrays are 1-indexed), and the
+# failure surfaces hundreds of lines later as something apparently unrelated. The
+# documented invocation is `curl -fsSL <url> | bash`, but `| sh` is the reflex, so
+# re-exec under bash rather than refusing -- and only refuse when there is no bash
+# at all.
+#
+# Written in strict POSIX sh, because it has to parse before we know what shell is
+# running it. Nothing above this point may use a bash-only construct.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        # When piped, $0 is "sh"/"bash" rather than a path, so re-execing $0 cannot
+        # work and there is no file to hand to bash either -- print the fix instead.
+        if [ -f "$0" ]; then exec bash "$0" "$@"; fi
+        echo "This installer needs bash. Re-run it as:" >&2
+        echo "  curl -fsSL <url> | bash" >&2
+        exit 1
+    fi
+    echo "ERROR: bash is required and was not found." >&2
+    echo "  Alpine / busybox:  apk add bash" >&2
+    echo "  Then:              curl -fsSL <url> | bash" >&2
+    exit 1
+fi
+
+# bash 3.2 is the floor: stock macOS ships 3.2.57 and will never be upgraded, so
+# this script is written to that level (no associative arrays, no ${x,,}, no
+# mapfile). scripts/check_installer_portability.sh keeps it that way. Anything
+# older than 3.1 predates `+=(` on arrays.
+case "${BASH_VERSINFO[0]:-0}" in
+    0|1|2) echo "ERROR: bash ${BASH_VERSION:-?} is too old; bash 3.2+ required." >&2; exit 1 ;;
+esac
+
 set -e
 
 # Guard against environment leakage when launched from another tool session.
@@ -24,6 +79,60 @@ fi
 
 # Prevent uv from discovering config files from the wrong user's home dir.
 export UV_NO_CONFIG=1
+
+# ----------------------------------------------------------------------------
+# Tool-level stall guards
+# ----------------------------------------------------------------------------
+# The wall-clock wrappers below are a backstop, not the first line of defence.
+# Without these, a registry that accepts the connection and then goes quiet burns
+# the ENTIRE wall-clock budget inside one dead request, so the wrapper's kill is
+# the first thing that happens rather than a fast failure and a retry against a
+# mirror that works. Each tool has its own stall detector; turn them all on.
+#
+# Only set when unset, so an operator on a genuinely slow link can raise them.
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-60}"
+export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-60}"
+export PIP_RETRIES="${PIP_RETRIES:-3}"
+
+# git aborts a transfer that stays under 1 KB/s for 60s. This is what bounds the
+# byte-moving part of `git clone` / `git fetch`; run_with_timeout around them
+# bounds the local object-write phase, which these two variables do not cover.
+export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}"
+export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-60}"
+
+# Curl flags for every download: give up on a dead TCP handshake, and abort a
+# transfer crawling under 1 KB/s for 30s. An array, not a space-separated string:
+# an unquoted string only word-splits in shells that do that, so the string form
+# silently degrades to one giant argument ("option --connect-timeout 20 ...: is
+# unknown") anywhere it is reused outside bash. The array is also SC2086-clean.
+CURL_STALL_FLAGS=(--connect-timeout 20 --speed-limit 1024 --speed-time 30)
+
+# ----------------------------------------------------------------------------
+# Proxy
+# ----------------------------------------------------------------------------
+# curl, uv, pip and git all read HTTP_PROXY / HTTPS_PROXY / NO_PROXY already, so
+# the work here is normalisation rather than plumbing: curl prefers the lowercase
+# spelling and Python's requests prefers the uppercase one, so a proxy exported in
+# only one case silently applies to only some of the tools -- which looks like
+# "the installer works up to the Python step".
+for _pv in http_proxy https_proxy no_proxy; do
+    # tr, not ${_pv^^}: uppercasing expansions needs bash 4 and macOS ships 3.2.
+    _pv_upper="$(printf '%s' "$_pv" | tr 'a-z' 'A-Z')"
+    eval "_pv_lower_val=\${$_pv:-}"
+    eval "_pv_upper_val=\${$_pv_upper:-}"
+    if [ -n "$_pv_lower_val" ] && [ -z "$_pv_upper_val" ]; then
+        export "$_pv_upper=$_pv_lower_val"
+    elif [ -n "$_pv_upper_val" ] && [ -z "$_pv_lower_val" ]; then
+        export "$_pv=$_pv_upper_val"
+    fi
+done
+unset _pv _pv_upper _pv_lower_val _pv_upper_val
+if [ -n "${HTTPS_PROXY:-}" ]; then
+    # ##*@ strips any credentials: HTTPS_PROXY frequently carries
+    # user:password@host, and echoing it would put a secret in the terminal
+    # scrollback and in any CI log that captures this run.
+    echo "Using proxy: ${HTTPS_PROXY##*@}"
+fi
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -87,6 +196,162 @@ log_success() { echo -e "\033[0;32m✓\033[0m $1"; }
 log_warn()    { echo -e "\033[0;33m⚠\033[0m $1"; }
 log_error()   { echo -e "\033[0;31m✗\033[0m $1"; }
 
+# ----------------------------------------------------------------------------
+# Timeouts for the network stages
+# ----------------------------------------------------------------------------
+# Every optional stage already tolerated a *failure* (`|| true` + log_warn), but
+# nothing protected any stage from a *hang*. A stalled `ollama pull`, an npm
+# registry that accepts the connection and then goes quiet, a wedged Ollama
+# daemon, or a package download that dribbles bytes forever left the installer
+# waiting indefinitely with no way out but Ctrl-C.
+#
+# Limits are deliberately moderate rather than maximally generous: an optional
+# stage degrades to a "run this to fix it later" message, so the cost of cutting
+# a slow-but-working download short is one rerun, while the cost of waiting too
+# long is an installer that looks frozen. Sized so a ~4 Mbps link finishes
+# comfortably.
+#
+# Scale them all for a slow connection:
+#   curl -fsSL <url> | AGENT8088_TIMEOUT_SCALE=3 bash
+TIMEOUT_SCALE="${AGENT8088_TIMEOUT_SCALE:-1}"
+case "$TIMEOUT_SCALE" in
+    ''|*[!0-9]*) TIMEOUT_SCALE=1 ;;
+esac
+[ "$TIMEOUT_SCALE" -lt 1 ] && TIMEOUT_SCALE=1
+
+T_OLLAMA_CHECK=$((15  * TIMEOUT_SCALE))   # nothing, local - instant unless the daemon is wedged
+T_OLLAMA_PULL=$((600  * TIMEOUT_SCALE))   # 274 MB embedding model
+T_NPM=$((300          * TIMEOUT_SCALE))   # 142 small packages, mostly round-trips
+T_CHROMIUM=$((600     * TIMEOUT_SCALE))   # ~150 MB browser download
+T_NODE_DL=$((180      * TIMEOUT_SCALE))   # ~30 MB tarball
+T_PIP=$((300          * TIMEOUT_SCALE))   # gateway extras: tens of MB of wheels
+T_GIT=$((600          * TIMEOUT_SCALE))   # shallow clone: small, but a stalled fetch hangs
+# The core editable install is the stage that actually hangs: it pulls
+# playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
+# premature cut fails the install outright -- but it is still the largest
+# download set here, so it gets the same 10m ceiling as Chromium rather than a
+# looser one. AGENT8088_TIMEOUT_SCALE raises it for a genuinely slow link.
+T_CORE_INSTALL=$((600 * TIMEOUT_SCALE))
+T_VENV=$((300         * TIMEOUT_SCALE))   # uv may download a CPython build
+T_UV_BOOT=$((300      * TIMEOUT_SCALE))   # uv self-installer
+
+# Does this `timeout` understand -k (kill-after)? GNU coreutils >= 7 and busybox
+# >= 1.30 do; older busybox treats -k as the command name and would run the
+# wrong thing entirely. Probed once, because getting it wrong is silent.
+_TIMEOUT_HAS_K=""
+_timeout_supports_k() {
+    if [ -z "$_TIMEOUT_HAS_K" ]; then
+        if timeout -k 1 1 true >/dev/null 2>&1; then _TIMEOUT_HAS_K=yes
+        else _TIMEOUT_HAS_K=no
+        fi
+    fi
+    [ "$_TIMEOUT_HAS_K" = yes ]
+}
+
+# Run a command under a wall-clock limit. macOS ships no `timeout` (it is GNU
+# coreutils), so prefer timeout/gtimeout where they exist and fall back to a
+# background watchdog that escalates TERM -> KILL.
+#
+# -k 10 matters: plain SIGTERM loses to a child that traps or ignores it (npm's
+# node wrapper does), so the child survives its own timeout and the installer
+# hangs anyway -- the "the timeout does not work" symptom.
+#
+# Returns 124 on timeout, matching GNU timeout, so callers can tell a hang from
+# an ordinary failure. A SIGKILLed child surfaces as 137 and a SIGTERMed one as
+# 143, so both are normalized to 124 -- warn_stage only recognizes 124 as a hang.
+# Must not let `wait` trip `set -e`.
+run_with_timeout() {
+    local _secs="$1"; shift
+    local _rc=0
+
+    if command -v timeout >/dev/null 2>&1; then
+        if _timeout_supports_k; then
+            timeout -k 10 "$_secs" "$@" || _rc=$?
+        else
+            timeout "$_secs" "$@" || _rc=$?
+        fi
+        case "$_rc" in 137|143) _rc=124 ;; esac
+        return $_rc
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout -k 10 "$_secs" "$@" || _rc=$?
+        case "$_rc" in 137|143) _rc=124 ;; esac
+        return $_rc
+    fi
+
+    "$@" &
+    local _pid=$!
+    (
+        _waited=0
+        while [ "$_waited" -lt "$_secs" ]; do
+            kill -0 "$_pid" 2>/dev/null || exit 0
+            sleep 1
+            _waited=$((_waited + 1))
+        done
+        kill -TERM "$_pid" 2>/dev/null || true
+        sleep 10
+        kill -KILL "$_pid" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
+    local _watchdog=$!
+
+    wait "$_pid" 2>/dev/null || _rc=$?
+    kill -KILL "$_watchdog" 2>/dev/null || true
+    wait "$_watchdog" 2>/dev/null || true
+
+    case "$_rc" in 137|143) _rc=124 ;; esac
+    return $_rc
+}
+
+# Skipped-stage ledger, printed as one block at the end of the run.
+#
+# Warnings are emitted as each stage runs, which on a multi-minute install means
+# they have scrolled well out of view by the time it finishes - the WhatsApp
+# bridge failing was reported and still went unnoticed. Recording them lets the
+# final summary state plainly what did not install and how to fix each one.
+# Fields are tab-separated: label, reason, fix command.
+SKIPPED_STAGES=()
+
+# NOTE for future edits: this appends to a shell array, so it must be called at
+# statement level. A call inside a pipeline or `( ... )` runs in a subshell, the
+# append is discarded when that subshell exits, and the stage then vanishes from
+# the final summary while still printing its warning -- a silent half-failure.
+record_skip() {
+    SKIPPED_STAGES+=("$1"$'\t'"$2"$'\t'"${3:-}")
+}
+
+# Warn about a stage that did not complete, naming a hang as a hang. "timed out
+# after 10m" and "failed" point at different fixes. The optional 5th argument is
+# the command that repairs it, surfaced again in the final summary.
+warn_stage() {
+    local _rc="$1" _secs="$2" _what="$3" _consequence="$4" _fix="${5:-}"
+    local _reason
+    if [ "$_rc" -eq 124 ]; then
+        _reason="timed out after $((_secs / 60))m"
+        log_warn "$_what timed out after $((_secs / 60))m - $_consequence"
+        log_warn "On a slow connection, rerun the installer with AGENT8088_TIMEOUT_SCALE=3"
+    else
+        _reason="failed (exit $_rc)"
+        log_warn "$_what failed - $_consequence"
+    fi
+    record_skip "$_what" "$_reason" "$_fix"
+}
+
+# Final block: what did not install, why, and the command that fixes it. Silent
+# when everything succeeded.
+print_skipped_summary() {
+    [ "${#SKIPPED_STAGES[@]}" -eq 0 ] && return 0
+    local _entry _label _reason _fix
+    echo ""
+    echo -e "\033[0;33m${#SKIPPED_STAGES[@]} optional component(s) did not install:\033[0m"
+    for _entry in "${SKIPPED_STAGES[@]}"; do
+        IFS=$'\t' read -r _label _reason _fix <<< "$_entry"
+        echo -e "  \033[0;33m•\033[0m $_label — $_reason"
+        [ -n "$_fix" ] && echo "      fix: $_fix"
+    done
+    echo ""
+    echo "  The core agent is installed and works without these."
+}
+
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
 }
@@ -135,9 +400,13 @@ detect_os() {
             else
                 OS="linux"
                 if [ -f /etc/os-release ]; then
-                    . /etc/os-release
-                    DISTRO="$ID"
-                    DISTRO_VERSION="${VERSION_ID:-}"
+                    # Read in a subshell. Sourcing it directly defines NAME,
+                    # VERSION, ID, PRETTY_NAME, HOME_URL and more in the
+                    # installer's own shell, where they can collide with names
+                    # used later -- a distro file is not ours to trust with our
+                    # namespace.
+                    DISTRO="$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-unknown}")"
+                    DISTRO_VERSION="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-}")"
                 else
                     DISTRO="unknown"; DISTRO_VERSION=""
                 fi
@@ -153,8 +422,13 @@ detect_os() {
             exit 1
             ;;
         *)
-            OS="unknown"; DISTRO="unknown"
-            log_warn "Unknown operating system"
+            # Previously this warned and carried on, so a BSD reached the uv/venv
+            # stages and failed there with something that named neither the OS nor
+            # the real problem. Refuse here, where the message can be useful.
+            log_error "Unsupported operating system: $(uname -s)"
+            log_info "Supported: Linux, macOS, WSL2. Windows uses install.ps1."
+            log_info "On another Unix, install manually:  pip install agent8088"
+            exit 1
             ;;
     esac
     log_success "Detected: $OS ($DISTRO)"
@@ -184,13 +458,24 @@ install_uv() {
     # on empty stdin).
     local _uv_installer
     _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/agent8088-uv.$$.sh")"
-    if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
+    if ! curl -LsSf "${CURL_STALL_FLAGS[@]}" --max-time 120 \
+            https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
         log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
         log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
         rm -f "$_uv_installer"
         exit 1
     fi
-    if UV_UNMANAGED_INSTALL="$AGENT8088_HOME/bin" sh "$_uv_installer" >/dev/null 2>&1; then
+    _uv_boot_rc=0
+    run_with_timeout "$T_UV_BOOT" \
+        env UV_UNMANAGED_INSTALL="$AGENT8088_HOME/bin" sh "$_uv_installer" >/dev/null 2>&1 \
+        || _uv_boot_rc=$?
+    if [ "$_uv_boot_rc" -eq 124 ]; then
+        log_error "The uv installer timed out after $((T_UV_BOOT / 60))m"
+        log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+        rm -f "$_uv_installer"
+        exit 1
+    fi
+    if [ "$_uv_boot_rc" -eq 0 ]; then
         rm -f "$_uv_installer"
         if [ -x "$_managed_uv" ]; then
             UV_CMD="$_managed_uv"
@@ -373,14 +658,24 @@ clone_repo() {
             git stash push --include-untracked -m "agent8088-install-autostash-$(date -u +%Y%m%d-%H%M%S)" >/dev/null 2>&1 || true
         fi
         git remote set-url origin "$REPO_URL" 2>/dev/null || true
-        git fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1
+        # GIT_HTTP_LOW_SPEED_* bounds the byte-moving part; this bounds the rest
+        # (ref negotiation, local object write), which those variables do not cover.
+        run_with_timeout "$T_GIT" git fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1 || {
+            log_error "git fetch timed out or failed after $((T_GIT / 60))m"
+            log_error "Check your connection, then rerun. On a slow link: AGENT8088_TIMEOUT_SCALE=3"
+            exit 1
+        }
         git checkout -B "$BRANCH" FETCH_HEAD >/dev/null 2>&1
         git reset --hard FETCH_HEAD >/dev/null 2>&1
     else
         log_info "Cloning Agent8088 repository..."
         rm -rf "$INSTALL_DIR"
         mkdir -p "$AGENT8088_HOME"
-        git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+        run_with_timeout "$T_GIT" git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR" || {
+            log_error "git clone timed out or failed after $((T_GIT / 60))m"
+            log_error "Check your connection, then rerun. On a slow link: AGENT8088_TIMEOUT_SCALE=3"
+            exit 1
+        }
         cd "$INSTALL_DIR"
         git config core.autocrlf false
         FRESH_INSTALL=true
@@ -397,11 +692,23 @@ install_deps() {
     local _py="$INSTALL_DIR/venv/bin/python"
     if [ "$DISTRO" = "termux" ]; then
         log_info "Creating venv (stdlib) and installing via pip..."
-        python -m venv "$INSTALL_DIR/venv"
+        run_with_timeout "$T_VENV" python -m venv "$INSTALL_DIR/venv" || {
+            log_error "venv creation timed out or failed"; exit 1; }
         # shellcheck disable=SC1091
-        source "$INSTALL_DIR/venv/bin/activate"
-        pip install --upgrade pip >/dev/null 2>&1
-        pip install --upgrade --force-reinstall -e . >/dev/null 2>&1 || { log_error "pip install failed"; exit 1; }
+        . "$INSTALL_DIR/venv/bin/activate"
+        # Cosmetic, and it failing must not abort an otherwise-fine install.
+        run_with_timeout "$T_CORE_INSTALL" pip install --upgrade pip >/dev/null 2>&1 || true
+        _core_rc=0
+        run_with_timeout "$T_CORE_INSTALL" pip install --upgrade --force-reinstall -e . \
+            >/dev/null 2>&1 || _core_rc=$?
+        if [ "$_core_rc" -eq 124 ]; then
+            log_error "pip install timed out after $((T_CORE_INSTALL / 60))m - a package download stalled."
+            log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+            exit 1
+        elif [ "$_core_rc" -ne 0 ]; then
+            log_error "pip install failed (exit $_core_rc)"
+            exit 1
+        fi
     else
         log_info "Creating venv and installing via uv..."
         # Re-running the installer over an existing install is a supported path —
@@ -413,14 +720,16 @@ install_deps() {
         #
         # --allow-existing reuses the venv, so an update keeps the packages it
         # already has instead of re-downloading them.
-        if ! "$UV_CMD" venv --python "$PYTHON_PATH" --allow-existing "$INSTALL_DIR/venv" >/dev/null 2>&1 \
+        if ! run_with_timeout "$T_VENV" "$UV_CMD" venv --python "$PYTHON_PATH" \
+                --allow-existing "$INSTALL_DIR/venv" >/dev/null 2>&1 \
                 || [ ! -x "$_py" ]; then
             # Reuse can legitimately fail: a venv built by a Python that has
             # since been removed or upgraded, or one left half-written by an
             # interrupted run. That is not something to hand back to the user as
             # a decision — rebuild it.
             log_warn "Existing virtualenv is not usable — rebuilding it"
-            "$UV_CMD" venv --python "$PYTHON_PATH" --clear "$INSTALL_DIR/venv" >/dev/null 2>&1 || {
+            run_with_timeout "$T_VENV" "$UV_CMD" venv --python "$PYTHON_PATH" \
+                    --clear "$INSTALL_DIR/venv" >/dev/null 2>&1 || {
                 log_error "Could not create the virtualenv at $INSTALL_DIR/venv"
                 log_error "Run this to see the underlying error:"
                 log_error "  $UV_CMD venv --python $PYTHON_PATH --clear $INSTALL_DIR/venv"
@@ -429,13 +738,33 @@ install_deps() {
                 exit 1
             }
         fi
-        "$UV_CMD" pip install --python "$_py" --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || {
-            log_error "uv pip install failed; trying with --all-extras"
-            "$UV_CMD" pip install --python "$_py" --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || {
-                log_error "Failed to install agent8088"
+        # This is the stage that actually hangs: playwright's and ddgs's native
+        # wheels plus mcp and Pillow. Mandatory, so a timeout is a hard failure
+        # with a specific message rather than a skip.
+        _core_rc=0
+        run_with_timeout "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
+            --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || _core_rc=$?
+        if [ "$_core_rc" -eq 124 ]; then
+            log_error "uv pip install timed out after $((T_CORE_INSTALL / 60))m - a package download stalled."
+            log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+            log_error "Or see the underlying error with:"
+            log_error "  $UV_CMD pip install --python $_py -e \"$INSTALL_DIR\""
+            exit 1
+        elif [ "$_core_rc" -ne 0 ]; then
+            log_error "uv pip install failed (exit $_core_rc); retrying with --reinstall"
+            _core_rc=0
+            run_with_timeout "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
+                --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || _core_rc=$?
+            if [ "$_core_rc" -ne 0 ]; then
+                if [ "$_core_rc" -eq 124 ]; then
+                    log_error "Retry also timed out after $((T_CORE_INSTALL / 60))m"
+                    log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+                else
+                    log_error "Failed to install agent8088 (exit $_core_rc)"
+                fi
                 exit 1
-            }
-        }
+            fi
+        fi
     fi
     log_success "agent8088 installed (editable)"
 
@@ -444,12 +773,19 @@ install_deps() {
     # discord.py, python-telegram-bot. Without these, runner.py:463-497 guards
     # each adapter with try/except ImportError and silently no-ops.
     log_info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
+    _gw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
-            log_warn "Gateway extras install failed - core agent still works"
+        run_with_timeout "$T_PIP" pip install -e ".[gateway]" >/dev/null 2>&1 || _gw_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 && GATEWAY_EXTRAS_INSTALLED=true || \
-            log_warn "Gateway extras install failed - core agent still works"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 || _gw_rc=$?
+    fi
+    if [ "$_gw_rc" -eq 0 ]; then
+        GATEWAY_EXTRAS_INSTALLED=true
+    else
+        warn_stage "$_gw_rc" "$T_PIP" "Gateway adapter extras" \
+            "Slack/Discord/Telegram adapters unavailable" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[gateway]\""
     fi
     [ "$GATEWAY_EXTRAS_INSTALLED" = true ] && log_success "Gateway adapters installed"
 
@@ -457,12 +793,19 @@ install_deps() {
     # Installed everywhere so web_search keeps its no-key fallback; non-fatal
     # because ddgs->primp has no Android wheel and cannot build under Termux.
     log_info "Installing keyless web search backend (ddgs)..."
+    _search_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
-            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+        run_with_timeout "$T_PIP" pip install -e ".[search]" >/dev/null 2>&1 || _search_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[search]" >/dev/null 2>&1 && SEARCH_EXTRAS_INSTALLED=true || \
-            log_warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[search]" >/dev/null 2>&1 || _search_rc=$?
+    fi
+    if [ "$_search_rc" -eq 0 ]; then
+        SEARCH_EXTRAS_INSTALLED=true
+    else
+        warn_stage "$_search_rc" "$T_PIP" "Keyless web search backend (ddgs)" \
+            "configure SearXNG or an API-key backend for web_search" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[search]\""
     fi
     [ "$SEARCH_EXTRAS_INSTALLED" = true ] && log_success "Keyless web search backend installed"
 
@@ -473,22 +816,38 @@ install_deps() {
     # fail the whole install.
     log_info "Installing Playwright (optional, for browse_page)..."
     local _playwright_installed=false
+    _pw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        pip install -e ".[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
-            log_warn "Playwright install failed - browse_page will show install instructions"
+        run_with_timeout "$T_PIP" pip install -e ".[browser]" >/dev/null 2>&1 || _pw_rc=$?
     else
-        "$UV_CMD" pip install --python "$_py" -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 && _playwright_installed=true || \
-            log_warn "Playwright install failed - browse_page will show install instructions"
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 || _pw_rc=$?
+    fi
+    if [ "$_pw_rc" -eq 0 ]; then
+        _playwright_installed=true
+    else
+        warn_stage "$_pw_rc" "$T_PIP" "Playwright" \
+            "browse_page will show install instructions" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[browser]\""
     fi
     if [ "$_playwright_installed" = true ]; then
         log_info "Installing Playwright Chromium browser (~280 MB)..."
-        "$_py" -m playwright install chromium >/dev/null 2>&1 && CHROMIUM_INSTALLED=true || \
-            log_warn "Chromium download failed - browse_page will show install instructions"
+        _chromium_rc=0
+        run_with_timeout "$T_CHROMIUM" "$_py" -m playwright install chromium \
+            >/dev/null 2>&1 || _chromium_rc=$?
+        if [ "$_chromium_rc" -eq 0 ]; then
+            CHROMIUM_INSTALLED=true
+        else
+            warn_stage "$_chromium_rc" "$T_CHROMIUM" "Chromium browser" \
+                "browse_page will show install instructions" \
+                "$_py -m playwright install chromium"
+        fi
         if [ "$CHROMIUM_INSTALLED" = true ] && [ "$OS" = "linux" ]; then
             log_info "Installing Playwright Chromium system dependencies..."
             local _playwright_sudo=""
             [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _playwright_sudo="sudo"
-            $_playwright_sudo "$_py" -m playwright install-deps chromium >/dev/null 2>&1 || \
+            run_with_timeout "$T_PIP" $_playwright_sudo "$_py" -m playwright install-deps chromium \
+                >/dev/null 2>&1 || \
                 log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
         fi
         [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
@@ -601,7 +960,7 @@ install_node_bridge() {
             esac
             local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
             local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
-            if curl -fsSL "$_url" -o "$_tmp" 2>/dev/null; then
+            if run_with_timeout "$T_NODE_DL" curl -fsSL "${CURL_STALL_FLAGS[@]}" "$_url" -o "$_tmp" 2>/dev/null; then
                 mkdir -p "$AGENT8088_HOME/node"
                 # Guarded: Node is optional (WhatsApp bridge only), so a bad
                 # tarball or missing decompressor must warn, not abort the run.
@@ -639,15 +998,22 @@ install_node_bridge() {
     fi
 
     log_info "Installing WhatsApp bridge npm dependencies..."
-    if npm install --prefix "$_bridge_dir" --no-audit --no-fund >/dev/null 2>&1; then
+    _npm_rc=0
+    run_with_timeout "$T_NPM" npm install --prefix "$_bridge_dir" --no-audit --no-fund \
+        >/dev/null 2>&1 || _npm_rc=$?
+    if [ "$_npm_rc" -eq 0 ]; then
         if [ -d "$_bridge_dir/node_modules" ]; then
             WHATSAPP_BRIDGE_READY=true
             log_success "WhatsApp bridge npm dependencies installed"
         else
             log_warn "WhatsApp bridge npm install reported success but node_modules missing"
+            record_skip "WhatsApp bridge" "npm reported success but node_modules missing" \
+                "npm install --prefix $_bridge_dir"
         fi
     else
-        log_warn "WhatsApp bridge npm install failed"
+        warn_stage "$_npm_rc" "$T_NPM" "WhatsApp bridge npm dependencies" \
+            "WhatsApp adapter unavailable" \
+            "npm install --prefix $_bridge_dir"
     fi
 }
 
@@ -678,16 +1044,22 @@ install_embedding_model() {
         log_info "Ollama not found - memory will embed through your configured provider"
         return 0
     fi
-    if ollama list 2>/dev/null | grep -q "^${EMBED_MODEL}"; then
+    # `ollama list` talks to the daemon on :11434. It answers instantly when that
+    # daemon is healthy and never when it is wedged, which is why it is guarded at
+    # all despite being a local call.
+    if run_with_timeout "$T_OLLAMA_CHECK" ollama list 2>/dev/null | grep -q "^${EMBED_MODEL}"; then
         log_success "Embedding model $EMBED_MODEL already present"
         return 0
     fi
     log_info "Pulling embedding model $EMBED_MODEL (274 MB, for memory recall)..."
-    if ollama pull "$EMBED_MODEL" >/dev/null 2>&1; then
+    _pull_rc=0
+    run_with_timeout "$T_OLLAMA_PULL" ollama pull "$EMBED_MODEL" >/dev/null 2>&1 || _pull_rc=$?
+    if [ "$_pull_rc" -eq 0 ]; then
         log_success "Embedding model $EMBED_MODEL installed"
     else
-        log_warn "Could not pull $EMBED_MODEL - memory recall will use keyword search only"
-        log_warn "Fix it later with:  ollama pull $EMBED_MODEL"
+        warn_stage "$_pull_rc" "$T_OLLAMA_PULL" "Embedding model $EMBED_MODEL" \
+            "memory recall will use keyword search only" \
+            "ollama pull $EMBED_MODEL"
     fi
 }
 
@@ -722,6 +1094,8 @@ install_native_sandbox() {
     local _py="$INSTALL_DIR/venv/bin/python"
     if [ ! -x "$_py" ]; then
         log_warn "venv python not found at $_py - skipping sandbox setup"
+        record_skip "Native sandbox runtime" "venv python not found" \
+            "agent8088 --sandbox-setup"
         return 0
     fi
 
@@ -799,6 +1173,8 @@ install_native_sandbox() {
     else
         [ -n "$_sandbox_setup" ] && log_warn "$_sandbox_setup"
         log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
+        record_skip "Native sandbox runtime" "setup did not complete" \
+            "agent8088 --sandbox-setup   (Docker is used automatically meanwhile)"
     fi
 }
 
@@ -908,258 +1284,6 @@ drop_config() {
 }
 
 # ----------------------------------------------------------------------------
-# Stage 8: Setup wizard
-# ----------------------------------------------------------------------------
-BUILTIN_MODEL_PROVIDERS=(
-    ollama openrouter openai gemini cerebras deepseek groq mistral moonshot qwen ollama-cloud copilot
-)
-
-provider_label() {
-    case "$1" in
-        ollama)       echo "Ollama (local)" ;;
-        openrouter)   echo "OpenRouter" ;;
-        openai)       echo "OpenAI" ;;
-        gemini)       echo "Google Gemini" ;;
-        cerebras)     echo "Cerebras" ;;
-        deepseek)     echo "DeepSeek" ;;
-        groq)         echo "Groq" ;;
-        mistral)      echo "Mistral" ;;
-        moonshot)     echo "Moonshot (Kimi)" ;;
-        qwen)         echo "Qwen (DashScope)" ;;
-        ollama-cloud) echo "Ollama Cloud" ;;
-        copilot)      echo "GitHub Copilot" ;;
-        *)            echo "$1" ;;
-    esac
-}
-
-provider_base_url() {
-    case "$1" in
-        ollama)       echo "http://localhost:11434/v1" ;;
-        openrouter)   echo "https://openrouter.ai/api/v1" ;;
-        openai)       echo "https://api.openai.com/v1" ;;
-        gemini)       echo "https://generativelanguage.googleapis.com/v1beta/openai/" ;;
-        cerebras)     echo "https://api.cerebras.ai/v1" ;;
-        deepseek)     echo "https://api.deepseek.com/v1" ;;
-        groq)         echo "https://api.groq.com/openai/v1" ;;
-        mistral)      echo "https://api.mistral.ai/v1" ;;
-        moonshot)     echo "https://api.moonshot.ai/v1" ;;
-        qwen)         echo "https://dashscope.aliyuncs.com/compatible-mode/v1" ;;
-        ollama-cloud) echo "https://ollama.com/v1" ;;
-        copilot)      echo "https://api.githubcopilot.com" ;;
-        *)            return 1 ;;
-    esac
-}
-
-provider_default_model() {
-    case "$1" in
-        ollama)       echo "qwen14b-tooluse-v3" ;;
-        openrouter)   echo "anthropic/claude-sonnet-4" ;;
-        openai)       echo "gpt-4o" ;;
-        gemini)       echo "gemini-2.0-flash" ;;
-        cerebras)     echo "gpt-oss-120b" ;;
-        deepseek)     echo "deepseek-chat" ;;
-        groq)         echo "llama-3.3-70b-versatile" ;;
-        mistral)      echo "mistral-small-latest" ;;
-        moonshot)     echo "kimi-k2.6" ;;
-        qwen)         echo "qwen-plus" ;;
-        ollama-cloud) echo "gpt-oss:120b" ;;
-        copilot)      echo "gpt-4o-mini" ;;
-        *)            echo "model-name" ;;
-    esac
-}
-
-is_builtin_provider() {
-    local candidate="$1" provider
-    for provider in "${BUILTIN_MODEL_PROVIDERS[@]}"; do
-        [ "$candidate" = "$provider" ] && return 0
-    done
-    return 1
-}
-
-read_setup_value() {
-    local prompt="$1" answer=""
-    if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -p "$prompt" answer || answer=""
-    elif (: </dev/tty) 2>/dev/null; then
-        printf "%s" "$prompt" > /dev/tty
-        IFS= read -r answer < /dev/tty || answer=""
-    fi
-    printf "%s" "$answer"
-}
-
-read_secret_setup_value() {
-    local prompt="$1" answer=""
-    if [ "$IS_INTERACTIVE" = true ]; then
-        read -r -s -p "$prompt" answer || answer=""
-        printf "\n" >&2
-    elif (: </dev/tty) 2>/dev/null; then
-        printf "%s" "$prompt" > /dev/tty
-        IFS= read -r -s answer < /dev/tty || answer=""
-        printf "\n" > /dev/tty
-    fi
-    printf "%s" "$answer"
-}
-
-select_model_provider() {
-    local current_provider="$1" answer current_lower provider i
-    echo "Select model provider:" >&2
-    for i in "${!BUILTIN_MODEL_PROVIDERS[@]}"; do
-        provider="${BUILTIN_MODEL_PROVIDERS[$i]}"
-        printf "  %2d) %s (%s) - default: %s\n" "$((i + 1))" "$(provider_label "$provider")" "$provider" "$(provider_default_model "$provider")" >&2
-    done
-    printf "  %2d) %s\n" "$((${#BUILTIN_MODEL_PROVIDERS[@]} + 1))" "Custom OpenAI-compatible" >&2
-    answer="$(read_setup_value "Choice [$current_provider]: ")"
-    answer="${answer:-$current_provider}"
-    if [[ "$answer" =~ ^[0-9]+$ ]]; then
-        if [ "$answer" -ge 1 ] && [ "$answer" -le "${#BUILTIN_MODEL_PROVIDERS[@]}" ]; then
-            printf "%s" "${BUILTIN_MODEL_PROVIDERS[$((answer - 1))]}"
-            return 0
-        fi
-        if [ "$answer" -eq "$((${#BUILTIN_MODEL_PROVIDERS[@]} + 1))" ]; then
-            printf "%s" "__custom__"
-            return 0
-        fi
-    fi
-    answer="$(printf "%s" "$answer" | tr '[:upper:]' '[:lower:]')"
-    current_lower="$(printf "%s" "$current_provider" | tr '[:upper:]' '[:lower:]')"
-    if is_builtin_provider "$answer"; then
-        printf "%s" "$answer"
-    elif [ "$answer" = "$current_lower" ]; then
-        printf "%s" "$current_provider"
-    elif [ "$answer" = "custom" ] || [ "$answer" = "custom openai-compatible" ] || [ "$answer" = "openai-compatible" ]; then
-        printf "%s" "__custom__"
-    else
-        printf "Unknown provider '%s'; keeping %s\n" "$answer" "$current_provider" >&2
-        printf "%s" "$current_provider"
-    fi
-}
-
-run_setup_wizard() {
-    if [ "$SKIP_SETUP" = true ]; then
-        log_info "Skipping setup wizard (--skip-setup)"
-        return 0
-    fi
-
-    # Auto-skip if no TTY (probe with (: </dev/tty) — Docker has the node but
-    # opening it fails ENXIO).
-    if [ "$IS_INTERACTIVE" = false ] && ! (: </dev/tty) 2>/dev/null; then
-        log_info "No TTY detected — skipping setup wizard"
-        log_info "Edit $AGENT8088_HOME/config.txt manually to configure your model."
-        return 0
-    fi
-
-    local config="$AGENT8088_HOME/config.txt"
-    log_info "Setup wizard"
-    log_info "  (Press Enter to keep the default shown in brackets)"
-
-    # working directory (allowed_paths)
-    local current_paths
-    current_paths="$(grep '^allowed_paths=' "$config" 2>/dev/null | cut -d= -f2- || true)"
-    current_paths="${current_paths:-~}"
-    local new_paths
-    new_paths="$(read_setup_value "Working directory [$current_paths]: ")"
-    new_paths="${new_paths:-$current_paths}"
-
-    # provider picker
-    local current_provider
-    current_provider="$(grep '^default_provider=' "$config" 2>/dev/null | cut -d= -f2- || true)"
-    current_provider="${current_provider:-ollama}"
-    local selected_provider
-    selected_provider="$(select_model_provider "$current_provider")"
-    local new_provider="$selected_provider"
-    local base_url=""
-    if [ "$selected_provider" = "__custom__" ]; then
-        local default_custom="custom"
-        is_builtin_provider "$current_provider" || default_custom="$current_provider"
-        new_provider="$(read_setup_value "Custom provider name [$default_custom]: ")"
-        new_provider="${new_provider:-$default_custom}"
-        if [[ ! "$new_provider" =~ ^[A-Za-z0-9_-]+$ ]]; then
-            log_error "Custom provider names use letters, numbers, _ or -"
-            exit 1
-        fi
-        local current_url
-        current_url="$(grep "^provider\.${new_provider}\.base_url=" "$config" 2>/dev/null | cut -d= -f2- || true)"
-        local url_label="required"
-        [ -n "$current_url" ] && url_label="Enter keeps current"
-        base_url="$(read_setup_value "OpenAI-compatible URL [$url_label]: ")"
-        base_url="${base_url:-$current_url}"
-        if [ -z "$base_url" ]; then
-            log_error "OpenAI-compatible URL is required for custom providers"
-            exit 1
-        fi
-    elif ! is_builtin_provider "$new_provider"; then
-        base_url="$(grep "^provider\.${new_provider}\.base_url=" "$config" 2>/dev/null | cut -d= -f2- || true)"
-        if [ -z "$base_url" ]; then
-            log_error "OpenAI-compatible URL is required for custom providers"
-            exit 1
-        fi
-    fi
-
-    # model name
-    local default_model
-    default_model="$(provider_default_model "$new_provider")"
-    local current_model
-    current_model="$(grep "^provider\.${new_provider}\.model=" "$config" 2>/dev/null | cut -d= -f2- || true)"
-    current_model="${current_model:-$default_model}"
-    local new_model
-    new_model="$(read_setup_value "Model name [$current_model]: ")"
-    new_model="${new_model:-$current_model}"
-
-    # api_key
-    local current_key
-    current_key="$(grep "^provider\.${new_provider}\.api_key=" "$config" 2>/dev/null | cut -d= -f2- || true)"
-    local new_key
-    new_key="$(read_secret_setup_value "API key for $new_provider [hidden; Enter keeps existing/skips]: ")"
-
-    # web search URL (optional)
-    local current_search
-    current_search="$(grep '^search_base_url=' "$config" 2>/dev/null | cut -d= -f2- || true)"
-    local new_search
-    new_search="$(read_setup_value "Web search URL (SearXNG) [Enter keeps current; type none to disable]: ")"
-
-    if [ -z "$base_url" ]; then
-        base_url="$(provider_base_url "$new_provider" || true)"
-    fi
-
-    # Write back
-    sed -i.bak "s|^allowed_paths=.*|allowed_paths=$new_paths|" "$config"
-    local project_root="${new_paths%%,*}"
-    project_root="$(printf "%s" "$project_root" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    if grep -q '^#*[[:space:]]*project_root=' "$config"; then
-        sed -i.bak "s|^#*[[:space:]]*project_root=.*|project_root=$project_root|" "$config"
-    else
-        echo "project_root=$project_root" >> "$config"
-    fi
-    sed -i.bak "s|^default_provider=.*|default_provider=$new_provider|" "$config"
-    grep -q "^default_provider=" "$config" || echo "default_provider=$new_provider" >> "$config"
-    sed -i.bak "s|^provider\.${new_provider}\.base_url=.*|provider.${new_provider}.base_url=$base_url|" "$config"
-    grep -q "^provider\.${new_provider}\.base_url=" "$config" || echo "provider.${new_provider}.base_url=$base_url" >> "$config"
-    if ! is_builtin_provider "$new_provider"; then
-        sed -i.bak "s|^provider\.${new_provider}\.api_mode=.*|provider.${new_provider}.api_mode=openai|" "$config"
-        grep -q "^provider\.${new_provider}\.api_mode=" "$config" || echo "provider.${new_provider}.api_mode=openai" >> "$config"
-    fi
-    sed -i.bak "s|^provider\.${new_provider}\.model=.*|provider.${new_provider}.model=$new_model|" "$config"
-    grep -q "^provider\.${new_provider}\.model=" "$config" || echo "provider.${new_provider}.model=$new_model" >> "$config"
-    if [ -n "$new_key" ]; then
-        sed -i.bak "s|^provider\.${new_provider}\.api_key=.*|provider.${new_provider}.api_key=$new_key|" "$config"
-        grep -q "^provider\.${new_provider}\.api_key=" "$config" || echo "provider.${new_provider}.api_key=$new_key" >> "$config"
-    fi
-    # Anchored at column 0 so ONLY an active key is touched. config.txt documents
-    # several commented `#   search_base_url=<example>` lines; a `^#*[[:space:]]*`
-    # pattern matched every one of them and rewrote all four into duplicate active
-    # keys, wiping the examples. No active line to replace is fine — the grep below
-    # appends one.
-    if [ "$(printf "%s" "$new_search" | tr '[:upper:]' '[:lower:]')" = "none" ]; then
-        sed -i.bak '/^search_base_url=.*/d' "$config"
-    elif [ -n "$new_search" ]; then
-        sed -i.bak "s|^search_base_url=.*|search_base_url=$new_search|" "$config"
-        grep -q "^search_base_url=" "$config" || echo "search_base_url=$new_search" >> "$config"
-    fi
-    rm -f "$config.bak"
-    log_success "Config written to $config"
-}
-
-# ----------------------------------------------------------------------------
 # Stage 9: Verify + finish
 # ----------------------------------------------------------------------------
 verify_install() {
@@ -1203,6 +1327,10 @@ verify_install() {
     echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
+    # Last, so it is the final thing on screen: per-stage warnings scrolled out of
+    # view minutes ago on a multi-minute install, which is how a failed WhatsApp
+    # bridge got reported and still went unnoticed.
+    print_skipped_summary
 }
 
 run_agent8088_command() {
@@ -1213,31 +1341,57 @@ run_agent8088_command() {
     fi
 }
 
+# Runs on EVERY invocation, not only on a fresh install.
+#
+# The removed gate was `FRESH_INSTALL != true && CONFIG_CREATED != true`, which
+# skipped setup on any re-run over an existing install that already had a config.
+# That is exactly the run where setup matters most: when an optional stage fails the
+# core agent still installs, so the user re-runs the installer -- and got no prompt
+# for working directory, model or web search, and no hint that `agent8088 --setup`
+# is the thing to run.
+#
+# Two gates remain, and both are there because the prompt is physically impossible,
+# not because it is unwanted:
+#   --skip-setup   an explicit request, honoured
+#   no /dev/tty    nothing to read from; the message names the manual command
 run_initial_setup() {
-    if [ "$FRESH_INSTALL" != true ] && [ "$CONFIG_CREATED" != true ]; then
-        log_info "Existing installation and config found — skipping first-run setup."
-        return 0
-    fi
     if [ "$SKIP_SETUP" = true ]; then
-        log_info "Skipping first-run setup (--skip-setup)"
+        log_info "Skipping setup (--skip-setup)"
+        log_info "Configure later with: agent8088 --setup"
         return 0
     fi
     if [ "$IS_INTERACTIVE" = false ] && ! (: </dev/tty) 2>/dev/null; then
-        log_info "No TTY detected — skipping first-run setup"
+        log_info "No TTY detected — skipping setup"
         log_info "Run agent8088 --setup later to configure your model."
         return 0
     fi
 
+    # Prefer the shim, fall back to the venv interpreter. setup_path runs before us,
+    # but a PATH-link directory that is not writable leaves no shim -- and skipping
+    # setup because a symlink is missing, when the module is right there and
+    # importable, is the wrong trade.
     local shim="$(get_command_link_dir)/agent8088"
-    if [ ! -x "$shim" ]; then
-        log_warn "agent8088 command is not ready yet; run agent8088 --setup later."
+    local venv_py="$INSTALL_DIR/venv/bin/python"
+    local setup_cmd=()
+    if [ -x "$shim" ]; then
+        setup_cmd=("$shim" --setup)
+    elif [ -x "$venv_py" ]; then
+        log_warn "agent8088 shim not found; running setup via the venv interpreter"
+        setup_cmd=("$venv_py" -m agent8088.cli --setup)
+    else
+        log_warn "agent8088 is not runnable yet; run agent8088 --setup later."
+        record_skip "First-run setup" "agent8088 not runnable" "agent8088 --setup"
         return 0
     fi
-    log_info "Starting first-run setup..."
-    if run_agent8088_command "$shim" --setup; then
+
+    log_info "Starting setup..."
+    if run_agent8088_command "${setup_cmd[@]}"; then
         INITIAL_SETUP_RAN=true
     else
-        log_warn "First-run setup did not complete; run agent8088 --setup later."
+        # Recorded, not just warned: on a multi-minute install this line scrolls out
+        # of view, which is how a skipped setup went unnoticed.
+        log_warn "Setup did not complete; run agent8088 --setup later."
+        record_skip "First-run setup" "did not complete" "agent8088 --setup"
     fi
 }
 

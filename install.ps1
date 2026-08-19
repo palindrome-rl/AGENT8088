@@ -28,6 +28,75 @@ $ErrorActionPreference = "Continue"
 # single core and throttling downloads by 10-100x.
 $ProgressPreference = "SilentlyContinue"
 
+# ----------------------------------------------------------------------------
+# TLS -- must run before ANY https call, including the terminal gate's relaunch
+# ----------------------------------------------------------------------------
+# Windows PowerShell 5.1 on Windows 10 pre-1809 and Server 2016/2019 defaults
+# ServicePointManager.SecurityProtocol to Ssl3, Tls -- TLS 1.0. Every host this
+# installer touches (astral.sh, github.com, nodejs.org, raw.githubusercontent.com)
+# has required TLS 1.2 since 2018, so on those systems the first https call dies
+# with "Could not create SSL/TLS secure channel" -- a message that names TLS
+# rather than the missing setting.
+#
+# Ordering is load-bearing: Start-InstallerInWindowsTerminal re-downloads this
+# script with Invoke-RestMethod when $PSCommandPath is empty, which is the case on
+# the documented `iex (irm ...)` path. That relaunch needs TLS 1.2 too.
+#
+# PowerShell 7 negotiates via the OS and ignores this property, so it is a no-op
+# there. -bor rather than assignment: leaving the existing flags alone means a
+# host that still requires TLS 1.0 (a corporate TLS-terminating proxy) keeps
+# working.
+try {
+    $tlsWanted = [Net.SecurityProtocolType]::Tls12
+    if ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+        $tlsWanted = $tlsWanted -bor [Net.SecurityProtocolType]::Tls13
+    }
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor $tlsWanted
+} catch {
+    # A .NET too old to know Tls12, or a constrained host. A download that needs
+    # it will fail with its own TLS message rather than silently here.
+}
+
+# ----------------------------------------------------------------------------
+# PowerShell version floor -- also before the terminal gate
+# ----------------------------------------------------------------------------
+# 5.1 is the floor. Ensure-SupportedTerminal calls Get-AppxPackage and uses
+# -notin, so on PS 3.0/4.0 it fails from inside the gate with a message about
+# Appx rather than about the PowerShell version. Name it once, here.
+if ($PSVersionTable.PSVersion.Major -lt 5) {
+    Write-Host "[X] PowerShell $($PSVersionTable.PSVersion) is too old." -ForegroundColor Red
+    Write-Host "    Windows PowerShell 5.1 or PowerShell 7+ is required."
+    Write-Host "    5.1 ships with Windows 10 / Server 2016+; otherwise install"
+    Write-Host "    PowerShell 7: https://aka.ms/powershell"
+    exit 1
+}
+
+# ----------------------------------------------------------------------------
+# Proxy
+# ----------------------------------------------------------------------------
+# WebClient and Invoke-WebRequest do NOT read HTTP_PROXY the way curl does; on
+# Windows the proxy normally comes from WinHTTP/IE settings, which a machine
+# configured only through environment variables does not have. Resolve one object
+# here and hand it to Invoke-BoundedDownload.
+$script:ResolvedProxy = $null
+$proxyUrl = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $env:HTTP_PROXY } else { "" }
+if ($proxyUrl) {
+    try {
+        $script:ResolvedProxy = New-Object System.Net.WebProxy($proxyUrl, $true)
+        # An authenticating corporate proxy typically accepts the logged-in
+        # identity, which avoids prompting for a password we must never handle.
+        $script:ResolvedProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        if ($env:NO_PROXY) { $script:ResolvedProxy.BypassList = $env:NO_PROXY -split ',' }
+        [System.Net.WebRequest]::DefaultWebProxy = $script:ResolvedProxy
+        # Masked: HTTPS_PROXY frequently carries user:password@host, and echoing it
+        # would put a credential in the terminal scrollback and any CI log.
+        Write-Host "-> Using proxy: $($proxyUrl -replace '://[^@/]+@', '://***@')" -ForegroundColor Cyan
+    } catch {
+        Write-Host "[!] Could not parse proxy '$($proxyUrl -replace '://[^@/]+@', '://***@')' - continuing without it" -ForegroundColor Yellow
+    }
+}
+
 # Force the console to UTF-8 so non-ASCII output from native commands (git box-
 # drawing glyphs, etc.) renders correctly instead of as IBM437 mojibake.
 try {
@@ -75,6 +144,25 @@ $env:PYTHONHOME = $null
 $env:UV_NO_CONFIG = "1"
 
 # ----------------------------------------------------------------------------
+# Tool-level stall guards
+# ----------------------------------------------------------------------------
+# The wall-clock wrappers below are a backstop, not the first line of defence.
+# Without these, a registry that accepts the connection and then goes quiet burns
+# the ENTIRE wall-clock budget inside one dead request, so the wrapper's kill is
+# the first thing that happens rather than a fast failure and a retry against a
+# mirror that works. Only set when unset, so an operator on a genuinely slow link
+# can raise them.
+if (-not $env:UV_HTTP_TIMEOUT)     { $env:UV_HTTP_TIMEOUT = "60" }
+if (-not $env:PIP_DEFAULT_TIMEOUT) { $env:PIP_DEFAULT_TIMEOUT = "60" }
+if (-not $env:PIP_RETRIES)         { $env:PIP_RETRIES = "3" }
+
+# git aborts a transfer that stays under 1 KB/s for 60s. This is what bounds
+# Clone-Repo's `git clone` / `git fetch`, which have no wrapper of their own --
+# wrapping them would swallow the progress output people rely on to see life.
+if (-not $env:GIT_HTTP_LOW_SPEED_LIMIT) { $env:GIT_HTTP_LOW_SPEED_LIMIT = "1000" }
+if (-not $env:GIT_HTTP_LOW_SPEED_TIME)  { $env:GIT_HTTP_LOW_SPEED_TIME  = "60" }
+
+# ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
 if (-not $InstallDir) { $InstallDir = Join-Path $Agent8088Home "agent8088" }
@@ -113,6 +201,259 @@ function Write-Info    { param([string]$Message) Write-Host "-> $Message" -Foreg
 function Write-Success { param([string]$Message) Write-Host "[OK] $Message" -ForegroundColor Green }
 function Write-Warn    { param([string]$Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -ForegroundColor Red }
+
+# ----------------------------------------------------------------------------
+# Timeouts for the network stages
+# ----------------------------------------------------------------------------
+# Nothing in this installer had a time limit, so any of its network calls could
+# hang forever: a stalled `ollama pull`, an npm registry that accepts the
+# connection and then goes quiet, a wedged Ollama daemon, or a package download
+# that dribbles bytes left the installer waiting with no way out but Ctrl-C.
+#
+# Limits are deliberately moderate rather than maximally generous: an optional
+# stage degrades to a "run this to fix it later" message, so the cost of cutting
+# a slow-but-working download short is one rerun, while the cost of waiting too
+# long is an installer that looks frozen. Sized so a ~4 Mbps link finishes
+# comfortably.
+#
+# Scale them all for a slow connection:
+#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm <url>)
+$TimeoutScale = 1
+if ($env:AGENT8088_TIMEOUT_SCALE -match '^\d+$' -and [int]$env:AGENT8088_TIMEOUT_SCALE -ge 1) {
+    $TimeoutScale = [int]$env:AGENT8088_TIMEOUT_SCALE
+}
+
+$TOllamaCheck = 15  * $TimeoutScale   # nothing, local - instant unless the daemon is wedged
+$TOllamaPull  = 600 * $TimeoutScale   # 274 MB embedding model
+$TNpm         = 300 * $TimeoutScale   # 142 small packages, mostly round-trips
+$TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
+$TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
+$TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
+# The core editable install is the stage that actually hangs: it pulls
+# playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
+# premature cut fails the install outright -- but it is still the largest
+# download set here, so it gets the same 10m ceiling as Chromium.
+$TCoreInstall = 600 * $TimeoutScale
+$TVenv        = 300 * $TimeoutScale   # uv may download a CPython build
+$TUvBoot      = 300 * $TimeoutScale   # uv self-installer
+$TExtract     = 300 * $TimeoutScale   # PortableGit self-extractor
+
+# Run an external command under a wall-clock limit.
+#
+# PowerShell has no `timeout`, so this uses System.Diagnostics.Process plus
+# WaitForExit(ms). That also solves a second problem: -WorkingDirectory sets the
+# child's directory without touching the caller's location.
+#
+# Output goes to pipes rather than the console to preserve the quiet install the
+# previous `2>&1 | Out-Null` calls had. Returns a hashtable so callers can tell a
+# hang from an ordinary non-zero exit:
+#   @{ ExitCode = <int>; TimedOut = <bool>; Output = <string> }
+# Output is only populated with -CaptureOutput, for callers that need to read what
+# the command printed (e.g. `ollama list`).
+#
+# Built on System.Diagnostics.Process rather than Start-Process -PassThru: the
+# latter does not reliably surface .ExitCode or honour WaitForExit(ms) on a
+# redirected child, which made a "timeout" that never fired and an exit code that
+# always read 0.
+function Invoke-WithTimeout {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [string]$WorkingDirectory,
+        [switch]$CaptureOutput
+    )
+
+    $result = @{ ExitCode = -1; TimedOut = $false; Output = "" }
+    $proc = $null
+
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $FilePath
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+
+        if ($Arguments.Count -gt 0) {
+            if ($null -ne $psi.PSObject.Properties['ArgumentList']) {
+                # PowerShell 7 / .NET Core: pass argv directly, no quoting needed.
+                foreach ($a in $Arguments) { $psi.ArgumentList.Add($a) }
+            } else {
+                # Windows PowerShell 5.1 / .NET Framework has no ArgumentList, so
+                # build the command line by hand. Quoting matters here: install
+                # paths routinely contain spaces (C:\Users\First Last\...).
+                $quoted = $Arguments | ForEach-Object {
+                    if ($_ -match '[\s"]') {
+                        '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+                    } else { $_ }
+                }
+                $psi.Arguments = ($quoted -join ' ')
+            }
+        }
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+
+        # Drain both pipes asynchronously. A child that fills its stdout buffer
+        # while nobody reads it blocks forever, which would reintroduce the exact
+        # hang this function exists to prevent (npm is chatty enough to hit it).
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+
+        if ($proc.WaitForExit($TimeoutSec * 1000)) {
+            # Second, argument-less wait: lets the async readers finish flushing
+            # before the exit code is read (documented .NET requirement).
+            try { $proc.WaitForExit() } catch { }
+            $result.ExitCode = $proc.ExitCode
+            if ($CaptureOutput) {
+                try { $result.Output = $outTask.GetAwaiter().GetResult() } catch { }
+            }
+        } else {
+            $result.TimedOut = $true
+            # Kill($true) takes the whole process tree but is .NET Core only, so
+            # 5.1 falls back to killing just the launched process. A stray child
+            # (npm's node, say) is a better outcome than a frozen installer.
+            try { $proc.Kill($true) } catch { try { $proc.Kill() } catch { } }
+            try { [void]$proc.WaitForExit(5000) } catch { }
+        }
+        if ($null -eq $result.Output) { $result.Output = "" }
+    } catch {
+        $result.ExitCode = -1
+        $result.Error = $_.Exception.Message
+    } finally {
+        if ($proc) { try { $proc.Dispose() } catch { } }
+    }
+
+    return $result
+}
+
+# Download one file under a hard wall-clock limit covering the BODY transfer.
+#
+# Invoke-WebRequest cannot do this on either edition, with or without -TimeoutSec.
+# On Windows PowerShell 5.1 that parameter maps to HttpWebRequest.Timeout, which
+# covers only up to the response headers -- the body is governed by a separate
+# per-read ReadWriteTimeout. On PowerShell 7 it maps to HttpClient.Timeout, which
+# stops applying once headers arrive and the stream copy to -OutFile begins.
+# Either way a server that accepts, sends headers, then dribbles bytes forever
+# hangs the installer with no way out but Ctrl-C.
+#
+# WebClient.DownloadFileTaskAsync + Task.Wait(ms) bounds the whole operation and
+# is the only API with one code path on 5.1 and 7.x. Obsolete in .NET Core, not
+# removed. Returns a hashtable shaped like Invoke-WithTimeout's:
+#   @{ Success = <bool>; TimedOut = <bool>; Error = <string> }
+#
+# -Proxy is a parameter rather than a read of script scope so the function stays
+# runnable in isolation by tests/test_installer_timeouts.py.
+function Invoke-BoundedDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [System.Net.IWebProxy]$Proxy
+    )
+
+    $result = @{ Success = $false; TimedOut = $false; Error = "" }
+    $client = $null
+    try {
+        $client = New-Object System.Net.WebClient
+        # GitHub release assets 403 an absent User-Agent.
+        $client.Headers.Add('User-Agent', 'agent8088-installer')
+        if ($Proxy) { $client.Proxy = $Proxy }
+
+        $task = $client.DownloadFileTaskAsync($Uri, $OutFile)
+        if ($task.Wait($TimeoutSec * 1000)) {
+            if ($task.IsFaulted) {
+                $result.Error = $task.Exception.GetBaseException().Message
+            } else {
+                $result.Success = $true
+            }
+        } else {
+            $result.TimedOut = $true
+            try { $client.CancelAsync() } catch { }
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { } }
+    }
+
+    # A cancelled or faulted transfer leaves a truncated file. Removing it matters:
+    # every caller's next step is Expand-Archive or a self-extractor, and a partial
+    # archive fails there with a corruption error that names the wrong cause.
+    if (-not $result.Success) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $OutFile
+    }
+    return $result
+}
+
+# Skipped-stage ledger, printed as one block at the end of the run.
+#
+# Warnings are emitted as each stage runs, which on a multi-minute install means
+# they have scrolled well out of view by the time it finishes - the WhatsApp
+# bridge failing was reported and still went unnoticed. Recording them lets the
+# final summary state plainly what did not install and how to fix each one.
+$SkippedStages = New-Object System.Collections.ArrayList
+
+function Register-SkippedStage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Fix = ""
+    )
+    # Create the list on first use rather than relying on the top-level
+    # declaration alone. This installer is normally run as `iex (irm ...)`, where
+    # $script: does not always resolve to the scope holding that declaration -
+    # and unlike the boolean readiness flags, where `$script:X = $true` creates
+    # the variable on assignment, calling .Add() on an unresolved name throws.
+    if ($null -eq $script:SkippedStages) {
+        $script:SkippedStages = New-Object System.Collections.ArrayList
+    }
+    [void]$script:SkippedStages.Add([pscustomobject]@{
+        Label  = $Label
+        Reason = $Reason
+        Fix    = $Fix
+    })
+}
+
+# Warn about a stage that did not complete, naming a hang as a hang. "timed out
+# after 10m" and "failed" point at different fixes. -Fix is the command that
+# repairs it, surfaced again in the final summary.
+function Write-StageWarning {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Result,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$Consequence,
+        [string]$Fix = ""
+    )
+    if ($Result.TimedOut) {
+        $reason = "timed out after $([int]($TimeoutSec / 60))m"
+        Write-Warn "$What timed out after $([int]($TimeoutSec / 60))m - $Consequence"
+        Write-Warn 'On a slow connection, rerun with: $env:AGENT8088_TIMEOUT_SCALE = 3'
+    } else {
+        $reason = "failed (exit $($Result.ExitCode))"
+        Write-Warn "$What failed (exit $($Result.ExitCode)) - $Consequence"
+    }
+    Register-SkippedStage -Label $What -Reason $reason -Fix $Fix
+}
+
+# Final block: what did not install, why, and the command that fixes it. Silent
+# when everything succeeded.
+function Write-SkippedSummary {
+    if ($null -eq $script:SkippedStages -or $script:SkippedStages.Count -eq 0) { return }
+    Write-Host ""
+    Write-Host "$($script:SkippedStages.Count) optional component(s) did not install:" -ForegroundColor Yellow
+    foreach ($s in $script:SkippedStages) {
+        Write-Host "  * " -ForegroundColor Yellow -NoNewline
+        Write-Host "$($s.Label) - $($s.Reason)"
+        if ($s.Fix) { Write-Host "      fix: $($s.Fix)" }
+    }
+    Write-Host ""
+    Write-Host "  The core agent is installed and works without these."
+}
 
 function Protect-ConfigFile {
     param([string]$Path)
@@ -360,7 +701,15 @@ function Install-Uv {
         $ErrorActionPreference = "Continue"
         $env:UV_INSTALL_DIR = Join-Path $Agent8088Home "bin"
         $psHostExe = Get-PowerShellHostExe
-        & $psHostExe -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Out-Null
+        $bootResult = Invoke-WithTimeout -FilePath $psHostExe `
+            -Arguments @("-ExecutionPolicy", "ByPass", "-c",
+                         "irm https://astral.sh/uv/install.ps1 | iex") `
+            -TimeoutSec $TUvBoot
+        if ($bootResult.TimedOut) {
+            Write-Err "The uv installer timed out after $([int]($TUvBoot / 60))m"
+            Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+            return $false
+        }
         $ErrorActionPreference = $prevEAP
 
         if (Test-Path $managedUv) {
@@ -415,7 +764,12 @@ function Test-Python {
     $prevEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        & $script:UvCmd python install $PythonVersion 2>&1 | Out-Null
+        $pyResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("python", "install", $PythonVersion) -TimeoutSec $TVenv
+        if ($pyResult.TimedOut) {
+            Write-Err "Downloading Python $PythonVersion timed out after $([int]($TVenv / 60))m"
+            Write-Warn 'On a slow connection, rerun with: $env:AGENT8088_TIMEOUT_SCALE = 3'
+        }
         $ErrorActionPreference = $prevEAP
         $pythonPath = & $script:UvCmd python find $PythonVersion 2>$null
         if ($pythonPath) {
@@ -505,7 +859,12 @@ function Install-Git {
         $gitDir = "$Agent8088Home\git"
 
         Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+        $dl = Invoke-BoundedDownload -Uri $downloadUrl -OutFile $tmpFile `
+                -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+        if (-not $dl.Success) {
+            $why = if ($dl.TimedOut) { "timed out after $([int]($TDownload / 60))m" } else { $dl.Error }
+            throw "Downloading $assetName failed: $why"
+        }
 
         if (Test-Path $gitDir) { Remove-Item -Recurse -Force $gitDir }
         New-Item -ItemType Directory -Path $gitDir -Force | Out-Null
@@ -515,11 +874,17 @@ function Install-Git {
         } else {
             # PortableGit is a self-extracting 7z archive.
             Write-Info "Extracting PortableGit to $gitDir ..."
-            $extractProc = Start-Process -FilePath $tmpFile `
-                -ArgumentList "-o`"$gitDir`"", "-y" `
-                -NoNewWindow -Wait -PassThru
-            if ($extractProc.ExitCode -ne 0) {
-                throw "PortableGit extraction failed (exit code $($extractProc.ExitCode))"
+            # Start-Process -Wait has no time limit, so a self-extractor stuck on
+            # an AV-locked file hung the install here. Invoke-WithTimeout quotes
+            # each argument itself, so "-o$gitDir" must NOT be pre-quoted -- doing
+            # so double-quotes it on Windows PowerShell 5.1.
+            $extract = Invoke-WithTimeout -FilePath $tmpFile `
+                -Arguments @("-o$gitDir", "-y") -TimeoutSec $TExtract
+            if ($extract.TimedOut) {
+                throw "PortableGit extraction timed out after $([int]($TExtract / 60))m"
+            }
+            if ($extract.ExitCode -ne 0) {
+                throw "PortableGit extraction failed (exit code $($extract.ExitCode))"
             }
         }
         Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
@@ -645,7 +1010,12 @@ function Clone-Repo {
             try {
                 $zipUrl = "https://github.com/tayyabimam1/AGENT8088/archive/refs/heads/$Branch.zip"
                 $tmpZip = "$env:TEMP\agent8088-$Branch.zip"
-                Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing -ErrorAction Stop
+                $dl = Invoke-BoundedDownload -Uri $zipUrl -OutFile $tmpZip `
+                        -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+                if (-not $dl.Success) {
+                    $why = if ($dl.TimedOut) { "timed out after $([int]($TDownload / 60))m" } else { $dl.Error }
+                    throw "ZIP fallback download failed: $why"
+                }
                 $tmpExtract = "$env:TEMP\agent8088-extract"
                 if (Test-Path $tmpExtract) { Remove-Item -Recurse -Force $tmpExtract -ErrorAction Stop }
                 Expand-Archive -Path $tmpZip -DestinationPath $tmpExtract -Force -ErrorAction Stop
@@ -698,25 +1068,44 @@ function Install-Deps {
         # the Test-Path below finds python.exe from the PREVIOUS install and
         # carries on, so a failed venv step reported success and the update
         # silently did not happen. install.sh hit the same call and died.
-        & $script:UvCmd venv --python $script:PythonVersion --allow-existing $venvDir 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $py)) {
+        $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("venv", "--python", $script:PythonVersion, "--allow-existing", $venvDir) `
+            -TimeoutSec $TVenv
+        if ($venvResult.TimedOut -or $venvResult.ExitCode -ne 0 -or -not (Test-Path $py)) {
             # A venv from a Python that has since gone, or a half-written one
             # from an interrupted run, cannot be reused. Rebuild it rather than
             # handing the user a decision they have no way to evaluate.
             Write-Warn "Existing virtualenv is not usable - rebuilding it"
-            & $script:UvCmd venv --python $script:PythonVersion --clear $venvDir 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $py)) {
+            $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+                -Arguments @("venv", "--python", $script:PythonVersion, "--clear", $venvDir) `
+                -TimeoutSec $TVenv
+            if ($venvResult.TimedOut) {
+                throw "venv creation timed out after $([int]($TVenv / 60))m (uv may be downloading a Python build)"
+            }
+            if ($venvResult.ExitCode -ne 0 -or -not (Test-Path $py)) {
                 Write-Err "Run this to see the underlying error:"
                 Write-Err "  $script:UvCmd venv --python $script:PythonVersion --clear $venvDir"
                 Write-Err "If it keeps failing, remove the install and start clean: agent8088 --uninstall"
-                throw "venv creation failed (uv exit $LASTEXITCODE)"
+                throw "venv creation failed (uv exit $($venvResult.ExitCode))"
             }
         }
-        & $script:UvCmd pip install --python $py --reinstall-package agent8088 -e $InstallDir 2>&1 | Out-Null
-        $exit = $LASTEXITCODE
+        # This is the stage that actually hangs: playwright's and ddgs's native
+        # wheels plus mcp and Pillow. Mandatory, so a timeout is a hard failure
+        # with a specific message rather than a skip.
+        $coreResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $py,
+                         "--reinstall-package", "agent8088", "-e", $InstallDir) `
+            -TimeoutSec $TCoreInstall
         $ErrorActionPreference = $prevEAP
-        if ($exit -ne 0) {
-            Write-Err "uv pip install failed (exit $exit)"
+        if ($coreResult.TimedOut) {
+            Write-Err "uv pip install timed out after $([int]($TCoreInstall / 60))m - a package download stalled."
+            Write-Err 'Retry on a slower link with: $env:AGENT8088_TIMEOUT_SCALE = 3'
+            Write-Err "Or see the underlying error with:"
+            Write-Err "  $script:UvCmd pip install --python `"$py`" -e `"$InstallDir`""
+            throw "uv pip install timed out"
+        }
+        if ($coreResult.ExitCode -ne 0) {
+            Write-Err "uv pip install failed (exit $($coreResult.ExitCode))"
             throw "Failed to install agent8088"
         }
     } catch {
@@ -746,39 +1135,59 @@ function Install-Gateway-Extras {
     $ErrorActionPreference = "Continue"
     try {
         Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[gateway]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $gwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]") `
+            -TimeoutSec $TPip
+        if ($gwResult.ExitCode -eq 0) {
             $script:GatewayExtrasInstalled = $true
             Write-Success "Gateway adapters installed"
         } else {
-            Write-Warn "Gateway extras install failed (exit $LASTEXITCODE) - core agent still works"
+            Write-StageWarning -Result $gwResult -TimeoutSec $TPip `
+                -What "Gateway adapter extras" `
+                -Consequence "Slack/Discord/Telegram adapters unavailable" `
+                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[gateway]`""
         }
 
         # Keyless web search backend ([search] extra - see pyproject.toml).
         Write-Info "Installing keyless web search backend (ddgs)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[search]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $searchResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[search]") `
+            -TimeoutSec $TPip
+        if ($searchResult.ExitCode -eq 0) {
             $script:SearchExtrasInstalled = $true
             Write-Success "Keyless web search backend installed"
         } else {
-            Write-Warn "ddgs install failed - configure SearXNG or an API-key backend for web_search"
+            Write-StageWarning -Result $searchResult -TimeoutSec $TPip `
+                -What "Keyless web search backend (ddgs)" `
+                -Consequence "configure SearXNG or an API-key backend for web_search" `
+                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[search]`""
         }
 
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
         Write-Info "Installing Playwright (optional, for browse_page)..."
-        & $script:UvCmd pip install --python $py -e "$InstallDir[browser]" 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $pwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]") `
+            -TimeoutSec $TPip
+        if ($pwResult.ExitCode -eq 0) {
             Write-Info "Installing Playwright Chromium browser (~280 MB)..."
-            & $py -m playwright install chromium 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            $chromiumResult = Invoke-WithTimeout -FilePath $py `
+                -Arguments @("-m", "playwright", "install", "chromium") `
+                -TimeoutSec $TChromium
+            if ($chromiumResult.ExitCode -eq 0) {
                 $script:ChromiumInstalled = $true
                 Write-Success "Chromium installed for browse_page"
             } else {
-                Write-Warn "Chromium download failed - browse_page will show install instructions"
+                Write-StageWarning -Result $chromiumResult -TimeoutSec $TChromium `
+                    -What "Chromium browser" `
+                    -Consequence "browse_page will show install instructions" `
+                    -Fix "`"$py`" -m playwright install chromium"
             }
         } else {
-            Write-Warn "Playwright install failed - browse_page will show install instructions"
+            Write-StageWarning -Result $pwResult -TimeoutSec $TPip `
+                -What "Playwright" `
+                -Consequence "browse_page will show install instructions" `
+                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[browser]`""
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -842,7 +1251,16 @@ function Install-Node-Bridge {
         $nodeDir = "$Agent8088Home\node"
 
         try {
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+            $dl = Invoke-BoundedDownload -Uri $downloadUrl -OutFile $tmpFile `
+                    -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+            if (-not $dl.Success) {
+                # Node is optional (WhatsApp bridge only), so warn rather than throw.
+                Write-StageWarning -Result @{ ExitCode = -1; TimedOut = $dl.TimedOut } `
+                    -TimeoutSec $TDownload -What "Node.js download" `
+                    -Consequence "WhatsApp bridge unavailable" `
+                    -Fix "rerun the installer"
+                return
+            }
             if (Test-Path $nodeDir) { Remove-Item -Recurse -Force $nodeDir }
             New-Item -ItemType Directory -Path $nodeDir -Force | Out-Null
             Expand-Archive -Path $tmpFile -DestinationPath $nodeDir -Force
@@ -894,16 +1312,50 @@ function Install-Node-Bridge {
         return
     }
 
+    # MAX_PATH is 260 unless LongPathsEnabled is on (Windows 10 1607+, off by
+    # default). The bridge sits about 120 characters deep before node_modules
+    # starts nesting, and npm trees routinely add 150+, so without this the
+    # install fails partway with ENAMETOOLONG or EPERM and the error names a
+    # package rather than the cause. A flat tree is cheaper and far likelier to
+    # succeed than asking for a registry change that needs admin and a reboot.
+    $longPathsEnabled = 0
+    try {
+        $longPathsEnabled = (Get-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name 'LongPathsEnabled' -ErrorAction Stop).LongPathsEnabled
+    } catch { $longPathsEnabled = 0 }
+
+    $npmExtraArgs = @()
+    if ($longPathsEnabled -ne 1) {
+        Write-Info "Long paths are disabled; installing the bridge with a flat node_modules tree."
+        $npmExtraArgs += "--install-strategy=hoisted"
+        if ($bridgeDir.Length -gt 150) {
+            Write-Warn "Bridge path is $($bridgeDir.Length) chars - npm may still hit the 260-char limit."
+            Write-Warn "Enable long paths (admin, one time), then rerun the installer:"
+            Write-Warn "  Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' LongPathsEnabled 1"
+        }
+    }
+
     Write-Info "Installing WhatsApp bridge npm dependencies..."
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $npmExe install --prefix $bridgeDir --no-audit --no-fund 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $nodeModules)) {
+        $npmResult = Invoke-WithTimeout -FilePath $npmExe `
+            -Arguments (@("install", "--prefix", $bridgeDir, "--no-audit", "--no-fund") + $npmExtraArgs) `
+            -TimeoutSec $TNpm
+        if ($npmResult.ExitCode -eq 0 -and (Test-Path $nodeModules)) {
             $script:WhatsAppBridgeReady = $true
             Write-Success "WhatsApp bridge npm dependencies installed"
+        } elseif ($npmResult.ExitCode -eq 0) {
+            Write-Warn "WhatsApp bridge npm install reported success but node_modules missing"
+            Register-SkippedStage -Label "WhatsApp bridge" `
+                -Reason "npm reported success but node_modules missing" `
+                -Fix "cd `"$bridgeDir`"; npm install"
         } else {
-            Write-Warn "WhatsApp bridge npm install failed (exit $LASTEXITCODE)"
+            Write-StageWarning -Result $npmResult -TimeoutSec $TNpm `
+                -What "WhatsApp bridge npm dependencies" `
+                -Consequence "WhatsApp adapter unavailable" `
+                -Fix "cd `"$bridgeDir`"; npm install"
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -935,18 +1387,29 @@ function Install-Embedding-Model {
         Write-Info "Ollama not found - memory will embed through your configured provider"
         return
     }
-    $installed = & ollama list 2>$null | Select-String -Pattern "^$EmbedModel" -Quiet
+    # `ollama list` talks to the daemon on :11434. It answers instantly when that
+    # daemon is healthy and never when it is wedged, which is why a local call is
+    # guarded at all.
+    $listResult = Invoke-WithTimeout -FilePath $ollama.Source `
+        -Arguments @("list") -TimeoutSec $TOllamaCheck -CaptureOutput
+    $installed = $false
+    if ($listResult.ExitCode -eq 0 -and $listResult.Output -match "(?m)^$([regex]::Escape($EmbedModel))") {
+        $installed = $true
+    }
     if ($installed) {
         Write-Success "Embedding model $EmbedModel already present"
         return
     }
     Write-Info "Pulling embedding model $EmbedModel (274 MB, for memory recall)..."
-    & ollama pull $EmbedModel *> $null
-    if ($LASTEXITCODE -eq 0) {
+    $pullResult = Invoke-WithTimeout -FilePath $ollama.Source `
+        -Arguments @("pull", $EmbedModel) -TimeoutSec $TOllamaPull
+    if ($pullResult.ExitCode -eq 0) {
         Write-Success "Embedding model $EmbedModel installed"
     } else {
-        Write-Warn "Could not pull $EmbedModel - memory recall will use keyword search only"
-        Write-Warn "Fix it later with:  ollama pull $EmbedModel"
+        Write-StageWarning -Result $pullResult -TimeoutSec $TOllamaPull `
+            -What "Embedding model $EmbedModel" `
+            -Consequence "memory recall will use keyword search only" `
+            -Fix "ollama pull $EmbedModel"
     }
 }
 
@@ -1092,194 +1555,6 @@ function Drop-Config {
 }
 
 # ----------------------------------------------------------------------------
-# Stage 8: Setup wizard
-# ----------------------------------------------------------------------------
-$BuiltinModelProviders = @(
-    "ollama", "openrouter", "openai", "gemini", "cerebras", "deepseek",
-    "groq", "mistral", "moonshot", "qwen", "ollama-cloud", "copilot"
-)
-$BuiltinProviderLabels = @{
-    "ollama" = "Ollama (local)"
-    "openrouter" = "OpenRouter"
-    "openai" = "OpenAI"
-    "gemini" = "Google Gemini"
-    "cerebras" = "Cerebras"
-    "deepseek" = "DeepSeek"
-    "groq" = "Groq"
-    "mistral" = "Mistral"
-    "moonshot" = "Moonshot (Kimi)"
-    "qwen" = "Qwen (DashScope)"
-    "ollama-cloud" = "Ollama Cloud"
-    "copilot" = "GitHub Copilot"
-}
-$BuiltinProviderUrls = @{
-    "ollama" = "http://localhost:11434/v1"
-    "openrouter" = "https://openrouter.ai/api/v1"
-    "openai" = "https://api.openai.com/v1"
-    "gemini" = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    "cerebras" = "https://api.cerebras.ai/v1"
-    "deepseek" = "https://api.deepseek.com/v1"
-    "groq" = "https://api.groq.com/openai/v1"
-    "mistral" = "https://api.mistral.ai/v1"
-    "moonshot" = "https://api.moonshot.ai/v1"
-    "qwen" = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    "ollama-cloud" = "https://ollama.com/v1"
-    "copilot" = "https://api.githubcopilot.com"
-}
-$BuiltinProviderModels = @{
-    "ollama" = "qwen14b-tooluse-v3"
-    "openrouter" = "anthropic/claude-sonnet-4"
-    "openai" = "gpt-4o"
-    "gemini" = "gemini-2.0-flash"
-    "cerebras" = "gpt-oss-120b"
-    "deepseek" = "deepseek-chat"
-    "groq" = "llama-3.3-70b-versatile"
-    "mistral" = "mistral-small-latest"
-    "moonshot" = "kimi-k2.6"
-    "qwen" = "qwen-plus"
-    "ollama-cloud" = "gpt-oss:120b"
-    "copilot" = "gpt-4o-mini"
-}
-
-function Select-ModelProvider {
-    param([string]$CurrentProvider)
-    Write-Host "Select model provider:"
-    for ($i = 0; $i -lt $BuiltinModelProviders.Count; $i++) {
-        $provider = $BuiltinModelProviders[$i]
-        Write-Host ("  {0,2}) {1} ({2}) - default: {3}" -f ($i + 1), $BuiltinProviderLabels[$provider], $provider, $BuiltinProviderModels[$provider])
-    }
-    $customIndex = $BuiltinModelProviders.Count + 1
-    Write-Host ("  {0,2}) Custom OpenAI-compatible" -f $customIndex)
-    $answer = Read-Host "Choice [$CurrentProvider]"
-    if (-not $answer) { $answer = $CurrentProvider }
-    $number = 0
-    if ([int]::TryParse($answer, [ref]$number)) {
-        if ($number -ge 1 -and $number -le $BuiltinModelProviders.Count) {
-            return $BuiltinModelProviders[$number - 1]
-        }
-        if ($number -eq $customIndex) { return "__custom__" }
-    }
-    $answer = $answer.ToLowerInvariant()
-    if ($BuiltinModelProviders -contains $answer) { return $answer }
-    if ($answer -eq $CurrentProvider.ToLowerInvariant()) { return $CurrentProvider }
-    if ($answer -in @("custom", "custom openai-compatible", "openai-compatible")) { return "__custom__" }
-    Write-Warn "Unknown provider '$answer'; keeping $CurrentProvider"
-    return $CurrentProvider
-}
-
-function Read-SecretValue {
-    param([string]$Prompt)
-    $secure = Read-Host $Prompt -AsSecureString
-    if (-not $secure -or $secure.Length -eq 0) { return "" }
-    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
-    }
-}
-
-function Run-SetupWizard {
-    if ($SkipSetup) {
-        Write-Info "Skipping setup wizard (--SkipSetup)"
-        return
-    }
-    if ($NonInteractive) {
-            Write-Info "Non-interactive mode - skipping setup wizard"
-        Write-Info "Edit $Agent8088Home\config.txt manually to configure your model."
-        return
-    }
-
-    $config = Join-Path $Agent8088Home "config.txt"
-    Write-Info "Setup wizard"
-    Write-Info "  (Press Enter to keep the default shown in brackets)"
-
-    # Working directory
-    $currentPaths = (Select-String -Path $config -Pattern '^allowed_paths=' | ForEach-Object { $_.Line -replace 'allowed_paths=', '' })
-    if (-not $currentPaths) { $currentPaths = "~" }
-    $newPaths = Read-Host "Working directory [$currentPaths]"
-    if (-not $newPaths) { $newPaths = $currentPaths }
-
-    # Provider picker
-    $currentProvider = (Select-String -Path $config -Pattern '^default_provider=' | ForEach-Object { $_.Line -replace 'default_provider=', '' })
-    if (-not $currentProvider) { $currentProvider = "ollama" }
-    $selectedProvider = Select-ModelProvider $currentProvider
-    $newProvider = $selectedProvider
-    $baseUrl = ""
-    if ($selectedProvider -eq "__custom__") {
-        $defaultCustom = if ($BuiltinModelProviders -contains $currentProvider) { "custom" } else { $currentProvider }
-        $newProvider = Read-Host "Custom provider name [$defaultCustom]"
-        if (-not $newProvider) { $newProvider = $defaultCustom }
-        if ($newProvider -notmatch '^[A-Za-z0-9_-]+$') {
-            Write-Err "Custom provider names use letters, numbers, _ or -"
-            exit 1
-        }
-        $currentUrl = (Select-String -Path $config -Pattern "^provider\.$newProvider\.base_url=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.base_url=", '' })
-        $urlLabel = if ($currentUrl) { "Enter keeps current" } else { "required" }
-        $baseUrl = Read-Host "OpenAI-compatible URL [$urlLabel]"
-        if (-not $baseUrl) { $baseUrl = $currentUrl }
-        if (-not $baseUrl) {
-            Write-Err "OpenAI-compatible URL is required for custom providers"
-            exit 1
-        }
-    } elseif ($BuiltinModelProviders -notcontains $newProvider) {
-        $baseUrl = (Select-String -Path $config -Pattern "^provider\.$newProvider\.base_url=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.base_url=", '' })
-        if (-not $baseUrl) {
-            Write-Err "OpenAI-compatible URL is required for custom providers"
-            exit 1
-        }
-    }
-
-    # Model name
-    $currentModel = (Select-String -Path $config -Pattern "^provider\.$newProvider\.model=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.model=", '' })
-    if (-not $currentModel) { $currentModel = if ($BuiltinProviderModels[$newProvider]) { $BuiltinProviderModels[$newProvider] } else { "model-name" } }
-    $newModel = Read-Host "Model name [$currentModel]"
-    if (-not $newModel) { $newModel = $currentModel }
-
-    # API key
-    $currentKey = (Select-String -Path $config -Pattern "^provider\.$newProvider\.api_key=" | ForEach-Object { $_.Line -replace "provider\.$newProvider\.api_key=", '' })
-    $newKey = Read-SecretValue "API key for $newProvider [hidden; Enter keeps existing/skips]"
-    if (-not $newKey) { $newKey = $currentKey }
-
-    # Web search URL (optional)
-    $currentSearch = (Select-String -Path $config -Pattern '^search_base_url=' | ForEach-Object { $_.Line -replace 'search_base_url=', '' })
-    $newSearch = Read-Host "Web search URL (SearXNG) [Enter keeps current; type none to disable]"
-
-    if (-not $baseUrl) { $baseUrl = $BuiltinProviderUrls[$newProvider] }
-
-    # Write back
-    $content = Get-Content $config -Raw
-    $content = $content -replace '(?m)^allowed_paths=.*', "allowed_paths=$newPaths"
-    $projectRoot = ($newPaths -split ',', 2)[0].Trim()
-    $content = $content -replace '(?m)^#?\s*project_root=.*', "project_root=$projectRoot"
-    if (-not ($content -match '(?m)^project_root=')) { $content += "`nproject_root=$projectRoot`n" }
-    $content = $content -replace '(?m)^default_provider=.*', "default_provider=$newProvider"
-    if (-not ($content -match '(?m)^default_provider=')) { $content += "`ndefault_provider=$newProvider`n" }
-    $content = $content -replace "(?m)^provider\.$newProvider\.base_url=.*", "provider.$newProvider.base_url=$baseUrl"
-    if (-not ($content -match "(?m)^provider\.$newProvider\.base_url=")) { $content += "`nprovider.$newProvider.base_url=$baseUrl`n" }
-    if ($BuiltinModelProviders -notcontains $newProvider) {
-        $content = $content -replace "(?m)^provider\.$newProvider\.api_mode=.*", "provider.$newProvider.api_mode=openai"
-        if (-not ($content -match "(?m)^provider\.$newProvider\.api_mode=")) { $content += "`nprovider.$newProvider.api_mode=openai`n" }
-    }
-    $content = $content -replace "(?m)^provider\.$newProvider\.model=.*", "provider.$newProvider.model=$newModel"
-    if (-not ($content -match "(?m)^provider\.$newProvider\.model=")) { $content += "`nprovider.$newProvider.model=$newModel`n" }
-    if ($newKey) {
-        $content = $content -replace "(?m)^provider\.$newProvider\.api_key=.*", "provider.$newProvider.api_key=$newKey"
-        if (-not ($content -match "(?m)^provider\.$newProvider\.api_key=")) { $content += "`nprovider.$newProvider.api_key=$newKey`n" }
-    }
-    if ($newSearch -and $newSearch.Trim().ToLowerInvariant() -eq "none") {
-        $content = $content -replace '(?m)^search_base_url=.*\r?\n?', ''
-    } elseif ($newSearch) {
-        # Anchored at column 0: config.txt documents commented example endpoints,
-        # and a '^#?\s*' pattern rewrote every one of them into a duplicate key.
-        $content = $content -replace '(?m)^search_base_url=.*', "search_base_url=$newSearch"
-        if (-not ($content -match '(?m)^search_base_url=')) { $content += "`nsearch_base_url=$newSearch`n" }
-    }
-    Set-Content -Path $config -Value $content -NoNewline:$false
-    Write-Success "Config written to $config"
-}
-
-# ----------------------------------------------------------------------------
 # Stage 9: Verify + finish
 # ----------------------------------------------------------------------------
 function Verify-Install {
@@ -1324,34 +1599,64 @@ function Verify-Install {
     Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$Branch/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
+    # Last, so it is the final thing on screen: per-stage warnings scrolled out of
+    # view minutes ago on a multi-minute install, which is how a failed WhatsApp
+    # bridge got reported and still went unnoticed.
+    Write-SkippedSummary
 }
 
+# Runs on EVERY invocation, not only on a fresh install.
+#
+# The removed gate was `-not $script:FreshInstall -and -not $script:ConfigCreated`,
+# which skipped setup on any re-run over an existing install that already had a
+# config. That is exactly the run where setup matters most: when an optional stage
+# fails the core agent still installs, so the user re-runs the installer -- and got
+# no prompt for working directory, model or web search, and no hint that
+# `agent8088 --setup` is the thing to run.
+#
+# Two gates remain, and both are there because the prompt is physically impossible,
+# not because it is unwanted: an explicit -SkipSetup, and a non-interactive host.
+#
+# Deliberately NOT wrapped in Invoke-WithTimeout: this is interactive and reads the
+# console, so a wall clock here would kill the user mid-answer.
 function Run-InitialSetup {
-    if (-not $script:FreshInstall -and -not $script:ConfigCreated) {
-        Write-Info "Existing installation and config found - skipping first-run setup."
-        return
-    }
     if ($SkipSetup) {
-        Write-Info "Skipping first-run setup (--SkipSetup)"
+        Write-Info "Skipping setup (-SkipSetup)"
+        Write-Info "Configure later with: agent8088 --setup"
         return
     }
     if ($NonInteractive) {
-        Write-Info "Non-interactive mode - skipping first-run setup"
+        Write-Info "Non-interactive mode - skipping setup"
         Write-Info "Run agent8088 --setup later to configure your model."
         return
     }
 
+    # Prefer the console script, fall back to the venv interpreter: a missing .exe
+    # shim (a partial install, an AV quarantine) is not a reason to skip setup when
+    # the module itself is right there and importable.
     $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
-    if (-not (Test-Path $agentExe)) {
-        Write-Warn "agent8088 command is not ready yet; run agent8088 --setup later."
+    $venvPy   = Join-Path $InstallDir "venv\Scripts\python.exe"
+    if (Test-Path $agentExe) {
+        Write-Info "Starting setup..."
+        & $agentExe --setup
+    } elseif (Test-Path $venvPy) {
+        Write-Warn "agent8088.exe not found; running setup via the venv interpreter"
+        & $venvPy -m agent8088.cli --setup
+    } else {
+        Write-Warn "agent8088 is not runnable yet; run agent8088 --setup later."
+        Register-SkippedStage -Label "First-run setup" `
+            -Reason "agent8088 not runnable" -Fix "agent8088 --setup"
         return
     }
-    Write-Info "Starting first-run setup..."
-    & $agentExe --setup
+
     if ($LASTEXITCODE -eq 0) {
         $script:InitialSetupRan = $true
     } else {
-        Write-Warn "First-run setup did not complete; run agent8088 --setup later."
+        # Recorded, not just warned: on a multi-minute install this line scrolls out
+        # of view, which is how a skipped setup went unnoticed.
+        Write-Warn "Setup did not complete; run agent8088 --setup later."
+        Register-SkippedStage -Label "First-run setup" `
+            -Reason "did not complete (exit $LASTEXITCODE)" -Fix "agent8088 --setup"
     }
 }
 
