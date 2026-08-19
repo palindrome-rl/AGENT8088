@@ -10,6 +10,61 @@
 # editable install, PATH/shim, config drop, and a setup wizard.
 # ============================================================================
 
+# ----------------------------------------------------------------------------
+# CRLF guard -- must be the very first executable code, and must stay one line
+# ----------------------------------------------------------------------------
+# A checkout made on Windows with core.autocrlf=true and then run under WSL or Git
+# Bash gives every line a trailing CR. bash reports that as `$'\r': command not
+# found`, or a syntax error, on a line that looks perfectly fine -- which sends
+# people hunting the wrong bug entirely.
+#
+# This is written as a single pipeline-and-list of simple commands, on purpose and
+# tested: under CRLF, bash still executes simple commands (the stray CR just ends
+# up inside an argument) but fails to parse ANY compound keyword. `case ... in` and
+# both forms of `if ... then ... fi` die with a syntax error before running, so a
+# guard written with either can never fire on the file it is meant to diagnose.
+# Keep this on one line, before everything else, and do not "tidy" it into an if.
+#
+# .gitattributes (install.sh text eol=lf) is the actual prevention; this is the
+# diagnostic for a checkout that predates it. `exit 1` picks up the stray CR and
+# so exits 255 with a "numeric argument required" note -- cosmetic, still non-zero.
+head -n 1 "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | grep -q "$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"${BASH_SOURCE[0]}\"" "  Or:   curl -fsSL <url> | bash   (always LF)" >&2 && exit 1
+
+# ----------------------------------------------------------------------------
+# Shell preflight -- must be the first executable code in this file
+# ----------------------------------------------------------------------------
+# This script uses bash arrays in ~30 places. Under dash, busybox ash or zsh those
+# are either a syntax error or silently wrong (zsh arrays are 1-indexed), and the
+# failure surfaces hundreds of lines later as something apparently unrelated. The
+# documented invocation is `curl -fsSL <url> | bash`, but `| sh` is the reflex, so
+# re-exec under bash rather than refusing -- and only refuse when there is no bash
+# at all.
+#
+# Written in strict POSIX sh, because it has to parse before we know what shell is
+# running it. Nothing above this point may use a bash-only construct.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        # When piped, $0 is "sh"/"bash" rather than a path, so re-execing $0 cannot
+        # work and there is no file to hand to bash either -- print the fix instead.
+        if [ -f "$0" ]; then exec bash "$0" "$@"; fi
+        echo "This installer needs bash. Re-run it as:" >&2
+        echo "  curl -fsSL <url> | bash" >&2
+        exit 1
+    fi
+    echo "ERROR: bash is required and was not found." >&2
+    echo "  Alpine / busybox:  apk add bash" >&2
+    echo "  Then:              curl -fsSL <url> | bash" >&2
+    exit 1
+fi
+
+# bash 3.2 is the floor: stock macOS ships 3.2.57 and will never be upgraded, so
+# this script is written to that level (no associative arrays, no ${x,,}, no
+# mapfile). scripts/check_installer_portability.sh keeps it that way. Anything
+# older than 3.1 predates `+=(` on arrays.
+case "${BASH_VERSINFO[0]:-0}" in
+    0|1|2) echo "ERROR: bash ${BASH_VERSION:-?} is too old; bash 3.2+ required." >&2; exit 1 ;;
+esac
+
 set -e
 
 # Guard against environment leakage when launched from another tool session.
@@ -51,6 +106,33 @@ export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-60}"
 # silently degrades to one giant argument ("option --connect-timeout 20 ...: is
 # unknown") anywhere it is reused outside bash. The array is also SC2086-clean.
 CURL_STALL_FLAGS=(--connect-timeout 20 --speed-limit 1024 --speed-time 30)
+
+# ----------------------------------------------------------------------------
+# Proxy
+# ----------------------------------------------------------------------------
+# curl, uv, pip and git all read HTTP_PROXY / HTTPS_PROXY / NO_PROXY already, so
+# the work here is normalisation rather than plumbing: curl prefers the lowercase
+# spelling and Python's requests prefers the uppercase one, so a proxy exported in
+# only one case silently applies to only some of the tools -- which looks like
+# "the installer works up to the Python step".
+for _pv in http_proxy https_proxy no_proxy; do
+    # tr, not ${_pv^^}: uppercasing expansions needs bash 4 and macOS ships 3.2.
+    _pv_upper="$(printf '%s' "$_pv" | tr 'a-z' 'A-Z')"
+    eval "_pv_lower_val=\${$_pv:-}"
+    eval "_pv_upper_val=\${$_pv_upper:-}"
+    if [ -n "$_pv_lower_val" ] && [ -z "$_pv_upper_val" ]; then
+        export "$_pv_upper=$_pv_lower_val"
+    elif [ -n "$_pv_upper_val" ] && [ -z "$_pv_lower_val" ]; then
+        export "$_pv=$_pv_upper_val"
+    fi
+done
+unset _pv _pv_upper _pv_lower_val _pv_upper_val
+if [ -n "${HTTPS_PROXY:-}" ]; then
+    # ##*@ strips any credentials: HTTPS_PROXY frequently carries
+    # user:password@host, and echoing it would put a secret in the terminal
+    # scrollback and in any CI log that captures this run.
+    echo "Using proxy: ${HTTPS_PROXY##*@}"
+fi
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -318,9 +400,13 @@ detect_os() {
             else
                 OS="linux"
                 if [ -f /etc/os-release ]; then
-                    . /etc/os-release
-                    DISTRO="$ID"
-                    DISTRO_VERSION="${VERSION_ID:-}"
+                    # Read in a subshell. Sourcing it directly defines NAME,
+                    # VERSION, ID, PRETTY_NAME, HOME_URL and more in the
+                    # installer's own shell, where they can collide with names
+                    # used later -- a distro file is not ours to trust with our
+                    # namespace.
+                    DISTRO="$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-unknown}")"
+                    DISTRO_VERSION="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-}")"
                 else
                     DISTRO="unknown"; DISTRO_VERSION=""
                 fi
@@ -336,8 +422,13 @@ detect_os() {
             exit 1
             ;;
         *)
-            OS="unknown"; DISTRO="unknown"
-            log_warn "Unknown operating system"
+            # Previously this warned and carried on, so a BSD reached the uv/venv
+            # stages and failed there with something that named neither the OS nor
+            # the real problem. Refuse here, where the message can be useful.
+            log_error "Unsupported operating system: $(uname -s)"
+            log_info "Supported: Linux, macOS, WSL2. Windows uses install.ps1."
+            log_info "On another Unix, install manually:  pip install agent8088"
+            exit 1
             ;;
     esac
     log_success "Detected: $OS ($DISTRO)"
