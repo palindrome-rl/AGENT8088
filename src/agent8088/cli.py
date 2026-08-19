@@ -4437,11 +4437,27 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     env_var_name = f"{provider.upper().replace('-', '_')}_API_KEY"
     current_key = _env_vars.get(env_var_name, "") or _current(f"provider.{provider}.api_key")
 
-    key = _custom_prompt(
-        f"API key for {provider}:",
-        default=current_key,
-        secret=True,
+    # Built-ins with no api_key_env (currently just "ollama") run on a local,
+    # unauthenticated endpoint -- prompting for a key there just confuses users
+    # who don't have one. A custom provider always prompts since it could be
+    # any OpenAI-compatible endpoint, keyed or not.
+    _needs_api_key = (
+        provider_choice == CUSTOM_PROVIDER_CHOICE
+        or bool(provider_registry.builtin_provider_defaults(provider).get("api_key_env"))
     )
+    if _needs_api_key:
+        key = _custom_prompt(
+            f"API key for {provider}:",
+            default=current_key,
+            secret=True,
+        )
+    else:
+        key = ""
+        _local_url = (
+            _current(f"provider.{provider}.base_url")
+            or provider_registry.builtin_provider_defaults(provider).get("base_url", "")
+        )
+        print(f"No API key needed — {provider} runs locally at {_local_url}.")
     # Fetch models
     print(f"\nFetching model list (up to {MODEL_DISCOVERY_TIMEOUT_SECONDS}s)...")
     try:
