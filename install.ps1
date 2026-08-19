@@ -75,6 +75,25 @@ $env:PYTHONHOME = $null
 $env:UV_NO_CONFIG = "1"
 
 # ----------------------------------------------------------------------------
+# Tool-level stall guards
+# ----------------------------------------------------------------------------
+# The wall-clock wrappers below are a backstop, not the first line of defence.
+# Without these, a registry that accepts the connection and then goes quiet burns
+# the ENTIRE wall-clock budget inside one dead request, so the wrapper's kill is
+# the first thing that happens rather than a fast failure and a retry against a
+# mirror that works. Only set when unset, so an operator on a genuinely slow link
+# can raise them.
+if (-not $env:UV_HTTP_TIMEOUT)     { $env:UV_HTTP_TIMEOUT = "60" }
+if (-not $env:PIP_DEFAULT_TIMEOUT) { $env:PIP_DEFAULT_TIMEOUT = "60" }
+if (-not $env:PIP_RETRIES)         { $env:PIP_RETRIES = "3" }
+
+# git aborts a transfer that stays under 1 KB/s for 60s. This is what bounds
+# Clone-Repo's `git clone` / `git fetch`, which have no wrapper of their own --
+# wrapping them would swallow the progress output people rely on to see life.
+if (-not $env:GIT_HTTP_LOW_SPEED_LIMIT) { $env:GIT_HTTP_LOW_SPEED_LIMIT = "1000" }
+if (-not $env:GIT_HTTP_LOW_SPEED_TIME)  { $env:GIT_HTTP_LOW_SPEED_TIME  = "60" }
+
+# ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
 if (-not $InstallDir) { $InstallDir = Join-Path $Agent8088Home "agent8088" }

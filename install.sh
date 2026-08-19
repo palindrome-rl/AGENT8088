@@ -26,6 +26,33 @@ fi
 export UV_NO_CONFIG=1
 
 # ----------------------------------------------------------------------------
+# Tool-level stall guards
+# ----------------------------------------------------------------------------
+# The wall-clock wrappers below are a backstop, not the first line of defence.
+# Without these, a registry that accepts the connection and then goes quiet burns
+# the ENTIRE wall-clock budget inside one dead request, so the wrapper's kill is
+# the first thing that happens rather than a fast failure and a retry against a
+# mirror that works. Each tool has its own stall detector; turn them all on.
+#
+# Only set when unset, so an operator on a genuinely slow link can raise them.
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-60}"
+export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-60}"
+export PIP_RETRIES="${PIP_RETRIES:-3}"
+
+# git aborts a transfer that stays under 1 KB/s for 60s. This is what bounds the
+# byte-moving part of `git clone` / `git fetch`; run_with_timeout around them
+# bounds the local object-write phase, which these two variables do not cover.
+export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}"
+export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-60}"
+
+# Curl flags for every download: give up on a dead TCP handshake, and abort a
+# transfer crawling under 1 KB/s for 30s. An array, not a space-separated string:
+# an unquoted string only word-splits in shells that do that, so the string form
+# silently degrades to one giant argument ("option --connect-timeout 20 ...: is
+# unknown") anywhere it is reused outside bash. The array is also SC2086-clean.
+CURL_STALL_FLAGS=(--connect-timeout 20 --speed-limit 1024 --speed-time 30)
+
+# ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/tayyabimam1/AGENT8088.git"
@@ -336,7 +363,8 @@ install_uv() {
     # on empty stdin).
     local _uv_installer
     _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/agent8088-uv.$$.sh")"
-    if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
+    if ! curl -LsSf "${CURL_STALL_FLAGS[@]}" --max-time 120 \
+            https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
         log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
         log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
         rm -f "$_uv_installer"
@@ -753,7 +781,7 @@ install_node_bridge() {
             esac
             local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
             local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
-            if curl -fsSL "$_url" -o "$_tmp" 2>/dev/null; then
+            if run_with_timeout "$T_NODE_DL" curl -fsSL "${CURL_STALL_FLAGS[@]}" "$_url" -o "$_tmp" 2>/dev/null; then
                 mkdir -p "$AGENT8088_HOME/node"
                 # Guarded: Node is optional (WhatsApp bridge only), so a bad
                 # tarball or missing decompressor must warn, not abort the run.
