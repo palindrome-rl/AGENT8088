@@ -1066,6 +1066,61 @@ class _TraceCodeBlock(CodeBlock):
             yield Text(code)
 
 
+_BOX_DRAWING_CHARS = set(
+    "─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋"
+    "═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬"
+)
+
+
+def _fence_ascii_art(text):
+    """Wrap hand-drawn box-drawing art in fenced code blocks before markdown
+    rendering.
+
+    Rich's Markdown renders real ``|``-delimited tables and fenced code blocks
+    by computing their layout itself, so those always come out aligned. But a
+    model that hand-draws a box (╔══╗ borders, manually padded columns) as a
+    bare paragraph gets reflowed like any other prose: Rich collapses the
+    padding and wraps the line, destroying the shape. Detecting box-drawing
+    characters outside an existing fence and fencing them preserves the
+    manual spacing verbatim, the same way a real code block would.
+    """
+    if not text or not any(ch in _BOX_DRAWING_CHARS for ch in text):
+        return text
+
+    out = []
+    in_fence = False
+    fence_marker = None
+    art_run = []
+
+    def flush_run():
+        if art_run:
+            out.append("```")
+            out.extend(art_run)
+            out.append("```")
+            art_run.clear()
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+            flush_run()
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            if stripped.startswith(fence_marker):
+                in_fence = False
+            continue
+        if any(ch in _BOX_DRAWING_CHARS for ch in line):
+            art_run.append(line)
+            continue
+        flush_run()
+        out.append(line)
+    flush_run()
+    return "\n".join(out)
+
+
 class _AnswerMarkdown(Markdown):
     """Markdown that renders fenced code the way the rest of the CLI does."""
 
@@ -1073,7 +1128,7 @@ class _AnswerMarkdown(Markdown):
                 "code_block": _TraceCodeBlock}
 
     def __init__(self, markup, **kwargs):
-        super().__init__(markup, code_theme=_syntax_theme(), **kwargs)
+        super().__init__(_fence_ascii_art(markup), code_theme=_syntax_theme(), **kwargs)
 
 
 def render_answer(answer):
@@ -1158,7 +1213,7 @@ def _make_subagent_ui(live):
             # the whole delegation — so render it rather than dumping it.
             text = (answer or "").strip()
             if text:
-                console.print(Padding(Markdown(text), (0, 0, 0, 3)))
+                console.print(Padding(_AnswerMarkdown(text), (0, 0, 0, 3)))
 
         return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result,
                 "on_escalation": sub_on_escalation, "done": done}
