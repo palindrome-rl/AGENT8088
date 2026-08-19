@@ -1589,31 +1589,57 @@ run_agent8088_command() {
     fi
 }
 
+# Runs on EVERY invocation, not only on a fresh install.
+#
+# The removed gate was `FRESH_INSTALL != true && CONFIG_CREATED != true`, which
+# skipped setup on any re-run over an existing install that already had a config.
+# That is exactly the run where setup matters most: when an optional stage fails the
+# core agent still installs, so the user re-runs the installer -- and got no prompt
+# for working directory, model or web search, and no hint that `agent8088 --setup`
+# is the thing to run.
+#
+# Two gates remain, and both are there because the prompt is physically impossible,
+# not because it is unwanted:
+#   --skip-setup   an explicit request, honoured
+#   no /dev/tty    nothing to read from; the message names the manual command
 run_initial_setup() {
-    if [ "$FRESH_INSTALL" != true ] && [ "$CONFIG_CREATED" != true ]; then
-        log_info "Existing installation and config found — skipping first-run setup."
-        return 0
-    fi
     if [ "$SKIP_SETUP" = true ]; then
-        log_info "Skipping first-run setup (--skip-setup)"
+        log_info "Skipping setup (--skip-setup)"
+        log_info "Configure later with: agent8088 --setup"
         return 0
     fi
     if [ "$IS_INTERACTIVE" = false ] && ! (: </dev/tty) 2>/dev/null; then
-        log_info "No TTY detected — skipping first-run setup"
+        log_info "No TTY detected — skipping setup"
         log_info "Run agent8088 --setup later to configure your model."
         return 0
     fi
 
+    # Prefer the shim, fall back to the venv interpreter. setup_path runs before us,
+    # but a PATH-link directory that is not writable leaves no shim -- and skipping
+    # setup because a symlink is missing, when the module is right there and
+    # importable, is the wrong trade.
     local shim="$(get_command_link_dir)/agent8088"
-    if [ ! -x "$shim" ]; then
-        log_warn "agent8088 command is not ready yet; run agent8088 --setup later."
+    local venv_py="$INSTALL_DIR/venv/bin/python"
+    local setup_cmd=()
+    if [ -x "$shim" ]; then
+        setup_cmd=("$shim" --setup)
+    elif [ -x "$venv_py" ]; then
+        log_warn "agent8088 shim not found; running setup via the venv interpreter"
+        setup_cmd=("$venv_py" -m agent8088.cli --setup)
+    else
+        log_warn "agent8088 is not runnable yet; run agent8088 --setup later."
+        record_skip "First-run setup" "agent8088 not runnable" "agent8088 --setup"
         return 0
     fi
-    log_info "Starting first-run setup..."
-    if run_agent8088_command "$shim" --setup; then
+
+    log_info "Starting setup..."
+    if run_agent8088_command "${setup_cmd[@]}"; then
         INITIAL_SETUP_RAN=true
     else
-        log_warn "First-run setup did not complete; run agent8088 --setup later."
+        # Recorded, not just warned: on a multi-minute install this line scrolls out
+        # of view, which is how a skipped setup went unnoticed.
+        log_warn "Setup did not complete; run agent8088 --setup later."
+        record_skip "First-run setup" "did not complete" "agent8088 --setup"
     fi
 }
 

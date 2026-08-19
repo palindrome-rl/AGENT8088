@@ -1708,32 +1708,58 @@ function Verify-Install {
     Write-SkippedSummary
 }
 
+# Runs on EVERY invocation, not only on a fresh install.
+#
+# The removed gate was `-not $script:FreshInstall -and -not $script:ConfigCreated`,
+# which skipped setup on any re-run over an existing install that already had a
+# config. That is exactly the run where setup matters most: when an optional stage
+# fails the core agent still installs, so the user re-runs the installer -- and got
+# no prompt for working directory, model or web search, and no hint that
+# `agent8088 --setup` is the thing to run.
+#
+# Two gates remain, and both are there because the prompt is physically impossible,
+# not because it is unwanted: an explicit -SkipSetup, and a non-interactive host.
+#
+# Deliberately NOT wrapped in Invoke-WithTimeout: this is interactive and reads the
+# console, so a wall clock here would kill the user mid-answer.
 function Run-InitialSetup {
-    if (-not $script:FreshInstall -and -not $script:ConfigCreated) {
-        Write-Info "Existing installation and config found - skipping first-run setup."
-        return
-    }
     if ($SkipSetup) {
-        Write-Info "Skipping first-run setup (--SkipSetup)"
+        Write-Info "Skipping setup (-SkipSetup)"
+        Write-Info "Configure later with: agent8088 --setup"
         return
     }
     if ($NonInteractive) {
-        Write-Info "Non-interactive mode - skipping first-run setup"
+        Write-Info "Non-interactive mode - skipping setup"
         Write-Info "Run agent8088 --setup later to configure your model."
         return
     }
 
+    # Prefer the console script, fall back to the venv interpreter: a missing .exe
+    # shim (a partial install, an AV quarantine) is not a reason to skip setup when
+    # the module itself is right there and importable.
     $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
-    if (-not (Test-Path $agentExe)) {
-        Write-Warn "agent8088 command is not ready yet; run agent8088 --setup later."
+    $venvPy   = Join-Path $InstallDir "venv\Scripts\python.exe"
+    if (Test-Path $agentExe) {
+        Write-Info "Starting setup..."
+        & $agentExe --setup
+    } elseif (Test-Path $venvPy) {
+        Write-Warn "agent8088.exe not found; running setup via the venv interpreter"
+        & $venvPy -m agent8088.cli --setup
+    } else {
+        Write-Warn "agent8088 is not runnable yet; run agent8088 --setup later."
+        Register-SkippedStage -Label "First-run setup" `
+            -Reason "agent8088 not runnable" -Fix "agent8088 --setup"
         return
     }
-    Write-Info "Starting first-run setup..."
-    & $agentExe --setup
+
     if ($LASTEXITCODE -eq 0) {
         $script:InitialSetupRan = $true
     } else {
-        Write-Warn "First-run setup did not complete; run agent8088 --setup later."
+        # Recorded, not just warned: on a multi-minute install this line scrolls out
+        # of view, which is how a skipped setup went unnoticed.
+        Write-Warn "Setup did not complete; run agent8088 --setup later."
+        Register-SkippedStage -Label "First-run setup" `
+            -Reason "did not complete (exit $LASTEXITCODE)" -Fix "agent8088 --setup"
     }
 }
 
