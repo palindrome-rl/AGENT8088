@@ -11,9 +11,11 @@
 
 param(
     [switch]$SkipSetup,
+    [switch]$TerminalBootstrap,
     [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "main" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
-    [string]$InstallDir = ""
+    [string]$InstallDir = "",
+    [string]$InstallerSourceUrl = ""
 )
 
 # Note: we use "Continue" (not "Stop") because native commands (uv, git, python)
@@ -170,6 +172,7 @@ $LauncherDir = "${Agent8088Home}-launcher"
 $RepoUrl = "https://github.com/tayyabimam1/AGENT8088.git"
 $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
+$script:PythonExecutable = $null
 $NodeVersion = "22.11.0"
 $WindowsTerminalMinVersion = [version]"1.19.0.0"
 $PendingUninstallWaitSeconds = 65
@@ -518,7 +521,25 @@ function Test-SupportedTerminalHost {
     if (-not $env:WT_SESSION) { return $false }
 
     $package = Get-WindowsTerminalPackage
+    # An active WT_SESSION is stronger evidence than AppX registration. Portable
+    # Terminal builds and temporarily stale per-user package registrations do not
+    # appear in Get-AppxPackage; trying to "upgrade" them can close the terminal
+    # that is running this installer and leave the user with no continuation.
+    if (-not $package) { return $true }
     return ($package -and ([version]$package.Version -ge $WindowsTerminalMinVersion))
+}
+
+function Get-WindowsTerminalExecutable {
+    param($Package = (Get-WindowsTerminalPackage))
+
+    $terminalCommand = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($terminalCommand -and $terminalCommand.Source) { return $terminalCommand.Source }
+    if ($Package -and $Package.InstallLocation) {
+        $candidate = Join-Path $Package.InstallLocation "WindowsTerminal.exe"
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
 }
 
 function Install-WindowsTerminal {
@@ -545,7 +566,21 @@ function Install-WindowsTerminal {
         return $true
     }
 
+    # WinGet returns UPDATE_NOT_APPLICABLE when its inventory sees an installed
+    # current package even if Get-AppxPackage cannot see that user's registration.
+    # If the application alias is usable, launch it and let WT_SESSION prove the
+    # handoff rather than turning a successful/no-op install into a hard failure.
+    $updateNotApplicable = -1978335189  # 0x8A15002B
+    $terminalExe = Get-WindowsTerminalExecutable -Package $package
+    if (-not $package -and $terminalExe -and $wingetExit -in @(0, $updateNotApplicable)) {
+        Write-Success "Windows Terminal is available at $terminalExe"
+        return $true
+    }
+
     Write-Err "Windows Terminal installation did not reach version $WindowsTerminalMinVersion (WinGet exit $wingetExit)."
+    if ($wingetExit -eq $updateNotApplicable) {
+        Write-Info "WinGet found no applicable update, but Windows Terminal is not registered for this user."
+    }
     return $false
 }
 
@@ -554,54 +589,113 @@ function ConvertTo-PowerShellLiteral {
     return "'" + ([string]$Value).Replace("'", "''") + "'"
 }
 
+function ConvertTo-EncodedPowerShellCommand {
+    param([Parameter(Mandatory = $true)][string]$Command)
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+}
+
+function Get-InstallerInvocation {
+    param(
+        [switch]$ForTerminalBootstrap,
+        [switch]$PreferLocalScript
+    )
+
+    $branchLiteral = ConvertTo-PowerShellLiteral $Branch
+    $homeLiteral = ConvertTo-PowerShellLiteral $Agent8088Home
+    $installLiteral = ConvertTo-PowerShellLiteral $InstallDir
+    $skipSetupLiteral = if ($SkipSetup) { '$true' } else { '$false' }
+    $arguments = "-Branch $branchLiteral -Agent8088Home $homeLiteral -InstallDir $installLiteral -SkipSetup`:$skipSetupLiteral"
+    if ($ForTerminalBootstrap) { $arguments += " -TerminalBootstrap" }
+
+    if ($PreferLocalScript -and -not $InstallerSourceUrl -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+        $scriptLiteral = ConvertTo-PowerShellLiteral $PSCommandPath
+        return "& $scriptLiteral $arguments"
+    }
+
+    $sourceUrl = $InstallerSourceUrl
+    if (-not $sourceUrl) {
+        $escapedBranch = [Uri]::EscapeDataString($Branch).Replace('%2F', '/')
+        $sourceUrl = "https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$escapedBranch/install.ps1"
+    }
+    $urlLiteral = ConvertTo-PowerShellLiteral $sourceUrl
+    $tlsCommand = "try { [Net.ServicePointManager]::SecurityProtocol = " +
+                  "[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}"
+    return ("$tlsCommand`r`n`$source = Invoke-RestMethod -Uri $urlLiteral`r`n" +
+            "& ([scriptblock]::Create(`$source)) $arguments -InstallerSourceUrl $urlLiteral")
+}
+
 function Start-InstallerInWindowsTerminal {
     $package = Get-WindowsTerminalPackage
-    $terminalCommand = Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    $terminalExe = if ($terminalCommand) { $terminalCommand.Source } else { $null }
-    if (-not $terminalExe -and $package.InstallLocation) {
-        $candidate = Join-Path $package.InstallLocation "WindowsTerminal.exe"
-        if (Test-Path $candidate) { $terminalExe = $candidate }
-    }
+    $terminalExe = Get-WindowsTerminalExecutable -Package $package
     if (-not $terminalExe) {
         Write-Err "Windows Terminal is installed, but its executable could not be found."
         Write-Info "Enable the 'wt.exe' App execution alias in Windows Settings, then re-run this installer."
         return $false
     }
 
-    $launcherPath = Join-Path ([IO.Path]::GetTempPath()) ("agent8088-install-{0}.ps1" -f [guid]::NewGuid())
-    $branchLiteral = ConvertTo-PowerShellLiteral $Branch
-    $homeLiteral = ConvertTo-PowerShellLiteral $Agent8088Home
-    $installLiteral = ConvertTo-PowerShellLiteral $InstallDir
-    $skipSetupLiteral = if ($SkipSetup) { '$true' } else { '$false' }
-
-    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
-        $scriptLiteral = ConvertTo-PowerShellLiteral $PSCommandPath
-        $installCommand = "& $scriptLiteral -Branch $branchLiteral -Agent8088Home $homeLiteral -InstallDir $installLiteral -SkipSetup`:$skipSetupLiteral"
-    } else {
-        $escapedBranch = [Uri]::EscapeDataString($Branch).Replace('%2F', '/')
-        $installerUrl = "https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$escapedBranch/install.ps1"
-        $urlLiteral = ConvertTo-PowerShellLiteral $installerUrl
-        $installCommand = "`$source = Invoke-RestMethod -Uri $urlLiteral`r`n& ([scriptblock]::Create(`$source)) -Branch $branchLiteral -Agent8088Home $homeLiteral -InstallDir $installLiteral -SkipSetup`:$skipSetupLiteral"
-    }
-
-    @"
-Remove-Item -LiteralPath `$PSCommandPath -Force -ErrorAction SilentlyContinue
-$installCommand
-"@ | Set-Content -LiteralPath $launcherPath -Encoding UTF8
-
+    $installCommand = Get-InstallerInvocation -PreferLocalScript
+    $encodedCommand = ConvertTo-EncodedPowerShellCommand -Command $installCommand
     $powerShellExe = Get-PowerShellHostExe
     $terminalArgs = @(
         "-w", "new", "`"$powerShellExe`"", "-NoExit", "-ExecutionPolicy", "Bypass",
-        "-File", "`"$launcherPath`""
+        "-EncodedCommand", $encodedCommand
     )
     try {
         Start-Process -FilePath $terminalExe -ArgumentList $terminalArgs | Out-Null
         Write-Success "Continuing installation in Windows Terminal..."
         return $true
     } catch {
-        Remove-Item -LiteralPath $launcherPath -Force -ErrorAction SilentlyContinue
         Write-Err "Could not launch Windows Terminal: $_"
+        return $false
+    }
+}
+
+function Start-TerminalUpgradeBootstrap {
+    $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path -LiteralPath $powerShellExe)) { $powerShellExe = Get-PowerShellHostExe }
+
+    # Run the actual installer in a child PowerShell. Its `exit 1` must not close
+    # this visible bootstrap window before the user can read the error.
+    $childCommand = Get-InstallerInvocation -ForTerminalBootstrap -PreferLocalScript
+    $childEncoded = ConvertTo-EncodedPowerShellCommand -Command $childCommand
+    $powerShellLiteral = ConvertTo-PowerShellLiteral $powerShellExe
+    $childEncodedLiteral = ConvertTo-PowerShellLiteral $childEncoded
+    $bootstrapCommand = @"
+ try { `$Host.UI.RawUI.WindowTitle = 'Agent8088 Terminal Setup' } catch {}
+ Write-Host 'Agent8088 is installing or updating Windows Terminal.' -ForegroundColor Cyan
+ Write-Host 'This window will remain open and report whether installation continues.'
+ & $powerShellLiteral -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEncodedLiteral
+ `$installerExit = `$LASTEXITCODE
+ if (`$installerExit -eq 0) {
+     Write-Host ''
+     Write-Host '[OK] Windows Terminal is ready. Agent8088 installation is continuing in the new window.' -ForegroundColor Green
+     Write-Host 'You may close this bootstrap window.'
+ } else {
+     Write-Host ''
+     Write-Host "[X] Agent8088 installation could not continue (exit `$installerExit)." -ForegroundColor Red
+     Write-Host 'Review the error above, then press Enter to close this window.'
+     [void](Read-Host)
+ }
+"@
+    $bootstrapEncoded = ConvertTo-EncodedPowerShellCommand -Command $bootstrapCommand
+    $conhostExe = Join-Path $env:SystemRoot "System32\conhost.exe"
+    try {
+        if (Test-Path -LiteralPath $conhostExe) {
+            $bootstrapArgs = @(
+                "`"$powerShellExe`"", "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", $bootstrapEncoded
+            )
+            Start-Process -FilePath $conhostExe -ArgumentList $bootstrapArgs | Out-Null
+        } else {
+            Start-Process -FilePath $powerShellExe -ArgumentList @(
+                "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", $bootstrapEncoded
+            ) | Out-Null
+        }
+        Write-Success "Windows Terminal setup opened in a separate window. Follow its progress there."
+        return $true
+    } catch {
+        Write-Err "Could not open the Windows Terminal setup window: $_"
         return $false
     }
 }
@@ -616,16 +710,20 @@ function Ensure-SupportedTerminal {
     Write-Host "  Windows Terminal detected: $versionLabel"
 
     if (-not $package -or ([version]$package.Version -lt $WindowsTerminalMinVersion)) {
-        if ($NonInteractive) {
-            Write-Err "Interactive confirmation is required to install or update Windows Terminal."
-            return "failed"
-        }
-        do {
-            $answer = (Read-Host "Install/update Windows Terminal and continue? [y/n]").Trim().ToLowerInvariant()
-        } while ($answer -notin @("y", "n"))
-        if ($answer -eq "n") {
-            Write-Info "Installation cancelled. Agent8088 was not installed."
-            return "failed"
+        if (-not $TerminalBootstrap) {
+            if ($NonInteractive) {
+                Write-Err "Interactive confirmation is required to install or update Windows Terminal."
+                return "failed"
+            }
+            do {
+                $answer = (Read-Host "Install/update Windows Terminal and continue? [y/n]").Trim().ToLowerInvariant()
+            } while ($answer -notin @("y", "n"))
+            if ($answer -eq "n") {
+                Write-Info "Installation cancelled. Agent8088 was not installed."
+                return "failed"
+            }
+            if (-not (Start-TerminalUpgradeBootstrap)) { return "failed" }
+            return "relaunched"
         }
         if (-not (Install-WindowsTerminal $package)) { return "failed" }
     }
@@ -759,7 +857,7 @@ function Test-Python {
             if ($pythonPath) {
                 $ver = & $pythonPath --version 2>$null
                 Write-Success "Python found: $ver"
-                $script:PythonVersion = $resolvedVer
+                $script:PythonExecutable = $pythonPath
                 return $true
             }
         } catch { }
@@ -780,6 +878,7 @@ function Test-Python {
         if ($pythonPath) {
             $ver = & $pythonPath --version 2>$null
             Write-Success "Python installed: $ver"
+            $script:PythonExecutable = $pythonPath
             return $true
         }
     } catch {
@@ -809,6 +908,7 @@ function Test-Python {
                 $ErrorActionPreference = $prevEAP2
                 if ($sysVer -match "Python 3\.(1[0-9]|[1-9][0-9])") {
                     Write-Success "Using system Python: $sysVer"
+                    $script:PythonExecutable = $pythonSource
                     return $true
                 }
             } catch {
@@ -1060,6 +1160,9 @@ function Clone-Repo {
 # ----------------------------------------------------------------------------
 function Install-Deps {
     Write-Info "Creating venv and installing via uv..."
+    if (-not $script:PythonExecutable) {
+        throw "Failed to install agent8088: Python was detected but its executable path was not recorded"
+    }
     $venvDir = Join-Path $InstallDir "venv"
     $py = Join-Path $venvDir "Scripts\python.exe"
     # Relax EAP: uv writes progress ("Using CPython...") to stderr, which
@@ -1074,22 +1177,26 @@ function Install-Deps {
         # carries on, so a failed venv step reported success and the update
         # silently did not happen. install.sh hit the same call and died.
         $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
-            -Arguments @("venv", "--python", $script:PythonVersion, "--allow-existing", $venvDir) `
+            -Arguments @("venv", "--python", $script:PythonExecutable, "--allow-existing", $venvDir) `
             -TimeoutSec $TVenv
         if ($venvResult.TimedOut -or $venvResult.ExitCode -ne 0 -or -not (Test-Path $py)) {
             # A venv from a Python that has since gone, or a half-written one
             # from an interrupted run, cannot be reused. Rebuild it rather than
             # handing the user a decision they have no way to evaluate.
-            Write-Warn "Existing virtualenv is not usable - rebuilding it"
+            if (Test-Path -LiteralPath $venvDir) {
+                Write-Warn "Existing virtualenv is not usable - rebuilding it"
+            } else {
+                Write-Warn "Initial virtualenv creation failed - retrying with a clean environment"
+            }
             $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
-                -Arguments @("venv", "--python", $script:PythonVersion, "--clear", $venvDir) `
+                -Arguments @("venv", "--python", $script:PythonExecutable, "--clear", $venvDir) `
                 -TimeoutSec $TVenv
             if ($venvResult.TimedOut) {
                 throw "venv creation timed out after $([int]($TVenv / 60))m (uv may be downloading a Python build)"
             }
             if ($venvResult.ExitCode -ne 0 -or -not (Test-Path $py)) {
                 Write-Err "Run this to see the underlying error:"
-                Write-Err "  $script:UvCmd venv --python $script:PythonVersion --clear $venvDir"
+                Write-Err "  $script:UvCmd venv --python `"$script:PythonExecutable`" --clear `"$venvDir`""
                 Write-Err "If it keeps failing, remove the install and start clean: agent8088 --uninstall"
                 throw "venv creation failed (uv exit $($venvResult.ExitCode))"
             }
@@ -1699,10 +1806,10 @@ function Start-InitialAgent {
 # Main
 # ----------------------------------------------------------------------------
 Write-Banner
+if (-not (Wait-ForPendingUninstall)) { exit 1 }
 $terminalAction = Ensure-SupportedTerminal
 if ($terminalAction -eq "relaunched") { exit 0 }
 if ($terminalAction -ne "continue") { exit 1 }
-if (-not (Wait-ForPendingUninstall)) { exit 1 }
 if (-not (Install-Uv)) { exit 1 }
 if (-not (Test-Python)) { exit 1 }
 if (-not (Install-Git)) { exit 1 }

@@ -34,6 +34,7 @@ def _run_powershell(command: str) -> str:
     [
         ("vscode", "", None, "True"),
         ("", "active", "1.19.0.0", "True"),
+        ("", "active", None, "True"),
         ("", "active", "1.18.9999.0", "False"),
         ("", "", "1.22.0.0", "False"),
     ],
@@ -60,15 +61,15 @@ Write-Output (Test-SupportedTerminalHost)
 
 
 @pytest.mark.parametrize(
-    ("package_version", "answer", "expected", "expected_install", "expected_launch"),
+    ("package_version", "answer", "expected", "expected_bootstrap", "expected_launch"),
     [
         (None, "n", "failed", "False", "False"),
-        ("1.18.0.0", "y", "relaunched", "True", "True"),
+        ("1.18.0.0", "y", "relaunched", "True", "False"),
         ("1.22.0.0", "unused", "relaunched", "False", "True"),
     ],
 )
 def test_legacy_host_prompts_only_when_terminal_needs_upgrade(
-    package_version, answer, expected, expected_install, expected_launch
+    package_version, answer, expected, expected_bootstrap, expected_launch
 ):
     package = (
         f"[pscustomobject]@{{ Version = '{package_version}' }}"
@@ -79,7 +80,8 @@ def test_legacy_host_prompts_only_when_terminal_needs_upgrade(
         f"""
 $WindowsTerminalMinVersion = [version]'1.19.0.0'
 $NonInteractive = $false
-$script:installCalled = $false
+$TerminalBootstrap = $false
+$script:bootstrapCalled = $false
 $script:launchCalled = $false
 function Test-SupportedTerminalHost {{ return $false }}
 function Get-WindowsTerminalPackage {{ return {package} }}
@@ -87,14 +89,14 @@ function Write-Warn {{ param([string]$Message) }}
 function Write-Err {{ param([string]$Message) }}
 function Write-Info {{ param([string]$Message) }}
 function Read-Host {{ param([string]$Prompt) return '{answer}' }}
-function Install-WindowsTerminal {{ param($ExistingPackage); $script:installCalled = $true; return $true }}
+function Start-TerminalUpgradeBootstrap {{ $script:bootstrapCalled = $true; return $true }}
 function Start-InstallerInWindowsTerminal {{ $script:launchCalled = $true; return $true }}
 {_powershell_function('Ensure-SupportedTerminal')}
 $result = Ensure-SupportedTerminal
-Write-Output "$result|$script:installCalled|$script:launchCalled"
+Write-Output "$result|$script:bootstrapCalled|$script:launchCalled"
 """
     )
-    assert output.splitlines()[-1] == f"{expected}|{expected_install}|{expected_launch}"
+    assert output.splitlines()[-1] == f"{expected}|{expected_bootstrap}|{expected_launch}"
 
 
 def test_terminal_relaunch_gate_runs_before_any_install_stage():
@@ -123,7 +125,7 @@ $Agent8088Home = "C:\\Users\\O'Brien\\Agent Home"
 $InstallDir = 'C:\\Agent Install'
 $SkipSetup = $true
 function Get-WindowsTerminalPackage {{ return [pscustomobject]@{{ InstallLocation = '' }} }}
-function Get-Command {{ return [pscustomobject]@{{ Source = 'C:\\mock\\wt.exe' }} }}
+function Get-WindowsTerminalExecutable {{ return 'C:\\mock\\wt.exe' }}
 function Get-PowerShellHostExe {{ return 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' }}
 function Write-Success {{ param([string]$Message) }}
 function Write-Err {{ param([string]$Message) }}
@@ -131,19 +133,101 @@ function Write-Info {{ param([string]$Message) }}
 function Start-Process {{
     param([string]$FilePath, [object[]]$ArgumentList)
     $script:startedFile = $FilePath
-    $script:launcherPath = $ArgumentList[-1].Trim('"')
+    $script:terminalArguments = $ArgumentList
 }}
 {_powershell_function('ConvertTo-PowerShellLiteral')}
+{_powershell_function('ConvertTo-EncodedPowerShellCommand')}
+{_powershell_function('Get-InstallerInvocation')}
 {_powershell_function('Start-InstallerInWindowsTerminal')}
 $result = Start-InstallerInWindowsTerminal
-$launcher = Get-Content -LiteralPath $script:launcherPath -Raw
-Remove-Item -LiteralPath $script:launcherPath -Force
+$encoded = $script:terminalArguments[-1]
+$launcher = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
 Write-Output "$result|$script:startedFile"
+Write-Output ($script:terminalArguments -join '|')
 Write-Output $launcher
 """
     )
     assert "True|C:\\mock\\wt.exe" in output
+    assert "-EncodedCommand" in output
+    assert output.index("Tls12") < output.index("Invoke-RestMethod")
     assert "AGENT8088/development/install.ps1" in output
     assert "-Agent8088Home 'C:\\Users\\O''Brien\\Agent Home'" in output
     assert "-InstallDir 'C:\\Agent Install'" in output
     assert "-SkipSetup:$true" in output
+    assert "agent8088-install-" not in output
+
+
+def test_terminal_upgrade_runs_in_visible_external_bootstrap():
+    output = _run_powershell(
+        f"""
+$env:SystemRoot = 'C:\\Windows'
+$Branch = 'development'
+$Agent8088Home = 'C:\\Users\\User\\AppData\\Local\\agent8088'
+$InstallDir = ''
+$InstallerSourceUrl = ''
+$SkipSetup = $false
+function Test-Path {{ param([string]$LiteralPath) return $true }}
+function Get-PowerShellHostExe {{ return 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' }}
+function Write-Success {{ param([string]$Message) }}
+function Write-Err {{ param([string]$Message) }}
+function Start-Process {{
+    param([string]$FilePath, [object[]]$ArgumentList)
+    $script:startedFile = $FilePath
+    $script:bootstrapArguments = $ArgumentList
+}}
+{_powershell_function('ConvertTo-PowerShellLiteral')}
+{_powershell_function('ConvertTo-EncodedPowerShellCommand')}
+{_powershell_function('Get-InstallerInvocation')}
+{_powershell_function('Start-TerminalUpgradeBootstrap')}
+$result = Start-TerminalUpgradeBootstrap
+$encoded = $script:bootstrapArguments[-1]
+$bootstrap = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+Write-Output "$result|$script:startedFile"
+Write-Output $bootstrap
+"""
+    )
+    assert "True|C:\\Windows\\System32\\conhost.exe" in output
+    assert "This window will remain open" in output
+    assert "Agent8088 installation could not continue" in output
+    assert "Read-Host" in output
+
+
+def test_terminal_bootstrap_installs_then_launches():
+    output = _run_powershell(
+        f"""
+$WindowsTerminalMinVersion = [version]'1.19.0.0'
+$NonInteractive = $false
+$TerminalBootstrap = $true
+$script:installCalled = $false
+$script:launchCalled = $false
+function Test-SupportedTerminalHost {{ return $false }}
+function Get-WindowsTerminalPackage {{ return $null }}
+function Write-Warn {{ param([string]$Message) }}
+function Write-Err {{ param([string]$Message) }}
+function Write-Info {{ param([string]$Message) }}
+function Install-WindowsTerminal {{ param($ExistingPackage); $script:installCalled = $true; return $true }}
+function Start-InstallerInWindowsTerminal {{ $script:launchCalled = $true; return $true }}
+{_powershell_function('Ensure-SupportedTerminal')}
+$result = Ensure-SupportedTerminal
+Write-Output "$result|$script:installCalled|$script:launchCalled"
+"""
+    )
+    assert output.splitlines()[-1] == "relaunched|True|True"
+
+
+def test_winget_no_applicable_update_accepts_a_working_terminal_alias():
+    output = _run_powershell(
+        f"""
+$WindowsTerminalMinVersion = [version]'1.19.0.0'
+function fakewinget {{ $global:LASTEXITCODE = -1978335189 }}
+function Get-Command {{ return [pscustomobject]@{{ Source = 'fakewinget' }} }}
+function Get-WindowsTerminalPackage {{ return $null }}
+function Get-WindowsTerminalExecutable {{ return 'C:\\Users\\User\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe' }}
+function Write-Info {{ param([string]$Message) }}
+function Write-Err {{ param([string]$Message) }}
+function Write-Success {{ param([string]$Message) }}
+{_powershell_function('Install-WindowsTerminal')}
+Write-Output (Install-WindowsTerminal $null)
+"""
+    )
+    assert output.splitlines()[-1] == "True"

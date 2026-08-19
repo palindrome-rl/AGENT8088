@@ -120,6 +120,9 @@ def test_windows_installer_requires_verified_repository():
     source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     clone = _powershell_function("Clone-Repo")
     assert 'if (-not (Clone-Repo)) { exit 1 }' in source
+    assert source.index('if (-not (Wait-ForPendingUninstall))') < source.index(
+        "$terminalAction = Ensure-SupportedTerminal"
+    )
     assert source.index('if (-not (Wait-ForPendingUninstall))') < source.index('if (-not (Install-Uv))')
     assert 'Repository verification failed' in clone
     assert 'installedCommit = "unknown"' not in clone
