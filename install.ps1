@@ -525,6 +525,26 @@ function Install-Git {
 # ----------------------------------------------------------------------------
 # Stage 4: Clone repo (with ZIP fallback)
 # ----------------------------------------------------------------------------
+function Remove-IncompleteInstallDirectory {
+    if (-not (Test-Path -LiteralPath $InstallDir)) { return $true }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $InstallDir)) { return $true }
+        } catch {
+            $lastError = $_
+        }
+        if ($attempt -lt 10) { Start-Sleep -Seconds 1 }
+    }
+
+    Write-Err "Could not remove the incomplete installation at $InstallDir."
+    Write-Err "Close every Agent8088 session, then run the installer again."
+    if ($lastError) { Write-Err "Locked-file error: $lastError" }
+    return $false
+}
+
 function Clone-Repo {
     Write-Info "Installing to $InstallDir..."
 
@@ -540,7 +560,12 @@ function Clone-Repo {
         $backupDir = "${InstallDir}.broken-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         Write-Warn "Existing checkout at $InstallDir has no commits (interrupted clone)."
         Write-Warn "Moving it aside to $backupDir before re-cloning."
-        Move-Item $InstallDir $backupDir
+        try {
+            Move-Item -LiteralPath $InstallDir -Destination $backupDir -ErrorAction Stop
+        } catch {
+            Write-Err "Could not move the interrupted checkout: $_"
+            return $false
+        }
     }
 
     if (Test-Path (Join-Path $InstallDir ".git")) {
@@ -558,47 +583,74 @@ function Clone-Repo {
                 }
                 Write-Info "Local changes detected, stashing before update..."
                 & git -c windows.appendAtomically=false stash push --include-untracked -m "agent8088-install-autostash" 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Err "Could not stash local installation changes."
+                    return $false
+                }
             }
             & git -c windows.appendAtomically=false remote set-url origin $RepoUrl 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Err "Could not configure the Agent8088 remote."; return $false }
             & git -c windows.appendAtomically=false fetch --depth 1 origin $Branch 2>$null
-            & git -c windows.appendAtomically=false checkout -B $Branch FETCH_HEAD 2>$null
-            & git -c windows.appendAtomically=false reset --hard FETCH_HEAD 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Err "Could not fetch '$Branch' from the Agent8088 remote."; return $false }
+            & git -c windows.appendAtomically=false checkout -B $Branch FETCH_HEAD 2>$null | Out-Host
+            if ($LASTEXITCODE -ne 0) { Write-Err "Could not check out '$Branch'."; return $false }
+            & git -c windows.appendAtomically=false reset --hard FETCH_HEAD 2>$null | Out-Host
+            if ($LASTEXITCODE -ne 0) { Write-Err "Could not reset the installation to '$Branch'."; return $false }
         } finally {
             Pop-Location
         }
     } else {
         Write-Info "Cloning Agent8088 repository..."
-        if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
+        if (-not (Remove-IncompleteInstallDirectory)) { return $false }
         New-Item -ItemType Directory -Path (Split-Path $InstallDir -Parent) -Force | Out-Null
 
         try {
-            & git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrl $InstallDir
+            & git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrl $InstallDir | Out-Host
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $InstallDir ".git"))) {
+                throw "git clone failed (exit $LASTEXITCODE)"
+            }
             & git -C $InstallDir -c windows.appendAtomically=false config core.autocrlf false
+            if ($LASTEXITCODE -ne 0) { throw "git config failed (exit $LASTEXITCODE)" }
         } catch {
             # ZIP fallback: GitHub archive. Then git init so future updates work.
-            Write-Warn "git clone failed; falling back to ZIP archive..."
-            $zipUrl = "https://github.com/tayyabimam1/AGENT8088/archive/refs/heads/$Branch.zip"
-            $tmpZip = "$env:TEMP\agent8088-$Branch.zip"
-            Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing
-            $tmpExtract = "$env:TEMP\agent8088-extract"
-            if (Test-Path $tmpExtract) { Remove-Item -Recurse -Force $tmpExtract }
-            Expand-Archive -Path $tmpZip -DestinationPath $tmpExtract -Force
-            $extractedDir = Get-ChildItem $tmpExtract -Directory | Select-Object -First 1
-            Move-Item $extractedDir.FullName $InstallDir
-            Remove-Item -Force $tmpZip; Remove-Item -Recurse -Force $tmpExtract
+            Write-Warn "git clone failed; falling back to ZIP archive: $_"
+            if (-not (Remove-IncompleteInstallDirectory)) { return $false }
+            try {
+                $zipUrl = "https://github.com/tayyabimam1/AGENT8088/archive/refs/heads/$Branch.zip"
+                $tmpZip = "$env:TEMP\agent8088-$Branch.zip"
+                Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing -ErrorAction Stop
+                $tmpExtract = "$env:TEMP\agent8088-extract"
+                if (Test-Path $tmpExtract) { Remove-Item -Recurse -Force $tmpExtract -ErrorAction Stop }
+                Expand-Archive -Path $tmpZip -DestinationPath $tmpExtract -Force -ErrorAction Stop
+                $extractedDir = Get-ChildItem $tmpExtract -Directory | Select-Object -First 1
+                if (-not $extractedDir) { throw "Downloaded archive did not contain a repository directory" }
+                Move-Item $extractedDir.FullName $InstallDir -ErrorAction Stop
+                Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+                Remove-Item -Recurse -Force $tmpExtract -ErrorAction SilentlyContinue
 
-            # Re-init so future `agent8088 update` works
-            & git -C $InstallDir init 2>$null
-            & git -C $InstallDir -c windows.appendAtomically=false config core.autocrlf false
-            & git -C $InstallDir remote add origin $RepoUrl 2>$null
-            & git -C $InstallDir fetch --depth 1 origin $Branch 2>$null
-            & git -C $InstallDir checkout -t origin/$Branch 2>$null
+                # Re-init so future `agent8088 update` works
+                & git -C $InstallDir init 2>$null | Out-Host
+                if ($LASTEXITCODE -ne 0) { throw "git init failed" }
+                & git -C $InstallDir -c windows.appendAtomically=false config core.autocrlf false
+                & git -C $InstallDir remote add origin $RepoUrl 2>$null
+                & git -C $InstallDir fetch --depth 1 origin $Branch 2>$null
+                if ($LASTEXITCODE -ne 0) { throw "git fetch after ZIP fallback failed" }
+                & git -C $InstallDir checkout -t origin/$Branch 2>$null | Out-Host
+                if ($LASTEXITCODE -ne 0) { throw "git checkout after ZIP fallback failed" }
+            } catch {
+                Write-Err "Could not prepare the Agent8088 repository: $_"
+                return $false
+            }
         }
         $script:FreshInstall = $true
     }
     $installedCommit = (& git -C $InstallDir rev-parse --short HEAD 2>$null)
-    if (-not $installedCommit) { $installedCommit = "unknown" }
+    if ($LASTEXITCODE -ne 0 -or -not $installedCommit) {
+        Write-Err "Repository verification failed at $InstallDir."
+        return $false
+    }
     Write-Success "Repository ready at $InstallDir ($Branch@$installedCommit)"
+    return $true
 }
 
 # ----------------------------------------------------------------------------
@@ -1237,7 +1289,7 @@ if ($terminalAction -ne "continue") { exit 1 }
 if (-not (Install-Uv)) { exit 1 }
 if (-not (Test-Python)) { exit 1 }
 if (-not (Install-Git)) { exit 1 }
-Clone-Repo
+if (-not (Clone-Repo)) { exit 1 }
 Install-Deps
 Install-Gateway-Extras
 Install-Node-Bridge
