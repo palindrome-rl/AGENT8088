@@ -3792,7 +3792,8 @@ def _agent8088_link_dir():
     if os.environ.get("AGENT8088_LINK_DIR"):
         return Path(os.environ["AGENT8088_LINK_DIR"]).expanduser()
     if os.name == "nt":
-        return _agent8088_home() / "agent8088" / "venv" / "Scripts"
+        home = _agent8088_home()
+        return home.with_name(f"{home.name}-launcher")
     return Path.home() / ".local" / "bin"
 
 
@@ -3965,8 +3966,9 @@ if (-not $removed) { exit 1 }
 def _run_windows_uninstall(home):
     link_dir = _agent8088_link_dir()
     managed_bin = home / "bin"
+    legacy_scripts = home / "agent8088" / "venv" / "Scripts"
     if not home.exists():
-        environment_result = _remove_windows_user_environment(link_dir, managed_bin)
+        environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
         if environment_result:
             print("Removed Agent8088 entries from the user PATH.")
         print(f"Install directory not found: {home}")
@@ -3982,7 +3984,7 @@ def _run_windows_uninstall(home):
         print(f"Could not schedule final cleanup: {exc}")
         return False
 
-    environment_result = _remove_windows_user_environment(link_dir, managed_bin)
+    environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
     if environment_result:
         print("Removed Agent8088 entries from the user PATH.")
     print("Agent8088 uninstall has been scheduled.")

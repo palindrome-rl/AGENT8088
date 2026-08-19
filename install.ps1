@@ -78,6 +78,7 @@ $env:UV_NO_CONFIG = "1"
 # Configuration
 # ----------------------------------------------------------------------------
 if (-not $InstallDir) { $InstallDir = Join-Path $Agent8088Home "agent8088" }
+$LauncherDir = "${Agent8088Home}-launcher"
 $RepoUrl = "https://github.com/tayyabimam1/AGENT8088.git"
 $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
@@ -977,23 +978,81 @@ function Install-Native-Sandbox {
 }
 
 # ----------------------------------------------------------------------------
-# Stage 6: Link the command (add venv\Scripts to User PATH)
+# Stage 6: Install the Windows command launcher
 # ----------------------------------------------------------------------------
+function Write-Agent8088Launcher {
+    param([string]$AgentExe = (Join-Path $InstallDir "venv\Scripts\agent8088.exe"))
+
+    if (-not (Test-Path -LiteralPath $AgentExe)) {
+        Write-Err "Cannot create the Agent8088 launcher; executable not found: $AgentExe"
+        return $false
+    }
+
+    New-Item -ItemType Directory -Path $LauncherDir -Force | Out-Null
+    $launcher = Join-Path $LauncherDir "agent8088.cmd"
+    $content = @"
+@echo off
+setlocal
+set "AGENT8088_HOME=$Agent8088Home"
+set "AGENT8088_LINK_DIR=$LauncherDir"
+"$AgentExe" %*
+set "_agent8088_exit=%ERRORLEVEL%"
+if /I "%~1"=="--uninstall" goto agent8088_wait_for_uninstall
+if /I "%~1"=="-uninstall" goto agent8088_wait_for_uninstall
+exit /b %_agent8088_exit%
+
+:agent8088_wait_for_uninstall
+set "_agent8088_home=$Agent8088Home"
+set "_agent8088_marker=${Agent8088Home}.uninstall-pending"
+set "_agent8088_log="
+set /a _agent8088_attempts=0
+if exist "%_agent8088_marker%" set /p "_agent8088_log="<"%_agent8088_marker%"
+
+:agent8088_wait_loop
+if not exist "%_agent8088_marker%" goto agent8088_uninstall_finished
+if defined _agent8088_log if exist "%_agent8088_log%" findstr /b /c:"FAILED:" "%_agent8088_log%" >nul && goto agent8088_uninstall_failed
+set /a _agent8088_attempts+=1
+if %_agent8088_attempts% GEQ 150 goto agent8088_uninstall_failed
+>nul 2>&1 ping -n 2 127.0.0.1
+goto agent8088_wait_loop
+
+:agent8088_uninstall_finished
+if exist "%_agent8088_home%" goto agent8088_uninstall_failed
+if not "%_agent8088_exit%"=="0" goto agent8088_uninstall_failed
+echo.
+echo [OK] Agent8088 was completely uninstalled.
+set "_agent8088_self=%~f0"
+for %%I in ("%~dp0.") do set "_agent8088_launcher=%%~fI"
+(goto) 2>nul & del /f /q "%_agent8088_self%" >nul 2>&1 & rd "%_agent8088_launcher%" >nul 2>&1
+
+:agent8088_uninstall_failed
+echo.
+echo [X] Agent8088 uninstall did not complete.
+if not "%_agent8088_exit%"=="0" echo The Agent8088 uninstaller exited with code %_agent8088_exit%.
+if defined _agent8088_log if exist "%_agent8088_log%" type "%_agent8088_log%"
+exit /b 1
+"@
+    [System.IO.File]::WriteAllText($launcher, $content, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
 function Setup-Path {
     $venvScripts = Join-Path $InstallDir "venv\Scripts"
-    Write-Info "Adding $venvScripts to User PATH..."
+    $managedBin = Join-Path $Agent8088Home "bin"
+    Write-Info "Installing Agent8088 command launcher at $LauncherDir..."
+    if (-not (Write-Agent8088Launcher)) { return $false }
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $userPathItems = if ($userPath) { $userPath -split ";" } else { @() }
-    if ($userPathItems -notcontains $venvScripts) {
-        $userPathItems += $venvScripts
-        [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
-        Write-Success "Added $venvScripts to User PATH"
-    } else {
-        Write-Success "$venvScripts already on PATH"
-    }
+    $userPathItems = @($userPathItems | Where-Object {
+        $_ -and $_ -ne $venvScripts -and $_ -ne $managedBin -and $_ -ne $LauncherDir
+    })
+    $userPathItems += $LauncherDir
+    [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
+    Write-Success "Agent8088 command launcher installed"
     # Session PATH so the rest of this run can find agent8088
-    $env:Path = "$venvScripts;$env:Path"
+    $env:Path = "$LauncherDir;$env:Path"
+    return $true
 }
 
 # ----------------------------------------------------------------------------
@@ -1322,7 +1381,7 @@ Install-Gateway-Extras
 Install-Node-Bridge
 Install-Embedding-Model
 Install-Native-Sandbox
-Setup-Path
+if (-not (Setup-Path)) { exit 1 }
 Drop-Config
 Run-InitialSetup
 Verify-Install

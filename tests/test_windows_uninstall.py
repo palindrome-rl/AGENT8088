@@ -17,7 +17,8 @@ def test_windows_uninstall_schedules_cleanup_without_moving_live_home(tmp_path, 
     (home / "config.txt").write_text("secret", encoding="utf-8")
     environment_removed = []
     helper_calls = []
-    monkeypatch.setattr(cli, "_agent8088_link_dir", lambda: home / "agent8088/venv/Scripts")
+    launcher_dir = home.with_name("agent8088-launcher")
+    monkeypatch.setattr(cli, "_agent8088_link_dir", lambda: launcher_dir)
     monkeypatch.setattr(
         cli, "_remove_windows_user_environment",
         lambda *paths: environment_removed.extend(paths) or True,
@@ -33,7 +34,11 @@ def test_windows_uninstall_schedules_cleanup_without_moving_live_home(tmp_path, 
     assert home.exists()
     assert not list(tmp_path.glob("agent8088.uninstalling-*"))
     assert helper_calls == [(home, os.getpid())]
-    assert environment_removed == [home / "agent8088/venv/Scripts", home / "bin"]
+    assert environment_removed == [
+        launcher_dir,
+        home / "bin",
+        home / "agent8088/venv/Scripts",
+    ]
 
 
 def test_windows_uninstall_helper_failure_leaves_live_install_and_environment(tmp_path, monkeypatch):

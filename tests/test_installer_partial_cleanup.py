@@ -1,6 +1,9 @@
+import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -120,3 +123,49 @@ def test_windows_installer_requires_verified_repository():
     assert source.index('if (-not (Wait-ForPendingUninstall))') < source.index('if (-not (Install-Uv))')
     assert 'Repository verification failed' in clone
     assert 'installedCommit = "unknown"' not in clone
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows cmd launcher behavior")
+def test_windows_launcher_waits_for_complete_uninstall_and_removes_itself(tmp_path):
+    agent_root = tmp_path / "agent8088"
+    launcher_dir = tmp_path / "agent8088-launcher"
+    agent_root.mkdir()
+    marker = tmp_path / "agent8088.uninstall-pending"
+    marker.write_text(str(tmp_path / "cleanup.log"), encoding="utf-8")
+    fake_agent = Path(os.environ["SystemRoot"]) / "System32" / "attrib.exe"
+
+    output = _run_powershell(
+        f"""
+$Agent8088Home = '{str(agent_root).replace("'", "''")}'
+$LauncherDir = '{str(launcher_dir).replace("'", "''")}'
+$InstallDir = '{str(tmp_path).replace("'", "''")}'
+function Write-Err {{ param([string]$Message) Write-Output $Message }}
+{_powershell_function('Write-Agent8088Launcher')}
+Write-Output (Write-Agent8088Launcher -AgentExe '{str(fake_agent).replace("'", "''")}')
+"""
+    )
+    assert output.splitlines()[-1] == "True"
+    launcher = launcher_dir / "agent8088.cmd"
+
+    def finish_cleanup():
+        time.sleep(1.2)
+        shutil.rmtree(agent_root)
+        marker.unlink()
+
+    cleanup = threading.Thread(target=finish_cleanup)
+    cleanup.start()
+    started = time.monotonic()
+    result = subprocess.run(
+        [os.environ["COMSPEC"], "/d", "/c", str(launcher), "--uninstall"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    elapsed = time.monotonic() - started
+    cleanup.join(timeout=5)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert elapsed >= 1
+    assert "[OK] Agent8088 was completely uninstalled." in result.stdout
+    assert not agent_root.exists()
+    assert not launcher_dir.exists()
