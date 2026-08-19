@@ -500,7 +500,7 @@ def _ddgs_cache_get(query: str, limit: int):
     if entry is None:
         return None
     stored_at, results = entry
-    if time.monotonic() - stored_at > _DDGS_CACHE_TTL:
+    if time.monotonic() - stored_at >= _DDGS_CACHE_TTL:
         _ddgs_cache.pop((query, limit), None)
         return None
     return results

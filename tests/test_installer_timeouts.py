@@ -66,10 +66,10 @@ needs_win_ps = pytest.mark.skipif(
     reason="needs Windows PowerShell 5.1 (Desktop edition); pwsh 7 takes the other branch",
 )
 
-# /bin/sleep on POSIX, timeout.exe on Windows. Kept in one place so the assertions
+# /bin/sleep on POSIX, ping.exe on Windows. Kept in one place so the assertions
 # below read the same on both.
 if sys.platform == "win32":
-    SLEEP, SLEEP_ARGS = "cmd.exe", '@("/c", "timeout /t 60 /nobreak")'
+    SLEEP, SLEEP_ARGS = "ping.exe", '@("-n", "61", "127.0.0.1")'
     ECHO, SH = "cmd.exe", "cmd.exe"
     EXIT7 = '-FilePath "cmd.exe" -Arguments @("/c", "exit 7")'
     EXIT0 = '-FilePath "cmd.exe" -Arguments @("/c", "exit 0")'
