@@ -1094,6 +1094,8 @@ install_native_sandbox() {
     local _py="$INSTALL_DIR/venv/bin/python"
     if [ ! -x "$_py" ]; then
         log_warn "venv python not found at $_py - skipping sandbox setup"
+        record_skip "Native sandbox runtime" "venv python not found" \
+            "agent8088 --sandbox-setup"
         return 0
     fi
 
@@ -1171,6 +1173,8 @@ install_native_sandbox() {
     else
         [ -n "$_sandbox_setup" ] && log_warn "$_sandbox_setup"
         log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
+        record_skip "Native sandbox runtime" "setup did not complete" \
+            "agent8088 --sandbox-setup   (Docker is used automatically meanwhile)"
     fi
 }
 

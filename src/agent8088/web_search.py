@@ -8,7 +8,7 @@ Roles:
   searxng   default   self-hosted, no key (see searxng_provision.py)
   tavily    optional  enabled by TAVILY_API_KEY
   exa       optional  enabled by EXA_API_KEY
-  ddgs      fallback  keyless, ships as a dependency — always available
+  ddgs      fallback  keyless, ships as a dependency — rotates several engines
 
 Selection precedence (mirrors Hermes' agent/web_search_registry.py):
 
@@ -42,13 +42,15 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-# Base order when no keyed backend is configured: searxng first (self-hosted,
-# no key), then ddgs (keyless fallback, but scrapes rather than using an API
-# so it's the one that rate-limits under normal use). tavily/exa sit at the
-# end of this base order, but Registry.chain() promotes either one to the
-# front — ahead of searxng and ddgs — the moment its API key is configured;
-# adding a key is a signal to prefer that backend. tavily wins the tie if
-# both are configured.
+# Base order when no keyed backend is configured: searxng first (self-hosted, no
+# key), then ddgs. ddgs scrapes result pages rather than using an API, so it is
+# still the backend most likely to throttle under sustained use — but it no longer
+# gives up when it does: it rotates several engines (separate throttle buckets),
+# retries a throttled attempt with backoff, spaces consecutive calls, and serves
+# repeat queries from a short cache. tavily/exa sit at the end of this base order,
+# but Registry.chain() promotes either one to the front — ahead of searxng and
+# ddgs — the moment its API key is configured; adding a key is a signal to prefer
+# that backend. tavily wins the tie if both are configured.
 PREFERENCE = ("searxng", "ddgs", "tavily", "exa")
 
 # web_search_provider=auto — "pick the best available at startup, then behave
