@@ -84,9 +84,12 @@ The wizard asks for:
 4. **Model** — fetched live from the provider's `/v1/models` where supported,
    otherwise typed
 5. **Web search** — pick a backend. SearXNG is offered first when Docker is
-   available (the wizard provisions it); otherwise the bundled keyless `ddgs`
-   fallback is already active and needs nothing. Tavily and Exa are optional
-   API-key backends. Re-running setup offers **Keep current setting**.
+   available (the wizard provisions it on `127.0.0.1`); otherwise the bundled
+   keyless `ddgs` fallback is already active and needs nothing. Tavily and Exa
+   are optional API-key backends. Re-running setup offers **Keep current
+   setting**. No endpoint is configured for you if you skip this — see
+   [Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng)
+   to set one later.
 
 Re-running the wizard pre-fills what you already have, so pressing Enter keeps
 the existing value instead of clearing it.

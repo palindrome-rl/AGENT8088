@@ -1,2 +1,0 @@
-Write a file at /workspace/artifacts/e2e_flag_test.txt with the content: full-auto writes without asking.
-/exit

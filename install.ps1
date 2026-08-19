@@ -83,6 +83,7 @@ $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
 $NodeVersion = "22.11.0"
 $FreshInstall = $false
+$ConfigCreated = $false
 $InitialSetupRan = $false
 # Readiness flags set by the new stages so Verify-Install can report actual state.
 $GatewayExtrasInstalled = $false
@@ -803,6 +804,7 @@ function Drop-Config {
             return
         }
         Protect-ConfigFile $configPath
+        $script:ConfigCreated = $true
         Write-Success "Default config.txt copied"
     } else {
         Write-Info "config.txt already exists at $configPath - preserving"
@@ -991,9 +993,11 @@ function Run-SetupWizard {
         if (-not ($content -match "(?m)^provider\.$newProvider\.api_key=")) { $content += "`nprovider.$newProvider.api_key=$newKey`n" }
     }
     if ($newSearch -and $newSearch.Trim().ToLowerInvariant() -eq "none") {
-        $content = $content -replace '(?m)^#?\s*search_base_url=.*\r?\n?', ''
+        $content = $content -replace '(?m)^search_base_url=.*\r?\n?', ''
     } elseif ($newSearch) {
-        $content = $content -replace '(?m)^#?\s*search_base_url=.*', "search_base_url=$newSearch"
+        # Anchored at column 0: config.txt documents commented example endpoints,
+        # and a '^#?\s*' pattern rewrote every one of them into a duplicate key.
+        $content = $content -replace '(?m)^search_base_url=.*', "search_base_url=$newSearch"
         if (-not ($content -match '(?m)^search_base_url=')) { $content += "`nsearch_base_url=$newSearch`n" }
     }
     Set-Content -Path $config -Value $content -NoNewline:$false
@@ -1048,8 +1052,8 @@ function Verify-Install {
 }
 
 function Run-InitialSetup {
-    if (-not $script:FreshInstall) {
-        Write-Info "Existing installation updated - skipping first-run setup."
+    if (-not $script:FreshInstall -and -not $script:ConfigCreated) {
+        Write-Info "Existing installation and config found - skipping first-run setup."
         return
     }
     if ($SkipSetup) {

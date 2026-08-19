@@ -1,5 +1,0 @@
-List the Python files in /workspace/src/agent8088 and give me a one-line summary of what each top-level module does. Use your tools.
-Now show me the git log for the last 5 commits on this branch.
-Read /workspace/README.md and tell me how many built-in tools Agent8088 has, according to the README.
-In three sentences, explain when I should use full-auto mode versus readonly mode.
-/exit

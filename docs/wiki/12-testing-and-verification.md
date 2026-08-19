@@ -190,7 +190,7 @@ These are normal on a clean machine and not failures:
 | Skip | Why |
 |---|---|
 | `web_search REAL query` | all backends failed, or ddgs rate limited |
-| `configured search backend reachable` | the temporary LAN SearXNG at `127.0.0.1:8888` is unreachable from this machine |
+| `configured search backend reachable` | no `search_base_url` is configured (the default), or the configured instance is unreachable from this machine |
 | `REAL native sandbox` | sandbox runtime not installed |
 
 If the sandbox runtime is missing, checks that exercise shell and permission

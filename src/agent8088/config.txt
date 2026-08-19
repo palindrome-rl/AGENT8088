@@ -26,9 +26,13 @@ allowed_paths=.
 # unless the narrow local-SearXNG opt-in below is enabled.
 
 # --- SSRF protection ---
-# TEMPORARY LAN DEPLOYMENT: bundled installs use the shared SearXNG at
-# 127.0.0.1. Replace these four search settings before public distribution.
-ssrf_allow_hosts=127.0.0.1,localhost,127.0.0.1:8888
+# Requests to private/internal addresses are blocked unless the host appears
+# here. Loopback only by default — nothing on your LAN is assumed reachable.
+#
+# To reach a SearXNG on another machine on your network, add its host:port:
+#   ssrf_allow_hosts=127.0.0.1,localhost,192.168.1.10:8888
+# `/search` adds the entry itself when it provisions a local instance.
+ssrf_allow_hosts=127.0.0.1,localhost
 
 # --- Permission Layer 3: Path-based write restrictions ---
 # Writes to these paths run without a prompt (auto-approved):
@@ -243,13 +247,36 @@ memory=1
 # Run `/search status` to see the live chain and `/search doctor` to diagnose.
 web_search_provider=auto
 #
-# SearXNG instance. A remote instance must use https:// — plaintext http:// is
-# accepted only for loopback/private hosts. The host must appear in
-# ssrf_allow_hosts above, or requests to it are blocked as internal.
-search_base_url=http://127.0.0.1:8888/search?q=
+# SearXNG instance. UNSET by default — no endpoint is assumed for you, so a
+# fresh install searches via the keyless ddgs fallback until you choose one.
+#
+# Three ways to set it:
+#   1. `/search` in the REPL — provisions a local container (needs Docker),
+#      writes the URL here, and allowlists it. Nothing else to do.
+#   2. Point at an instance you already run, on this machine or your LAN:
+#        search_base_url=http://127.0.0.1:8888/search?q=
+#        search_base_url=http://192.168.1.10:8888/search?q=
+#      A LAN host must also be added to ssrf_allow_hosts above.
+#   3. Point at a public instance — https:// is REQUIRED (plaintext http:// is
+#      accepted only for loopback/private hosts, so queries never cross the
+#      internet in the clear):
+#        search_base_url=https://searx.example.org/search?q=
+#
+# The URL must end at `search?q=` with no placeholder — the query is appended.
+# The instance must have JSON output enabled (`json` in search.formats), which
+# upstream SearXNG disables by default; `/search doctor` reports it if not.
+# search_base_url=
+#
+# Host port for the container `/search` provisions (default 8888). Change it if
+# 8888 is already taken. Always published to 127.0.0.1 only — the JSON API is
+# unauthenticated, so it is never exposed to the network.
+# searxng_host_port=8888
+#
 # Skip approval only for explicitly pinned loopback or explicitly allowlisted
 # private-LAN SearXNG. It never permits a fallback to a public provider.
 # Credentials and direct personal identifiers in search queries remain blocked.
+# With no search_base_url set (the default above) this key does nothing: ddgs
+# serves instead, and each of those searches asks — they reach a third party.
 web_search_no_prompt=1
 #
 # Results per search (default 5, max 20):

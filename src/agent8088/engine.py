@@ -293,9 +293,12 @@ PROJECT_ROOT = _configured_project_root(APP_CONFIG)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Ends at "q=" with NO placeholder — tools.txt appends {query_q} itself. (A trailing
-# {query} here would produce a doubled placeholder in the final URL.)
-SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "http://127.0.0.1:8888/search?q=")
+# Unset unless the operator configured one. A loopback default used to live here
+# for tools.txt to interpolate, but web_search is mode=search now and never
+# templates a URL — so the default only made every machine claim a SearXNG it
+# did not have, costing a failed local request before the fallback took over.
+# Ends at "q=" with NO placeholder; the SearXNG backend appends the query.
+SEARCH_BASE_URL = APP_CONFIG.get("search_base_url", "")
 # Whether the user actually SET a search URL, captured before the default is
 # injected into APP_CONFIG below. The web search registry needs the distinction:
 # a defaulted value would make the SearXNG backend claim to be configured on
@@ -523,8 +526,14 @@ SANDBOX_ALLOWED_DOMAINS = [
 
 # Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
 # command references must exist there too. Without this, a missing config key left
-# `{search_base_url}` literal in the URL and web_search failed with the confusing
+# a `{placeholder}` literal in the URL and the tool failed with the confusing
 # "Blocked: scheme '' is not allowed" from the SSRF guard.
+#
+# search_base_url seeds an EMPTY string, not an endpoint: it is no longer
+# templated (web_search is mode=search), and both the SearXNG backend's
+# is_available() and _local_searxng_no_prompt_enabled() read "" as "operator
+# chose nothing" — which is what keeps a machine with no instance out of the
+# no-prompt path.
 APP_CONFIG.setdefault("search_base_url", SEARCH_BASE_URL)
 APP_CONFIG.setdefault("gemma_base_url", GEMMA_BASE_URL)
 APP_CONFIG.setdefault("model_base_url", MODEL_BASE_URL)
