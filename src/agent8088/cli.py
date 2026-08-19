@@ -3416,9 +3416,14 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
 def _choice_prompt(message, choices, default=""):
     try:
         from InquirerPy import inquirer
-        kwargs = {"message": message, "choices": choices, "max_height": "70%"}
-        if default:
-            kwargs["default"] = default
+        # InquirerPy's fuzzy prompt mis-renders (duplicate/garbled highlighted
+        # row) when a `default=` matching a later choice is passed. Instead,
+        # move the default to the front so the prompt's natural index-0
+        # cursor lands on it without needing the `default` kwarg.
+        ordered = choices
+        if default and default in choices:
+            ordered = [default] + [c for c in choices if c != default]
+        kwargs = {"message": message, "choices": ordered, "max_height": "70%"}
         return inquirer.fuzzy(**kwargs).execute()
     except (ImportError, EOFError, OSError, KeyboardInterrupt):
         # See _custom_prompt for why these exceptions are grouped.
@@ -4405,11 +4410,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     except Exception:
         models = []
     if models:
-        model_name = _choice_prompt(
-            "Select model:",
-            models,
-            current_model if current_model in models else "",
-        )
+        model_name = _choice_prompt("Select model:", models)
     else:
         print("Model discovery unavailable; enter the model name manually.")
         model_name = ""
