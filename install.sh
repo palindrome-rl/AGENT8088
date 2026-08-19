@@ -87,6 +87,158 @@ log_success() { echo -e "\033[0;32m✓\033[0m $1"; }
 log_warn()    { echo -e "\033[0;33m⚠\033[0m $1"; }
 log_error()   { echo -e "\033[0;31m✗\033[0m $1"; }
 
+# ----------------------------------------------------------------------------
+# Timeouts for the network stages
+# ----------------------------------------------------------------------------
+# Every optional stage already tolerated a *failure* (`|| true` + log_warn), but
+# nothing protected any stage from a *hang*. A stalled `ollama pull`, an npm
+# registry that accepts the connection and then goes quiet, a wedged Ollama
+# daemon, or a package download that dribbles bytes forever left the installer
+# waiting indefinitely with no way out but Ctrl-C.
+#
+# Limits are deliberately moderate rather than maximally generous: an optional
+# stage degrades to a "run this to fix it later" message, so the cost of cutting
+# a slow-but-working download short is one rerun, while the cost of waiting too
+# long is an installer that looks frozen. Sized so a ~4 Mbps link finishes
+# comfortably.
+#
+# Scale them all for a slow connection:
+#   curl -fsSL <url> | AGENT8088_TIMEOUT_SCALE=3 bash
+TIMEOUT_SCALE="${AGENT8088_TIMEOUT_SCALE:-1}"
+case "$TIMEOUT_SCALE" in
+    ''|*[!0-9]*) TIMEOUT_SCALE=1 ;;
+esac
+[ "$TIMEOUT_SCALE" -lt 1 ] && TIMEOUT_SCALE=1
+
+T_OLLAMA_CHECK=$((15  * TIMEOUT_SCALE))   # nothing, local - instant unless the daemon is wedged
+T_OLLAMA_PULL=$((600  * TIMEOUT_SCALE))   # 274 MB embedding model
+T_NPM=$((300          * TIMEOUT_SCALE))   # 142 small packages, mostly round-trips
+T_CHROMIUM=$((600     * TIMEOUT_SCALE))   # ~150 MB browser download
+T_NODE_DL=$((180      * TIMEOUT_SCALE))   # ~30 MB tarball
+T_PIP=$((300          * TIMEOUT_SCALE))   # gateway extras: tens of MB of wheels
+T_GIT=$((600          * TIMEOUT_SCALE))   # shallow clone: small, but a stalled fetch hangs
+# The core editable install is the stage that actually hangs: it pulls
+# playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
+# premature cut fails the install outright -- but it is still the largest
+# download set here, so it gets the same 10m ceiling as Chromium rather than a
+# looser one. AGENT8088_TIMEOUT_SCALE raises it for a genuinely slow link.
+T_CORE_INSTALL=$((600 * TIMEOUT_SCALE))
+T_VENV=$((300         * TIMEOUT_SCALE))   # uv may download a CPython build
+T_UV_BOOT=$((300      * TIMEOUT_SCALE))   # uv self-installer
+
+# Does this `timeout` understand -k (kill-after)? GNU coreutils >= 7 and busybox
+# >= 1.30 do; older busybox treats -k as the command name and would run the
+# wrong thing entirely. Probed once, because getting it wrong is silent.
+_TIMEOUT_HAS_K=""
+_timeout_supports_k() {
+    if [ -z "$_TIMEOUT_HAS_K" ]; then
+        if timeout -k 1 1 true >/dev/null 2>&1; then _TIMEOUT_HAS_K=yes
+        else _TIMEOUT_HAS_K=no
+        fi
+    fi
+    [ "$_TIMEOUT_HAS_K" = yes ]
+}
+
+# Run a command under a wall-clock limit. macOS ships no `timeout` (it is GNU
+# coreutils), so prefer timeout/gtimeout where they exist and fall back to a
+# background watchdog that escalates TERM -> KILL.
+#
+# -k 10 matters: plain SIGTERM loses to a child that traps or ignores it (npm's
+# node wrapper does), so the child survives its own timeout and the installer
+# hangs anyway -- the "the timeout does not work" symptom.
+#
+# Returns 124 on timeout, matching GNU timeout, so callers can tell a hang from
+# an ordinary failure. A SIGKILLed child surfaces as 137 and a SIGTERMed one as
+# 143, so both are normalized to 124 -- warn_stage only recognizes 124 as a hang.
+# Must not let `wait` trip `set -e`.
+run_with_timeout() {
+    local _secs="$1"; shift
+    local _rc=0
+
+    if command -v timeout >/dev/null 2>&1; then
+        if _timeout_supports_k; then
+            timeout -k 10 "$_secs" "$@" || _rc=$?
+        else
+            timeout "$_secs" "$@" || _rc=$?
+        fi
+        case "$_rc" in 137|143) _rc=124 ;; esac
+        return $_rc
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout -k 10 "$_secs" "$@" || _rc=$?
+        case "$_rc" in 137|143) _rc=124 ;; esac
+        return $_rc
+    fi
+
+    "$@" &
+    local _pid=$!
+    (
+        _waited=0
+        while [ "$_waited" -lt "$_secs" ]; do
+            kill -0 "$_pid" 2>/dev/null || exit 0
+            sleep 1
+            _waited=$((_waited + 1))
+        done
+        kill -TERM "$_pid" 2>/dev/null || true
+        sleep 10
+        kill -KILL "$_pid" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
+    local _watchdog=$!
+
+    wait "$_pid" 2>/dev/null || _rc=$?
+    kill -KILL "$_watchdog" 2>/dev/null || true
+    wait "$_watchdog" 2>/dev/null || true
+
+    case "$_rc" in 137|143) _rc=124 ;; esac
+    return $_rc
+}
+
+# Skipped-stage ledger, printed as one block at the end of the run.
+#
+# Warnings are emitted as each stage runs, which on a multi-minute install means
+# they have scrolled well out of view by the time it finishes - the WhatsApp
+# bridge failing was reported and still went unnoticed. Recording them lets the
+# final summary state plainly what did not install and how to fix each one.
+# Fields are tab-separated: label, reason, fix command.
+SKIPPED_STAGES=()
+
+record_skip() {
+    SKIPPED_STAGES+=("$1"$'\t'"$2"$'\t'"${3:-}")
+}
+
+# Warn about a stage that did not complete, naming a hang as a hang. "timed out
+# after 10m" and "failed" point at different fixes. The optional 5th argument is
+# the command that repairs it, surfaced again in the final summary.
+warn_stage() {
+    local _rc="$1" _secs="$2" _what="$3" _consequence="$4" _fix="${5:-}"
+    local _reason
+    if [ "$_rc" -eq 124 ]; then
+        _reason="timed out after $((_secs / 60))m"
+        log_warn "$_what timed out after $((_secs / 60))m - $_consequence"
+        log_warn "On a slow connection, rerun the installer with AGENT8088_TIMEOUT_SCALE=3"
+    else
+        _reason="failed (exit $_rc)"
+        log_warn "$_what failed - $_consequence"
+    fi
+    record_skip "$_what" "$_reason" "$_fix"
+}
+
+# Final block: what did not install, why, and the command that fixes it. Silent
+# when everything succeeded.
+print_skipped_summary() {
+    [ "${#SKIPPED_STAGES[@]}" -eq 0 ] && return 0
+    local _entry _label _reason _fix
+    echo ""
+    echo -e "\033[0;33m${#SKIPPED_STAGES[@]} optional component(s) did not install:\033[0m"
+    for _entry in "${SKIPPED_STAGES[@]}"; do
+        IFS=$'\t' read -r _label _reason _fix <<< "$_entry"
+        echo -e "  \033[0;33m•\033[0m $_label — $_reason"
+        [ -n "$_fix" ] && echo "      fix: $_fix"
+    done
+    echo ""
+    echo "  The core agent is installed and works without these."
+}
+
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
 }
