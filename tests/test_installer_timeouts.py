@@ -143,6 +143,48 @@ def test_a_chatty_child_does_not_deadlock():
     assert int(re.search(r"Bytes=(\d+)", out).group(1)) > 100_000
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="needs Windows handle inheritance")
+def test_a_grandchild_holding_the_pipe_does_not_hang_the_call():
+    """The reported hang: the installer stopped with no output at all, right before
+    the first message of the stage after npm.
+
+    Both the post-exit WaitForExit() and a .GetResult() on the read task complete
+    on pipe EOF, not on the child exiting - and the child's children inherit those
+    pipe handles. One surviving grandchild (`ollama list` leaving a server behind)
+    holds the write end open, so EOF never arrives and an unbounded wait sits
+    inside the one function whose job is to bound waits. Here the child exits
+    immediately and leaves a 40s grandchild behind; the call must not wait on it.
+    """
+    # Timed inside PowerShell: the grandchild inherits every inheritable handle,
+    # this harness's own stdout pipe included, so subprocess.run here waits for it
+    # no matter how promptly the function returns. Only the inner clock is the
+    # measurement.
+    spawn = "start /b ping.exe -n 21 127.0.0.1 & exit 0"
+    out = _run(
+        '$sw = [Diagnostics.Stopwatch]::StartNew()\n'
+        f'$r = Invoke-WithTimeout -FilePath "cmd.exe" -Arguments @("/c", \'{spawn}\') '
+        '-TimeoutSec 60 -CaptureOutput -DrainSec 2\n'
+        '$sw.Stop()\n'
+        'Write-Output "ExitCode=$($r.ExitCode) TimedOut=$($r.TimedOut) '
+        'Elapsed=$([int]$sw.Elapsed.TotalSeconds)"',
+        "Invoke-WithTimeout",
+    )
+    assert "TimedOut=False" in out, out
+    inner = int(re.search(r"Elapsed=(\d+)", out).group(1))
+    # Returning at ~20s would mean it waited for the grandchild, which is the bug.
+    assert inner < 10, f"the call took {inner}s; it waited on the grandchild"
+
+
+def test_the_drain_wait_is_bounded_at_every_call_site():
+    """An argument-less WaitForExit() or a .GetResult() on the read task is an
+    unbounded wait, whatever the stage budget says."""
+    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    code = [l for l in source.splitlines() if not l.strip().startswith("#")]
+    offenders = [l.strip() for l in code
+                 if re.search(r"WaitForExit\(\s*\)", l) or "GetAwaiter()" in l]
+    assert offenders == [], f"unbounded wait(s) remain: {offenders}"
+
+
 def test_a_missing_binary_returns_a_failure_rather_than_throwing():
     """A provider of last resort must not raise; the installer decides what to do."""
     out = _run('$r = Invoke-WithTimeout -FilePath "/definitely/not/here" -TimeoutSec 5\n'

@@ -269,7 +269,11 @@ function Invoke-WithTimeout {
         [string[]]$Arguments = @(),
         [Parameter(Mandatory = $true)][int]$TimeoutSec,
         [string]$WorkingDirectory,
-        [switch]$CaptureOutput
+        [switch]$CaptureOutput,
+        # How long to wait for an exited child's pipes to reach EOF. Not a limit on
+        # the work - the child is already gone by then - only on the flush, so it
+        # is deliberately short and deliberately not one of the stage budgets.
+        [int]$DrainSec = 10
     )
 
     $result = @{ ExitCode = -1; TimedOut = $false; Output = "" }
@@ -312,12 +316,23 @@ function Invoke-WithTimeout {
         $errTask = $proc.StandardError.ReadToEndAsync()
 
         if ($proc.WaitForExit($TimeoutSec * 1000)) {
-            # Second, argument-less wait: lets the async readers finish flushing
-            # before the exit code is read (documented .NET requirement).
-            try { $proc.WaitForExit() } catch { }
+            # Second wait, bounded: lets the async readers finish flushing before
+            # the exit code is read (documented .NET requirement). It has to be
+            # bounded, because both this wait and the read below finish on pipe
+            # EOF rather than on the child exiting - and the child's own children
+            # inherit those pipe handles. One surviving grandchild (`ollama list`
+            # leaving a server behind, npm leaving a node) holds the write end
+            # open, EOF never comes, and an argument-less WaitForExit or a
+            # .GetResult() on the read task waits for it forever. That put an
+            # unbounded wait inside the one function whose job is to bound them,
+            # and hung the installer with no output at all - the message for the
+            # stage comes after this returns.
+            try { [void]$proc.WaitForExit($DrainSec * 1000) } catch { }
             $result.ExitCode = $proc.ExitCode
             if ($CaptureOutput) {
-                try { $result.Output = $outTask.GetAwaiter().GetResult() } catch { }
+                try {
+                    if ($outTask.Wait($DrainSec * 1000)) { $result.Output = $outTask.Result }
+                } catch { }
             }
         } else {
             $result.TimedOut = $true
