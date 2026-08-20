@@ -116,14 +116,23 @@ CURL_STALL_FLAGS=(--connect-timeout 20 --speed-limit 1024 --speed-time 30)
 _download_file() {
     local _dl_url="$1" _dl_out="$2" _dl_timeout="$3"
     if command -v curl >/dev/null 2>&1; then
-        run_with_timeout "$_dl_timeout" curl -fsSL "${CURL_STALL_FLAGS[@]}" "$_dl_url" -o "$_dl_out" 2>/dev/null
+        # --proto '=https' --tlsv1.2: refuse anything but https + TLS1.2+, so a
+        # compromised/misconfigured DNS or redirect can't quietly downgrade this
+        # to a plaintext or legacy-TLS transfer. This matters here specifically
+        # because the one call site extracts and then EXECUTES the downloaded
+        # archive (a Node.js runtime, then npm installs from it) with no
+        # checksum verification of its own.
+        run_with_timeout "$_dl_timeout" curl -fsSL --proto '=https' --tlsv1.2 \
+            "${CURL_STALL_FLAGS[@]}" "$_dl_url" -o "$_dl_out" 2>/dev/null
         return $?
     fi
     if command -v wget >/dev/null 2>&1; then
         # wget's nearest equivalents: --timeout bounds a stalled read (curl's
         # --speed-time), --tries=1 avoids wget's own silent retry loop stacking on
-        # top of run_with_timeout's wall clock.
-        run_with_timeout "$_dl_timeout" wget -q --timeout=30 --tries=1 -O "$_dl_out" "$_dl_url" 2>/dev/null
+        # top of run_with_timeout's wall clock. --https-only is wget's closest
+        # match to curl's --proto/--tlsv1.2 pin above: it refuses a plain-http
+        # URL or a redirect down to one.
+        run_with_timeout "$_dl_timeout" wget -q --https-only --timeout=30 --tries=1 -O "$_dl_out" "$_dl_url" 2>/dev/null
         return $?
     fi
     log_warn "Neither curl nor wget is available - cannot download $_dl_url"
@@ -481,8 +490,11 @@ install_uv() {
     # on empty stdin).
     local _uv_installer
     _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/agent8088-uv.$$.sh")"
-    if ! curl -LsSf "${CURL_STALL_FLAGS[@]}" --max-time 120 \
-            https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
+    # Routed through _download_file (curl-or-wget, same TLS/proto pin as the
+    # Node tarball download below) rather than bare curl: a curl-less-but-
+    # wget-having host would otherwise die right here, on this mandatory
+    # bootstrap step, before ever reaching the fallback Part B protects.
+    if ! _download_file "https://astral.sh/uv/install.sh" "$_uv_installer" 120; then
         log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
         log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
         rm -f "$_uv_installer"
