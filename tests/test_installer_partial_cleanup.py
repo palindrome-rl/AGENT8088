@@ -124,7 +124,10 @@ Write-Output (Wait-ForPendingUninstall)
 def test_windows_installer_requires_verified_repository():
     source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     clone = _powershell_function("Clone-Repo")
-    assert 'if (-not (Clone-Repo)) { exit 1 }' in source
+    assert 'if (-not (Clone-Repo)) {' in source
+    clone_failure = source.split('if (-not (Clone-Repo)) {', 1)[1].split('}', 1)[0]
+    assert 'Set-InstallerExitStatus -ExitCode 1' in clone_failure
+    assert 'return' in clone_failure
     assert source.index('if (-not (Wait-ForPendingUninstall))') < source.index(
         "$terminalAction = Ensure-SupportedTerminal"
     )

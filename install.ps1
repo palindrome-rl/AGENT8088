@@ -18,6 +18,16 @@ param(
     [string]$InstallerSourceUrl = ""
 )
 
+# Record an installer result without killing the user's current PowerShell.
+# TerminalBootstrap is an internal child process whose parent waits on its OS
+# exit code, so only that dedicated child may call exit; the documented
+# `iex (irm ...)` path always returns to its caller.
+function Set-InstallerExitStatus {
+    param([Parameter(Mandatory = $true)][int]$ExitCode)
+    $global:LASTEXITCODE = $ExitCode
+    if ($TerminalBootstrap) { exit $ExitCode }
+}
+
 # Note: we use "Continue" (not "Stop") because native commands (uv, git, python)
 # write progress/diagnostic text to stderr. With "Stop", PowerShell wraps every
 # stderr line as a NativeCommandError and throws - making `uv venv`'s harmless
@@ -71,7 +81,11 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Host "    Windows PowerShell 5.1 or PowerShell 7+ is required."
     Write-Host "    5.1 ships with Windows 10 / Server 2016+; otherwise install"
     Write-Host "    PowerShell 7: https://aka.ms/powershell"
-    exit 1
+    # The documented iex invocation runs inside the user's existing shell.
+    # `exit 1` here would terminate that shell (and VS Code would report only
+    # "terminal process terminated"), hiding the useful explanation above.
+    Set-InstallerExitStatus -ExitCode 1
+    return
 }
 
 # ----------------------------------------------------------------------------
@@ -2231,7 +2245,12 @@ function Start-InitialAgent {
 # Main
 # ----------------------------------------------------------------------------
 Write-Banner
-if (-not (Test-DiskSpace)) { exit 1 }
+Set-InstallerExitStatus -ExitCode 0
+if (-not (Test-DiskSpace)) {
+    Write-Info "Installation stopped. Free the required disk space, then run the installer again."
+    Set-InstallerExitStatus -ExitCode 1
+    return
+}
 Show-LongPathWarningIfNeeded
 Test-HostConnectivity
 if (-not $env:AGENT8088_TIMEOUT_SCALE -and (Test-SlowConnection)) {
@@ -2242,24 +2261,48 @@ if (-not $env:AGENT8088_TIMEOUT_SCALE -and (Test-SlowConnection)) {
 # Wrapped so an unexpected exception (e.g. Install-Deps's throw, or any
 # native launch failure nothing downstream anticipated) prints one clean
 # message and still runs Write-SkippedSummary, instead of propagating out as
-# a raw stack trace that skips the summary entirely. `exit` inside `if`
-# checks below is a hard stop, not an exception, so it is unaffected by this
-# try/catch - it terminates before the catch could ever see it.
+# a raw stack trace that skips the summary entirely. Fatal checks return from
+# this remotely evaluated script after setting LASTEXITCODE; they must never
+# terminate the PowerShell/VS Code terminal that invoked `iex (irm ...)`.
 try {
-    if (-not (Wait-ForPendingUninstall)) { exit 1 }
+    if (-not (Wait-ForPendingUninstall)) {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
     $terminalAction = Ensure-SupportedTerminal
-    if ($terminalAction -eq "relaunched") { exit 0 }
-    if ($terminalAction -ne "continue") { exit 1 }
-    if (-not (Install-Uv)) { exit 1 }
-    if (-not (Test-Python)) { exit 1 }
-    if (-not (Install-Git)) { exit 1 }
-    if (-not (Clone-Repo)) { exit 1 }
+    if ($terminalAction -eq "relaunched") {
+        Set-InstallerExitStatus -ExitCode 0
+        return
+    }
+    if ($terminalAction -ne "continue") {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
+    if (-not (Install-Uv)) {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
+    if (-not (Test-Python)) {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
+    if (-not (Install-Git)) {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
+    if (-not (Clone-Repo)) {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
     Install-Deps
     Install-Gateway-Extras
     Install-Node-Bridge
     Install-Embedding-Model
     Install-Native-Sandbox
-    if (-not (Setup-Path)) { exit 1 }
+    if (-not (Setup-Path)) {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
     Drop-Config
     Run-InitialSetup
     Verify-Install
@@ -2269,5 +2312,7 @@ try {
     Write-Err "Installation failed: $_"
     Write-Info "Re-run the installer to retry - completed stages are skipped or resumed automatically."
     Write-SkippedSummary
-    exit 1
+    Set-InstallerExitStatus -ExitCode 1
+    return
 }
+Set-InstallerExitStatus -ExitCode 0

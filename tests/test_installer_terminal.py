@@ -1,3 +1,4 @@
+import base64
 import re
 import shutil
 import subprocess
@@ -104,7 +105,64 @@ def test_terminal_relaunch_gate_runs_before_any_install_stage():
     assert source.index("$terminalAction = Ensure-SupportedTerminal") < source.index(
         "if (-not (Install-Uv))"
     )
-    assert 'if ($terminalAction -eq "relaunched") { exit 0 }' in source
+    assert 'if ($terminalAction -eq "relaunched")' in source
+
+
+def test_installer_never_terminates_the_calling_powershell_process():
+    """The documented ``iex (irm ...)`` runs in the user's current shell.
+
+    A top-level ``exit`` therefore kills VS Code's terminal instead of merely
+    stopping the installer.  Fatal paths must return to that shell and expose
+    their status through LASTEXITCODE.
+    """
+    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    main = source.split("# Main\n# " + "-" * 76 + "\n", 1)[1]
+    code = [line for line in main.splitlines()
+            if not line.strip().startswith("#")]
+    assert not any(re.search(r"\bexit\s+[01]\b", line) for line in code)
+    status = _powershell_function("Set-InstallerExitStatus")
+    assert "if ($TerminalBootstrap) { exit $ExitCode }" in status
+
+
+def test_failed_disk_preflight_returns_to_iex_caller_with_status_one():
+    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    main = source.split("# Main\n# " + "-" * 76 + "\n", 1)[1]
+    encoded = base64.b64encode(main.encode("utf-16-le")).decode("ascii")
+    output = _run_powershell(
+        f"""
+$main = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}'))
+$TerminalBootstrap = $false
+{_powershell_function('Set-InstallerExitStatus')}
+function Write-Banner {{ Write-Output 'banner' }}
+function Write-Info {{ param([string]$Message) Write-Output $Message }}
+function Test-DiskSpace {{ return $false }}
+Invoke-Expression $main
+Write-Output "caller-alive|$LASTEXITCODE"
+"""
+    )
+    assert output.splitlines()[-1] == "caller-alive|1"
+
+
+def test_terminal_bootstrap_failure_preserves_child_process_exit_code():
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if not powershell:
+        pytest.skip("PowerShell is not installed")
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-Command",
+            (
+                "$TerminalBootstrap = $true; "
+                f"{_powershell_function('Set-InstallerExitStatus')}; "
+                "Set-InstallerExitStatus -ExitCode 1"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
 
 
 def test_powershell_literal_escapes_single_quotes():
