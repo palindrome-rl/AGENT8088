@@ -136,3 +136,23 @@ def test_main_calls_configure_logging(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         cli.main()
     assert called, "configure_logging was not called from main()"
+
+
+def test_mcp_server_entrypoint_uses_configure_logging():
+    """`python -m agent8088.mcp_server` bypasses cli.main(); its entry function
+    must wire the daily JSONL sink via configure_logging() rather than the
+    stderr-only logging.basicConfig. Source contract test — the MCP server does
+    heavy stdio/HTTP work that's not deterministic to drive without a real
+    MCP transport, so we assert the wiring exists, not the behavior."""
+    from pathlib import Path
+    import agent8088.mcp_server as m
+    src = Path(m.__file__).read_text(encoding="utf-8")
+    assert "logging.basicConfig" not in src, (
+        "mcp_server.py still uses logging.basicConfig; the MCP entrypoint must "
+        "call configure_logging() so the agent8088.mcp_server logger gets the "
+        "daily JSONL file sink (parity with gateway/__main__.py)."
+    )
+    assert "configure_logging" in src, (
+        "mcp_server.py must import and call configure_logging from "
+        "logging_setup to attach the operational log sink."
+    )

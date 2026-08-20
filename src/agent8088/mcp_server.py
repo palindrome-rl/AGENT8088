@@ -191,7 +191,8 @@ def run_mcp_server(transport="stdio", host="127.0.0.1", port=8931):
 
     engine.resolve_auto_search_provider()
 
-    logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+    from agent8088.logging_setup import configure_logging
+    configure_logging()
 
     from agent8088 import engine as A
     if exposed_tool_names(A.APP_CONFIG) != EXPOSED_TOOLS:
