@@ -130,14 +130,14 @@ def test_long_paths_disabled_when_registry_value_absent():
     assert out.strip() == "False"
 
 
-def test_long_path_warning_fires_when_disabled_and_sets_script_flag():
+def test_long_path_warning_silent_but_sets_script_flag_when_disabled():
     out = _run(
         'function Get-ItemProperty { throw "not found" }\n'
         "Show-LongPathWarningIfNeeded\n"
         'Write-Output "Flag=$script:LongPathsEnabled"',
         "Test-LongPathsRegistryEnabled", "Show-LongPathWarningIfNeeded",
     )
-    assert "WARN:Windows long paths are disabled" in out
+    assert "WARN:" not in out
     assert "Flag=False" in out
 
 
