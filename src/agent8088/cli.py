@@ -2520,7 +2520,11 @@ def _reinstall_package(package: str) -> tuple[bool, str]:
 
 
 def cmd_doctor(rest):
-    fix = rest.strip().lower() == "--fix"
+    arg = rest.strip()
+    fix = arg.lower() == "--fix"
+    if arg and not fix:
+        console.print(f"[red]unknown option:[/red] {arg}  (try /doctor or /doctor --fix)")
+        return
     active = _active_provider_name()
     provider = A.PROVIDERS.get(active, {})
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
@@ -2546,6 +2550,7 @@ def cmd_doctor(rest):
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
+    t.add_row("Web search", "ok" if A.web_search._ddgs_installed() else "[red]ddgs broken - run /doctor --fix[/red]")
     console.print(t)
 
     if fix:
