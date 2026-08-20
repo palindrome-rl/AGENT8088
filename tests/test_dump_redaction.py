@@ -16,6 +16,11 @@ def test_dump_redacts_a_configured_secret(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.A, "APP_DIR", tmp_path)
     monkeypatch.setattr(cli.A, "APP_CONFIG", {"provider.openai.api_key": "sk-super-secret-value"})
     monkeypatch.setattr(cli.A, "collect_secret_values", lambda config: ["sk-super-secret-value"])
+    # Make the secret actually land in cmd_dump's assembled `lines` (via the
+    # "Model:" line) so the test would fail if the redaction loop were ever
+    # removed. Without this, the secret never appears in `text` and the
+    # assertion below passes vacuously regardless of whether redaction runs.
+    monkeypatch.setattr(cli.A, "MODEL_NAME", "sk-super-secret-value")
 
     cli.cmd_dump("")
 
