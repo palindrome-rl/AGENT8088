@@ -879,11 +879,28 @@ install_deps() {
         fi
         if [ "$CHROMIUM_INSTALLED" = true ] && [ "$OS" = "linux" ]; then
             log_info "Installing Playwright Chromium system dependencies..."
-            local _playwright_sudo=""
-            [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _playwright_sudo="sudo"
-            run_with_timeout "$T_PIP" $_playwright_sudo "$_py" -m playwright install-deps chromium \
-                >/dev/null 2>&1 || \
-                log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
+            if [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
+                run_with_timeout "$T_PIP" "$_py" -m playwright install-deps chromium \
+                    >/dev/null 2>&1 || \
+                    log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
+            elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+                # Passwordless: either a NOPASSWD sudoers rule, or a sudo
+                # timestamp already cached earlier in this same session. `-n`
+                # on the real command too, so a timestamp that expires between
+                # this check and the call fails closed instead of prompting.
+                run_with_timeout "$T_PIP" sudo -n "$_py" -m playwright install-deps chromium \
+                    >/dev/null 2>&1 || \
+                    log_warn "Playwright system dependencies were not installed - run: sudo playwright install-deps chromium"
+            else
+                # sudo would need a real password here, and it prompts via
+                # /dev/tty directly -- bypassing this stage's >/dev/null
+                # redirect entirely. From the terminal, that reads as the
+                # installer having silently frozen for however long T_PIP
+                # allows, with no visible prompt to explain why. Skip it up
+                # front instead, with an immediate, specific instruction.
+                log_warn "Playwright system dependencies need a sudo password - skipping (not run non-interactively)"
+                log_info "  Run manually if browse_page needs it: sudo $_py -m playwright install-deps chromium"
+            fi
         fi
         [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
     fi
