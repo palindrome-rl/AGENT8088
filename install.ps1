@@ -897,11 +897,8 @@ function Test-DiskSpace {
 }
 
 # MAX_PATH is 260 unless this registry value is set (Windows 10 1607+, off by
-# default). It only actually bites during Install-Node-Bridge's npm install,
-# but that is 5+ minutes into the install - moving the check here means an
-# admin can fix it and re-run once instead of discovering it deep in a stage.
-# $script:LongPathsEnabled is read back inside Install-Node-Bridge so the
-# registry is only queried once.
+# default). Checked once up front so Install-Node-Bridge can read
+# $script:LongPathsEnabled instead of querying the registry itself.
 function Test-LongPathsRegistryEnabled {
     try {
         return ((Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
@@ -912,13 +909,10 @@ function Test-LongPathsRegistryEnabled {
 }
 
 function Show-LongPathWarningIfNeeded {
+    # No warning here: Install-Node-Bridge already falls back to a flattened
+    # dependency tree when this is off, and only warns if that fallback is
+    # itself at risk (path still too long) or actually fails.
     $script:LongPathsEnabled = Test-LongPathsRegistryEnabled
-    if ($script:LongPathsEnabled) { return }
-    Write-Warn "Windows long paths are disabled (registry LongPathsEnabled)."
-    Write-Warn "The WhatsApp bridge's npm dependency tree can exceed the 260-char MAX_PATH limit without it."
-    Write-Warn "Fix now for the smoothest install (admin PowerShell, one-time):"
-    Write-Warn "  Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' LongPathsEnabled 1"
-    Write-Warn "Continuing without it - the WhatsApp bridge step will fall back to a flattened dependency tree."
 }
 
 # Hosts this installer downloads from, probed once up front. A short TCP
@@ -1740,6 +1734,21 @@ function Install-Node-Bridge {
                 $nodeExe = $managedNode
                 $npmExe = Join-Path $Agent8088Home "node\npm.cmd"
                 Write-Success "Managed Node found ($ver)"
+                # The fresh-install branch below adds $nodeDir to $env:Path so this
+                # session's own child processes can find node - a resumed install
+                # skipping straight to this branch needs the same thing, or the
+                # later native-sandbox-setup step (which shells out to a fresh
+                # agent8088.exe process) can't find node even though it's right here.
+                $managedNodeDir = Split-Path $managedNode -Parent
+                if (($env:Path -split ";") -notcontains $managedNodeDir) {
+                    $env:Path = "$managedNodeDir;$env:Path"
+                }
+                $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+                $userPathItems = if ($userPath) { $userPath -split ";" } else { @() }
+                if ($userPathItems -notcontains $managedNodeDir) {
+                    $userPathItems += $managedNodeDir
+                    [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
+                }
             } else {
                 Write-Warn "Existing Node at $managedNode did not run - reinstalling"
             }

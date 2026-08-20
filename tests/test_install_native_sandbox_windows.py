@@ -68,3 +68,59 @@ def test_windows_install_reports_missing_requirements(tmp_path, monkeypatch):
     result = engine.install_native_sandbox()
 
     assert "koffi native addon" in result
+
+
+def test_windows_install_retries_verification_after_transient_failure(tmp_path, monkeypatch):
+    """A freshly-written koffi.node can still be mid antivirus-scan when the
+    first probe runs. That first failure must not be reported as a permanent
+    one if a retry moments later succeeds.
+    """
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(engine, "_which_executable",
+                         lambda name: {"node": "node", "npm": "npm"}.get(name))
+    monkeypatch.setattr(engine.subprocess, "run",
+                         lambda *a, **k: type("R", (), {"stdout": "v20.11.0\n"})())
+    monkeypatch.setattr(engine, "_exec_process", lambda argv, timeout: "ok")
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    monkeypatch.setattr(engine.time, "sleep", lambda secs: None)
+
+    attempts = []
+
+    def flaky_ready(*a, **k):
+        attempts.append(1)
+        return len(attempts) > 1
+
+    monkeypatch.setattr(engine, "_native_sandbox_ready", flaky_ready)
+
+    result = engine.install_native_sandbox()
+
+    assert len(attempts) == 2
+    assert "verified" in result
+    assert "could not" not in result
+
+
+def test_windows_install_reports_failure_after_retry_also_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(engine, "_which_executable",
+                         lambda name: {"node": "node", "npm": "npm"}.get(name))
+    monkeypatch.setattr(engine.subprocess, "run",
+                         lambda *a, **k: type("R", (), {"stdout": "v20.11.0\n"})())
+    monkeypatch.setattr(engine, "_exec_process", lambda argv, timeout: "ok")
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    monkeypatch.setattr(engine.time, "sleep", lambda secs: None)
+
+    attempts = []
+
+    def always_fails(*a, **k):
+        attempts.append(1)
+        engine._native_sandbox_failure = "windows-acl-run: boom"
+        return False
+
+    monkeypatch.setattr(engine, "_native_sandbox_ready", always_fails)
+
+    result = engine.install_native_sandbox()
+
+    assert len(attempts) == 2
+    assert "could not" in result

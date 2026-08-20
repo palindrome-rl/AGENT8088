@@ -4209,10 +4209,22 @@ def install_native_sandbox() -> str:
             "Native sandbox runtime installed. "
             f"Install the remaining OS packages: {', '.join(missing)}."
         )
+    global _native_sandbox_broken, _native_sandbox_verified
     if not _native_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
-        return ("Native sandbox runtime installed but could not "
-                f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
-                "Docker will be used when available.")
+        # koffi.node was just written by the npm install above; on Windows a
+        # real-time antivirus scan can still hold a lock on it for a moment,
+        # making this first probe fail even though the runtime is fine. One
+        # retry after a short pause tells the two apart instead of reporting
+        # a permanent failure for a transient one. The latch has to be reset
+        # by hand - it is designed to stick for the rest of a normal session,
+        # but this is a one-shot setup command, not a long-lived process.
+        time.sleep(2)
+        _native_sandbox_broken = False
+        _native_sandbox_verified = None
+        if not _native_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
+            return ("Native sandbox runtime installed but could not "
+                    f"be verified. {_native_sandbox_repair_hint(_native_sandbox_failure)} "
+                    "Docker will be used when available.")
     return "Native sandbox runtime installed and verified."
 
 
