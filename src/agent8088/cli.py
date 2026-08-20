@@ -1006,10 +1006,33 @@ def _diff_counts(diff_lines):
     return added, removed
 
 
+_SEARCH_RESULT_ITEM_RE = re.compile(r"^\d+\. ", re.MULTILINE)
+_SEARCH_PROVIDER_RE = re.compile(r"\(via (\w+)\)|No results from (\w+)")
+
+
 def on_result(name, result):
     if S.verbose == "off":
         return
     mode = A.TOOL_SPECS.get(name, {}).get("mode")
+
+    if name == "web_search":
+        # The raw result carries a "[Retrieved ...]" date stamp and an
+        # <<<EXTERNAL_UNTRUSTED_CONTENT>>> tag for the model's benefit, not
+        # the user's - dumping that as the preview read as broken output.
+        # Only take this branch for something shaped like an actual result
+        # set; an error or a blocked-pending-approval payload falls through
+        # to the generic preview below unchanged.
+        stripped = result.strip()
+        if (stripped.startswith(A._SEARCH_STAMP_PREFIX)
+                or "Search results (via" in stripped
+                or stripped.startswith("No results from")):
+            provider = _SEARCH_PROVIDER_RE.search(stripped)
+            count = len(_SEARCH_RESULT_ITEM_RE.findall(result))
+            summary = f"Found {count} result{'s' if count != 1 else ''}" if count else "No results found"
+            if provider:
+                summary += f" via {provider.group(1) or provider.group(2)}"
+            console.print(Text(f"  ⎿  {summary}", style="dim"))
+            return
 
     if mode == "subagent":
         console.print(Panel(Text(result), title="[#237dd7]subagent result[/#237dd7]",
