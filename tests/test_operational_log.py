@@ -115,3 +115,11 @@ def test_daily_rotation_opens_new_dated_file(log_dir, monkeypatch):
     assert f_tomorrow.exists(), f"expected new file {f_tomorrow}"
     entries = _read_jsonl(f_tomorrow)
     assert entries[0]["msg"] == "day two"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
+def test_log_file_is_private(log_dir):
+    """Operational log file gets 0600 on POSIX, same as the audit log."""
+    L.configure_logging()
+    logging.getLogger("agent8088.engine").info("x")
+    assert oct(_today_file(log_dir).stat().st_mode)[-3:] == "600"
