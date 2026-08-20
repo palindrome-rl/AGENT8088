@@ -138,7 +138,7 @@ def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, 
     try:
         fetch_client = client.with_options(timeout=timeout) if hasattr(client, "with_options") else client
         resp = fetch_client.models.list()
-        models = sorted(_normalize_model_id(provider_name, m.id) for m in resp.data)
+        models = sorted(set(_normalize_model_id(provider_name, m.id) for m in resp.data))
         disk[cache_key] = {"ts": now, "models": models}
         _save_disk_cache(disk)
         return models

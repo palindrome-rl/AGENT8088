@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import re
 import secrets
-import shutil
 import subprocess
 import time
 import urllib.request
@@ -97,7 +96,13 @@ def write_settings(home: Path) -> Path:
 
 
 def _docker():
-    return shutil.which("docker")
+    # Docker Desktop ships both docker.exe and an extensionless Unix shell
+    # wrapper in the same Windows directory. Python 3.12 may resolve the shell
+    # wrapper first, which CreateProcess rejects with WinError 193. Reuse the
+    # sandbox's platform-safe resolver so Windows explicitly selects docker.exe.
+    from .engine import _which_executable
+
+    return _which_executable("docker")
 
 
 def _run(argv, timeout=90):
@@ -148,7 +153,22 @@ def start(home: Path, port: int | None = None) -> dict:
     settings = write_settings(home)
     existing = status()
     if existing.get("running"):
-        return {"ok": True, "detail": "already running",
+        # settings.yml is read when SearXNG starts.  An older Agent8088 build
+        # could create/update the bind-mounted file after Docker had already
+        # started the container, leaving the running process on SearXNG's
+        # defaults (where JSON output is disabled).  Restart the managed
+        # container during an explicit setup so it loads the current file.
+        try:
+            restarted = _run([docker, "restart", CONTAINER_NAME], timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"ok": False,
+                    "detail": f"could not restart the existing container: {exc}"}
+        if restarted.returncode != 0:
+            detail = ((restarted.stderr or "")
+                      + (restarted.stdout or "")).strip()[:400]
+            return {"ok": False,
+                    "detail": detail or "could not restart the existing container"}
+        return {"ok": True, "detail": "restarted with current settings",
                 "base_url": base_url(port)}
     # Remove any leftover so `docker run` does not fail on a name clash. A
     # crash-looping container counts: matching only the stopped wording left a

@@ -287,6 +287,7 @@ class GatewayRunner:
                     answer = await asyncio.to_thread(
                         run_turn, key, event.text, self.sessions,
                         on_escalation=_on_escalation,
+                        platform=event.platform, chat_type=event.chat_type,
                     )
                 finally:
                     A._plan_on_approval = None

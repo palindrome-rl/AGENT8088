@@ -94,7 +94,7 @@ Everything persists in the `agent8088-data` named volume, mounted at
 Inspect or back it up:
 
 ```sh
-docker volume inspect agent8088_agent8088-data
+docker volume inspect agent8088-features-added-development_agent8088-data
 ```
 
 ## Starting fresh

@@ -2,7 +2,9 @@
 
 [← Wiki index](README.md)
 
-Symptom-first. Run `/doctor` in the REPL for an automated health check.
+Symptom-first. Run `/doctor [--fix]` in the REPL for an automated health check
+(`--fix` repairs a broken web-search install), or `/dump` to produce a
+redacted bundle for a bug report.
 
 ## Install & startup
 
@@ -311,7 +313,8 @@ Don't rely on ruff `F811`; it has verifiably missed this in this codebase.
 ## Still stuck
 
 ```
-/doctor      # environment health
+/doctor      # environment health (add --fix to repair a broken web-search install)
+/dump        # redacted diagnostic bundle, for sharing in a bug report
 /config      # active config + path
 /status      # model, mode, tools, skills
 /trace on    # capture full JSON trace, then /save trace.json
