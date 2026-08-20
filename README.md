@@ -43,12 +43,12 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 
 ## Quick start
 
-### Install
+### Install Agent8088
 
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palindrome-rl/AGENT8088/main/install.sh | bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/main/install.sh | bash
 ```
 
 **Windows (PowerShell)**
@@ -68,6 +68,21 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
 | Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
+
+### Supported platforms
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS 12+ (Apple Silicon & Intel) | Supported | `install.sh` |
+| Ubuntu / Debian / Fedora / Arch (x64, arm64) | Supported | `install.sh` |
+| WSL2 | Supported | `install.sh`; clone with LF line endings, not CRLF |
+| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1` |
+| Windows Server, legacy Console Host, PowerShell ISE | Not supported | needs a modern terminal host — see `install.ps1`'s terminal check |
+| Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
+| Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
+
+After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
+`/dump` to produce a bundle for a bug report.
 
 The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed — run `uv pip install -e ".[dev]"` if you need the test suite.
 
@@ -93,7 +108,8 @@ The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`
 | `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |
 | `/plan <task>` | Research, propose a plan, and wait for your approval before mutations. |
 | `/capabilities` | Show the live tool, MCP, sandbox, skill, sub-agent, and guardrail configuration. |
-| `/doctor` | Check local setup and report likely problems. |
+| `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
+| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report. |
 
 ---
 
@@ -148,7 +164,7 @@ The versioned [documentation wiki](docs/wiki/README.md) is the source of truth f
 
 ## Contributing
 
-Create a topic branch from `main` and run the suite in an isolated configuration:
+Create a branch from `main` and run the suite in an isolated configuration:
 
 ```sh
 git clone https://github.com/palindrome-rl/AGENT8088.git

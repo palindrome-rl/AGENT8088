@@ -17,11 +17,14 @@ feature is reachable here:
 Run:  python agent8088_cli.py
 """
 import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
+import subprocess
+import shutil
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
     pass
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -197,6 +200,7 @@ class _SubStatusLine:
 # ---------------------------------------------------------------------------
 from agent8088 import engine as A
 from agent8088 import searxng_provision
+from agent8088.logging_setup import configure_logging
 
 
 # ---------------------------------------------------------------------------
@@ -1002,10 +1006,33 @@ def _diff_counts(diff_lines):
     return added, removed
 
 
+_SEARCH_RESULT_ITEM_RE = re.compile(r"^\d+\. ", re.MULTILINE)
+_SEARCH_PROVIDER_RE = re.compile(r"\(via (\w+)\)|No results from (\w+)")
+
+
 def on_result(name, result):
     if S.verbose == "off":
         return
     mode = A.TOOL_SPECS.get(name, {}).get("mode")
+
+    if name == "web_search":
+        # The raw result carries a "[Retrieved ...]" date stamp and an
+        # <<<EXTERNAL_UNTRUSTED_CONTENT>>> tag for the model's benefit, not
+        # the user's - dumping that as the preview read as broken output.
+        # Only take this branch for something shaped like an actual result
+        # set; an error or a blocked-pending-approval payload falls through
+        # to the generic preview below unchanged.
+        stripped = result.strip()
+        if (stripped.startswith(A._SEARCH_STAMP_PREFIX)
+                or "Search results (via" in stripped
+                or stripped.startswith("No results from")):
+            provider = _SEARCH_PROVIDER_RE.search(stripped)
+            count = len(_SEARCH_RESULT_ITEM_RE.findall(result))
+            summary = f"Found {count} result{'s' if count != 1 else ''}" if count else "No results found"
+            if provider:
+                summary += f" via {provider.group(1) or provider.group(2)}"
+            console.print(Text(f"  ⎿  {summary}", style="dim"))
+            return
 
     if mode == "subagent":
         console.print(Panel(Text(result), title="[#237dd7]subagent result[/#237dd7]",
@@ -1066,6 +1093,101 @@ class _TraceCodeBlock(CodeBlock):
             yield Text(code)
 
 
+_BOX_DRAWING_CHARS = set(
+    "─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋"
+    "═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬"
+)
+
+
+def _normalize_box_row_widths(lines):
+    """Re-pad bordered content rows to match the width of the block's own
+    frame lines.
+
+    A model asked to hand-draw a box usually gets the frame right (a run of
+    ═/─ is trivial to count) but often under-pads an individual content row
+    by a character or two, leaving its right-hand border short of every
+    other line. Fencing the block preserves that mistake verbatim — this
+    pass corrects it using the frame's own width as ground truth, without
+    needing to understand the row's internal column layout: any line whose
+    length falls short of the frame gets extra spaces inserted just before
+    its closing border character.
+    """
+    frame_widths = [len(ln) for ln in lines if ln and all(ch in _BOX_DRAWING_CHARS for ch in ln)]
+    if not frame_widths:
+        return lines
+
+    width = max(frame_widths)
+    fixed = []
+    for line in lines:
+        if (len(line) < width and line
+                and line[0] in _BOX_DRAWING_CHARS and line[-1] in _BOX_DRAWING_CHARS):
+            line = line[:-1] + " " * (width - len(line)) + line[-1]
+        fixed.append(line)
+    return fixed
+
+
+def _fence_ascii_art(text):
+    """Wrap hand-drawn box-drawing art in fenced code blocks before markdown
+    rendering, and repair its row widths either way.
+
+    Rich's Markdown renders real ``|``-delimited tables and fenced code blocks
+    by computing their layout itself, so those always come out aligned. But a
+    model that hand-draws a box (╔══╗ borders, manually padded columns) as a
+    bare paragraph gets reflowed like any other prose: Rich collapses the
+    padding and wraps the line, destroying the shape. Detecting box-drawing
+    characters outside an existing fence and fencing them preserves the
+    manual spacing verbatim, the same way a real code block would — and
+    since "verbatim" can still mean the model miscounted a row's padding,
+    _normalize_box_row_widths runs on every box-art block, fenced by the
+    model itself or by us, to straighten any row that came in short.
+    """
+    if not text or not any(ch in _BOX_DRAWING_CHARS for ch in text):
+        return text
+
+    out = []
+    in_fence = False
+    fence_marker = None
+    art_run = []
+    fence_buffer = None
+
+    def flush_run():
+        if art_run:
+            out.append("```")
+            out.extend(_normalize_box_row_widths(art_run))
+            out.append("```")
+            art_run.clear()
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not in_fence and (stripped.startswith("```") or stripped.startswith("~~~")):
+            flush_run()
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append(line)
+            fence_buffer = []
+            continue
+        if in_fence:
+            if stripped.startswith(fence_marker):
+                out.extend(_normalize_box_row_widths(fence_buffer))
+                out.append(line)
+                in_fence = False
+                fence_buffer = None
+                continue
+            fence_buffer.append(line)
+            continue
+        if any(ch in _BOX_DRAWING_CHARS for ch in line):
+            art_run.append(line)
+            continue
+        flush_run()
+        out.append(line)
+    if in_fence:
+        # Unterminated fence (output cut off mid-block) — emit what we
+        # buffered as-is rather than guessing at a width to normalize to.
+        out.extend(fence_buffer or [])
+    flush_run()
+    return "\n".join(out)
+
+
 class _AnswerMarkdown(Markdown):
     """Markdown that renders fenced code the way the rest of the CLI does."""
 
@@ -1073,7 +1195,7 @@ class _AnswerMarkdown(Markdown):
                 "code_block": _TraceCodeBlock}
 
     def __init__(self, markup, **kwargs):
-        super().__init__(markup, code_theme=_syntax_theme(), **kwargs)
+        super().__init__(_fence_ascii_art(markup), code_theme=_syntax_theme(), **kwargs)
 
 
 def render_answer(answer):
@@ -1158,7 +1280,7 @@ def _make_subagent_ui(live):
             # the whole delegation — so render it rather than dumping it.
             text = (answer or "").strip()
             if text:
-                console.print(Padding(Markdown(text), (0, 0, 0, 3)))
+                console.print(Padding(_AnswerMarkdown(text), (0, 0, 0, 3)))
 
         return {"spin": spin, "on_calls": sub_on_calls, "on_result": sub_on_result,
                 "on_escalation": sub_on_escalation, "done": done}
@@ -1842,7 +1964,8 @@ def cmd_help(_):
         ("/mcp remove <name> [--project]", "Remove an MCP server from the selected scope"),
         ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
-        ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
+        ("/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install"),
+        ("/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report"),
         ("/new <name>", "Create a named persistent session"),
         ("/sessions", "List named sessions"),
         ("/resume <name>", "Load a named session"),
@@ -2394,7 +2517,40 @@ def _endpoint_probe(endpoint):
         return f"unreachable ({exc})"
 
 
-def cmd_doctor(_):
+def _reinstall_package(package: str) -> tuple[bool, str]:
+    """Force-reinstall `package` into the interpreter currently running this
+    process. Tries pip first -- it works whether the venv is stdlib-created or a
+    `uv venv --seed` one. A uv venv built without --seed has no pip module at all
+    (install.sh never assumes one either), so a "No module named pip" failure
+    falls back to `uv pip install --python <this interpreter>`, the same command
+    install.sh itself uses to populate the venv in the first place."""
+    pip_result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--force-reinstall", package],
+        capture_output=True, text=True, timeout=180,
+    )
+    if pip_result.returncode == 0:
+        return True, f"reinstalled {package} via pip"
+
+    uv = shutil.which("uv")
+    if uv and "No module named pip" in (pip_result.stderr or ""):
+        uv_result = subprocess.run(
+            [uv, "pip", "install", "--python", sys.executable,
+             "--force-reinstall", package],
+            capture_output=True, text=True, timeout=180,
+        )
+        if uv_result.returncode == 0:
+            return True, f"reinstalled {package} via uv"
+        return False, (uv_result.stderr or uv_result.stdout or "unknown uv error")[-300:]
+
+    return False, (pip_result.stderr or pip_result.stdout or "unknown pip error")[-300:]
+
+
+def cmd_doctor(rest):
+    arg = rest.strip()
+    fix = arg.lower() == "--fix"
+    if arg and not fix:
+        console.print(f"[red]unknown option:[/red] {arg}  (try /doctor or /doctor --fix)")
+        return
     active = _active_provider_name()
     provider = A.PROVIDERS.get(active, {})
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
@@ -2420,7 +2576,75 @@ def cmd_doctor(_):
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
+    t.add_row("Web search", "ok" if A.web_search._ddgs_installed() else "[red]ddgs broken - run /doctor --fix[/red]")
     console.print(t)
+
+    if fix:
+        console.print("[dim]Checking for auto-repairable issues...[/dim]")
+        if A.web_search._ddgs_installed():
+            console.print("[dim]No auto-repairable issues found.[/dim]")
+        else:
+            ok, detail = _reinstall_package("ddgs")
+            if ok and A.web_search._ddgs_installed():
+                console.print(f"[green]Fixed:[/green] web search — {detail}")
+            elif ok:
+                console.print(
+                    f"[yellow]Reinstalled ddgs but it still fails to import[/yellow] "
+                    f"({detail}) — this usually means a missing system library; "
+                    f"see: pip install ddgs -v"
+                )
+            else:
+                console.print(f"[red]Could not fix web search:[/red] {detail}")
+                console.print(
+                    f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
+                )
+
+
+def cmd_dump(_rest):
+    """Write a redacted, shareable diagnostic bundle to the user data dir's dump.txt."""
+    import platform
+    from agent8088 import __version__
+
+    active = _active_provider_name()
+    provider = A.PROVIDERS.get(active, {})
+    sandbox = A.sandbox_status()
+
+    lines = [
+        f"Agent8088 diagnostic dump — {__version__}",
+        "Generated: this file was written by `agent8088 dump`; review before sharing.",
+        "",
+        "## System",
+        f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
+        f"Python: {sys.version.split()[0]} at {sys.executable}",
+        f"Shell: {os.environ.get('SHELL', 'unknown')}",
+        "",
+        "## Provider",
+        f"Active: {active}",
+        f"Model: {A.MODEL_NAME}",
+        f"Endpoint reachable: {_endpoint_probe(provider.get('base_url') or A.MODEL_BASE_URL)}",
+        "",
+        "## Sandbox",
+        f"Requested: {sandbox['requested']}",
+        f"Resolved: {sandbox['resolved']} ({sandbox['verification']})",
+        f"Detail: {sandbox['detail']}",
+        "",
+        "## Configuration",
+        f"Config path: {A.CONFIG_PATH} (exists={A.CONFIG_PATH.exists()})",
+        f"Tools: {len(_active_tool_specs())}  Skills: {len(_active_skills())}",
+    ]
+
+    text = "\n".join(lines) + "\n"
+    # Defense in depth: this function never touches api keys/tokens by construction
+    # (nothing above reads them), but scrub anyway using the same secret list every
+    # other tool-output path redacts through, in case a future edit adds a field
+    # that does.
+    for secret in A.collect_secret_values(A.APP_CONFIG):
+        text = text.replace(secret, "[REDACTED]")
+
+    out_path = A._agent_data_dir() / "dump.txt"
+    A._write_private_text(out_path, text)
+    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
+    console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
 
 
 def cmd_sandbox(rest):
@@ -2605,6 +2829,16 @@ def cmd_search(rest):
                       f"ssrf_allow_hosts={', '.join(sorted(A.SSRF_ALLOW_HOSTS)) or 'not set'}")
         t.add_row("ddgs importable",
                   "yes" if A.web_search._ddgs_installed() else "[red]no[/red]")
+        # Which engines the egress policy actually permits. Worth its own row: the
+        # check is per-engine and fails closed, so "importable: yes" with an
+        # allowlist that blocks every engine is a real and otherwise invisible state.
+        try:
+            _engines, _block = A.web_search._ddgs_allowed_engines(A._search_context())
+            t.add_row("ddgs engines allowed",
+                      ", ".join(_engines) if _engines
+                      else f"[red]none — {_block}[/red]")
+        except Exception as exc:  # noqa: BLE001 — a doctor row must never break the report
+            t.add_row("ddgs engines allowed", f"[red]could not determine ({exc})[/red]")
         console.print(t)
         cmd_search("status")
         return
@@ -2703,7 +2937,7 @@ def cmd_audit(rest):
 
     if want:
         console.print("step verification: [green]on[/green] — after every mutating step a "
-                      "read-only auditor checks the real files against your approved plan, "
+                      "read-only auditor checks the result in the real environment, "
                       "and a step that fails is put back.")
         console.print("[dim]this spends one extra model call — and its tokens — per "
                       "mutating step, and it comes out of the same turn budget as the "
@@ -2715,6 +2949,89 @@ def cmd_audit(rest):
     if not saved:
         console.print(f"[yellow]applies to this session only — could not write to "
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
+
+
+def _print_line(line, args):
+    if getattr(args, "json", False):
+        print(line)
+    else:
+        import json as _json
+        try:
+            obj = _json.loads(line)
+            ts = obj.get("ts", "")
+            if "T" in ts:
+                ts = ts.split("T", 1)[1]
+            print(f"{ts} {obj.get('level', '?')} {obj.get('subsystem', '?')} {obj.get('msg', '')}")
+        except Exception:
+            print(line)
+
+
+def _follow(path, args, matches_fn, print_fn):
+    """tail -f with rotation detection. Exits on Ctrl+C."""
+    import time as _time
+    last_size = path.stat().st_size if path.exists() else 0
+    try:
+        while True:
+            _time.sleep(1)
+            if not path.exists():
+                # File may have been rotated away; wait for it to reappear.
+                continue
+            cur_size = path.stat().st_size
+            if cur_size < last_size:
+                print("Log cursor reset (file rotated).")
+                last_size = 0
+            if cur_size > last_size:
+                with path.open("r", encoding="utf-8") as fh:
+                    fh.seek(last_size)
+                    for line in fh:
+                        if matches_fn(line.rstrip("\n")):
+                            print_fn(line.rstrip("\n"), args)
+                last_size = cur_size
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_logs(args):
+    """Print or follow the operational JSONL log.
+
+    Reads the daily file directly (no RPC in v1). Human format:
+        HH:MM:SS+TZ level subsystem msg
+    With --json: raw JSONL lines.
+    """
+    path = getattr(args, "log_file", None)
+    if path is None:
+        from agent8088 import engine as _A
+        path = _A._agent_data_dir() / "logs" / (
+            f"agent8088-{datetime.now().astimezone().strftime('%Y-%m-%d')}.log")
+    if not path.exists():
+        print(f"No log file at {path}. Run agent8088 to start logging.")
+        return 1
+    import json as _json
+    level_filter = (args.level or "").upper() or None
+    sub_filter = args.subsystem or None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # Keep only non-empty, valid-JSON lines that match the filters.
+    def _matches(line):
+        if not line.strip():
+            return False
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            return False
+        if level_filter and obj.get("level", "").upper() != level_filter:
+            return False
+        if sub_filter and sub_filter.lower() not in obj.get("subsystem", "").lower():
+            return False
+        return True
+    matched = [l for l in lines if _matches(l)]
+    tail = matched[-args.limit:] if args.limit else matched
+    # Print the initial tail.
+    for line in tail:
+        _print_line(line, args)
+    # Follow mode: poll for new bytes.
+    if getattr(args, "logs", None) == "follow":
+        _follow(path, args, _matches, _print_line)
+    return 0
 
 
 def cmd_new(rest):
@@ -3416,9 +3733,14 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
 def _choice_prompt(message, choices, default=""):
     try:
         from InquirerPy import inquirer
-        kwargs = {"message": message, "choices": choices, "max_height": "70%"}
-        if default:
-            kwargs["default"] = default
+        # InquirerPy's fuzzy prompt mis-renders (duplicate/garbled highlighted
+        # row) when a `default=` matching a later choice is passed. Instead,
+        # move the default to the front so the prompt's natural index-0
+        # cursor lands on it without needing the `default` kwarg.
+        ordered = choices
+        if default and default in choices:
+            ordered = [default] + [c for c in choices if c != default]
+        kwargs = {"message": message, "choices": ordered, "max_height": "70%"}
         return inquirer.fuzzy(**kwargs).execute()
     except (ImportError, EOFError, OSError, KeyboardInterrupt):
         # See _custom_prompt for why these exceptions are grouped.
@@ -3469,7 +3791,7 @@ COMMANDS = {
     "audit": cmd_audit,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
-    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
+    "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
@@ -3787,7 +4109,8 @@ def _agent8088_link_dir():
     if os.environ.get("AGENT8088_LINK_DIR"):
         return Path(os.environ["AGENT8088_LINK_DIR"]).expanduser()
     if os.name == "nt":
-        return _agent8088_home() / "agent8088" / "venv" / "Scripts"
+        home = _agent8088_home()
+        return home.with_name(f"{home.name}-launcher")
     return Path.home() / ".local" / "bin"
 
 
@@ -3835,6 +4158,436 @@ def _remove_agent8088_config_exports():
     return removed
 
 
+def _remove_windows_user_environment(*owned_path_entries):
+    """Remove only the Windows user-environment entries Agent8088 owns."""
+    import winreg
+
+    def _same_path(left, right):
+        def _normal(value):
+            value = os.path.expandvars(str(value).strip().strip('"'))
+            return os.path.normcase(os.path.normpath(value))
+        return _normal(left) == _normal(right)
+
+    def _owned_path(value):
+        return any(_same_path(value, owned) for owned in owned_path_entries)
+
+    removed_path = False
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, "Environment", 0,
+            winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
+        )
+        try:
+            try:
+                user_path, value_type = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                user_path, value_type = "", winreg.REG_EXPAND_SZ
+            entries = [entry for entry in user_path.split(";") if entry.strip()]
+            kept = [entry for entry in entries if not _owned_path(entry)]
+            if kept != entries:
+                winreg.SetValueEx(key, "Path", 0, value_type, ";".join(kept))
+                removed_path = True
+            try:
+                winreg.DeleteValue(key, "AGENT8088_CONFIG")
+            except FileNotFoundError:
+                pass
+        finally:
+            winreg.CloseKey(key)
+    except OSError as exc:
+        print(f"Warning: could not update the Windows user environment: {exc}")
+        environment_ok = False
+    else:
+        environment_ok = True
+
+    current_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = os.pathsep.join(
+        entry for entry in current_path.split(os.pathsep)
+        if entry and not _owned_path(entry)
+    )
+    os.environ.pop("AGENT8088_CONFIG", None)
+    return removed_path if environment_ok else None
+
+
+def _purge_install_tree(target):
+    """Delete everything under `target` that this process can still remove.
+
+    The uninstall normally runs from an executable that lives inside `target`,
+    so the tree can never be emptied from here: Windows keeps a lock on the
+    running image and on the interpreter DLL beside it. Everything else can go
+    right now, which leaves the deferred helper a handful of locked binaries
+    instead of a whole install, and means that even a helper that never runs
+    leaves behind something visibly uninstalled rather than half working.
+
+    Returns the paths that survived.
+    """
+    import shutil
+    import stat
+
+    def _clear_readonly(func, path, _exc):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+
+    if not target.exists():
+        return []
+    leftovers = []
+    try:
+        children = sorted(target.iterdir(), key=lambda item: item.name.lower())
+    except OSError:
+        return [target]
+    # The subtree holding the running interpreter goes last, so that every other
+    # part of the uninstall is already done by the time this process starts
+    # deleting the library it is running out of.
+    running = Path(sys.executable).resolve(strict=False)
+
+    def _holds_interpreter(child):
+        try:
+            return child.resolve(strict=False) in running.parents
+        except OSError:
+            return False
+    children.sort(key=_holds_interpreter)
+    # onerror was renamed to onexc in 3.12 and goes away after that; the handler
+    # ignores the third argument, which is all that differs between the two.
+    on_error = (
+        {"onexc": _clear_readonly} if sys.version_info >= (3, 12)
+        else {"onerror": _clear_readonly}
+    )
+    for child in children:
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, **on_error)
+            else:
+                child.unlink()
+        except OSError:
+            pass
+        if child.exists():
+            leftovers.append(child)
+    if not leftovers:
+        try:
+            target.rmdir()
+        except OSError:
+            leftovers.append(target)
+    return leftovers
+
+
+# `rd /s /q` is what makes this work at all. A rename needs every handle in the
+# subtree closed, so moving the install aside fails outright when one file in it
+# is still locked; deleting where it stands only needs each file to be
+# individually deletable, so it keeps making progress. The rename is still tried
+# first, because it frees the install path for an immediate reinstall, but it is
+# only an optimisation and its failure must never end the uninstall.
+#
+# Only cmdlets and `cmd` are used below - no .NET calls, no methods on objects.
+# Those are unavailable under the Constrained Language Mode that application
+# control policies impose, and this script has to run on locked-down machines.
+_WINDOWS_CLEANUP_HELPER = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$comspec = $env:ComSpec
+if (-not $comspec) { $comspec = 'cmd.exe' }
+
+function Write-CleanupLog {
+  param([string]$Message)
+  # The launcher `type`s this log, so it is written in the console's own
+  # encoding: -Encoding UTF8 prepends a BOM, which shows up there as mojibake.
+  Set-Content -LiteralPath $LogPath -Value $Message -Encoding Default -ErrorAction SilentlyContinue
+}
+
+function Remove-CleanupTree {
+  param([string]$Path)
+  for ($attempt = 0; $attempt -lt 30; $attempt++) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    if ($attempt -gt 0) { Start-Sleep -Seconds 1 }
+    & $comspec /d /c attrib -r -s -h "$Path\*" /s /d | Out-Null
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $Path) { & $comspec /d /c rd /s /q "$Path" | Out-Null }
+  }
+  return (-not (Test-Path -LiteralPath $Path))
+}
+
+Write-CleanupLog "RUNNING: waiting for Agent8088 process $ParentPid to exit."
+for ($tick = 0; $tick -lt 300; $tick++) {
+  if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+  Start-Sleep -Milliseconds 200
+}
+
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+  $_.ExecutablePath -and $_.ExecutablePath -ilike ($Target + '\*')
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+for ($attempt = 0; $attempt -lt 5; $attempt++) {
+  if (-not (Test-Path -LiteralPath $Target)) { break }
+  if ($attempt -gt 0) { Start-Sleep -Seconds 1 }
+  Move-Item -LiteralPath $Target -Destination $Quarantine -ErrorAction SilentlyContinue
+}
+
+$targetParent = Split-Path -Parent $Target
+$quarantinePrefix = (Split-Path -Leaf $Target) + '.uninstalling-'
+$cleanupPaths = @()
+if (Test-Path -LiteralPath $targetParent) {
+  $cleanupPaths += @(Get-ChildItem -LiteralPath $targetParent -Directory -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like ($quarantinePrefix + '*') } | ForEach-Object { $_.FullName })
+}
+if (Test-Path -LiteralPath $Target) { $cleanupPaths += $Target }
+
+$remaining = @()
+foreach ($cleanupPath in $cleanupPaths) {
+  if (-not (Remove-CleanupTree $cleanupPath)) { $remaining += $cleanupPath }
+}
+
+if ($remaining.Count -eq 0) {
+  Write-CleanupLog 'SUCCESS: Agent8088 files removed.'
+} else {
+  # Reaching here means something outside this uninstall's reach has the file
+  # mapped - a security scanner, most often - and no retry will beat that. A
+  # restart releases it, which is the only remedy worth printing.
+  Write-CleanupLog ('FAILED: another program still has these files open; a restart releases them: ' + ($remaining -join ', '))
+}
+# The marker means "cleanup is in flight" and nothing more. Leaving it behind
+# after a failed run wedged both the next uninstall, which waited on it, and the
+# next install, which refused to start while it existed - so it always goes. How
+# the run ended is the log's job to record.
+Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+if ($remaining.Count -ne 0) { exit 1 }
+"""
+
+
+def _powershell_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _start_windows_cleanup_helper(target, parent_pid):
+    """Delete what is left of an install once its running executable exits."""
+    import base64
+    import subprocess
+    import uuid
+
+    token = uuid.uuid4().hex
+    temp_dir = Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".")
+    log_path = temp_dir / f"agent8088-uninstall-{token}.log"
+    quarantine = target.with_name(f"{target.name}.uninstalling-{token[:12]}")
+    marker_path = target.with_name(f"{target.name}.uninstall-pending")
+    # Passed as an encoded command rather than a .ps1 on disk: -Command and
+    # -EncodedCommand are exempt from the script execution policy, which a
+    # machine policy can otherwise pin somewhere -ExecutionPolicy Bypass cannot
+    # override, and there is no temp script left to fail to write or delete.
+    script = "\n".join((
+        f"$Target = {_powershell_literal(target)}",
+        f"$Quarantine = {_powershell_literal(quarantine)}",
+        f"$ParentPid = {int(parent_pid)}",
+        f"$LogPath = {_powershell_literal(log_path)}",
+        f"$MarkerPath = {_powershell_literal(marker_path)}",
+        _WINDOWS_CLEANUP_HELPER,
+    ))
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    executable = str(powershell) if powershell.exists() else "powershell.exe"
+    marker_path.write_text(str(log_path), encoding="utf-8")
+    try:
+        subprocess.Popen(
+            [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", encoded],
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        marker_path.unlink(missing_ok=True)
+        raise
+    return log_path
+
+
+def _remove_windows_launcher_dir(link_dir):
+    """Remove the launcher directory when this run did not come through it.
+
+    The launcher is a .cmd, and cmd.exe reads a batch file as it goes: deleting
+    one mid-run makes the shell fail on its next line. So when the launcher
+    started us, deleting it is left to the launcher itself, once it is done.
+    """
+    import shutil
+
+    if os.environ.get("AGENT8088_LINK_DIR") or not link_dir.exists():
+        return False
+    shutil.rmtree(link_dir, ignore_errors=True)
+    return not link_dir.exists()
+
+
+def _run_powershell_capture(script, timeout=20):
+    """Run a short PowerShell snippet and return its stdout, or None."""
+    import base64
+    import subprocess
+
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    executable = str(powershell) if powershell.exists() else "powershell.exe"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        done = subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-EncodedCommand", encoded],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _windows_processes_in_tree(target):
+    """Live processes holding a file inside `target`, as (pid, name).
+
+    Windows cannot delete a running executable or a loaded DLL, so anything
+    still holding one will survive every retry the cleanup makes. A loaded
+    module counts as much as the executable: `python.exe <script in the
+    install>` runs from outside the tree but still maps the install's .pyd
+    files. Nothing in the standard library reports another process's image or
+    module paths, and matching on process name alone would catch unrelated
+    pythons, so this asks the OS.
+
+    This process and everything that launched it are excluded. The launcher
+    chain runs from inside the install too, and stopping a process tree that
+    contains this one takes the uninstall down with it - silently, because a
+    piped stdout is block buffered and dies unflushed.
+
+    Best effort by nature - module enumeration is refused for processes at a
+    higher integrity level, so a file a security scanner has mapped stays
+    invisible here.
+    """
+    listing = _run_powershell_capture(
+        "$prefix = " + _powershell_literal(Path(str(target)) / "*") + "\n"
+        f"$selfPid = {os.getpid()}\n"
+        # One CIM query for the definitive case, then module lists for the few
+        # runtimes that could be hosting install code from outside the tree.
+        # Enumerating modules for every process on the box costs a minute.
+        "$hosts = @('python.exe', 'pythonw.exe', 'node.exe', 'agent8088.exe')\n"
+        "$all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)\n"
+        "$byId = @{}\n"
+        "foreach ($proc in $all) { $byId[[int]$proc.ProcessId] = $proc }\n"
+        "$mine = @{}\n"
+        "$walk = [int]$selfPid\n"
+        "for ($step = 0; $step -lt 64; $step++) {\n"
+        "  if (-not $walk) { break }\n"
+        "  if ($mine.ContainsKey($walk)) { break }\n"
+        "  $mine[$walk] = $true\n"
+        "  if (-not $byId.ContainsKey($walk)) { break }\n"
+        "  $walk = [int]$byId[$walk].ParentProcessId\n"
+        "}\n"
+        "foreach ($proc in $all) {\n"
+        "  if ($mine.ContainsKey([int]$proc.ProcessId)) { continue }\n"
+        "  if (-not (($proc.ExecutablePath -and $proc.ExecutablePath -ilike $prefix) -or ($hosts -contains $proc.Name))) { continue }\n"
+        "  $found = $proc.ExecutablePath -and $proc.ExecutablePath -ilike $prefix\n"
+        "  if (-not $found) {\n"
+        "    try {\n"
+        "      foreach ($module in (Get-Process -Id $proc.ProcessId -ErrorAction Stop).Modules) {\n"
+        "        if ($module.FileName -ilike $prefix) { $found = $true; break }\n"
+        "      }\n"
+        "    } catch { }\n"
+        "  }\n"
+        "  if ($found) { \"$($proc.ProcessId)`t$($proc.Name)\" }\n"
+        "}\n",
+        timeout=60,
+    )
+    if not listing:
+        return []
+    found = []
+    for line in listing.splitlines():
+        pid, _, name = line.partition("\t")
+        try:
+            pid = int(pid.strip())
+        except ValueError:
+            continue
+        if pid and pid != os.getpid():
+            found.append((pid, name.strip() or "unknown"))
+    return found
+
+
+def _stop_windows_processes(processes):
+    """Terminate processes, with their children, and report how many went."""
+    import subprocess
+
+    stopped = 0
+    for pid, _name in processes:
+        try:
+            done = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            stopped += 1
+    return stopped
+
+
+def _run_windows_uninstall(home):
+    # Everything the rest of this run needs is imported up front. The purge below
+    # deletes the library this interpreter is running out of - a managed Python
+    # lives inside the install too - so any later import could land on a file
+    # that is already gone. These are the modules the helpers below import.
+    import base64  # noqa: F401
+    import shutil  # noqa: F401
+    import stat  # noqa: F401
+    import subprocess  # noqa: F401
+    import uuid  # noqa: F401
+
+    def _say(message):
+        # Piped stdout is block buffered, and everything below can take this
+        # process down - stopping a stray, or deleting its own library. Whatever
+        # has been reported so far has to be on screen before that happens.
+        print(message, flush=True)
+
+    link_dir = _agent8088_link_dir()
+    managed_bin = home / "bin"
+    legacy_scripts = home / "agent8088" / "venv" / "Scripts"
+
+    environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
+    if environment_result is None:
+        _say("Uninstall stopped: the Windows user environment could not be updated.")
+        return False
+    if environment_result:
+        _say("Removed Agent8088 entries from the user PATH.")
+
+    if not home.exists():
+        _say(f"Install directory not found: {home}")
+        _remove_windows_launcher_dir(link_dir)
+        _say("Agent8088 user environment entries removed.")
+        return True
+
+    blockers = _windows_processes_in_tree(home)
+    if blockers:
+        _say(f"{len(blockers)} Agent8088 process(es) are still running from the install:")
+        for pid, name in blockers:
+            _say(f"  {name} (pid {pid})")
+        _say("Stopping them; Windows cannot delete a running program.")
+        _stop_windows_processes(blockers)
+
+    leftovers = _purge_install_tree(home)
+    if not leftovers:
+        _say(f"Removed {home}")
+        # Nothing is deferred, so nothing may look pending: a marker left by an
+        # earlier failed attempt would send the launcher into its wait.
+        home.with_name(f"{home.name}.uninstall-pending").unlink(missing_ok=True)
+        _remove_windows_launcher_dir(link_dir)
+        _say("Open a NEW terminal for PATH to refresh.")
+        return True
+
+    try:
+        log_path = _start_windows_cleanup_helper(home, os.getpid())
+    except OSError as exc:
+        _say(f"Could not schedule final cleanup: {exc}")
+        _say(f"{len(leftovers)} locked item(s) remain. Delete this folder by hand: {home}")
+        return False
+
+    _say("Removed the Agent8088 install contents.")
+    _say("The files this program is running from go as soon as it exits.")
+    _say(f"Cleanup log: {log_path}")
+    return True
+
+
 def _run_uninstall():
     import shutil
     import stat
@@ -3853,33 +4606,39 @@ def _run_uninstall():
         return False
 
     def _clear_readonly(func, path, _exc):
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
-
-    _deferred = False
-    if home.exists():
+        # A file this process cannot chmod (e.g. one a Docker container wrote
+        # into a bind-mounted config dir, owned by a different uid) must not
+        # crash rmtree here — that took down the whole uninstall over a single
+        # leftover file instead of removing everything else and saying so.
+        # OR in the bits rather than setting mode outright: `func` can be
+        # os.rmdir for a directory that merely has an unremovable child, and
+        # clobbering its mode to owner-write-only would strip the execute bit
+        # a directory needs to stay traversable, leaving it locked out even
+        # to its own owner.
         try:
-            shutil.rmtree(home, onerror=_clear_readonly)
-            print(f"Removed {home}")
-        except PermissionError:
-            # On Windows the running agent8088.exe lives inside `home`, so the
-            # OS holds a lock and rmtree cannot delete it from this process.
-            # Hand the actual deletion to a detached cmd.exe that waits for
-            # this process to exit, then deletes the directory tree.
-            import subprocess
-            del_cmd = (
-                f'timeout /t 2 /nobreak >nul & '
-                f'rmdir /s /q "{home}" 2>nul || '
-                f'(timeout /t 2 /nobreak >nul & rmdir /s /q "{home}" 2>nul) || '
-                f'(timeout /t 3 /nobreak >nul & rmdir /s /q "{home}")'
-            )
-            subprocess.Popen(
-                ["cmd", "/c", del_cmd],
-                close_fds=True, creationflags=0x00000008,  # DETACHED_PROCESS
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            _deferred = True
-            print(f"Scheduled removal of {home} (will complete after this process exits).")
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR | stat.S_IXUSR)
+            func(path)
+        except OSError:
+            pass
+
+    if os.name == "nt":
+        return _run_windows_uninstall(home)
+
+    if home.exists():
+        shutil.rmtree(home, onerror=_clear_readonly)
+        if home.exists():
+            leftover = sorted(str(p) for p in home.rglob("*") if not p.is_dir())
+            print(f"Could not fully remove {home}.")
+            for path in leftover[:10]:
+                print(f"  left behind: {path}")
+            if len(leftover) > 10:
+                print(f"  ...and {len(leftover) - 10} more")
+            print("These are likely owned by another user (e.g. a Docker "
+                  "container that wrote into this folder). Stop anything "
+                  "using them, then re-run `agent8088 --uninstall`, or "
+                  "remove the folder by hand with sudo.")
+            return False
+        print(f"Removed {home}")
     else:
         print(f"Install directory not found: {home}")
 
@@ -4232,11 +4991,27 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     env_var_name = f"{provider.upper().replace('-', '_')}_API_KEY"
     current_key = _env_vars.get(env_var_name, "") or _current(f"provider.{provider}.api_key")
 
-    key = _custom_prompt(
-        f"API key for {provider}:",
-        default=current_key,
-        secret=True,
+    # Built-ins with no api_key_env (currently just "ollama") run on a local,
+    # unauthenticated endpoint -- prompting for a key there just confuses users
+    # who don't have one. A custom provider always prompts since it could be
+    # any OpenAI-compatible endpoint, keyed or not.
+    _needs_api_key = (
+        provider_choice == CUSTOM_PROVIDER_CHOICE
+        or bool(provider_registry.builtin_provider_defaults(provider).get("api_key_env"))
     )
+    if _needs_api_key:
+        key = _custom_prompt(
+            f"API key for {provider}:",
+            default=current_key,
+            secret=True,
+        )
+    else:
+        key = ""
+        _local_url = (
+            _current(f"provider.{provider}.base_url")
+            or provider_registry.builtin_provider_defaults(provider).get("base_url", "")
+        )
+        print(f"No API key needed — {provider} runs locally at {_local_url}.")
     # Fetch models
     print(f"\nFetching model list (up to {MODEL_DISCOVERY_TIMEOUT_SECONDS}s)...")
     try:
@@ -4255,11 +5030,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     except Exception:
         models = []
     if models:
-        model_name = _choice_prompt(
-            "Select model:",
-            models,
-            current_model if current_model in models else "",
-        )
+        model_name = _choice_prompt("Select model:", models)
     else:
         print("Model discovery unavailable; enter the model name manually.")
         model_name = ""
@@ -4747,6 +5518,7 @@ def _run_gateway_setup():
 
 
 def main():
+    configure_logging()
     import argparse
     from agent8088 import __version__
     parser = argparse.ArgumentParser(
@@ -4777,6 +5549,16 @@ def main():
     parser.add_argument("--mcp-http", action="store_true", help="use HTTP transport for MCP server (implies --mcp-serve)")
     parser.add_argument("--mcp-port", type=int, default=None, help="MCP server HTTP port (default 8931); implies --mcp-serve --mcp-http")
     parser.add_argument("--mcp-host", default=None, help="MCP server bind host (default 127.0.0.1, loopback only); implies --mcp-serve --mcp-http")
+    parser.add_argument("--logs", nargs="?", const="tail", default=None,
+                        help="print or follow the operational log; 'follow' tails in real time")
+    parser.add_argument("-n", "--limit", type=int, default=50,
+                        help="with --logs: number of lines to print (default 50)")
+    parser.add_argument("--level", default=None,
+                        help="with --logs: filter by level (DEBUG|INFO|WARNING|ERROR)")
+    parser.add_argument("--subsystem", default=None,
+                        help="with --logs: substring filter on subsystem name")
+    parser.add_argument("--json", action="store_true",
+                        help="with --logs: emit raw JSONL instead of human format")
     args = parser.parse_args()
 
     # The transport flags are meaningless without --mcp-serve, and argparse happily
@@ -4788,9 +5570,17 @@ def main():
     if args.mcp_http:
         args.mcp_serve = True
 
+    if args.logs is not None:
+        # Locate today's file for cmd_logs.
+        from datetime import datetime as _dt
+        today = _dt.now().astimezone().strftime("%Y-%m-%d")
+        args.log_file = A._agent_data_dir() / "logs" / f"agent8088-{today}.log"
+        rc = cmd_logs(args)
+        return rc if isinstance(rc, int) else 0
+
     if args.uninstall:
-        _run_uninstall()
-        return
+        uninstall_ok = _run_uninstall()
+        return (0 if uninstall_ok else 1) if os.name == "nt" else None
     if args.update:
         _run_update(force=args.force)
         return
