@@ -17,6 +17,7 @@ feature is reachable here:
 Run:  python agent8088_cli.py
 """
 import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
+import subprocess, shutil
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -2487,6 +2488,34 @@ def _endpoint_probe(endpoint):
             return f"reachable ({parsed.hostname}:{port})"
     except OSError as exc:
         return f"unreachable ({exc})"
+
+
+def _reinstall_package(package: str) -> tuple[bool, str]:
+    """Force-reinstall `package` into the interpreter currently running this
+    process. Tries pip first -- it works whether the venv is stdlib-created or a
+    `uv venv --seed` one. A uv venv built without --seed has no pip module at all
+    (install.sh never assumes one either), so a "No module named pip" failure
+    falls back to `uv pip install --python <this interpreter>`, the same command
+    install.sh itself uses to populate the venv in the first place."""
+    pip_result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--force-reinstall", package],
+        capture_output=True, text=True, timeout=180,
+    )
+    if pip_result.returncode == 0:
+        return True, f"reinstalled {package} via pip"
+
+    uv = shutil.which("uv")
+    if uv and "No module named pip" in (pip_result.stderr or ""):
+        uv_result = subprocess.run(
+            [uv, "pip", "install", "--python", sys.executable,
+             "--force-reinstall", package],
+            capture_output=True, text=True, timeout=180,
+        )
+        if uv_result.returncode == 0:
+            return True, f"reinstalled {package} via uv"
+        return False, (uv_result.stderr or uv_result.stdout or "unknown uv error")[-300:]
+
+    return False, (pip_result.stderr or pip_result.stdout or "unknown pip error")[-300:]
 
 
 def cmd_doctor(_):
