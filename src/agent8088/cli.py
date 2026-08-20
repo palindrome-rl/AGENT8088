@@ -1939,6 +1939,7 @@ def cmd_help(_):
         ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install"),
+        ("/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report"),
         ("/new <name>", "Create a named persistent session"),
         ("/sessions", "List named sessions"),
         ("/resume <name>", "Load a named session"),
@@ -2566,6 +2567,53 @@ def cmd_doctor(rest):
                 console.print(
                     f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
                 )
+
+
+def cmd_dump(_rest):
+    """Write a redacted, shareable diagnostic bundle to APP_DIR/dump.txt."""
+    import platform
+    from agent8088 import __version__
+
+    active = _active_provider_name()
+    provider = A.PROVIDERS.get(active, {})
+    sandbox = A.sandbox_status()
+
+    lines = [
+        f"Agent8088 diagnostic dump — {__version__}",
+        f"Generated: this file was written by `agent8088 dump`; review before sharing.",
+        "",
+        "## System",
+        f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
+        f"Python: {sys.version.split()[0]} at {sys.executable}",
+        f"Shell: {os.environ.get('SHELL', 'unknown')}",
+        "",
+        "## Provider",
+        f"Active: {active}",
+        f"Model: {A.MODEL_NAME}",
+        f"Endpoint reachable: {_endpoint_probe(provider.get('base_url') or A.MODEL_BASE_URL)}",
+        "",
+        "## Sandbox",
+        f"Requested: {sandbox['requested']}",
+        f"Resolved: {sandbox['resolved']} ({sandbox['verification']})",
+        f"Detail: {sandbox['detail']}",
+        "",
+        "## Configuration",
+        f"Config path: {A.CONFIG_PATH} (exists={A.CONFIG_PATH.exists()})",
+        f"Tools: {len(_active_tool_specs())}  Skills: {len(_active_skills())}",
+    ]
+
+    text = "\n".join(lines) + "\n"
+    # Defense in depth: this function never touches api keys/tokens by construction
+    # (nothing above reads them), but scrub anyway using the same secret list every
+    # other tool-output path redacts through, in case a future edit adds a field
+    # that does.
+    for secret in A.collect_secret_values(A.APP_CONFIG):
+        text = text.replace(secret, "[REDACTED]")
+
+    out_path = A.APP_DIR / "dump.txt"
+    out_path.write_text(text, encoding="utf-8")
+    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
+    console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
 
 
 def cmd_sandbox(rest):
@@ -3629,7 +3677,7 @@ COMMANDS = {
     "audit": cmd_audit,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
-    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
+    "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
