@@ -199,6 +199,7 @@ class _SubStatusLine:
 # ---------------------------------------------------------------------------
 from agent8088 import engine as A
 from agent8088 import searxng_provision
+from agent8088.logging_setup import configure_logging
 
 
 # ---------------------------------------------------------------------------
@@ -5390,6 +5391,7 @@ def _run_gateway_setup():
 
 
 def main():
+    configure_logging()
     import argparse
     from agent8088 import __version__
     parser = argparse.ArgumentParser(

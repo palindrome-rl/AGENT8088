@@ -8,6 +8,7 @@ every sibling subsystem logger currently lacks.
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -123,3 +124,15 @@ def test_log_file_is_private(log_dir):
     L.configure_logging()
     logging.getLogger("agent8088.engine").info("x")
     assert oct(_today_file(log_dir).stat().st_mode)[-3:] == "600"
+
+
+def test_main_calls_configure_logging(tmp_path, monkeypatch):
+    """cli.main() must configure logging before dispatching to any mode."""
+    called = []
+    monkeypatch.setattr(A, "_agent_data_dir", lambda: tmp_path)
+    import agent8088.cli as cli
+    monkeypatch.setattr(cli, "configure_logging", lambda: called.append(True))
+    monkeypatch.setattr(sys, "argv", ["agent8088", "--version"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert called, "configure_logging was not called from main()"
