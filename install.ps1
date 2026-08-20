@@ -1009,8 +1009,15 @@ function Test-StageComplete {
 function Set-StageComplete {
     param([Parameter(Mandatory = $true)][string]$Stage)
     $marker = Get-StageMarkerPath $Stage
-    New-Item -ItemType Directory -Path (Split-Path $marker -Parent) -Force | Out-Null
-    Set-Content -LiteralPath $marker -Value (Get-Date).ToString("o") -ErrorAction SilentlyContinue
+    try {
+        New-Item -ItemType Directory -Path (Split-Path $marker -Parent) -Force -ErrorAction Stop | Out-Null
+        Set-Content -LiteralPath $marker -Value (Get-Date).ToString("o") -ErrorAction Stop
+    } catch {
+        # Silently swallowing this used to mean a rerun would look like resume
+        # was broken - redownloading everything with no clue why - instead of
+        # telling the user their $Agent8088Home permissions are the cause.
+        Write-Warn "Could not save resume marker for '$Stage' ($_) - a rerun will redo this stage."
+    }
 }
 
 # ----------------------------------------------------------------------------
@@ -1102,10 +1109,23 @@ function Install-Uv {
     $managedUv = Join-Path $Agent8088Home "bin\uv.exe"
 
     if (Test-Path $managedUv) {
-        $script:UvCmd = $managedUv
-        $version = & $managedUv --version
-        Write-Success "Managed uv found ($version)"
-        return $true
+        # A corrupted/partial binary (an interrupted prior install, or AV that
+        # quarantined it after this Test-Path but before the launch) can
+        # throw a real Win32 launch exception here, not just a bad exit code.
+        # Uncaught, that propagates out of the whole script with a raw stack
+        # trace instead of a clean message - so treat "won't run" the same
+        # as "not installed" and fall through to (re)installing it.
+        try {
+            $version = & $managedUv --version 2>$null
+        } catch {
+            $version = $null
+        }
+        if ($version) {
+            $script:UvCmd = $managedUv
+            Write-Success "Managed uv found ($version)"
+            return $true
+        }
+        Write-Warn "Existing uv at $managedUv did not run - reinstalling"
     }
 
     Write-Info "Installing managed uv into $Agent8088Home\bin ..."
@@ -1577,6 +1597,9 @@ function Install-Gateway-Extras {
     $py = Join-Path $InstallDir "venv\Scripts\python.exe"
     if (-not (Test-Path $py)) {
         Write-Warn "venv python not found at $py - skipping gateway extras"
+        Register-SkippedStage -Label "Gateway/search extras + Chromium" `
+            -Reason "venv python not found" `
+            -Fix "re-run the installer so Install-Deps can rebuild the venv"
         return
     }
 
@@ -1704,11 +1727,21 @@ function Install-Node-Bridge {
     if (-not $nodeExe) {
         $managedNode = Join-Path $Agent8088Home "node\node.exe"
         if (Test-Path $managedNode) {
-            $ver = & $managedNode --version 2>$null
+            # A corrupted/partial binary can throw a real launch exception,
+            # not just print nothing - catch it the same way as the exit
+            # code check just below, so it falls through to reinstalling
+            # instead of taking down the whole script.
+            try {
+                $ver = & $managedNode --version 2>$null
+            } catch {
+                $ver = $null
+            }
             if ($ver) {
                 $nodeExe = $managedNode
                 $npmExe = Join-Path $Agent8088Home "node\npm.cmd"
                 Write-Success "Managed Node found ($ver)"
+            } else {
+                Write-Warn "Existing Node at $managedNode did not run - reinstalling"
             }
         }
     }
@@ -1778,6 +1811,9 @@ function Install-Node-Bridge {
         } catch {
             Write-Warn "Could not install portable Node: $_"
             Write-Info "WhatsApp bridge needs Node 20.11+ - install manually from https://nodejs.org/"
+            Register-SkippedStage -Label "WhatsApp bridge (Node.js)" `
+                -Reason "portable Node install failed: $_" `
+                -Fix "install Node 20.11+ manually from https://nodejs.org/, then rerun"
             return
         }
     }
@@ -1934,6 +1970,7 @@ function Install-Native-Sandbox {
     $result = Invoke-WithTimeout -FilePath $agentExe `
         -Arguments @("--sandbox-setup") -TimeoutSec $TSandboxSetup -CaptureOutput
     if ($result.ExitCode -eq 0) {
+        $script:SandboxInstalled = $true
         Write-Success "Native sandbox installed and verified"
     } else {
         Write-StageWarning -Result $result -TimeoutSec $TSandboxSetup `
@@ -2048,6 +2085,9 @@ function Drop-Config {
             Copy-Item $srcConfig $configPath
         } else {
             Write-Warn "No default config.txt found; you'll need to create one"
+            Register-SkippedStage -Label "Default config" `
+                -Reason "no config.txt template found in the repository checkout" `
+                -Fix "create $configPath by hand, or re-run the installer over a clean checkout"
             return
         }
         Protect-ConfigFile $configPath
@@ -2190,21 +2230,35 @@ if (-not $env:AGENT8088_TIMEOUT_SCALE -and (Test-SlowConnection)) {
     $TOllamaPull *= 2; $TNpm *= 2; $TChromium *= 2; $TDownload *= 2; $TPip *= 2
     $TCoreInstall *= 2; $TVenv *= 2; $TUvBoot *= 2; $TExtract *= 2; $TSandboxSetup *= 2
 }
-if (-not (Wait-ForPendingUninstall)) { exit 1 }
-$terminalAction = Ensure-SupportedTerminal
-if ($terminalAction -eq "relaunched") { exit 0 }
-if ($terminalAction -ne "continue") { exit 1 }
-if (-not (Install-Uv)) { exit 1 }
-if (-not (Test-Python)) { exit 1 }
-if (-not (Install-Git)) { exit 1 }
-if (-not (Clone-Repo)) { exit 1 }
-Install-Deps
-Install-Gateway-Extras
-Install-Node-Bridge
-Install-Embedding-Model
-Install-Native-Sandbox
-if (-not (Setup-Path)) { exit 1 }
-Drop-Config
-Run-InitialSetup
-Verify-Install
-Start-InitialAgent
+# Wrapped so an unexpected exception (e.g. Install-Deps's throw, or any
+# native launch failure nothing downstream anticipated) prints one clean
+# message and still runs Write-SkippedSummary, instead of propagating out as
+# a raw stack trace that skips the summary entirely. `exit` inside `if`
+# checks below is a hard stop, not an exception, so it is unaffected by this
+# try/catch - it terminates before the catch could ever see it.
+try {
+    if (-not (Wait-ForPendingUninstall)) { exit 1 }
+    $terminalAction = Ensure-SupportedTerminal
+    if ($terminalAction -eq "relaunched") { exit 0 }
+    if ($terminalAction -ne "continue") { exit 1 }
+    if (-not (Install-Uv)) { exit 1 }
+    if (-not (Test-Python)) { exit 1 }
+    if (-not (Install-Git)) { exit 1 }
+    if (-not (Clone-Repo)) { exit 1 }
+    Install-Deps
+    Install-Gateway-Extras
+    Install-Node-Bridge
+    Install-Embedding-Model
+    Install-Native-Sandbox
+    if (-not (Setup-Path)) { exit 1 }
+    Drop-Config
+    Run-InitialSetup
+    Verify-Install
+    Start-InitialAgent
+} catch {
+    Write-Host ""
+    Write-Err "Installation failed: $_"
+    Write-Info "Re-run the installer to retry - completed stages are skipped or resumed automatically."
+    Write-SkippedSummary
+    exit 1
+}
