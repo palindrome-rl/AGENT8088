@@ -3233,7 +3233,19 @@ def _playwright_available() -> bool:
 def _exec_browser(args: dict) -> str:
     """Load a page in a headless browser and return its text, optionally scoped to
     a CSS selector. Handles JS-rendered pages that curl cannot. SSRF-guarded.
-    Degrades with install instructions when Playwright isn't present."""
+    Degrades with install instructions when Playwright isn't present.
+
+    `playwright` the Python package is a core dependency (always installed),
+    but the Chromium *browser binary* is a separate ~280 MB download the
+    installer fetches afterward and can fail or be skipped independently
+    (network blip, disk space, antivirus). `_playwright_available` alone
+    cannot see that gap - it would report available and let the missing-binary
+    case fall through to playwright's own multi-paragraph "Executable doesn't
+    exist" error, which reads as a crash rather than an install step. Checking
+    the resolved executable_path up front, inside the same driver session
+    launch() would use, catches that case with the same clear message as a
+    fully-missing install.
+    """
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
@@ -3248,6 +3260,10 @@ def _exec_browser(args: dict) -> str:
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
+            if not os.path.exists(p.chromium.executable_path):
+                return ("Playwright's Chromium browser is not installed. Install it with:\n"
+                        "  playwright install chromium\n"
+                        "Until then, use web_search or get_page_title instead.")
             browser = p.chromium.launch(headless=True)
             try:
                 page = browser.new_page()
