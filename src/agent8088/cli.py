@@ -24,6 +24,7 @@ try:
 except ImportError:
     pass
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -199,6 +200,7 @@ class _SubStatusLine:
 # ---------------------------------------------------------------------------
 from agent8088 import engine as A
 from agent8088 import searxng_provision
+from agent8088.logging_setup import configure_logging
 
 
 # ---------------------------------------------------------------------------
@@ -2926,6 +2928,89 @@ def cmd_audit(rest):
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
 
 
+def _print_line(line, args):
+    if getattr(args, "json", False):
+        print(line)
+    else:
+        import json as _json
+        try:
+            obj = _json.loads(line)
+            ts = obj.get("ts", "")
+            if "T" in ts:
+                ts = ts.split("T", 1)[1]
+            print(f"{ts} {obj.get('level', '?')} {obj.get('subsystem', '?')} {obj.get('msg', '')}")
+        except Exception:
+            print(line)
+
+
+def _follow(path, args, matches_fn, print_fn):
+    """tail -f with rotation detection. Exits on Ctrl+C."""
+    import time as _time
+    last_size = path.stat().st_size if path.exists() else 0
+    try:
+        while True:
+            _time.sleep(1)
+            if not path.exists():
+                # File may have been rotated away; wait for it to reappear.
+                continue
+            cur_size = path.stat().st_size
+            if cur_size < last_size:
+                print("Log cursor reset (file rotated).")
+                last_size = 0
+            if cur_size > last_size:
+                with path.open("r", encoding="utf-8") as fh:
+                    fh.seek(last_size)
+                    for line in fh:
+                        if matches_fn(line.rstrip("\n")):
+                            print_fn(line.rstrip("\n"), args)
+                last_size = cur_size
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_logs(args):
+    """Print or follow the operational JSONL log.
+
+    Reads the daily file directly (no RPC in v1). Human format:
+        HH:MM:SS+TZ level subsystem msg
+    With --json: raw JSONL lines.
+    """
+    path = getattr(args, "log_file", None)
+    if path is None:
+        from agent8088 import engine as _A
+        path = _A._agent_data_dir() / "logs" / (
+            f"agent8088-{datetime.now().astimezone().strftime('%Y-%m-%d')}.log")
+    if not path.exists():
+        print(f"No log file at {path}. Run agent8088 to start logging.")
+        return 1
+    import json as _json
+    level_filter = (args.level or "").upper() or None
+    sub_filter = args.subsystem or None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # Keep only non-empty, valid-JSON lines that match the filters.
+    def _matches(line):
+        if not line.strip():
+            return False
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            return False
+        if level_filter and obj.get("level", "").upper() != level_filter:
+            return False
+        if sub_filter and sub_filter.lower() not in obj.get("subsystem", "").lower():
+            return False
+        return True
+    matched = [l for l in lines if _matches(l)]
+    tail = matched[-args.limit:] if args.limit else matched
+    # Print the initial tail.
+    for line in tail:
+        _print_line(line, args)
+    # Follow mode: poll for new bytes.
+    if getattr(args, "logs", None) == "follow":
+        _follow(path, args, _matches, _print_line)
+    return 0
+
+
 def cmd_new(rest):
     try:
         name = _session_name(rest)
@@ -5390,6 +5475,7 @@ def _run_gateway_setup():
 
 
 def main():
+    configure_logging()
     import argparse
     from agent8088 import __version__
     parser = argparse.ArgumentParser(
@@ -5420,6 +5506,16 @@ def main():
     parser.add_argument("--mcp-http", action="store_true", help="use HTTP transport for MCP server (implies --mcp-serve)")
     parser.add_argument("--mcp-port", type=int, default=None, help="MCP server HTTP port (default 8931); implies --mcp-serve --mcp-http")
     parser.add_argument("--mcp-host", default=None, help="MCP server bind host (default 127.0.0.1, loopback only); implies --mcp-serve --mcp-http")
+    parser.add_argument("--logs", nargs="?", const="tail", default=None,
+                        help="print or follow the operational log; 'follow' tails in real time")
+    parser.add_argument("-n", "--limit", type=int, default=50,
+                        help="with --logs: number of lines to print (default 50)")
+    parser.add_argument("--level", default=None,
+                        help="with --logs: filter by level (DEBUG|INFO|WARNING|ERROR)")
+    parser.add_argument("--subsystem", default=None,
+                        help="with --logs: substring filter on subsystem name")
+    parser.add_argument("--json", action="store_true",
+                        help="with --logs: emit raw JSONL instead of human format")
     args = parser.parse_args()
 
     # The transport flags are meaningless without --mcp-serve, and argparse happily
@@ -5430,6 +5526,14 @@ def main():
         args.mcp_http = True
     if args.mcp_http:
         args.mcp_serve = True
+
+    if args.logs is not None:
+        # Locate today's file for cmd_logs.
+        from datetime import datetime as _dt
+        today = _dt.now().astimezone().strftime("%Y-%m-%d")
+        args.log_file = A._agent_data_dir() / "logs" / f"agent8088-{today}.log"
+        rc = cmd_logs(args)
+        return rc if isinstance(rc, int) else 0
 
     if args.uninstall:
         uninstall_ok = _run_uninstall()
