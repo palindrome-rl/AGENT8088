@@ -4606,19 +4606,39 @@ def _run_uninstall():
         return False
 
     def _clear_readonly(func, path, _exc):
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
+        # A file this process cannot chmod (e.g. one a Docker container wrote
+        # into a bind-mounted config dir, owned by a different uid) must not
+        # crash rmtree here — that took down the whole uninstall over a single
+        # leftover file instead of removing everything else and saying so.
+        # OR in the bits rather than setting mode outright: `func` can be
+        # os.rmdir for a directory that merely has an unremovable child, and
+        # clobbering its mode to owner-write-only would strip the execute bit
+        # a directory needs to stay traversable, leaving it locked out even
+        # to its own owner.
+        try:
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR | stat.S_IXUSR)
+            func(path)
+        except OSError:
+            pass
 
     if os.name == "nt":
         return _run_windows_uninstall(home)
 
     if home.exists():
-        try:
-            shutil.rmtree(home, onerror=_clear_readonly)
-            print(f"Removed {home}")
-        except OSError as exc:
-            print(f"Could not remove {home}: {exc}")
+        shutil.rmtree(home, onerror=_clear_readonly)
+        if home.exists():
+            leftover = sorted(str(p) for p in home.rglob("*") if not p.is_dir())
+            print(f"Could not fully remove {home}.")
+            for path in leftover[:10]:
+                print(f"  left behind: {path}")
+            if len(leftover) > 10:
+                print(f"  ...and {len(leftover) - 10} more")
+            print("These are likely owned by another user (e.g. a Docker "
+                  "container that wrote into this folder). Stop anything "
+                  "using them, then re-run `agent8088 --uninstall`, or "
+                  "remove the folder by hand with sudo.")
             return False
+        print(f"Removed {home}")
     else:
         print(f"Install directory not found: {home}")
 
