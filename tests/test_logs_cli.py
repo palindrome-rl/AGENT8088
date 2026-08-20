@@ -103,3 +103,76 @@ def test_logs_missing_file_exits_clean(tmp_path, monkeypatch, capsys):
     assert rc == 1
     assert "No log file" in out
     assert "Traceback" not in out
+
+
+def test_logs_follow_emits_new_lines(tmp_path, monkeypatch, capsys):
+    log_dir = tmp_path / "logs"
+    f = _seed_log(log_dir, 5)
+    monkeypatch.setattr(A, "_agent_data_dir", lambda: tmp_path)
+    args = _make_args(log_dir, follow=True, limit=5)
+
+    # Run cmd_logs in a thread; it blocks on follow. Stop it by setting a flag
+    # the function polls. We monkeypatch time.sleep to set the stop flag after
+    # the append so the test is deterministic — no real time.sleep in the path.
+    stop = {"flag": False}
+    appended = threading.Event()
+
+    def _fake_sleep(_secs):
+        if not appended.is_set():
+            # First few sleeps happen before the append — append now.
+            with f.open("a", encoding="utf-8") as fh:
+                for i in range(3):
+                    fh.write(json.dumps({"ts": "2026-08-20T13:00:00+00:00",
+                                         "level": "INFO",
+                                         "subsystem": "engine",
+                                         "msg": f"new {i}"}) + "\n")
+            appended.set()
+            return  # return once so the loop reads the new bytes
+        # After the append, signal stop on the next sleep.
+        stop["flag"] = True
+        raise KeyboardInterrupt  # how cmd_logs follow exits
+
+    monkeypatch.setattr(time, "sleep", _fake_sleep)
+    monkeypatch.setattr(A, "time", time)  # if engine imported time locally
+    # Some cli code may import time itself; patch the module-level reference too.
+    import agent8088.cli as _cli
+    monkeypatch.setattr(_cli.time, "sleep", _fake_sleep, raising=False)
+
+    rc = cli.cmd_logs(args)  # should exit via KeyboardInterrupt internally
+    out, _ = capsys.readouterr()
+    # The 5 seeded lines should print first, then the 3 new ones.
+    assert "record 4" in out  # last seeded line
+    assert "new 0" in out and "new 1" in out and "new 2" in out
+
+
+def test_logs_follow_handles_rotation(tmp_path, monkeypatch, capsys):
+    log_dir = tmp_path / "logs"
+    f = _seed_log(log_dir, 3)
+    monkeypatch.setattr(A, "_agent_data_dir", lambda: tmp_path)
+    args = _make_args(log_dir, follow=True, limit=3)
+
+    rotated = threading.Event()
+
+    def _fake_sleep(_secs):
+        if not rotated.is_set():
+            # Simulate rotation: move the current file aside, write a fresh file.
+            rotated_path = f.with_suffix(f.suffix + ".old")
+            f.replace(rotated_path)
+            with f.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": "2026-08-20T14:00:00+00:00",
+                                     "level": "INFO",
+                                     "subsystem": "engine",
+                                     "msg": "post-rotation"}) + "\n")
+            rotated.set()
+            return  # return once so the loop detects the rotation
+        if rotated.is_set():
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(time, "sleep", _fake_sleep)
+    import agent8088.cli as _cli
+    monkeypatch.setattr(_cli.time, "sleep", _fake_sleep, raising=False)
+
+    cli.cmd_logs(args)
+    out, _ = capsys.readouterr()
+    assert "Log cursor reset (file rotated)." in out
+    assert "post-rotation" in out

@@ -2928,6 +2928,46 @@ def cmd_audit(rest):
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
 
 
+def _print_line(line, args):
+    if getattr(args, "json", False):
+        print(line)
+    else:
+        import json as _json
+        try:
+            obj = _json.loads(line)
+            ts = obj.get("ts", "")
+            if "T" in ts:
+                ts = ts.split("T", 1)[1]
+            print(f"{ts} {obj.get('level', '?')} {obj.get('subsystem', '?')} {obj.get('msg', '')}")
+        except Exception:
+            print(line)
+
+
+def _follow(path, args, matches_fn, print_fn):
+    """tail -f with rotation detection. Exits on Ctrl+C."""
+    import time as _time
+    last_size = path.stat().st_size if path.exists() else 0
+    try:
+        while True:
+            _time.sleep(1)
+            if not path.exists():
+                # File may have been rotated away; wait for it to reappear.
+                continue
+            cur_size = path.stat().st_size
+            if cur_size < last_size:
+                print("Log cursor reset (file rotated).")
+                last_size = 0
+            if cur_size > last_size:
+                with path.open("r", encoding="utf-8") as fh:
+                    fh.seek(last_size)
+                    for line in fh:
+                        if matches_fn(line.rstrip("\n")):
+                            print_fn(line.rstrip("\n"), args)
+                last_size = cur_size
+    except KeyboardInterrupt:
+        pass
+
+
 def cmd_logs(args):
     """Print or follow the operational JSONL log.
 
@@ -2962,22 +3002,12 @@ def cmd_logs(args):
         return True
     matched = [l for l in lines if _matches(l)]
     tail = matched[-args.limit:] if args.limit else matched
+    # Print the initial tail.
     for line in tail:
-        if getattr(args, "json", False):
-            print(line)
-        else:
-            try:
-                obj = _json.loads(line)
-                ts = obj.get("ts", "")
-                # Shorten the timestamp to the time+offset portion for readability.
-                if "T" in ts:
-                    ts = ts.split("T", 1)[1]
-                lvl = obj.get("level", "?")
-                sub = obj.get("subsystem", "?")
-                msg = obj.get("msg", "")
-                print(f"{ts} {lvl} {sub} {msg}")
-            except Exception:
-                print(line)
+        _print_line(line, args)
+    # Follow mode: poll for new bytes.
+    if getattr(args, "logs", None) == "follow":
+        _follow(path, args, _matches, _print_line)
     return 0
 
 
