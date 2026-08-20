@@ -107,6 +107,29 @@ export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-60}"
 # unknown") anywhere it is reused outside bash. The array is also SC2086-clean.
 CURL_STALL_FLAGS=(--connect-timeout 20 --speed-limit 1024 --speed-time 30)
 
+# Download one URL to one path, trying curl first and falling back to wget. Some
+# minimal base images (notably a few Alpine variants used in CI containers) ship
+# wget but not curl, or vice versa -- Aider's installer documents the same
+# curl-then-wget fallback for exactly this reason. Returns the underlying tool's
+# exit code; the caller already treats a non-zero/timeout result as "this optional
+# stage didn't work" rather than a hard failure.
+_download_file() {
+    local _dl_url="$1" _dl_out="$2" _dl_timeout="$3"
+    if command -v curl >/dev/null 2>&1; then
+        run_with_timeout "$_dl_timeout" curl -fsSL "${CURL_STALL_FLAGS[@]}" "$_dl_url" -o "$_dl_out" 2>/dev/null
+        return $?
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        # wget's nearest equivalents: --timeout bounds a stalled read (curl's
+        # --speed-time), --tries=1 avoids wget's own silent retry loop stacking on
+        # top of run_with_timeout's wall clock.
+        run_with_timeout "$_dl_timeout" wget -q --timeout=30 --tries=1 -O "$_dl_out" "$_dl_url" 2>/dev/null
+        return $?
+    fi
+    log_warn "Neither curl nor wget is available - cannot download $_dl_url"
+    return 1
+}
+
 # ----------------------------------------------------------------------------
 # Proxy
 # ----------------------------------------------------------------------------
