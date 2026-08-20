@@ -3,7 +3,7 @@
 # Agent8088 Installer — Linux, macOS, WSL2, Termux
 # ============================================================================
 # Usage:
-#   curl -fsSL https://<YOUR-URL>/install.sh | bash
+#   curl -fsSL --proto '=https' --tlsv1.2 https://<YOUR-URL>/install.sh | bash
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, git install, repo clone, venv,
@@ -1324,7 +1324,7 @@ verify_install() {
         echo "  Sandbox:  Docker fallback is automatic when available"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
+    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
