@@ -2937,7 +2937,7 @@ def cmd_audit(rest):
 
     if want:
         console.print("step verification: [green]on[/green] — after every mutating step a "
-                      "read-only auditor checks the real files against your approved plan, "
+                      "read-only auditor checks the result in the real environment, "
                       "and a step that fails is put back.")
         console.print("[dim]this spends one extra model call — and its tokens — per "
                       "mutating step, and it comes out of the same turn budget as the "

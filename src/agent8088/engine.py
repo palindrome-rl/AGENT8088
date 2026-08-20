@@ -2633,8 +2633,9 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
 
     Skipped when the shared turn budget is already spent — the auditor spends the
     parent's budget by design, and burning the remainder on verification would
-    starve the work being verified. A `fail` verdict halts the plan; anything
-    else is recorded but never halts, because an auditor that cannot run must not
+    starve the work being verified. A `fail` verdict marks the call as failed
+    (and therefore halts an explicit plan runner); anything else is recorded but
+    never marks the call as failed, because an auditor that cannot run must not
     be able to stop work on its own.
     """
     if _active_budget is not None and _active_budget.exceeded():
@@ -2704,36 +2705,33 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     return "", ""
 
 
-def _approved_plan_audit_applies(tool_name: str, depth: int) -> bool:
-    """Whether an ordinary tool call should be verified right now.
+def _audit_applies(tool_name: str, depth: int) -> bool:
+    """Whether a completed tool call should be verified.
 
-    The auditor reached a plan's writes for a structural reason rather than a
-    deliberate one: plan mode forced every mutation through `execute_plan`, and
-    that is the only path the audit hooked. An approved plan now runs as ordinary
-    tool calls, so without this the default `/plan` path would be the one path
-    with no verification at all — the opposite of what the audit is for.
-
-    Depth 0 only. A sub-agent's writes are not the plan, and auditing inside the
-    auditor would set it verifying itself.
+    ``/audit on`` covers every top-level mutation, whether or not it came from an
+    approved plan. Depth 0 is deliberate: a sub-agent's writes are outside the
+    top-level workflow, and auditing inside the auditor would make it verify
+    itself recursively.
     """
-    if not (PLAN_AUDIT and _plan_approved and depth == 0):
+    if not (PLAN_AUDIT and depth == 0):
         return False
     return _plan_step_is_auditable(tool_name, "")
 
 
-def _audit_approved_plan_call(tool_name: str, tool_args: dict, result: str,
-                              depth: int, snapshot) -> str:
-    """Verify one post-approval call and put a failed write back.
+def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
+                     depth: int, snapshot) -> str:
+    """Verify one top-level mutation and put a failed write back.
 
     `_exec_plan` halts its remaining steps on a failed verdict. There is no step
     list to halt here, so the equivalent is to hand the model a result it cannot
     read as success and to say plainly that nothing later should be built on top
-    of it. The same asymmetry holds as in plans: only a `fail` undoes anything —
+    of it. Only a `fail` undoes anything —
     an auditor that could not reach its model must not be able to destroy work.
     """
     step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
+    plan_context = _plan_approved_text[:1500] if _plan_approved else ""
     reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
-                                    plan_context=_plan_approved_text[:1500])
+                                    plan_context=plan_context)
     parts = [result]
     if note:
         parts.append(f"audit: {note}")
@@ -2743,8 +2741,8 @@ def _audit_approved_plan_call(tool_name: str, tool_args: dict, result: str,
         elif PLAN_AUDIT_REVERT and TOOL_SPECS.get(tool_name, {}).get("mode") != "write_text":
             parts.append(f"not reverted — {tool_name} has no undo; "
                          "inspect the effect by hand")
-        parts.append(f"Error: verification failed — {reason}. Stop carrying out the plan "
-                     "and report what actually happened; do not assume any later step is "
+        parts.append(f"Error: verification failed — {reason}. Stop the current work and "
+                     "report what actually happened; do not assume any later action is "
                      "safe to run.")
     return "\n".join(parts)
 
@@ -5049,7 +5047,7 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
 
     # Taken before the call runs: once it has written, the previous state is the
     # one thing that cannot be reconstructed.
-    will_audit = _approved_plan_audit_applies(name, depth)
+    will_audit = _audit_applies(name, depth)
     snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
 
     try:
@@ -5067,7 +5065,7 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # had to answer.
     if (will_audit and not result.startswith("ESCALATION_REQUEST\x1f")
             and not _plan_step_failed(result)):
-        result = _audit_approved_plan_call(name, args, result, depth, snapshot)
+        result = _audit_tool_call(name, args, result, depth, snapshot)
 
     _remember_escalation(name, args, result)
 
