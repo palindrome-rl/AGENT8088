@@ -121,6 +121,7 @@ def test_terminal_relaunch_preserves_installer_parameters():
     output = _run_powershell(
         f"""
 $Branch = 'development'
+$RepoSlug = 'palindrome-rl/AGENT8088'
 $Agent8088Home = "C:\\Users\\O'Brien\\Agent Home"
 $InstallDir = 'C:\\Agent Install'
 $SkipSetup = $true
@@ -150,7 +151,7 @@ Write-Output $launcher
     assert "True|C:\\mock\\wt.exe" in output
     assert "-EncodedCommand" in output
     assert output.index("Tls12") < output.index("Invoke-RestMethod")
-    assert "AGENT8088/development/install.ps1" in output
+    assert "palindrome-rl/AGENT8088/development/install.ps1" in output
     assert "-Agent8088Home 'C:\\Users\\O''Brien\\Agent Home'" in output
     assert "-InstallDir 'C:\\Agent Install'" in output
     assert "-SkipSetup:$true" in output
@@ -162,6 +163,7 @@ def test_terminal_upgrade_runs_in_visible_external_bootstrap():
         f"""
 $env:SystemRoot = 'C:\\Windows'
 $Branch = 'development'
+$RepoSlug = 'palindrome-rl/AGENT8088'
 $Agent8088Home = 'C:\\Users\\User\\AppData\\Local\\agent8088'
 $InstallDir = ''
 $InstallerSourceUrl = ''
@@ -190,6 +192,12 @@ Write-Output $bootstrap
     assert "This window will remain open" in output
     assert "Agent8088 installation could not continue" in output
     assert "Read-Host" in output
+
+
+def test_windows_installer_urls_use_the_internal_repository():
+    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    assert '$RepoSlug = "palindrome-rl/AGENT8088"' in source
+    assert "tayyabimam1/AGENT8088" not in source
 
 
 def test_terminal_bootstrap_installs_then_launches():

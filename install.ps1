@@ -169,7 +169,8 @@ if (-not $env:GIT_HTTP_LOW_SPEED_TIME)  { $env:GIT_HTTP_LOW_SPEED_TIME  = "60" }
 # ----------------------------------------------------------------------------
 if (-not $InstallDir) { $InstallDir = Join-Path $Agent8088Home "agent8088" }
 $LauncherDir = "${Agent8088Home}-launcher"
-$RepoUrl = "https://github.com/tayyabimam1/AGENT8088.git"
+$RepoSlug = "palindrome-rl/AGENT8088"
+$RepoUrl = "https://github.com/$RepoSlug.git"
 $PythonVersion = "3.11"
 $PythonFallbackVersions = @("3.12", "3.10")
 $script:PythonExecutable = $null
@@ -630,7 +631,7 @@ function Get-InstallerInvocation {
     $sourceUrl = $InstallerSourceUrl
     if (-not $sourceUrl) {
         $escapedBranch = [Uri]::EscapeDataString($Branch).Replace('%2F', '/')
-        $sourceUrl = "https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$escapedBranch/install.ps1"
+        $sourceUrl = "https://raw.githubusercontent.com/$RepoSlug/$escapedBranch/install.ps1"
     }
     $urlLiteral = ConvertTo-PowerShellLiteral $sourceUrl
     $tlsCommand = "try { [Net.ServicePointManager]::SecurityProtocol = " +
@@ -1137,7 +1138,7 @@ function Clone-Repo {
             Write-Warn "git clone failed; falling back to ZIP archive: $_"
             if (-not (Remove-IncompleteInstallDirectory)) { return $false }
             try {
-                $zipUrl = "https://github.com/tayyabimam1/AGENT8088/archive/refs/heads/$Branch.zip"
+                $zipUrl = "https://github.com/$RepoSlug/archive/refs/heads/$Branch.zip"
                 $tmpZip = "$env:TEMP\agent8088-$Branch.zip"
                 $dl = Invoke-BoundedDownload -Uri $zipUrl -OutFile $tmpZip `
                         -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
@@ -1759,7 +1760,7 @@ function Verify-Install {
         Write-Host "            Native is not set up on Windows yet (optional, may fail):"
         Write-Host "            elevated agent8088 --sandbox-setup"
     }
-    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$Branch/install.ps1)"
+    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/$RepoSlug/$Branch/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
