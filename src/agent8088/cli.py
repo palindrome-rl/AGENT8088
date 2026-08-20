@@ -5506,6 +5506,16 @@ def main():
     parser.add_argument("--mcp-http", action="store_true", help="use HTTP transport for MCP server (implies --mcp-serve)")
     parser.add_argument("--mcp-port", type=int, default=None, help="MCP server HTTP port (default 8931); implies --mcp-serve --mcp-http")
     parser.add_argument("--mcp-host", default=None, help="MCP server bind host (default 127.0.0.1, loopback only); implies --mcp-serve --mcp-http")
+    parser.add_argument("--logs", nargs="?", const="tail", default=None,
+                        help="print or follow the operational log; 'follow' tails in real time")
+    parser.add_argument("-n", "--limit", type=int, default=50,
+                        help="with --logs: number of lines to print (default 50)")
+    parser.add_argument("--level", default=None,
+                        help="with --logs: filter by level (DEBUG|INFO|WARNING|ERROR)")
+    parser.add_argument("--subsystem", default=None,
+                        help="with --logs: substring filter on subsystem name")
+    parser.add_argument("--json", action="store_true",
+                        help="with --logs: emit raw JSONL instead of human format")
     args = parser.parse_args()
 
     # The transport flags are meaningless without --mcp-serve, and argparse happily
@@ -5516,6 +5526,14 @@ def main():
         args.mcp_http = True
     if args.mcp_http:
         args.mcp_serve = True
+
+    if args.logs is not None:
+        # Locate today's file for cmd_logs.
+        from datetime import datetime as _dt
+        today = _dt.now().astimezone().strftime("%Y-%m-%d")
+        args.log_file = A._agent_data_dir() / "logs" / f"agent8088-{today}.log"
+        rc = cmd_logs(args)
+        return rc if isinstance(rc, int) else 0
 
     if args.uninstall:
         uninstall_ok = _run_uninstall()

@@ -176,3 +176,36 @@ def test_logs_follow_handles_rotation(tmp_path, monkeypatch, capsys):
     out, _ = capsys.readouterr()
     assert "Log cursor reset (file rotated)." in out
     assert "post-rotation" in out
+
+
+def test_main_logs_flag_dispatches_to_cmd_logs(tmp_path, monkeypatch, capsys):
+    """agent8088 --logs must dispatch to cmd_logs and exit 0 (not enter REPL)."""
+    log_dir = tmp_path / "logs"
+    _seed_log(log_dir, 3)
+    monkeypatch.setattr(A, "_agent_data_dir", lambda: tmp_path)
+    called = []
+    import agent8088.cli as _cli
+    def _fake_cmd_logs(args):
+        called.append(args)
+        return 0
+    monkeypatch.setattr(_cli, "cmd_logs", _fake_cmd_logs)
+    monkeypatch.setattr(sys, "argv", ["agent8088", "--logs"])
+    rc = _cli.main()
+    assert called, "--logs did not dispatch to cmd_logs"
+    # main() should not fall through to the REPL.
+    assert rc in (0, None)
+
+
+def test_main_logs_follow_passes_follow_arg(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    _seed_log(log_dir, 1)
+    monkeypatch.setattr(A, "_agent_data_dir", lambda: tmp_path)
+    captured = {}
+    import agent8088.cli as _cli
+    def _fake_cmd_logs(args):
+        captured["logs"] = getattr(args, "logs", None)
+        return 0
+    monkeypatch.setattr(_cli, "cmd_logs", _fake_cmd_logs)
+    monkeypatch.setattr(sys, "argv", ["agent8088", "--logs", "follow"])
+    _cli.main()
+    assert captured.get("logs") == "follow"
