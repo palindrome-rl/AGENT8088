@@ -69,6 +69,21 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
 | Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
 
+### Supported platforms
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS 12+ (Apple Silicon & Intel) | Supported | `install.sh` |
+| Ubuntu / Debian / Fedora / Arch (x64, arm64) | Supported | `install.sh` |
+| WSL2 | Supported | `install.sh`; clone with LF line endings, not CRLF |
+| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1` |
+| Windows Server, legacy Console Host, PowerShell ISE | Not supported | needs a modern terminal host — see `install.ps1`'s terminal check |
+| Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
+| Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
+
+Run `agent8088 doctor` after installing to verify your setup, or `agent8088 dump` to
+produce a bundle for a bug report.
+
 The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed — run `uv pip install -e ".[dev]"` if you need the test suite.
 
 ### Configure and run
