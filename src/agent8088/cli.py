@@ -24,6 +24,7 @@ try:
 except ImportError:
     pass
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -2925,6 +2926,59 @@ def cmd_audit(rest):
     if not saved:
         console.print(f"[yellow]applies to this session only — could not write to "
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
+
+
+def cmd_logs(args):
+    """Print or follow the operational JSONL log.
+
+    Reads the daily file directly (no RPC in v1). Human format:
+        HH:MM:SS+TZ level subsystem msg
+    With --json: raw JSONL lines.
+    """
+    path = getattr(args, "log_file", None)
+    if path is None:
+        from agent8088 import engine as _A
+        path = _A._agent_data_dir() / "logs" / (
+            f"agent8088-{datetime.now().astimezone().strftime('%Y-%m-%d')}.log")
+    if not path.exists():
+        print(f"No log file at {path}. Run agent8088 to start logging.")
+        return 1
+    import json as _json
+    level_filter = (args.level or "").upper() or None
+    sub_filter = args.subsystem or None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # Keep only non-empty, valid-JSON lines that match the filters.
+    def _matches(line):
+        if not line.strip():
+            return False
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            return False
+        if level_filter and obj.get("level", "").upper() != level_filter:
+            return False
+        if sub_filter and sub_filter.lower() not in obj.get("subsystem", "").lower():
+            return False
+        return True
+    matched = [l for l in lines if _matches(l)]
+    tail = matched[-args.limit:] if args.limit else matched
+    for line in tail:
+        if getattr(args, "json", False):
+            print(line)
+        else:
+            try:
+                obj = _json.loads(line)
+                ts = obj.get("ts", "")
+                # Shorten the timestamp to the time+offset portion for readability.
+                if "T" in ts:
+                    ts = ts.split("T", 1)[1]
+                lvl = obj.get("level", "?")
+                sub = obj.get("subsystem", "?")
+                msg = obj.get("msg", "")
+                print(f"{ts} {lvl} {sub} {msg}")
+            except Exception:
+                print(line)
+    return 0
 
 
 def cmd_new(rest):
