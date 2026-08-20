@@ -17,7 +17,8 @@ feature is reachable here:
 Run:  python agent8088_cli.py
 """
 import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
-import subprocess, shutil
+import subprocess
+import shutil
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
