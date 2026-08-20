@@ -212,7 +212,11 @@ def test_digits_202_in_an_unrelated_message_is_not_a_rate_limit(monkeypatch):
     assert "rate limited" not in out.error.lower()
 
 
-def test_a_non_throttle_failure_does_not_burn_retries(monkeypatch):
+def test_a_non_throttle_failure_is_retried_too(monkeypatch):
+    """A connection reset, an unwrapped timeout, or one engine's page layout
+    changing is attempt-specific, not query-specific — retrying is not "the
+    same thing again" since `backend` names several engines. Only running out
+    of attempts (here, all 3) ends the search."""
     calls = []
 
     def fake(query, limit, *, backend, timeout, proxy=None, region=None):
@@ -220,8 +224,25 @@ def test_a_non_throttle_failure_does_not_burn_retries(monkeypatch):
         raise ValueError("malformed html")
 
     _stub(monkeypatch, fake)
-    DdgsProvider().search("q", 5, FakeCtx())
-    assert len(calls) == 1, "a parse error will not fix itself on a retry"
+    out = DdgsProvider().search("q", 5, FakeCtx())
+    assert len(calls) == 3
+    assert isinstance(out, SearchFailure)
+    assert "rate limited" not in out.error.lower()
+
+
+def test_a_non_throttle_failure_can_still_succeed_on_a_later_attempt(monkeypatch):
+    calls = []
+
+    def fake(query, limit, *, backend, timeout, proxy=None, region=None):
+        calls.append(1)
+        if len(calls) < 2:
+            raise ConnectionResetError("connection reset by peer")
+        return _hits()
+
+    _stub(monkeypatch, fake)
+    out = DdgsProvider().search("q", 5, FakeCtx())
+    assert isinstance(out, SearchSuccess) and out.results
+    assert len(calls) == 2
 
 
 def test_no_results_found_is_success_with_nothing(monkeypatch):

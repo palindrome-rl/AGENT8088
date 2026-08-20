@@ -4578,7 +4578,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
     # to the normal check_permission gate so it escalates properly.
     plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
-    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled())
+    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled()
+                          and not _ddgs_only_chain())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
 
@@ -4661,7 +4662,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                    detail=query[:120], reason="outbound_secret")
             return leak
         local_no_prompt = _local_searxng_no_prompt_enabled()
-        if (not local_no_prompt
+        ddgs_only = _ddgs_only_chain()
+        if (not local_no_prompt and not ddgs_only
                 and not check_permission(mode, f"web_search: {query[:80]}",
                                          approval_key=approval_key)):
             _audit("escalation_requested", tool=name, mode=mode,
@@ -4684,8 +4686,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return _frame_search_results(web_search.run_search(
                 query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
 
+        _audit_extra = {"reason": "ddgs_no_prompt"} if ddgs_only and not local_no_prompt else {}
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
-               detail=query[:200])
+               detail=query[:200], **_audit_extra)
         if not local_no_prompt:
             return _frame_search_results(web_search.run_search(
                 query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
@@ -6071,6 +6074,34 @@ def _local_searxng_no_prompt_enabled() -> bool:
                 or f"{host}:{parts.port}" in allowed_hosts))
     except ValueError:
         return False
+
+
+def _ddgs_only_chain() -> bool:
+    """True when ddgs is the only backend that would actually serve a search.
+
+    No SearXNG configured and no keyed backend (tavily/exa) enabled — ddgs,
+    the keyless fallback that ships with every install, is the entire chain.
+    Gating that behind an interactive "may I search the web?" prompt only
+    ever blocks the one backend nobody had to opt into, and does so on every
+    single call since there is no session-wide grant (see grant_escalation) —
+    which is exactly the failure mode that made web_search unusable with no
+    SearXNG/API-key backend configured. ddgs's own guards are unaffected:
+    _web_search_query_guard and _outbound_secret_check above still run before
+    this point, and DdgsProvider.search() still fails closed against its own
+    per-engine egress allowlist (web_search._ddgs_allowed_engines) — this only
+    removes the human-in-the-loop step, not any of the actual security checks.
+
+    Deliberately separate from _local_searxng_no_prompt_enabled: that opt-in
+    protects a deliberately LOCAL-only pin from silently escaping to the
+    public internet. There is no local backend here to escape from — ddgs
+    reaching the public internet is not a silent downgrade, it is the only
+    thing this chain was ever going to do.
+    """
+    try:
+        chain = WEB_SEARCH_REGISTRY.chain(_search_config(), _search_context())
+    except Exception:  # noqa: BLE001 — a chain probe failure must not block search
+        return False
+    return bool(chain) and all(provider.name == "ddgs" for provider in chain)
 
 
 def _search_config() -> dict:

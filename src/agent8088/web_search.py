@@ -639,12 +639,18 @@ class DdgsProvider(WebSearchProvider):
 
     ddgs scrapes result pages rather than using an API, so it is still the backend
     most likely to throttle under sustained agent use — but it no longer gives up
-    when it does. Three things carry that: several engines are named explicitly so a
-    202 rotates to the next throttle bucket instead of ending the search, a
-    throttled attempt is retried with backoff, and repeat queries are served from a
-    short-lived cache. It earns its place as the fallback that needs no key, no
-    hosting and no setup, and because it ships as a dependency web_search always has
-    somewhere to land when SearXNG is absent or failing.
+    when it does. Four things carry that: several engines are named explicitly so a
+    202 rotates to the next throttle bucket instead of ending the search, EVERY
+    attempt failure is retried with backoff (not just recognised throttle
+    exceptions — a connection reset or an unwrapped timeout gets the same second
+    chance), repeat queries are served from a short-lived cache, and — because it
+    is the fallback nobody has to opt into — engine.py exempts it from the
+    permission-escalation prompt when it is the only backend in the chain (see
+    engine._ddgs_only_chain), so a missing/misconfigured SearXNG or API key can
+    never turn into "web_search does not work at all". It earns its place as the
+    fallback that needs no key, no hosting and no setup, and because it ships as a
+    dependency web_search always has somewhere to land when SearXNG is absent or
+    failing.
 
     SECURITY: the library owns its HTTP client, so its requests do NOT pass through
     engine.py's guard. Every host each engine reaches is therefore checked against
@@ -702,15 +708,20 @@ class DdgsProvider(WebSearchProvider):
                                  timeout=_DDGS_TIMEOUT, proxy=proxy) or []
             except Exception as exc:  # noqa: BLE001 — a provider must never raise
                 last_error = str(exc) or exc.__class__.__name__
-                if throttles and isinstance(exc, throttles):
-                    throttled = True
-                    continue
                 # Upstream signals "zero hits" by raising. That is not a provider
                 # failure, and reporting it as one would send run_search shopping
                 # for another backend over a query nothing can answer.
                 if "no results found" in last_error.lower():
                     return SearchSuccess([], provider=self.name)
-                break  # a parse error will not fix itself on a retry
+                if throttles and isinstance(exc, throttles):
+                    throttled = True
+                # Retry everything else too, not just recognised throttle types:
+                # a connection reset, a timeout ddgs did not wrap, or one engine's
+                # page layout changing are attempt-specific, not query-specific —
+                # and `backend` names several engines (separate throttle/failure
+                # buckets), so a later attempt is not just "try the same thing
+                # again". Only running out of attempts ends the search.
+                continue
             results = [SearchResult(title=str(r.get("title") or ""),
                                     url=str(r.get("href") or ""),
                                     snippet=str(r.get("body") or "")[:MAX_SNIPPET_CHARS])
