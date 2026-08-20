@@ -2335,6 +2335,35 @@ def _infer_step_args(tool_name: str, step_text: str, given_args: dict = None) ->
     return args
 
 
+def _kill_detached_process(process):
+    """Force-kill a process started with start_new_session/CREATE_NEW_PROCESS_GROUP.
+
+    That flag deliberately takes the child out of the terminal's own process
+    group so a timeout can kill it without also killing this CLI - but it means
+    the child never receives the terminal's own Ctrl+C/SIGINT either. Without
+    this, a Ctrl+C during a stuck command doesn't just fail to stop the
+    command: Popen.__exit__() closes process.stdout to clean up, and that
+    close() blocks on the same lock the still-running drain() thread holds
+    inside its blocked stdout.read() - so the whole CLI hangs until the
+    orphaned child eventually exits on its own.
+    """
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+            capture_output=True, timeout=10,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     kwargs = {
         "shell": shell,
@@ -2369,23 +2398,15 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
         try:
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            if sys.platform == "win32":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                    capture_output=True, timeout=10,
-                )
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            _kill_detached_process(process)
             reader.join(timeout=2)
             return f"Command timed out after {timeout}s."
+        except BaseException:
+            # Ctrl+C mid-command: see _kill_detached_process for why the child
+            # must be killed here too, not just left for Popen's own cleanup.
+            _kill_detached_process(process)
+            reader.join(timeout=2)
+            raise
         reader.join()
     text = output.decode(errors="replace").strip()
     if truncated:
