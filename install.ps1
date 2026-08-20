@@ -413,6 +413,32 @@ function Invoke-BoundedDownload {
     return $result
 }
 
+# PortableGit, the Node zip, and the repo ZIP fallback each hit exactly one
+# URL with no retry. GitHub and nodejs.org both throw intermittent 503s that a
+# second attempt clears on its own; a timeout already burned its whole budget,
+# so backoff is a short fixed delay, not exponential.
+function Invoke-BoundedDownloadWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][int]$TimeoutSec,
+        [System.Net.IWebProxy]$Proxy,
+        [int]$MaxAttempts = 3,
+        [int]$BackoffSec = 2
+    )
+    $result = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $result = Invoke-BoundedDownload -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -Proxy $Proxy
+        if ($result.Success) { return $result }
+        if ($attempt -lt $MaxAttempts) {
+            $why = if ($result.TimedOut) { "timed out" } elseif ($result.Error) { $result.Error } else { "failed" }
+            Write-Warn "Download attempt $attempt/$MaxAttempts failed ($why) - retrying..."
+            Start-Sleep -Seconds $BackoffSec
+        }
+    }
+    return $result
+}
+
 # Skipped-stage ledger, printed as one block at the end of the run.
 #
 # Warnings are emitted as each stage runs, which on a multi-minute install means
@@ -477,6 +503,21 @@ function Write-SkippedSummary {
     }
     Write-Host ""
     Write-Host "  The core agent is installed and works without these."
+}
+
+# A valid archive that extracts without error but is missing its expected
+# executable is the single most common "worked on my other PC, not this one"
+# report - almost always antivirus quarantine, but the raw error
+# ("node.exe not found after extraction") never names AV as the cause.
+function Write-AntivirusGuidance {
+    param(
+        [Parameter(Mandatory = $true)][string]$What,
+        [Parameter(Mandatory = $true)][string]$ExpectedPath,
+        [Parameter(Mandatory = $true)][string]$QuarantineHint
+    )
+    Write-Warn "$What was downloaded and extracted, but $ExpectedPath is missing."
+    Write-Warn "This is typically antivirus quarantine, not a bad download."
+    Write-Warn "Add an exclusion for '$QuarantineHint' and re-run, or temporarily disable real-time protection."
 }
 
 function Protect-ConfigFile {
@@ -558,15 +599,67 @@ function Get-WindowsTerminalExecutable {
     return $null
 }
 
+# WinGet-less path for LTSC/LTSB or any machine with App Installer removed.
+# Resolves the current version via the /releases/latest redirect - a plain
+# github.com page redirect, not the 60-req/hr api.github.com endpoint - so the
+# asset filename (which embeds the version) never needs to be hardcoded.
+function Install-WindowsTerminalFromGitHubRelease {
+    Write-Info "WinGet unavailable - trying Windows Terminal's GitHub release directly..."
+    $tmpFile = $null
+    try {
+        $req = [System.Net.WebRequest]::Create("https://github.com/microsoft/terminal/releases/latest")
+        $req.AllowAutoRedirect = $false
+        $req.Method = "HEAD"
+        if ($script:ResolvedProxy) { $req.Proxy = $script:ResolvedProxy }
+        $resp = $req.GetResponse()
+        $location = $resp.Headers["Location"]
+        $resp.Close()
+        if ($location -notmatch '/releases/tag/(v[\d.]+)') {
+            Write-Warn "Could not resolve the latest Windows Terminal version from GitHub."
+            return $false
+        }
+        $tag = $Matches[1]
+        $ver = $tag.TrimStart('v')
+        $assetName = "Microsoft.WindowsTerminal_${ver}_8wekyb3d8bbwe.msixbundle"
+        $downloadUrl = "https://github.com/microsoft/terminal/releases/download/$tag/$assetName"
+        $tmpFile = "$env:TEMP\$assetName"
+        $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
+            -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+        if (-not $dl.Success) {
+            $why = if ($dl.TimedOut) { "timed out" } else { $dl.Error }
+            Write-Warn "Downloading Windows Terminal $ver failed: $why"
+            return $false
+        }
+        Add-AppxPackage -Path $tmpFile -ErrorAction Stop
+        return $true
+    } catch {
+        # Most common cause: a missing dependency package (VCLibs/UI.Xaml)
+        # that WinGet resolves automatically but sideloading does not.
+        Write-Warn "Could not sideload Windows Terminal: $_"
+        Write-Info "Manual install: https://github.com/microsoft/terminal/releases/latest"
+        return $false
+    } finally {
+        if ($tmpFile) { Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue }
+    }
+}
+
 function Install-WindowsTerminal {
     param($ExistingPackage)
 
     $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $winget) {
-        Write-Err "WinGet is required to install Windows Terminal automatically."
-        Write-Info "Install App Installer from Microsoft Store, then re-run this installer."
+        if (Install-WindowsTerminalFromGitHubRelease) {
+            $package = Get-WindowsTerminalPackage
+            if ($package -and ([version]$package.Version -ge $WindowsTerminalMinVersion)) {
+                Write-Success "Windows Terminal $($package.Version) is ready"
+                return $true
+            }
+        }
+        Write-Err "Could not install Windows Terminal automatically (no WinGet, and the GitHub fallback did not succeed)."
+        Write-Info "Install App Installer from Microsoft Store for the WinGet path, then re-run this installer."
         Write-Info "https://aka.ms/getwinget"
+        Write-Info "Or install Windows Terminal manually: https://aka.ms/terminal"
         return $false
     }
 
@@ -775,6 +868,152 @@ function Get-WindowsArch {
 }
 
 # ----------------------------------------------------------------------------
+# Pre-flight checks -- run once at the very start of Main, before any stage
+# ----------------------------------------------------------------------------
+
+# The full install (Python, playwright/chromium, node_modules, ollama model)
+# needs roughly 3-4 GB. Left unchecked, a full disk fails partway through with
+# a cryptic error from pip or npm that never names the actual cause.
+function Test-DiskSpace {
+    param([int]$MinimumGB = 4)
+    try {
+        $root = [System.IO.Path]::GetPathRoot($Agent8088Home)
+        $driveLetter = $root.TrimEnd('\', '/').TrimEnd(':')
+        if (-not $driveLetter) { return $true }
+        $drive = Get-PSDrive -Name $driveLetter -ErrorAction Stop
+        $freeGB = [math]::Round($drive.Free / 1GB, 1)
+        if ($drive.Free -lt ($MinimumGB * 1GB)) {
+            Write-Err "Only $freeGB GB free on $root - Agent8088 needs about $MinimumGB GB"
+            Write-Err "(Python, Playwright/Chromium, node_modules, and the embedding model)."
+            Write-Err "Free up space or install to a different drive with -Agent8088Home, then re-run."
+            return $false
+        }
+        return $true
+    } catch {
+        # A drive type Get-PSDrive can't report on (rare). Don't block the
+        # install over a check that itself failed to run.
+        return $true
+    }
+}
+
+# MAX_PATH is 260 unless this registry value is set (Windows 10 1607+, off by
+# default). It only actually bites during Install-Node-Bridge's npm install,
+# but that is 5+ minutes into the install - moving the check here means an
+# admin can fix it and re-run once instead of discovering it deep in a stage.
+# $script:LongPathsEnabled is read back inside Install-Node-Bridge so the
+# registry is only queried once.
+function Test-LongPathsRegistryEnabled {
+    try {
+        return ((Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name 'LongPathsEnabled' -ErrorAction Stop).LongPathsEnabled -eq 1)
+    } catch {
+        return $false
+    }
+}
+
+function Show-LongPathWarningIfNeeded {
+    $script:LongPathsEnabled = Test-LongPathsRegistryEnabled
+    if ($script:LongPathsEnabled) { return }
+    Write-Warn "Windows long paths are disabled (registry LongPathsEnabled)."
+    Write-Warn "The WhatsApp bridge's npm dependency tree can exceed the 260-char MAX_PATH limit without it."
+    Write-Warn "Fix now for the smoothest install (admin PowerShell, one-time):"
+    Write-Warn "  Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' LongPathsEnabled 1"
+    Write-Warn "Continuing without it - the WhatsApp bridge step will fall back to a flattened dependency tree."
+}
+
+# Hosts this installer downloads from, probed once up front. A short TCP
+# connect that fails names the actual unreachable host immediately, instead of
+# letting the user wait out a multi-minute download timeout with no way to
+# tell a dead network from a slow one.
+$script:InstallerRequiredHosts = @(
+    @{ Name = "astral.sh"; Required = $true },
+    @{ Name = "github.com"; Required = $true },
+    @{ Name = "nodejs.org"; Required = $false },
+    @{ Name = "registry.npmjs.org"; Required = $false }
+)
+
+function Test-TcpConnectivity {
+    param([string]$HostName, [int]$Port = 443, [int]$TimeoutMs = 5000)
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $connectTask = $client.ConnectAsync($HostName, $Port)
+        if (-not $connectTask.Wait($TimeoutMs)) { return $false }
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { } }
+    }
+}
+
+function Test-HostConnectivity {
+    # A configured proxy means WinHTTP/the proxy resolves routing; a raw TCP
+    # connect straight to the target host bypasses that and can fail even
+    # though a proxied download (Invoke-BoundedDownload honors -Proxy) would
+    # succeed. Skip the direct probe there rather than report a false failure.
+    if ($script:ResolvedProxy) { return }
+
+    $unreachable = @($script:InstallerRequiredHosts | Where-Object { -not (Test-TcpConnectivity -HostName $_.Name) })
+    if ($unreachable.Count -eq 0) { return }
+
+    foreach ($h in $unreachable) {
+        $kind = if ($h.Required) { "required" } else { "optional" }
+        Write-Warn "Cannot reach $($h.Name):443 ($kind) - check your firewall, VPN, or proxy (set HTTPS_PROXY)."
+    }
+    if (@($unreachable | Where-Object { $_.Required }).Count -gt 0) {
+        Write-Warn "The install will likely hang or fail at a download step until this is resolved."
+    }
+}
+
+# Rough throughput probe against this repo's own install.ps1 (a host we
+# already trust and are about to talk to for uv). Bounded to 8s so a probe
+# that itself stalls doesn't add a real delay to the install it's trying to
+# speed up.
+function Test-SlowConnection {
+    param([int]$ThresholdBytesPerSec = 125000)  # ~1 Mbps
+    if ($script:ResolvedProxy) { return $false }  # throughput through a proxy isn't representative of the direct probe path
+    $tmp = $null
+    try {
+        $tmp = [System.IO.Path]::GetTempFileName()
+        $probeUrl = "https://raw.githubusercontent.com/$RepoSlug/$Branch/install.ps1"
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $dl = Invoke-BoundedDownload -Uri $probeUrl -OutFile $tmp -TimeoutSec 8 -Proxy $script:ResolvedProxy
+        $sw.Stop()
+        if (-not $dl.Success) { return $false }
+        $size = (Get-Item -LiteralPath $tmp -ErrorAction SilentlyContinue).Length
+        if (-not $size -or $sw.Elapsed.TotalSeconds -le 0) { return $false }
+        return (($size / $sw.Elapsed.TotalSeconds) -lt $ThresholdBytesPerSec)
+    } catch {
+        return $false
+    } finally {
+        if ($tmp) { Remove-Item -Force $tmp -ErrorAction SilentlyContinue }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Resume/checkpoint markers -- let a rerun after a failure skip heavy optional
+# stages (gateway/search extras, Chromium) that already completed instead of
+# redownloading them, so recovery is a quick rerun rather than starting over.
+# ----------------------------------------------------------------------------
+function Get-StageMarkerPath {
+    param([Parameter(Mandatory = $true)][string]$Stage)
+    Join-Path $Agent8088Home ".install-stages\$Stage.done"
+}
+
+function Test-StageComplete {
+    param([Parameter(Mandatory = $true)][string]$Stage)
+    Test-Path -LiteralPath (Get-StageMarkerPath $Stage)
+}
+
+function Set-StageComplete {
+    param([Parameter(Mandatory = $true)][string]$Stage)
+    $marker = Get-StageMarkerPath $Stage
+    New-Item -ItemType Directory -Path (Split-Path $marker -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $marker -Value (Get-Date).ToString("o") -ErrorAction SilentlyContinue
+}
+
+# ----------------------------------------------------------------------------
 # Stage 1: Install uv (managed, into $Agent8088Home\bin)
 # ----------------------------------------------------------------------------
 function Wait-ForPendingUninstall {
@@ -811,6 +1050,54 @@ function Wait-ForPendingUninstall {
     return $true
 }
 
+# Fallback for when astral.sh is unreachable or the bootstrap times out. Uses
+# uv's own GitHub release via the /releases/latest/download/ redirect, which
+# resolves the current version without hardcoding it or hitting the
+# rate-limited api.github.com endpoint.
+function Install-UvFromGitHubRelease {
+    Write-Info "astral.sh install failed or timed out - trying uv's GitHub release as a fallback..."
+    $tmpFile = $null
+    $tmpExtract = $null
+    try {
+        $arch = Get-WindowsArch
+        $assetName = switch ($arch) {
+            "arm64" { "uv-aarch64-pc-windows-msvc.zip" }
+            "x86"   { "uv-i686-pc-windows-msvc.zip" }
+            default { "uv-x86_64-pc-windows-msvc.zip" }
+        }
+        $downloadUrl = "https://github.com/astral-sh/uv/releases/latest/download/$assetName"
+        $tmpFile = "$env:TEMP\$assetName"
+        $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
+            -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+        if (-not $dl.Success) {
+            $why = if ($dl.TimedOut) { "timed out" } else { $dl.Error }
+            Write-Warn "GitHub release fallback for uv also failed: $why"
+            return $false
+        }
+        $binDir = Join-Path $Agent8088Home "bin"
+        New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+        $tmpExtract = "$env:TEMP\uv-extract-$(Get-Random)"
+        Expand-Archive -Path $tmpFile -DestinationPath $tmpExtract -Force
+        # The zip's internal layout (flat root vs. a uv-<target>/ subfolder)
+        # has varied across releases; search rather than assume one shape.
+        $uvExeFound = Get-ChildItem -Path $tmpExtract -Recurse -Filter "uv.exe" | Select-Object -First 1
+        if (-not $uvExeFound) {
+            Write-Warn "GitHub release archive did not contain uv.exe"
+            return $false
+        }
+        Copy-Item $uvExeFound.FullName (Join-Path $binDir "uv.exe") -Force
+        $uvxFound = Get-ChildItem -Path $tmpExtract -Recurse -Filter "uvx.exe" | Select-Object -First 1
+        if ($uvxFound) { Copy-Item $uvxFound.FullName (Join-Path $binDir "uvx.exe") -Force }
+        return (Test-Path (Join-Path $binDir "uv.exe"))
+    } catch {
+        Write-Warn "GitHub release fallback for uv failed: $_"
+        return $false
+    } finally {
+        if ($tmpFile) { Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue }
+        if ($tmpExtract) { Remove-Item -Recurse -Force $tmpExtract -ErrorAction SilentlyContinue }
+    }
+}
+
 function Install-Uv {
     $managedUv = Join-Path $Agent8088Home "bin\uv.exe"
 
@@ -833,12 +1120,10 @@ function Install-Uv {
             -Arguments @("-ExecutionPolicy", "ByPass", "-c",
                          "irm https://astral.sh/uv/install.ps1 | iex") `
             -TimeoutSec $TUvBoot
-        if ($bootResult.TimedOut) {
-            Write-Err "The uv installer timed out after $([int]($TUvBoot / 60))m"
-            Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
-            return $false
-        }
         $ErrorActionPreference = $prevEAP
+        if ($bootResult.TimedOut) {
+            Write-Warn "The uv installer timed out after $([int]($TUvBoot / 60))m"
+        }
 
         if (Test-Path $managedUv) {
             $script:UvCmd = $managedUv
@@ -846,6 +1131,16 @@ function Install-Uv {
             Write-Success "Managed uv installed ($version)"
             return $true
         }
+
+        # astral.sh was unreachable, or the bootstrap failed/timed out - try
+        # uv's GitHub release directly before giving up.
+        if (Install-UvFromGitHubRelease) {
+            $script:UvCmd = $managedUv
+            $version = & $managedUv --version
+            Write-Success "Managed uv installed via GitHub release fallback ($version)"
+            return $true
+        }
+
         Write-Err "uv installed but not found at $managedUv"
         Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
         return $false
@@ -989,7 +1284,7 @@ function Install-Git {
         $gitDir = "$Agent8088Home\git"
 
         Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
-        $dl = Invoke-BoundedDownload -Uri $downloadUrl -OutFile $tmpFile `
+        $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
                 -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
         if (-not $dl.Success) {
             $why = if ($dl.TimedOut) { "timed out after $([int]($TDownload / 60))m" } else { $dl.Error }
@@ -1020,7 +1315,10 @@ function Install-Git {
         Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
 
         $gitExe = "$gitDir\cmd\git.exe"
-        if (-not (Test-Path $gitExe)) { throw "Git extraction did not produce git.exe at $gitExe" }
+        if (-not (Test-Path $gitExe)) {
+            Write-AntivirusGuidance -What "PortableGit" -ExpectedPath $gitExe -QuarantineHint $gitDir
+            throw "Git extraction did not produce git.exe at $gitExe"
+        }
 
         # Add to session PATH
         $env:Path = "$gitDir\cmd;$env:Path"
@@ -1062,7 +1360,21 @@ function Remove-IncompleteInstallDirectory {
     }
 
     Write-Err "Could not remove the incomplete installation at $InstallDir."
-    Write-Err "Close every Agent8088 session, then run the installer again."
+    # Get-Process only sees processes whose own executable lives under
+    # $InstallDir - it won't catch a process elsewhere holding a handle open
+    # via a DLL or working directory - but that covers the common case
+    # (a running agent8088.exe) without needing a handle.exe dependency.
+    $blockers = @()
+    try {
+        $blockers = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$InstallDir*" })
+    } catch { }
+    if ($blockers.Count -gt 0) {
+        Write-Err "These process(es) have files open inside $InstallDir :"
+        foreach ($p in $blockers) { Write-Err "  $($p.ProcessName) (PID $($p.Id)) - $($p.Path)" }
+        Write-Err "Close them, then run the installer again."
+    } else {
+        Write-Err "Close every Agent8088 session, then run the installer again."
+    }
     if ($lastError) { Write-Err "Locked-file error: $lastError" }
     return $false
 }
@@ -1140,7 +1452,7 @@ function Clone-Repo {
             try {
                 $zipUrl = "https://github.com/$RepoSlug/archive/refs/heads/$Branch.zip"
                 $tmpZip = "$env:TEMP\agent8088-$Branch.zip"
-                $dl = Invoke-BoundedDownload -Uri $zipUrl -OutFile $tmpZip `
+                $dl = Invoke-BoundedDownloadWithRetry -Uri $zipUrl -OutFile $tmpZip `
                         -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
                 if (-not $dl.Success) {
                     $why = if ($dl.TimedOut) { "timed out after $([int]($TDownload / 60))m" } else { $dl.Error }
@@ -1271,60 +1583,83 @@ function Install-Gateway-Extras {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
-        $gwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
-            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]") `
-            -TimeoutSec $TPip
-        if ($gwResult.ExitCode -eq 0) {
+        # Each sub-step below is marked complete on success and skipped on a
+        # later rerun. Without this, a rerun triggered by e.g. a failed
+        # WhatsApp bridge step redid every pip install and the ~280 MB
+        # Chromium download from scratch, turning any single failure into a
+        # full redo instead of a 30-second resume.
+        if (Test-StageComplete "gateway-extras") {
             $script:GatewayExtrasInstalled = $true
-            Write-Success "Gateway adapters installed"
+            Write-Success "Gateway adapters already installed (skipping)"
         } else {
-            Write-StageWarning -Result $gwResult -TimeoutSec $TPip `
-                -What "Gateway adapter extras" `
-                -Consequence "Slack/Discord/Telegram adapters unavailable" `
-                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[gateway]`""
+            Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
+            $gwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+                -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]") `
+                -TimeoutSec $TPip
+            if ($gwResult.ExitCode -eq 0) {
+                $script:GatewayExtrasInstalled = $true
+                Set-StageComplete "gateway-extras"
+                Write-Success "Gateway adapters installed"
+            } else {
+                Write-StageWarning -Result $gwResult -TimeoutSec $TPip `
+                    -What "Gateway adapter extras" `
+                    -Consequence "Slack/Discord/Telegram adapters unavailable" `
+                    -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[gateway]`""
+            }
         }
 
         # Keyless web search backend ([search] extra - see pyproject.toml).
-        Write-Info "Installing keyless web search backend (ddgs)..."
-        $searchResult = Invoke-WithTimeout -FilePath $script:UvCmd `
-            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[search]") `
-            -TimeoutSec $TPip
-        if ($searchResult.ExitCode -eq 0) {
+        if (Test-StageComplete "search-extras") {
             $script:SearchExtrasInstalled = $true
-            Write-Success "Keyless web search backend installed"
+            Write-Success "Keyless web search backend already installed (skipping)"
         } else {
-            Write-StageWarning -Result $searchResult -TimeoutSec $TPip `
-                -What "Keyless web search backend (ddgs)" `
-                -Consequence "configure SearXNG or an API-key backend for web_search" `
-                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[search]`""
+            Write-Info "Installing keyless web search backend (ddgs)..."
+            $searchResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+                -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[search]") `
+                -TimeoutSec $TPip
+            if ($searchResult.ExitCode -eq 0) {
+                $script:SearchExtrasInstalled = $true
+                Set-StageComplete "search-extras"
+                Write-Success "Keyless web search backend installed"
+            } else {
+                Write-StageWarning -Result $searchResult -TimeoutSec $TPip `
+                    -What "Keyless web search backend (ddgs)" `
+                    -Consequence "configure SearXNG or an API-key backend for web_search" `
+                    -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[search]`""
+            }
         }
 
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
-        Write-Info "Installing Playwright (optional, for browse_page)..."
-        $pwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
-            -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]") `
-            -TimeoutSec $TPip
-        if ($pwResult.ExitCode -eq 0) {
-            Write-Info "Installing Playwright Chromium browser (~280 MB)..."
-            $chromiumResult = Invoke-WithTimeout -FilePath $py `
-                -Arguments @("-m", "playwright", "install", "chromium") `
-                -TimeoutSec $TChromium
-            if ($chromiumResult.ExitCode -eq 0) {
-                $script:ChromiumInstalled = $true
-                Write-Success "Chromium installed for browse_page"
-            } else {
-                Write-StageWarning -Result $chromiumResult -TimeoutSec $TChromium `
-                    -What "Chromium browser" `
-                    -Consequence "browse_page will show install instructions" `
-                    -Fix "`"$py`" -m playwright install chromium"
-            }
+        if (Test-StageComplete "chromium") {
+            $script:ChromiumInstalled = $true
+            Write-Success "Chromium already installed (skipping)"
         } else {
-            Write-StageWarning -Result $pwResult -TimeoutSec $TPip `
-                -What "Playwright" `
-                -Consequence "browse_page will show install instructions" `
-                -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[browser]`""
+            Write-Info "Installing Playwright (optional, for browse_page)..."
+            $pwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+                -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]") `
+                -TimeoutSec $TPip
+            if ($pwResult.ExitCode -eq 0) {
+                Write-Info "Installing Playwright Chromium browser (~280 MB)..."
+                $chromiumResult = Invoke-WithTimeout -FilePath $py `
+                    -Arguments @("-m", "playwright", "install", "chromium") `
+                    -TimeoutSec $TChromium
+                if ($chromiumResult.ExitCode -eq 0) {
+                    $script:ChromiumInstalled = $true
+                    Set-StageComplete "chromium"
+                    Write-Success "Chromium installed for browse_page"
+                } else {
+                    Write-StageWarning -Result $chromiumResult -TimeoutSec $TChromium `
+                        -What "Chromium browser" `
+                        -Consequence "browse_page will show install instructions" `
+                        -Fix "`"$py`" -m playwright install chromium"
+                }
+            } else {
+                Write-StageWarning -Result $pwResult -TimeoutSec $TPip `
+                    -What "Playwright" `
+                    -Consequence "browse_page will show install instructions" `
+                    -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[browser]`""
+            }
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -1379,8 +1714,18 @@ function Install-Node-Bridge {
     }
 
     if (-not $nodeExe) {
-        Write-Info "Installing portable Node $NodeVersion into $Agent8088Home\node ..."
         $arch = Get-WindowsArch
+        if ($arch -eq "x86") {
+            # Node.js has published no 32-bit Windows builds since Node 10
+            # (EOL 2021); mapping x86 to the x64 zip here used to silently
+            # download a binary that can't run on the machine at all.
+            Write-Warn "32-bit Windows detected - Node.js no longer publishes 32-bit Windows builds."
+            Write-Info "The WhatsApp bridge is unavailable on 32-bit Windows."
+            Register-SkippedStage -Label "WhatsApp bridge (Node.js)" `
+                -Reason "32-bit Windows has no compatible Node.js build"
+            return
+        }
+        Write-Info "Installing portable Node $NodeVersion into $Agent8088Home\node ..."
         $nodeArch = if ($arch -eq "arm64") { "arm64" } else { "x64" }
         $assetName = "node-v$NodeVersion-win-$nodeArch.zip"
         $downloadUrl = "https://nodejs.org/dist/v$NodeVersion/$assetName"
@@ -1388,7 +1733,7 @@ function Install-Node-Bridge {
         $nodeDir = "$Agent8088Home\node"
 
         try {
-            $dl = Invoke-BoundedDownload -Uri $downloadUrl -OutFile $tmpFile `
+            $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
                     -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
             if (-not $dl.Success) {
                 # Node is optional (WhatsApp bridge only), so warn rather than throw.
@@ -1416,7 +1761,10 @@ function Install-Node-Bridge {
 
             $nodeExe = Join-Path $nodeDir "node.exe"
             $npmExe = Join-Path $nodeDir "npm.cmd"
-            if (-not (Test-Path $nodeExe)) { throw "node.exe not found after extraction at $nodeExe" }
+            if (-not (Test-Path $nodeExe)) {
+                Write-AntivirusGuidance -What "Node.js" -ExpectedPath $nodeExe -QuarantineHint $nodeDir
+                throw "node.exe not found after extraction at $nodeExe"
+            }
 
             $env:Path = "$nodeDir;$env:Path"
             $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -1455,15 +1803,12 @@ function Install-Node-Bridge {
     # install fails partway with ENAMETOOLONG or EPERM and the error names a
     # package rather than the cause. A flat tree is cheaper and far likelier to
     # succeed than asking for a registry change that needs admin and a reboot.
-    $longPathsEnabled = 0
-    try {
-        $longPathsEnabled = (Get-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
-            -Name 'LongPathsEnabled' -ErrorAction Stop).LongPathsEnabled
-    } catch { $longPathsEnabled = 0 }
+    # Read once, up front in Show-LongPathWarningIfNeeded (Main), rather than
+    # re-querying the registry here.
+    $longPathsEnabled = if ($null -ne $script:LongPathsEnabled) { $script:LongPathsEnabled } else { Test-LongPathsRegistryEnabled }
 
     $npmExtraArgs = @()
-    if ($longPathsEnabled -ne 1) {
+    if (-not $longPathsEnabled) {
         Write-Info "Long paths are disabled; installing the bridge with a flat node_modules tree."
         $npmExtraArgs += "--install-strategy=hoisted"
         if ($bridgeDir.Length -gt 150) {
@@ -1837,6 +2182,14 @@ function Start-InitialAgent {
 # Main
 # ----------------------------------------------------------------------------
 Write-Banner
+if (-not (Test-DiskSpace)) { exit 1 }
+Show-LongPathWarningIfNeeded
+Test-HostConnectivity
+if (-not $env:AGENT8088_TIMEOUT_SCALE -and (Test-SlowConnection)) {
+    Write-Warn "Slow connection detected - doubling all download timeouts."
+    $TOllamaPull *= 2; $TNpm *= 2; $TChromium *= 2; $TDownload *= 2; $TPip *= 2
+    $TCoreInstall *= 2; $TVenv *= 2; $TUvBoot *= 2; $TExtract *= 2; $TSandboxSetup *= 2
+}
 if (-not (Wait-ForPendingUninstall)) { exit 1 }
 $terminalAction = Ensure-SupportedTerminal
 if ($terminalAction -eq "relaunched") { exit 0 }
