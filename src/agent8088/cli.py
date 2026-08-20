@@ -2570,7 +2570,7 @@ def cmd_doctor(rest):
 
 
 def cmd_dump(_rest):
-    """Write a redacted, shareable diagnostic bundle to APP_DIR/dump.txt."""
+    """Write a redacted, shareable diagnostic bundle to the user data dir's dump.txt."""
     import platform
     from agent8088 import __version__
 
@@ -2580,7 +2580,7 @@ def cmd_dump(_rest):
 
     lines = [
         f"Agent8088 diagnostic dump — {__version__}",
-        f"Generated: this file was written by `agent8088 dump`; review before sharing.",
+        "Generated: this file was written by `agent8088 dump`; review before sharing.",
         "",
         "## System",
         f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
@@ -2610,8 +2610,8 @@ def cmd_dump(_rest):
     for secret in A.collect_secret_values(A.APP_CONFIG):
         text = text.replace(secret, "[REDACTED]")
 
-    out_path = A.APP_DIR / "dump.txt"
-    out_path.write_text(text, encoding="utf-8")
+    out_path = A._agent_data_dir() / "dump.txt"
+    A._write_private_text(out_path, text)
     console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
     console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
 
