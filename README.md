@@ -81,8 +81,8 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
 | Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
 
-Run `agent8088 doctor` after installing to verify your setup, or `agent8088 dump` to
-produce a bundle for a bug report.
+After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
+`/dump` to produce a bundle for a bug report.
 
 The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed — run `uv pip install -e ".[dev]"` if you need the test suite.
 
@@ -108,7 +108,8 @@ The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`
 | `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |
 | `/plan <task>` | Research, propose a plan, and wait for your approval before mutations. |
 | `/capabilities` | Show the live tool, MCP, sandbox, skill, sub-agent, and guardrail configuration. |
-| `/doctor` | Check local setup and report likely problems. |
+| `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
+| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report. |
 
 ---
 
