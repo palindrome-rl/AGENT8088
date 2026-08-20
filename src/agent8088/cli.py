@@ -2518,7 +2518,8 @@ def _reinstall_package(package: str) -> tuple[bool, str]:
     return False, (pip_result.stderr or pip_result.stdout or "unknown pip error")[-300:]
 
 
-def cmd_doctor(_):
+def cmd_doctor(rest):
+    fix = rest.strip().lower() == "--fix"
     active = _active_provider_name()
     provider = A.PROVIDERS.get(active, {})
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
@@ -2545,6 +2546,26 @@ def cmd_doctor(_):
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
     console.print(t)
+
+    if fix:
+        console.print("[dim]Checking for auto-repairable issues...[/dim]")
+        if A.web_search._ddgs_installed():
+            console.print("[dim]No auto-repairable issues found.[/dim]")
+        else:
+            ok, detail = _reinstall_package("ddgs")
+            if ok and A.web_search._ddgs_installed():
+                console.print(f"[green]Fixed:[/green] web search — {detail}")
+            elif ok:
+                console.print(
+                    f"[yellow]Reinstalled ddgs but it still fails to import[/yellow] "
+                    f"({detail}) — this usually means a missing system library; "
+                    f"see: pip install ddgs -v"
+                )
+            else:
+                console.print(f"[red]Could not fix web search:[/red] {detail}")
+                console.print(
+                    f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
+                )
 
 
 def cmd_sandbox(rest):
