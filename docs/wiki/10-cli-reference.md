@@ -113,7 +113,8 @@ Run with no flags for the interactive REPL.
 | `/limits tool <name> <seconds>` | Per-tool timeout |
 | `/config` | Active config + file path |
 | `/capabilities` | What the agent can do and which guardrails are in force |
-| `/doctor` | Environment health check |
+| `/doctor [--fix]` | Environment health check; `--fix` repairs a broken web-search install |
+| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report |
 | `/trace [on\|off]` | Toggle JSON trace capture |
 | `/verbose` | Toggle verbose output |
 
