@@ -292,3 +292,140 @@ def test_64_bit_windows_still_resolves_x64_asset_name():
     bridge = _powershell_function("Install-Node-Bridge")
     assert '$nodeArch = if ($arch -eq "arm64") { "arm64" } else { "x64" }' in bridge
     assert bridge.index('if ($arch -eq "x86")') < bridge.index('$nodeArch = if ($arch -eq "arm64")')
+
+
+# --------------------------------------------------------------------------
+# Install-Native-Sandbox: $SandboxInstalled must actually get set (pre-dated
+# this PR - it was declared, read by Verify-Install, but never assigned, so
+# a successful install still told the user native sandbox wasn't set up).
+# --------------------------------------------------------------------------
+def test_sandbox_success_sets_the_installed_flag():
+    out = _run(
+        '$InstallDir = "C:\\agent8088\\agent8088"\n'
+        '$TSandboxSetup = 5\n'
+        'function Test-Path { [CmdletBinding()] param([string]$LiteralPath) $true }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec, [switch]$CaptureOutput) @{ ExitCode = 0 } }\n'
+        'Install-Native-Sandbox\n'
+        'Write-Output "SandboxInstalled=$script:SandboxInstalled"',
+        "Install-Native-Sandbox",
+    )
+    assert "SandboxInstalled=True" in out
+
+
+def test_sandbox_failure_leaves_the_installed_flag_false():
+    out = _run(
+        '$InstallDir = "C:\\agent8088\\agent8088"\n'
+        '$TSandboxSetup = 5\n'
+        'function Test-Path { [CmdletBinding()] param([string]$LiteralPath) $true }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec, [switch]$CaptureOutput) @{ ExitCode = 1 } }\n'
+        'function Write-StageWarning { param($Result, $TimeoutSec, $What, $Consequence, $Fix) }\n'
+        'Install-Native-Sandbox\n'
+        'Write-Output "SandboxInstalled=$script:SandboxInstalled"',
+        "Install-Native-Sandbox",
+    )
+    assert "SandboxInstalled=" in out and "SandboxInstalled=True" not in out
+
+
+# --------------------------------------------------------------------------
+# A corrupted/unlaunchable managed binary must not crash the whole script -
+# it should be treated the same as "not installed" and reinstalled.
+# --------------------------------------------------------------------------
+def test_uv_fast_path_falls_through_on_launch_exception(tmp_path):
+    # First Test-Path call lies that a corrupted uv.exe already exists (so the
+    # real `& $managedUv --version` below hits a genuinely nonexistent file and
+    # throws a real launch exception); later calls report it's still missing,
+    # so the function proceeds to its normal (stubbed) reinstall/fallback path
+    # instead of crashing the whole script.
+    out = _run(
+        f'$Agent8088Home = "{tmp_path}"\n'
+        '$TUvBoot = 1\n'
+        '$Global:__calls = 0\n'
+        'function Test-Path { [CmdletBinding()] param([string]$Path) $Global:__calls++; return ($Global:__calls -eq 1) }\n'
+        'function Get-PowerShellHostExe { "pwsh" }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec) @{ TimedOut = $false; ExitCode = 1 } }\n'
+        'function Install-UvFromGitHubRelease { $false }\n'
+        'try { $r = Install-Uv } catch { Write-Output "THREW:$_"; $r = "threw" }\n'
+        'Write-Output "Result=$r"',
+        "Install-Uv",
+    )
+    assert "THREW:" not in out
+    assert "WARN:Existing uv at" in out and "did not run - reinstalling" in out
+    assert "Result=False" in out
+
+
+def test_managed_node_fast_path_falls_through_on_launch_exception(tmp_path):
+    out = _run(
+        f'$Agent8088Home = "{tmp_path}"\n'
+        f'$InstallDir = "{tmp_path / "agent8088"}"\n'
+        '$TDownload = 1\n'
+        '$Global:__calls = 0\n'
+        'function Get-Command { [CmdletBinding()] param([string]$Name, $CommandType) $null }\n'
+        'function Get-WindowsArch { "x64" }\n'
+        # First Test-Path call (the managed-node check) lies that a corrupted
+        # node.exe exists; every other Test-Path call reports "missing" so the
+        # download step below is what actually runs next.
+        'function Test-Path { [CmdletBinding()] param([string]$LiteralPath, [string]$Path) $Global:__calls++; return ($Global:__calls -eq 1) }\n'
+        'function Invoke-BoundedDownloadWithRetry { @{ Success = $false; TimedOut = $false; Error = "network down" } }\n'
+        'function Write-StageWarning { param($Result, $TimeoutSec, $What, $Consequence, $Fix) Write-Output "STAGEWARN:$What" }\n'
+        'try { Install-Node-Bridge; Write-Output "Completed" } catch { Write-Output "THREW:$_" }',
+        "Install-Node-Bridge",
+    )
+    assert "THREW:" not in out
+    assert "WARN:Existing Node at" in out and "did not run - reinstalling" in out
+    assert "Completed" in out
+
+
+# --------------------------------------------------------------------------
+# Failures that must now show up in the final Write-SkippedSummary instead
+# of scrolling off-screen as a single Write-Warn line.
+# --------------------------------------------------------------------------
+def test_missing_venv_registers_a_skipped_stage_for_all_three_extras():
+    out = _run(
+        '$InstallDir = "C:\\agent8088\\agent8088"\n'
+        'function Test-Path { [CmdletBinding()] param([string]$Path) $false }\n'
+        'function Register-SkippedStage { param([string]$Label, [string]$Reason, [string]$Fix) Write-Output "SKIPPED:${Label}" }\n'
+        'Install-Gateway-Extras',
+        "Install-Gateway-Extras",
+    )
+    assert "SKIPPED:Gateway/search extras + Chromium" in out
+
+
+def test_portable_node_install_failure_registers_a_skipped_stage():
+    out = _run(
+        '$Agent8088Home = "C:\\agent8088"\n'
+        '$InstallDir = "C:\\agent8088\\agent8088"\n'
+        'function Get-Command { [CmdletBinding()] param([string]$Name) $null }\n'
+        'function Get-WindowsArch { "x64" }\n'
+        'function Test-Path { [CmdletBinding()] param([string]$LiteralPath, [string]$Path) $false }\n'
+        'function Invoke-BoundedDownloadWithRetry { throw "network down" }\n'
+        'function Register-SkippedStage { param([string]$Label, [string]$Reason, [string]$Fix) Write-Output "SKIPPED:${Label}:${Reason}" }\n'
+        'Install-Node-Bridge',
+        "Install-Node-Bridge",
+    )
+    assert "SKIPPED:WhatsApp bridge (Node.js):portable Node install failed" in out
+
+
+def test_missing_config_template_registers_a_skipped_stage(tmp_path):
+    out = _run(
+        f'$Agent8088Home = "{tmp_path}"\n'
+        f'$InstallDir = "{tmp_path / "agent8088"}"\n'
+        'function Test-Path { [CmdletBinding()] param([string]$Path) $false }\n'
+        'function Register-SkippedStage { param([string]$Label, [string]$Reason, [string]$Fix) Write-Output "SKIPPED:${Label}:${Reason}" }\n'
+        'Drop-Config',
+        "Drop-Config",
+    )
+    assert "SKIPPED:Default config:no config.txt template found" in out
+
+
+# --------------------------------------------------------------------------
+# Set-StageComplete: a failed marker write must not fail silently, since a
+# rerun would otherwise look like "resume" is broken with no explanation.
+# --------------------------------------------------------------------------
+def test_stage_marker_write_failure_warns_instead_of_failing_silently():
+    out = _run(
+        '$Agent8088Home = "Z:\\nonexistent\\definitely\\not\\writable"\n'
+        'function New-Item { param($ItemType, $Path, [switch]$Force, $ErrorAction) throw "Access is denied" }\n'
+        'Set-StageComplete -Stage "chromium"',
+        "Get-StageMarkerPath", "Set-StageComplete",
+    )
+    assert "WARN:Could not save resume marker for 'chromium'" in out
