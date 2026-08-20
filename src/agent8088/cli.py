@@ -17,6 +17,8 @@ feature is reachable here:
 Run:  python agent8088_cli.py
 """
 import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
+import subprocess
+import shutil
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -1937,7 +1939,8 @@ def cmd_help(_):
         ("/mcp remove <name> [--project]", "Remove an MCP server from the selected scope"),
         ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
-        ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
+        ("/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install"),
+        ("/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report"),
         ("/new <name>", "Create a named persistent session"),
         ("/sessions", "List named sessions"),
         ("/resume <name>", "Load a named session"),
@@ -2489,7 +2492,40 @@ def _endpoint_probe(endpoint):
         return f"unreachable ({exc})"
 
 
-def cmd_doctor(_):
+def _reinstall_package(package: str) -> tuple[bool, str]:
+    """Force-reinstall `package` into the interpreter currently running this
+    process. Tries pip first -- it works whether the venv is stdlib-created or a
+    `uv venv --seed` one. A uv venv built without --seed has no pip module at all
+    (install.sh never assumes one either), so a "No module named pip" failure
+    falls back to `uv pip install --python <this interpreter>`, the same command
+    install.sh itself uses to populate the venv in the first place."""
+    pip_result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--force-reinstall", package],
+        capture_output=True, text=True, timeout=180,
+    )
+    if pip_result.returncode == 0:
+        return True, f"reinstalled {package} via pip"
+
+    uv = shutil.which("uv")
+    if uv and "No module named pip" in (pip_result.stderr or ""):
+        uv_result = subprocess.run(
+            [uv, "pip", "install", "--python", sys.executable,
+             "--force-reinstall", package],
+            capture_output=True, text=True, timeout=180,
+        )
+        if uv_result.returncode == 0:
+            return True, f"reinstalled {package} via uv"
+        return False, (uv_result.stderr or uv_result.stdout or "unknown uv error")[-300:]
+
+    return False, (pip_result.stderr or pip_result.stdout or "unknown pip error")[-300:]
+
+
+def cmd_doctor(rest):
+    arg = rest.strip()
+    fix = arg.lower() == "--fix"
+    if arg and not fix:
+        console.print(f"[red]unknown option:[/red] {arg}  (try /doctor or /doctor --fix)")
+        return
     active = _active_provider_name()
     provider = A.PROVIDERS.get(active, {})
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
@@ -2515,7 +2551,75 @@ def cmd_doctor(_):
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
+    t.add_row("Web search", "ok" if A.web_search._ddgs_installed() else "[red]ddgs broken - run /doctor --fix[/red]")
     console.print(t)
+
+    if fix:
+        console.print("[dim]Checking for auto-repairable issues...[/dim]")
+        if A.web_search._ddgs_installed():
+            console.print("[dim]No auto-repairable issues found.[/dim]")
+        else:
+            ok, detail = _reinstall_package("ddgs")
+            if ok and A.web_search._ddgs_installed():
+                console.print(f"[green]Fixed:[/green] web search — {detail}")
+            elif ok:
+                console.print(
+                    f"[yellow]Reinstalled ddgs but it still fails to import[/yellow] "
+                    f"({detail}) — this usually means a missing system library; "
+                    f"see: pip install ddgs -v"
+                )
+            else:
+                console.print(f"[red]Could not fix web search:[/red] {detail}")
+                console.print(
+                    f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
+                )
+
+
+def cmd_dump(_rest):
+    """Write a redacted, shareable diagnostic bundle to the user data dir's dump.txt."""
+    import platform
+    from agent8088 import __version__
+
+    active = _active_provider_name()
+    provider = A.PROVIDERS.get(active, {})
+    sandbox = A.sandbox_status()
+
+    lines = [
+        f"Agent8088 diagnostic dump — {__version__}",
+        "Generated: this file was written by `agent8088 dump`; review before sharing.",
+        "",
+        "## System",
+        f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
+        f"Python: {sys.version.split()[0]} at {sys.executable}",
+        f"Shell: {os.environ.get('SHELL', 'unknown')}",
+        "",
+        "## Provider",
+        f"Active: {active}",
+        f"Model: {A.MODEL_NAME}",
+        f"Endpoint reachable: {_endpoint_probe(provider.get('base_url') or A.MODEL_BASE_URL)}",
+        "",
+        "## Sandbox",
+        f"Requested: {sandbox['requested']}",
+        f"Resolved: {sandbox['resolved']} ({sandbox['verification']})",
+        f"Detail: {sandbox['detail']}",
+        "",
+        "## Configuration",
+        f"Config path: {A.CONFIG_PATH} (exists={A.CONFIG_PATH.exists()})",
+        f"Tools: {len(_active_tool_specs())}  Skills: {len(_active_skills())}",
+    ]
+
+    text = "\n".join(lines) + "\n"
+    # Defense in depth: this function never touches api keys/tokens by construction
+    # (nothing above reads them), but scrub anyway using the same secret list every
+    # other tool-output path redacts through, in case a future edit adds a field
+    # that does.
+    for secret in A.collect_secret_values(A.APP_CONFIG):
+        text = text.replace(secret, "[REDACTED]")
+
+    out_path = A._agent_data_dir() / "dump.txt"
+    A._write_private_text(out_path, text)
+    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
+    console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
 
 
 def cmd_sandbox(rest):
@@ -3579,7 +3683,7 @@ COMMANDS = {
     "audit": cmd_audit,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
-    "status": cmd_status, "doctor": cmd_doctor, "sandbox": cmd_sandbox, "mode": cmd_mode,
+    "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,

@@ -3,7 +3,7 @@
 # Agent8088 Installer — Linux, macOS, WSL2, Termux
 # ============================================================================
 # Usage:
-#   curl -fsSL https://<YOUR-URL>/install.sh | bash
+#   curl -fsSL --proto '=https' --tlsv1.2 https://<YOUR-URL>/install.sh | bash
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, git install, repo clone, venv,
@@ -106,6 +106,38 @@ export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-60}"
 # silently degrades to one giant argument ("option --connect-timeout 20 ...: is
 # unknown") anywhere it is reused outside bash. The array is also SC2086-clean.
 CURL_STALL_FLAGS=(--connect-timeout 20 --speed-limit 1024 --speed-time 30)
+
+# Download one URL to one path, trying curl first and falling back to wget. Some
+# minimal base images (notably a few Alpine variants used in CI containers) ship
+# wget but not curl, or vice versa -- Aider's installer documents the same
+# curl-then-wget fallback for exactly this reason. Returns the underlying tool's
+# exit code; the caller already treats a non-zero/timeout result as "this optional
+# stage didn't work" rather than a hard failure.
+_download_file() {
+    local _dl_url="$1" _dl_out="$2" _dl_timeout="$3"
+    if command -v curl >/dev/null 2>&1; then
+        # --proto '=https' --tlsv1.2: refuse anything but https + TLS1.2+, so a
+        # compromised/misconfigured DNS or redirect can't quietly downgrade this
+        # to a plaintext or legacy-TLS transfer. This matters here specifically
+        # because the one call site extracts and then EXECUTES the downloaded
+        # archive (a Node.js runtime, then npm installs from it) with no
+        # checksum verification of its own.
+        run_with_timeout "$_dl_timeout" curl -fsSL --proto '=https' --tlsv1.2 \
+            "${CURL_STALL_FLAGS[@]}" "$_dl_url" -o "$_dl_out" 2>/dev/null
+        return $?
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        # wget's nearest equivalents: --timeout bounds a stalled read (curl's
+        # --speed-time), --tries=1 avoids wget's own silent retry loop stacking on
+        # top of run_with_timeout's wall clock. --https-only is wget's closest
+        # match to curl's --proto/--tlsv1.2 pin above: it refuses a plain-http
+        # URL or a redirect down to one.
+        run_with_timeout "$_dl_timeout" wget -q --https-only --timeout=30 --tries=1 -O "$_dl_out" "$_dl_url" 2>/dev/null
+        return $?
+    fi
+    log_warn "Neither curl nor wget is available - cannot download $_dl_url"
+    return 1
+}
 
 # ----------------------------------------------------------------------------
 # Proxy
@@ -458,8 +490,11 @@ install_uv() {
     # on empty stdin).
     local _uv_installer
     _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/agent8088-uv.$$.sh")"
-    if ! curl -LsSf "${CURL_STALL_FLAGS[@]}" --max-time 120 \
-            https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
+    # Routed through _download_file (curl-or-wget, same TLS/proto pin as the
+    # Node tarball download below) rather than bare curl: a curl-less-but-
+    # wget-having host would otherwise die right here, on this mandatory
+    # bootstrap step, before ever reaching the fallback Part B protects.
+    if ! _download_file "https://astral.sh/uv/install.sh" "$_uv_installer" 120; then
         log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
         log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
         rm -f "$_uv_installer"
@@ -844,11 +879,28 @@ install_deps() {
         fi
         if [ "$CHROMIUM_INSTALLED" = true ] && [ "$OS" = "linux" ]; then
             log_info "Installing Playwright Chromium system dependencies..."
-            local _playwright_sudo=""
-            [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _playwright_sudo="sudo"
-            run_with_timeout "$T_PIP" $_playwright_sudo "$_py" -m playwright install-deps chromium \
-                >/dev/null 2>&1 || \
-                log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
+            if [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
+                run_with_timeout "$T_PIP" "$_py" -m playwright install-deps chromium \
+                    >/dev/null 2>&1 || \
+                    log_warn "Playwright system dependencies were not installed - run: playwright install-deps chromium"
+            elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+                # Passwordless: either a NOPASSWD sudoers rule, or a sudo
+                # timestamp already cached earlier in this same session. `-n`
+                # on the real command too, so a timestamp that expires between
+                # this check and the call fails closed instead of prompting.
+                run_with_timeout "$T_PIP" sudo -n "$_py" -m playwright install-deps chromium \
+                    >/dev/null 2>&1 || \
+                    log_warn "Playwright system dependencies were not installed - run: sudo playwright install-deps chromium"
+            else
+                # sudo would need a real password here, and it prompts via
+                # /dev/tty directly -- bypassing this stage's >/dev/null
+                # redirect entirely. From the terminal, that reads as the
+                # installer having silently frozen for however long T_PIP
+                # allows, with no visible prompt to explain why. Skip it up
+                # front instead, with an immediate, specific instruction.
+                log_warn "Playwright system dependencies need a sudo password - skipping (not run non-interactively)"
+                log_info "  Run manually if browse_page needs it: sudo $_py -m playwright install-deps chromium"
+            fi
         fi
         [ "$CHROMIUM_INSTALLED" = true ] && log_success "Chromium installed for browse_page"
     fi
@@ -960,7 +1012,7 @@ install_node_bridge() {
             esac
             local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
             local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
-            if run_with_timeout "$T_NODE_DL" curl -fsSL "${CURL_STALL_FLAGS[@]}" "$_url" -o "$_tmp" 2>/dev/null; then
+            if _download_file "$_url" "$_tmp" "$T_NODE_DL"; then
                 mkdir -p "$AGENT8088_HOME/node"
                 # Guarded: Node is optional (WhatsApp bridge only), so a bad
                 # tarball or missing decompressor must warn, not abort the run.
@@ -1324,7 +1376,7 @@ verify_install() {
         echo "  Sandbox:  Docker fallback is automatic when available"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
+    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
