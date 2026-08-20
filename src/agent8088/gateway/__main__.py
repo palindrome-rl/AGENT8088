@@ -3,10 +3,8 @@ import logging
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    from agent8088.logging_setup import configure_logging
+    configure_logging()
     # `python -m agent8088.gateway` bypasses cli.main(), where
     # web_search_provider=auto normally resolves. Resolve here too so an
     # unattended gateway does not spend the whole session on an unresolved pin

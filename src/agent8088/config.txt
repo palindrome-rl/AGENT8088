@@ -217,7 +217,7 @@ memory=1
 # --- web search ---
 # One web_search tool, four interchangeable backends, in priority order:
 #   searxng  default   self-hosted, no key   (`/search setup` provisions it)
-#   ddgs     fallback  keyless, bundled — always available, needs no setup
+#   ddgs     fallback  keyless, bundled — rotates several engines, no setup
 #   tavily   optional  needs TAVILY_API_KEY — takes first priority once set
 #   exa      optional  needs EXA_API_KEY — takes priority, behind tavily
 # Adding an API key is the signal to prefer that backend, so a configured
@@ -289,7 +289,19 @@ web_search_no_prompt=1
 #   EXA_API_KEY      semantic/neural search                  (https://exa.ai)
 #
 # The keyless ddgs fallback needs nothing: it ships with agent8088 and is used
-# automatically whenever SearXNG is unset, unreachable, or failing.
+# automatically whenever SearXNG is unset, unreachable, or failing. It queries
+# several engines in rotation (DuckDuckGo, Brave, Mojeek, Startpage, Yahoo, then
+# Wikipedia), retries once with backoff if an engine throttles it, leaves ~2s
+# between consecutive searches, and reuses an identical query for 5 minutes — so a
+# 202 from one engine no longer ends the search. `/search doctor` shows which
+# engines your egress policy currently permits.
+#
+# Optional outbound proxy for ddgs ONLY (http/https/socks5). DuckDuckGo and some
+# other engines block requests from a number of cloud IP ranges, which otherwise
+# leaves a VPS install with no keyless search at all. The proxy is treated as any
+# other egress destination: it is checked against ssrf_allow_hosts and the egress
+# policy, and a proxy the policy forbids is dropped rather than honoured.
+# search_proxy=socks5h://127.0.0.1:9150
 
 # --- gateway allowlist scoping ---
 # User ids are scoped to the platform whose *_allowed_users line they appear

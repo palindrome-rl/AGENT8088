@@ -49,7 +49,7 @@ PAGES = [
     ("12-testing-and-verification.md", "Testing-and-Verification"),
     ("13-troubleshooting.md", "Troubleshooting"),
     ("14-contributing.md", "Contributing"),
-    ("15-FAQ.md", "FAQ"),
+    ("15-faq.md", "FAQ"),
     ("16-memory.md", "Memory"),
     ("17-docker.md", "Docker"),
 ]

@@ -16,7 +16,7 @@ No admin rights are needed for the base install.
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palindrome-rl/AGENT8088/main/install.sh | bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/main/install.sh | bash
 ```
 
 **Windows (PowerShell)**
