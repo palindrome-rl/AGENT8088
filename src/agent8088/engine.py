@@ -6856,7 +6856,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             _raise_if_interrupted(interrupt_check)
             if on_tool:
                 on_tool(name)
-            with spin(f"running {name}..."):
+            # on_calls already announced "Searching the web..." once; this spinner
+            # is the next beat, not a repeat of it.
+            spin_msg = "Fetching results…" if name == "web_search" else f"running {name}..."
+            with spin(spin_msg):
                 result = exec_tool(name, json.dumps(args), depth=depth)
             if (PERMISSION_MODE == "plan-only"
                     and result.startswith("Error: plan mode")):
