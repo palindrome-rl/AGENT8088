@@ -983,7 +983,7 @@ install_node_bridge() {
             esac
             local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
             local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
-            if run_with_timeout "$T_NODE_DL" curl -fsSL "${CURL_STALL_FLAGS[@]}" "$_url" -o "$_tmp" 2>/dev/null; then
+            if _download_file "$_url" "$_tmp" "$T_NODE_DL"; then
                 mkdir -p "$AGENT8088_HOME/node"
                 # Guarded: Node is optional (WhatsApp bridge only), so a bad
                 # tarball or missing decompressor must warn, not abort the run.
