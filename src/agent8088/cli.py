@@ -1938,7 +1938,7 @@ def cmd_help(_):
         ("/mcp remove <name> [--project]", "Remove an MCP server from the selected scope"),
         ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
-        ("/doctor", "Check model endpoint reachability, auth/config, tools, and skills"),
+        ("/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install"),
         ("/new <name>", "Create a named persistent session"),
         ("/sessions", "List named sessions"),
         ("/resume <name>", "Load a named session"),
