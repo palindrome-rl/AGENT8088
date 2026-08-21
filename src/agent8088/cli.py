@@ -4208,6 +4208,74 @@ def _remove_windows_user_environment(*owned_path_entries):
     return removed_path if environment_ok else None
 
 
+class _UninstallActivity:
+    """Small stdlib-only spinner safe to use while deleting this package.
+
+    Rich powers Agent8088's normal UI, but the Windows uninstaller removes the
+    very site-packages tree Rich lives in.  Keeping this indicator to already
+    imported stdlib modules means its background repaint cannot import a file
+    that disappeared halfway through cleanup.
+    """
+
+    _frames = ("|", "/", "-", "\\")
+
+    def __init__(self, message, *, stream=None, enabled=None, interval=0.12):
+        self.message = str(message).rstrip(".")
+        self.stream = stream or sys.stdout
+        if enabled is None:
+            enabled = (
+                os.environ.get("AGENT8088_NO_PROGRESS") != "1"
+                and not os.environ.get("CI")
+                and bool(getattr(self.stream, "isatty", lambda: False)())
+            )
+        self.enabled = bool(enabled)
+        self.interval = max(float(interval), 0.01)
+        self._stop = threading.Event()
+        self._thread = None
+        self._started = 0.0
+        self._last_length = 0
+
+    def _render(self, index):
+        elapsed = int(max(0.0, time.monotonic() - self._started))
+        line = f"[{self._frames[index % len(self._frames)]}] {self.message}... ({elapsed}s)"
+        padding = " " * max(0, self._last_length - len(line))
+        self.stream.write("\r" + line + padding)
+        self.stream.flush()
+        self._last_length = len(line)
+
+    def _run(self):
+        index = 1
+        while not self._stop.wait(self.interval):
+            try:
+                self._render(index)
+            except (OSError, ValueError):
+                return
+            index += 1
+
+    def __enter__(self):
+        if not self.enabled:
+            print(f"{self.message}...", file=self.stream, flush=True)
+            return self
+        self._started = time.monotonic()
+        self._render(0)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        if not self.enabled:
+            return False
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=max(0.5, self.interval * 3))
+        try:
+            self.stream.write("\r" + (" " * max(self._last_length, 1)) + "\r")
+            self.stream.flush()
+        except (OSError, ValueError):
+            pass
+        return False
+
+
 def _purge_install_tree(target):
     """Delete everything under `target` that this process can still remove.
 
@@ -4565,7 +4633,8 @@ def _run_windows_uninstall(home):
         _say("Stopping them; Windows cannot delete a running program.")
         _stop_windows_processes(blockers)
 
-    leftovers = _purge_install_tree(home)
+    with _UninstallActivity("Deleting Agent8088 files"):
+        leftovers = _purge_install_tree(home)
     if not leftovers:
         _say(f"Removed {home}")
         # Nothing is deferred, so nothing may look pending: a marker left by an

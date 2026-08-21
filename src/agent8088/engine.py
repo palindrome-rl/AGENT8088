@@ -3373,15 +3373,30 @@ _DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no range
 
 
 def _native_sandbox_shell_argv(command: str) -> list:
-    """Wrap a shell command string for cmd.exe.
+    """Return argv for a shell command without nesting cmd.exe quotes.
 
-    The Windows ACL runner execs argv directly and has no shell semantics of
-    its own (no &&, no VAR=value env-prefix syntax) - cmd.exe does the
-    interpreting instead of the runner.
+    The Windows ACL runner accepts a real argv and quotes each element using
+    CRT rules before CreateProcessAsUserW.  cmd.exe does *not* use CRT rules
+    for the command string following ``/c``: embedded quotes are escaped as
+    ``\"`` and become literal characters.  A quoted executable below a user
+    path containing spaces therefore becomes a command literally named
+    ``\"C:\\Users\\First Last\\...\\python.exe\"``.
+
+    Pass a structured Python argv through the runner instead.  The confined
+    Python child decodes the opaque command and asks ``subprocess`` for the
+    platform shell from *inside the restricted token*.  This preserves cmd.exe
+    operators and output while keeping all quote boundaries out of the ACL
+    runner's command line.
     """
-    system_root = os.environ.get("SystemRoot", r"C:\Windows")
-    cmd_exe = str(Path(system_root) / "System32" / "cmd.exe")
-    return [cmd_exe, "/d", "/s", "/c", command]
+    import base64
+
+    bridge = (
+        "import base64, subprocess, sys\n"
+        "command = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+        "raise SystemExit(subprocess.run(command, shell=True).returncode)\n"
+    )
+    payload = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    return [sys.executable, "-c", bridge, payload]
 
 
 def _dsh_runner_path() -> Path:
@@ -3697,12 +3712,12 @@ def _native_sandbox_ready(cwd: Path, readonly: bool = False,
     except OSError as exc:
         _mark_native_sandbox_broken(f"Native sandbox probe could not prepare: {exc}", quiet)
         return False
-    probe = _process_display([sys.executable, "-c", "pass"])
     if sys.platform == "win32":
         mode = "read-only" if readonly else "workspace-write"
         probe_argv = runtime + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
-                                "--mode", mode, "--"] + _native_sandbox_shell_argv(probe)
+                                "--mode", mode, "--", sys.executable, "-c", "pass"]
     else:
+        probe = _process_display([sys.executable, "-c", "pass"])
         command = (f"cd {shlex.quote(str(cwd))} && "
                    f"TMPDIR={shlex.quote(str(sandbox_tmp))} {probe}")
         probe_argv = runtime + ["--settings", str(settings), "-c", command]
@@ -3933,9 +3948,10 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
         runtime = _native_sandbox_argv()
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
         if sys.platform == "win32":
-            wrapped = _native_sandbox_shell_argv(command)
             native_argv = runtime + ["--workspace", str(PROJECT_ROOT), "--temp",
-                                     str(sandbox_tmp), "--mode", "read-only", "--"] + wrapped
+                                     str(sandbox_tmp), "--mode", "read-only", "--"] + [
+                                         str(part) for part in argv
+                                     ]
         else:
             settings = _write_sandbox_settings(readonly=True)
             native_command = (f"cd {shlex.quote(str(PROJECT_ROOT))} && "
