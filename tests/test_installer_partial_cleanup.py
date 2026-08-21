@@ -140,14 +140,15 @@ def test_windows_launcher_wait_is_bounded_and_ends_on_a_deleted_home():
     """The launcher must not sit there silently while a stuck helper spins."""
     source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     launcher = _powershell_function("Write-Agent8088Launcher")
-    assert "echo Finishing Agent8088 cleanup..." in launcher
+    assert "Finishing Agent8088 cleanup" in launcher
+    assert "@('|', '/', '-', '\\')" in launcher
+    assert "[Console]::IsOutputRedirected" in launcher
+    assert "Elapsed.TotalSeconds" in launcher
     # An install that is already gone ends the wait, whatever the marker says.
-    assert launcher.index('if not exist "%_agent8088_home%" goto agent8088_uninstall_finished') < (
-        launcher.index("if %_agent8088_attempts% GEQ")
-    )
-    cap = int(re.search(r"if %_agent8088_attempts% GEQ (\d+)", launcher).group(1))
+    assert launcher.index("Test-Path -LiteralPath $HomePath") < launcher.index("Elapsed.TotalSeconds")
+    cap = int(re.search(r"Elapsed\.TotalSeconds -lt (\d+)", launcher).group(1))
     assert cap <= 60, "a longer wait than the cleanup helper can even take reads as a hang"
-    assert source.count("_agent8088_attempts") >= 3
+    assert "[OK] Agent8088 was completely uninstalled." in launcher
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows cmd launcher behavior")
@@ -224,11 +225,13 @@ Write-Output (Write-Agent8088Launcher -AgentExe '{str(fake_agent).replace("'", "
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows cmd launcher behavior")
 def test_windows_launcher_waits_for_complete_uninstall_and_removes_itself(tmp_path):
-    agent_root = tmp_path / "agent8088"
-    launcher_dir = tmp_path / "agent8088-launcher"
+    spaced_parent = tmp_path / "User With Spaces"
+    spaced_parent.mkdir()
+    agent_root = spaced_parent / "agent8088"
+    launcher_dir = spaced_parent / "agent8088-launcher"
     agent_root.mkdir()
-    marker = tmp_path / "agent8088.uninstall-pending"
-    marker.write_text(str(tmp_path / "cleanup.log"), encoding="utf-8")
+    marker = spaced_parent / "agent8088.uninstall-pending"
+    marker.write_text(str(spaced_parent / "cleanup.log"), encoding="utf-8")
     fake_agent = Path(os.environ["SystemRoot"]) / "System32" / "attrib.exe"
 
     output = _run_powershell(
@@ -245,7 +248,10 @@ Write-Output (Write-Agent8088Launcher -AgentExe '{str(fake_agent).replace("'", "
     launcher = launcher_dir / "agent8088.cmd"
 
     def finish_cleanup():
-        time.sleep(1.2)
+        # Leave enough room for a cold Windows PowerShell 5.1 startup before the
+        # waiter begins repainting; otherwise a heavily loaded CI host can delete
+        # the directory before the first frame is emitted.
+        time.sleep(3.0)
         shutil.rmtree(agent_root)
         marker.unlink()
 
@@ -256,6 +262,7 @@ Write-Output (Write-Agent8088Launcher -AgentExe '{str(fake_agent).replace("'", "
         [os.environ["COMSPEC"], "/d", "/c", str(launcher), "--uninstall"],
         capture_output=True,
         text=True,
+        env={**os.environ, "AGENT8088_FORCE_PROGRESS": "1"},
         timeout=15,
     )
     elapsed = time.monotonic() - started
@@ -263,6 +270,8 @@ Write-Output (Write-Agent8088Launcher -AgentExe '{str(fake_agent).replace("'", "
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert elapsed >= 1
+    assert "[|] Finishing Agent8088 cleanup" in result.stdout
+    assert any(frame in result.stdout for frame in ("[/]", "[-]", "[\\]"))
     assert "[OK] Agent8088 was completely uninstalled." in result.stdout
     assert not agent_root.exists()
     assert not launcher_dir.exists()

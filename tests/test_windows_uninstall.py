@@ -1,4 +1,5 @@
 import base64
+import io
 import os
 import shutil
 import stat
@@ -15,6 +16,42 @@ from agent8088 import cli
 
 def _encoded_script(args):
     return base64.b64decode(args[args.index("-EncodedCommand") + 1]).decode("utf-16-le")
+
+
+def test_uninstall_activity_animates_and_clears_the_line():
+    stream = io.StringIO()
+    activity = cli._UninstallActivity(
+        "Deleting Agent8088 files", stream=stream, enabled=True, interval=0.01,
+    )
+
+    with activity:
+        time.sleep(0.06)
+
+    output = stream.getvalue()
+    assert "[|] Deleting Agent8088 files" in output
+    assert any(frame in output for frame in ("[/]", "[-]", "[\\]"))
+    assert output.endswith("\r")
+
+
+def test_uninstall_activity_is_a_plain_message_when_not_interactive():
+    stream = io.StringIO()
+
+    with cli._UninstallActivity("Deleting Agent8088 files", stream=stream, enabled=False):
+        pass
+
+    assert stream.getvalue() == "Deleting Agent8088 files...\n"
+
+
+def test_uninstall_activity_clears_itself_when_deletion_raises():
+    stream = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        with cli._UninstallActivity(
+            "Deleting Agent8088 files", stream=stream, enabled=True, interval=0.01,
+        ):
+            raise RuntimeError("delete failed")
+
+    assert stream.getvalue().endswith("\r")
 
 
 def test_windows_uninstall_deletes_what_it_can_and_defers_the_rest(tmp_path, monkeypatch):
