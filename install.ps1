@@ -261,6 +261,68 @@ $TExtract     = 300 * $TimeoutScale   # PortableGit self-extractor
 # nothing here should be allowed to hang forever.
 $TSandboxSetup = 180 * $TimeoutScale
 
+# One-line activity display for quiet installation stages. The external tools
+# still own their real progress output where they have one (notably git clone);
+# this is only for commands whose output is intentionally captured. ASCII
+# frames survive Windows PowerShell 5.1's legacy code pages, unlike the Unicode
+# spinners used by the interactive Agent8088 UI.
+function Test-InteractiveProgress {
+    if ($env:AGENT8088_NO_PROGRESS -eq "1" -or $env:CI) { return $false }
+    if ($env:AGENT8088_FORCE_PROGRESS -eq "1") { return $true }
+    try {
+        return (-not [Console]::IsOutputRedirected -and $null -ne $Host.UI -and $null -ne $Host.UI.RawUI)
+    } catch {
+        return $false
+    }
+}
+
+function Start-InstallerActivity {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    $clock = New-Object System.Diagnostics.Stopwatch
+    $clock.Start()
+    $state = @{
+        Enabled    = [bool](Test-InteractiveProgress)
+        Message    = $Message
+        Frame      = 0
+        LastLength = 0
+        Clock      = $clock
+    }
+    if ($state.Enabled) { Update-InstallerActivity -State $state }
+    return $state
+}
+
+function Update-InstallerActivity {
+    param([Parameter(Mandatory = $true)][hashtable]$State)
+    if (-not $State.Enabled) { return }
+    $frames = @('|', '/', '-', '\')
+    $frame = $frames[$State.Frame % $frames.Count]
+    $State.Frame++
+    $elapsed = [int][Math]::Floor($State.Clock.Elapsed.TotalSeconds)
+    $line = "[$frame] $($State.Message) ($($elapsed)s)"
+    $padding = ""
+    if ($State.LastLength -gt $line.Length) {
+        $padding = " " * ($State.LastLength - $line.Length)
+    }
+    try {
+        Write-Host ("`r" + $line + $padding) -NoNewline -ForegroundColor Cyan
+        $State.LastLength = $line.Length
+    } catch {
+        # Losing the terminal must never turn a successful install into a failure.
+        $State.Enabled = $false
+    }
+}
+
+function Stop-InstallerActivity {
+    param([hashtable]$State)
+    if ($null -eq $State) { return }
+    try { $State.Clock.Stop() } catch { }
+    if (-not $State.Enabled) { return }
+    try {
+        $width = [Math]::Max([int]$State.LastLength, 1)
+        Write-Host ("`r" + (" " * $width) + "`r") -NoNewline
+    } catch { }
+}
+
 # Run an external command under a wall-clock limit.
 #
 # PowerShell has no `timeout`, so this uses System.Diagnostics.Process plus
@@ -285,6 +347,7 @@ function Invoke-WithTimeout {
         [Parameter(Mandatory = $true)][int]$TimeoutSec,
         [string]$WorkingDirectory,
         [switch]$CaptureOutput,
+        [string]$Activity,
         # How long to wait for an exited child's pipes to reach EOF. Not a limit on
         # the work - the child is already gone by then - only on the flush, so it
         # is deliberately short and deliberately not one of the stage budgets.
@@ -293,6 +356,7 @@ function Invoke-WithTimeout {
 
     $result = @{ ExitCode = -1; TimedOut = $false; Output = "" }
     $proc = $null
+    $activityState = $null
 
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -330,7 +394,19 @@ function Invoke-WithTimeout {
         $outTask = $proc.StandardOutput.ReadToEndAsync()
         $errTask = $proc.StandardError.ReadToEndAsync()
 
-        if ($proc.WaitForExit($TimeoutSec * 1000)) {
+        if ($Activity) { $activityState = Start-InstallerActivity -Message $Activity }
+        $waitClock = New-Object System.Diagnostics.Stopwatch
+        $waitClock.Start()
+        $exited = $proc.HasExited
+        while (-not $exited -and $waitClock.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $remainingMs = [int](($TimeoutSec - $waitClock.Elapsed.TotalSeconds) * 1000)
+            $sliceMs = [Math]::Min(125, [Math]::Max(1, $remainingMs))
+            $exited = $proc.WaitForExit($sliceMs)
+            if ($activityState) { Update-InstallerActivity -State $activityState }
+        }
+        $waitClock.Stop()
+
+        if ($exited) {
             # Second wait, bounded: lets the async readers finish flushing before
             # the exit code is read (documented .NET requirement). It has to be
             # bounded, because both this wait and the read below finish on pipe
@@ -362,6 +438,7 @@ function Invoke-WithTimeout {
         $result.ExitCode = -1
         $result.Error = $_.Exception.Message
     } finally {
+        if ($activityState) { Stop-InstallerActivity -State $activityState }
         if ($proc) { try { $proc.Dispose() } catch { } }
     }
 
@@ -390,11 +467,13 @@ function Invoke-BoundedDownload {
         [Parameter(Mandatory = $true)][string]$Uri,
         [Parameter(Mandatory = $true)][string]$OutFile,
         [Parameter(Mandatory = $true)][int]$TimeoutSec,
-        [System.Net.IWebProxy]$Proxy
+        [System.Net.IWebProxy]$Proxy,
+        [string]$Activity
     )
 
     $result = @{ Success = $false; TimedOut = $false; Error = "" }
     $client = $null
+    $activityState = $null
     try {
         $client = New-Object System.Net.WebClient
         # GitHub release assets 403 an absent User-Agent.
@@ -402,9 +481,19 @@ function Invoke-BoundedDownload {
         if ($Proxy) { $client.Proxy = $Proxy }
 
         $task = $client.DownloadFileTaskAsync($Uri, $OutFile)
-        if ($task.Wait($TimeoutSec * 1000)) {
+        if ($Activity) { $activityState = Start-InstallerActivity -Message $Activity }
+        $waitClock = New-Object System.Diagnostics.Stopwatch
+        $waitClock.Start()
+        while (-not $task.IsCompleted -and $waitClock.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            Start-Sleep -Milliseconds 125
+            if ($activityState) { Update-InstallerActivity -State $activityState }
+        }
+        $waitClock.Stop()
+        if ($task.IsCompleted) {
             if ($task.IsFaulted) {
                 $result.Error = $task.Exception.GetBaseException().Message
+            } elseif ($task.IsCanceled) {
+                $result.Error = "download was cancelled"
             } else {
                 $result.Success = $true
             }
@@ -415,6 +504,7 @@ function Invoke-BoundedDownload {
     } catch {
         $result.Error = $_.Exception.Message
     } finally {
+        if ($activityState) { Stop-InstallerActivity -State $activityState }
         if ($client) { try { $client.Dispose() } catch { } }
     }
 
@@ -437,12 +527,14 @@ function Invoke-BoundedDownloadWithRetry {
         [Parameter(Mandatory = $true)][string]$OutFile,
         [Parameter(Mandatory = $true)][int]$TimeoutSec,
         [System.Net.IWebProxy]$Proxy,
+        [string]$Activity,
         [int]$MaxAttempts = 3,
         [int]$BackoffSec = 2
     )
     $result = $null
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        $result = Invoke-BoundedDownload -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -Proxy $Proxy
+        $result = Invoke-BoundedDownload -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec `
+            -Proxy $Proxy -Activity $Activity
         if ($result.Success) { return $result }
         if ($attempt -lt $MaxAttempts) {
             $why = if ($result.TimedOut) { "timed out" } elseif ($result.Error) { $result.Error } else { "failed" }
@@ -638,7 +730,8 @@ function Install-WindowsTerminalFromGitHubRelease {
         $downloadUrl = "https://github.com/microsoft/terminal/releases/download/$tag/$assetName"
         $tmpFile = "$env:TEMP\$assetName"
         $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
-            -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+            -TimeoutSec $TDownload -Proxy $script:ResolvedProxy `
+            -Activity "Downloading Windows Terminal $ver"
         if (-not $dl.Success) {
             $why = if ($dl.TimedOut) { "timed out" } else { $dl.Error }
             Write-Warn "Downloading Windows Terminal $ver failed: $why"
@@ -1044,8 +1137,17 @@ function Wait-ForPendingUninstall {
 
     Write-Info "Waiting for a previous Agent8088 uninstall to finish..."
     $deadline = (Get-Date).AddSeconds($PendingUninstallWaitSeconds)
-    while ((Test-Path -LiteralPath $pendingMarker) -and (Test-Path -LiteralPath $Agent8088Home) -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 250
+    $activityState = $null
+    if (Get-Command Start-InstallerActivity -ErrorAction SilentlyContinue) {
+        $activityState = Start-InstallerActivity -Message "Waiting for previous Agent8088 cleanup"
+    }
+    try {
+        while ((Test-Path -LiteralPath $pendingMarker) -and (Test-Path -LiteralPath $Agent8088Home) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 125
+            if ($activityState) { Update-InstallerActivity -State $activityState }
+        }
+    } finally {
+        if ($activityState) { Stop-InstallerActivity -State $activityState }
     }
     if (-not (Test-Path -LiteralPath $pendingMarker)) { return $true }
     if (-not (Test-Path -LiteralPath $Agent8088Home)) {
@@ -1083,7 +1185,7 @@ function Install-UvFromGitHubRelease {
         $downloadUrl = "https://github.com/astral-sh/uv/releases/latest/download/$assetName"
         $tmpFile = "$env:TEMP\$assetName"
         $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
-            -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+            -TimeoutSec $TDownload -Proxy $script:ResolvedProxy -Activity "Downloading uv"
         if (-not $dl.Success) {
             $why = if ($dl.TimedOut) { "timed out" } else { $dl.Error }
             Write-Warn "GitHub release fallback for uv also failed: $why"
@@ -1147,7 +1249,7 @@ function Install-Uv {
         $bootResult = Invoke-WithTimeout -FilePath $psHostExe `
             -Arguments @("-ExecutionPolicy", "ByPass", "-c",
                          "irm https://astral.sh/uv/install.ps1 | iex") `
-            -TimeoutSec $TUvBoot
+            -TimeoutSec $TUvBoot -Activity "Installing uv"
         $ErrorActionPreference = $prevEAP
         if ($bootResult.TimedOut) {
             Write-Warn "The uv installer timed out after $([int]($TUvBoot / 60))m"
@@ -1216,7 +1318,8 @@ function Test-Python {
     try {
         $ErrorActionPreference = "Continue"
         $pyResult = Invoke-WithTimeout -FilePath $script:UvCmd `
-            -Arguments @("python", "install", $PythonVersion) -TimeoutSec $TVenv
+            -Arguments @("python", "install", $PythonVersion) -TimeoutSec $TVenv `
+            -Activity "Installing Python $PythonVersion"
         if ($pyResult.TimedOut) {
             Write-Err "Downloading Python $PythonVersion timed out after $([int]($TVenv / 60))m"
             Write-Warn 'On a slow connection, rerun with: $env:AGENT8088_TIMEOUT_SCALE = 3'
@@ -1313,7 +1416,8 @@ function Install-Git {
 
         Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
         $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
-                -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+                -TimeoutSec $TDownload -Proxy $script:ResolvedProxy `
+                -Activity "Downloading PortableGit"
         if (-not $dl.Success) {
             $why = if ($dl.TimedOut) { "timed out after $([int]($TDownload / 60))m" } else { $dl.Error }
             throw "Downloading $assetName failed: $why"
@@ -1332,7 +1436,8 @@ function Install-Git {
             # each argument itself, so "-o$gitDir" must NOT be pre-quoted -- doing
             # so double-quotes it on Windows PowerShell 5.1.
             $extract = Invoke-WithTimeout -FilePath $tmpFile `
-                -Arguments @("-o$gitDir", "-y") -TimeoutSec $TExtract
+                -Arguments @("-o$gitDir", "-y") -TimeoutSec $TExtract `
+                -Activity "Extracting PortableGit"
             if ($extract.TimedOut) {
                 throw "PortableGit extraction timed out after $([int]($TExtract / 60))m"
             }
@@ -1377,14 +1482,25 @@ function Remove-IncompleteInstallDirectory {
     if (-not (Test-Path -LiteralPath $InstallDir)) { return $true }
 
     $lastError = $null
-    for ($attempt = 1; $attempt -le 10; $attempt++) {
-        try {
-            Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
-            if (-not (Test-Path -LiteralPath $InstallDir)) { return $true }
-        } catch {
-            $lastError = $_
+    $activityState = $null
+    if (Get-Command Start-InstallerActivity -ErrorAction SilentlyContinue) {
+        $activityState = Start-InstallerActivity -Message "Removing incomplete Agent8088 installation"
+    }
+    try {
+        for ($attempt = 1; $attempt -le 10; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
+                if (-not (Test-Path -LiteralPath $InstallDir)) { return $true }
+            } catch {
+                $lastError = $_
+            }
+            if ($attempt -lt 10) {
+                Start-Sleep -Seconds 1
+                if ($activityState) { Update-InstallerActivity -State $activityState }
+            }
         }
-        if ($attempt -lt 10) { Start-Sleep -Seconds 1 }
+    } finally {
+        if ($activityState) { Stop-InstallerActivity -State $activityState }
     }
 
     Write-Err "Could not remove the incomplete installation at $InstallDir."
@@ -1481,7 +1597,8 @@ function Clone-Repo {
                 $zipUrl = "https://github.com/$RepoSlug/archive/refs/heads/$Branch.zip"
                 $tmpZip = "$env:TEMP\agent8088-$Branch.zip"
                 $dl = Invoke-BoundedDownloadWithRetry -Uri $zipUrl -OutFile $tmpZip `
-                        -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+                        -TimeoutSec $TDownload -Proxy $script:ResolvedProxy `
+                        -Activity "Downloading Agent8088 repository archive"
                 if (-not $dl.Success) {
                     $why = if ($dl.TimedOut) { "timed out after $([int]($TDownload / 60))m" } else { $dl.Error }
                     throw "ZIP fallback download failed: $why"
@@ -1543,7 +1660,7 @@ function Install-Deps {
         # silently did not happen. install.sh hit the same call and died.
         $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
             -Arguments @("venv", "--python", $script:PythonExecutable, "--allow-existing", $venvDir) `
-            -TimeoutSec $TVenv
+            -TimeoutSec $TVenv -Activity "Creating Agent8088 virtual environment"
         if ($venvResult.TimedOut -or $venvResult.ExitCode -ne 0 -or -not (Test-Path $py)) {
             # A venv from a Python that has since gone, or a half-written one
             # from an interrupted run, cannot be reused. Rebuild it rather than
@@ -1555,7 +1672,7 @@ function Install-Deps {
             }
             $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("venv", "--python", $script:PythonExecutable, "--clear", $venvDir) `
-                -TimeoutSec $TVenv
+                -TimeoutSec $TVenv -Activity "Rebuilding Agent8088 virtual environment"
             if ($venvResult.TimedOut) {
                 throw "venv creation timed out after $([int]($TVenv / 60))m (uv may be downloading a Python build)"
             }
@@ -1572,7 +1689,7 @@ function Install-Deps {
         $coreResult = Invoke-WithTimeout -FilePath $script:UvCmd `
             -Arguments @("pip", "install", "--python", $py,
                          "--reinstall-package", "agent8088", "-e", $InstallDir) `
-            -TimeoutSec $TCoreInstall
+            -TimeoutSec $TCoreInstall -Activity "Installing Agent8088 core dependencies"
         $ErrorActionPreference = $prevEAP
         if ($coreResult.TimedOut) {
             Write-Err "uv pip install timed out after $([int]($TCoreInstall / 60))m - a package download stalled."
@@ -1626,7 +1743,7 @@ function Install-Gateway-Extras {
             Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
             $gwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]") `
-                -TimeoutSec $TPip
+                -TimeoutSec $TPip -Activity "Installing gateway adapter dependencies"
             if ($gwResult.ExitCode -eq 0) {
                 $script:GatewayExtrasInstalled = $true
                 Set-StageComplete "gateway-extras"
@@ -1647,7 +1764,7 @@ function Install-Gateway-Extras {
             Write-Info "Installing keyless web search backend (ddgs)..."
             $searchResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[search]") `
-                -TimeoutSec $TPip
+                -TimeoutSec $TPip -Activity "Installing keyless web search backend"
             if ($searchResult.ExitCode -eq 0) {
                 $script:SearchExtrasInstalled = $true
                 Set-StageComplete "search-extras"
@@ -1669,12 +1786,12 @@ function Install-Gateway-Extras {
             Write-Info "Installing Playwright (optional, for browse_page)..."
             $pwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]") `
-                -TimeoutSec $TPip
+                -TimeoutSec $TPip -Activity "Installing Playwright"
             if ($pwResult.ExitCode -eq 0) {
                 Write-Info "Installing Playwright Chromium browser (~280 MB)..."
                 $chromiumResult = Invoke-WithTimeout -FilePath $py `
                     -Arguments @("-m", "playwright", "install", "chromium") `
-                    -TimeoutSec $TChromium
+                    -TimeoutSec $TChromium -Activity "Installing Playwright Chromium"
                 if ($chromiumResult.ExitCode -eq 0) {
                     $script:ChromiumInstalled = $true
                     Set-StageComplete "chromium"
@@ -1790,7 +1907,8 @@ function Install-Node-Bridge {
 
         try {
             $dl = Invoke-BoundedDownloadWithRetry -Uri $downloadUrl -OutFile $tmpFile `
-                    -TimeoutSec $TDownload -Proxy $script:ResolvedProxy
+                    -TimeoutSec $TDownload -Proxy $script:ResolvedProxy `
+                    -Activity "Downloading portable Node.js"
             if (-not $dl.Success) {
                 # Node is optional (WhatsApp bridge only), so warn rather than throw.
                 Write-StageWarning -Result @{ ExitCode = -1; TimedOut = $dl.TimedOut } `
@@ -1883,7 +2001,7 @@ function Install-Node-Bridge {
     try {
         $npmResult = Invoke-WithTimeout -FilePath $npmExe `
             -Arguments (@("install", "--prefix", $bridgeDir, "--no-audit", "--no-fund") + $npmExtraArgs) `
-            -TimeoutSec $TNpm
+            -TimeoutSec $TNpm -Activity "Installing WhatsApp bridge dependencies"
         if ($npmResult.ExitCode -eq 0 -and (Test-Path $nodeModules)) {
             $script:WhatsAppBridgeReady = $true
             Write-Success "WhatsApp bridge npm dependencies installed"
@@ -1943,7 +2061,8 @@ function Install-Embedding-Model {
     }
     Write-Info "Pulling embedding model $EmbedModel (274 MB, for memory recall)..."
     $pullResult = Invoke-WithTimeout -FilePath $ollama.Source `
-        -Arguments @("pull", $EmbedModel) -TimeoutSec $TOllamaPull
+        -Arguments @("pull", $EmbedModel) -TimeoutSec $TOllamaPull `
+        -Activity "Pulling embedding model $EmbedModel"
     if ($pullResult.ExitCode -eq 0) {
         Write-Success "Embedding model $EmbedModel installed"
     } else {
@@ -1991,11 +2110,16 @@ function Install-Native-Sandbox {
     }
     Write-Info "Setting up native sandbox..."
     $result = Invoke-WithTimeout -FilePath $agentExe `
-        -Arguments @("--sandbox-setup") -TimeoutSec $TSandboxSetup -CaptureOutput
+        -Arguments @("--sandbox-setup") -TimeoutSec $TSandboxSetup -CaptureOutput `
+        -Activity "Setting up native sandbox"
     if ($result.ExitCode -eq 0) {
         $script:SandboxInstalled = $true
         Write-Success "Native sandbox installed and verified"
     } else {
+        $detail = if ($result.Output) { [string]$result.Output } elseif ($result.Error) { [string]$result.Error } else { "" }
+        $detail = $detail.Trim()
+        if ($detail.Length -gt 1000) { $detail = $detail.Substring(0, 1000) + "..." }
+        if ($detail) { Write-Warn "Native sandbox details: $detail" }
         Write-StageWarning -Result $result -TimeoutSec $TSandboxSetup `
             -What "Native sandbox setup" `
             -Consequence "Docker will be used for sandboxing if available" `
@@ -2016,6 +2140,78 @@ function Write-Agent8088Launcher {
 
     New-Item -ItemType Directory -Path $LauncherDir -Force | Out-Null
     $launcher = Join-Path $LauncherDir "agent8088.cmd"
+    $homeLiteral = "'" + ([string]$Agent8088Home).Replace("'", "''") + "'"
+    $markerLiteral = "'" + ([string]"${Agent8088Home}.uninstall-pending").Replace("'", "''") + "'"
+    # The running executable has to exit before its final files can be removed,
+    # so the launcher owns the last progress line.  Encode the waiter instead of
+    # writing a temporary .ps1: machine execution policy cannot block
+    # -EncodedCommand, and there is no script file that can disappear mid-run.
+    $waitScript = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$HomePath = __AGENT8088_HOME__
+$MarkerPath = __AGENT8088_MARKER__
+$LogPath = ''
+if (Test-Path -LiteralPath $MarkerPath) {
+  $LogPath = [string](Get-Content -LiteralPath $MarkerPath -ErrorAction SilentlyContinue | Select-Object -First 1)
+  }
+$Frames = @('|', '/', '-', '\')
+$Interactive = $false
+if ($env:AGENT8088_NO_PROGRESS -ne '1' -and -not $env:CI) {
+  if ($env:AGENT8088_FORCE_PROGRESS -eq '1') {
+    $Interactive = $true
+  } else {
+    try { $Interactive = -not [Console]::IsOutputRedirected } catch { }
+  }
+  }
+$Clock = [Diagnostics.Stopwatch]::StartNew()
+$Frame = 0
+$LastLength = 0
+$Announced = $false
+while ((Test-Path -LiteralPath $HomePath) -and
+       (Test-Path -LiteralPath $MarkerPath) -and
+       $Clock.Elapsed.TotalSeconds -lt 60) {
+  if ($Interactive) {
+    $Glyph = $Frames[$Frame % $Frames.Count]
+    $Line = "[$Glyph] Finishing Agent8088 cleanup... ($([int]$Clock.Elapsed.TotalSeconds)s)"
+    $Padding = ' ' * [Math]::Max(0, $LastLength - $Line.Length)
+    Write-Host ("`r" + $Line + $Padding) -NoNewline -ForegroundColor Cyan
+    $LastLength = $Line.Length
+    $Frame++
+  } elseif (-not $Announced) {
+    Write-Output 'Finishing Agent8088 cleanup...'
+    $Announced = $true
+  }
+  Start-Sleep -Milliseconds 125
+  }
+$Clock.Stop()
+if ($Interactive -and $LastLength -gt 0) {
+  Write-Host ("`r" + (' ' * $LastLength) + "`r") -NoNewline
+  }
+if (-not (Test-Path -LiteralPath $HomePath)) {
+  if ($Interactive) {
+    Write-Host '[OK] Agent8088 was completely uninstalled.' -ForegroundColor Green
+  } else {
+    Write-Output '[OK] Agent8088 was completely uninstalled.'
+  }
+  exit 0
+  }
+if ($Interactive) {
+  Write-Host '[X] Agent8088 uninstall did not remove every file.' -ForegroundColor Red
+  } else {
+    Write-Output '[X] Agent8088 uninstall did not remove every file.'
+  }
+if ($LogPath -and (Test-Path -LiteralPath $LogPath)) {
+  Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue
+  }
+Write-Output "Delete this folder by hand to finish: $HomePath"
+exit 1
+'@
+    $waitScript = $waitScript.Replace('__AGENT8088_HOME__', $homeLiteral).Replace(
+        '__AGENT8088_MARKER__', $markerLiteral
+    )
+    $waitEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($waitScript))
+    $systemPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path -LiteralPath $systemPowerShell)) { $systemPowerShell = "powershell.exe" }
     $content = @"
 @echo off
 setlocal
@@ -2023,46 +2219,22 @@ set "AGENT8088_HOME=$Agent8088Home"
 set "AGENT8088_LINK_DIR=$LauncherDir"
 "$AgentExe" %*
 set "_agent8088_exit=%ERRORLEVEL%"
+rem A non-zero exit means the uninstaller cancelled, or stopped before it
+rem scheduled any cleanup, so there is nothing here to wait for. Without this,
+rem a marker left behind by an earlier run turns a cancelled uninstall into a
+rem full wait and then reports a failure that never happened.
 if /I "%~1"=="--uninstall" goto agent8088_wait_for_uninstall
 if /I "%~1"=="-uninstall" goto agent8088_wait_for_uninstall
 exit /b %_agent8088_exit%
 
 :agent8088_wait_for_uninstall
-rem A non-zero exit means the uninstaller cancelled, or stopped before it
-rem scheduled any cleanup, so there is nothing here to wait for. Without this,
-rem a marker left behind by an earlier run turns a cancelled uninstall into a
-rem full wait and then reports a failure that never happened.
 if not "%_agent8088_exit%"=="0" exit /b %_agent8088_exit%
-set "_agent8088_home=$Agent8088Home"
-set "_agent8088_marker=${Agent8088Home}.uninstall-pending"
-set "_agent8088_log="
-set /a _agent8088_attempts=0
-if not exist "%_agent8088_marker%" goto agent8088_uninstall_finished
-set /p "_agent8088_log="<"%_agent8088_marker%"
-echo Finishing Agent8088 cleanup...
-
-:agent8088_wait_loop
-if not exist "%_agent8088_home%" goto agent8088_uninstall_finished
-if not exist "%_agent8088_marker%" goto agent8088_uninstall_finished
-set /a _agent8088_attempts+=1
-if %_agent8088_attempts% GEQ 60 goto agent8088_uninstall_failed
->nul 2>&1 ping -n 2 127.0.0.1
-goto agent8088_wait_loop
-
-:agent8088_uninstall_finished
-if exist "%_agent8088_home%" goto agent8088_uninstall_failed
-echo.
-echo [OK] Agent8088 was completely uninstalled.
+"$systemPowerShell" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $waitEncoded
+set "_agent8088_wait_exit=%ERRORLEVEL%"
+if not "%_agent8088_wait_exit%"=="0" exit /b %_agent8088_wait_exit%
 set "_agent8088_self=%~f0"
 for %%I in ("%~dp0.") do set "_agent8088_launcher=%%~fI"
 (goto) 2>nul & del /f /q "%_agent8088_self%" >nul 2>&1 & rd "%_agent8088_launcher%" >nul 2>&1
-
-:agent8088_uninstall_failed
-echo.
-echo [X] Agent8088 uninstall did not remove every file.
-if defined _agent8088_log if exist "%_agent8088_log%" type "%_agent8088_log%"
-echo Delete this folder by hand to finish: %_agent8088_home%
-exit /b 1
 "@
     [System.IO.File]::WriteAllText($launcher, $content, [System.Text.UTF8Encoding]::new($false))
     return $true
