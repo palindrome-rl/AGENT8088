@@ -5,17 +5,23 @@ rather than requiring actual Windows hardware - the Win32 API behavior itself
 (CreateRestrictedToken, ACL grants) can only be proven on real Windows, see
 `.claude/plans/2026-08-19_154753-windows-acl-native-sandbox.md` Task 10.
 """
-import sys
+import base64
 
 from agent8088 import engine
 
 
-def test_windows_shell_command_wraps_cmd_exe(monkeypatch):
-    monkeypatch.setenv("SystemRoot", r"C:\Windows")
-    argv = engine._native_sandbox_shell_argv('cd /d C:\\ws && set "TMPDIR=C:\\tmp"& echo hi')
-    assert argv[0].lower().endswith("cmd.exe")
-    assert argv[1:4] == ["/d", "/s", "/c"]
-    assert argv[4] == 'cd /d C:\\ws && set "TMPDIR=C:\\tmp"& echo hi'
+def test_windows_shell_command_uses_argv_safe_bridge(monkeypatch):
+    spaced_python = r"C:\Users\Test User\Agent8088\venv\Scripts\python.exe"
+    command = 'cd /d C:\\ws && set "TMPDIR=C:\\tmp"& echo hi'
+    monkeypatch.setattr(engine.sys, "executable", spaced_python)
+
+    argv = engine._native_sandbox_shell_argv(command)
+
+    assert argv[0] == spaced_python
+    assert argv[1] == "-c"
+    assert "subprocess.run" in argv[2]
+    assert base64.b64decode(argv[3]).decode("utf-8") == command
+    assert not any(part.lower().endswith("cmd.exe") for part in argv)
 
 
 def test_dsh_runner_path_resolution(tmp_path, monkeypatch):
@@ -77,14 +83,19 @@ def test_exec_native_sandbox_builds_dsh_argv_on_windows(tmp_path, monkeypatch):
 
     monkeypatch.setattr(engine, "_exec_process", fake_exec_process)
 
+    spaced_python = r"C:\Users\Test User\Agent8088\venv\Scripts\python.exe"
+    monkeypatch.setattr(engine.sys, "executable", spaced_python)
+
     engine._exec_native_sandbox("echo hi", timeout=10, cwd=tmp_path)
 
     argv = captured["argv"]
     assert "--workspace" in argv
     assert "--mode" in argv
     assert argv[argv.index("--mode") + 1] == "workspace-write"
-    assert argv[-1] == "echo hi"  # the wrapped command is the final cmd.exe arg
-    assert argv[argv.index("--") + 1].lower().endswith("cmd.exe")
+    child = argv[argv.index("--") + 1:]
+    assert child[0] == spaced_python
+    assert child[1] == "-c"
+    assert base64.b64decode(child[3]).decode("utf-8") == "echo hi"
 
 
 def test_exec_native_sandbox_readonly_uses_read_only_mode_on_windows(tmp_path, monkeypatch):
@@ -103,6 +114,51 @@ def test_exec_native_sandbox_readonly_uses_read_only_mode_on_windows(tmp_path, m
 
     argv = captured["argv"]
     assert argv[argv.index("--mode") + 1] == "read-only"
+
+
+def test_native_probe_passes_spaced_python_as_raw_argv(tmp_path, monkeypatch):
+    spaced_python = r"C:\Users\Test User\Agent8088\venv\Scripts\python.exe"
+    runtime = [r"C:\Node\node.exe", r"C:\Agent Home\runtime\runner.js"]
+    captured = {}
+
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setattr(engine.sys, "executable", spaced_python)
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "Agent Home"))
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: runtime)
+    monkeypatch.setattr(engine, "_write_sandbox_settings", lambda *a, **k: tmp_path / "settings.json")
+    monkeypatch.setattr(engine, "_native_sandbox_broken", False)
+    monkeypatch.setattr(engine, "_native_sandbox_verified", None)
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+
+    assert engine._native_sandbox_ready(tmp_path)
+    argv = captured["argv"]
+    assert argv[argv.index("--") + 1:] == [spaced_python, "-c", "pass"]
+
+
+def test_structured_native_command_preserves_spaced_argv(tmp_path, monkeypatch):
+    command = [r"C:\Program Files\Git\cmd\git.exe", "status", "--short"]
+    runtime = [r"C:\Node\node.exe", r"C:\Agent Home\runtime\runner.js"]
+    captured = {}
+
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "Agent Home"))
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *a, **k: True)
+    monkeypatch.setattr(engine, "_native_sandbox_argv", lambda: runtime)
+    monkeypatch.setattr(
+        engine, "_exec_process",
+        lambda argv, timeout: captured.setdefault("argv", argv) or "ok",
+    )
+
+    engine._exec_sandbox_argv(command, timeout=10)
+
+    argv = captured["argv"]
+    assert argv[argv.index("--") + 1:] == command
 
 
 def test_missing_requirements_flags_absent_koffi_addon(tmp_path, monkeypatch):

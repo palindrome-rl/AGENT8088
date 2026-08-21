@@ -326,6 +326,20 @@ def test_sandbox_failure_leaves_the_installed_flag_false():
     assert "SandboxInstalled=" in out and "SandboxInstalled=True" not in out
 
 
+def test_sandbox_failure_prints_the_captured_reason():
+    out = _run(
+        '$InstallDir = "C:\\Agent Home\\agent8088"\n'
+        '$TSandboxSetup = 5\n'
+        'function Test-Path { [CmdletBinding()] param([string]$LiteralPath) $true }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec, [switch]$CaptureOutput) '
+        '@{ ExitCode = 1; Output = "quoted Python path was not recognized"; Error = "" } }\n'
+        'function Write-StageWarning { param($Result, $TimeoutSec, $What, $Consequence, $Fix) }\n'
+        'Install-Native-Sandbox\n',
+        "Install-Native-Sandbox",
+    )
+    assert "WARN:Native sandbox details: quoted Python path was not recognized" in out
+
+
 # --------------------------------------------------------------------------
 # A corrupted/unlaunchable managed binary must not crash the whole script -
 # it should be treated the same as "not installed" and reinstalled.

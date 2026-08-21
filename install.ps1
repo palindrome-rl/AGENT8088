@@ -1996,6 +1996,10 @@ function Install-Native-Sandbox {
         $script:SandboxInstalled = $true
         Write-Success "Native sandbox installed and verified"
     } else {
+        $detail = if ($result.Output) { [string]$result.Output } elseif ($result.Error) { [string]$result.Error } else { "" }
+        $detail = $detail.Trim()
+        if ($detail.Length -gt 1000) { $detail = $detail.Substring(0, 1000) + "..." }
+        if ($detail) { Write-Warn "Native sandbox details: $detail" }
         Write-StageWarning -Result $result -TimeoutSec $TSandboxSetup `
             -What "Native sandbox setup" `
             -Consequence "Docker will be used for sandboxing if available" `
