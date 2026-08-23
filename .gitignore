@@ -68,5 +68,9 @@ artifacts/*
 # db, model cache, sandbox state. Local runtime state, never source.
 .agent8088/
 
+# Claude Code session runtime state (scheduled-wakeup lock, etc.) — not project
+# content, and specific to whichever machine/session created it.
+.claude/*.lock
+
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/
