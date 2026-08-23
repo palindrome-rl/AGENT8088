@@ -102,7 +102,7 @@ The body becomes the sub-agent's system prompt.
 A skill package bundles instructions, and optionally extra tool definitions,
 that get merged into the agent's context.
 
-### The 11 bundled skills
+### The 12 bundled skills
 
 | Skill | Category |
 |---|---|
@@ -117,6 +117,7 @@ that get merged into the agent's context.
 | `document-to-action-items` | software-development |
 | `spike` | workflow |
 | `humanizer` | creative |
+| `simplify-code` | software-development |
 
 Loaded skills appear in the system prompt under `## Installed skills`, and in
 `/status`.
