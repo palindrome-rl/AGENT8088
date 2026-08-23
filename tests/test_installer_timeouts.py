@@ -51,6 +51,14 @@ def _run(body: str, *functions: str) -> str:
     return result.stdout
 
 
+ACTIVITY_FUNCTIONS = (
+    "Test-InteractiveProgress",
+    "Start-InstallerActivity",
+    "Update-InstallerActivity",
+    "Stop-InstallerActivity",
+)
+
+
 def _is_desktop_edition() -> bool:
     """True only on Windows PowerShell 5.1."""
     ps = shutil.which("pwsh") or shutil.which("powershell")
@@ -111,6 +119,49 @@ def test_success_is_zero_and_not_a_timeout():
                'Write-Output "ExitCode=$($r.ExitCode) TimedOut=$($r.TimedOut)"',
                "Invoke-WithTimeout")
     assert "ExitCode=0" in out and "TimedOut=False" in out
+
+
+def test_activity_animates_while_a_bounded_process_is_running():
+    if sys.platform == "win32":
+        command = '-FilePath "ping.exe" -Arguments @("-n", "3", "127.0.0.1")'
+    else:
+        command = '-FilePath "/bin/sleep" -Arguments @("1")'
+    out = _run(
+        '$env:AGENT8088_FORCE_PROGRESS = "1"\n'
+        f'$r = Invoke-WithTimeout {command} -TimeoutSec 10 -Activity "Installing test component"\n'
+        'Write-Output "ExitCode=$($r.ExitCode)"',
+        *ACTIVITY_FUNCTIONS,
+        "Invoke-WithTimeout",
+    )
+    assert "Installing test component" in out
+    assert "[|]" in out
+    assert any(frame in out for frame in ("[/]", "[-]", "[\\]"))
+    assert "ExitCode=0" in out
+
+
+def test_activity_is_silent_when_output_is_redirected():
+    out = _run(
+        f'$r = Invoke-WithTimeout {EXIT0} -TimeoutSec 10 -Activity "Hidden activity"\n'
+        'Write-Output "ExitCode=$($r.ExitCode)"',
+        *ACTIVITY_FUNCTIONS,
+        "Invoke-WithTimeout",
+    )
+    assert "Hidden activity" not in out
+    assert "ExitCode=0" in out
+
+
+def test_activity_does_not_change_timeout_semantics():
+    started = time.monotonic()
+    out = _run(
+        '$env:AGENT8088_FORCE_PROGRESS = "1"\n'
+        f'$r = Invoke-WithTimeout -FilePath "{SLEEP}" -Arguments {SLEEP_ARGS} '
+        '-TimeoutSec 2 -Activity "Waiting on a stuck process"\n'
+        'Write-Output "TimedOut=$($r.TimedOut)"',
+        *ACTIVITY_FUNCTIONS,
+        "Invoke-WithTimeout",
+    )
+    assert "TimedOut=True" in out
+    assert time.monotonic() - started < 20
 
 
 def test_an_argument_containing_spaces_round_trips():
@@ -242,6 +293,44 @@ def test_a_cut_off_download_leaves_no_partial_file(tarpit, tmp_path):
     _run(f'$d = Invoke-BoundedDownload -Uri "{tarpit}" -OutFile "{out_file}" -TimeoutSec 5\n'
          'Write-Output "done"', "Invoke-BoundedDownload")
     assert not out_file.exists()
+
+
+def test_bounded_download_animates_without_changing_timeout_result(tarpit, tmp_path):
+    out_file = tmp_path / "animated-stall.bin"
+    out = _run(
+        '$env:AGENT8088_FORCE_PROGRESS = "1"\n'
+        f'$d = Invoke-BoundedDownload -Uri "{tarpit}" -OutFile "{out_file}" '
+        '-TimeoutSec 2 -Activity "Downloading test archive"\n'
+        'Write-Output "TimedOut=$($d.TimedOut) Success=$($d.Success)"',
+        *ACTIVITY_FUNCTIONS,
+        "Invoke-BoundedDownload",
+    )
+    assert "Downloading test archive" in out
+    assert "[|]" in out
+    assert any(frame in out for frame in ("[/]", "[-]", "[\\]"))
+    assert "TimedOut=True" in out and "Success=False" in out
+    assert not out_file.exists()
+
+
+def test_long_windows_install_stages_declare_an_activity_message():
+    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    expected = (
+        "Installing uv",
+        "Installing Python $PythonVersion",
+        "Downloading PortableGit",
+        "Extracting PortableGit",
+        "Creating Agent8088 virtual environment",
+        "Installing Agent8088 core dependencies",
+        "Installing gateway adapter dependencies",
+        "Installing keyless web search backend",
+        "Installing Playwright Chromium",
+        "Downloading portable Node.js",
+        "Installing WhatsApp bridge dependencies",
+        "Pulling embedding model $EmbedModel",
+        "Setting up native sandbox",
+    )
+    for message in expected:
+        assert f'-Activity "{message}"' in source
 
 
 def test_a_real_download_still_succeeds(tmp_path):
