@@ -1,0 +1,12 @@
+# Line endings
+#
+# install.sh must stay LF even on a Windows checkout: it is executed by bash under
+# WSL and Git Bash, where a stray CR is a syntax error rather than whitespace.
+# install.sh carries a runtime CRLF diagnostic too, but this is the prevention --
+# the diagnostic only exists for checkouts made before this file.
+install.sh              text eol=lf
+docker-entrypoint.sh    text eol=lf
+*.sh                    text eol=lf
+
+# PowerShell is consumed by Windows hosts; CRLF is the native convention there.
+*.ps1                   text eol=crlf
