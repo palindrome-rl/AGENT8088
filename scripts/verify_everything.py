@@ -126,7 +126,9 @@ ok("sub-agents loaded",
 # adding one doesn't fail the run, and there is no reason skills should differ.
 ok("skills loaded",
    {"documentation-writing", "documents", "github-code-review", "plan",
-    "systematic-debugging", "test-driven-development"} <= set(E.SKILL_PACKAGES),
+    "systematic-debugging", "test-driven-development",
+    "github-pr-workflow", "grounded-citations", "document-to-action-items",
+    "spike", "humanizer"} <= set(E.SKILL_PACKAGES),
    ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
