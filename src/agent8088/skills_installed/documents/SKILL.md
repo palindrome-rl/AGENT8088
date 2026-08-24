@@ -11,6 +11,20 @@ No dedicated document tool exists. Write a Python script, run it with
 Libraries already installed: `python-docx`, `openpyxl`, `python-pptx`,
 `reportlab`. Do not install anything else.
 
+**"Convert this file" means the existing file's actual content, not a fresh
+one you write from scratch.** A conversion path exists — LibreOffice, see
+below — use it. Writing a new script that generates a *different* document
+with similar-sounding content is not a conversion and does not satisfy the
+request, even if the script runs successfully.
+
+**On Windows, `execute_shell` runs `cmd.exe`, not bash — for every command in
+this skill, not just the LibreOffice ones.** `cmd.exe` only understands
+double quotes; a leading/trailing `'single quote'` is not stripped and gets
+passed to the program literally, which is why `python -c '...'` fails with a
+syntax error. Use double quotes: `python -c "..."`. Prefer writing a `.py`
+file with `write_file` and running `python script.py` over an inline `-c`
+one-liner — one fewer layer of quoting to get wrong.
+
 Always use an absolute output path. A bare filename gets redirected into
 `artifacts/` by write-path rules — a later `read_text` on the bare name may
 miss it.
