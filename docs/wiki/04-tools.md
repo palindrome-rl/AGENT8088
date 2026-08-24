@@ -2,7 +2,7 @@
 
 [← Wiki index](README.md)
 
-21 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+32 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
 is what the permission layer gates on — see
 [Permissions & Security](03-permissions-and-security.md).
 
@@ -31,6 +31,17 @@ is what the permission layer gates on — see
 | `git_commit` | `shell` | `message` | prompt | Commit staged changes. |
 | `git_push` | `shell` | — | **blocked** | Refused at the always-on floor. |
 | `git_create_pr` | `shell` | `title`, `body` | prompt | Open a PR via `gh`. |
+| `view_skill` | `skill` | `name`, `resource` | ✅ | Load one path-confined text resource from an enabled progressive skill. |
+| `cli_anything_status` | `cli_anything` | — | ✅ | Report the isolated CLI-Anything runtime state. |
+| `cli_anything_setup` | `cli_anything` | — | prompt | Install pinned CLI-Hub into its isolated environment. |
+| `cli_anything_list` | `cli_anything` | — | prompt | List the official catalog as JSON. |
+| `cli_anything_search` | `cli_anything` | `query` | prompt | Search the official CLI-Anything catalog. |
+| `cli_anything_info` | `cli_anything` | `name` | prompt | Inspect one catalog entry. |
+| `cli_anything_install` | `cli_anything` | `name` | prompt | Install one approved Python harness at the pinned upstream revision. |
+| `cli_anything_update` | `cli_anything` | `name` | prompt | Reinstall one managed harness at the pinned upstream revision. |
+| `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
+| `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
+| `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
 
 > `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
 > without a prompt under the native sandbox, escalated under `local`, because
@@ -75,6 +86,8 @@ the agent recovers instead of looping when the model invents a tool that
 | `plan` | the plan-only entry point |
 | `introspect` | self-report — allowed in **every** mode; touches no file, socket, or process |
 | `mcp` | external MCP tool — see [MCP](07-mcp.md) |
+| `skill` | path-confined local text loading for enabled progressive skills |
+| `cli_anything` | action-specific catalog, package-change, or host-execution permission checks |
 
 ## Adding a tool
 

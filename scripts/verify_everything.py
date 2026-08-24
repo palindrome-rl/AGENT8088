@@ -121,7 +121,8 @@ ok("tools loaded", len(E.TOOL_NAMES) >= 20, f"{len(E.TOOL_NAMES)} tools")
 ok("sub-agents loaded",
    {"auditor", "coder", "explore", "general-purpose", "researcher"} <= set(E.SUBAGENT_SPECS),
    ", ".join(sorted(E.SUBAGENT_SPECS)))
-ok("skills loaded", len(E.SKILL_PACKAGES) == 5, ", ".join(sorted(E.SKILL_PACKAGES)))
+ok("skills loaded", len(E.SKILL_PACKAGES) >= 6 and "cli-anything" in E.SKILL_PACKAGES,
+   ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
 ok("tool docs in system prompt", "spawn_subagent(" in E.SYSTEM_PROMPT)
@@ -303,6 +304,17 @@ expected_tools = {
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
     "browse_page": "browser",
+    "view_skill": "skill",
+    "cli_anything_status": "cli_anything",
+    "cli_anything_setup": "cli_anything",
+    "cli_anything_list": "cli_anything",
+    "cli_anything_search": "cli_anything",
+    "cli_anything_info": "cli_anything",
+    "cli_anything_install": "cli_anything",
+    "cli_anything_update": "cli_anything",
+    "cli_anything_uninstall": "cli_anything",
+    "cli_anything_skill": "cli_anything",
+    "cli_anything_run": "cli_anything",
 }
 ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")

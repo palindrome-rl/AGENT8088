@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import memory, web_search
+from agent8088 import cli_anything, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -2092,6 +2092,8 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
             "description": meta.get("description", default_tool_description(name)),
             "version": meta.get("version", "0"),
             "category": meta.get("category", "general"),
+            "progressive": str(meta.get("progressive", "false")).strip().lower()
+                           in {"1", "true", "yes", "on"},
             "path": str(pkg),
             "prose": body.strip(),
             "tools": tools,
@@ -2119,9 +2121,50 @@ def render_skill_docs(skills: dict) -> str:
     for name, skill in skills.items():
         prose = (skill.get("prose") or "").strip()
         lines.append(f"\n### {name}\n{skill['description']}")
-        if prose:
+        if skill.get("progressive"):
+            lines.append(
+                f"Load this skill only when it matches the user's request: call "
+                f"view_skill(name={name!r}, resource='SKILL.md')."
+            )
+        elif prose:
             lines.append(prose)
     return "\n".join(lines)
+
+
+_SKILL_RESOURCE_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml"}
+_MAX_SKILL_RESOURCE_BYTES = 512 * 1024
+DISABLED_SKILLS = set()
+
+
+def set_disabled_skills(names) -> None:
+    """Synchronize the active CLI session's disabled-skill boundary."""
+    global DISABLED_SKILLS
+    DISABLED_SKILLS = set(names or ()) & set(SKILL_PACKAGES)
+
+
+def read_skill_resource(name: str, resource: str) -> str:
+    """Read one installed skill resource without allowing path traversal."""
+    skill = SKILL_PACKAGES.get(str(name or "").strip())
+    if not skill:
+        raise ValueError(f"Unknown skill: {name or '(missing name)'}")
+    if skill["name"] in DISABLED_SKILLS:
+        raise ValueError(f"Skill is disabled for this session: {skill['name']}")
+    root = Path(skill["path"]).resolve(strict=True)
+    relative = str(resource or "SKILL.md").strip().replace("\\", "/")
+    if not relative or relative.startswith("/"):
+        raise ValueError("Skill resource must be a relative path.")
+    # Check containment before requiring the file to exist. Besides producing a
+    # clear refusal, this avoids leaking whether an escaped path exists.
+    target = (root / relative).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Skill resource path escapes the installed skill.") from exc
+    if not target.is_file() or target.suffix.lower() not in _SKILL_RESOURCE_SUFFIXES:
+        raise ValueError("Skill resource must be a supported text file.")
+    if target.stat().st_size > _MAX_SKILL_RESOURCE_BYTES:
+        raise ValueError("Skill resource is too large to load.")
+    return target.read_text(encoding="utf-8")
 
 
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
@@ -4623,6 +4666,108 @@ def _plan_mode_block_message() -> str:
             "call normally. Do not claim any of it is done before that happens.")
 
 
+def _run_cli_anything_tool(name: str, args: dict, timeout: int,
+                           approval_key: str, allow_plan: bool) -> str:
+    """Run the optional CLI-Anything adapter through Agent8088's policy layer."""
+    if name == "cli_anything_status":
+        return json.dumps(cli_anything.status(CONFIG_PATH, timeout=timeout), indent=2)
+
+    local_tools = {"cli_anything_skill"}
+    network_tools = {"cli_anything_list", "cli_anything_search", "cli_anything_info"}
+    mutation_tools = {
+        "cli_anything_setup", "cli_anything_install", "cli_anything_update",
+        "cli_anything_uninstall", "cli_anything_run",
+    }
+    if name not in local_tools | network_tools | mutation_tools:
+        return f"Unknown CLI-Anything tool: {name}"
+    if PERMISSION_MODE == "plan-only" and allow_plan and name not in local_tools:
+        return _plan_mode_block_message()
+
+    if name in local_tools:
+        display = f"{name}: {str(args.get('name') or '')[:100]}"
+        policy_mode = "read"
+    elif name in network_tools:
+        detail = (str(args.get("query") or args.get("name") or "").strip())[:160]
+        leak = _outbound_secret_check(detail) or _outbound_secret_check(
+            json.dumps(args, default=str))
+        if leak:
+            _audit("tool_call", tool=name, mode="browser", decision="denied",
+                   detail=detail, reason="outbound_secret")
+            return leak
+        blocked = _egress_check(cli_anything.CLI_HUB_REGISTRY) or _ssrf_check(
+            cli_anything.CLI_HUB_REGISTRY)
+        if blocked:
+            return blocked
+        if not check_permission("browser", cli_anything.CLI_HUB_REGISTRY,
+                                approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="browser",
+                   decision="blocked", detail=detail,
+                   change_type="network_request")
+            return request_escalation(
+                target_mode="edit",
+                paths=[cli_anything.CLI_HUB_REGISTRY],
+                change_type="network_request",
+                reason="Contact the official CLI-Anything catalog?",
+            )
+        policy_mode = "browser"
+        display = f"{name}: {detail}"
+    else:
+        if name == "cli_anything_run":
+            raw_cwd = str(args.get("cwd") or PROJECT_ROOT)
+            try:
+                cwd = Path(raw_cwd).expanduser().resolve(strict=True)
+            except OSError as exc:
+                return f"Error: Working directory is unavailable: {exc}"
+            if not cwd.is_dir():
+                return f"Error: Working directory does not exist: {cwd}"
+            zone = _check_path_zone(cwd)
+            if zone == "blocked":
+                return f"Error: CLI-Anything working directory is blocked: {cwd}"
+            args = dict(args)
+            args["cwd"] = str(cwd)
+        display = f"{name}: {str(args.get('name') or 'runtime')[:100]}"
+        if not check_permission("shell", display, host=True,
+                                approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="shell",
+                   decision="blocked", detail=display,
+                   change_type="local_execution")
+            return request_escalation(
+                target_mode="edit",
+                paths=[display],
+                change_type="local_execution",
+                reason=("Run this CLI-Anything operation on the host? "
+                        "It may install packages or change application files."),
+            )
+        policy_mode = "shell"
+
+    _audit("tool_call", tool=name, mode=policy_mode, decision="allowed",
+           detail=display[:200])
+    try:
+        if name == "cli_anything_skill":
+            result = cli_anything.installed_skill(
+                CONFIG_PATH, args.get("name"), timeout=timeout)
+        elif name == "cli_anything_setup":
+            result = cli_anything.setup(CONFIG_PATH, timeout=timeout)
+        elif name == "cli_anything_list":
+            result = cli_anything.list_clis(CONFIG_PATH, timeout=timeout)
+        elif name == "cli_anything_search":
+            result = cli_anything.search(CONFIG_PATH, args.get("query"), timeout=timeout)
+        elif name == "cli_anything_info":
+            result = cli_anything.info(CONFIG_PATH, args.get("name"), timeout=timeout)
+        elif name in {"cli_anything_install", "cli_anything_update", "cli_anything_uninstall"}:
+            action = name.removeprefix("cli_anything_")
+            result = cli_anything.manage(
+                CONFIG_PATH, action, args.get("name"), timeout=timeout)
+        else:
+            result = cli_anything.run(
+                CONFIG_PATH, args.get("name"), args.get("arguments"),
+                args.get("cwd") or PROJECT_ROOT, timeout=timeout)
+    except (OSError, RuntimeError, TypeError, ValueError,
+            subprocess.SubprocessError) as exc:
+        result = f"Error: {exc}"
+    return _wrap_untrusted(str(result), f"CLI-Anything operation: {name}")
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
@@ -4634,6 +4779,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
     approval_key = _tool_call_key(name, args)
+
+    if mode == "skill":
+        try:
+            return read_skill_resource(args.get("name", ""), args.get("resource", "SKILL.md"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            return f"Error: {exc}"
+
+    if mode == "cli_anything":
+        return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"
@@ -6337,6 +6491,10 @@ def describe_capabilities() -> str:
     # --- Skills and subagents ---
     lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
     lines += [f"- {s}" for s in sorted(SKILL_PACKAGES)] or ["- none installed"]
+    cli_state = cli_anything.status(CONFIG_PATH)
+    cli_detail = (f"ready (CLI-Hub {cli_state['version']})"
+                  if cli_state["available"] else "available on demand")
+    lines.append(f"- CLI-Anything runtime: {cli_detail}")
     lines.append("")
     lines.append(f"## Subagents ({len(SUBAGENT_SPECS)})")
     lines += [f"- {a}" for a in sorted(SUBAGENT_SPECS)] or ["- none configured"]

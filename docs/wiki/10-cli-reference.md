@@ -37,7 +37,7 @@ Run with no flags for the interactive REPL.
 
 ## Slash commands
 
-**37 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
+**38 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
 `/models`.
 
 ### Session
@@ -83,6 +83,7 @@ Run with no flags for the interactive REPL.
 | `/agents` | List sub-agent profiles |
 | `/agent <type> <task>` | Run a sub-agent directly |
 | `/skills` | List skills; `disable`/`enable <name>` |
+| `/cli-anything [task]` | Show integration status, or route a task through the CLI-Anything skill |
 
 ### Permissions and isolation
 
@@ -165,6 +166,7 @@ message — otherwise `/help` would be a free channel for flooding the gateway.
 |---|---|
 | `AGENT8088_CONFIG` | Config file path (`/nonexistent` forces packaged defaults) |
 | `AGENT8088_HOME` | Data directory |
+| `AGENT8088_CLI_ANYTHING_HOME` | Optional override for the isolated CLI-Anything runtime directory |
 | `AGENT8088_PROVIDER` | Active provider |
 | `AGENT8088_PERMISSION` | Starting permission mode (`readonly` or `full-auto`; `plan-only` falls back to `readonly`) |
 | `AGENT8088_SANDBOX` | Sandbox backend |

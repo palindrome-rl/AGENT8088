@@ -1,0 +1,10 @@
+{
+  "project": "HKUDS/CLI-Anything",
+  "repository": "https://github.com/HKUDS/CLI-Anything",
+  "revision": "810c18b0d1ab9b234bc996c9fd999318523a3ef0",
+  "methodology": "cli-anything-plugin/HARNESS.md",
+  "hermes_reference": "hermes-skill/SKILL.md",
+  "cli_hub_version": "0.4.1",
+  "license": "Apache-2.0",
+  "adaptation": "Agent8088 tool names, progressive loading, permission boundaries, and isolated CLI-Hub management"
+}

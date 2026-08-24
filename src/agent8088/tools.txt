@@ -18,4 +18,15 @@ git_push|Push the current branch to origin. Only use when the user asked you to 
 git_create_pr|Open a pull request with the gh CLI. Only use when the user asked for a PR.|mode=shell|args=title,body|command=gh pr create --title "{title}" --body "{body}"|timeout=120|host=1
 schedule_task|Schedule this agent to run a task periodically, or list/remove schedules. action is list, add, or remove; schedule is 5 cron fields (e.g. "0 9 * * *"); task is the query to run. Windows uses Task Scheduler while the user is signed in and supports common minute, hourly, daily, weekly, and monthly forms.|mode=cron|args=action,schedule,task|timeout=20
 run_sandboxed|Run a Python snippet with native OS isolation and no network, using Docker only as a fallback. Use for untrusted or risky code instead of execute_shell.|mode=docker|args=code|timeout=90
+view_skill|Load one text resource from an installed progressive skill. Start with resource=SKILL.md, then load only the references that skill directs you to.|mode=skill|args=name,resource|timeout=10
+cli_anything_status|Report whether Agent8088's isolated CLI-Anything runtime is installed and verified.|mode=cli_anything|timeout=10
+cli_anything_setup|Install the pinned CLI-Hub runtime into Agent8088's isolated integration environment. Call status first and use only when CLI-Anything is needed.|mode=cli_anything|timeout=300
+cli_anything_list|List the official CLI-Anything catalog as JSON. CLI-Anything setup must already be complete.|mode=cli_anything|timeout=45
+cli_anything_search|Search the official CLI-Anything catalog for existing application harnesses. CLI-Anything setup must already be complete.|mode=cli_anything|args=query|timeout=45
+cli_anything_info|Show catalog and installation details for one CLI-Anything harness.|mode=cli_anything|args=name|timeout=45
+cli_anything_install|Install one reviewed Python CLI-Anything harness into Agent8088's isolated integration environment. Public npm, uv, and generic shell installers are refused.|mode=cli_anything|args=name|timeout=300
+cli_anything_update|Update one installed Python CLI-Anything harness inside Agent8088's isolated integration environment.|mode=cli_anything|args=name|timeout=300
+cli_anything_uninstall|Remove one installed Python CLI-Anything harness from Agent8088's isolated integration environment.|mode=cli_anything|args=name|timeout=300
+cli_anything_skill|Load the packaged SKILL.md for one harness installed in Agent8088's isolated CLI-Anything environment.|mode=cli_anything|args=name|timeout=15
+cli_anything_run|Run an installed CLI-Anything harness using a structured argument array, never a shell string. Prefer --json in arguments.|mode=cli_anything|args=name,arguments,cwd|arg_types=arguments:array|timeout=300
 browse_page|Load a user-supplied web page in a real headless browser and return its text. It is not a routine web-search follow-up.|mode=browser|args=url|timeout=60
