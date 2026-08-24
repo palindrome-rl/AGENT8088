@@ -5389,6 +5389,7 @@ def _scan_json_object(text: str, start: int, limit: int = None) -> str:
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
     text = _outside_fenced_code(text)
+    text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):

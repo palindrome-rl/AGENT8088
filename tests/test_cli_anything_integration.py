@@ -61,6 +61,25 @@ def test_cli_anything_read_can_repeat_after_a_state_change(monkeypatch, engine):
                and "after" in message["content"] for message in messages)
 
 
+def test_cli_anything_hybrid_argument_markup_keeps_export_arguments(engine):
+    expected = {
+        "name": "freecad",
+        "arguments": [
+            "--json", "-p", "cadtest/proj.json", "export", "render",
+            "cadtest/plate.step", "--preset", "step",
+        ],
+        "cwd": "artifacts",
+    }
+    text = (
+        "✿FUNCTION✿: cli_anything_run "
+        f"✿ARGS</arg_key><arg_value>{json.dumps(expected)}</arg_value></tool_call>"
+    )
+
+    assert engine.find_tool_calls(text, {"cli_anything_run"}) == [
+        {"name": "cli_anything_run", "arguments": expected}
+    ]
+
+
 def test_view_skill_loads_text_and_rejects_traversal(engine):
     loaded = engine.run_tool(
         "view_skill", {"name": "cli-anything", "resource": "SKILL.md"}
