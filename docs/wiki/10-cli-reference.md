@@ -76,8 +76,14 @@ agent8088 --uninstall --all --yes --non-interactive   # fully unattended, full r
 
 ## Slash commands
 
-**37 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
+**39 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
 `/models`.
+
+Pasting a bare file path into the prompt — nothing else on the line — reads it
+immediately: images go to a vision model, documents are extracted to text.
+Unlike a tool call the model makes on its own, this works outside
+`allowed_paths`, because it's a path the user personally typed. The
+sensitive-file floor still applies unconditionally.
 
 ### Session
 
@@ -118,7 +124,8 @@ agent8088 --uninstall --all --yes --non-interactive   # fully unattended, full r
 | `/tool <name> <json>` | Invoke one tool directly |
 | `/plan [task]` | Enter plan mode: propose a plan, approve it, then it runs |
 | `/audit [on\|off]` | Show or change step verification; no argument reports the current setting and the last turn's cost |
-| `/image <path>` | Attach an image to the next prompt |
+| `/image <path> [question]` | Analyze an image with a vision-capable model |
+| `/paste [question]` | Analyze an image from the OS clipboard (Windows/macOS; Pillow's `ImageGrab`) |
 | `/agents` | List sub-agent profiles |
 | `/agent <type> <task>` | Run a sub-agent directly |
 | `/skills` | List skills; `disable`/`enable <name>` |

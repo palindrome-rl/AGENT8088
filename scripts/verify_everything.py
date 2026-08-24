@@ -121,7 +121,15 @@ ok("tools loaded", len(E.TOOL_NAMES) >= 20, f"{len(E.TOOL_NAMES)} tools")
 ok("sub-agents loaded",
    {"auditor", "coder", "explore", "general-purpose", "researcher"} <= set(E.SUBAGENT_SPECS),
    ", ".join(sorted(E.SUBAGENT_SPECS)))
-ok("skills loaded", len(E.SKILL_PACKAGES) == 5, ", ".join(sorted(E.SKILL_PACKAGES)))
+# Subset, like the sub-agent check above, rather than an exact count: the
+# neighbouring tool check is deliberately "a floor, not an exact count" so that
+# adding one doesn't fail the run, and there is no reason skills should differ.
+ok("skills loaded",
+   {"documentation-writing", "documents", "github-code-review", "plan",
+    "systematic-debugging", "test-driven-development",
+    "github-pr-workflow", "grounded-citations", "document-to-action-items",
+    "spike", "humanizer", "simplify-code"} <= set(E.SKILL_PACKAGES),
+   ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
 ok("tool docs in system prompt", "spawn_subagent(" in E.SYSTEM_PROMPT)
@@ -303,6 +311,10 @@ expected_tools = {
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
     "browse_page": "browser",
+    # Shares write_text with write_file deliberately: every guard keyed on that
+    # mode then applies to it too, with no second gate to keep in sync.
+    "create_document": "write_text",
+    "convert_document": "write_text",
 }
 ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")
@@ -1175,7 +1187,7 @@ ok("_redact_secrets handles empty input", E._redact_secrets("") == "")
 section("20. CLI SURFACE")
 from agent8088 import cli as C  # noqa: E402
 expected_cmds = {
-    "help", "tools", "tool", "agents", "agent", "plan", "image", "skills", "raw",
+    "help", "tools", "tool", "agents", "agent", "plan", "image", "paste", "skills", "raw",
     "model", "models", "config", "memory", "status", "doctor", "sandbox", "new",
     "sessions", "resume", "reset", "compact", "history", "trace", "reasoning",
     "think", "verbose", "usage", "temp", "maxturns", "save", "clear",

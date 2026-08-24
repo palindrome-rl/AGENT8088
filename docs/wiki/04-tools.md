@@ -10,7 +10,7 @@ is what the permission layer gates on — see
 
 | Tool | Mode | Args | readonly? | What it does |
 |---|---|---|---|---|
-| `read_text` | `read_text` | `filename` | ✅ | Read a file. Refuses credential files. |
+| `read_text` | `read_text` | `filename`, `offset`*, `limit`* | ✅ | Read a file. Extracts `.docx`/`.xlsx`/`.pptx`/`.pdf` to text. Paginated. Refuses credential files. |
 | `write_file` | `write_text` | `filename`, `content` | prompt | Write a file. Path-zone + sensitive + shell-rc checked. |
 | `execute_shell` | `shell` | `command` | safe list only | Run a shell command. |
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
@@ -19,6 +19,33 @@ is what the permission layer gates on — see
 | `web_search` | `search` | `query` | prompt by default | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url` | prompt | Headless browser — renders JS that curl can't. |
+| `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
+
+`*` optional argument.
+
+## Documents
+
+Reading is automatic: point `read_text` at a `.docx`, `.xlsx`, `.pptx` or `.pdf`
+and it comes back as text. `.docx` and `.pptx` are parsed with the standard
+library; `.xlsx` uses openpyxl and `.pdf` uses pypdf. A scanned PDF with no text
+layer says so rather than returning a blank-looking document. Files larger than
+`max_document_bytes` (25 MB) are refused.
+
+Long files arrive one page at a time with a header naming the true line count —
+pass `offset` to continue, `limit` to change the page size (`read_page_lines`,
+default 200). Short files are returned whole with no header.
+
+Writing has two routes. The `documents` skill teaches the agent to write
+`python-docx`/`openpyxl`/`python-pptx`/`reportlab` code and run it through
+`execute_shell` — the flexible path, and the only one that produces PDFs or
+edits an existing file. `create_document` is the deterministic fallback for when
+generating that code is unreliable: it takes plain lines rather than code, but
+only creates new `.docx`/`.xlsx`/`.pptx`.
+
+`create_document` declares `mode=write_text` deliberately. Around a dozen places
+key on that mode — the sensitive-file floor, write path zones, plan-only
+blocking, plan-audit revert. Sharing the mode means the tool inherits every one
+of them instead of needing a parallel set that could drift.
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
 | `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |

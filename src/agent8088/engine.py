@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import memory, web_search
+from agent8088 import documents, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -324,6 +324,13 @@ MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1
 # answer defeats the delegation it was spawned for. 0 disables the cap.
 MAX_SUBAGENT_ANSWER_CHARS = int(APP_CONFIG.get("max_subagent_answer_chars", "6000"))
 MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
+# Lines returned per read_text call when no explicit limit is given. Sized well
+# under _tool_result_for_model's own character cap so a page arrives whole.
+READ_PAGE_LINES = int(APP_CONFIG.get("read_page_lines", "200"))
+# Documents are extracted, not byte-capped, so MAX_READ_BYTES does not apply to
+# them; this is their separate ceiling. Without it the extraction path is an
+# unbounded read reachable in readonly mode.
+MAX_DOCUMENT_BYTES = int(APP_CONFIG.get("max_document_bytes", str(25 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
 MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "300")))
@@ -1744,11 +1751,17 @@ _IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".gif": "image/gif", ".webp": "image/webp"}
 
 
-def build_image_message(text: str, images: list) -> dict:
+def build_image_message(text: str, images: list, resolver=None) -> dict:
     """Build a multimodal user message: text plus one or more images.
     Local paths are inlined as base64 data URLs; http(s) URLs pass through
-    (SSRF-checked). Requires a vision-capable model/provider."""
+    (SSRF-checked). Requires a vision-capable model/provider.
+
+    resolver defaults to resolve_user_path (ALLOWED_PATHS-gated), unchanged
+    from before this parameter existed. The paste-detection path in cli.py
+    passes resolve_pasted_path instead — see that function's docstring for why.
+    """
     import base64 as _b64
+    resolver = resolver or resolve_user_path
     parts = [{"type": "text", "text": text or ""}]
     for ref in images or []:
         ref = str(ref).strip()
@@ -1758,7 +1771,7 @@ def build_image_message(text: str, images: list) -> dict:
                 raise ValueError(blocked)
             parts.append({"type": "image_url", "image_url": {"url": ref}})
             continue
-        path = resolve_user_path(ref)
+        path = resolver(ref)
         if not path.exists():
             raise ValueError(f"Image not found: {path}")
         if _is_sensitive_path(str(path)):
@@ -1768,7 +1781,12 @@ def build_image_message(text: str, images: list) -> dict:
             raise ValueError(f"Unsupported image type: {path.suffix or '(none)'}")
         if path.stat().st_size > MAX_IMAGE_BYTES:
             raise ValueError(f"Image is too large (limit: {MAX_IMAGE_BYTES} bytes): {path}")
-        b64 = _b64.b64encode(path.read_bytes()).decode()
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(documents.cloud_placeholder_message(path)
+                             or f"Could not read {path}: {exc.strerror or exc}")
+        b64 = _b64.b64encode(raw).decode()
         parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
     return {"role": "user", "content": parts}
 
@@ -1803,11 +1821,18 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
     # Each field prefers the inline tools.txt value, then config.txt, then a default.
     def g(ekey, ckey, default=""):
         return extra.get(ekey, config.get(f"{ckey}.{name}", default))
+    args = parse_csv(g("args", "tool_params"))
+    # Args the model may omit. Subtracted from the JSON schema's "required" and
+    # from TOOL_REQUIRED_PARAMS — execute_plan checks a step against the latter,
+    # so listing an arg here and not there would still reject the step. Names
+    # not present in args= are dropped: a typo must not invent a parameter.
+    optional = [a for a in parse_csv(g("optional", "tool_optional")) if a in args]
     return {
         "name": name,
         "description": description,
         "mode": (extra.get("mode") or config.get(f"tool_mode.{name}") or "shell").strip().lower(),
-        "args": parse_csv(g("args", "tool_params")),
+        "args": args,
+        "optional": optional,
         "keywords": set(parse_csv(g("keywords", "tool_keywords"))),
         "command": g("command", "tool_command"),
         "sandbox_image": g("sandbox_image", "tool_sandbox_image"),
@@ -1868,6 +1893,18 @@ def load_tool_specs(path: Path, config: dict) -> dict:
     return specs
 
 
+def required_params(spec: dict) -> list:
+    """A tool's mandatory args: everything declared in args= minus optional=.
+
+    Single definition on purpose. This feeds both the JSON schema sent to the
+    model and TOOL_REQUIRED_PARAMS, which is rebuilt in three places; they
+    disagreeing is how an arg becomes optional to the model but still rejected
+    by execute_plan.
+    """
+    optional = set(spec.get("optional") or ())
+    return [arg for arg in (spec.get("args") or []) if arg not in optional]
+
+
 def build_tools_def(tool_specs: dict) -> list:
     result = []
     for name, spec in tool_specs.items():
@@ -1880,7 +1917,7 @@ def build_tools_def(tool_specs: dict) -> list:
                 arg_types = spec.get("arg_types", {})
                 props[param] = {"type": arg_types.get(param, "string")}
             params = {"type": "object", "properties": props,
-                      "required": list(spec["args"])}
+                      "required": required_params(spec)}
         result.append({
             "type": "function",
             "function": {
@@ -1897,7 +1934,7 @@ MCP_RUNTIME = MCPRuntime(PROJECT_ROOT)
 TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
 TOOLS_DEF = build_tools_def(TOOL_SPECS)
 TOOL_NAMES = set(TOOL_SPECS.keys())
-TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+TOOL_REQUIRED_PARAMS = {name: required_params(spec) for name, spec in TOOL_SPECS.items()}
 
 
 def reload_mcp_tools():
@@ -1909,7 +1946,7 @@ def reload_mcp_tools():
     TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
     TOOLS_DEF = build_tools_def(TOOL_SPECS)
     TOOL_NAMES = set(TOOL_SPECS)
-    TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+    TOOL_REQUIRED_PARAMS = {name: required_params(spec) for name, spec in TOOL_SPECS.items()}
     SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS) + render_skill_docs(SKILL_PACKAGES) + render_persona(USER_FILE)
     return MCP_RUNTIME.statuses
 
@@ -2018,6 +2055,10 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- A direct request to run a command MUST call execute_shell.")
     if "web_search" in specs:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
+    if "convert_document" in specs:
+        lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
+    if "create_document" in specs:
+        lines.append("- A direct request to create a .docx/.xlsx/.pptx file from content MUST call create_document, not write_file or execute_shell.")
     for name, s in specs.items():
         args = ", ".join(s["args"]) or "no args"
         lines.append(f"- {name}({args}): {s['description']}")
@@ -2129,7 +2170,7 @@ if SKILL_PACKAGES:
     TOOL_SPECS = merge_skill_tools(TOOL_SPECS, SKILL_PACKAGES)
     TOOLS_DEF = build_tools_def(TOOL_SPECS)
     TOOL_NAMES = set(TOOL_SPECS.keys())
-    TOOL_REQUIRED_PARAMS = {name: list(spec["args"]) for name, spec in TOOL_SPECS.items()}
+    TOOL_REQUIRED_PARAMS = {name: required_params(spec) for name, spec in TOOL_SPECS.items()}
 
 
 SYSTEM_PROMPT = (BASE_SYSTEM_PROMPT + "\n" + render_tool_docs(TOOL_SPECS)
@@ -2250,6 +2291,24 @@ def resolve_user_path(raw_path: str) -> Path:
     return resolved
 
 
+def resolve_pasted_path(raw_path: str) -> Path:
+    """Resolve a path the user typed or pasted directly into the prompt.
+
+    Deliberately skips the ALLOWED_PATHS check that resolve_user_path enforces:
+    this is the one place a user's own literal input is trusted more than a
+    model-issued tool call, so pasting a path outside the project (Desktop,
+    Downloads, ...) reads immediately instead of being refused. The model
+    itself gains nothing from this — a read_text tool call to the same path
+    still goes through resolve_user_path and is still refused. The
+    sensitive-file floor stays unconditional regardless: naming a path by hand
+    is not evidence it isn't a credential.
+    """
+    p = Path(_from_container_path(raw_path)).expanduser().resolve()
+    if _is_sensitive_path(str(p)):
+        raise ValueError(f"Access to sensitive file denied: {p}")
+    return p
+
+
 def resolve_write_path(raw_path: str) -> Path:
     """Store what the agent creates in artifacts/; honour a stated location.
 
@@ -2301,11 +2360,62 @@ def _shadowed_project_file(raw_path: str, target: Path) -> Path | None:
 
 
 def _read_text_limited(path: Path, limit: int = MAX_READ_BYTES) -> str:
-    with path.open("rb") as stream:
-        data = stream.read(limit + 1)
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+    except OSError as exc:
+        # An undownloaded OneDrive/Dropbox placeholder passes exists() and
+        # reports a size, but opening it fails with EINVAL. Say that, rather
+        # than letting a bare OSError surface as an unexplained failure.
+        raise ValueError(documents.cloud_placeholder_message(path)
+                         or f"Could not read {path}: {exc.strerror or exc}")
     if len(data) > limit:
         raise ValueError(f"File is too large to read (limit: {limit} bytes): {path}")
-    return data.decode("utf-8")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        # Undecodable bytes used to escape as a raw UnicodeDecodeError traceback.
+        # Both callers already handle ValueError (the read branch turns it into a
+        # tool error, the write branch's diff snapshot swallows it), so raising it
+        # here is what makes reading a .png — or writing over one — degrade into a
+        # message instead of a crash. errors="replace" was the other option and is
+        # worse: silent mojibake the model would try to reason about.
+        raise ValueError(f"Not a text file (binary content): {path}")
+
+
+def _paginate_read(text: str, args: dict, path) -> str:
+    """Return a window of `text`, with a header saying what was left out.
+
+    _tool_result_for_model truncates every tool result to a few thousand
+    characters, so a long document would otherwise reach the model as its first
+    page with no indication the rest exists — which reads as "this is the whole
+    document" and gets summarized as such. Stating the real line count and the
+    window is what lets the model ask for the next one.
+    """
+    lines = text.splitlines()
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        limit = int(args.get("limit") or READ_PAGE_LINES)
+    except (TypeError, ValueError):
+        limit = READ_PAGE_LINES
+    limit = max(1, limit)
+
+    # A short file is returned as-is: no header, so ordinary reads look exactly
+    # as they did before this feature existed.
+    if offset == 0 and len(lines) <= limit:
+        return text
+
+    window = lines[offset:offset + limit]
+    shown_to = offset + len(window)
+    header = (f"[{Path(path).name} — lines {offset + 1}-{shown_to} of {len(lines)}. "
+              f"Pass offset={shown_to} to read on.]")
+    if not window:
+        header = (f"[{Path(path).name} — offset {offset} is past the end "
+                  f"({len(lines)} lines).]")
+    return header + "\n" + "\n".join(window)
 
 
 def classify_plan_component(step_text: str) -> str:
@@ -2582,6 +2692,14 @@ PLAN_REVERT_MAX_BYTES = int(APP_CONFIG.get("plan_audit_revert_max_bytes", str(1 
 # inconclusive verdict at the price of a model call. Reads are absent for the
 # obvious reason — auditing a read tells you the read returned what it returned.
 _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
+# Tools that share a closure mode but are deterministic built-ins whose output
+# is already verified on disk by the tool itself. The auditor runs in a
+# disposable sandbox copy and on Windows hosts cannot even see the real file the
+# step produced, so it returns `fail`/`unknown` from its own blindness — pure
+# noise that costs a model call and tokens, and on a `fail` verdict can revert
+# correct work. Excluded here: convert_document checks output_path.exists() and
+# the byte count itself; there is no model-authored logic to second-guess.
+_NON_AUDITABLE_TOOLS = {"convert_document"}
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
 
@@ -2596,6 +2714,8 @@ def _plan_step_is_auditable(tool_name: str, acceptance: str) -> bool:
     the reported page text is in the auditor's task, so "the page mentions pricing"
     is checkable, while an invented criterion for a page nobody kept would not be.
     """
+    if tool_name in _NON_AUDITABLE_TOOLS:
+        return False
     if acceptance:
         return True
     return TOOL_SPECS.get(tool_name, {}).get("mode") in _CLOSURE_MODES
@@ -5016,7 +5136,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
 
     if mode == "read_text":
-        return _strip_special_tokens(_read_text_limited(read_target))
+        # Documents are extracted to text first. Deliberately handled inside the
+        # existing read mode rather than as a new tool: this way a .docx read
+        # goes through the same sensitive-file floor, read path zones and
+        # check_permission() call that every other read does, with no new
+        # security code and no second gate to keep in sync. It also keeps the
+        # auditor's larger result allowance, which _tool_result_for_model keys
+        # on the literal name "read_text".
+        text = documents.extract_text(read_target, MAX_DOCUMENT_BYTES)
+        if text is None:  # not a document — read it as ordinary text
+            text = _read_text_limited(read_target)
+        return _strip_special_tokens(_paginate_read(text, args, read_target))
 
     if mode == "write_text":
         global _last_write_diff
@@ -5028,6 +5158,32 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             old_content = _read_text_limited(target) if target.exists() else ""
         except ValueError:
             old_content = ""
+        # create_document declares mode=write_text on purpose rather than a mode
+        # of its own: a dozen separate places key on "write_text" (sensitive-file
+        # floor, path zones, plan-only blocking, plan-audit revert, closure
+        # modes). A new mode would have to be added to every one, and the cost of
+        # missing a single site is a write that skips a guard. Sharing the mode
+        # means it cannot skip any of them; only the bytes-on-disk step differs.
+        if name == "create_document":
+            result = documents.build_document(target, content)
+            _last_write_diff = None  # binary output — a text diff would be noise
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path instead.")
+            return result
+        if name == "convert_document":
+            # Deterministic on purpose: skill-only guidance ("run soffice via
+            # execute_shell") failed twice against the actual target model —
+            # asked to convert an existing file, it wrote a fresh script
+            # generating a different document instead of following the
+            # documented command. This tool removes that choice: the model
+            # names a file and a format, nothing else to substitute.
+            result = documents.convert_document(target, str(args.get("format", "")))
+            _last_write_diff = None  # binary output — a text diff would be noise
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path instead.")
+            return result
         if args.get("_private") is True:
             _write_private_text(target, content)
         else:

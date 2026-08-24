@@ -1502,6 +1502,25 @@ def _stream_view(reasoning_parts, content):
 _session_allowlist = set()  # patterns approved for the rest of the session
 
 
+def _drain_queued_keys():
+    """Discard any keystrokes buffered in stdin before an interactive prompt.
+
+    On Windows, when the Rich Live spinner stops and an InquirerPy picker
+    launches, a stray Enter from the terminal transition can be sitting in
+    the input buffer. The picker reads it as an immediate confirmation of
+    the default (which is 'deny' for escalations — fail-closed), so the
+    prompt appears to auto-deny without the user pressing anything. Draining
+    the buffer first ensures only a deliberate keypress reaches the picker.
+    """
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        except (ImportError, OSError):
+            pass
+
+
 def _permission_choice(question, options, typed_prompt, typed_map, default):
     """Ask the user to pick one of `options` — a list of (value, label).
 
@@ -1521,6 +1540,7 @@ def _permission_choice(question, options, typed_prompt, typed_map, default):
         except ImportError:
             pass
         else:
+            _drain_queued_keys()
             return inquirer.select(
                 message=question,
                 choices=[Choice(value, name=label) for value, label in options],
@@ -1954,6 +1974,7 @@ def cmd_help(_):
         ("/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs"),
         ("/audit [on|off]", "Verify each step against the real files after it runs"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
+        ("/paste [q]", "Analyze an image from the OS clipboard (Windows/macOS)"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
         ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
@@ -2315,15 +2336,19 @@ def cmd_raw(rest):
     console.print(f"[dim]finish_reason={fr}[/dim]")
 
 
-def cmd_image(rest):
+def cmd_image(rest, resolver=None):
     parts = rest.split(None, 1)
     if not parts:
         console.print("[red]usage:[/red] /image <path-or-url> [question]")
         return
     ref = parts[0]
     question = parts[1] if len(parts) > 1 else "Describe this image."
+    # A path typed directly into /image is the same "the user typed this by
+    # hand" case the bare-paste feature exists for — no reason /image should
+    # be more restrictive than pasting the same path with no command at all.
+    resolver = resolver or A.resolve_pasted_path
     try:
-        msg = A.build_image_message(question, [ref])
+        msg = A.build_image_message(question, [ref], resolver=resolver)
     except Exception as e:
         console.print(f"[red]error:[/red] {e}")
         return
@@ -2342,6 +2367,136 @@ def cmd_image(rest):
     _save_active_session()
 
 
+def cmd_paste(rest):
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        console.print("[red]error:[/red] Pillow is not installed")
+        return
+    try:
+        img = ImageGrab.grabclipboard()
+    except NotImplementedError:
+        # ImageGrab.grabclipboard() only implements clipboard access on
+        # Windows/macOS; Linux needs xclip/wl-clipboard and Pillow raises this
+        # instead of silently returning None there.
+        console.print("[red]error:[/red] clipboard image paste isn't supported on this platform")
+        return
+    if img is None:
+        console.print("[red]error:[/red] clipboard has no image")
+        return
+    import tempfile
+    fd, tmp_name = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    img.save(tmp_path, "PNG")
+    try:
+        # A temp file, not something the user pasted a path to — resolve_pasted_path
+        # is right here too: it's the agent's own trusted output, not a model-chosen
+        # read, so the same "bypass ALLOWED_PATHS, keep the sensitive floor" rule fits.
+        cmd_image(f"{tmp_path} {rest}".strip(), resolver=A.resolve_pasted_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Bare-path paste detection — a file path typed or pasted with nothing else
+# (or a path plus a trailing question, same shape as /image) reads or
+# analyzes it immediately rather than being sent to the model as chat text.
+# Only fires when the candidate resolves to a real file on disk, which is
+# what keeps this from ever misfiring on ordinary chat that merely looks
+# path-shaped.
+# ---------------------------------------------------------------------------
+def _detect_pasted_file(line: str):
+    """Find a real, existing file path anywhere in the line — not just as the
+    first token — so "describe this image C:\\...\\photo.png" triggers the
+    same as a bare path pasted alone. Whatever text remains once the path is
+    removed becomes the question, matching /image's <path> [question] shape
+    regardless of where in the sentence the path actually sits.
+
+    The only guard against misfiring on ordinary chat is that the candidate
+    must resolve to a file that genuinely exists on disk.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("/"):
+        return None
+
+    # Quoted spans first (a Windows drag-drop path containing a space is
+    # quoted), then bare whitespace-delimited tokens not already inside one
+    # of those spans — a bare token never contains a space, so this is safe.
+    spans = []
+    for m in re.finditer(r'"([^"]+)"|\'([^\']+)\'', stripped):
+        spans.append((m.group(1) or m.group(2), m.span()))
+    covered = [s for _, s in spans]
+    for m in re.finditer(r"\S+", stripped):
+        if any(m.start() >= a and m.end() <= b for a, b in covered):
+            continue
+        spans.append((m.group(0), m.span()))
+    spans.sort(key=lambda item: item[1][0])
+
+    for candidate, (start, end) in spans:
+        try:
+            path = Path(candidate.strip()).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path = path.resolve()
+        except OSError:
+            continue
+        if path.is_file():
+            question = (stripped[:start] + stripped[end:]).strip()
+            return path, question
+
+    # Unquoted Windows paths with spaces (e.g. "C:\...\Palindrome Business
+    # Plan.pdf") were split into tokens by the \S+ scan above, none of which
+    # resolved to a file. Re-join consecutive tokens starting from a
+    # drive-letter token (X:\) and check if the joined path is a real file —
+    # the same "must exist on disk" guard against misfiring on chat.
+    drive_re = re.compile(r"^[A-Za-z]:[\\/]")
+    for i, (candidate, (start, _)) in enumerate(spans):
+        if not drive_re.match(candidate):
+            continue
+        for j in range(len(spans), i, -1):  # longest match first
+            joined = " ".join(s[0] for s in spans[i:j])
+            try:
+                path = Path(joined).resolve()
+            except OSError:
+                continue
+            if path.is_file():
+                end = spans[j - 1][1][1]
+                question = (stripped[:start] + stripped[end:]).strip()
+                return path, question
+    return None
+
+
+def _handle_pasted_file(path, question):
+    # Check the sensitive-file floor before touching the file at all, for
+    # both branches below — extract_text() has no floor of its own, so
+    # skipping this would let a pasted-path .docx read a credential file that
+    # a bare read_text call would refuse.
+    try:
+        resolved = A.resolve_pasted_path(str(path))
+    except ValueError as e:
+        console.print(f"[red]error:[/red] {e}")
+        return True
+
+    suffix = resolved.suffix.lower()
+    if suffix in A._IMAGE_MIME:
+        cmd_image(f"{resolved} {question}".strip(), resolver=A.resolve_pasted_path)
+        return True
+
+    try:
+        text = A.documents.extract_text(str(resolved), A.MAX_DOCUMENT_BYTES)
+    except ValueError as e:
+        console.print(f"[red]error:[/red] {e}")
+        return True
+    if text is None:
+        try:
+            text = A._read_text_limited(resolved)
+        except (ValueError, UnicodeDecodeError):
+            return False  # not text either — let it fall through as chat
+    body = A._paginate_read(text, {}, resolved)
+    instruction = question or f"Here is the content of {resolved.name}."
+    do_chat(f"{instruction}\n\n{body}")
+    return True
 def cmd_model(rest):
     raw_arg = rest.strip()
     arg = raw_arg.lower()
@@ -3787,7 +3942,7 @@ def _configure_custom_models_endpoint():
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
-    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
+    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,
     "audit": cmd_audit,
     "skills": cmd_skills,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
@@ -5308,9 +5463,17 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     home = _agent8088_home()
     config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
-        print(f"Config not found: {config_path}")
-        print("Run the installer first.")
-        return
+        # Seed from the packaged template so the wizard has defaults to edit.
+        # The old behaviour — refusing to run and telling the user to "run the
+        # installer first" — was a dead end when the config had been deleted or
+        # never created: --setup is the tool that creates it.
+        packaged = Path(__file__).with_name("config.txt")
+        try:
+            content = packaged.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_text(config_path, content)
     content = config_path.read_text(encoding="utf-8")
     def _current(key):
         m = _re.search(rf'^{_re.escape(key)}=(.*)$', content, _re.MULTILINE)
@@ -5543,9 +5706,16 @@ def _run_gateway_setup():
     home = _agent8088_home()
     config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
-        print(f"Config not found: {config_path}")
-        print("Run `agent8088 --setup` first to create a base config.")
-        return
+        # Seed from the packaged template — same fix as _run_setup. The old
+        # "run --setup first" message was a dead end when --setup itself
+        # also refused on a missing config.
+        packaged = Path(__file__).with_name("config.txt")
+        try:
+            content = packaged.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_text(config_path, content)
     content = config_path.read_text(encoding="utf-8")
 
     def _current(key):
@@ -6060,6 +6230,9 @@ def main():
                     console.print(f"[red]error:[/red] {e}")
             else:
                 console.print(f"[red]unknown command:[/red] /{cmd}  (try /help)")
+            continue
+        pasted = _detect_pasted_file(line)
+        if pasted and _handle_pasted_file(*pasted):
             continue
         try:
             do_chat(line)
