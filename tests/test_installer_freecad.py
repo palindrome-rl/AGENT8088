@@ -118,12 +118,15 @@ def test_winget_install_failure_registers_a_skipped_stage_not_a_throw():
 @needs_windows
 def test_successful_winget_install_is_detected_afterward():
     out = _run(
-        # FreeCAD has 8 candidates (4 directories × 2 executable names).
-        # First 8 Test-Path checks (pre-install) say absent; calls 9+ (post-install
-        # verification) say present -- simulates winget actually landing the binary
-        # between the two detection passes.
+        # FreeCAD has 12 candidates (6 directories x 2 executable names --
+        # Program Files, Program Files (x86), and the real per-user
+        # %LOCALAPPDATA%\Programs location the official installer actually
+        # uses, confirmed against a live install). First 12 Test-Path checks
+        # (pre-install) say absent; calls 13+ (post-install verification) say
+        # present -- simulates winget actually landing the binary between the
+        # two detection passes.
         '$script:calls = 0\n'
-        'function Test-Path { param($Path) $script:calls++; $script:calls -gt 8 }\n'
+        'function Test-Path { param($Path) $script:calls++; $script:calls -gt 12 }\n'
         'function Get-Command { param($Name, $CommandType, $ErrorAction) [pscustomobject]@{ Source = "fakewinget" } }\n'
         'function fakewinget { $global:LASTEXITCODE = 0 }\n'
         '$r = Install-FreeCAD\n'

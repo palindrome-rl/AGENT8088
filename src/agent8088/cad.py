@@ -44,16 +44,32 @@ CONVERTIBLE_CAD_TARGETS = ("step", "stl", "iges", "obj", "brep", "dxf")
 
 CAD_PRIMITIVES = ("box", "cylinder", "sphere", "cone", "tube")
 
-# The exe name and portable/installer layout are unverified (see module
-# docstring), so this checks BOTH plausible casings in BOTH plausible
-# directories rather than guessing one. AGENT8088_FREECAD lets a user who
-# extracted a portable 7z anywhere point straight at it without editing code.
-FREECAD_INSTALL_PATHS = (
-    r"C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe",
-    r"C:\Program Files\FreeCAD 1.1\bin\FreeCADCmd.exe",
-    r"C:\Program Files\FreeCAD\bin\freecadcmd.exe",
-    r"C:\Program Files\FreeCAD\bin\FreeCADCmd.exe",
-)
+# The exe name and portable/installer layout were unverified when this was
+# written (see module docstring) — confirmed on a real install afterward:
+# freecadcmd.exe (lowercase) at %LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\. The
+# official installer defaults to that per-user, no-elevation location, not
+# Program Files — install.ps1's WinGet path was never actually exercised, so
+# both roots are checked rather than trusting either guess alone. Both
+# casings are kept for a WinGet/portable layout that may still land in
+# Program Files. AGENT8088_FREECAD lets a user who extracted a portable 7z
+# anywhere point straight at it without editing code.
+def _freecad_candidates():
+    import os
+    names = ("freecadcmd.exe", "FreeCADCmd.exe")
+    dirs = [
+        r"C:\Program Files\FreeCAD 1.1\bin",
+        r"C:\Program Files\FreeCAD\bin",
+    ]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        dirs += [
+            str(Path(local_app_data) / "Programs" / "FreeCAD 1.1" / "bin"),
+            str(Path(local_app_data) / "Programs" / "FreeCAD" / "bin"),
+        ]
+    return tuple(str(Path(d) / n) for d in dirs for n in names)
+
+
+FREECAD_INSTALL_PATHS = _freecad_candidates()
 
 
 def freecad_executable() -> str | None:

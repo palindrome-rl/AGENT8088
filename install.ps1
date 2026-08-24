@@ -867,11 +867,16 @@ function Install-LibreOffice {
 # ----------------------------------------------------------------------------
 function Install-FreeCAD {
     $freecadNames = @("freecadcmd.exe", "FreeCADCmd.exe")
+    # The official installer defaults to a per-user, no-elevation install
+    # under %LOCALAPPDATA%\Programs, not Program Files -- confirmed on a real
+    # install; this was a guess when first written (see cad.py's own note).
     $freecadDirs = @(
         "$env:ProgramFiles\FreeCAD 1.1\bin",
         "$env:ProgramFiles\FreeCAD\bin",
         "${env:ProgramFiles(x86)}\FreeCAD 1.1\bin",
-        "${env:ProgramFiles(x86)}\FreeCAD\bin"
+        "${env:ProgramFiles(x86)}\FreeCAD\bin",
+        "$env:LOCALAPPDATA\Programs\FreeCAD 1.1\bin",
+        "$env:LOCALAPPDATA\Programs\FreeCAD\bin"
     )
     $candidates = foreach ($dir in $freecadDirs) {
         foreach ($name in $freecadNames) { Join-Path $dir $name }
