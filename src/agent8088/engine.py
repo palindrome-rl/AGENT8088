@@ -1277,10 +1277,6 @@ def grant_escalation(change_type: str = ""):
         _local_fallback_grant = False
         _pending_approval_key = ""
         return
-    if change_type == "local_execution":
-        _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
-        _pending_approval_key = ""
-        return
     _one_shot_grant = _pending_approval_key or True
     _pending_approval_key = ""
     _local_fallback_grant = False

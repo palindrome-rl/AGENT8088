@@ -80,6 +80,7 @@ def _save_ledger(root: Path, value: dict) -> None:
 
 def _managed_env(root: Path, *, include_venv_path: bool = True) -> dict[str, str]:
     env = dict(os.environ)
+    real_home = env.get("HOME") or env.get("USERPROFILE")
     state = _state_home(root)
     state.mkdir(parents=True, exist_ok=True)
     env["CLI_HUB_NO_ANALYTICS"] = "1"
@@ -93,12 +94,26 @@ def _managed_env(root: Path, *, include_venv_path: bool = True) -> dict[str, str
     # Path.home(). Give it a private home without changing the real user home
     # for application harnesses executed later.
     env["HOME"] = str(state)
+    # Keep user-level Git transport settings (for example, HTTP/1.1 on networks
+    # that reset HTTP/2 transfers) while CLI-Hub itself keeps a private HOME.
+    if real_home and not env.get("GIT_CONFIG_GLOBAL"):
+        git_config = Path(real_home) / ".gitconfig"
+        if git_config.is_file():
+            env["GIT_CONFIG_GLOBAL"] = str(git_config)
     if os.name == "nt":
         env["USERPROFILE"] = str(state)
     if include_venv_path:
         bindir = hub_executable(root).parent
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
     return env
+
+
+def _uv_executable(root: Path) -> Path | None:
+    candidates = [
+        root.parent.parent / "bin" / ("uv.exe" if os.name == "nt" else "uv"),
+        Path(shutil.which("uv") or ""),
+    ]
+    return next((path for path in candidates if str(path) and path.is_file()), None)
 
 
 def _run(argv: list[str], *, root: Path, timeout: int, cwd: Path | None = None,
@@ -188,15 +203,11 @@ def setup(config_path: Path | str, *, timeout: int = 300) -> str:
     if current["available"] and current["version"] == CLI_HUB_VERSION:
         return f"CLI-Anything is ready (CLI-Hub {CLI_HUB_VERSION}) at {root}."
 
-    uv_candidates = [
-        root.parent.parent / "bin" / ("uv.exe" if os.name == "nt" else "uv"),
-        Path(shutil.which("uv") or ""),
-    ]
-    uv = next((path for path in uv_candidates if str(path) and path.is_file()), None)
+    uv = _uv_executable(root)
     python = venv_python(root)
     if not python.is_file():
         if uv:
-            done = _run([str(uv), "venv", "--python", sys.executable, str(venv_dir(root))],
+            done = _run([str(uv), "venv", "--seed", "--python", sys.executable, str(venv_dir(root))],
                         root=root, timeout=timeout)
         else:
             done = _run([sys.executable, "-m", "venv", str(venv_dir(root))],
@@ -289,14 +300,17 @@ def manage(config_path: Path | str, action: str, name: object, *, timeout: int =
 
     python = venv_python(root)
     package_name = f"cli-anything-{safe_name}"
+    uv = _uv_executable(root)
     if action == "uninstall":
-        argv = [str(python), "-m", "pip", "uninstall", "-y", package_name]
+        argv = ([str(uv), "pip", "uninstall", "--python", str(python), package_name]
+                if uv else [str(python), "-m", "pip", "uninstall", "-y", package_name])
     else:
         pinned = (
             "git+https://github.com/HKUDS/CLI-Anything.git@"
             f"{CLI_ANYTHING_REVISION}#subdirectory={subdirectory}"
         )
-        argv = [str(python), "-m", "pip", "install"]
+        argv = ([str(uv), "pip", "install", "--python", str(python)]
+                if uv else [str(python), "-m", "pip", "install"])
         if action == "update":
             argv.extend(["--upgrade", "--force-reinstall"])
         argv.append(pinned)

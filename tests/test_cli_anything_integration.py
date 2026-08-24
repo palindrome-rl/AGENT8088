@@ -59,6 +59,20 @@ def test_cli_anything_setup_uses_normal_permission_escalation(engine, monkeypatc
     assert called == []
 
 
+def test_cli_anything_setup_runs_after_one_time_local_execution_approval(engine, monkeypatch):
+    called = []
+    monkeypatch.setattr(engine.cli_anything, "setup", lambda *_a, **_kw: called.append(True) or "ready")
+    engine.PERMISSION_MODE = "readonly"
+
+    blocked = engine.exec_tool("cli_anything_setup", "{}")
+    assert blocked.startswith("ESCALATION_REQUEST\x1f")
+    engine.grant_escalation("local_execution")
+
+    approved = engine.exec_tool("cli_anything_setup", "{}")
+    assert "ready" in approved
+    assert called == [True]
+
+
 def test_cli_anything_catalog_list_escalates_in_readonly(engine, monkeypatch):
     called = []
     monkeypatch.setattr(
@@ -95,6 +109,60 @@ def test_catalog_list_uses_json_output(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_anything, "_run", fake_run)
     assert json.loads(cli_anything.list_clis(config))[0]["name"] == "gimp"
     assert seen["argv"] == [str(hub), "list", "--json"]
+
+
+def test_setup_seeds_a_uv_virtual_environment(monkeypatch, tmp_path):
+    config = tmp_path / "config.txt"
+    root = cli_anything.integration_root(config)
+    uv = tmp_path / "uv"
+    statuses = iter(({"available": False}, {"available": True, "version": cli_anything.CLI_HUB_VERSION}))
+    calls = []
+
+    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: next(statuses))
+    monkeypatch.setattr(cli_anything, "_uv_executable", lambda *_a: uv)
+    monkeypatch.setattr(
+        cli_anything, "_run",
+        lambda argv, **kwargs: calls.append(argv) or subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    )
+
+    assert "ready" in cli_anything.setup(config)
+    assert calls[0] == [str(uv), "venv", "--seed", "--python", sys.executable, str(cli_anything.venv_dir(root))]
+
+
+def test_manage_uses_uv_when_an_existing_environment_has_no_pip(monkeypatch, tmp_path):
+    config = tmp_path / "config.txt"
+    root = cli_anything.integration_root(config)
+    hub = cli_anything.hub_executable(root)
+    uv = tmp_path / "uv"
+    seen = {}
+    monkeypatch.setattr(cli_anything, "_require_hub", lambda *_a, **_kw: (root, hub))
+    monkeypatch.setattr(cli_anything, "_uv_executable", lambda *_a: uv)
+    monkeypatch.setattr(cli_anything, "_registry_entry", lambda *_a, **_kw: {
+        "name": "demo", "_source": "harness", "install_strategy": "pip",
+        "install_cmd": cli_anything.TRUSTED_HARNESS_INSTALL_PREFIX + "demo/agent-harness",
+        "entry_point": "cli-anything-demo",
+    })
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_anything, "_run", fake_run)
+
+    cli_anything.manage(config, "install", "demo")
+    assert seen["argv"][:5] == [str(uv), "pip", "install", "--python", str(cli_anything.venv_python(root))]
+
+
+def test_managed_environment_preserves_the_user_git_config(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    git_config = home / ".gitconfig"
+    git_config.write_text("[http]\n\tversion = HTTP/1.1\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+
+    env = cli_anything._managed_env(tmp_path / "integration")
+    assert env["HOME"] == str(tmp_path / "integration" / "state")
+    assert env["GIT_CONFIG_GLOBAL"] == str(git_config)
 
 
 def test_safe_arguments_requires_json_array_and_rejects_newlines():
