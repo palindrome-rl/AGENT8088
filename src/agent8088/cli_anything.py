@@ -254,6 +254,7 @@ def status(config_path: Path | str, *, timeout: int = 10) -> dict:
         "available": False,
         "version": "",
         "expected_version": CLI_HUB_VERSION,
+        "installed": sorted(_load_ledger(root)),
         "root": str(root),
         "executable": str(hub),
     }
@@ -465,6 +466,10 @@ def installed_skill(config_path: Path | str, name: object, *, timeout: int = 15)
             "`document info` also counts hidden dependency parts. Paths passed to "
             "the harness are relative to `cwd`; when `cwd` is `artifacts/engine`, "
             "use `engine_project.json`, not `artifacts/engine/engine_project.json`.\n"
+            "FreeCAD command arguments named `INDEX` are zero-based list indexes, "
+            "not the one-based persistent `id`. Agent8088 adds an `index` field to "
+            "part creation and boolean results; always reuse that `index` in later "
+            "boolean, info, remove, and measure commands.\n"
         )
     return skill
 
@@ -498,6 +503,86 @@ def _freecad_remove_error(argv: list[str], workdir: Path) -> str | None:
         f"'{dependent.get('name')}' references it. Boolean operands are already "
         "hidden and excluded from export; keep them in the project."
     )
+
+
+def _resolve_freecad_measurement(result: str, argv: list[str], workdir: Path,
+                                 root: Path, timeout: int,
+                                 path_prefix: Path | None) -> str:
+    """Resolve measurements the harness defers for boolean parts."""
+    try:
+        payload = json.loads(result)
+        command = argv.index("measure")
+        kind = argv[command + 1]
+        index = int(argv[command + 2])
+        project_flag = next(flag for flag in ("-p", "--project") if flag in argv)
+        project_path = Path(argv[argv.index(project_flag) + 1])
+        project_path = project_path if project_path.is_absolute() else workdir / project_path
+        if payload.get("deferred") is not True or kind not in {"bounding-box", "volume"}:
+            return result
+    except (ValueError, StopIteration, IndexError, TypeError, AttributeError,
+            json.JSONDecodeError):
+        return result
+    resolver = r'''
+import json
+import sys
+import tempfile
+from pathlib import Path
+from cli_anything.freecad.utils.freecad_backend import run_macro_content
+from cli_anything.freecad.utils.freecad_macro_gen import generate_macro, _safe_name
+
+project = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+target_name = _safe_name(project["parts"][int(sys.argv[2])]["name"])
+with tempfile.TemporaryDirectory(prefix="agent8088-freecad-measure-") as temporary:
+    macro = generate_macro(project, str(Path(temporary) / "measure.step"), "step")
+    macro += """
+import json
+target = doc.getObject(%r)
+box = target.Shape.BoundBox
+print("AGENT8088_METRICS=" + json.dumps({
+    "volume": target.Shape.Volume,
+    "min": {"x": box.XMin, "y": box.YMin, "z": box.ZMin},
+    "max": {"x": box.XMax, "y": box.YMax, "z": box.ZMax},
+    "size": {"x": box.XLength, "y": box.YLength, "z": box.ZLength},
+}))
+""" % target_name
+    print(json.dumps(run_macro_content(macro)))
+'''
+    done = _run(
+        [str(venv_python(root)), "-c", resolver, str(project_path), str(index)],
+        root=root,
+        timeout=timeout,
+        cwd=workdir,
+        managed_home=False,
+        path_prefix=path_prefix,
+    )
+    try:
+        backend = json.loads(done.stdout)
+        marker = "AGENT8088_METRICS="
+        metrics = json.loads(backend["stdout"].split(marker, 1)[1].splitlines()[0])
+        if done.returncode or backend["returncode"]:
+            return result
+        if kind == "volume":
+            payload["volume"] = metrics["volume"]
+        else:
+            payload.update({key: metrics[key] for key in ("min", "max", "size")})
+        payload["deferred"] = False
+        return json.dumps(payload, indent=2)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return result
+
+
+def _freecad_expose_part_index(result: str, argv: list[str]) -> str:
+    """Make the harness's zero-based part index explicit beside its 1-based ID."""
+    try:
+        command = argv.index("part")
+        if argv[command + 1] not in {"add", "boolean"}:
+            return result
+        payload = json.loads(result)
+        payload["index"] = int(payload["id"]) - 1
+        payload["index_note"] = "Use index, not id, in commands that accept INDEX."
+        return json.dumps(payload, indent=2)
+    except (ValueError, IndexError, KeyError, TypeError, json.JSONDecodeError):
+        return result
 
 
 def run(config_path: Path | str, name: object, arguments: object, cwd: Path | str,
@@ -539,6 +624,10 @@ def run(config_path: Path | str, name: object, arguments: object, cwd: Path | st
     result = _result(_run([str(executable), *argv], root=root, timeout=timeout,
                           cwd=workdir, managed_home=False, path_prefix=path_prefix))
     if safe_name == "freecad":
+        result = _freecad_expose_part_index(result, argv)
+        result = _resolve_freecad_measurement(
+            result, argv, workdir, root, timeout, path_prefix
+        )
         try:
             command = argv.index("import")
             if argv[command + 1] != "info":

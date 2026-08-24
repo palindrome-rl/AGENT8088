@@ -4690,10 +4690,6 @@ def _run_cli_anything_tool(name: str, args: dict, timeout: int,
             _audit("tool_call", tool=name, mode="browser", decision="denied",
                    detail=detail, reason="outbound_secret")
             return leak
-        blocked = _egress_check(cli_anything.CLI_HUB_REGISTRY) or _ssrf_check(
-            cli_anything.CLI_HUB_REGISTRY)
-        if blocked:
-            return blocked
         if not check_permission("browser", cli_anything.CLI_HUB_REGISTRY,
                                 approval_key=approval_key):
             _audit("escalation_requested", tool=name, mode="browser",
@@ -4705,6 +4701,10 @@ def _run_cli_anything_tool(name: str, args: dict, timeout: int,
                 change_type="network_request",
                 reason="Contact the official CLI-Anything catalog?",
             )
+        blocked = _egress_check(cli_anything.CLI_HUB_REGISTRY) or _ssrf_check(
+            cli_anything.CLI_HUB_REGISTRY)
+        if blocked:
+            return blocked
         policy_mode = "browser"
         display = f"{name}: {detail}"
     else:

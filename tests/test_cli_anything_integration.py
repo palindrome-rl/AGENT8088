@@ -603,6 +603,56 @@ def test_freecad_step_inspection_counts_exported_solids(monkeypatch, tmp_path):
     assert json.loads(result)["estimated_objects"] == 2
 
 
+def test_freecad_resolves_deferred_boolean_measurement(monkeypatch, tmp_path):
+    config = tmp_path / "config.txt"
+    root = cli_anything.integration_root(config)
+    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("placeholder", encoding="utf-8")
+    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
+    (tmp_path / "project.json").write_text(json.dumps({"parts": [
+        {"name": "Final Cut", "type": "cut"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
+    monkeypatch.setattr(cli_anything, "_freecad_macos_bin", lambda: None)
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == str(executable):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({
+                    "kind": "bounding_box", "part_index": 0, "deferred": True,
+                    "min": None, "max": None, "size": None,
+                }), stderr="",
+            )
+        backend = {"returncode": 0, "stdout": (
+            'AGENT8088_METRICS={"volume": 42.0, "min": {"x": 0, "y": 1, "z": 2}, '
+            '"max": {"x": 10, "y": 21, "z": 32}, "size": {"x": 10, "y": 20, "z": 30}}'
+        )}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(backend), stderr="")
+
+    monkeypatch.setattr(cli_anything, "_run", fake_run)
+    result = cli_anything.run(
+        config, "freecad",
+        ["--json", "-p", "project.json", "measure", "bounding-box", "0"], tmp_path,
+    )
+
+    assert json.loads(result) == {
+        "kind": "bounding_box", "part_index": 0, "deferred": False,
+        "min": {"x": 0, "y": 1, "z": 2},
+        "max": {"x": 10, "y": 21, "z": 32},
+        "size": {"x": 10, "y": 20, "z": 30},
+    }
+
+
+def test_freecad_part_result_exposes_zero_based_index():
+    result = cli_anything._freecad_expose_part_index(
+        '{"id": 9, "name": "FuseBaseUpright", "type": "fuse"}',
+        ["--json", "part", "boolean", "fuse", "0", "1"],
+    )
+
+    assert json.loads(result)["index"] == 8
+
+
 def test_freecad_refuses_removing_a_referenced_boolean_operand(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
