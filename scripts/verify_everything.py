@@ -128,7 +128,7 @@ ok("skills loaded",
    {"documentation-writing", "documents", "github-code-review", "plan",
     "systematic-debugging", "test-driven-development",
     "github-pr-workflow", "grounded-citations", "document-to-action-items",
-    "spike", "humanizer", "simplify-code"} <= set(E.SKILL_PACKAGES),
+    "spike", "humanizer", "simplify-code", "cad"} <= set(E.SKILL_PACKAGES),
    ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
