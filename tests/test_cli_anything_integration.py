@@ -184,6 +184,18 @@ def test_safe_arguments_requires_json_array_and_rejects_newlines():
         cli_anything._safe_arguments(["safe", "bad\nargument"])
 
 
+@pytest.mark.parametrize("value", ["freecad", '"freecad"', "`freecad`", "cli-anything-freecad"])
+def test_safe_name_normalizes_common_model_forms(value):
+    assert cli_anything._safe_name(value) == "freecad"
+
+
+def test_safe_name_rejects_non_string_and_shell_syntax():
+    with pytest.raises(TypeError, match="string"):
+        cli_anything._safe_name(["freecad"])
+    with pytest.raises(ValueError, match="letters"):
+        cli_anything._safe_name("freecad; whoami")
+
+
 def test_subprocess_runner_never_uses_a_shell(monkeypatch, tmp_path):
     seen = {}
 

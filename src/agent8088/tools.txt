@@ -28,5 +28,5 @@ cli_anything_install|Install one reviewed Python CLI-Anything harness into Agent
 cli_anything_update|Update one installed Python CLI-Anything harness inside Agent8088's isolated integration environment.|mode=cli_anything|args=name|timeout=300
 cli_anything_uninstall|Remove one installed Python CLI-Anything harness from Agent8088's isolated integration environment.|mode=cli_anything|args=name|timeout=300
 cli_anything_skill|Load the packaged SKILL.md for one harness installed in Agent8088's isolated CLI-Anything environment.|mode=cli_anything|args=name|timeout=15
-cli_anything_run|Run an installed CLI-Anything harness using a structured argument array, never a shell string. Prefer --json in arguments.|mode=cli_anything|args=name,arguments,cwd|arg_types=arguments:array|timeout=300
+cli_anything_run|Run an installed CLI-Anything harness using its catalog name (for example, freecad) and a structured argument array, never a shell string. Prefer --json in arguments.|mode=cli_anything|args=name,arguments,cwd|arg_types=arguments:array|timeout=300
 browse_page|Load a user-supplied web page in a real headless browser and return its text. It is not a routine web-search follow-up.|mode=browser|args=url|timeout=60

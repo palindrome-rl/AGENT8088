@@ -162,9 +162,16 @@ def _result(done: subprocess.CompletedProcess) -> str:
 
 
 def _safe_name(name: object) -> str:
-    value = str(name or "").strip().lower()
+    if not isinstance(name, str):
+        raise TypeError("CLI name must be a string.")
+    value = name.strip().lower()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'`":
+        value = value[1:-1].strip()
+    value = value.removeprefix("cli-anything-")
     if not value or len(value) > MAX_NAME_LENGTH or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", value):
-        raise ValueError("CLI name must contain only letters, numbers, dots, underscores, or hyphens.")
+        raise ValueError(
+            "CLI name must contain only letters, numbers, dots, underscores, or hyphens."
+        )
     return value
 
 
