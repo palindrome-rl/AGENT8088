@@ -314,6 +314,7 @@ expected_tools = {
     # Shares write_text with write_file deliberately: every guard keyed on that
     # mode then applies to it too, with no second gate to keep in sync.
     "create_document": "write_text",
+    "convert_document": "write_text",
 }
 ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")

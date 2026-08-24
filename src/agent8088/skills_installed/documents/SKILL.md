@@ -159,51 +159,44 @@ Editing follows the same open → modify → save pattern:
 ## LibreOffice (soffice) — conversion, legacy formats, formula recalc
 
 The Windows installer tries to install LibreOffice via WinGet, but the install
-can fail or be skipped (offline machine, no WinGet). Check before every use —
-never assume it's there from a previous call.
+can fail or be skipped (offline machine, no WinGet). The `convert_document`
+tool checks for soffice itself and tells you plainly if it's missing — you do
+not need to pre-check before calling it.
 
-**On Windows, `execute_shell` runs `cmd.exe`, not bash.** Use `dir`, not `ls`.
-Use `2>nul`, not `2>/dev/null`. Do not chain with `&&`/`||` expecting POSIX
-semantics. Getting this wrong wastes turns on `'ls' is not recognized` before
-you ever reach the real work. The single most reliable check, which works
-whether or not soffice is on PATH:
+**Converting .docx/.pptx/.xlsx to PDF, or legacy .doc/.ppt/.xls to a modern
+format — use the `convert_document` tool, NOT `execute_shell` with soffice.**
+This is the one thing the tool exists for. It finds soffice, runs the
+conversion, verifies the output file landed on disk, and reports the result.
+Calling `execute_shell` with a raw soffice command instead of `convert_document`
+is the wrong choice even when the command is correct — the tool handles
+quoting, path resolution, and output verification you would have to do by hand.
 
 ```
-execute_shell: if exist "C:\Program Files\LibreOffice\program\soffice.exe" (echo FOUND) else (echo MISSING)
+convert_document: {"filename": "C:/in/report.docx", "format": "pdf"}
 ```
 
-If that says MISSING, also try the `(x86)` path, then `where soffice`. If none
-of them find it, tell the user LibreOffice isn't installed and point them at
-https://www.libreoffice.org/download/ or rerunning the installer — don't
-pretend the conversion happened.
+The output lands next to the source with the same basename and new extension
+(`report.docx` → `report.pdf`). The tool checks the output exists on disk
+rather than trusting soffice's stdout — soffice can print a success line and
+still produce nothing (locked output, unsupported filter).
+
+**Limitation: PDF → docx/pptx/xlsx is NOT supported.** LibreOffice opens PDF
+as a Draw document, and Draw has no export filter for Writer/Impress/Calc
+formats. The tool rejects this combination upfront. To extract text from a
+PDF into an editable document, use a PDF text-extraction library
+(e.g. `pdfplumber`) via `execute_shell` instead — that is a different task
+than format conversion.
 
 **Never run a bare recursive listing** (`dir /s /b` on a project directory)
 to find a file — it returns thousands of lines and buries the answer. Check
-the exact path you were given instead.
-
-**Converting .docx/.pptx/.xlsx to PDF.** `soffice` is usually NOT on PATH —
-call it by full path, quoted (it contains a space):
-
-```
-execute_shell: "C:\Program Files\LibreOffice\program\soffice.exe" --headless --convert-to pdf --outdir "C:\out" "C:\in\report.docx"
-```
-
-The output filename is derived from the input, not chosen by you: `report.docx`
-becomes `report.pdf` in `--outdir`. Verify it exists afterward rather than
-assuming — soffice can print a conversion line and still produce nothing.
-
-**Legacy .doc/.ppt/.xls → modern format**, then read it with `read_text` like
-any other file — this feeds the existing extraction path, no separate reader
-needed:
-
-```
-execute_shell: "C:\Program Files\LibreOffice\program\soffice.exe" --headless --convert-to docx --outdir "C:\out" "C:\in\old.doc"
-read_text: C:\out\old.docx
-```
+the exact path you were given instead. If the user gave a relative path,
+resolve it against the workspace root (the project directory, or `artifacts/`
+for a bare filename).
 
 **Recalculating formulas** in a file you didn't write yourself (e.g. one the
-user handed you with existing formulas): convert it to itself to force a
-recalc, giving the call its own isolated profile directory —
+user handed you with existing formulas): this is the one LibreOffice case
+`convert_document` does NOT cover, because it needs an isolated profile
+directory to avoid collisions. Run it via `execute_shell`:
 
 ```
 execute_shell: "C:\Program Files\LibreOffice\program\soffice.exe" --headless "-env:UserInstallation=file:///C:/temp/lo-profile-1" --convert-to xlsx --outdir "C:\out" "C:\in\data.xlsx"
@@ -215,8 +208,8 @@ fail unpredictably — this project doesn't run `soffice` inside a
 network-restricted sandbox, so a fresh temp dir is enough; nothing heavier is
 needed here.
 
-**Cold start is slow** (3-5s) — well inside `execute_shell`'s default 25s
-timeout, but don't assume the same speed as a Python library call.
+**Cold start is slow** (3-5s) — well inside the tool's 60s timeout, but don't
+assume the same speed as a Python library call.
 
 ## PDF — reportlab
 

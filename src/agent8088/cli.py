@@ -1502,6 +1502,25 @@ def _stream_view(reasoning_parts, content):
 _session_allowlist = set()  # patterns approved for the rest of the session
 
 
+def _drain_queued_keys():
+    """Discard any keystrokes buffered in stdin before an interactive prompt.
+
+    On Windows, when the Rich Live spinner stops and an InquirerPy picker
+    launches, a stray Enter from the terminal transition can be sitting in
+    the input buffer. The picker reads it as an immediate confirmation of
+    the default (which is 'deny' for escalations — fail-closed), so the
+    prompt appears to auto-deny without the user pressing anything. Draining
+    the buffer first ensures only a deliberate keypress reaches the picker.
+    """
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        except (ImportError, OSError):
+            pass
+
+
 def _permission_choice(question, options, typed_prompt, typed_map, default):
     """Ask the user to pick one of `options` — a list of (value, label).
 
@@ -1521,6 +1540,7 @@ def _permission_choice(question, options, typed_prompt, typed_map, default):
         except ImportError:
             pass
         else:
+            _drain_queued_keys()
             return inquirer.select(
                 message=question,
                 choices=[Choice(value, name=label) for value, label in options],

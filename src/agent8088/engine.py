@@ -2050,6 +2050,10 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- A direct request to run a command MUST call execute_shell.")
     if "web_search" in specs:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
+    if "convert_document" in specs:
+        lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
+    if "create_document" in specs:
+        lines.append("- A direct request to create a .docx/.xlsx/.pptx file from content MUST call create_document, not write_file or execute_shell.")
     for name, s in specs.items():
         args = ", ".join(s["args"]) or "no args"
         lines.append(f"- {name}({args}): {s['description']}")
@@ -2676,6 +2680,14 @@ PLAN_REVERT_MAX_BYTES = int(APP_CONFIG.get("plan_audit_revert_max_bytes", str(1 
 # inconclusive verdict at the price of a model call. Reads are absent for the
 # obvious reason — auditing a read tells you the read returned what it returned.
 _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
+# Tools that share a closure mode but are deterministic built-ins whose output
+# is already verified on disk by the tool itself. The auditor runs in a
+# disposable sandbox copy and on Windows hosts cannot even see the real file the
+# step produced, so it returns `fail`/`unknown` from its own blindness — pure
+# noise that costs a model call and tokens, and on a `fail` verdict can revert
+# correct work. Excluded here: convert_document checks output_path.exists() and
+# the byte count itself; there is no model-authored logic to second-guess.
+_NON_AUDITABLE_TOOLS = {"convert_document"}
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
 
@@ -2690,6 +2702,8 @@ def _plan_step_is_auditable(tool_name: str, acceptance: str) -> bool:
     the reported page text is in the auditor's task, so "the page mentions pricing"
     is checkable, while an invented criterion for a page nobody kept would not be.
     """
+    if tool_name in _NON_AUDITABLE_TOOLS:
+        return False
     if acceptance:
         return True
     return TOOL_SPECS.get(tool_name, {}).get("mode") in _CLOSURE_MODES
@@ -5131,6 +5145,19 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # means it cannot skip any of them; only the bytes-on-disk step differs.
         if name == "create_document":
             result = documents.build_document(target, content)
+            _last_write_diff = None  # binary output — a text diff would be noise
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path instead.")
+            return result
+        if name == "convert_document":
+            # Deterministic on purpose: skill-only guidance ("run soffice via
+            # execute_shell") failed twice against the actual target model —
+            # asked to convert an existing file, it wrote a fresh script
+            # generating a different document instead of following the
+            # documented command. This tool removes that choice: the model
+            # names a file and a format, nothing else to substitute.
+            result = documents.convert_document(target, str(args.get("format", "")))
             _last_write_diff = None  # binary output — a text diff would be noise
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "

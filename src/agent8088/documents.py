@@ -366,6 +366,128 @@ def _build_pptx(path, lines):
     return f"Created {path} — {slides} slide(s), {bullets} bullet(s)"
 
 
+# ---------------------------------------------------------------------------
+# Conversion — LibreOffice headless
+# ---------------------------------------------------------------------------
+# Skill-only guidance ("run soffice via execute_shell") proved unreliable
+# against the weak local model this project targets: given "convert X to
+# PDF", it wrote a fresh reportlab script generating an unrelated document
+# from scratch rather than following the documented soffice command, twice,
+# even after the skill was rewritten to lead with that instruction. A
+# deterministic tool the model just calls with two arguments removes the
+# chance to substitute its own approach — same reasoning as build_document.
+CONVERTIBLE_TARGETS = ("pdf", "docx", "pptx", "xlsx")
+
+# LibreOffice headless opens each input format as a specific app, and can only
+# export to that app's formats (plus PDF, which every app exports). PDF is the
+# exception: it opens as a Draw document, and Draw does NOT export to
+# Writer/Impress/Calc formats — so "convert PDF to docx" fails with
+# "no export filter" every time. Mapping this keeps the tool from claiming a
+# conversion is possible, running soffice, and returning a raw filter error
+# that the model then tries to work around with a cascade of shell commands.
+_WRITER_FORMATS = (".docx", ".doc", ".odt", ".rtf")
+_CALC_FORMATS = (".xlsx", ".xls", ".csv", ".ods")
+_IMPRESS_FORMATS = (".pptx", ".ppt", ".odp")
+_DRAW_FORMATS = (".pdf",)  # PDF imports as a Draw doc; Draw exports to pdf/html/png, not docx/pptx/xlsx
+
+_SOFFICE_INSTALL_PATHS = (
+    r"C:\Program Files\LibreOffice\program\soffice.exe",
+    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+)
+
+
+def _soffice_executable():
+    """Find soffice, or None. Checked fresh every call — the installer's
+    LibreOffice step is best-effort and can have failed or been skipped."""
+    import shutil
+    found = shutil.which("soffice")
+    if found:
+        return found
+    for candidate in _SOFFICE_INSTALL_PATHS:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _conversion_is_supported(src_ext: str, target_format: str) -> bool:
+    """Whether LibreOffice headless can convert this source to this target.
+
+    Every app can export to PDF. Within an app family, the native formats
+    convert to each other. PDF is the narrow case: it imports as Draw, and
+    Draw only exports to PDF (and image/html formats we don't expose) — not
+    to docx/pptx/xlsx, which belong to other apps.
+    """
+    src_ext = src_ext.lower()
+    target_format = target_format.lower()
+    if target_format == "pdf":
+        return True  # every app exports to PDF
+    if src_ext in _DRAW_FORMATS:
+        return False  # PDF source can only go to PDF, not to editable formats
+    if src_ext in _WRITER_FORMATS:
+        return target_format in ("docx",)  # expose only the modern Writer target
+    if src_ext in _CALC_FORMATS:
+        return target_format in ("xlsx",)
+    if src_ext in _IMPRESS_FORMATS:
+        return target_format in ("pptx",)
+    return False  # unknown source family
+
+
+def convert_document(path, target_format: str, timeout: int = 60) -> str:
+    """Convert `path` to `target_format` via LibreOffice headless, in place
+    (same directory, same basename, new extension). Returns a summary or a
+    plain-language reason it didn't happen — never raises, so a tool caller
+    can return this string directly as the result.
+    """
+    path = Path(path)
+    target_format = (target_format or "").strip().lower().lstrip(".")
+    if target_format not in CONVERTIBLE_TARGETS:
+        return (f"Cannot convert to '{target_format}'. Supported targets: "
+                 f"{', '.join(CONVERTIBLE_TARGETS)}.")
+
+    src_ext = path.suffix.lower()
+    if not _conversion_is_supported(src_ext, target_format):
+        # Be explicit: name the unsupported pair and what IS supported for this
+        # source, so the model does not fall back to a shell workaround cascade.
+        if src_ext == ".pdf":
+            hint = ("PDF can only be re-exported as PDF via LibreOffice. "
+                    "To extract PDF text into an editable document, use a "
+                    "PDF-to-text tool or library (e.g. pdfplumber) instead.")
+        else:
+            hint = f"Convert {src_ext} files to one of: {', '.join(CONVERTIBLE_TARGETS)}."
+        return (f"Conversion not supported: {src_ext} -> .{target_format}. {hint}")
+
+    soffice = _soffice_executable()
+    if not soffice:
+        return ("LibreOffice is not installed, so conversion is unavailable. "
+                 "Install it with: winget install TheDocumentFoundation.LibreOffice "
+                 "(or rerun the Agent8088 installer), then try again.")
+
+    if not path.exists():
+        return f"Cannot convert: {path} does not exist."
+
+    output_path = path.with_suffix("." + target_format)
+    import subprocess
+    try:
+        result = subprocess.run(
+            [soffice, "--headless", "--convert-to", target_format,
+             "--outdir", str(path.parent), str(path)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return (f"LibreOffice timed out after {timeout}s converting {path.name}. "
+                 "A first-run profile setup can be slow — try again.")
+
+    # soffice can print a success-looking line and still not produce the file
+    # (locked output, unsupported filter for this input) — check disk, not
+    # the exit code or stdout text, before claiming success.
+    if not output_path.exists():
+        detail = (result.stderr or result.stdout or "no output from soffice").strip()
+        return (f"Conversion failed: {path.name} was not converted to "
+                 f"{target_format}. LibreOffice said: {detail[:300]}")
+
+    return f"Converted {path.name} to {output_path.name} ({output_path.stat().st_size} bytes)."
+
+
 if __name__ == "__main__":
     # Minimal self-check: build a real .docx/.pptx in a temp dir and confirm
     # extraction round-trips. Run with: python -m agent8088.documents
