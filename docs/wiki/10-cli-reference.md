@@ -48,8 +48,12 @@ By default `--uninstall` removes everything the installer created: the
 install directory (venv, bundled uv/Node, sandbox runtime), the `agent8088`
 command shim, the `PATH` and `AGENT8088_CONFIG` lines it added to shell rc
 files (or the Windows user-environment `PATH` entries for the bundled
-Git/Node on Windows), and any crontab entries or Windows Task Scheduler
-entries a `cron_mode` schedule registered.
+Git/Node on Windows), any crontab entries or Windows Task Scheduler entries a
+`cron_mode` schedule registered, and the SearXNG Docker container from
+`/search setup` if one exists — it runs with `--restart unless-stopped`, so
+Docker itself would otherwise keep it running (and restart it on reboot)
+indefinitely, since deleting the install directory doesn't touch a running
+container.
 
 Two things are deliberately **not** touched:
 

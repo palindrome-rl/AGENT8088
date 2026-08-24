@@ -325,3 +325,91 @@ def test_run_uninstall_workspace_flag_true_removes_default_data(tmp_path, monkey
 
     assert result is True
     assert not trace_dir.exists(), "--workspace must remove default user data"
+
+
+# --- SearXNG Docker container cleanup ---------------------------------------
+#
+# searxng_provision.start() runs the container with `--restart unless-stopped`,
+# so Docker itself keeps it alive (and restarts it on reboot) until something
+# explicitly removes it - deleting $AGENT8088_HOME never touches a running
+# container, since it isn't a file. Before this, --uninstall left it running
+# indefinitely, bound to 127.0.0.1, with a now-deleted bind-mounted config dir.
+
+def test_searxng_container_exists_true_when_running_or_stopped(monkeypatch):
+    for detail in ("running", "container exists but is stopped"):
+        monkeypatch.setattr(cli.searxng_provision, "status", lambda d=detail: {"detail": d})
+        assert cli._agent8088_searxng_container_exists() is True
+
+
+def test_searxng_container_exists_false_when_absent_or_no_docker(monkeypatch):
+    for detail in ("docker is not installed", "container does not exist"):
+        monkeypatch.setattr(cli.searxng_provision, "status", lambda d=detail: {"detail": d})
+        assert cli._agent8088_searxng_container_exists() is False
+
+
+def test_remove_agent8088_searxng_container_stops_it_when_present(monkeypatch):
+    monkeypatch.setattr(cli.searxng_provision, "status", lambda: {"detail": "running"})
+    stop_calls = []
+    monkeypatch.setattr(cli.searxng_provision, "stop",
+                         lambda: stop_calls.append(1) or {"ok": True, "detail": "removed"})
+
+    removed = cli._remove_agent8088_searxng_container()
+
+    assert removed is True
+    assert stop_calls == [1]
+
+
+def test_remove_agent8088_searxng_container_noop_when_absent(monkeypatch):
+    monkeypatch.setattr(cli.searxng_provision, "status", lambda: {"detail": "container does not exist"})
+    stop_calls = []
+    monkeypatch.setattr(cli.searxng_provision, "stop", lambda: stop_calls.append(1) or {"ok": True})
+
+    removed = cli._remove_agent8088_searxng_container()
+
+    assert removed is False
+    assert stop_calls == [], "stop() must not be called for a container that was never created"
+
+
+def test_describe_agent8088_side_effects_lists_searxng_container(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_agent8088_link_dir", lambda: tmp_path / ".local" / "bin")
+    monkeypatch.setattr(cli.subprocess, "run",
+                         lambda cmd, **kw: mock.Mock(returncode=1, stdout="", stderr=""))
+    monkeypatch.setattr(cli.searxng_provision, "status", lambda: {"detail": "running"})
+
+    lines = cli._describe_agent8088_side_effects(tmp_path / "agent8088")
+
+    assert any("SearXNG" in line for line in lines)
+
+
+def test_run_uninstall_removes_searxng_container(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "agent8088"
+    home.mkdir()
+    monkeypatch.setattr(cli, "_agent8088_home", lambda: home)
+    monkeypatch.setattr(cli, "_describe_agent8088_side_effects", lambda *_a, **_kw: [])
+    monkeypatch.setattr(cli, "_remove_agent8088_shim", lambda _home: False)
+    monkeypatch.setattr(cli, "_remove_agent8088_config_exports", lambda: 0)
+    monkeypatch.setattr(cli, "_remove_agent8088_path_exports", lambda: 0)
+    monkeypatch.setattr(cli, "_remove_agent8088_crontab_entries", lambda: 0)
+    monkeypatch.setattr(cli, "_warn_shared_playwright_cache", lambda: None)
+    monkeypatch.setattr(cli, "_remove_agent8088_searxng_container", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: "yes")
+
+    result = cli._run_uninstall()
+
+    assert result is True
+    assert "Removed the SearXNG Docker container." in capsys.readouterr().out
+
+
+def test_run_uninstall_dry_run_never_touches_searxng(tmp_path, monkeypatch):
+    home = tmp_path / "agent8088"
+    home.mkdir()
+    monkeypatch.setattr(cli, "_agent8088_home", lambda: home)
+    monkeypatch.setattr(cli, "_describe_agent8088_side_effects", lambda *_a, **_kw: [])
+
+    def _fail_if_called():
+        raise AssertionError("--dry-run must not touch the SearXNG container")
+
+    monkeypatch.setattr(cli, "_remove_agent8088_searxng_container", _fail_if_called)
+
+    assert cli._run_uninstall(dry_run=True) is True

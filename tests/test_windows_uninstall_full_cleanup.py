@@ -111,6 +111,7 @@ def test_run_windows_uninstall_removes_git_and_node_path_entries(tmp_path, monke
     monkeypatch.setattr(cli, "_purge_install_tree", lambda _home: [])
     monkeypatch.setattr(cli, "_remove_windows_launcher_dir", lambda _link_dir: None)
     monkeypatch.setattr(cli, "_warn_shared_playwright_cache", lambda: None)
+    monkeypatch.setattr(cli, "_remove_agent8088_searxng_container", lambda: False)
 
     assert cli._run_windows_uninstall(home)
 
@@ -128,6 +129,7 @@ def test_run_windows_uninstall_deletes_registered_scheduled_tasks(tmp_path, monk
     monkeypatch.setattr(cli, "_purge_install_tree", lambda _home: [])
     monkeypatch.setattr(cli, "_remove_windows_launcher_dir", lambda _link_dir: None)
     monkeypatch.setattr(cli, "_warn_shared_playwright_cache", lambda: None)
+    monkeypatch.setattr(cli, "_remove_agent8088_searxng_container", lambda: False)
     monkeypatch.setattr(cli.shutil, "which", lambda _n: "schtasks.exe")
     schtasks_calls = []
     monkeypatch.setattr(cli.subprocess, "run",
@@ -147,6 +149,7 @@ def test_run_windows_uninstall_keeps_workspace_data_by_default(tmp_path, monkeyp
     monkeypatch.setattr(cli, "_purge_install_tree", lambda _home: [])
     monkeypatch.setattr(cli, "_remove_windows_launcher_dir", lambda _link_dir: None)
     monkeypatch.setattr(cli, "_warn_shared_playwright_cache", lambda: None)
+    monkeypatch.setattr(cli, "_remove_agent8088_searxng_container", lambda: False)
     removed_calls = []
     monkeypatch.setattr(cli, "_remove_agent8088_workspace_data", lambda: removed_calls.append(1) or 2)
 
@@ -155,3 +158,31 @@ def test_run_windows_uninstall_keeps_workspace_data_by_default(tmp_path, monkeyp
 
     assert cli._run_windows_uninstall(home, workspace=True)
     assert removed_calls == [1]
+
+
+def test_run_windows_uninstall_removes_searxng_container(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "agent8088"
+    home.mkdir()
+    monkeypatch.setattr(cli, "_remove_windows_user_environment", lambda *_paths: True)
+    monkeypatch.setattr(cli, "_windows_processes_in_tree", lambda _home: [])
+    monkeypatch.setattr(cli, "_purge_install_tree", lambda _home: [])
+    monkeypatch.setattr(cli, "_remove_windows_launcher_dir", lambda _link_dir: None)
+    monkeypatch.setattr(cli, "_warn_shared_playwright_cache", lambda: None)
+    monkeypatch.setattr(cli, "_remove_agent8088_searxng_container", lambda: True)
+
+    assert cli._run_windows_uninstall(home)
+
+    assert "Removed the SearXNG Docker container." in capsys.readouterr().out
+
+
+def test_run_windows_uninstall_removes_searxng_container_even_if_home_already_gone(tmp_path, monkeypatch, capsys):
+    """The container is Docker's responsibility, not the filesystem's - it must
+    still get cleaned up even when $AGENT8088_HOME was already deleted by hand."""
+    home = tmp_path / "agent8088"  # deliberately never created
+    monkeypatch.setattr(cli, "_remove_windows_user_environment", lambda *_paths: True)
+    monkeypatch.setattr(cli, "_remove_windows_launcher_dir", lambda _link_dir: None)
+    monkeypatch.setattr(cli, "_remove_agent8088_searxng_container", lambda: True)
+
+    assert cli._run_windows_uninstall(home)
+
+    assert "Removed the SearXNG Docker container." in capsys.readouterr().out

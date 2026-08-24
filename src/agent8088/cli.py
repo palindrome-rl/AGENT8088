@@ -4287,6 +4287,31 @@ def _warn_shared_playwright_cache():
         print(f'  To remove it yourself: rm -rf "{cache_dir}"')
 
 
+def _agent8088_searxng_container_exists():
+    """Whether the agent8088-managed SearXNG container currently exists.
+
+    Read-only - used by the pre-delete preview/--dry-run. Docker being absent
+    or the container never having been provisioned both count as "no".
+    """
+    status = searxng_provision.status()
+    return status.get("detail") not in ("docker is not installed", "container does not exist")
+
+
+def _remove_agent8088_searxng_container():
+    """Stop and remove the agent8088-managed SearXNG Docker container.
+
+    `searxng_provision.start()` runs it with `--restart unless-stopped`, so
+    Docker itself keeps the container alive - and restarts it on reboot -
+    until something explicitly removes it. Deleting $AGENT8088_HOME never
+    touches it, since a running container isn't a file. Docker being absent,
+    or the container never having been started, are both silent no-ops here.
+    """
+    if not _agent8088_searxng_container_exists():
+        return False
+    result = searxng_provision.stop()
+    return bool(result.get("ok"))
+
+
 def _windows_owned_path_entries(home):
     """Every Windows user-PATH entry an agent8088 install can add.
 
@@ -4387,6 +4412,9 @@ def _describe_agent8088_side_effects(home, include_workspace=False):
                     lines.append(f"{len(marked)} crontab entr{'y' if len(marked) == 1 else 'ies'}")
         except (OSError, subprocess.TimeoutExpired):
             pass
+
+    if _agent8088_searxng_container_exists():
+        lines.append(f"SearXNG Docker container ({searxng_provision.CONTAINER_NAME})")
 
     if include_workspace:
         default_trace_dir = _default_agent8088_trace_dir()
@@ -4858,6 +4886,9 @@ def _run_windows_uninstall(home, workspace=False):
     if environment_result:
         _say("Removed Agent8088 entries from the user PATH.")
 
+    if _remove_agent8088_searxng_container():
+        _say("Removed the SearXNG Docker container.")
+
     if not home.exists():
         _say(f"Install directory not found: {home}")
         _remove_windows_launcher_dir(link_dir)
@@ -4954,6 +4985,12 @@ def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
 
     if os.name == "nt":
         return _run_windows_uninstall(home, workspace=workspace)
+
+    if _remove_agent8088_searxng_container():
+        print("Removed the SearXNG Docker container.")
+        # Stopping it first, before the directory it bind-mounts is deleted,
+        # avoids the container racing this rmtree and leaving a freshly
+        # written file behind for _clear_readonly to trip over.
 
     if home.exists():
         shutil.rmtree(home, onerror=_clear_readonly)
