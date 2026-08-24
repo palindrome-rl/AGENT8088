@@ -6826,7 +6826,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     spin = spin or (lambda msg: nullcontext())
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
-    seen = set()      # (name, args) signatures already run -> breaks loops
+    last_completed = None  # consecutive identical call -> (signature, output)
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
@@ -7060,16 +7060,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                      "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                     continue
 
-            if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
-                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, _last_tool_output)}"
-                          if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
+            # Only consecutive repeats are safe to cache. A matching read after
+            # another tool call may observe state that changed in between.
+            if ("__parse_error__" not in args and last_completed
+                    and sig == last_completed[0]):
+                previous_output = last_completed[1]
+                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
+                          if previous_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
                 if turn_tools is not None:
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
 
-            if "__parse_error__" not in args:
-                seen.add(sig)
             # The user may have hit ESC while this response was still streaming.
             # Without a check here the tool they just cancelled runs anyway, and
             # the interrupt is only noticed at the top of the next turn — after
@@ -7093,7 +7095,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # a sub-run the text travels on as evidence the step failed.
             if _is_missing_argument_error(result) and missing_args_retries < 2:
                 missing_args_retries += 1
-                seen.discard(sig)
                 messages.append({"role": "user", "content": result})
                 if trace is not None:
                     trace.append({"turn": turn, "type": "missing_tool_args",
@@ -7109,19 +7110,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # pending approval was filed as a completed one, so the retry the
                 # user had just authorised was answered from the escalation text.
                 search_results[_search_signature(str(args.get("query") or ""))] = result
-                if not _search_was_usable(result):
-                    # An errored or empty search must stay retryable, and the
-                    # byte-exact `seen` guard above would otherwise block the
-                    # identical retry before the equivalence check runs. Same
-                    # discard the escalation path uses.
-                    seen.discard(sig)
             searched = searched or (name == "web_search" and _search_was_usable(result))
 
-            # A granted escalation retries the exact call once; remove it from the
-            # repeat guard before asking the UI for approval.
             blocked = result.startswith("ESCALATION_REQUEST\x1f")
-            if blocked:
-                seen.discard(sig)
 
             if on_result:
                 on_result(name, result)
@@ -7148,6 +7139,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Permission denied by the user. You remain in readonly mode. "
                     "Tell the user what you could not do and why the task cannot be completed."})
                 continue
+
+            if ("__parse_error__" not in args
+                    and not (name == "web_search" and not _search_was_usable(result))):
+                last_completed = (sig, result)
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}

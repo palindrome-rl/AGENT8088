@@ -26,6 +26,41 @@ def test_cli_anything_skill_reaches_the_model_without_ordinary_tool_truncation(e
     assert "[tool result truncated:" in engine._tool_result_for_model("cli_anything_search", skill)
 
 
+def test_cli_anything_read_can_repeat_after_a_state_change(monkeypatch, engine):
+    info = {"name": "freecad", "arguments": ["part", "info", "0"], "cwd": "."}
+    mutate = {"name": "freecad", "arguments": ["part", "boolean", "cut", "0", "1"], "cwd": "."}
+    responses = [
+        f"✿FUNCTION✿: cli_anything_run ✿ARGS✿: {json.dumps(info)}",
+        f"✿FUNCTION✿: cli_anything_run ✿ARGS✿: {json.dumps(mutate)}",
+        f"✿FUNCTION✿: cli_anything_run ✿ARGS✿: {json.dumps(info)}",
+        f"✿FUNCTION✿: cli_anything_run ✿ARGS✿: {json.dumps(info)}",
+        "done",
+    ]
+    executed = []
+
+    def completion(*_args, **_kwargs):
+        content = responses.pop(0)
+        message = type("Message", (), {"content": content})()
+        choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+        return type("Response", (), {"choices": [choice]})()
+
+    def execute(name, raw_args, **_kwargs):
+        executed.append((name, json.loads(raw_args)))
+        return ("before", "mutated", "after")[len(executed) - 1]
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    monkeypatch.setattr(engine, "exec_tool", execute)
+    messages = [{"role": "user", "content": "Test a stateful CLI workflow."}]
+
+    assert engine.run_agent(
+        messages, max_turns=5, system_prompt="", tools_def=[],
+        allowed_tools={"cli_anything_run"},
+    ) == "done"
+    assert [args for _name, args in executed] == [info, mutate, info]
+    assert any("already ran with this output" in message["content"]
+               and "after" in message["content"] for message in messages)
+
+
 def test_view_skill_loads_text_and_rejects_traversal(engine):
     loaded = engine.run_tool(
         "view_skill", {"name": "cli-anything", "resource": "SKILL.md"}
