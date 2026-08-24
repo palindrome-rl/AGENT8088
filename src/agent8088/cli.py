@@ -4158,6 +4158,247 @@ def _remove_agent8088_config_exports():
     return removed
 
 
+def _remove_agent8088_path_exports():
+    """Remove the exact PATH line install.sh's setup_path() appended.
+
+    Matched by exact line content, not a substring on link_dir - a user's own
+    hand-written PATH edit that happens to mention the same directory in a
+    different form (quoting, order, appended comment) is left alone rather
+    than guessed at.
+    """
+    link_dir = _agent8088_link_dir()
+    path_line = f'export PATH="{link_dir}:$PATH"'
+    removed = 0
+    for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
+               Path.home() / ".bashrc", Path.home() / ".bash_profile",
+               Path.home() / ".profile"):
+        if not rc.exists() or not rc.is_file():
+            continue
+        lines = rc.read_text(encoding="utf-8", errors="ignore").splitlines()
+        kept = [line for line in lines if line.strip() != path_line]
+        if kept != lines:
+            rc.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            removed += 1
+    return removed
+
+
+def _remove_agent8088_crontab_entries():
+    """Remove crontab lines this process added (marked with engine._CRON_MARKER).
+
+    Leaves every other line - including ones from other software - untouched.
+    """
+    from agent8088.engine import _CRON_MARKER
+
+    try:
+        current = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if current.returncode != 0:
+        return 0  # no crontab for this user, or `crontab` unavailable
+
+    lines = current.stdout.splitlines()
+    kept = [line for line in lines if _CRON_MARKER not in line]
+    if kept == lines:
+        return 0
+
+    payload = "\n".join(kept) + ("\n" if kept else "")
+    try:
+        subprocess.run(["crontab", "-"], input=payload, capture_output=True,
+                        text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    return len(lines) - len(kept)
+
+
+def _default_agent8088_trace_dir():
+    return Path.home() / "Documents" / "agent8088" / "traces"
+
+
+def _default_agent8088_whatsapp_session_dir():
+    return Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
+
+
+def _remove_agent8088_workspace_data():
+    """Remove the trace-log and WhatsApp session directories, but only when
+    they're still at the compiled-in default path. A path the user pointed
+    somewhere else (AGENT8088_TRACE_DIR, or a custom whatsapp_session_dir in
+    config.txt) is left alone rather than guessed at - it may not even be
+    agent8088-exclusive storage.
+
+    Opt-in only (see the --workspace flag on --uninstall) - like OpenClaw's
+    `uninstall --workspace`, user-generated data is not deleted unless asked
+    for, even though program files and installation side effects are.
+    """
+    def _prune_empty_ancestors(path, stop_at):
+        parent = path.parent
+        while parent != stop_at and parent.exists():
+            try:
+                next(parent.iterdir())
+                break  # not empty
+            except StopIteration:
+                pass
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    removed = 0
+    default_trace_dir = _default_agent8088_trace_dir()
+    if "AGENT8088_TRACE_DIR" not in os.environ and default_trace_dir.exists():
+        shutil.rmtree(default_trace_dir, ignore_errors=True)
+        removed += 1
+        _prune_empty_ancestors(default_trace_dir, Path.home() / "Documents")
+
+    default_wa_dir = _default_agent8088_whatsapp_session_dir()
+    if default_wa_dir.exists():
+        shutil.rmtree(default_wa_dir, ignore_errors=True)
+        removed += 1
+        _prune_empty_ancestors(default_wa_dir, Path.home() / ".local" / "share")
+
+    return removed
+
+
+def _shared_playwright_cache_dir():
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ms-playwright"
+
+
+def _warn_shared_playwright_cache():
+    """Playwright's default browser cache can be shared with other projects
+    on this machine - never delete it automatically. New agent8088 installs
+    avoid this entirely (see engine.py's _exec_browser setting
+    PLAYWRIGHT_BROWSERS_PATH), but a pre-existing install's Chromium download
+    still lives there.
+    """
+    cache_dir = _shared_playwright_cache_dir()
+    if not cache_dir.exists():
+        return
+    print(f"Note: Playwright's Chromium browser was left in place at {cache_dir}")
+    print("  It may be shared with other projects on this machine, so it wasn't removed.")
+    if os.name == "nt":
+        print(f'  To remove it yourself: Remove-Item -Recurse -Force "{cache_dir}"')
+    else:
+        print(f'  To remove it yourself: rm -rf "{cache_dir}"')
+
+
+def _windows_owned_path_entries(home):
+    """Every Windows user-PATH entry an agent8088 install can add.
+
+    Shared by the actual removal (_run_windows_uninstall) and the read-only
+    preview (_describe_agent8088_side_effects) so the two can't drift apart.
+    """
+    return (
+        _agent8088_link_dir(),
+        home / "bin",
+        home / "agent8088" / "venv" / "Scripts",
+        home / "git" / "cmd",
+        home / "git" / "bin",
+        home / "git" / "usr" / "bin",
+        home / "node",
+    )
+
+
+def _remove_windows_scheduled_tasks(home):
+    """Delete every Task Scheduler entry this install registered.
+
+    scheduled-tasks.json (inside home) is the authoritative list of task IDs
+    this install created - read it before home gets purged, and delete each
+    task by its exact `Agent8088-<id>` name so nothing else on the machine's
+    task list is touched.
+    """
+    registry = home / "scheduled-tasks.json"
+    try:
+        entries = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(entries, list):
+        return 0
+
+    scheduler = shutil.which("schtasks.exe") or shutil.which("schtasks") or "schtasks.exe"
+    removed = 0
+    for entry in entries:
+        task_id = str(entry.get("id", ""))
+        if not re.fullmatch(r"[0-9a-f]{16}", task_id):
+            continue
+        task_name = f"Agent8088-{task_id}"
+        try:
+            subprocess.run([scheduler, "/Delete", "/TN", task_name, "/F"],
+                            capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        removed += 1
+    return removed
+
+
+def _describe_agent8088_side_effects(home, include_workspace=False):
+    """List every agent8088-owned side effect found outside $AGENT8088_HOME,
+    for the pre-delete confirmation prompt and --dry-run. Read-only - detects,
+    never removes.
+    """
+    lines = []
+    if os.name == "nt":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_QUERY_VALUE)
+            try:
+                user_path, _ = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                user_path = ""
+            finally:
+                winreg.CloseKey(key)
+        except OSError:
+            user_path = ""
+
+        def _normal(value):
+            value = os.path.expandvars(str(value).strip().strip('"'))
+            return os.path.normcase(os.path.normpath(value))
+
+        owned = {_normal(p) for p in _windows_owned_path_entries(home)}
+        present = [e for e in user_path.split(";") if e.strip() and _normal(e) in owned]
+        if present:
+            lines.append(f"{len(present)} PATH entr{'y' if len(present) == 1 else 'ies'} in the Windows user environment")
+
+        try:
+            entries = json.loads((home / "scheduled-tasks.json").read_text(encoding="utf-8"))
+            if isinstance(entries, list) and entries:
+                lines.append(f"{len(entries)} Windows Task Scheduler entr{'y' if len(entries) == 1 else 'ies'}")
+        except (OSError, ValueError):
+            pass
+    else:
+        link_dir = _agent8088_link_dir()
+        path_line = f'export PATH="{link_dir}:$PATH"'
+        for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
+                   Path.home() / ".bashrc", Path.home() / ".bash_profile",
+                   Path.home() / ".profile"):
+            if rc.exists() and path_line in rc.read_text(encoding="utf-8", errors="ignore").splitlines():
+                lines.append(f"PATH line in {rc}")
+        try:
+            current = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=20)
+            if current.returncode == 0:
+                from agent8088.engine import _CRON_MARKER
+                marked = [l for l in current.stdout.splitlines() if _CRON_MARKER in l]
+                if marked:
+                    lines.append(f"{len(marked)} crontab entr{'y' if len(marked) == 1 else 'ies'}")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if include_workspace:
+        default_trace_dir = _default_agent8088_trace_dir()
+        if "AGENT8088_TRACE_DIR" not in os.environ and default_trace_dir.exists():
+            lines.append(f"Trace log directory: {default_trace_dir}")
+        default_wa_dir = _default_agent8088_whatsapp_session_dir()
+        if default_wa_dir.exists():
+            lines.append(f"WhatsApp session directory: {default_wa_dir}")
+
+    return lines
+
+
 def _remove_windows_user_environment(*owned_path_entries):
     """Remove only the Windows user-environment entries Agent8088 owns."""
     import winreg
@@ -4591,7 +4832,7 @@ def _stop_windows_processes(processes):
     return stopped
 
 
-def _run_windows_uninstall(home):
+def _run_windows_uninstall(home, workspace=False):
     # Everything the rest of this run needs is imported up front. The purge below
     # deletes the library this interpreter is running out of - a managed Python
     # lives inside the install too - so any later import could land on a file
@@ -4609,10 +4850,8 @@ def _run_windows_uninstall(home):
         print(message, flush=True)
 
     link_dir = _agent8088_link_dir()
-    managed_bin = home / "bin"
-    legacy_scripts = home / "agent8088" / "venv" / "Scripts"
 
-    environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
+    environment_result = _remove_windows_user_environment(*_windows_owned_path_entries(home))
     if environment_result is None:
         _say("Uninstall stopped: the Windows user environment could not be updated.")
         return False
@@ -4625,6 +4864,10 @@ def _run_windows_uninstall(home):
         _say("Agent8088 user environment entries removed.")
         return True
 
+    removed_tasks = _remove_windows_scheduled_tasks(home)
+    if removed_tasks:
+        _say(f"Removed {removed_tasks} scheduled task(s) from Windows Task Scheduler.")
+
     blockers = _windows_processes_in_tree(home)
     if blockers:
         _say(f"{len(blockers)} Agent8088 process(es) are still running from the install:")
@@ -4632,6 +4875,12 @@ def _run_windows_uninstall(home):
             _say(f"  {name} (pid {pid})")
         _say("Stopping them; Windows cannot delete a running program.")
         _stop_windows_processes(blockers)
+
+    if workspace:
+        removed_data = _remove_agent8088_workspace_data()
+        if removed_data:
+            _say(f"Removed {removed_data} workspace data director{'y' if removed_data == 1 else 'ies'}.")
+    _warn_shared_playwright_cache()
 
     with _UninstallActivity("Deleting Agent8088 files"):
         leftovers = _purge_install_tree(home)
@@ -4657,19 +4906,32 @@ def _run_windows_uninstall(home):
     return True
 
 
-def _run_uninstall():
+def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
     import shutil
     import stat
     home = _agent8088_home()
+    side_effects = _describe_agent8088_side_effects(home, include_workspace=workspace)
     print(f"This will permanently remove Agent8088 from: {home}")
-    try:
-        answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
-    except EOFError:
-        print("Uninstall cancelled.")
-        return False
-    if answer.strip() != "yes":
-        print("Uninstall cancelled.")
-        return False
+    if side_effects:
+        print("It will also remove:")
+        for line in side_effects:
+            print(f"  - {line}")
+    if not workspace:
+        print("(trace logs and the WhatsApp session directory are kept - pass --workspace or --all to remove them too)")
+
+    if dry_run:
+        print("(--dry-run: nothing was removed)")
+        return True
+
+    if not assume_yes:
+        try:
+            answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
+        except EOFError:
+            print("Uninstall cancelled.")
+            return False
+        if answer.strip() != "yes":
+            print("Uninstall cancelled.")
+            return False
     if not _safe_uninstall_home(home):
         print(f"Refusing to remove unsafe path: {home}")
         return False
@@ -4691,7 +4953,7 @@ def _run_uninstall():
             pass
 
     if os.name == "nt":
-        return _run_windows_uninstall(home)
+        return _run_windows_uninstall(home, workspace=workspace)
 
     if home.exists():
         shutil.rmtree(home, onerror=_clear_readonly)
@@ -4723,6 +4985,13 @@ def _run_uninstall():
         pass
     if os.name != "nt":
         _remove_agent8088_config_exports()
+        _remove_agent8088_path_exports()
+        _remove_agent8088_crontab_entries()
+    if workspace:
+        removed_data = _remove_agent8088_workspace_data()
+        if removed_data:
+            print(f"Removed {removed_data} workspace data director{'y' if removed_data == 1 else 'ies'}.")
+    _warn_shared_playwright_cache()
     print("Done. Open a NEW terminal for PATH to refresh.")
     return True
 
@@ -5605,6 +5874,22 @@ def main():
     parser.add_argument("--mode", choices=["readonly", "full-auto"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
+    # Flag names/semantics follow OpenClaw's `uninstall` command (--workspace,
+    # --all, --yes, --non-interactive, --dry-run): program files and
+    # installation side effects (PATH entries, cron/scheduled tasks) are
+    # always removed, but user-generated data is opt-in, matching
+    # OpenClaw's "state vs workspace" split rather than deleting everything
+    # by default.
+    parser.add_argument("--workspace", action="store_true",
+                        help="with --uninstall: also remove trace logs and the WhatsApp session directory")
+    parser.add_argument("--all", action="store_true",
+                        help="with --uninstall: shorthand for --workspace")
+    parser.add_argument("--yes", action="store_true",
+                        help="with --uninstall: skip the confirmation prompt")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="with --uninstall: never prompt; requires --yes")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --uninstall: print what would be removed, remove nothing")
     parser.add_argument("--update", action="store_true",
                         help=f"update to the latest commit of {UPDATE_BRANCH} + reinstall, then exit")
     parser.add_argument("--force", action="store_true",
@@ -5648,7 +5933,14 @@ def main():
         return rc if isinstance(rc, int) else 0
 
     if args.uninstall:
-        uninstall_ok = _run_uninstall()
+        if args.non_interactive and not args.yes:
+            print("--non-interactive requires --yes.")
+            return 1 if os.name == "nt" else None
+        uninstall_ok = _run_uninstall(
+            workspace=args.workspace or args.all,
+            assume_yes=args.yes,
+            dry_run=args.dry_run,
+        )
         return (0 if uninstall_ok else 1) if os.name == "nt" else None
     if args.update:
         _run_update(force=args.force)

@@ -3275,6 +3275,15 @@ def _exec_browser(args: dict) -> str:
         return ("Playwright is not installed. Install it with:\n"
                 "  pip install playwright && playwright install chromium\n"
                 "Until then, use web_search or get_page_title instead.")
+    # Keep Chromium's ~280MB download inside $AGENT8088_HOME rather than the
+    # OS-default shared cache (~/.cache/ms-playwright etc.) - that shared
+    # cache can belong to other Playwright-using projects on the same
+    # machine, so `agent8088 --uninstall` cannot safely delete it. Installing
+    # into our own subdirectory means the existing home-directory wipe
+    # already covers it, with no separate cleanup logic needed.
+    os.environ.setdefault(
+        "PLAYWRIGHT_BROWSERS_PATH", str(_agent_data_dir() / "playwright-browsers")
+    )
     selector = str(args.get("selector") or "").strip()
     try:
         from playwright.sync_api import sync_playwright
