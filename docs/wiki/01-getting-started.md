@@ -8,8 +8,15 @@
 - A model endpoint — either local [Ollama](https://ollama.com) or any
   OpenAI-compatible API key
 - Optional: Node.js 20.11+ for the native sandbox and the WhatsApp bridge
+- Optional (Windows): LibreOffice, for `.docx`/`.pptx`/`.xlsx`→PDF conversion,
+  legacy `.doc`/`.ppt`/`.xls` reading, and Excel formula recalculation. The
+  installer tries to install it via WinGet; if that fails (no WinGet, offline
+  machine) it's skipped with a warning rather than blocking setup — those
+  three capabilities are simply unavailable until it's installed manually.
 
-No admin rights are needed for the base install.
+No admin rights are needed for the base install. WinGet may prompt for
+elevation when installing LibreOffice specifically, since it's a per-machine
+install — that's WinGet's own prompt, not something this installer requests.
 
 ## Install
 

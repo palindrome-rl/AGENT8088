@@ -800,6 +800,56 @@ function Install-WindowsTerminal {
     return $false
 }
 
+# ----------------------------------------------------------------------------
+# LibreOffice (headless soffice) - .docx/.pptx to PDF conversion, legacy
+# .doc/.ppt/.xls reading, Excel formula recalculation. Used by the `documents`
+# skill via execute_shell; nothing in engine.py depends on it existing.
+#
+# No vendor-published portable/no-admin distribution exists for LibreOffice
+# the way there is for Node.js, so WinGet is the only silent install path.
+# Modeled directly on Install-WindowsTerminal above: same non-interactive
+# invocation, same "warn and register a skipped stage, never abort the whole
+# installer" contract as every other optional component here.
+# ----------------------------------------------------------------------------
+function Install-LibreOffice {
+    $sofficePaths = @(
+        "$env:ProgramFiles\LibreOffice\program\soffice.exe",
+        "${env:ProgramFiles(x86)}\LibreOffice\program\soffice.exe"
+    )
+    $existing = $sofficePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($existing) {
+        Write-Success "LibreOffice found at $existing"
+        return $true
+    }
+
+    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $winget) {
+        Write-Warn "WinGet not found - cannot install LibreOffice automatically."
+        Register-SkippedStage -Label "LibreOffice" `
+            -Reason "no WinGet available" `
+            -Fix "install App Installer from the Microsoft Store, then rerun, or install LibreOffice manually from https://www.libreoffice.org/download/"
+        return $false
+    }
+
+    Write-Info "Installing LibreOffice (needed for .docx/.pptx to PDF conversion and legacy .doc/.ppt/.xls) ..."
+    & $winget.Source install --id TheDocumentFoundation.LibreOffice --exact --source winget `
+        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
+    $wingetExit = $LASTEXITCODE
+
+    $installed = $sofficePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($installed) {
+        Write-Success "LibreOffice installed at $installed"
+        return $true
+    }
+
+    Write-Warn "LibreOffice install did not complete (WinGet exit $wingetExit)."
+    Register-SkippedStage -Label "LibreOffice" `
+        -Reason "WinGet install failed (exit $wingetExit)" `
+        -Fix "install LibreOffice manually from https://www.libreoffice.org/download/, then rerun"
+    return $false
+}
+
 function ConvertTo-PowerShellLiteral {
     param([AllowNull()][string]$Value)
     return "'" + ([string]$Value).Replace("'", "''") + "'"
@@ -2469,6 +2519,7 @@ try {
     Install-Deps
     Install-Gateway-Extras
     Install-Node-Bridge
+    Install-LibreOffice
     Install-Embedding-Model
     Install-Native-Sandbox
     if (-not (Setup-Path)) {

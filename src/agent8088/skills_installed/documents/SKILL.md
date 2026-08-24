@@ -1,7 +1,7 @@
 ---
 name: documents
-description: Create and edit Word (.docx), Excel (.xlsx), PowerPoint (.pptx), and PDF files by writing Python and running it via execute_shell.
-version: 1.0.0
+description: Create and edit Word (.docx), Excel (.xlsx), PowerPoint (.pptx), and PDF files by writing Python via execute_shell; convert to PDF, read legacy .doc/.ppt/.xls, and recalculate formulas via LibreOffice when installed.
+version: 1.1.0
 category: software-development
 ---
 
@@ -25,12 +25,15 @@ corrupt or empty file — don't ship one unread.
 read_text /absolute/path/to/output.docx
 ```
 
-## Legacy formats are not supported
+## Legacy formats (.doc / .xls / .ppt)
 
-`.doc`, `.xls`, `.ppt` need LibreOffice, which is not a dependency here. Do
-not attempt to write or edit them with these libraries — you will produce a
-corrupt file. Tell the user legacy formats aren't supported and offer the
-modern equivalent (.docx/.xlsx/.pptx) instead.
+Never touch these with python-docx/openpyxl/python-pptx — they don't
+understand the old binary format and you will produce a corrupt file.
+
+LibreOffice, installed by the Windows installer alongside this agent, handles
+them. See the LibreOffice section below to check it's actually present before
+relying on it — the install can fail (no WinGet, offline machine) and degrades
+to a warning rather than blocking setup, so don't assume it's there.
 
 ## Word (.docx) — python-docx
 
@@ -98,13 +101,15 @@ wb.save("/absolute/path/to/data.xlsx")
 ```
 
 **Formula trap**: openpyxl writes the formula string only — no cached
-result. There is no LibreOffice in this repo to recalculate it. Reading a
-formula cell back with `load_workbook(path, data_only=True)` returns `None`,
-not the number, until the file has been opened and saved in real Excel.
+result. Reading a formula cell back with `load_workbook(path, data_only=True)`
+returns `None`, not the number, until something recalculates it — either real
+Excel, or LibreOffice headless (see below).
 
-Rule: if a script or the agent itself needs the *value*, compute it in
-Python and write the number. Write a formula only when a human will open the
-file in Excel and expects to see live formulas.
+Rule: if a script or the agent itself needs the *value* immediately, compute
+it in Python and write the number — that's simpler than a recalculation
+round-trip. Reach for LibreOffice's recalc only when the file already has
+formulas you didn't write yourself (e.g. one the user handed you) and you
+need their computed values.
 
 ## PowerPoint (.pptx) — python-pptx
 
@@ -136,6 +141,68 @@ prs.save("/absolute/path/to/deck.pptx")
 Editing follows the same open → modify → save pattern:
 `Presentation("/absolute/path/to/deck.pptx")`, change shapes/text, then
 `.save()` back to the same path.
+
+## LibreOffice (soffice) — conversion, legacy formats, formula recalc
+
+The Windows installer tries to install LibreOffice via WinGet, but the install
+can fail or be skipped (offline machine, no WinGet). Check before every use —
+never assume it's there from a previous call.
+
+**On Windows, `execute_shell` runs `cmd.exe`, not bash.** Use `dir`, not `ls`.
+Use `2>nul`, not `2>/dev/null`. Do not chain with `&&`/`||` expecting POSIX
+semantics. Getting this wrong wastes turns on `'ls' is not recognized` before
+you ever reach the real work. The single most reliable check, which works
+whether or not soffice is on PATH:
+
+```
+execute_shell: if exist "C:\Program Files\LibreOffice\program\soffice.exe" (echo FOUND) else (echo MISSING)
+```
+
+If that says MISSING, also try the `(x86)` path, then `where soffice`. If none
+of them find it, tell the user LibreOffice isn't installed and point them at
+https://www.libreoffice.org/download/ or rerunning the installer — don't
+pretend the conversion happened.
+
+**Never run a bare recursive listing** (`dir /s /b` on a project directory)
+to find a file — it returns thousands of lines and buries the answer. Check
+the exact path you were given instead.
+
+**Converting .docx/.pptx/.xlsx to PDF.** `soffice` is usually NOT on PATH —
+call it by full path, quoted (it contains a space):
+
+```
+execute_shell: "C:\Program Files\LibreOffice\program\soffice.exe" --headless --convert-to pdf --outdir "C:\out" "C:\in\report.docx"
+```
+
+The output filename is derived from the input, not chosen by you: `report.docx`
+becomes `report.pdf` in `--outdir`. Verify it exists afterward rather than
+assuming — soffice can print a conversion line and still produce nothing.
+
+**Legacy .doc/.ppt/.xls → modern format**, then read it with `read_text` like
+any other file — this feeds the existing extraction path, no separate reader
+needed:
+
+```
+execute_shell: "C:\Program Files\LibreOffice\program\soffice.exe" --headless --convert-to docx --outdir "C:\out" "C:\in\old.doc"
+read_text: C:\out\old.docx
+```
+
+**Recalculating formulas** in a file you didn't write yourself (e.g. one the
+user handed you with existing formulas): convert it to itself to force a
+recalc, giving the call its own isolated profile directory —
+
+```
+execute_shell: "C:\Program Files\LibreOffice\program\soffice.exe" --headless "-env:UserInstallation=file:///C:/temp/lo-profile-1" --convert-to xlsx --outdir "C:\out" "C:\in\data.xlsx"
+```
+
+Each call needs a **distinct** profile path (a fresh temp dir per call is
+enough). Two `soffice` calls sharing one profile directory can collide and
+fail unpredictably — this project doesn't run `soffice` inside a
+network-restricted sandbox, so a fresh temp dir is enough; nothing heavier is
+needed here.
+
+**Cold start is slow** (3-5s) — well inside `execute_shell`'s default 25s
+timeout, but don't assume the same speed as a Python library call.
 
 ## PDF — reportlab
 
