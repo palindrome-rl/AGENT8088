@@ -8,6 +8,7 @@ credential must be refused in every permission mode, exactly as a .txt is.
 """
 import json
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -141,3 +142,50 @@ def test_sensitive_document_is_refused_in_every_permission_mode(engine, tmp_path
     secret = _docx(tmp_path / "id_rsa.docx")
     result = _read(engine, secret)
     assert "Quarterly summary" not in result
+
+
+# --- cloud placeholders (OneDrive/Dropbox Files On-Demand) -----------------
+def test_cloud_placeholder_is_named_as_such_not_reported_as_corrupt(engine, tmp_path, monkeypatch):
+    """An undownloaded OneDrive file passes exists() and reports a real size,
+    but opening it raises OSError(EINVAL). It used to surface through the zip
+    parser as "not a valid .docx (bad zip)" -- telling the user their file is
+    corrupt and sending them after the wrong problem."""
+    from agent8088 import documents
+
+    fake = tmp_path / "cloud.docx"
+    fake.write_bytes(b"placeholder")
+    monkeypatch.setattr(documents, "cloud_placeholder_message",
+                        lambda p: f"{Path(p).name} is stored in the cloud")
+
+    def refuse(*a, **k):
+        raise OSError(22, "Invalid argument")
+    monkeypatch.setattr(Path, "open", refuse)
+
+    result = documents.extract_text(fake)
+    assert "stored in the cloud" in result
+    assert "bad zip" not in result
+
+
+def test_a_normal_unreadable_file_still_reports_the_os_reason(engine, tmp_path, monkeypatch):
+    """The cloud message must not swallow every OSError -- a genuine
+    permission/IO error should still say what actually went wrong."""
+    from agent8088 import documents
+
+    fake = tmp_path / "locked.docx"
+    fake.write_bytes(b"x")
+    monkeypatch.setattr(documents, "cloud_placeholder_message", lambda p: None)
+
+    def refuse(*a, **k):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(Path, "open", refuse)
+
+    result = documents.extract_text(fake)
+    assert "Permission denied" in result
+
+
+def test_cloud_placeholder_check_is_a_noop_for_ordinary_local_files(tmp_path):
+    """It must not misfire on normal files -- every local read would break."""
+    from agent8088 import documents
+    ordinary = tmp_path / "local.txt"
+    ordinary.write_text("hello", encoding="utf-8")
+    assert documents.cloud_placeholder_message(ordinary) is None

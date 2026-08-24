@@ -12,10 +12,58 @@ module (and anything that imports it) loads fine without them.
 """
 from __future__ import annotations
 
+import os
 import re
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
+# OneDrive/Dropbox "Files On-Demand" placeholders pass exists() and is_file(),
+# and stat() reports the real size — but the bytes are not on this disk, and
+# opening one raises OSError(EINVAL) instead of downloading it. Without a
+# specific check the failure surfaces through the format parsers as "not a
+# valid .docx (bad zip)", which tells the user their file is corrupt when it
+# is merely not downloaded — the wrong problem, and one they would go looking
+# for in the wrong place.
+_FILE_ATTRIBUTE_OFFLINE = 0x1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_CLOUD_ATTRS = (_FILE_ATTRIBUTE_OFFLINE
+                | _FILE_ATTRIBUTE_RECALL_ON_OPEN
+                | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+
+def cloud_placeholder_message(path) -> str | None:
+    """Return an actionable message if `path` is an undownloaded cloud
+    placeholder, else None. Windows-only; other platforms return None."""
+    if os.name != "nt":
+        return None
+    try:
+        attrs = Path(path).stat().st_file_attributes
+    except (AttributeError, OSError):
+        return None
+    if not attrs & _CLOUD_ATTRS:
+        return None
+    return (f"{Path(path).name} is stored in the cloud and has not been downloaded "
+            f"to this PC, so its contents cannot be read. In File Explorer, right-click "
+            f"it and choose \"Always keep on this device\" (or open it once in its own "
+            f"app), wait for the sync to finish, then try again.")
+
+
+def _readable_or_reason(path) -> str | None:
+    """None if the file's bytes can actually be read, else why not.
+
+    Probes 4 bytes rather than trusting exists()/stat(). A cloud file that
+    hydrates on access succeeds here and proceeds normally — this only
+    changes the message on the paths that were already failing.
+    """
+    try:
+        with Path(path).open("rb") as handle:
+            handle.read(4)
+        return None
+    except OSError as exc:
+        return (cloud_placeholder_message(path)
+                or f"Could not read {Path(path).name}: {exc.strerror or exc}")
 
 # Caller's normal file-read path caps at ~2MB; that cap doesn't apply here, so
 # without an explicit guard a crafted large document is an unbounded-memory
@@ -55,6 +103,13 @@ def extract_text(path, max_bytes: int = MAX_DOCUMENT_BYTES):
         raise ValueError(
             f"Document is too large to read (limit: {max_bytes} bytes): {path}"
         )
+
+    # Before handing the file to a format parser, confirm the bytes are
+    # actually readable — otherwise an undownloaded cloud file is reported as
+    # a corrupt document.
+    unreadable = _readable_or_reason(path)
+    if unreadable:
+        return unreadable
 
     if ext == ".docx":
         return _extract_docx(path)

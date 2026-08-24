@@ -1781,7 +1781,12 @@ def build_image_message(text: str, images: list, resolver=None) -> dict:
             raise ValueError(f"Unsupported image type: {path.suffix or '(none)'}")
         if path.stat().st_size > MAX_IMAGE_BYTES:
             raise ValueError(f"Image is too large (limit: {MAX_IMAGE_BYTES} bytes): {path}")
-        b64 = _b64.b64encode(path.read_bytes()).decode()
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(documents.cloud_placeholder_message(path)
+                             or f"Could not read {path}: {exc.strerror or exc}")
+        b64 = _b64.b64encode(raw).decode()
         parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
     return {"role": "user", "content": parts}
 
@@ -2355,8 +2360,15 @@ def _shadowed_project_file(raw_path: str, target: Path) -> Path | None:
 
 
 def _read_text_limited(path: Path, limit: int = MAX_READ_BYTES) -> str:
-    with path.open("rb") as stream:
-        data = stream.read(limit + 1)
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+    except OSError as exc:
+        # An undownloaded OneDrive/Dropbox placeholder passes exists() and
+        # reports a size, but opening it fails with EINVAL. Say that, rather
+        # than letting a bare OSError surface as an unexplained failure.
+        raise ValueError(documents.cloud_placeholder_message(path)
+                         or f"Could not read {path}: {exc.strerror or exc}")
     if len(data) > limit:
         raise ValueError(f"File is too large to read (limit: {limit} bytes): {path}")
     try:
