@@ -5157,9 +5157,17 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     home = _agent8088_home()
     config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
-        print(f"Config not found: {config_path}")
-        print("Run the installer first.")
-        return
+        # Seed from the packaged template so the wizard has defaults to edit.
+        # The old behaviour — refusing to run and telling the user to "run the
+        # installer first" — was a dead end when the config had been deleted or
+        # never created: --setup is the tool that creates it.
+        packaged = Path(__file__).with_name("config.txt")
+        try:
+            content = packaged.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_text(config_path, content)
     content = config_path.read_text(encoding="utf-8")
     def _current(key):
         m = _re.search(rf'^{_re.escape(key)}=(.*)$', content, _re.MULTILINE)
@@ -5392,9 +5400,16 @@ def _run_gateway_setup():
     home = _agent8088_home()
     config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
-        print(f"Config not found: {config_path}")
-        print("Run `agent8088 --setup` first to create a base config.")
-        return
+        # Seed from the packaged template — same fix as _run_setup. The old
+        # "run --setup first" message was a dead end when --setup itself
+        # also refused on a missing config.
+        packaged = Path(__file__).with_name("config.txt")
+        try:
+            content = packaged.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_text(config_path, content)
     content = config_path.read_text(encoding="utf-8")
 
     def _current(key):
