@@ -20,6 +20,12 @@ def test_cli_anything_skill_is_progressive_and_not_eagerly_injected(engine):
     assert "Choose the smallest workflow" not in rendered
 
 
+def test_cli_anything_skill_reaches_the_model_without_ordinary_tool_truncation(engine):
+    skill = "x" * 15_000
+    assert engine._tool_result_for_model("cli_anything_skill", skill) == skill
+    assert "[tool result truncated:" in engine._tool_result_for_model("cli_anything_search", skill)
+
+
 def test_view_skill_loads_text_and_rejects_traversal(engine):
     loaded = engine.run_tool(
         "view_skill", {"name": "cli-anything", "resource": "SKILL.md"}
@@ -391,9 +397,15 @@ def test_freecad_run_uses_the_macos_application_cli(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_anything, "_freecad_macos_bin", lambda: app_bin)
 
     def fake_run(argv, **kwargs):
+        seen["argv"] = argv
         seen["path_prefix"] = kwargs["path_prefix"]
         return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
 
     monkeypatch.setattr(cli_anything, "_run", fake_run)
-    assert cli_anything.run(config, "freecad", ["--json", "document", "profiles"], tmp_path) == "{}"
+    assert cli_anything.run(
+        config, "freecad",
+        ["--json", "-p", "plate.FCStd", "export", "render", "plate.stl", "--overwrite"],
+        tmp_path,
+    ) == "{}"
+    assert seen["argv"][-2:] == ["--preset", "stl"]
     assert seen["path_prefix"] == app_bin

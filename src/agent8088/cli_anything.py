@@ -407,6 +407,15 @@ def run(config_path: Path | str, name: object, arguments: object, cwd: Path | st
         *, timeout: int = 120) -> str:
     safe_name = _safe_name(name)
     argv = _safe_arguments(arguments)
+    if safe_name == "freecad" and "--preset" not in argv:
+        try:
+            render_index = argv.index("render", argv.index("export") + 1)
+        except ValueError:
+            pass
+        else:
+            if (render_index + 1 < len(argv)
+                    and Path(argv[render_index + 1]).suffix.lower() == ".stl"):
+                argv.extend(("--preset", "stl"))
     root, _hub = _require_hub(config_path)
     ledger = _ledger_path(root)
     try:

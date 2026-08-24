@@ -6687,9 +6687,12 @@ _TOOL_RESULT_PREFIX = "Tool result ("
 
 def _tool_result_for_model(name: str, result: str) -> str:
     """Keep ordinary tool context small while letting the auditor inspect files."""
-    limit = 12_000 if _active_role == "subagent:auditor" and name in {
-        "read_text", "last_output"
-    } else 3_000
+    if name == "cli_anything_skill":
+        limit = 32_000
+    elif _active_role == "subagent:auditor" and name in {"read_text", "last_output"}:
+        limit = 12_000
+    else:
+        limit = 3_000
     if len(result) <= limit:
         return result
     return (result[:limit]
