@@ -111,6 +111,15 @@ def test_catalog_list_uses_json_output(monkeypatch, tmp_path):
     assert seen["argv"] == [str(hub), "list", "--json"]
 
 
+def test_cli_anything_task_receives_an_extended_turn_budget(engine):
+    assert engine._turn_limit_for_messages(
+        [{"role": "user", "content": "Use CLI-Anything with FreeCAD."}], 10
+    ) == 20
+    assert engine._turn_limit_for_messages(
+        [{"role": "user", "content": "Summarize this text."}], 10
+    ) == 10
+
+
 def test_setup_seeds_a_uv_virtual_environment(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
@@ -199,6 +208,20 @@ def test_subprocess_runner_never_uses_a_shell(monkeypatch, tmp_path):
         "encoding": "utf-8",
         "pip_cache": str(tmp_path / "cache" / "pip"),
     }
+
+
+def test_subprocess_runner_prefixes_a_harness_path(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["path"] = kwargs["env"]["PATH"]
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(cli_anything.subprocess, "run", fake_run)
+    prefix = tmp_path / "FreeCAD/bin"
+    cli_anything._run(["program"], root=tmp_path, timeout=5,
+                       managed_home=False, path_prefix=prefix)
+    assert seen["path"].startswith(str(prefix) + os.pathsep)
 
 
 def test_manage_refuses_public_or_generic_install_strategies(monkeypatch, tmp_path):
@@ -341,3 +364,24 @@ def test_run_uses_ledger_entry_and_structured_argv(monkeypatch, tmp_path):
     ]
     assert seen["cwd"] == tmp_path.resolve()
     assert seen["managed_home"] is False
+
+
+def test_freecad_run_uses_the_macos_application_cli(monkeypatch, tmp_path):
+    config = tmp_path / "config.txt"
+    root = cli_anything.integration_root(config)
+    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("placeholder", encoding="utf-8")
+    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
+    app_bin = tmp_path / "FreeCAD.app/Contents/Resources/bin"
+    seen = {}
+    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
+    monkeypatch.setattr(cli_anything, "_freecad_macos_bin", lambda: app_bin)
+
+    def fake_run(argv, **kwargs):
+        seen["path_prefix"] = kwargs["path_prefix"]
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(cli_anything, "_run", fake_run)
+    assert cli_anything.run(config, "freecad", ["--json", "document", "profiles"], tmp_path) == "{}"
+    assert seen["path_prefix"] == app_bin

@@ -6787,6 +6787,19 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
     return False
 
 
+CLI_ANYTHING_MIN_TURNS = 20
+
+
+def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
+    """Give an explicit CLI-Anything task room for its install-and-run workflow."""
+    requested = any(
+        "cli-anything" in str(message.get("content") or "").casefold()
+        for message in messages
+        if message.get("role") == "user"
+    )
+    return max(max_turns, CLI_ANYTHING_MIN_TURNS) if requested else max_turns
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -6831,7 +6844,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": 0, "type": "preflight_refusal", "content": refusal})
         return refusal
 
-    for turn in range(max_turns):
+    for turn in range(_turn_limit_for_messages(messages, max_turns)):
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools

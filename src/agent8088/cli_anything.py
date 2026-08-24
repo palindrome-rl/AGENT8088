@@ -116,8 +116,19 @@ def _uv_executable(root: Path) -> Path | None:
     return next((path for path in candidates if str(path) and path.is_file()), None)
 
 
+def _freecad_macos_bin() -> Path | None:
+    """Return FreeCAD's bundled headless CLI directory on macOS when present."""
+    if sys.platform != "darwin":
+        return None
+    candidates = [
+        Path("/Applications/FreeCAD.app/Contents/Resources/bin"),
+        Path.home() / "Applications/FreeCAD.app/Contents/Resources/bin",
+    ]
+    return next((path for path in candidates if (path / "freecadcmd").is_file()), None)
+
+
 def _run(argv: list[str], *, root: Path, timeout: int, cwd: Path | None = None,
-         managed_home: bool = True) -> subprocess.CompletedProcess:
+         managed_home: bool = True, path_prefix: Path | None = None) -> subprocess.CompletedProcess:
     env = _managed_env(root) if managed_home else dict(os.environ)
     if not managed_home:
         env["CLI_HUB_NO_ANALYTICS"] = "1"
@@ -127,6 +138,8 @@ def _run(argv: list[str], *, root: Path, timeout: int, cwd: Path | None = None,
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["PATH"] = str(hub_executable(root).parent) + os.pathsep + env.get("PATH", "")
+    if path_prefix:
+        env["PATH"] = str(path_prefix) + os.pathsep + env.get("PATH", "")
     return subprocess.run(
         argv,
         cwd=str(cwd) if cwd else None,
@@ -405,5 +418,6 @@ def run(config_path: Path | str, name: object, arguments: object, cwd: Path | st
         raise ValueError(f"Working directory does not exist: {workdir}")
     # The application receives the user's real HOME/USERPROFILE; CLI-Hub's
     # private home is only for registry cache and install bookkeeping.
+    path_prefix = _freecad_macos_bin() if safe_name == "freecad" else None
     return _result(_run([str(executable), *argv], root=root, timeout=timeout,
-                        cwd=workdir, managed_home=False))
+                        cwd=workdir, managed_home=False, path_prefix=path_prefix))
