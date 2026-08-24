@@ -6792,16 +6792,22 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 
 
 CLI_ANYTHING_MIN_TURNS = 20
+CLI_ANYTHING_MAX_TURNS = 40
+CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
-def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
-    """Give an explicit CLI-Anything task room for its install-and-run workflow."""
-    requested = any(
+def _cli_anything_requested(messages: list[dict]) -> bool:
+    return any(
         "cli-anything" in str(message.get("content") or "").casefold()
         for message in messages
         if message.get("role") == "user"
     )
-    return max(max_turns, CLI_ANYTHING_MIN_TURNS) if requested else max_turns
+
+
+def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
+    """Give an explicit CLI-Anything task room for its install-and-run workflow."""
+    return (max(max_turns, CLI_ANYTHING_MIN_TURNS)
+            if _cli_anything_requested(messages) else max_turns)
 
 
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
@@ -6850,7 +6856,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         return refusal
 
     turn_limit = _turn_limit_for_messages(messages, max_turns)
-    for turn in range(turn_limit):
+    dynamic_cli = _cli_anything_requested(messages)
+    hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
+    for turn in range(hard_turn_limit):
+        if turn >= turn_limit:
+            break
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools
@@ -7182,6 +7192,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed:
             forcing = False
+            if (dynamic_cli and turn + 1 == turn_limit
+                    and turn_limit < hard_turn_limit
+                    and tool_outputs and not _plan_step_failed(tool_outputs[-1])):
+                turn_limit = min(
+                    turn_limit + CLI_ANYTHING_EXTENSION_TURNS, hard_turn_limit
+                )
         elif forcing:
             forced_stop = True
             break

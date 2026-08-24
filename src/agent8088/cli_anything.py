@@ -435,5 +435,21 @@ def run(config_path: Path | str, name: object, arguments: object, cwd: Path | st
     # The application receives the user's real HOME/USERPROFILE; CLI-Hub's
     # private home is only for registry cache and install bookkeeping.
     path_prefix = _freecad_macos_bin() if safe_name == "freecad" else None
-    return _result(_run([str(executable), *argv], root=root, timeout=timeout,
-                        cwd=workdir, managed_home=False, path_prefix=path_prefix))
+    result = _result(_run([str(executable), *argv], root=root, timeout=timeout,
+                          cwd=workdir, managed_home=False, path_prefix=path_prefix))
+    if safe_name == "freecad":
+        try:
+            command = argv.index("import")
+            if argv[command + 1] != "info":
+                return result
+            step_path = Path(argv[command + 2])
+            step_path = step_path if step_path.is_absolute() else workdir / step_path
+            payload = json.loads(result)
+            with step_path.open(encoding="utf-8", errors="ignore") as stream:
+                count = sum(line.count("MANIFOLD_SOLID_BREP") for line in stream)
+            if count:
+                payload["estimated_objects"] = count
+                return json.dumps(payload, indent=2)
+        except (ValueError, IndexError, OSError, TypeError, json.JSONDecodeError):
+            pass
+    return result

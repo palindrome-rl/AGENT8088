@@ -180,6 +180,31 @@ def test_cli_anything_task_receives_an_extended_turn_budget(engine):
     ) == 10
 
 
+def test_cli_anything_turn_budget_grows_while_tools_make_progress(monkeypatch, engine):
+    monkeypatch.setattr(engine, "CLI_ANYTHING_MIN_TURNS", 2)
+    monkeypatch.setattr(engine, "CLI_ANYTHING_MAX_TURNS", 4)
+    monkeypatch.setattr(engine, "CLI_ANYTHING_EXTENSION_TURNS", 1)
+    responses = [
+        '✿FUNCTION✿: cli_anything_run ✿ARGS✿: {"name":"freecad","arguments":["one"],"cwd":"."}',
+        '✿FUNCTION✿: cli_anything_run ✿ARGS✿: {"name":"freecad","arguments":["two"],"cwd":"."}',
+        "done",
+    ]
+
+    def completion(*_args, **_kwargs):
+        message = type("Message", (), {"content": responses.pop(0)})()
+        choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+        return type("Response", (), {"choices": [choice]})()
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    monkeypatch.setattr(engine, "exec_tool", lambda *_a, **_kw: '{"ok": true}')
+
+    assert engine.run_agent(
+        [{"role": "user", "content": "Use CLI-Anything with FreeCAD."}],
+        max_turns=1, system_prompt="", tools_def=[],
+        allowed_tools={"cli_anything_run"},
+    ) == "done"
+
+
 def test_setup_seeds_a_uv_virtual_environment(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
@@ -463,3 +488,30 @@ def test_freecad_run_uses_the_macos_application_cli(monkeypatch, tmp_path):
     ) == "{}"
     assert seen["argv"][-2:] == ["--preset", "stl"]
     assert seen["path_prefix"] == app_bin
+
+
+def test_freecad_step_inspection_counts_exported_solids(monkeypatch, tmp_path):
+    config = tmp_path / "config.txt"
+    root = cli_anything.integration_root(config)
+    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("placeholder", encoding="utf-8")
+    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
+    (tmp_path / "assembly.step").write_text(
+        "#1=MANIFOLD_SOLID_BREP('Box',#2);\n#3=MANIFOLD_SOLID_BREP('Cylinder',#4);\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
+    monkeypatch.setattr(cli_anything, "_freecad_macos_bin", lambda: None)
+    monkeypatch.setattr(
+        cli_anything, "_run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout='{"estimated_objects": 1}', stderr=""
+        ),
+    )
+
+    result = cli_anything.run(
+        config, "freecad", ["--json", "import", "info", "assembly.step"], tmp_path
+    )
+
+    assert json.loads(result)["estimated_objects"] == 2
