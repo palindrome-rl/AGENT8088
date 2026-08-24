@@ -6837,6 +6837,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
+    forced_stop = False
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -6848,7 +6849,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": 0, "type": "preflight_refusal", "content": refusal})
         return refusal
 
-    for turn in range(_turn_limit_for_messages(messages, max_turns)):
+    turn_limit = _turn_limit_for_messages(messages, max_turns)
+    for turn in range(turn_limit):
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools
@@ -7181,18 +7183,24 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         if executed:
             forcing = False
         elif forcing:
+            forced_stop = True
             break
         else:
             forcing = True
             messages.append({"role": "user", "content":
                 "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
 
-    # Max turns reached or forced stop: return the best answer we have.
-    fallback_source = "\n\n".join(tool_outputs) or _last_tool_output
-    fallback = _guard_answer(fallback_source[:3000] if fallback_source else "Could not complete the task.")
+    # Max turns reached or forced stop: report the failure, not the beginning of
+    # accumulated tool context (which is usually a skill document).
+    reason = ("stopped because repeated tool calls made no progress"
+              if forced_stop else f"reached the {turn_limit}-turn limit before completing the task")
+    latest = tool_outputs[-1] if tool_outputs else _last_tool_output
+    fallback = f"Error: Agent {reason}."
+    if latest:
+        fallback += f"\n\nLatest tool result:\n{latest[:2500]}"
+    fallback = _guard_answer(fallback)
     if on_answer:
         on_answer(fallback)
     if trace is not None:
-        trace.append({"turn": -1, "type": "max_turns",
-                      "content": _last_tool_output[:3000] if _last_tool_output else fallback})
+        trace.append({"turn": -1, "type": "max_turns", "content": fallback})
     return fallback
