@@ -2444,6 +2444,26 @@ def _detect_pasted_file(line: str):
         if path.is_file():
             question = (stripped[:start] + stripped[end:]).strip()
             return path, question
+
+    # Unquoted Windows paths with spaces (e.g. "C:\...\Palindrome Business
+    # Plan.pdf") were split into tokens by the \S+ scan above, none of which
+    # resolved to a file. Re-join consecutive tokens starting from a
+    # drive-letter token (X:\) and check if the joined path is a real file —
+    # the same "must exist on disk" guard against misfiring on chat.
+    drive_re = re.compile(r"^[A-Za-z]:[\\/]")
+    for i, (candidate, (start, _)) in enumerate(spans):
+        if not drive_re.match(candidate):
+            continue
+        for j in range(len(spans), i, -1):  # longest match first
+            joined = " ".join(s[0] for s in spans[i:j])
+            try:
+                path = Path(joined).resolve()
+            except OSError:
+                continue
+            if path.is_file():
+                end = spans[j - 1][1][1]
+                question = (stripped[:start] + stripped[end:]).strip()
+                return path, question
     return None
 
 
