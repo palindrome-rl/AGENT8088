@@ -7166,6 +7166,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             interactive_fail = "EOFError" in result or "EOF when reading" in result or "input()" in result.lower()
             note = ("\n\nThis script needs interactive input which is not available. "
                     "Do NOT retry it. Give your final answer now." if interactive_fail else "")
+            if blocked:
+                # Reached only when there is no escalation handler to ask — a
+                # sub-agent spawned without a UI, for instance. The raw
+                # ESCALATION_REQUEST payload is an internal wire format (unit
+                # separators, mode, change type, paths); handing it to the model
+                # as if it were tool output invites it back out again in the
+                # final answer. Say plainly what happened instead.
+                result = (f"Permission denied: {name} needs access this run does not "
+                          f"have, and there is nobody to ask. Do not retry it. "
+                          f"Continue without it, or explain what you could not do.")
             model_result = _tool_result_for_model(name, result)
             messages.append({"role": "user", "content":
                              f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
