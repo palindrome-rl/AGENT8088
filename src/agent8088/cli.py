@@ -4227,9 +4227,9 @@ def _remove_agent8088_workspace_data():
     config.txt) is left alone rather than guessed at - it may not even be
     agent8088-exclusive storage.
 
-    Opt-in only (see the --workspace flag on --uninstall) - like OpenClaw's
-    `uninstall --workspace`, user-generated data is not deleted unless asked
-    for, even though program files and installation side effects are.
+    Opt-in only (see the --workspace flag on --uninstall) - user-generated
+    data is not deleted unless asked for, even though program files and
+    installation side effects are.
     """
     def _prune_empty_ancestors(path, stop_at):
         parent = path.parent
@@ -5874,12 +5874,10 @@ def main():
     parser.add_argument("--mode", choices=["readonly", "full-auto"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
-    # Flag names/semantics follow OpenClaw's `uninstall` command (--workspace,
-    # --all, --yes, --non-interactive, --dry-run): program files and
-    # installation side effects (PATH entries, cron/scheduled tasks) are
-    # always removed, but user-generated data is opt-in, matching
-    # OpenClaw's "state vs workspace" split rather than deleting everything
-    # by default.
+    # Program files and installation side effects (PATH entries,
+    # cron/scheduled tasks) are always removed, but user-generated data is
+    # opt-in - deleting a user's trace logs or WhatsApp session by default
+    # would be a surprising thing for --uninstall to do without being asked.
     parser.add_argument("--workspace", action="store_true",
                         help="with --uninstall: also remove trace logs and the WhatsApp session directory")
     parser.add_argument("--all", action="store_true",

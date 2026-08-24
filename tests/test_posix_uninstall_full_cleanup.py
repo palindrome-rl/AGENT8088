@@ -2,9 +2,8 @@
 side effects outside $AGENT8088_HOME (a shell rc PATH line, crontab entries,
 trace logs, a WhatsApp session dir, a shared Playwright browser cache) that
 `--uninstall` didn't used to touch. Flag design (--workspace/--all/--yes/
---non-interactive/--dry-run) mirrors OpenClaw's `uninstall` command: program
-files and installation side effects are always removed, user-generated data
-is opt-in.
+--non-interactive/--dry-run): program files and installation side effects
+are always removed, user-generated data is opt-in.
 """
 import json
 import sys
@@ -18,7 +17,7 @@ from agent8088 import cli
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX uninstall path only")
 
 
-# --- CLI flag wiring (main() -> _run_uninstall), OpenClaw-style flags ------
+# --- CLI flag wiring (main() -> _run_uninstall) -----------------------------
 
 def test_main_wires_workspace_and_all_and_yes_and_dry_run_into_run_uninstall(monkeypatch):
     captured = {}
