@@ -5390,6 +5390,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
     text = _outside_fenced_code(text)
     text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
+    text = text.replace("✿ARGS⃣:", "✿ARGS✿:")
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
@@ -6804,6 +6805,16 @@ def _cli_anything_requested(messages: list[dict]) -> bool:
     )
 
 
+def _execute_shell_forbidden(messages: list[dict]) -> bool:
+    return any(
+        re.search(r"\b(?:do not|don't|never)\s+(?:use|call)\s+execute_shell\b",
+                  str(message.get("content") or ""), re.IGNORECASE)
+        for message in messages
+        if message.get("role") == "user"
+        and not str(message.get("content") or "").startswith(_TOOL_RESULT_PREFIX)
+    )
+
+
 def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
     """Give an explicit CLI-Anything task room for its install-and-run workflow."""
     return (max(max_turns, CLI_ANYTHING_MIN_TURNS)
@@ -6857,6 +6868,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
     turn_limit = _turn_limit_for_messages(messages, max_turns)
     dynamic_cli = _cli_anything_requested(messages)
+    no_execute_shell = _execute_shell_forbidden(messages)
     hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
@@ -6865,6 +6877,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools
         )
+        if no_execute_shell:
+            round_allowed_tools.discard("execute_shell")
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()

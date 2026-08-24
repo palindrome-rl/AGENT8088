@@ -80,6 +80,44 @@ def test_cli_anything_hybrid_argument_markup_keeps_export_arguments(engine):
     ]
 
 
+def test_cli_anything_keycap_argument_markup_keeps_arguments(engine):
+    expected = {"name": "freecad", "arguments": ["--json", "part", "list"], "cwd": "."}
+    text = f"✿FUNCTION✿: cli_anything_run ✿ARGS⃣: {json.dumps(expected)}"
+
+    assert engine.find_tool_calls(text, {"cli_anything_run"}) == [
+        {"name": "cli_anything_run", "arguments": expected}
+    ]
+
+
+def test_explicit_execute_shell_prohibition_is_enforced(monkeypatch, engine):
+    responses = [
+        '✿FUNCTION✿: execute_shell ✿ARGS✿: {"command":"echo forbidden"}',
+        '✿FUNCTION✿: cli_anything_status ✿ARGS✿: {}',
+        "done",
+    ]
+    executed = []
+
+    def completion(*_args, **_kwargs):
+        message = type("Message", (), {"content": responses.pop(0)})()
+        choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+        return type("Response", (), {"choices": [choice]})()
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    monkeypatch.setattr(
+        engine, "exec_tool",
+        lambda name, *_a, **_kw: executed.append(name) or '{"available": true}',
+    )
+
+    result = engine.run_agent(
+        [{"role": "user", "content": "Use CLI-Anything. Do not use execute_shell."}],
+        max_turns=3, system_prompt="", tools_def=[],
+        allowed_tools={"execute_shell", "cli_anything_status"},
+    )
+
+    assert result == "done"
+    assert executed == ["cli_anything_status"]
+
+
 def test_view_skill_loads_text_and_rejects_traversal(engine):
     loaded = engine.run_tool(
         "view_skill", {"name": "cli-anything", "resource": "SKILL.md"}
@@ -408,6 +446,54 @@ def test_installed_skill_is_resolved_inside_managed_venv(monkeypatch, tmp_path):
     assert cli_anything.installed_skill(config, "demo") == "# Demo harness skill"
 
 
+def test_freecad_skill_explains_boolean_operand_visibility(monkeypatch, tmp_path):
+    config = tmp_path / "config.txt"
+    root = cli_anything.integration_root(config)
+    skill = cli_anything.venv_dir(root) / "lib/python/site-packages/cli_anything/freecad/skills/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("# FreeCAD", encoding="utf-8")
+    cli_anything._save_ledger(root, {
+        "freecad": {"entry_point": "cli-anything-freecad", "dist_name": "cli-anything-freecad"}
+    })
+    monkeypatch.setattr(
+        cli_anything, "_require_hub",
+        lambda *_a, **_kw: (root, cli_anything.hub_executable(root)),
+    )
+    monkeypatch.setattr(
+        cli_anything, "_run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=str(skill) + "\n", stderr=""
+        ),
+    )
+
+    assert "Never remove the operands" in cli_anything.installed_skill(config, "freecad")
+
+
+def test_freecad_harness_patch_materializes_booleans_and_skips_hidden_parts(tmp_path):
+    root = tmp_path / "runtime"
+    generator = (
+        cli_anything.venv_dir(root)
+        / "lib/python3.13/site-packages/cli_anything/freecad/utils/freecad_macro_gen.py"
+    )
+    generator.parent.mkdir(parents=True)
+    generator.write_text('''def booleans(project):
+    boolean_ops = project.get("boolean_ops", [])
+
+def export(project):
+    lines.append("# Collect all shape objects for export")
+    lines.append("export_objects = []")
+    lines.append("for obj in doc.Objects:")
+    lines.append("    if hasattr(obj, 'Shape') and obj.Shape.isValid():")
+    lines.append("        export_objects.append(obj)")
+''', encoding="utf-8")
+
+    cli_anything._patch_freecad_harness(root)
+    patched = generator.read_text(encoding="utf-8")
+
+    assert "materialize stored boolean parts" in patched
+    assert "obj.Name not in hidden_objects" in patched
+
+
 def test_installed_skill_refuses_path_outside_managed_venv(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
@@ -515,3 +601,30 @@ def test_freecad_step_inspection_counts_exported_solids(monkeypatch, tmp_path):
     )
 
     assert json.loads(result)["estimated_objects"] == 2
+
+
+def test_freecad_refuses_removing_a_referenced_boolean_operand(monkeypatch, tmp_path):
+    config = tmp_path / "config.txt"
+    root = cli_anything.integration_root(config)
+    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("placeholder", encoding="utf-8")
+    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
+    (tmp_path / "project.json").write_text(json.dumps({"parts": [
+        {"id": 1, "name": "Outer", "type": "cylinder", "visible": False},
+        {"id": 2, "name": "Inner", "type": "cylinder", "visible": False},
+        {"id": 3, "name": "Barrel", "type": "cut",
+         "params": {"base_id": 1, "tool_id": 2}, "visible": True},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
+    monkeypatch.setattr(
+        cli_anything, "_run",
+        lambda *_a, **_kw: pytest.fail("referenced operand removal must not execute"),
+    )
+
+    result = cli_anything.run(
+        config, "freecad",
+        ["--json", "-p", "project.json", "part", "remove", "1"], tmp_path,
+    )
+
+    assert "already hidden and excluded from export" in result

@@ -127,6 +127,60 @@ def _freecad_macos_bin() -> Path | None:
     return next((path for path in candidates if (path / "freecadcmd").is_file()), None)
 
 
+def _patch_freecad_harness(root: Path) -> None:
+    """Repair boolean export in the pinned FreeCAD harness."""
+    candidates = [
+        *venv_dir(root).glob(
+            "lib/python*/site-packages/cli_anything/freecad/utils/freecad_macro_gen.py"
+        ),
+        venv_dir(root) / "Lib/site-packages/cli_anything/freecad/utils/freecad_macro_gen.py",
+    ]
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        return
+    source = path.read_text(encoding="utf-8")
+    marker = "# Agent8088: materialize stored boolean parts"
+    if marker in source:
+        return
+    old_booleans = '    boolean_ops = project.get("boolean_ops", [])'
+    new_booleans = '''    boolean_ops = list(project.get("boolean_ops", []))
+    # Agent8088: materialize stored boolean parts
+    known_names = {op.get("name") for op in boolean_ops}
+    for part in project.get("parts", []):
+        if part.get("type") not in {"cut", "fuse", "common"}:
+            continue
+        params = part.get("params", {})
+        base = _part_by_id(project, params.get("base_id"))
+        tool = _part_by_id(project, params.get("tool_id"))
+        if base and tool and part.get("name") not in known_names:
+            boolean_ops.append({
+                "type": part["type"], "name": part["name"],
+                "base": base["name"], "tool": tool["name"],
+            })'''
+    old_export = '''    lines.append("# Collect all shape objects for export")
+    lines.append("export_objects = []")
+    lines.append("for obj in doc.Objects:")
+    lines.append("    if hasattr(obj, 'Shape') and obj.Shape.isValid():")
+    lines.append("        export_objects.append(obj)")'''
+    new_export = '''    hidden_names = sorted(
+        _safe_name(part.get("name", ""))
+        for part in project.get("parts", [])
+        if not part.get("visible", True)
+    )
+    lines.append("# Collect visible shape objects for export")
+    lines.append(f"hidden_objects = {hidden_names!r}")
+    lines.append("export_objects = []")
+    lines.append("for obj in doc.Objects:")
+    lines.append("    if obj.Name not in hidden_objects and hasattr(obj, 'Shape') and obj.Shape.isValid():")
+    lines.append("        export_objects.append(obj)")'''
+    if old_booleans not in source or old_export not in source:
+        raise RuntimeError("The installed FreeCAD harness no longer matches its compatibility patch.")
+    patched = source.replace(old_booleans, new_booleans).replace(old_export, new_export)
+    temporary = path.with_suffix(".agent8088.tmp")
+    temporary.write_text(patched, encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def _run(argv: list[str], *, root: Path, timeout: int, cwd: Path | None = None,
          managed_home: bool = True, path_prefix: Path | None = None) -> subprocess.CompletedProcess:
     env = _managed_env(root) if managed_home else dict(os.environ)
@@ -400,7 +454,50 @@ def installed_skill(config_path: Path | str, name: object, *, timeout: int = 15)
         raise RuntimeError(f"Installed CLI skill is missing: {skill_path}")
     if skill_path.stat().st_size > MAX_SKILL_BYTES:
         raise RuntimeError("The installed CLI skill is too large to load safely.")
-    return skill_path.read_text(encoding="utf-8")
+    skill = skill_path.read_text(encoding="utf-8")
+    if safe_name == "freecad":
+        skill += (
+            "\n## Agent8088 FreeCAD notes\n\n"
+            "Boolean operations keep references to their source operands and "
+            "automatically mark those operands `visible=false`. Never remove the "
+            "operands: hidden parts stay in the editable project but are excluded "
+            "from export. Verify final exported solids with `import info`; "
+            "`document info` also counts hidden dependency parts. Paths passed to "
+            "the harness are relative to `cwd`; when `cwd` is `artifacts/engine`, "
+            "use `engine_project.json`, not `artifacts/engine/engine_project.json`.\n"
+        )
+    return skill
+
+
+def _freecad_remove_error(argv: list[str], workdir: Path) -> str | None:
+    """Refuse removal of an operand that a boolean result still needs."""
+    try:
+        command = argv.index("part")
+        if argv[command + 1] != "remove":
+            return None
+        index = int(argv[command + 2])
+        project_flag = next(flag for flag in ("-p", "--project") if flag in argv)
+        project_path = Path(argv[argv.index(project_flag) + 1])
+        project_path = project_path if project_path.is_absolute() else workdir / project_path
+        project = json.loads(project_path.read_text(encoding="utf-8"))
+        parts = project["parts"]
+        operand = parts[index]
+        dependent = next(
+            part for part in parts
+            if part.get("type") in {"cut", "fuse", "common"}
+            and operand.get("id") in {
+                part.get("params", {}).get("base_id"),
+                part.get("params", {}).get("tool_id"),
+            }
+        )
+    except (ValueError, StopIteration, IndexError, KeyError, OSError,
+            TypeError, json.JSONDecodeError):
+        return None
+    return (
+        f"Error: Cannot remove part index {index} because boolean part "
+        f"'{dependent.get('name')}' references it. Boolean operands are already "
+        "hidden and excluded from export; keep them in the project."
+    )
 
 
 def run(config_path: Path | str, name: object, arguments: object, cwd: Path | str,
@@ -432,6 +529,10 @@ def run(config_path: Path | str, name: object, arguments: object, cwd: Path | st
     workdir = Path(cwd).expanduser().resolve(strict=False)
     if not workdir.is_dir():
         raise ValueError(f"Working directory does not exist: {workdir}")
+    if safe_name == "freecad" and (remove_error := _freecad_remove_error(argv, workdir)):
+        return remove_error
+    if safe_name == "freecad":
+        _patch_freecad_harness(root)
     # The application receives the user's real HOME/USERPROFILE; CLI-Hub's
     # private home is only for registry cache and install bookkeeping.
     path_prefix = _freecad_macos_bin() if safe_name == "freecad" else None
