@@ -17,10 +17,19 @@ do the job.
 ## Find FreeCAD first, and call it by full path
 
 ```
-execute_shell: if exist "C:\Users\%USERNAME%\AppData\Local\Programs\FreeCAD 1.1\bin\freecadcmd.exe" (echo FOUND) else (echo MISSING)
+execute_shell: if exist "%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\freecadcmd.exe" (echo FOUND) else (echo MISSING)
 ```
 
-The official installer puts it at
+**Use `%LOCALAPPDATA%`, never `C:\Users\%USERNAME%\AppData\Local`.** Verified
+failure: under the native sandbox those two do not agree — `%USERNAME%`
+expands to the sandbox's own restricted account while the real profile
+directory belongs to the signed-in user, so the hand-built path points at a
+profile that does not exist and the check reports MISSING against a working
+install. `%LOCALAPPDATA%` resolves correctly in both places. The same trap
+applies to `%APPDATA%` and `%USERPROFILE%`: use the variable that names the
+directory you want, never rebuild it out of `%USERNAME%`.
+
+The official installer puts FreeCAD at
 `%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\freecadcmd.exe` — a per-user
 location, not `Program Files`, and not on `PATH`. Also check
 `C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe` (a WinGet or portable
@@ -28,16 +37,33 @@ install may land there instead). If neither exists, tell the user FreeCAD
 isn't installed rather than guessing or claiming success — and never invent
 a reason for a failure that has nothing to do with FreeCAD being missing.
 
+Harmless noise to expect on every sandboxed run: `unable to open file
+...FreeCAD/v1-1/system.cfg` / `user.cfg`. FreeCAD cannot write its config
+under the sandbox's restricted profile. It still executes correctly — judge
+the run by its output and by whether the file landed on disk, not by these
+lines.
+
 **On Windows, `execute_shell` runs `cmd.exe`, not bash.** `dir` not `ls`,
 double quotes not single. Same rule as the `documents` skill, repeated here
 because it bites every shell-based skill the same way.
 
-## Write the script to a file, run it, then verify on disk
+## Write the script into the project, not a temp directory
 
 ```
-write_file: C:\...\script.py
-execute_shell: "C:\Users\%USERNAME%\AppData\Local\Programs\FreeCAD 1.1\bin\freecadcmd.exe" C:\...\script.py
+write_file: artifacts\make_part.py
+execute_shell: "%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\freecadcmd.exe" "<absolute path to artifacts\make_part.py>"
 ```
+
+**Put the script under the project (`artifacts\`), never in the system temp
+directory.** Verified failure: under the native sandbox a script written to
+`%TEMP%` cannot be read back at all — even `type file.py` returns
+`Access is denied`, and `freecadcmd` given such a path dies with
+`Application unexpectedly terminated` and exit 1. That message names nothing
+useful; the real cause is the sandbox denying access to temp. Writing to
+`artifacts\` avoids it entirely.
+
+If a run fails that way, check whether the script is somewhere the sandbox
+can actually read before assuming FreeCAD or the script is at fault.
 
 Then confirm the output file actually exists and re-read it with `read_text`
 (which already extracts CAD summaries) before saying anything succeeded.
