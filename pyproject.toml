@@ -75,6 +75,9 @@ agent8088 = "agent8088.cli:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "browser_integration: slow end-to-end tests that launch a real headless browser and call a real LLM provider",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent8088"]
