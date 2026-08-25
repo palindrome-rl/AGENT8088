@@ -568,7 +568,9 @@ def test_run_uses_ledger_entry_and_structured_argv(monkeypatch, tmp_path):
 def test_freecad_run_uses_the_macos_application_cli(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable = cli_anything.hub_executable(root).parent / (
+        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
+    )
     executable.parent.mkdir(parents=True)
     executable.write_text("placeholder", encoding="utf-8")
     cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
@@ -595,7 +597,9 @@ def test_freecad_run_uses_the_macos_application_cli(monkeypatch, tmp_path):
 def test_freecad_step_inspection_counts_exported_solids(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable = cli_anything.hub_executable(root).parent / (
+        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
+    )
     executable.parent.mkdir(parents=True)
     executable.write_text("placeholder", encoding="utf-8")
     cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
@@ -622,7 +626,9 @@ def test_freecad_step_inspection_counts_exported_solids(monkeypatch, tmp_path):
 def test_freecad_resolves_deferred_boolean_measurement(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable = cli_anything.hub_executable(root).parent / (
+        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
+    )
     executable.parent.mkdir(parents=True)
     executable.write_text("placeholder", encoding="utf-8")
     cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
@@ -675,7 +681,9 @@ def test_freecad_part_result_exposes_zero_based_index():
 def test_freecad_refuses_removing_a_referenced_boolean_operand(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / "cli-anything-freecad"
+    executable = cli_anything.hub_executable(root).parent / (
+        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
+    )
     executable.parent.mkdir(parents=True)
     executable.write_text("placeholder", encoding="utf-8")
     cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
