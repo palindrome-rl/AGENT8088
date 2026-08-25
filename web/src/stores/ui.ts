@@ -1,9 +1,11 @@
 import { create } from 'zustand'
 
+type Theme = 'dark' | 'light'
+
 interface UIState {
   sidebarCollapsed: boolean
   commandPaletteOpen: boolean
-  theme: 'dark' | 'light'
+  theme: Theme
   approvalPending: {
     id: string
     toolName: string
@@ -18,6 +20,7 @@ interface UIState {
   toggleSidebar: () => void
   setCommandPaletteOpen: (open: boolean) => void
   toggleTheme: () => void
+  setTheme: (theme: Theme) => void
   setApprovalPending: (approval: UIState['approvalPending']) => void
   setPlanApprovalPending: (plan: UIState['planApprovalPending']) => void
 }
@@ -32,6 +35,7 @@ export const useUIStore = create<UIState>((set) => ({
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
   toggleTheme: () => set((s) => ({ theme: s.theme === 'dark' ? 'light' : 'dark' })),
+  setTheme: (theme) => set({ theme }),
   setApprovalPending: (approval) => set({ approvalPending: approval }),
   setPlanApprovalPending: (plan) => set({ planApprovalPending: plan }),
 }))

@@ -6,8 +6,22 @@
   --brand-border: #0077B6;
 }
 
+/* Dark mode (default) */
 html.dark {
   color-scheme: dark;
+}
+html.dark body {
+  background: #0a0a0b;
+  color: #e4e4e7;
+}
+
+/* Light mode */
+html:not(.dark) {
+  color-scheme: light;
+}
+html:not(.dark) body {
+  background: #fafafa;
+  color: #18181b;
 }
 
 body {
@@ -64,13 +78,22 @@ body {
   transition: width 280ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* Fluid message entrance */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.msg-enter {
+  animation: msg-in 0.2s ease-out;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
 
-/* Focus ring — subtle, Beautiful UI style */
+/* Focus ring — subtle */
 *:focus-visible {
   outline: 2px solid rgba(35, 125, 215, 0.4);
   outline-offset: 1px;

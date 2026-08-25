@@ -31,10 +31,10 @@ export function ChatPanel() {
               </div>
             </div>
 
-            <h1 className="mb-1 text-base font-semibold tracking-tight text-zinc-100">
+            <h1 className="mb-1 text-base font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 light:text-zinc-900">
               Agent8088
             </h1>
-            <p className="mb-5 text-[13px] text-zinc-500">
+            <p className="mb-5 text-[13px] text-zinc-500 dark:text-zinc-500 light:text-zinc-500">
               Your local AI assistant
             </p>
 
@@ -46,8 +46,8 @@ export function ChatPanel() {
               <SuggestionCard title="Browse tools" subtitle="32 tools across 14 modes" />
             </div>
 
-            <div className="mt-5 flex items-center gap-1.5 text-[11px] text-zinc-600">
-              <kbd className="rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 font-mono text-zinc-400">
+            <div className="mt-5 flex items-center gap-1.5 text-[11px] text-zinc-600 dark:text-zinc-600 light:text-zinc-400">
+              <kbd className="rounded border border-zinc-700 dark:border-zinc-700 light:border-zinc-300 bg-zinc-900 dark:bg-zinc-900 light:bg-zinc-100 px-1.5 py-0.5 font-mono text-zinc-400 dark:text-zinc-400 light:text-zinc-500">
                 ⌘K
               </kbd>
               <span>command palette</span>
@@ -65,7 +65,7 @@ export function ChatPanel() {
               <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
             ))}
             {streamingText && (
-              <div className="stream-cursor text-[14px] leading-relaxed text-zinc-200">
+              <div className="stream-cursor text-[14px] leading-relaxed text-zinc-200 dark:text-zinc-200 light:text-zinc-800">
                 {streamingText}
               </div>
             )}
@@ -80,9 +80,9 @@ export function ChatPanel() {
 
 function SuggestionCard({ title, subtitle }: { title: string; subtitle: string }) {
   return (
-    <div className="rounded-lg border border-zinc-800/60 bg-zinc-900/30 px-3 py-2 transition-colors hover:border-zinc-700 hover:bg-zinc-900/50">
-      <div className="text-[13px] font-medium text-zinc-200">{title}</div>
-      <div className="text-[11px] text-zinc-500">{subtitle}</div>
+    <div className="rounded-lg border border-zinc-800/60 dark:border-zinc-800/60 light:border-zinc-200 bg-zinc-900/30 dark:bg-zinc-900/30 light:bg-white px-3 py-2 transition-colors hover:border-zinc-700 dark:hover:border-zinc-700 light:hover:border-zinc-300 hover:bg-zinc-900/50 dark:hover:bg-zinc-900/50 light:hover:bg-zinc-50">
+      <div className="text-[13px] font-medium text-zinc-200 dark:text-zinc-200 light:text-zinc-800">{title}</div>
+      <div className="text-[11px] text-zinc-500 dark:text-zinc-500 light:text-zinc-400">{subtitle}</div>
     </div>
   )
 }

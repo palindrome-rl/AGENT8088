@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
   FolderClock, Settings, Stethoscope, ChevronLeft, ChevronRight,
+  Sun, Moon,
 } from 'lucide-react'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
@@ -19,22 +20,21 @@ const navItems = [
 ]
 
 export function Sidebar() {
-  const { sidebarCollapsed, toggleSidebar } = useUIStore()
+  const { sidebarCollapsed, toggleSidebar, theme, toggleTheme } = useUIStore()
 
   return (
     <aside className={cn(
-      'sidebar-transition relative flex flex-col border-r border-zinc-800/60 bg-zinc-950 overflow-hidden',
+      'sidebar-transition relative flex flex-col bg-zinc-950 dark:bg-zinc-950 light:bg-white border-r border-zinc-800/60 dark:border-zinc-800/60 light:border-zinc-200 overflow-hidden',
       sidebarCollapsed ? 'w-14' : 'w-56',
     )}>
-      {/* Header */}
+      {/* Header with logo */}
       <div className="flex h-12 items-center gap-2 px-3">
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10">
-          <span className="text-[11px] font-bold tracking-tight text-brand-cyan">
-            8088
-          </span>
-        </div>
-        {!sidebarCollapsed && (
-          <span className="text-sm font-medium tracking-tight text-zinc-200">Agent8088</span>
+        {sidebarCollapsed ? (
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10">
+            <span className="text-[11px] font-bold tracking-tight text-brand-cyan">8088</span>
+          </div>
+        ) : (
+          <img src="/logo.png" alt="Agent8088" className="h-6 w-auto" />
         )}
       </div>
 
@@ -49,7 +49,7 @@ export function Sidebar() {
               'flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] transition-colors duration-150',
               isActive
                 ? 'bg-brand-primary/10 text-brand-cyan'
-                : 'text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-200',
+                : 'text-zinc-400 dark:text-zinc-400 light:text-zinc-600 hover:bg-zinc-800/40 dark:hover:bg-zinc-800/40 light:hover:bg-zinc-100 hover:text-zinc-200 dark:hover:text-zinc-200 light:hover:text-zinc-900',
             )}
           >
             <Icon className="h-4 w-4 shrink-0" />
@@ -58,13 +58,29 @@ export function Sidebar() {
         ))}
       </nav>
 
-      {/* Collapse toggle */}
-      <button
-        onClick={toggleSidebar}
-        className="flex h-8 items-center justify-center border-t border-zinc-800/60 text-zinc-600 hover:text-zinc-300"
-      >
-        {sidebarCollapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronLeft className="h-3.5 w-3.5" />}
-      </button>
+      {/* Footer: theme toggle + palindrome logo + collapse */}
+      <div className="border-t border-zinc-800/60 dark:border-zinc-800/60 light:border-zinc-200">
+        <div className="flex items-center justify-between px-3 py-2">
+          <button
+            onClick={toggleTheme}
+            className="flex items-center gap-1.5 text-[12px] text-zinc-500 hover:text-zinc-300 dark:hover:text-zinc-300 light:hover:text-zinc-700 transition-colors"
+          >
+            {theme === 'dark' ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+            {!sidebarCollapsed && <span>{theme === 'dark' ? 'Light' : 'Dark'}</span>}
+          </button>
+        </div>
+        {!sidebarCollapsed && (
+          <div className="flex items-center justify-center py-1.5">
+            <img src="/palindrome-logo.png" alt="Palindrome" className="h-5 w-auto opacity-60" />
+          </div>
+        )}
+        <button
+          onClick={toggleSidebar}
+          className="flex h-8 w-full items-center justify-center text-zinc-600 hover:text-zinc-300 dark:hover:text-zinc-300 light:hover:text-zinc-700"
+        >
+          {sidebarCollapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronLeft className="h-3.5 w-3.5" />}
+        </button>
+      </div>
     </aside>
   )
 }
