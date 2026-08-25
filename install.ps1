@@ -247,6 +247,7 @@ $TNpm         = 300 * $TimeoutScale   # 142 small packages, mostly round-trips
 $TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
 $TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
 $TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
+$TLibreOffice = 1800 * $TimeoutScale  # ~350 MB MSI plus dependency resolution/install
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
 # premature cut fails the install outright -- but it is still the largest
@@ -833,9 +834,14 @@ function Install-LibreOffice {
     }
 
     Write-Info "Installing LibreOffice (needed for .docx/.pptx to PDF conversion and legacy .doc/.ppt/.xls) ..."
-    & $winget.Source install --id TheDocumentFoundation.LibreOffice --exact --source winget `
-        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
-    $wingetExit = $LASTEXITCODE
+    $wingetResult = Invoke-WithTimeout -FilePath $winget.Source `
+        -Arguments @(
+            "install", "--id", "TheDocumentFoundation.LibreOffice", "--exact",
+            "--source", "winget", "--accept-source-agreements",
+            "--accept-package-agreements", "--disable-interactivity"
+        ) `
+        -TimeoutSec $TLibreOffice -CaptureOutput -Activity "Downloading and installing LibreOffice"
+    $wingetExit = $wingetResult.ExitCode
 
     $installed = $sofficePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($installed) {
@@ -843,9 +849,16 @@ function Install-LibreOffice {
         return $true
     }
 
-    Write-Warn "LibreOffice install did not complete (WinGet exit $wingetExit)."
+    $wingetReason = if ($wingetResult.TimedOut) {
+        "timed out after $TLibreOffice seconds"
+    } elseif ($wingetResult.Error) {
+        "could not start: $($wingetResult.Error)"
+    } else {
+        "WinGet exit $wingetExit"
+    }
+    Write-Warn "LibreOffice install did not complete ($wingetReason)."
     Register-SkippedStage -Label "LibreOffice" `
-        -Reason "WinGet install failed (exit $wingetExit)" `
+        -Reason "WinGet install failed ($wingetReason)" `
         -Fix "install LibreOffice manually from https://www.libreoffice.org/download/, then rerun"
     return $false
 }

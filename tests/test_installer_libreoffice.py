@@ -91,7 +91,9 @@ def test_winget_install_failure_registers_a_skipped_stage_not_a_throw():
     out = _run(
         'function Test-Path { param($Path) $false }\n'
         'function Get-Command { param($Name, $CommandType, $ErrorAction) [pscustomobject]@{ Source = "fakewinget" } }\n'
-        'function fakewinget { $global:LASTEXITCODE = 1 }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec, [switch]$CaptureOutput, $Activity) '
+        '@{ ExitCode = 1; TimedOut = $false; Output = "" } }\n'
+        '$TLibreOffice = 1800\n'
         '$r = Install-LibreOffice\n'
         'Write-Output "Result=$r"',
         "Install-LibreOffice",
@@ -109,10 +111,48 @@ def test_successful_winget_install_is_detected_afterward():
         '$script:calls = 0\n'
         'function Test-Path { param($Path) $script:calls++; $script:calls -gt 2 }\n'
         'function Get-Command { param($Name, $CommandType, $ErrorAction) [pscustomobject]@{ Source = "fakewinget" } }\n'
-        'function fakewinget { $global:LASTEXITCODE = 0 }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec, [switch]$CaptureOutput, $Activity) '
+        '@{ ExitCode = 0; TimedOut = $false; Output = "" } }\n'
+        '$TLibreOffice = 1800\n'
         '$r = Install-LibreOffice\n'
         'Write-Output "Result=$r"',
         "Install-LibreOffice",
     )
     assert "Result=True" in out
     assert "SUCCESS:LibreOffice installed" in out
+
+
+@needs_windows
+def test_winget_install_uses_the_activity_spinner_and_expected_package():
+    """The LibreOffice stage must use the common animated process wrapper,
+    while retaining WinGet's exact package and non-interactive flags."""
+    out = _run(
+        'function Test-Path { param($Path) $false }\n'
+        'function Get-Command { param($Name, $CommandType, $ErrorAction) [pscustomobject]@{ Source = "winget.exe" } }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec, [switch]$CaptureOutput, $Activity) '
+        'Write-Host "CALL:$FilePath|$($Arguments -join ";")|$TimeoutSec|$CaptureOutput|$Activity"; '
+        '@{ ExitCode = 1; TimedOut = $false; Output = "" } }\n'
+        '$TLibreOffice = 1800\n'
+        '$null = Install-LibreOffice',
+        "Install-LibreOffice",
+    )
+    assert "CALL:winget.exe|install;--id;TheDocumentFoundation.LibreOffice;--exact" in out
+    assert "--accept-source-agreements;--accept-package-agreements;--disable-interactivity" in out
+    assert "|1800|True|Downloading and installing LibreOffice" in out
+
+
+@needs_windows
+def test_winget_timeout_remains_optional_and_reports_the_reason():
+    out = _run(
+        'function Test-Path { param($Path) $false }\n'
+        'function Get-Command { param($Name, $CommandType, $ErrorAction) [pscustomobject]@{ Source = "winget.exe" } }\n'
+        'function Invoke-WithTimeout { param($FilePath, $Arguments, $TimeoutSec, [switch]$CaptureOutput, $Activity) '
+        '@{ ExitCode = -1; TimedOut = $true; Output = "" } }\n'
+        '$TLibreOffice = 1800\n'
+        '$r = Install-LibreOffice\n'
+        'Write-Output "Result=$r"',
+        "Install-LibreOffice",
+    )
+    assert "Result=False" in out
+    assert "timed out after 1800 seconds" in out
+    assert "SKIPPED:LibreOffice|WinGet install failed" in out
