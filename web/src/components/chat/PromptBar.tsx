@@ -58,9 +58,9 @@ export function PromptBar() {
   }
 
   return (
-    <div className="relative bg-zinc-950 px-4 pb-3 pt-2">
+    <div className="relative bg-zinc-950 pb-4 pt-2">
       {showCommands && filteredCommands.length > 0 && (
-        <div className="absolute bottom-full left-4 right-4 mb-2 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl shadow-black/40">
+        <div className="absolute bottom-full left-1/2 mb-2 w-full max-w-2xl -translate-x-1/2 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl shadow-black/40">
           <div className="border-b border-zinc-800/60 px-3 py-1 text-[11px] text-zinc-500">
             Commands
           </div>
@@ -75,30 +75,32 @@ export function PromptBar() {
           ))}
         </div>
       )}
-      <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1.5 transition-colors focus-within:border-brand-primary/40">
-        <textarea
-          ref={inputRef}
-          value={text}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          placeholder="Send a message or / for commands..."
-          rows={1}
-          className="flex-1 resize-none bg-transparent px-2.5 py-1.5 text-[13px] text-zinc-100 placeholder:text-zinc-600 focus:outline-none"
-        />
-        <button
-          onClick={isStreaming ? () => wsSend({ type: 'interrupt' }) : handleSend}
-          disabled={!isStreaming && !text.trim()}
-          className={cn(
-            'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-all',
-            isStreaming
-              ? 'bg-red-600/15 text-red-400 hover:bg-red-600/25'
-              : text.trim()
-                ? 'bg-brand-primary/15 text-brand-cyan hover:bg-brand-primary/25'
-                : 'bg-zinc-800/50 text-zinc-600',
-          )}
-        >
-          {isStreaming ? <Square className="h-3 w-3" /> : <Send className="h-3.5 w-3.5" />}
-        </button>
+      <div className="mx-auto w-full max-w-2xl">
+        <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/50 px-3 py-2 transition-colors focus-within:border-brand-primary/40">
+          <textarea
+            ref={inputRef}
+            value={text}
+            onChange={handleChange}
+            onKeyDown={handleKeyDown}
+            placeholder="Send a message..."
+            rows={1}
+            className="flex-1 resize-none bg-transparent text-[14px] text-zinc-100 placeholder:text-zinc-600 focus:outline-none"
+          />
+          <button
+            onClick={isStreaming ? () => wsSend({ type: 'interrupt' }) : handleSend}
+            disabled={!isStreaming && !text.trim()}
+            className={cn(
+              'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-all',
+              isStreaming
+                ? 'bg-red-600/15 text-red-400 hover:bg-red-600/25'
+                : text.trim()
+                  ? 'bg-brand-primary/15 text-brand-cyan hover:bg-brand-primary/25'
+                  : 'text-zinc-600',
+            )}
+          >
+            {isStreaming ? <Square className="h-3 w-3" /> : <Send className="h-4 w-4" />}
+          </button>
+        </div>
       </div>
     </div>
   )
