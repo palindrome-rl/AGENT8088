@@ -152,7 +152,12 @@ export function Sidebar() {
           ) : (
             <div className="absolute left-2 top-1 flex h-8 w-8 items-center justify-center">
               <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10">
-                <span className="text-[11px] font-bold tracking-tight text-brand-cyan">8088</span>
+                <img
+                  src="/palindrome-logo.png"
+                  alt="Palindrome"
+                  className="h-5 w-6 object-contain"
+                  style={{ mixBlendMode: theme === 'dark' ? 'screen' : 'normal', filter: theme === 'light' ? 'invert(1)' : undefined }}
+                />
               </div>
             </div>
           )}
