@@ -3407,6 +3407,33 @@ BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds"
 SHOW_REASONING = False
 
 
+class _QuietBrowserUseNoiseFilter(logging.Filter):
+    """Drops specific browser-use WARNING-level messages that carry no
+    actionable information for the end user, while leaving every other
+    WARNING - including the security watchdog's own "Blocking navigation to
+    disallowed URL"/"non-allowed URL detected" messages - fully visible.
+    Those matter (they're the SSRF deny-list actually doing its job); these
+    don't: a one-time, permanent notice about our own deny-list using glob
+    patterns (it always does, by design - see
+    _BROWSER_PROHIBITED_HOST_PATTERNS), and the per-step "model returned an
+    empty action, retrying" notice, which doesn't change whether the task
+    ultimately succeeds (that's already reflected in browse_page's own
+    returned text via history.is_done())."""
+
+    _NOISY_SUBSTRINGS = (
+        "Using glob patterns in allowed_domains",
+        "Model returned empty action",
+        "Model still returned empty after retry",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(s in message for s in self._NOISY_SUBSTRINGS)
+
+
+_browser_use_noise_filter = _QuietBrowserUseNoiseFilter()
+
+
 def _set_browser_use_log_verbosity(verbose: bool) -> None:
     """browser-use's own step-by-step log (Eval/Memory/Next goal/...) and
     litellm's "completion() model=..." lines print straight to the console,
@@ -3427,10 +3454,26 @@ def _set_browser_use_log_verbosity(verbose: bool) -> None:
     touches the root logger, not "browser_use"/"bubus" themselves),
     printing each line more times the longer a session runs. A plain
     `import browser_use` already configures a handler once, at package
-    import - all that is needed on top of that is the level."""
+    import - all that is needed on top of that is the level.
+
+    Dropping specific WARNING-level messages needs a Filter, and it has to
+    go on the *handler*, not the logger: the noisy messages are logged by
+    child loggers (e.g. browser_use.browser.watchdogs.security_watchdog),
+    and a Filter attached to a logger is only consulted for records logged
+    directly on that exact logger instance, not ones a child propagates up
+    to it - only a Handler's own filter sees every record that reaches it,
+    regardless of which logger originated it."""
     level = logging.INFO if verbose else logging.WARNING
     for logger_name in ("browser_use", "bubus", "LiteLLM"):
         logging.getLogger(logger_name).setLevel(level)
+
+    for handler in logging.getLogger("browser_use").handlers:
+        has_filter = _browser_use_noise_filter in handler.filters
+        if verbose and has_filter:
+            handler.removeFilter(_browser_use_noise_filter)
+        elif not verbose and not has_filter:
+            handler.addFilter(_browser_use_noise_filter)
+
     try:
         import litellm
         litellm.suppress_debug_info = not verbose
@@ -3724,6 +3767,22 @@ def _exec_browser(args: dict) -> str:
                 else "browser_task_timeout_seconds")
         result = (f"Browser error: task exceeded the {_browser_task_timeout()}s "
                   f"time limit (raise {knob} in config.txt).")
+    except KeyboardInterrupt:
+        # Ctrl+C ends agent8088 outright (cli.py's main loop catches this one
+        # level up and exits) - re-raise so that still happens. What this
+        # catches here is purely cosmetic: asyncio.run()'s own best-effort
+        # task cancellation can't always finish gracefully mid-Playwright-
+        # session, since its connection-management task needs a round of
+        # network I/O to close that a hard interrupt doesn't leave time for.
+        # The interpreter's later garbage collection of that abandoned task
+        # then prints "Task was destroyed but it is pending!"/"Future
+        # exception was never retrieved" through the standard "asyncio"
+        # logger - after the CLI has already said goodbye, reading as a
+        # crash on the way out of a process that already exited cleanly. The
+        # process is on its way down either way, so silence that logger for
+        # its remaining lifetime rather than leave that artifact visible.
+        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+        raise
     except Exception as e:
         result = f"Browser error: {e}"
     finally:

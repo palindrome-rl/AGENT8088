@@ -104,6 +104,48 @@ def test_active_role_restored_even_when_the_run_raises(monkeypatch, tmp_path):
     assert A._active_role == "main"
 
 
+def test_ctrl_c_during_the_run_is_reraised_not_swallowed(monkeypatch, tmp_path):
+    """Ctrl+C must still end agent8088 (cli.py's main loop catches this one
+    level up) - this only silences the cosmetic asyncio shutdown noise that
+    follows, it must never turn the interrupt itself into a quiet return."""
+    _install_present_chromium(monkeypatch, tmp_path)
+
+    async def fake_run_browser_agent(url, task):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
+
+    with pytest.raises(KeyboardInterrupt):
+        A._exec_browser({"url": "https://example.com", "task": "read the heading"})
+
+
+def test_ctrl_c_during_the_run_silences_the_asyncio_shutdown_warning(monkeypatch, tmp_path):
+    """asyncio.run() can't always finish gracefully cancelling a mid-flight
+    Playwright session on a hard interrupt - the interpreter's later garbage
+    collection of the abandoned task then logs "Task was destroyed but it
+    is pending!" through the standard "asyncio" logger, well after the CLI
+    has already said goodbye. The process is exiting either way, so that
+    logger should go quiet rather than print what reads as a crash on the
+    way out of a process that already exited cleanly."""
+    import logging
+    _install_present_chromium(monkeypatch, tmp_path)
+    logger = logging.getLogger("asyncio")
+    original_level = logger.level
+    logger.setLevel(logging.NOTSET)
+
+    async def fake_run_browser_agent(url, task):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            A._exec_browser({"url": "https://example.com", "task": "read the heading"})
+        assert logger.level == logging.CRITICAL
+    finally:
+        logger.setLevel(original_level)
+
+
 # --- _run_browser_agent itself, with browser-use stubbed out ----------------
 
 
@@ -255,6 +297,70 @@ def test_set_browser_use_log_verbosity_restores_info_on_every_logger_when_verbos
     finally:
         for logger, level in zip(loggers, original_levels):
             logger.setLevel(level)
+
+
+def _log_record(message):
+    import logging
+    return logging.LogRecord(
+        name="browser_use.browser.watchdogs.security_watchdog", level=logging.WARNING,
+        pathname=__file__, lineno=1, msg=message, args=(), exc_info=None)
+
+
+def test_noise_filter_drops_the_glob_pattern_notice():
+    filt = A._QuietBrowserUseNoiseFilter()
+    record = _log_record(
+        '⚠️ Using glob patterns in allowed_domains. Note: Patterns like '
+        '"*.example.com" will match both subdomains AND the main domain.')
+    assert filt.filter(record) is False
+
+
+def test_noise_filter_drops_the_empty_action_retry_notice():
+    filt = A._QuietBrowserUseNoiseFilter()
+    assert filt.filter(_log_record("Model returned empty action. Retrying...")) is False
+    assert filt.filter(_log_record("Model still returned empty after retry. Inserting safe noop action.")) is False
+
+
+def test_noise_filter_keeps_security_blocking_warnings():
+    """The exact scenario this must never hide: the SSRF deny-list's second
+    layer (see the Critical fix) actually refusing a navigation. Losing
+    visibility into that would be a real transparency regression, not a
+    cosmetic one."""
+    filt = A._QuietBrowserUseNoiseFilter()
+    assert filt.filter(_log_record(
+        "⛔️ Blocking navigation to disallowed URL: http://169.254.169.254/")) is True
+    assert filt.filter(_log_record(
+        "⛔️ Navigation to non-allowed URL detected: http://127.0.0.1:9/")) is True
+
+
+@pytest.fixture
+def browser_use_handler():
+    """pytest's own logging plugin clears the "browser_use" logger's
+    handlers before each test runs, so the handler a plain `import
+    browser_use` would normally attach at package-init time isn't there to
+    inspect by the time a test starts. Attach a stand-in explicitly instead
+    - _set_browser_use_log_verbosity only cares that it's a handler on this
+    logger, not that browser-use created it."""
+    import logging
+    logger = logging.getLogger("browser_use")
+    handler = logging.NullHandler()
+    logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_verbosity_toggle_adds_and_removes_the_noise_filter_on_the_handler(browser_use_handler):
+    A._set_browser_use_log_verbosity(False)
+    assert A._browser_use_noise_filter in browser_use_handler.filters
+    A._set_browser_use_log_verbosity(True)
+    assert A._browser_use_noise_filter not in browser_use_handler.filters
+
+
+def test_verbosity_toggle_does_not_duplicate_the_filter_across_repeated_calls(browser_use_handler):
+    for _ in range(5):
+        A._set_browser_use_log_verbosity(False)
+    assert browser_use_handler.filters.count(A._browser_use_noise_filter) == 1
 
 
 def test_set_browser_use_log_verbosity_does_not_accumulate_handlers():
