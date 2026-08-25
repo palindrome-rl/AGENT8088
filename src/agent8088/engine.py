@@ -3467,6 +3467,20 @@ def _set_browser_use_log_verbosity(verbose: bool) -> None:
     for logger_name in ("browser_use", "bubus", "LiteLLM"):
         logging.getLogger(logger_name).setLevel(level)
 
+    # browser-use's own cleanup of a Playwright session's low-level
+    # connection task doesn't always finish before the coroutine driving it
+    # returns - not only when interrupted, but sometimes even on a normal,
+    # successful completion. The interpreter's later garbage collection of
+    # that lingering task then logs "Task was destroyed but it is
+    # pending!"/"Future exception was never retrieved" through the standard
+    # "asyncio" logger, at ERROR level - reading as a crash in the middle of
+    # an otherwise-correct answer. This codebase has no other asyncio usage
+    # anywhere, so silencing this logger by default is safe: there is
+    # nothing else it could be hiding. /reasoning on restores it, same as
+    # the others, since a real asyncio bug elsewhere would also want to
+    # surface through here.
+    logging.getLogger("asyncio").setLevel(logging.WARNING if verbose else logging.CRITICAL)
+
     for handler in logging.getLogger("browser_use").handlers:
         has_filter = _browser_use_noise_filter in handler.filters
         if verbose and has_filter:

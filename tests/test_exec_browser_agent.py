@@ -299,6 +299,34 @@ def test_set_browser_use_log_verbosity_restores_info_on_every_logger_when_verbos
             logger.setLevel(level)
 
 
+def test_set_browser_use_log_verbosity_silences_asyncios_shutdown_noise_by_default():
+    """Not gated behind catching a KeyboardInterrupt: browser-use's own
+    cleanup of a Playwright session's low-level connection task can leave it
+    lingering even on a normal, successful completion, and the interpreter's
+    later garbage collection of it logs through the standard "asyncio"
+    logger at ERROR level - WARNING (the threshold the other three loggers
+    use) would not suppress that, only CRITICAL does."""
+    import logging
+    logger = logging.getLogger("asyncio")
+    original_level = logger.level
+    try:
+        A._set_browser_use_log_verbosity(False)
+        assert logger.level == logging.CRITICAL
+    finally:
+        logger.setLevel(original_level)
+
+
+def test_set_browser_use_log_verbosity_restores_asyncio_warnings_when_verbose():
+    import logging
+    logger = logging.getLogger("asyncio")
+    original_level = logger.level
+    try:
+        A._set_browser_use_log_verbosity(True)
+        assert logger.level == logging.WARNING
+    finally:
+        logger.setLevel(original_level)
+
+
 def _log_record(message):
     import logging
     return logging.LogRecord(
