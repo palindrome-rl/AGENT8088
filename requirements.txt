@@ -28,6 +28,8 @@ Pygments>=2.13,<3
 # Headless browser behind browse_page. The Python package only — the browser
 # binary still needs `playwright install chromium`.
 playwright>=1.40,<2
+browser-use>=0.13,<0.14
+litellm>=1,<2
 
 # Keyless web search fallback. web_search must always have a backend needing no
 # Docker, no API key and no setup, so an unreachable SearXNG still returns
@@ -49,7 +51,7 @@ reportlab>=4,<5
 #   pip install -e ".[search]"    alias — ddgs is already a core dep
 #   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
 #   pip install -e ".[dev]"       pytest, ruff, pip-audit
-#   pip install -e ".[litellm]"   litellm, for a provider with api_mode=litellm
+#   pip install -e ".[litellm]"   alias — litellm is already a core dep
 #
 # browser and search are aliases for packages that are already core, kept so the
 # installers' existing steps and any documented command keep working. They were

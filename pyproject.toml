@@ -11,7 +11,7 @@ dependencies = [
     "openai>=1.0.0,<3",
     "rich>=13.0.0,<16",
     "InquirerPy>=0.3.4,<1",
-    "mcp>=1.27,<2",
+    "mcp>=1.26,<2",
     "Pillow>=9,<13",
     # Both are imported directly by cli.py and were reaching the install only as
     # transitive dependencies -- prompt_toolkit via InquirerPy, Pygments via
@@ -25,6 +25,8 @@ dependencies = [
     # not be there makes the tool's availability a property of how someone
     # installed rather than of what the product is.
     "playwright>=1.40,<2",
+    "browser-use>=0.13,<0.14",
+    "litellm>=1,<2",
     # Keyless web search fallback. web_search must always have a backend needing
     # no Docker, no API key and no setup, so an unreachable SearXNG still
     # returns results rather than an error. As an extra that guarantee held only
@@ -61,10 +63,11 @@ gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", 
 browser = ["playwright>=1.40,<2"]
 search = ["ddgs>=9,<10"]
 dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
-# Only needed for a provider profile with api_mode=litellm. Kept out of the base
-# install because it is a large dependency serving one optional backend, but
-# declared so `pip install agent8088[litellm]` works instead of leaving the user
-# to discover the package name from a runtime error.
+# litellm is now a core dependency above (browse_page's interactive
+# browsing needs it regardless of which provider the main agent loop uses).
+# Kept as an alias, like `browser` and `search` above, so
+# `pip install agent8088[litellm]` stays valid instead of erroring on an
+# unknown extra.
 litellm = ["litellm>=1,<2"]
 
 [project.scripts]
