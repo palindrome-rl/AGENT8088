@@ -3483,8 +3483,16 @@ def _browser_profile_kwargs(proxy_url: str) -> dict:
 
     allowed_hosts = set()
     for entry in SSRF_ALLOW_HOSTS:
+        # Entries are "host" or "host:port" (_ssrf_host_allowlisted matches
+        # both). Only the host half can be expressed as a domain pattern.
+        if entry.startswith("[") and "]" in entry:      # [::1] / [::1]:8080
+            allowed_hosts.add(entry[1:entry.index("]")])
+            continue
         host, sep, port = entry.rpartition(":")
-        allowed_hosts.add(host if sep and port.isdigit() else entry)
+        # A bare IPv6 literal ("::1") also ends in ":<digits>" - the remaining
+        # colon in the host half is what tells the two apart.
+        allowed_hosts.add(host if sep and port.isdigit() and ":" not in host
+                          else entry)
     # A host the operator allowlisted through ssrf_allow_hosts must stay
     # reachable, and a deny-list of patterns cannot express an exception - so
     # drop any pattern that would cover an allowlisted host.

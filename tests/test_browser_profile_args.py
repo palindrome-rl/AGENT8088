@@ -148,6 +148,24 @@ def test_an_ssrf_allowlisted_host_stays_reachable(monkeypatch):
     assert kwargs["block_ip_addresses"] is False
 
 
+@pytest.mark.parametrize("entry,freed,still_blocked", [
+    ("127.0.0.1:8123", "127.*", "10.*"),
+    ("127.0.0.1", "127.*", "10.*"),
+    ("wiki.internal", "*.internal", "10.*"),
+    ("[::1]:8080", "::1", "127.*"),
+    ("::1", "::1", "127.*"),
+])
+def test_allowlist_entry_forms_are_all_understood(monkeypatch, entry, freed, still_blocked):
+    """ssrf_allow_hosts accepts host and host:port, and a bare IPv6 literal
+    ends in ":<digits>" just like a host:port does."""
+    monkeypatch.setattr(A, "SSRF_ALLOW_HOSTS", {entry})
+
+    patterns = A._browser_profile_kwargs("http://127.0.0.1:45671")["prohibited_domains"]
+
+    assert freed not in patterns
+    assert still_blocked in patterns
+
+
 def test_ssrf_allow_private_drops_the_navigation_deny_list(monkeypatch):
     """With ssrf_allow_private=1 the proxy's own check is a no-op, so keeping
     a second layer that still blocks would only be confusing."""
