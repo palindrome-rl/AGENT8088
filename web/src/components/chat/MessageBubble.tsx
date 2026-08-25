@@ -8,12 +8,19 @@ import type { ChatMessage } from '@/types/api'
 export function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user'
   return (
-    <div className={cn('flex gap-3 px-4 py-3', isUser ? 'justify-end' : 'justify-start')}>
-      <div className={cn('max-w-3xl rounded-lg px-4 py-2', isUser
-        ? 'bg-brand-primary/15 text-zinc-100'
-        : 'bg-zinc-900 text-zinc-200'
+    <div className={cn('flex gap-3 px-4 py-2.5', isUser ? 'justify-end' : 'justify-start')}>
+      {!isUser && (
+        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-brand-border/20 bg-gradient-to-br from-brand-primary/15 to-brand-cyan/5">
+          <span className="bg-gradient-to-br from-brand-cyan to-brand-primary bg-clip-text text-[10px] font-bold tracking-tighter text-transparent">
+            8088
+          </span>
+        </div>
+      )}
+      <div className={cn('max-w-3xl rounded-2xl px-4 py-2.5', isUser
+        ? 'rounded-tr-sm bg-brand-primary/15 text-zinc-100'
+        : 'rounded-tl-sm bg-zinc-900/60 text-zinc-200'
       )}>
-        <div className="mb-1 text-xs text-zinc-500">{isUser ? 'You' : 'Agent8088'}</div>
+        <div className="mb-1 text-xs font-medium text-zinc-500">{isUser ? 'You' : 'Agent8088'}</div>
         <div className="prose prose-invert prose-sm max-w-none">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}

@@ -26,12 +26,14 @@ export function Sidebar() {
       'flex flex-col border-r border-zinc-800 bg-zinc-950 transition-all duration-200',
       sidebarCollapsed ? 'w-16' : 'w-56',
     )}>
-      <div className="flex h-14 items-center gap-2 border-b border-zinc-800 px-4">
-        <div className="flex h-8 w-8 items-center justify-center rounded bg-brand-primary/10 text-brand-cyan font-bold">
-          8088
+      <div className="flex h-14 items-center gap-2.5 border-b border-zinc-800/80 px-4">
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-brand-border/20 bg-gradient-to-br from-brand-primary/15 to-brand-cyan/5 font-bold">
+          <span className="bg-gradient-to-br from-brand-cyan to-brand-primary bg-clip-text text-xs tracking-tighter text-transparent">
+            8088
+          </span>
         </div>
         {!sidebarCollapsed && (
-          <span className="text-sm font-semibold text-zinc-200">Agent8088</span>
+          <span className="text-sm font-semibold tracking-tight text-zinc-200">Agent8088</span>
         )}
       </div>
 
