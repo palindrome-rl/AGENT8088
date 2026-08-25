@@ -29,7 +29,9 @@ class Agent8088ChatModel(ChatLiteLLM):
         return result
 
 
-def build_browser_chat_model(client, model_name: str, budget=None) -> Agent8088ChatModel:
+def build_browser_chat_model(
+    client, model_name: str, budget=None, max_tokens: Optional[int] = None
+) -> Agent8088ChatModel:
     """Build a browser-use chat model that targets the exact same
     provider/model engine.py's main loop is already configured for.
 
@@ -40,13 +42,23 @@ def build_browser_chat_model(client, model_name: str, budget=None) -> Agent8088C
     string here, since ChatLiteLLM always calls litellm under the hood -
     an OpenAI-SDK-style client's base_url/api_key describe an
     OpenAI-compatible endpoint, which litellm can also reach via the
-    `openai/<model>` provider prefix plus a custom api_base."""
+    `openai/<model>` provider prefix plus a custom api_base.
+
+    `max_tokens` should be the caller's own completion-token ceiling
+    (engine.py's MAX_COMPLETION_TOKENS): left at ChatLiteLLM's own default
+    of 4096, a model that spends much of its budget on the "thinking" field
+    before writing the actual action can get cut off mid-response, which
+    browser-use reports as "Model returned empty action" and retries the
+    whole step - a silent, avoidable source of wasted round-trips."""
+    kwargs = {"budget": budget}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     if isinstance(client, dict) and client.get("api_mode") == "litellm":
         return Agent8088ChatModel(
             model=model_name,
             api_key=client.get("api_key") or None,
             api_base=client.get("api_base") or None,
-            budget=budget,
+            **kwargs,
         )
     api_key = getattr(client, "api_key", None)
     base_url = getattr(client, "base_url", None)
@@ -54,5 +66,5 @@ def build_browser_chat_model(client, model_name: str, budget=None) -> Agent8088C
         model=f"openai/{model_name}",
         api_key=api_key,
         api_base=str(base_url) if base_url else None,
-        budget=budget,
+        **kwargs,
     )

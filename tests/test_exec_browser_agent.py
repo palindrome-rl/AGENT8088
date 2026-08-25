@@ -151,17 +151,24 @@ def fake_browser_use(monkeypatch):
     _FakeAgent.instances = []
     _FakeAgent.hang = False
     profiles = []
+    llm_calls = []
 
     def fake_profile(**kwargs):
         profiles.append(kwargs)
         return types.SimpleNamespace(**kwargs)
 
+    def fake_build_browser_chat_model(client, model_name, budget=None, max_tokens=None):
+        llm_calls.append({"client": client, "model_name": model_name,
+                          "budget": budget, "max_tokens": max_tokens})
+        return object()
+
     monkeypatch.setattr(browser_use, "Agent", _FakeAgent)
     monkeypatch.setattr(browser_use, "BrowserProfile", fake_profile)
     monkeypatch.setattr("agent8088.browser_llm.build_browser_chat_model",
-                        lambda client, model_name, budget=None: object())
+                        fake_build_browser_chat_model)
     monkeypatch.setattr(A, "_active_budget", None)
-    return types.SimpleNamespace(profiles=profiles, agents=_FakeAgent.instances)
+    return types.SimpleNamespace(
+        profiles=profiles, agents=_FakeAgent.instances, llm_calls=llm_calls)
 
 
 def test_telemetry_and_cloud_sync_are_disabled_before_the_agent_runs(
@@ -196,6 +203,19 @@ def test_the_profile_is_built_from_the_security_kwargs(fake_browser_use):
     assert kwargs["proxy"].bypass == "<-loopback>"
     assert kwargs["proxy"].server.startswith("http://127.0.0.1:")
     assert kwargs["prohibited_domains"]
+
+
+def test_the_llm_is_built_with_the_same_completion_token_ceiling_as_the_main_loop(
+        fake_browser_use):
+    """Left at ChatLiteLLM's own default (4096, half of engine.py's own 8192),
+    a model that spends much of its budget on 'thinking' before writing the
+    action can get cut off mid-response - browser-use reports this as "Model
+    returned empty action" and retries the whole step, a silent, avoidable
+    source of wasted round-trips. The browsing loop must get the same ceiling
+    the main agent loop already uses, not browser-use's unrelated default."""
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    assert fake_browser_use.llm_calls[0]["max_tokens"] == A.MAX_COMPLETION_TOKENS
 
 
 def test_the_browser_is_closed_when_the_task_times_out(fake_browser_use, monkeypatch):

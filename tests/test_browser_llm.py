@@ -52,6 +52,25 @@ def test_build_browser_chat_model_from_openai_sdk_style_client():
     assert model.api_key == "sk-y"
 
 
+def test_max_tokens_defaults_to_chatlitellms_own_value_when_not_given():
+    client = {"api_mode": "litellm", "api_base": "https://api.example.com", "api_key": "sk-x"}
+    model = build_browser_chat_model(client, "openai/gpt-4o", budget=None)
+    assert model.max_tokens == 4096  # ChatLiteLLM's own default
+
+
+def test_max_tokens_is_threaded_through_for_both_client_shapes():
+    litellm_client = {"api_mode": "litellm", "api_base": "https://api.example.com", "api_key": "sk-x"}
+    model = build_browser_chat_model(litellm_client, "openai/gpt-4o", budget=None, max_tokens=8192)
+    assert model.max_tokens == 8192
+
+    class _FakeSDKClient:
+        api_key = "sk-y"
+        base_url = "http://localhost:11434/v1"
+
+    model = build_browser_chat_model(_FakeSDKClient(), "llama3", budget=None, max_tokens=8192)
+    assert model.max_tokens == 8192
+
+
 @pytest.mark.asyncio
 async def test_ainvoke_charges_the_budget_on_success(monkeypatch):
     budget = _FakeBudget()

@@ -3557,7 +3557,8 @@ async def _run_browser_agent(url: str, task: str) -> str:
         lambda target_url: _egress_check(target_url) or _ssrf_check(target_url))
     agent = None
     try:
-        llm = build_browser_chat_model(client, MODEL_NAME, budget=_active_budget)
+        llm = build_browser_chat_model(
+            client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS)
         profile = BrowserProfile(**_browser_profile_kwargs(proxy_url))
         agent = Agent(
             task=task,
