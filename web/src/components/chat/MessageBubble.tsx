@@ -1,7 +1,6 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { CodeBlock } from './CodeBlock'
 
 import type { ChatMessage } from '@/types/api'
 
@@ -38,13 +37,10 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
                     {children}
                   </code>
                 ) : (
-                  <SyntaxHighlighter
+                  <CodeBlock
+                    code={String(children).replace(/\n$/, '')}
                     language={match?.[1] || 'text'}
-                    style={vscDarkPlus}
-                    customStyle={{ margin: 0, borderRadius: '0.5rem', fontSize: '0.8rem' }}
-                  >
-                    {String(children).replace(/\n$/, '')}
-                  </SyntaxHighlighter>
+                  />
                 )
               },
             }}
