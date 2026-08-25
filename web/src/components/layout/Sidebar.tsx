@@ -23,44 +23,47 @@ export function Sidebar() {
 
   return (
     <aside className={cn(
-      'flex flex-col border-r border-zinc-800 bg-zinc-950 transition-all duration-200',
-      sidebarCollapsed ? 'w-16' : 'w-56',
+      'sidebar-transition relative flex flex-col border-r border-zinc-800/60 bg-zinc-950 overflow-hidden',
+      sidebarCollapsed ? 'w-14' : 'w-56',
     )}>
-      <div className="flex h-14 items-center gap-2.5 border-b border-zinc-800/80 px-4">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10 font-bold">
-          <span className="text-xs tracking-tighter text-brand-cyan">
+      {/* Header */}
+      <div className="flex h-12 items-center gap-2 px-3">
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10">
+          <span className="text-[11px] font-bold tracking-tight text-brand-cyan">
             8088
           </span>
         </div>
         {!sidebarCollapsed && (
-          <span className="text-sm font-semibold tracking-tight text-zinc-200">Agent8088</span>
+          <span className="text-sm font-medium tracking-tight text-zinc-200">Agent8088</span>
         )}
       </div>
 
-      <nav className="flex-1 space-y-1 p-2">
+      {/* Nav */}
+      <nav className="flex-1 space-y-0.5 px-2 py-2">
         {navItems.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
             to={to}
             end={to === '/'}
             className={({ isActive }) => cn(
-              'flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors',
+              'flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] transition-colors duration-150',
               isActive
-                ? 'bg-brand-primary/15 text-brand-cyan'
-                : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200',
+                ? 'bg-brand-primary/10 text-brand-cyan'
+                : 'text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-200',
             )}
           >
             <Icon className="h-4 w-4 shrink-0" />
-            {!sidebarCollapsed && <span>{label}</span>}
+            {!sidebarCollapsed && <span className="truncate">{label}</span>}
           </NavLink>
         ))}
       </nav>
 
+      {/* Collapse toggle */}
       <button
         onClick={toggleSidebar}
-        className="flex h-10 items-center justify-center border-t border-zinc-800 text-zinc-500 hover:text-zinc-200"
+        className="flex h-8 items-center justify-center border-t border-zinc-800/60 text-zinc-600 hover:text-zinc-300"
       >
-        {sidebarCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+        {sidebarCollapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronLeft className="h-3.5 w-3.5" />}
       </button>
     </aside>
   )

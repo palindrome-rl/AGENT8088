@@ -11,11 +11,12 @@ html.dark {
 }
 
 body {
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: 'Inter', system-ui, ui-sans-serif, sans-serif;
+  font-size: 14px;
   -webkit-font-smoothing: antialiased;
 }
 
-/* Pixel-grid loading accent (Beautiful UI style) */
+/* Beautiful UI — pixel-grid loader */
 .pixel-grid-loader {
   background-image:
     linear-gradient(rgba(35, 125, 215, 0.1) 1px, transparent 1px),
@@ -29,7 +30,7 @@ body {
   50% { opacity: 0.8; }
 }
 
-/* Streaming text cursor */
+/* Beautiful UI — streaming text cursor */
 .stream-cursor::after {
   content: '▊';
   animation: blink 1s step-end infinite;
@@ -40,8 +41,37 @@ body {
   50% { opacity: 0; }
 }
 
+/* Beautiful UI — shimmer for loading states */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
+  animation: shimmer 1.8s infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Smooth sidebar transition — Beautiful UI easing */
+.sidebar-transition {
+  transition: width 280ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+/* Focus ring — subtle, Beautiful UI style */
+*:focus-visible {
+  outline: 2px solid rgba(35, 125, 215, 0.4);
+  outline-offset: 1px;
+}

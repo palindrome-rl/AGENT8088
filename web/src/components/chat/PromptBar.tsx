@@ -58,27 +58,24 @@ export function PromptBar() {
   }
 
   return (
-    <div className="relative bg-zinc-950 px-4 pb-4 pt-2">
-      {/* Subtle top fade */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-2 bg-zinc-950" />
-
+    <div className="relative bg-zinc-950 px-4 pb-3 pt-2">
       {showCommands && filteredCommands.length > 0 && (
-        <div className="absolute bottom-full left-4 right-4 mb-2 overflow-hidden rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl shadow-black/50">
-          <div className="border-b border-zinc-800 px-3 py-1.5 text-xs text-zinc-500">
+        <div className="absolute bottom-full left-4 right-4 mb-2 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl shadow-black/40">
+          <div className="border-b border-zinc-800/60 px-3 py-1 text-[11px] text-zinc-500">
             Commands
           </div>
           {filteredCommands.map(cmd => (
             <button
               key={cmd}
               onClick={() => { setText(`/${cmd} `); setShowCommands(false); inputRef.current?.focus() }}
-              className="block w-full px-3 py-2 text-left text-sm transition-colors hover:bg-zinc-800/60"
+              className="block w-full px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-zinc-800/50"
             >
               <span className="font-mono text-brand-cyan">/{cmd}</span>
             </button>
           ))}
         </div>
       )}
-      <div className="flex items-end gap-2.5 rounded-2xl border border-zinc-700/80 bg-zinc-900/60 p-2.5 transition-colors focus-within:border-brand-primary/50 focus-within:bg-zinc-900">
+      <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1.5 transition-colors focus-within:border-brand-primary/40">
         <textarea
           ref={inputRef}
           value={text}
@@ -86,21 +83,21 @@ export function PromptBar() {
           onKeyDown={handleKeyDown}
           placeholder="Send a message or / for commands..."
           rows={1}
-          className="flex-1 resize-none bg-transparent px-1.5 py-1.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none"
+          className="flex-1 resize-none bg-transparent px-2.5 py-1.5 text-[13px] text-zinc-100 placeholder:text-zinc-600 focus:outline-none"
         />
         <button
           onClick={isStreaming ? () => wsSend({ type: 'interrupt' }) : handleSend}
           disabled={!isStreaming && !text.trim()}
           className={cn(
-            'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-all',
+            'flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-all',
             isStreaming
-              ? 'bg-red-600/20 text-red-400 hover:bg-red-600/30'
+              ? 'bg-red-600/15 text-red-400 hover:bg-red-600/25'
               : text.trim()
-                ? 'bg-brand-primary/20 text-brand-cyan hover:bg-brand-primary/30'
-                : 'bg-zinc-800 text-zinc-600',
+                ? 'bg-brand-primary/15 text-brand-cyan hover:bg-brand-primary/25'
+                : 'bg-zinc-800/50 text-zinc-600',
           )}
         >
-          {isStreaming ? <Square className="h-3.5 w-3.5" /> : <Send className="h-4 w-4" />}
+          {isStreaming ? <Square className="h-3 w-3" /> : <Send className="h-3.5 w-3.5" />}
         </button>
       </div>
     </div>
