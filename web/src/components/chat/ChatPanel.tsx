@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react'
+import { useRef, useEffect, useState } from 'react'
 import { useSessionStore } from '@/stores/session'
 import { MessageBubble } from './MessageBubble'
 import { ToolChip } from './ToolChip'
@@ -11,10 +11,20 @@ export function ChatPanel() {
   const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
   const { theme } = useUIStore()
   const scrollRef = useRef<HTMLDivElement>(null)
+  const [showLoader, setShowLoader] = useState(false)
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages, isStreaming, toolEvents, streamingText])
+
+  // Show loader after 300ms of streaming with no text yet (agent is "thinking")
+  useEffect(() => {
+    if (isStreaming && !streamingText) {
+      const t = setTimeout(() => setShowLoader(true), 300)
+      return () => clearTimeout(t)
+    }
+    setShowLoader(false)
+  }, [isStreaming, streamingText])
 
   const isEmpty = messages.length === 0 && !isStreaming
 
@@ -23,7 +33,7 @@ export function ChatPanel() {
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
         {isEmpty && (
           <div className="flex h-full flex-col items-center justify-center px-6">
-            {/* Logo image instead of text */}
+            {/* Logo image */}
             <div className="mb-4">
               <img src="/logo.png" alt="Agent8088" className="h-10 w-auto" style={{ mixBlendMode: theme === 'dark' ? 'screen' : 'normal' }} />
             </div>
@@ -52,22 +62,77 @@ export function ChatPanel() {
         {messages.map((msg, i) => (
           <MessageBubble key={i} message={msg} />
         ))}
-        {isStreaming && (
-          <div className="mx-auto max-w-3xl px-6 py-4">
+
+        {/* Loading state — Beautiful UI pixel-grid loader while agent thinks */}
+        {isStreaming && showLoader && !streamingText && (
+          <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
+            <PixelLoader theme={theme} />
+          </div>
+        )}
+
+        {/* Streaming response with fade-in */}
+        {isStreaming && streamingText && (
+          <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
             <ThinkingTrace />
             {toolEvents.map((tool, i) => (
               <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
             ))}
-            {streamingText && (
-              <div className="stream-cursor text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200">
-                {streamingText}
-              </div>
-            )}
+            <div className="stream-cursor text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200">
+              {streamingText}
+            </div>
           </div>
         )}
         <ApprovalCard />
       </div>
       <PromptBar />
+    </div>
+  )
+}
+
+/** Beautiful UI pixel-grid loader — 3x3 grid with chevron wavefront */
+function PixelLoader({ theme }: { theme: string }) {
+  const [ds, setDs] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => setDs(d => d + 1), 100)
+    return () => clearInterval(t)
+  }, [])
+  const elapsed = (ds / 10).toFixed(1) + 's'
+
+  const chevron = [0, 90, 180, 90, 180, 270, 180, 270, 360]
+  const cellColor = theme === 'dark' ? '#e4e4e7' : '#18181b'
+
+  return (
+    <div className="flex items-center gap-2.5" role="status">
+      <span className="grid shrink-0 grid-cols-3 gap-[1.5px]">
+        {chevron.map((delay, i) => (
+          <span
+            key={i}
+            className="h-1 w-1 rounded-[1px]"
+            style={{
+              backgroundColor: cellColor,
+              opacity: 0.15,
+              animation: `pixel-on 650ms ease-in-out ${delay}ms infinite`,
+            }}
+          />
+        ))}
+      </span>
+      <span
+        className="text-[13px] font-medium"
+        style={{
+          color: theme === 'dark' ? '#71717a' : '#a1a1aa',
+          backgroundImage: `linear-gradient(90deg, ${theme === 'dark' ? '#71717a' : '#a1a1aa'} 35%, ${theme === 'dark' ? '#e4e4e7' : '#18181b'} 50%, ${theme === 'dark' ? '#71717a' : '#a1a1aa'} 65%)`,
+          backgroundSize: '200% 100%',
+          WebkitBackgroundClip: 'text',
+          backgroundClip: 'text',
+          WebkitTextFillColor: 'transparent',
+          animation: 'shimmer-text 1.4s linear infinite',
+        }}
+      >
+        Churning
+      </span>
+      <span className="font-mono text-[12px] text-zinc-400 dark:text-zinc-500 tabular-nums">
+        {elapsed}
+      </span>
     </div>
   )
 }
