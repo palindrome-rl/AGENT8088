@@ -96,19 +96,41 @@ def test_browse_page_can_fill_and_submit_a_form(local_test_page):
 
 
 @_run_live
-def test_ssrf_proxy_blocks_a_request_the_page_itself_makes(local_test_page):
+def test_ssrf_proxy_blocks_a_request_the_page_itself_makes(local_test_page, monkeypatch):
     """The pre-flight _egress_check/_ssrf_check in _exec_browser only ever
     sees the *initial* url. This is the one test that proves the SSRF
     proxy - the reason this whole component exists - also governs a request
     the page makes on its own mid-session, not just the first navigation.
     169.254.169.254 (the cloud-metadata address) is a literal IP so this
-    needs no real DNS/network access to be deterministic."""
+    needs no real DNS/network access to be deterministic.
+
+    "fetch blocked" alone would be a weak assertion: nothing is listening on
+    169.254.169.254, so the fetch fails either way and the test cannot tell
+    "the proxy refused it" from "nobody answered". Recording every URL the
+    proxy's check function is actually handed closes that gap - if the request
+    were bypassing the proxy (as it did before ProxySettings(bypass=
+    "<-loopback>") was set), the metadata URL would never appear here."""
+    checked = []
+    real_ssrf_check = A._ssrf_check
+
+    def recording_ssrf_check(url):
+        checked.append(url)
+        return real_ssrf_check(url)
+
+    monkeypatch.setattr(A, "_ssrf_check", recording_ssrf_check)
+
     result = A._exec_browser({
         "url": local_test_page,
         "task": ("Click the 'Probe metadata endpoint' button, wait a moment, "
                   "then report the exact text in the paragraph with id "
                   "'probe-result'."),
     })
+    proxy_checks = [u for u in checked if "169.254.169.254" in u]
+    assert proxy_checks, (
+        "the metadata fetch never reached the SSRF proxy's check - it was "
+        f"routed around it. URLs the check saw: {checked}")
+    assert all(real_ssrf_check(u) for u in proxy_checks), \
+        "the check saw the metadata URL but did not block it"
     assert "fetch blocked" in result
     assert "fetch succeeded" not in result
 

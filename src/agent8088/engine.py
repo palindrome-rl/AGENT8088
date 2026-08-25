@@ -3400,10 +3400,122 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "25"))
 BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "300"))
 
+# Host patterns the browsing agent is forbidden from navigating to, enforced by
+# browser-use's own security watchdog *before* Chromium issues the request.
+#
+# This is a second, independent layer behind the SSRF-filtering proxy, and it
+# exists because Chromium refuses to send some targets through a proxy at all:
+# loopback and link-local hosts are covered by an implicit proxy-bypass rule,
+# so a request to 127.0.0.1 or 169.254.169.254 would never reach the proxy and
+# therefore never be seen by _egress_check/_ssrf_check. ProxySettings(bypass=
+# "<-loopback>") closes the link-local half of that gap, but the loopback half
+# survives it (the proxy itself is bound to 127.0.0.1, so Chromium keeps
+# exempting loopback unconditionally) - hence this list.
+#
+# Patterns are matched against the hostname with fnmatch by browser-use's
+# SecurityWatchdog (browser_use/browser/watchdogs/security_watchdog.py,
+# _is_url_match), so ranges are spelled as globs rather than CIDRs. They cover
+# the same address space _ssrf_check rejects: loopback, link-local, RFC1918,
+# CGNAT, IPv6 ULA/link-local, and the reserved/multicast ranges. Keep the list
+# under 100 entries - at 100 browser-use silently converts it to a set and
+# drops pattern matching entirely (DOMAIN_OPTIMIZATION_THRESHOLD).
+_BROWSER_PROHIBITED_HOST_PATTERNS = (
+    # Loopback and the unspecified address.
+    "localhost", "*.localhost", "127.*", "0.0.0.0", "0", "::1", "::",
+    # Link-local, including the 169.254.169.254 cloud-metadata endpoint.
+    "169.254.*", "fe8*:*", "fe9*:*", "fea*:*", "feb*:*",
+    # RFC1918 private ranges.
+    "10.*", "192.168.*", "172.1[6-9].*", "172.2[0-9].*", "172.3[01].*",
+    # CGNAT 100.64.0.0/10.
+    "100.6[4-9].*", "100.[7-9][0-9].*", "100.1[01][0-9].*", "100.12[0-7].*",
+    # IPv6 unique-local (fc00::/7). The ":" keeps these from matching ordinary
+    # hostnames that merely start with "fc"/"fd" (e.g. fcbarcelona.com).
+    "fc*:*", "fd*:*",
+    # Other special-use / reserved / multicast ranges.
+    "192.0.0.*", "192.0.2.*", "198.18.*", "198.19.*", "198.51.100.*",
+    "203.0.113.*", "22[4-9].*", "23[0-9].*", "24[0-9].*", "25[0-5].*",
+    # Internal naming conventions that resolve inside a private network.
+    "*.local", "*.internal",
+)
+
+
+def _browser_task_timeout() -> int:
+    """The real wall-clock bound on one browse_page call.
+
+    browser_task_timeout_seconds is the browser-specific budget, but a single
+    tool call may never outrun max_tool_timeout_seconds - the documented hard
+    ceiling every other tool path clamps to (see run_tool)."""
+    return min(max(1, BROWSER_TASK_TIMEOUT_SECONDS), MAX_TOOL_TIMEOUT_SECONDS)
+
+
+def _browser_profile_kwargs(proxy_url: str) -> dict:
+    """Build the BrowserProfile(...) kwargs for one browsing session.
+
+    Split out from _run_browser_agent so the security-critical parts (proxy
+    routing, headless, the navigation deny-list) can be asserted by a fast unit
+    test without launching a browser - see tests/test_browser_profile_args.py.
+    """
+    from browser_use.browser import ProxySettings
+
+    kwargs = {
+        # Everything goes through the local SSRF-filtering proxy. "<-loopback>"
+        # *removes* Chromium's implicit loopback/link-local bypass rule, so
+        # targets like 169.254.169.254 are proxied (and checked) rather than
+        # dialed directly. See _BROWSER_PROHIBITED_HOST_PATTERNS for the part
+        # of that gap this flag cannot close.
+        "proxy": ProxySettings(server=proxy_url, bypass="<-loopback>"),
+        # browser-use defaults headless to "headful if a display exists", which
+        # pops a real visible window on any desktop. browse_page is documented
+        # as a headless tool and runs unattended, so pin it.
+        "headless": True,
+        # browser-use downloads three CRX extensions from clients2.google.com
+        # on first launch and injects them into every page. Those downloads are
+        # made by browser-use itself, not through the proxy, so they bypass
+        # _egress_check/_ssrf_check and the audit log entirely.
+        "enable_default_extensions": False,
+    }
+    if SSRF_ALLOW_PRIVATE:
+        # The operator has explicitly opted every private range back in; the
+        # proxy's own check is a no-op in this mode too.
+        return kwargs
+
+    import fnmatch
+
+    allowed_hosts = set()
+    for entry in SSRF_ALLOW_HOSTS:
+        host, sep, port = entry.rpartition(":")
+        allowed_hosts.add(host if sep and port.isdigit() else entry)
+    # A host the operator allowlisted through ssrf_allow_hosts must stay
+    # reachable, and a deny-list of patterns cannot express an exception - so
+    # drop any pattern that would cover an allowlisted host.
+    kwargs["prohibited_domains"] = [
+        pattern for pattern in _BROWSER_PROHIBITED_HOST_PATTERNS
+        if not any(fnmatch.fnmatchcase(host, pattern) or host == pattern
+                   for host in allowed_hosts)
+    ]
+    # Catches IP literals a hostname pattern cannot - decimal/hex/octal/
+    # short-form encodings of the same private addresses (http://2130706433/
+    # is 127.0.0.1). Can't be used alongside an allowlist: it refuses every
+    # IP-literal URL, including an allowlisted one.
+    kwargs["block_ip_addresses"] = not SSRF_ALLOW_HOSTS
+    return kwargs
+
 
 def _playwright_available() -> bool:
     try:
         import playwright.sync_api  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _browser_use_available() -> bool:
+    """browser-use requires Python >= 3.11 while this project supports 3.10,
+    so it is declared with an environment marker and is genuinely absent on a
+    3.10 install (see pyproject.toml). Checked explicitly so that case reports
+    itself instead of surfacing as a bare ImportError."""
+    try:
+        import browser_use  # noqa: F401
         return True
     except Exception:
         return False
@@ -3420,16 +3532,25 @@ async def _run_browser_agent(url: str, task: str) -> str:
     Agent8088ChatModel (browser_llm.py), so a multi-step task can't spend
     tokens outside the user's existing budget ceiling.
     """
+    # browser-use ships anonymized telemetry ON by default and posts the task
+    # text, visited URLs, extracted content and model name to a third-party
+    # analytics endpoint on every run - traffic this codebase's own egress
+    # guard and audit log never see, because browser-use makes it directly.
+    # setdefault, not a plain assignment: an operator who deliberately opted
+    # in through the environment keeps their setting.
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
+    os.environ.setdefault("BROWSER_USE_CLOUD_SYNC", "false")
+
     from browser_use import Agent, BrowserProfile
-    from browser_use.browser import ProxySettings
     from agent8088.browser_llm import build_browser_chat_model
     from agent8088.browser_proxy import start_ssrf_filtering_proxy
 
     proxy_url, stop_proxy = start_ssrf_filtering_proxy(
         lambda target_url: _egress_check(target_url) or _ssrf_check(target_url))
+    agent = None
     try:
         llm = build_browser_chat_model(client, MODEL_NAME, budget=_active_budget)
-        profile = BrowserProfile(proxy=ProxySettings(server=proxy_url))
+        profile = BrowserProfile(**_browser_profile_kwargs(proxy_url))
         agent = Agent(
             task=task,
             llm=llm,
@@ -3450,14 +3571,30 @@ async def _run_browser_agent(url: str, task: str) -> str:
         )
         history = await asyncio.wait_for(
             agent.run(max_steps=BROWSER_MAX_STEPS),
-            timeout=BROWSER_TASK_TIMEOUT_SECONDS,
+            timeout=_browser_task_timeout(),
         )
     finally:
+        # agent.run() closes its own session on a normal return, but on a
+        # timeout (or any other exception) it is cancelled mid-step and the
+        # Chromium process it launched would be orphaned. close() kills the
+        # session; it is safe to call on an already-closed one.
+        if agent is not None:
+            try:
+                await asyncio.wait_for(agent.close(), timeout=30)
+            except Exception:
+                pass
         stop_proxy()
 
     result = history.final_result() or "(The task did not produce a final result.)"
     if not history.is_done():
         result += "\n\n(Note: the browsing task hit its step or time limit before finishing.)"
+    # A budget stop raises inside Agent8088ChatModel.ainvoke, but browser-use
+    # catches per-step exceptions and keeps going until max_steps, so the real
+    # reason would otherwise never reach the user - only the generic
+    # "hit its step or time limit" note above.
+    over_budget = _active_budget.exceeded() if _active_budget is not None else None
+    if over_budget:
+        result += f"\n\n(The browsing task stopped early: {over_budget})"
     return result
 
 
@@ -3483,6 +3620,12 @@ def _exec_browser(args: dict) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
+    # Validated with the other arguments, before the environment pre-flight
+    # below: a missing 'task' is a caller error, and reporting it as "Chromium
+    # is not installed" would send the caller off fixing the wrong thing.
+    task = str(args.get("task") or "").strip()
+    if not task:
+        return "Error: browser tool requires 'task'."
     blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
@@ -3490,6 +3633,11 @@ def _exec_browser(args: dict) -> str:
         return ("Playwright is not installed. Install it with:\n"
                 "  pip install playwright && playwright install chromium\n"
                 "Until then, use web_search or get_page_title instead.")
+    if not _browser_use_available():
+        return ("Interactive browsing is unavailable: the browser-use package "
+                "is not installed. It requires Python 3.11 or newer, so it is "
+                "skipped on a Python 3.10 install. Reinstall Agent8088 on "
+                "Python 3.11+, or use web_search or get_page_title instead.")
     # Keep Chromium's ~280MB download inside $AGENT8088_HOME rather than the
     # OS-default shared cache (~/.cache/ms-playwright etc.) - that shared
     # cache can belong to other Playwright-using projects on the same
@@ -3507,16 +3655,15 @@ def _exec_browser(args: dict) -> str:
     except Exception as e:
         return f"Browser error: {e}"
 
-    task = str(args.get("task") or "").strip()
-    if not task:
-        return "Error: browser tool requires 'task'."
-
     saved_role, _active_role = _active_role, "subagent:browser"
     try:
         result = asyncio.run(_run_browser_agent(url, task))
     except asyncio.TimeoutError:
-        result = (f"Browser error: task exceeded the {BROWSER_TASK_TIMEOUT_SECONDS}s "
-                  f"time limit (raise browser_task_timeout_seconds in config.txt).")
+        knob = ("max_tool_timeout_seconds"
+                if BROWSER_TASK_TIMEOUT_SECONDS > MAX_TOOL_TIMEOUT_SECONDS
+                else "browser_task_timeout_seconds")
+        result = (f"Browser error: task exceeded the {_browser_task_timeout()}s "
+                  f"time limit (raise {knob} in config.txt).")
     except Exception as e:
         result = f"Browser error: {e}"
     finally:

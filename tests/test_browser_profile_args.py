@@ -1,0 +1,172 @@
+"""The browsing session's security posture is decided entirely by the kwargs
+_run_browser_agent hands to BrowserProfile, so those kwargs - and the Chromium
+launch flags they compile down to - are what these tests assert.
+
+This is deliberately a *static* test: no browser is launched, no LLM is called,
+nothing touches the network. The bug that made it necessary (Chromium quietly
+bypassing the SSRF proxy for loopback and link-local targets, and headless
+never being set at all) shipped precisely because the only coverage of "does
+the profile actually do what we think" was a live end-to-end test that could
+not distinguish "the proxy blocked it" from "nothing answered".
+"""
+import pytest
+
+from agent8088 import engine as A
+
+pytest.importorskip("browser_use")
+
+
+def _profile(tmp_path, **overrides):
+    """Build a real BrowserProfile from production kwargs and return it.
+
+    user_data_dir is supplied because get_args() asserts on it; the path has no
+    "chrome" in it, so browser-use's profile-copying step is a no-op and
+    nothing outside tmp_path is touched.
+    """
+    from browser_use import BrowserProfile
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+    kwargs.update(overrides)
+    return BrowserProfile(user_data_dir=str(tmp_path / "profile"), **kwargs)
+
+
+def test_proxy_is_configured_with_the_loopback_bypass_removed():
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert kwargs["proxy"].server == "http://127.0.0.1:45671"
+    # Chromium bypasses the proxy for loopback/link-local hosts by default, so
+    # 169.254.169.254 (cloud metadata) would never reach the SSRF filter.
+    # "<-loopback>" subtracts that implicit rule.
+    assert kwargs["proxy"].bypass == "<-loopback>"
+
+
+def test_launch_args_carry_the_proxy_server_and_bypass_list(tmp_path):
+    args = _profile(tmp_path).get_args()
+
+    assert "--proxy-server=http://127.0.0.1:45671" in args
+    assert "--proxy-bypass-list=<-loopback>" in args
+
+
+def test_launch_args_are_headless(tmp_path):
+    profile = _profile(tmp_path)
+
+    assert profile.headless is True
+    # browser-use spells headless as a launch flag, not just a Python kwarg;
+    # this is what actually keeps a real window off the user's screen.
+    assert any(a.startswith("--headless") for a in profile.get_args())
+    assert "--start-maximized" not in profile.get_args()
+
+
+@pytest.mark.parametrize("host", [
+    "127.0.0.1", "localhost", "169.254.169.254", "10.0.0.5", "192.168.1.1",
+    "172.16.0.1", "172.31.255.254", "100.64.0.1", "100.127.0.1", "0.0.0.0",
+    "::1", "fd00::1", "fe80::1", "printer.local", "db.internal",
+])
+def test_private_and_loopback_hosts_are_prohibited_from_navigation(host):
+    """The second, independent layer behind the proxy: browser-use's own
+    security watchdog refuses these before Chromium issues any request, which
+    is the only thing that covers loopback (Chromium keeps exempting it from
+    the proxy even with "<-loopback>", because the proxy itself is on
+    127.0.0.1)."""
+    import fnmatch
+
+    patterns = A._browser_profile_kwargs("http://127.0.0.1:45671")["prohibited_domains"]
+
+    assert any(fnmatch.fnmatchcase(host, p) or host == p for p in patterns), \
+        f"{host} is not covered by any prohibited_domains pattern"
+
+
+@pytest.mark.parametrize("host", [
+    "example.com", "en.wikipedia.org", "fcbarcelona.com", "fda.gov",
+    "100.200.30.40", "172.32.0.1", "11.0.0.1", "localhost.example.com",
+])
+def test_ordinary_public_hosts_are_not_prohibited(host):
+    import fnmatch
+
+    patterns = A._browser_profile_kwargs("http://127.0.0.1:45671")["prohibited_domains"]
+
+    assert not any(fnmatch.fnmatchcase(host, p) or host == p for p in patterns), \
+        f"{host} is wrongly matched by a prohibited_domains pattern"
+
+
+def test_prohibited_domains_stays_below_the_pattern_matching_threshold():
+    """browser-use converts a list of >= 100 domains to a set and silently
+    stops doing pattern matching, which would turn every glob above into a
+    no-op (browser_use/browser/profile.py, DOMAIN_OPTIMIZATION_THRESHOLD)."""
+    from browser_use.browser.profile import DOMAIN_OPTIMIZATION_THRESHOLD
+
+    patterns = A._browser_profile_kwargs("http://127.0.0.1:45671")["prohibited_domains"]
+
+    assert isinstance(patterns, list)
+    assert len(patterns) < DOMAIN_OPTIMIZATION_THRESHOLD
+
+
+def test_the_watchdog_actually_refuses_a_prohibited_url(tmp_path):
+    """Assert against browser-use's real matcher rather than reimplementing
+    it, so this test fails if the upstream semantics ever change."""
+    import logging
+
+    from browser_use.browser.watchdogs.security_watchdog import SecurityWatchdog
+
+    profile = _profile(tmp_path)
+    fake_session = type("_S", (), {
+        "browser_profile": profile,
+        "logger": logging.getLogger("test_browser_profile_args"),
+    })()
+    watchdog = SecurityWatchdog.model_construct(browser_session=fake_session)
+
+    assert watchdog._is_url_allowed("https://example.com/") is True
+    assert watchdog._is_url_allowed("http://169.254.169.254/latest/meta-data/") is False
+    assert watchdog._is_url_allowed("http://127.0.0.1:8123/x") is False
+    assert watchdog._is_url_allowed("http://localhost:8123/x") is False
+    assert watchdog._is_url_allowed("http://10.0.0.5/x") is False
+    # An obfuscated IP literal (2130706433 == 127.0.0.1) that no hostname
+    # pattern can express - this is what block_ip_addresses is there for.
+    assert watchdog._is_url_allowed("http://2130706433/") is False
+
+
+def test_ip_literals_are_blocked_outright_when_nothing_is_allowlisted():
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert kwargs["block_ip_addresses"] is True
+
+
+def test_an_ssrf_allowlisted_host_stays_reachable(monkeypatch):
+    """ssrf_allow_hosts is the documented escape hatch for reaching one
+    internal host. The navigation deny-list must not silently override it -
+    a deny-list of patterns cannot express an exception, so the covering
+    pattern is dropped instead."""
+    monkeypatch.setattr(A, "SSRF_ALLOW_HOSTS", {"127.0.0.1:8123"})
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert "127.*" not in kwargs["prohibited_domains"]
+    # ...but only that host's range opens up; everything else stays shut.
+    assert "169.254.*" in kwargs["prohibited_domains"]
+    assert "10.*" in kwargs["prohibited_domains"]
+    # block_ip_addresses would refuse the allowlisted IP literal too.
+    assert kwargs["block_ip_addresses"] is False
+
+
+def test_ssrf_allow_private_drops_the_navigation_deny_list(monkeypatch):
+    """With ssrf_allow_private=1 the proxy's own check is a no-op, so keeping
+    a second layer that still blocks would only be confusing."""
+    monkeypatch.setattr(A, "SSRF_ALLOW_PRIVATE", True)
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert "prohibited_domains" not in kwargs
+    assert "block_ip_addresses" not in kwargs
+    # The proxy and headless are unconditional either way.
+    assert kwargs["proxy"].bypass == "<-loopback>"
+    assert kwargs["headless"] is True
+
+
+def test_default_extensions_are_off(tmp_path):
+    """browser-use otherwise downloads three CRX extensions from
+    clients2.google.com on first launch - traffic that does not go through the
+    SSRF proxy and never reaches the audit log."""
+    profile = _profile(tmp_path)
+
+    assert profile.enable_default_extensions is False
+    assert not any("--load-extension" in a for a in profile.get_args())
