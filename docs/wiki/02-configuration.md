@@ -163,7 +163,8 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_tool_output_bytes` | Cap on tool output fed back to the model. |
 | `max_tool_timeout_seconds` | Hard ceiling for one tool call (default `300`). |
 | `max_image_bytes` | Cap on an image attachment. |
-| `browser_timeout_ms` | `browse_page` timeout. |
+| `browser_max_steps` | Max steps `browse_page`'s browsing agent takes on one task (default `25`). |
+| `browser_task_timeout_seconds` | Overall wall-clock limit for one `browse_page` call (default `300`). |
 
 ### Turn budget
 

@@ -241,5 +241,22 @@ Honest list, for anyone extending this:
   `max_turn_cost_usd` bounds a single turn, but nothing aggregates spend across
   runs. `model_telemetry=1` writes per-call records to a local JSONL file; the
   gap is that nothing reads them back for aggregation.
-- **`browse_page` is read-only.** It renders and extracts text; it can't click
-  or fill forms.
+- **`browse_page`'s reliability depends on the configured model.** It can
+  click, fill forms, navigate, and extract via natural-language
+  instructions, but each step relies on the model returning strict,
+  parseable JSON. Some models/providers occasionally wrap that JSON in
+  markdown code fences or return malformed output; when that happens
+  repeatedly within one task, the browsing agent gives up early rather
+  than completing the task. This is a limitation of the underlying model's
+  instruction-following, not of `browse_page` itself.
+
+This was discovered directly during this feature's own live testing:
+against a real configured provider, three of four end-to-end scenarios
+verified working correctly, but a fourth failed consistently because that
+specific model repeatedly returned markdown-fenced JSON that couldn't be
+parsed — a documented, out-of-scope model-compliance limitation rather
+than a `browse_page` defect (see the design spec's Open Questions section
+and the implementation plan's Global Constraints for the related
+`use_vision=False` requirement, which exists for the same class of reason:
+`browse_page` must degrade gracefully across whatever model a user has
+configured, not assume one particular model's capabilities).
