@@ -97,6 +97,37 @@ The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`
 
 > **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account + WFP egress filter. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
 
+### Use the web UI
+
+Build the frontend once, then launch the FastAPI web server from the repository root:
+
+```sh
+cd web && npm install && npm run build
+cd ..
+agent8088 --web
+```
+
+Open [http://127.0.0.1:8180](http://127.0.0.1:8180) in a browser. The web UI uses the same Agent8088 configuration, sessions, tools, permissions, and engine as the CLI.
+
+For local frontend development, run the backend and Vite in separate terminals:
+
+```sh
+# Terminal 1
+PYTHONPATH=src python -m agent8088.cli --web --web-dev
+
+# Terminal 2
+cd web && npm run dev
+```
+
+Then open [http://127.0.0.1:5180](http://127.0.0.1:5180). Vite proxies API and WebSocket traffic to the backend.
+
+| Flag | Purpose | Default |
+| --- | --- | --- |
+| `--web` | Launch the web UI instead of the terminal REPL. | off |
+| `--web-port PORT` | Set the web server port. | `8180` |
+| `--web-host HOST` | Set the bind host. | `127.0.0.1` |
+| `--web-dev` | Run the backend in development mode without serving built frontend files. | off |
+
 ### A few useful commands
 
 | Command | Purpose |
