@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { Image as ImageIcon, Upload, X } from 'lucide-react'
+import { Upload, X } from 'lucide-react'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { cn } from '@/lib/utils'
 
