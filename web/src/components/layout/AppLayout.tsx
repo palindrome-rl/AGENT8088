@@ -14,9 +14,7 @@ export function AppLayout() {
     const html = document.documentElement
     if (theme === 'dark') {
       html.classList.add('dark')
-      html.classList.remove('light')
     } else {
-      html.classList.add('light')
       html.classList.remove('dark')
     }
   }, [theme])
@@ -33,7 +31,7 @@ export function AppLayout() {
   }, [])
 
   return (
-    <div className="flex h-screen overflow-hidden bg-zinc-950 dark:bg-zinc-950 light:bg-zinc-50">
+    <div className="flex h-screen overflow-hidden bg-zinc-50 dark:bg-zinc-950">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
         <main className="flex-1 overflow-auto">

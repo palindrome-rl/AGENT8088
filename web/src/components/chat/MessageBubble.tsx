@@ -2,18 +2,18 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { cn } from '@/lib/utils'
+
 import type { ChatMessage } from '@/types/api'
 
 export function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user'
 
   if (isUser) {
-    // User messages aligned right — DeepSeek style
+    // User messages — right-aligned bubble with slide-in animation
     return (
-      <div className="msg-enter w-full py-3">
+      <div className="user-msg-enter w-full py-3">
         <div className="mx-auto flex max-w-3xl justify-end px-6">
-          <div className="max-w-[80%] rounded-xl rounded-tr-sm bg-brand-primary/10 px-4 py-2.5 text-[14px] leading-relaxed text-zinc-100">
+          <div className="max-w-[80%] rounded-xl rounded-tr-sm bg-brand-primary/10 dark:bg-brand-primary/10 px-4 py-2.5 text-[14px] leading-relaxed text-zinc-900 dark:text-zinc-100">
             {message.content}
           </div>
         </div>
@@ -23,10 +23,10 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
 
   // Assistant messages — flat full-width with border-b
   return (
-    <div className="msg-enter w-full border-b border-zinc-800/40 dark:border-zinc-800/40 light:border-zinc-200">
+    <div className="msg-enter w-full border-b border-zinc-200 dark:border-zinc-800/40">
       <div className="mx-auto max-w-3xl px-6 py-4">
-        <div className="mb-1 text-[11px] font-medium text-zinc-500">Agent8088</div>
-        <div className="prose prose-invert prose-sm max-w-none text-[14px] leading-relaxed text-zinc-200 dark:text-zinc-200 light:text-zinc-800">
+        <div className="mb-1 text-[11px] font-medium text-zinc-400 dark:text-zinc-500">Agent8088</div>
+        <div className="prose prose-sm max-w-none text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
@@ -34,7 +34,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
                 const match = /language-(\w+)/.exec(className || '')
                 const isInline = !className
                 return isInline ? (
-                  <code className="rounded bg-zinc-800 dark:bg-zinc-800 light:bg-zinc-200 px-1 py-0.5 font-mono text-[13px] text-zinc-300 dark:text-zinc-300 light:text-zinc-700" {...props}>
+                  <code className="rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 font-mono text-[13px] text-zinc-700 dark:text-zinc-300" {...props}>
                     {children}
                   </code>
                 ) : (

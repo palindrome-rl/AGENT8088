@@ -80,11 +80,20 @@ body {
 
 /* Fluid message entrance */
 @keyframes msg-in {
-  from { opacity: 0; transform: translateY(4px); }
+  from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
 }
 .msg-enter {
-  animation: msg-in 0.2s ease-out;
+  animation: msg-in 0.25s ease-out;
+}
+
+/* User message slide-in from right */
+@keyframes user-msg-in {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.user-msg-enter {
+  animation: user-msg-in 0.2s ease-out;
 }
 
 /* Scrollbar styling */

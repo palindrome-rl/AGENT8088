@@ -7,17 +7,17 @@ export function ThinkingTrace() {
   const [expanded, setExpanded] = useState(false)
   if (!streamingReasoning.length) return null
   return (
-    <div className="my-1 rounded-lg border border-zinc-800/60 bg-zinc-900/20">
+    <div className="my-1 rounded-lg border border-zinc-200 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/20">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11px] text-zinc-500"
+        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11px] text-zinc-400 dark:text-zinc-500"
       >
         {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
         <Brain className="h-3 w-3" />
         <span>Thinking ({streamingReasoning.length} tokens)</span>
       </button>
       {expanded && (
-        <pre className="max-h-56 overflow-auto border-t border-zinc-800/60 p-2 font-mono text-[11px] text-zinc-500">
+        <pre className="max-h-56 overflow-auto border-t border-zinc-200 dark:border-zinc-800/60 p-2 font-mono text-[11px] text-zinc-500 dark:text-zinc-500">
           {streamingReasoning.join('')}
         </pre>
       )}

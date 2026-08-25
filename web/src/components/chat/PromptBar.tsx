@@ -58,17 +58,17 @@ export function PromptBar() {
   }
 
   return (
-    <div className="relative bg-zinc-950 dark:bg-zinc-950 light:bg-zinc-50 pb-4 pt-2">
+    <div className="relative bg-zinc-50 dark:bg-zinc-950 pb-4 pt-2">
       {showCommands && filteredCommands.length > 0 && (
-        <div className="absolute bottom-full left-1/2 mb-2 w-full max-w-2xl -translate-x-1/2 overflow-hidden rounded-xl border border-zinc-800 dark:border-zinc-800 light:border-zinc-200 bg-zinc-900 dark:bg-zinc-900 light:bg-white shadow-2xl shadow-black/40">
-          <div className="border-b border-zinc-800/60 dark:border-zinc-800/60 light:border-zinc-200 px-3 py-1 text-[11px] text-zinc-500 dark:text-zinc-500 light:text-zinc-400">
+        <div className="absolute bottom-full left-1/2 mb-2 w-full max-w-2xl -translate-x-1/2 overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-2xl shadow-black/10 dark:shadow-black/40">
+          <div className="border-b border-zinc-200 dark:border-zinc-800/60 px-3 py-1 text-[11px] text-zinc-400 dark:text-zinc-500">
             Commands
           </div>
           {filteredCommands.map(cmd => (
             <button
               key={cmd}
               onClick={() => { setText(`/${cmd} `); setShowCommands(false); inputRef.current?.focus() }}
-              className="block w-full px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-zinc-800/50 dark:hover:bg-zinc-800/50 light:hover:bg-zinc-100"
+              className="block w-full px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50"
             >
               <span className="font-mono text-brand-cyan">/{cmd}</span>
             </button>
@@ -76,7 +76,7 @@ export function PromptBar() {
         </div>
       )}
       <div className="mx-auto w-full max-w-2xl">
-        <div className="flex items-center gap-2 rounded-xl border border-zinc-800 dark:border-zinc-800 light:border-zinc-300 bg-zinc-900/50 dark:bg-zinc-900/50 light:bg-white px-3 py-2 transition-colors focus-within:border-brand-primary/40">
+        <div className="flex items-center gap-2 rounded-xl border border-zinc-300 dark:border-zinc-800 bg-white dark:bg-zinc-900/50 px-3 py-2 transition-colors focus-within:border-brand-primary/40">
           <textarea
             ref={inputRef}
             value={text}
@@ -84,7 +84,7 @@ export function PromptBar() {
             onKeyDown={handleKeyDown}
             placeholder="Send a message..."
             rows={1}
-            className="flex-1 resize-none bg-transparent text-[14px] text-zinc-100 dark:text-zinc-100 light:text-zinc-900 placeholder:text-zinc-600 dark:placeholder:text-zinc-600 light:placeholder:text-zinc-400 focus:outline-none"
+            className="flex-1 resize-none bg-transparent text-[14px] text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:outline-none"
           />
           <button
             onClick={isStreaming ? () => wsSend({ type: 'interrupt' }) : handleSend}
@@ -95,7 +95,7 @@ export function PromptBar() {
                 ? 'bg-red-600/15 text-red-400 hover:bg-red-600/25'
                 : text.trim()
                   ? 'bg-brand-primary/15 text-brand-cyan hover:bg-brand-primary/25'
-                  : 'text-zinc-600 dark:text-zinc-600 light:text-zinc-400',
+                  : 'text-zinc-300 dark:text-zinc-600',
             )}
           >
             {isStreaming ? <Square className="h-3 w-3" /> : <Send className="h-4 w-4" />}
