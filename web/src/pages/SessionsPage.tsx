@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  FolderClock, Plus, Play, RotateCcw, Compact, Loader2,
+  FolderClock, Plus, Play, RotateCcw, Archive, Loader2,
   AlertCircle, MessageSquare, CheckCircle2, X,
 } from 'lucide-react'
 import type { SessionInfo } from '@/types/api'
@@ -146,7 +146,7 @@ function CompactDialog({ open, onClose, onCompact, isCompacting }: {
               disabled={isCompacting}
               className="flex items-center gap-1.5 rounded-lg bg-brand-primary px-3 py-2 text-sm font-medium text-white hover:bg-brand-primary/80 disabled:opacity-40"
             >
-              {isCompacting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Compact className="h-4 w-4" />}
+              {isCompacting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
               Compact
             </button>
           </div>
@@ -277,7 +277,7 @@ export default function SessionsPage() {
             className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-300 transition-colors hover:border-brand-primary/40 hover:text-brand-cyan disabled:opacity-40"
             title="Summarize older turns"
           >
-            {compactMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Compact className="h-4 w-4" />}
+            {compactMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
             Compact
           </button>
         </div>
