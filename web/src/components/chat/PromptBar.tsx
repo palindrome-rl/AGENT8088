@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Send, Square, Plus, Mic } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
@@ -20,6 +21,10 @@ const COMMANDS = [
   'exit', 'quit', 'stop', 'approve', 'deny',
 ]
 
+function generatedSessionName() {
+  return `chat-${Date.now()}`
+}
+
 function parseToken(draft: string): { kind: 'at' | 'slash'; query: string; start: number } | null {
   const match = /(^|\s)([@/])([\w-]*)$/.exec(draft)
   if (!match) return null
@@ -36,11 +41,13 @@ export function PromptBar() {
   const [plusOpen, setPlusOpen] = useState(false)
   const [listening, setListening] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  const [sessionError, setSessionError] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const measureRef = useRef<HTMLSpanElement>(null)
   const controlsRef = useRef<HTMLDivElement>(null)
-  const { isStreaming, addMessage } = useSessionStore()
+  const { isStreaming, sessionName, addMessage, setSessionName } = useSessionStore()
   const { send: wsSend } = useWebSocket()
+  const queryClient = useQueryClient()
 
   const token = dismissed ? null : parseToken(text)
   const menu = plusOpen ? 'at' : token?.kind ?? null
@@ -77,13 +84,44 @@ export function PromptBar() {
     return () => document.removeEventListener('pointerdown', close)
   }, [menu, plusOpen])
 
-  const handleSend = () => {
+  const ensureSession = async () => {
+    if (sessionName) return
+
+    const statusResponse = await fetch('/api/status')
+    if (!statusResponse.ok) throw new Error(`Could not read session status (${statusResponse.status})`)
+    const status = await statusResponse.json() as { session_name?: string }
+    if (status.session_name) {
+      setSessionName(status.session_name)
+      return
+    }
+
+    const name = generatedSessionName()
+    const response = await fetch('/api/sessions/new', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+    if (!response.ok) throw new Error(`Could not create session (${response.status})`)
+    const result = await response.json() as { error?: string; name?: string }
+    if (result.error) throw new Error(result.error)
+    setSessionName(result.name || name)
+    void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+  }
+
+  const handleSend = async () => {
     const trimmed = text.trim()
     if (!trimmed || isStreaming) return
+    setSessionError('')
     if (trimmed.startsWith('/')) {
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
       wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
     } else {
+      try {
+        await ensureSession()
+      } catch (error) {
+        setSessionError(error instanceof Error ? error.message : 'Could not create a session')
+        return
+      }
       addMessage({ role: 'user', content: trimmed })
       wsSend({ type: 'chat', text: trimmed })
     }
@@ -115,12 +153,13 @@ export function PromptBar() {
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      handleSend()
+      void handleSend()
     }
   }
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setText(e.target.value)
+    setSessionError('')
     setDismissed(false)
     setPlusOpen(false)
   }
@@ -132,6 +171,11 @@ export function PromptBar() {
       data-promptbar
       className="relative bg-zinc-50 dark:bg-zinc-950 pb-4 pt-2"
     >
+      {sessionError && (
+        <div role="alert" className="mx-auto mb-2 max-w-2xl px-4 text-xs text-red-500 dark:text-red-400">
+          {sessionError}
+        </div>
+      )}
       {/* ── / command menu ─────────────────────────────── */}
       {menu === 'slash' && rows.length > 0 && (
         <div

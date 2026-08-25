@@ -4,7 +4,9 @@ import {
   FolderClock, Plus, Play, RotateCcw, Archive, Loader2,
   AlertCircle, MessageSquare, CheckCircle2, X,
 } from 'lucide-react'
-import type { SessionInfo } from '@/types/api'
+import { useNavigate } from 'react-router-dom'
+import { useSessionStore } from '@/stores/session'
+import type { ChatMessage, SessionInfo } from '@/types/api'
 import { cn } from '@/lib/utils'
 
 // ---- API helpers ----
@@ -32,6 +34,7 @@ interface SessionActionResponse {
   messages?: number
   summary?: string
   message?: string
+  history?: { messages: ChatMessage[] }
 }
 
 // ---- New Session Dialog ----
@@ -206,6 +209,8 @@ function SessionRow({ session, onResume, isResuming }: {
 
 export default function SessionsPage() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const { clearChat, setMessages, setSessionName } = useSessionStore()
   const [newSessionOpen, setNewSessionOpen] = useState(false)
   const [compactOpen, setCompactOpen] = useState(false)
   const [resumingName, setResumingName] = useState<string | null>(null)
@@ -219,27 +224,55 @@ export default function SessionsPage() {
   // New session
   const newMutation = useMutation({
     mutationFn: (name: string) => postJSON<SessionActionResponse>('/api/sessions/new', { name }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
+    onSuccess: (data) => {
+      if (!data.ok || !data.name) return
+      clearChat()
+      setSessionName(data.name)
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+      navigate('/')
+    },
   })
 
   // Resume session
   const resumeMutation = useMutation({
-    mutationFn: (name: string) => postJSON<SessionActionResponse>('/api/sessions/resume', { name }),
+    mutationFn: async (name: string) => {
+      const result = await postJSON<SessionActionResponse>('/api/sessions/resume', { name })
+      if (result.error || !result.ok) return result
+      return {
+        ...result,
+        history: await fetchJSON<{ messages: ChatMessage[] }>('/api/history'),
+      }
+    },
     onMutate: (name) => setResumingName(name),
     onSettled: () => setResumingName(null),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
+    onSuccess: (data, name) => {
+      if (!data.ok) return
+      setMessages(data.history?.messages ?? [])
+      setSessionName(data.name || name)
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+      navigate('/')
+    },
   })
 
   // Reset session
   const resetMutation = useMutation({
     mutationFn: () => postJSON<SessionActionResponse>('/api/sessions/reset', {}),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
+    onSuccess: (data) => {
+      if (!data.ok) return
+      clearChat()
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+    },
   })
 
   // Compact session
   const compactMutation = useMutation({
     mutationFn: (keep: number) => postJSON<SessionActionResponse>('/api/sessions/compact', { keep }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
+    onSuccess: async (data) => {
+      if (!data.ok) return
+      const history = await fetchJSON<{ messages: ChatMessage[] }>('/api/history')
+      setMessages(history.messages)
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+    },
   })
 
   const activeSession = sessionsQuery.data?.find((s) => s.active)

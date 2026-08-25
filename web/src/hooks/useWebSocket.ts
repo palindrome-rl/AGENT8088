@@ -1,16 +1,37 @@
 import { useCallback, useEffect, useRef } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
-import type { WSClientMessage, WSEvent } from '@/types/api'
+import type { ChatMessage, StatusInfo, WSClientMessage, WSEvent } from '@/types/api'
 
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null)
   const {
     setStreaming, appendStreamingText, appendStreamingReasoning,
     addToolEvent, updateToolEvent, updatePlanStep,
-    resetStreaming, addMessage, setStatus,
+    resetStreaming, addMessage, setStatus, setMessages, setSessionName,
   } = useSessionStore()
   const { setApprovalPending, setPlanApprovalPending } = useUIStore()
+  const queryClient = useQueryClient()
+
+  const syncSession = useCallback(async () => {
+    try {
+      const statusResponse = await fetch('/api/status')
+      if (!statusResponse.ok) return
+      const status = await statusResponse.json() as StatusInfo
+      setStatus(status)
+      setSessionName(status.session_name || '')
+
+      const historyResponse = await fetch('/api/history')
+      if (!historyResponse.ok) return
+      const history = await historyResponse.json() as { messages?: ChatMessage[] }
+      if (Array.isArray(history.messages)) {
+        setMessages(history.messages)
+      }
+    } catch {
+      // The WebSocket reconnect loop remains the source of truth if the API is unavailable.
+    }
+  }, [setMessages, setSessionName, setStatus])
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -77,6 +98,14 @@ export function useWebSocket() {
           resetStreaming()
           break
         case 'session_saved':
+          if (data.name) setSessionName(data.name)
+          void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+          break
+        case 'command_result':
+          if (['new', 'resume', 'reset', 'compact'].includes(data.command.toLowerCase())) {
+            void syncSession()
+            void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+          }
           break
       }
     }
@@ -88,16 +117,18 @@ export function useWebSocket() {
     return ws
   }, [setStreaming, appendStreamingText, appendStreamingReasoning,
       addToolEvent, updateToolEvent, updatePlanStep, resetStreaming,
-      addMessage, setStatus, setApprovalPending, setPlanApprovalPending])
+      addMessage, setStatus, setMessages, setSessionName, setApprovalPending,
+      setPlanApprovalPending, queryClient, syncSession])
 
   const send = useCallback((msg: WSClientMessage) => {
     wsRef.current?.send(JSON.stringify(msg))
   }, [])
 
   useEffect(() => {
+    void syncSession()
     const ws = connect()
     return () => ws?.close()
-  }, [connect])
+  }, [connect, syncSession])
 
   return { send, ws: wsRef }
 }

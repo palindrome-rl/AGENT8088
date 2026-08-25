@@ -33,7 +33,7 @@ const SIDEBAR_COLLAPSED = 52
 
 export function Sidebar() {
   const { sidebarCollapsed, toggleSidebar, theme, toggleTheme } = useUIStore()
-  const { clearChat, setMessages } = useSessionStore()
+  const { clearChat, setMessages, setSessionName } = useSessionStore()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
@@ -88,9 +88,17 @@ export function Sidebar() {
     }
   }, [settingsOpen])
 
-  const handleNewChat = () => {
+  const handleNewChat = async () => {
+    try {
+      const response = await fetch('/api/sessions/reset', { method: 'POST' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Could not reset session')
+      return
+    }
     clearChat()
     setSettingsOpen(false)
+    await sessionsQuery.refetch()
     navigate('/')
   }
 
@@ -109,6 +117,7 @@ export function Sidebar() {
       const history = await historyResponse.json() as { messages: ChatMessage[] }
       clearChat()
       setMessages(history.messages)
+      setSessionName(name)
       await sessionsQuery.refetch()
       navigate('/')
     } catch (error) {

@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type { ChatMessage, StatusInfo } from '@/types/api'
 
 interface SessionState {
+  sessionName: string
   messages: ChatMessage[]
   status: StatusInfo | null
   isStreaming: boolean
@@ -21,6 +22,7 @@ interface SessionState {
   }>
 
   setMessages: (messages: ChatMessage[]) => void
+  setSessionName: (name: string) => void
   clearChat: () => void
   addMessage: (message: ChatMessage) => void
   setStatus: (status: StatusInfo) => void
@@ -35,6 +37,7 @@ interface SessionState {
 }
 
 export const useSessionStore = create<SessionState>((set) => ({
+  sessionName: '',
   messages: [],
   status: null,
   isStreaming: false,
@@ -44,6 +47,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   planSteps: [],
 
   setMessages: (messages) => set({ messages }),
+  setSessionName: (sessionName) => set({ sessionName }),
   clearChat: () => set({
     messages: [],
     status: null,
