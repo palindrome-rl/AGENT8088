@@ -221,26 +221,57 @@ def test_browser_use_logging_follows_the_reasoning_toggle(fake_browser_use, monk
     assert calls == [True]
 
 
-def test_set_browser_use_log_verbosity_quiets_litellm_by_default():
+_NOISY_LOGGER_NAMES = ("browser_use", "bubus", "LiteLLM")
+
+
+def test_set_browser_use_log_verbosity_quiets_every_noisy_logger_by_default():
+    """"bubus" specifically: browser-use's own "result"/quiet logging mode
+    explicitly special-cases this logger to stay at INFO regardless (it
+    carries the Agent's step narration, dispatched through its event bus) -
+    a real bug that let the "quiet by default" fix ship without actually
+    silencing the noise it was meant to hide. Set directly, not through
+    browser-use's own setup_logging(), so this doesn't depend on it ever
+    fixing that."""
     import logging
-    logger = logging.getLogger("LiteLLM")
-    original_level = logger.level
+    loggers = [logging.getLogger(name) for name in _NOISY_LOGGER_NAMES]
+    original_levels = [logger.level for logger in loggers]
     try:
         A._set_browser_use_log_verbosity(False)
-        assert logger.level == logging.WARNING
+        for logger in loggers:
+            assert logger.level == logging.WARNING, logger.name
     finally:
-        logger.setLevel(original_level)
+        for logger, level in zip(loggers, original_levels):
+            logger.setLevel(level)
 
 
-def test_set_browser_use_log_verbosity_restores_info_when_verbose():
+def test_set_browser_use_log_verbosity_restores_info_on_every_logger_when_verbose():
     import logging
-    logger = logging.getLogger("LiteLLM")
-    original_level = logger.level
+    loggers = [logging.getLogger(name) for name in _NOISY_LOGGER_NAMES]
+    original_levels = [logger.level for logger in loggers]
     try:
         A._set_browser_use_log_verbosity(True)
-        assert logger.level == logging.INFO
+        for logger in loggers:
+            assert logger.level == logging.INFO, logger.name
     finally:
-        logger.setLevel(original_level)
+        for logger, level in zip(loggers, original_levels):
+            logger.setLevel(level)
+
+
+def test_set_browser_use_log_verbosity_does_not_accumulate_handlers():
+    """The earlier implementation called browser-use's own setup_logging()
+    on every browse_page call, which appends a fresh handler to the
+    "browser_use"/"bubus" loggers each time (only the root logger's handlers
+    get cleared) - after enough calls in one long session, every log line
+    would print once per accumulated handler. Setting levels directly must
+    never touch handlers at all."""
+    import logging
+    loggers = [logging.getLogger(name) for name in ("browser_use", "bubus")]
+    handler_counts_before = [len(logger.handlers) for logger in loggers]
+    for _ in range(5):
+        A._set_browser_use_log_verbosity(False)
+        A._set_browser_use_log_verbosity(True)
+    for logger, before in zip(loggers, handler_counts_before):
+        assert len(logger.handlers) == before, logger.name
 
 
 def test_the_profile_is_built_from_the_security_kwargs(fake_browser_use):
@@ -251,6 +282,24 @@ def test_the_profile_is_built_from_the_security_kwargs(fake_browser_use):
     assert kwargs["proxy"].bypass == "<-loopback>"
     assert kwargs["proxy"].server.startswith("http://127.0.0.1:")
     assert kwargs["prohibited_domains"]
+
+
+def test_the_agent_is_built_with_vision_and_the_judge_both_disabled(fake_browser_use):
+    """use_vision=False: browser-use's default (True) sends a screenshot
+    every step and hard-errors against a model that doesn't accept image
+    input - this adapter has to work with whatever model is configured, not
+    assume one that can see. use_judge=False: browser-use's default (True)
+    runs one extra full LLM call after every completed task purely to
+    self-critique the result (advisory-only - its verdict doesn't retry or
+    change what's returned), which is pure extra latency/cost, and whose
+    rubric leans on screenshot evidence that use_vision=False guarantees
+    will never exist - so left on, it reliably reports correct answers as
+    failed. Neither flag had a regression test before this."""
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    kwargs = fake_browser_use.agents[0].kwargs
+    assert kwargs["use_vision"] is False
+    assert kwargs["use_judge"] is False
 
 
 def test_the_llm_is_built_with_the_same_completion_token_ceiling_as_the_main_loop(

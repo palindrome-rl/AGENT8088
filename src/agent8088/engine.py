@@ -3416,16 +3416,21 @@ def _set_browser_use_log_verbosity(verbose: bool) -> None:
     as the main loop's own chain-of-thought; /reasoning on (or /think on)
     restores it.
 
-    browser-use ships an explicit "result" logging level for exactly this
-    (BROWSER_USE_LOGGING_LEVEL=result config / setup_logging(log_level=...))
-    - force_setup=True bypasses its "only configure once per process" guard
-    so this reflects the *current* toggle state on every call, not just
-    whichever state was active the first time browse_page ever ran."""
-    from browser_use.logging_config import setup_logging as _browser_use_setup_logging
-
-    _browser_use_setup_logging(log_level="info" if verbose else "result", force_setup=True)
-    litellm_level = logging.INFO if verbose else logging.WARNING
-    logging.getLogger("LiteLLM").setLevel(litellm_level)
+    Sets logger *levels* directly rather than calling browser-use's own
+    setup_logging(): its "result" mode does not actually quiet everything -
+    it explicitly special-cases the "bubus" event-bus logger (what the
+    Agent's step narration is dispatched through) to stay at INFO regardless
+    (see browser_use/logging_config.py, "Configure bubus logger to allow
+    INFO level logs") - so relying on it alone leaves the exact noise this
+    exists to hide. It would also stack a duplicate handler onto these
+    loggers every time this function runs (its handler-clearing only
+    touches the root logger, not "browser_use"/"bubus" themselves),
+    printing each line more times the longer a session runs. A plain
+    `import browser_use` already configures a handler once, at package
+    import - all that is needed on top of that is the level."""
+    level = logging.INFO if verbose else logging.WARNING
+    for logger_name in ("browser_use", "bubus", "LiteLLM"):
+        logging.getLogger(logger_name).setLevel(level)
     try:
         import litellm
         litellm.suppress_debug_info = not verbose
@@ -3610,6 +3615,19 @@ async def _run_browser_agent(url: str, task: str) -> str:
             # which would hit the same failure - only False fully disables
             # both the automatic per-step screenshot and that action.
             use_vision=False,
+            # browser-use defaults use_judge=True: after every completed task
+            # it runs one more full LLM call to self-critique the result. Its
+            # own verdict doesn't retry or change what's returned - it's
+            # advisory-only logging - so it's pure extra latency and token
+            # cost for no behavioral benefit. Worse, its rubric leans on
+            # screenshot evidence, which use_vision=False above deliberately
+            # never produces - so with vision off it tends to report a
+            # confident, correct answer as failed for lacking screenshots
+            # that were never going to exist. Off, for the same reason vision
+            # is off: this adapter has to work the same way regardless of
+            # which model/provider is configured, not assume one judge_llm
+            # call will reliably agree with itself.
+            use_judge=False,
         )
         history = await asyncio.wait_for(
             agent.run(max_steps=BROWSER_MAX_STEPS),
