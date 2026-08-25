@@ -240,11 +240,25 @@ loopback, link-local, private, and other reserved addresses. Unless
 `ssrf_allow_hosts` or `ssrf_allow_private` is set, it also refuses to navigate
 to a bare IP address of any kind — that is what catches an internal address
 written in an obfuscated form (`http://2130706433/` is `127.0.0.1`); use a
-hostname for a public site. Remaining caveat: that second layer
-covers navigation, so a *subresource* request a page makes to another port on
-your own machine (`http://127.0.0.1:<port>/...`) is the one case neither layer
-catches. Set `ssrf_allow_hosts` deliberately, and treat pages you hand to
-`browse_page` as untrusted.
+hostname for a public site.
+
+Two caveats worth knowing:
+
+- **`ssrf_allow_hosts` ships non-empty by default** (`127.0.0.1,localhost`, so
+  local tooling stays reachable out of the box), which means the
+  obfuscated-IP-literal check above is inactive by default, not just when an
+  operator deliberately widens it. This does not reopen anything the default
+  didn't already allow in plain form — loopback access was already permitted —
+  but it does mean the obfuscated-form protection only actually applies once
+  `ssrf_allow_hosts` is emptied out. Non-loopback private ranges (RFC1918,
+  link-local, the cloud-metadata address) stay checked regardless, since the
+  filtering proxy resolves the real address before deciding, obfuscated or not.
+- That second layer covers navigation, so a *subresource* request a page makes
+  to another port on your own machine (`http://127.0.0.1:<port>/...`) is the
+  one case neither layer catches.
+
+Set `ssrf_allow_hosts` deliberately, and treat pages you hand to `browse_page`
+as untrusted.
 
 The policy runs *before* the SSRF check, which is a DNS lookup. A host the policy
 already rejects is never resolved, so the attempt never reaches that domain's
