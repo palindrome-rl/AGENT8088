@@ -12,7 +12,9 @@ openai>=1.0.0,<3
 rich>=13.0.0,<16
 InquirerPy>=0.3.4,<1
 
-# MCP client and server runtime (external servers, and --mcp-serve).
+# MCP client and server runtime (external servers, and --mcp-serve). The floor
+# is 1.26 rather than 1.27 because browser-use hard-pins mcp==1.26.0; a higher
+# floor makes the two impossible to install together.
 mcp>=1.26,<2
 
 # Terminal logo rendering.
@@ -28,7 +30,11 @@ Pygments>=2.13,<3
 # Headless browser behind browse_page. The Python package only — the browser
 # binary still needs `playwright install chromium`.
 playwright>=1.40,<2
-browser-use>=0.13,<0.14
+# Interactive browsing (browse_page's agent) and the LLM adapter behind it.
+# browser-use needs Python >= 3.11 while this project supports 3.10, so the
+# marker keeps a 3.10 install resolvable — without it, pip fails on the whole
+# file rather than dropping one tool.
+browser-use>=0.13,<0.14; python_version >= "3.11"
 litellm>=1,<2
 
 # Keyless web search fallback. web_search must always have a backend needing no

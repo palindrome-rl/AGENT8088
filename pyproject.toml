@@ -11,6 +11,8 @@ dependencies = [
     "openai>=1.0.0,<3",
     "rich>=13.0.0,<16",
     "InquirerPy>=0.3.4,<1",
+    # 1.26 rather than 1.27: browser-use hard-pins mcp==1.26.0, and a floor of
+    # 1.27 makes the two impossible to install together.
     "mcp>=1.26,<2",
     "Pillow>=9,<13",
     # Both are imported directly by cli.py and were reaching the install only as
@@ -25,7 +27,12 @@ dependencies = [
     # not be there makes the tool's availability a property of how someone
     # installed rather than of what the product is.
     "playwright>=1.40,<2",
-    "browser-use>=0.13,<0.14",
+    # browser-use requires Python >= 3.11, but this project supports 3.10 (see
+    # requires-python above, and the installers' 3.10 fallback). Without the
+    # marker the whole package becomes uninstallable on 3.10 - pip and uv both
+    # fail to resolve rather than dropping one tool. With it, a 3.10 install
+    # keeps every other tool and browse_page reports what is missing.
+    "browser-use>=0.13,<0.14; python_version >= '3.11'",
     "litellm>=1,<2",
     # Keyless web search fallback. web_search must always have a backend needing
     # no Docker, no API key and no setup, so an unreachable SearXNG still
