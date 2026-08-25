@@ -34,7 +34,7 @@ export function Sidebar() {
             <span className="text-[11px] font-bold tracking-tight text-brand-cyan">8088</span>
           </div>
         ) : (
-          <img src="/logo.png" alt="Agent8088" className="h-6 w-auto" />
+          <img src="/logo.png" alt="Agent8088" className="h-6 w-auto" style={{ mixBlendMode: 'screen' }} />
         )}
       </div>
 
@@ -71,7 +71,7 @@ export function Sidebar() {
         </div>
         {!sidebarCollapsed && (
           <div className="flex items-center justify-center py-1.5">
-            <img src="/palindrome-logo.png" alt="Palindrome" className="h-5 w-auto opacity-60" />
+            <img src="/palindrome-logo.png" alt="Palindrome" className="h-5 w-auto opacity-60" style={{ mixBlendMode: 'screen' }} />
           </div>
         )}
         <button

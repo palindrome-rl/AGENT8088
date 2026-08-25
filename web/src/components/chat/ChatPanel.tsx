@@ -80,9 +80,9 @@ export function ChatPanel() {
 
 function SuggestionCard({ title, subtitle }: { title: string; subtitle: string }) {
   return (
-    <div className="rounded-lg border border-zinc-800/60 dark:border-zinc-800/60 light:border-zinc-200 bg-zinc-900/30 dark:bg-zinc-900/30 light:bg-white px-3 py-2 transition-colors hover:border-zinc-700 dark:hover:border-zinc-700 light:hover:border-zinc-300 hover:bg-zinc-900/50 dark:hover:bg-zinc-900/50 light:hover:bg-zinc-50">
-      <div className="text-[13px] font-medium text-zinc-200 dark:text-zinc-200 light:text-zinc-800">{title}</div>
-      <div className="text-[11px] text-zinc-500 dark:text-zinc-500 light:text-zinc-400">{subtitle}</div>
+    <div className="overflow-hidden rounded-lg border border-zinc-800/60 dark:border-zinc-800/60 light:border-zinc-200 bg-zinc-900/30 dark:bg-zinc-900/30 light:bg-white px-3 py-2 transition-colors hover:border-zinc-700 dark:hover:border-zinc-700 light:hover:border-zinc-300 hover:bg-zinc-900/50 dark:hover:bg-zinc-900/50 light:hover:bg-zinc-50">
+      <div className="truncate text-[13px] font-medium text-zinc-200 dark:text-zinc-200 light:text-zinc-800">{title}</div>
+      <div className="truncate text-[11px] text-zinc-500 dark:text-zinc-500 light:text-zinc-400">{subtitle}</div>
     </div>
   )
 }
