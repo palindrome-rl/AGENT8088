@@ -3435,6 +3435,18 @@ async def _run_browser_agent(url: str, task: str) -> str:
             llm=llm,
             browser_profile=profile,
             initial_actions=[{"navigate": {"url": url, "new_tab": False}}],
+            # browser-use defaults to use_vision=True (sends a screenshot with
+            # every step) and errors out entirely against a model that
+            # doesn't accept image input - which is exactly the situation for
+            # a large share of the providers/models agent8088 supports (local
+            # or text-only). Since this adapter is required to work with
+            # "whatever provider the user already has configured," not just
+            # vision-capable ones, screenshots must be off unconditionally.
+            # use_vision="auto" was considered and rejected: it still exposes
+            # a "screenshot" action the model can choose to call on its own,
+            # which would hit the same failure - only False fully disables
+            # both the automatic per-step screenshot and that action.
+            use_vision=False,
         )
         history = await asyncio.wait_for(
             agent.run(max_steps=BROWSER_MAX_STEPS),
