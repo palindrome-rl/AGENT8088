@@ -777,12 +777,17 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     turn_start = time.time()
     tokens_ref = [0]
 
+    # Capture the running event loop BEFORE spawning the thread —
+    # asyncio.get_event_loop() called from a worker thread crashes or
+    # returns None in Python 3.10+. This is the core fix.
+    loop = asyncio.get_running_loop()
+
     def spin(msg_str):
         elapsed = time.time() - turn_start
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "spin", "message": msg_str,
                           "elapsed": elapsed, "tokens": tokens_ref[0]}),
-            asyncio.get_event_loop(),
+            loop,
         )
         from contextlib import nullcontext
         return nullcontext()
@@ -791,7 +796,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         tokens_ref[0] += 1
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "token", "kind": kind, "delta": delta}),
-            asyncio.get_event_loop(),
+            loop,
         )
 
     def on_calls(calls):
@@ -799,37 +804,36 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                      for c in calls] if calls else []
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "tool_calls", "calls": call_list}),
-            asyncio.get_event_loop(),
+            loop,
         )
 
     def on_tool(name):
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "tool_start", "name": name}),
-            asyncio.get_event_loop(),
+            loop,
         )
 
     def on_result(name, result):
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "tool_result", "name": name, "result": result[:5000]}),
-            asyncio.get_event_loop(),
+            loop,
         )
 
     def on_escalation(name, result):
         """Approval flow — send to WebSocket, wait for response."""
         esc_id = f"esc-{int(time.time()*1000)}"
-        # Parse the change_type from the result text
-        change_type = "write"  # default
+        change_type = "write"
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "escalation", "tool_name": name,
                           "change_type": change_type, "description": result[:1000],
                           "id": esc_id}),
-            asyncio.get_event_loop(),
+            loop,
         )
         _pending_approval["event"].clear()
         _pending_approval["event"].wait(timeout=300)
         approved = _pending_approval.get("approved", False)
         if approved:
-            C.A.grant_escalation()
+            A.grant_escalation()
         return approved
 
     def on_answer(answer):
@@ -838,7 +842,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
             ws.send_json({"type": "answer", "text": answer,
                           "usage": {"seconds": elapsed, "tokens": tokens_ref[0],
                                     "context": C._estimate_context_pct()}}),
-            asyncio.get_event_loop(),
+            loop,
         )
 
     # Run the agent in a thread to not block the event loop
@@ -864,24 +868,25 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
             C._save_active_session()
             asyncio.run_coroutine_threadsafe(
                 ws.send_json({"type": "session_saved", "name": S.name or ""}),
-                asyncio.get_event_loop(),
+                loop,
             )
         except A.AgentInterrupted:
             asyncio.run_coroutine_threadsafe(
                 ws.send_json({"type": "interrupted", "elapsed": time.time() - turn_start,
                               "partial": ""}),
-                asyncio.get_event_loop(),
+                loop,
             )
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             asyncio.run_coroutine_threadsafe(
                 ws.send_json({"type": "error", "message": str(exc)}),
-                asyncio.get_event_loop(),
+                loop,
             )
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     # Await thread completion without blocking the event loop
-    loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, thread.join)
 
 
