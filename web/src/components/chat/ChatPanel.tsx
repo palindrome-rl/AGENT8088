@@ -25,8 +25,8 @@ export function ChatPanel() {
             {/* Logo block */}
             <div className="relative mb-8">
               <div className="absolute inset-0 animate-pulse rounded-2xl bg-brand-primary/10 blur-2xl" />
-              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl border border-brand-border/30 bg-gradient-to-br from-brand-primary/10 to-brand-cyan/5">
-                <span className="bg-gradient-to-br from-brand-cyan to-brand-primary bg-clip-text text-2xl font-bold tracking-tighter text-transparent">
+              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl border border-brand-border/30 bg-brand-primary/5">
+                <span className="text-2xl font-bold tracking-tighter text-brand-cyan">
                   8088
                 </span>
               </div>

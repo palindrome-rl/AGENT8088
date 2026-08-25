@@ -27,8 +27,8 @@ export function Sidebar() {
       sidebarCollapsed ? 'w-16' : 'w-56',
     )}>
       <div className="flex h-14 items-center gap-2.5 border-b border-zinc-800/80 px-4">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-brand-border/20 bg-gradient-to-br from-brand-primary/15 to-brand-cyan/5 font-bold">
-          <span className="bg-gradient-to-br from-brand-cyan to-brand-primary bg-clip-text text-xs tracking-tighter text-transparent">
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10 font-bold">
+          <span className="text-xs tracking-tighter text-brand-cyan">
             8088
           </span>
         </div>

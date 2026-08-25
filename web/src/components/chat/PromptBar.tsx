@@ -58,9 +58,9 @@ export function PromptBar() {
   }
 
   return (
-    <div className="relative bg-gradient-to-t from-zinc-950 to-zinc-950/80 px-4 pb-4 pt-2">
+    <div className="relative bg-zinc-950 px-4 pb-4 pt-2">
       {/* Subtle top fade */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-2 bg-gradient-to-t from-transparent to-zinc-950" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-2 bg-zinc-950" />
 
       {showCommands && filteredCommands.length > 0 && (
         <div className="absolute bottom-full left-4 right-4 mb-2 overflow-hidden rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl shadow-black/50">

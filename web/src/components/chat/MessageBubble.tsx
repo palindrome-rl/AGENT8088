@@ -10,8 +10,8 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
   return (
     <div className={cn('flex gap-3 px-4 py-2.5', isUser ? 'justify-end' : 'justify-start')}>
       {!isUser && (
-        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-brand-border/20 bg-gradient-to-br from-brand-primary/15 to-brand-cyan/5">
-          <span className="bg-gradient-to-br from-brand-cyan to-brand-primary bg-clip-text text-[10px] font-bold tracking-tighter text-transparent">
+        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10">
+          <span className="text-[10px] font-bold tracking-tighter text-brand-cyan">
             8088
           </span>
         </div>
