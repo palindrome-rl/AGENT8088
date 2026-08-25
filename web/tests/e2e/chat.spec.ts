@@ -20,6 +20,15 @@ test('Agent8088 logo returns to home', async ({ page }) => {
   await expect(page).toHaveURL(/\/$/)
 })
 
+test('settings pages have an explicit back to chat control', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Settings' }).click()
+  await page.getByRole('link', { name: 'Tools', exact: true }).click()
+  await expect(page).toHaveURL(/\/tools$/)
+  await page.getByRole('button', { name: 'Back to chat' }).click()
+  await expect(page).toHaveURL(/\/$/)
+})
+
 test('command palette opens with Cmd+K', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('textbox', { name: 'Prompt' }).press('Control+k')

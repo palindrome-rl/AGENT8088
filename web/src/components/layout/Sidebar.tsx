@@ -1,8 +1,8 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
-  FolderClock, Settings, Stethoscope, ChevronLeft, ChevronRight,
-  Sun, Moon, Search, X, Plus,
+  FolderClock, Settings, Stethoscope,
+  PanelLeftClose, PanelLeftOpen, Sun, Moon, Search, X, Plus,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { useUIStore } from '@/stores/ui'
@@ -170,7 +170,7 @@ export function Sidebar() {
               onClick={toggleSidebar}
               className="absolute right-2 top-1 flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200"
             >
-              <ChevronLeft className="h-4 w-4" />
+              <PanelLeftClose className="h-4 w-4" />
             </button>
           )}
           {sidebarCollapsed && (
@@ -180,7 +180,7 @@ export function Sidebar() {
               onClick={toggleSidebar}
               className="absolute left-2 top-0.5 flex h-9 w-9 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200"
             >
-              <ChevronRight className="h-4 w-4" />
+              <PanelLeftOpen className="h-4 w-4" />
             </button>
           )}
         </div>

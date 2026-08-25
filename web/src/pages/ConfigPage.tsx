@@ -98,9 +98,9 @@ function Section({ icon: Icon, title, subtitle, children }: {
 
 function InfoRow({ label, value, mono }: { label: string; value: string | number; mono?: boolean }) {
   return (
-    <div className="flex items-center justify-between border-b border-zinc-800/60 py-2 text-sm last:border-0">
-      <span className="text-zinc-500">{label}</span>
-      <span className={cn('text-zinc-200', mono && 'font-mono text-xs')}>{value}</span>
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-zinc-800/60 py-2 text-sm last:border-0">
+      <span className="min-w-0 truncate text-zinc-500" title={label}>{label}</span>
+      <span className={cn('min-w-0 max-w-full break-all text-right text-zinc-200', mono && 'font-mono text-xs')} title={String(value)}>{value}</span>
     </div>
   )
 }
