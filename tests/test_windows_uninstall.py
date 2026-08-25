@@ -84,6 +84,10 @@ def test_windows_uninstall_deletes_what_it_can_and_defers_the_rest(tmp_path, mon
         launcher_dir,
         home / "bin",
         home / "agent8088/venv/Scripts",
+        home / "git" / "cmd",
+        home / "git" / "bin",
+        home / "git" / "usr" / "bin",
+        home / "node",
     ]
 
 

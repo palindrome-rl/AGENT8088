@@ -334,6 +334,68 @@ run_with_timeout() {
     return $_rc
 }
 
+# Like run_with_timeout, but for a command that needs to read the password
+# from the controlling terminal (currently just `sudo -v`).
+#
+# Plain `timeout` puts its child in a new process group -- that's exactly
+# what lets -k 10 kill an entire misbehaving subtree, but it also means a
+# child that tries to read /dev/tty is no longer in the terminal's foreground
+# process group. The kernel responds to that with SIGTTIN, whose default
+# action is to STOP the process. Nothing here ever does `fg`/SIGCONT, so it
+# stays stopped until this same function's own -k 10 eventually SIGKILLs it --
+# up to T_PIP+10s (minutes) after a perfectly correct password was typed,
+# with the keystrokes themselves just echoing into the tty unconsumed. That
+# reproduced 100% of the time in a Docker+tmux harness before this existed.
+#
+# --foreground keeps the child in the caller's own process group so it can
+# actually read the prompt. Only used for `sudo -v`, which has no children of
+# its own that could dodge a plain SIGTERM, so losing group-kill here has no
+# downside.
+run_with_timeout_foreground() {
+    local _secs="$1"; shift
+    local _rc=0
+
+    if command -v timeout >/dev/null 2>&1; then
+        if _timeout_supports_k; then
+            timeout --foreground -k 10 "$_secs" "$@" || _rc=$?
+        else
+            timeout --foreground "$_secs" "$@" || _rc=$?
+        fi
+        case "$_rc" in 137|143) _rc=124 ;; esac
+        return $_rc
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout --foreground -k 10 "$_secs" "$@" || _rc=$?
+        case "$_rc" in 137|143) _rc=124 ;; esac
+        return $_rc
+    fi
+
+    # No timeout/gtimeout binary: same manual watchdog as run_with_timeout.
+    # `"$@" &` in a non-interactive script never creates a new process group
+    # on its own, so this fallback was never affected by the SIGTTIN bug above.
+    "$@" &
+    local _pid=$!
+    (
+        _waited=0
+        while [ "$_waited" -lt "$_secs" ]; do
+            kill -0 "$_pid" 2>/dev/null || exit 0
+            sleep 1
+            _waited=$((_waited + 1))
+        done
+        kill -TERM "$_pid" 2>/dev/null || true
+        sleep 10
+        kill -KILL "$_pid" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
+    local _watchdog=$!
+
+    wait "$_pid" 2>/dev/null || _rc=$?
+    kill -KILL "$_watchdog" 2>/dev/null || true
+    wait "$_watchdog" 2>/dev/null || true
+
+    case "$_rc" in 137|143) _rc=124 ;; esac
+    return $_rc
+}
+
 # Skipped-stage ledger, printed as one block at the end of the run.
 #
 # Warnings are emitted as each stage runs, which on a multi-minute install means
@@ -900,6 +962,11 @@ install_deps() {
     if [ "$_playwright_installed" = true ]; then
         log_info "Installing Playwright Chromium browser (~280 MB)..."
         _chromium_rc=0
+        # Match engine.py's _exec_browser default so the browser this step
+        # downloads is the one the runtime actually looks for - and so it
+        # lives inside $AGENT8088_HOME, where uninstall already cleans up
+        # rather than the OS-shared ms-playwright cache other tools may use.
+        export PLAYWRIGHT_BROWSERS_PATH="$AGENT8088_HOME/playwright-browsers"
         run_with_timeout "$T_CHROMIUM" "$_py" -m playwright install chromium \
             >/dev/null 2>&1 || _chromium_rc=$?
         if [ "$_chromium_rc" -eq 0 ]; then
@@ -943,11 +1010,12 @@ install_deps() {
                     log_info "Playwright's system dependencies need sudo - you may be prompted for your password."
                     local _sudo_authed=0
                     if [ -t 0 ]; then
-                        run_with_timeout "$T_PIP" sudo -v && _sudo_authed=1
+                        run_with_timeout_foreground "$T_PIP" sudo -v && _sudo_authed=1
                     else
-                        run_with_timeout "$T_PIP" sudo -v </dev/tty && _sudo_authed=1
+                        run_with_timeout_foreground "$T_PIP" sudo -v </dev/tty && _sudo_authed=1
                     fi
                     if [ "$_sudo_authed" -eq 1 ]; then
+                        log_info "Authenticated - installing system packages (this may take a minute)..."
                         run_with_timeout "$T_PIP" sudo -n "$_py" -m playwright install-deps chromium \
                             >/dev/null 2>&1 || \
                             log_warn "Playwright system dependencies were not installed - run: sudo $_py -m playwright install-deps chromium"

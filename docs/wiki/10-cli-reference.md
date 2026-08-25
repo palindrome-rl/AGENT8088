@@ -8,7 +8,9 @@ Verified from the argument parser in `src/agent8088/cli.py`:
 
 ```
 usage: agent8088 [-h] [--version] [--full-auto]
-                 [--mode {readonly,full-auto}] [--uninstall]
+                 [--mode {readonly,full-auto}]
+                 [--uninstall] [--workspace] [--all] [--yes]
+                 [--non-interactive] [--dry-run]
                  [--update] [--force] [--setup] [--model-setup] [--sandbox-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
@@ -31,9 +33,46 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mcp-host HOST` | MCP bind host (default `127.0.0.1`) |
 | `--update` | Pull latest code + reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
-| `--uninstall` | Remove install dir + env vars, then exit |
+| `--uninstall` | Remove the install dir, shim, PATH/config lines, and crontab/scheduled-task entries, then exit. Trace logs and the WhatsApp session dir are kept unless `--workspace`/`--all` is also passed |
+| `--workspace` | With `--uninstall`: also remove trace logs and the WhatsApp session directory |
+| `--all` | With `--uninstall`: shorthand for `--workspace` |
+| `--yes` | With `--uninstall`: skip the confirmation prompt |
+| `--non-interactive` | With `--uninstall`: never prompt; requires `--yes` |
+| `--dry-run` | With `--uninstall`: print what would be removed, remove nothing |
 
 Run with no flags for the interactive REPL.
+
+### What `--uninstall` does and doesn't remove
+
+By default `--uninstall` removes everything the installer created: the
+install directory (venv, bundled uv/Node, sandbox runtime), the `agent8088`
+command shim, the `PATH` and `AGENT8088_CONFIG` lines it added to shell rc
+files (or the Windows user-environment `PATH` entries for the bundled
+Git/Node on Windows), any crontab entries or Windows Task Scheduler entries a
+`cron_mode` schedule registered, and the SearXNG Docker container from
+`/search setup` if one exists — it runs with `--restart unless-stopped`, so
+Docker itself would otherwise keep it running (and restart it on reboot)
+indefinitely, since deleting the install directory doesn't touch a running
+container.
+
+Two things are deliberately **not** touched:
+
+- **Trace logs and the WhatsApp session directory** — these are your data,
+  not installer residue, so they're kept by default. Pass `--workspace` (or
+  `--all`) to remove them too.
+- **A pre-existing shared Playwright browser cache** (`~/.cache/ms-playwright`
+  on Linux, `~/Library/Caches/ms-playwright` on macOS,
+  `%LOCALAPPDATA%\ms-playwright` on Windows) — other Playwright-based tools on
+  the same machine can share that cache, so it's never auto-deleted. A fresh
+  install now downloads Chromium into `$AGENT8088_HOME/playwright-browsers`
+  instead, so this only applies to installs from before that change; uninstall
+  prints the exact manual command to remove the shared cache yourself if one
+  is found.
+
+```
+agent8088 --uninstall --dry-run              # preview only, nothing removed
+agent8088 --uninstall --all --yes --non-interactive   # fully unattended, full removal
+```
 
 ## Slash commands
 

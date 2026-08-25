@@ -1906,6 +1906,10 @@ function Install-Gateway-Extras {
                 -TimeoutSec $TPip -Activity "Installing Playwright"
             if ($pwResult.ExitCode -eq 0) {
                 Write-Info "Installing Playwright Chromium browser (~280 MB)..."
+                # Match engine.py's _exec_browser default: browsers live inside
+                # $Agent8088Home so `agent8088 --uninstall` already covers them
+                # without touching the OS-shared ms-playwright cache.
+                $env:PLAYWRIGHT_BROWSERS_PATH = "$Agent8088Home\playwright-browsers"
                 $chromiumResult = Invoke-WithTimeout -FilePath $py `
                     -Arguments @("-m", "playwright", "install", "chromium") `
                     -TimeoutSec $TChromium -Activity "Installing Playwright Chromium"
