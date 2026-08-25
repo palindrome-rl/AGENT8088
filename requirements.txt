@@ -50,7 +50,7 @@ reportlab>=4,<5
 #                                 `playwright install chromium`
 #   pip install -e ".[search]"    alias — ddgs is already a core dep
 #   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
-#   pip install -e ".[dev]"       pytest, ruff, pip-audit
+#   pip install -e ".[dev]"       pytest, pytest-asyncio, ruff, pip-audit
 #   pip install -e ".[litellm]"   alias — litellm is already a core dep
 #
 # browser and search are aliases for packages that are already core, kept so the
@@ -63,5 +63,6 @@ reportlab>=4,<5
 # Listed so the whole dependency surface is visible in one place:
 #   gateway: slack-bolt>=1.18.0,<2  slack-sdk>=3.23.0,<4  httpx>=0.24.0,<1
 #            discord.py>=2.3.0,<3   python-telegram-bot>=20,<23
-#   dev:     pytest>=7.0.0,<10      ruff>=0.8,<1          pip-audit>=2.7,<3
+#   dev:     pytest>=7.0.0,<10      pytest-asyncio>=0.23,<2
+#            ruff>=0.8,<1            pip-audit>=2.7,<3
 #   litellm: litellm>=1,<2

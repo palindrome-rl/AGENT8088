@@ -62,7 +62,7 @@ gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", 
 # best-effort install step happened to succeed, and both degrade silently.
 browser = ["playwright>=1.40,<2"]
 search = ["ddgs>=9,<10"]
-dev = ["pytest>=7.0.0,<10", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
+dev = ["pytest>=7.0.0,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
 # litellm is now a core dependency above (browse_page's interactive
 # browsing needs it regardless of which provider the main agent loop uses).
 # Kept as an alias, like `browser` and `search` above, so
@@ -72,6 +72,9 @@ litellm = ["litellm>=1,<2"]
 
 [project.scripts]
 agent8088 = "agent8088.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent8088"]
