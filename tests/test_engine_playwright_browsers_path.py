@@ -46,7 +46,7 @@ def test_exec_browser_sets_playwright_browsers_path_inside_agent_home(monkeypatc
     monkeypatch.setattr(engine, "_playwright_available", lambda: True)
     _install_fake_playwright(monkeypatch)
 
-    result = engine._exec_browser({"url": "https://example.com"})
+    result = engine._exec_browser({"url": "https://example.com", "task": "read the heading"})
 
     assert os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == str(tmp_path / "agent8088" / "playwright-browsers")
     assert "Chromium browser is not installed" in result
@@ -60,7 +60,7 @@ def test_exec_browser_respects_existing_override(monkeypatch, tmp_path):
     monkeypatch.setattr(engine, "_playwright_available", lambda: True)
     _install_fake_playwright(monkeypatch)
 
-    engine._exec_browser({"url": "https://example.com"})
+    engine._exec_browser({"url": "https://example.com", "task": "read the heading"})
 
     assert os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "/custom/path"
 
@@ -74,7 +74,7 @@ def test_exec_browser_does_not_set_env_var_when_playwright_unavailable(monkeypat
     monkeypatch.setattr(engine, "_ssrf_check", lambda url: None)
     monkeypatch.setattr(engine, "_playwright_available", lambda: False)
 
-    result = engine._exec_browser({"url": "https://example.com"})
+    result = engine._exec_browser({"url": "https://example.com", "task": "read the heading"})
 
     assert "not installed" in result
     assert "PLAYWRIGHT_BROWSERS_PATH" not in os.environ

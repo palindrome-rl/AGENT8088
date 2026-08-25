@@ -50,7 +50,7 @@ def test_missing_chromium_binary_returns_clean_install_instructions(monkeypatch,
     missing_path = str(tmp_path / "chromium" / "chrome.exe")
     _install_fake_sync_playwright(monkeypatch, missing_path, launch_calls)
 
-    result = A._exec_browser({"url": "https://example.com"})
+    result = A._exec_browser({"url": "https://example.com", "task": "read the heading"})
 
     assert "Chromium browser is not installed" in result
     assert "playwright install chromium" in result
