@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
+import ast, asyncio, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -3397,7 +3397,8 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 # Browser — real page rendering via Playwright (optional dependency)
 # ---------------------------------------------------------------------------
-BROWSER_TIMEOUT_MS = int(APP_CONFIG.get("browser_timeout_ms", "20000"))
+BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "25"))
+BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "300"))
 
 
 def _playwright_available() -> bool:
@@ -3408,22 +3409,65 @@ def _playwright_available() -> bool:
         return False
 
 
+async def _run_browser_agent(url: str, task: str) -> str:
+    """Drive one browser-use Agent run and return its final result text.
+
+    Every request the browser makes passes through a fresh local SSRF-
+    filtering proxy (browser_proxy.py) that runs the same _egress_check/
+    _ssrf_check the old single-shot tool ran on every request, not just the
+    first navigation - see the design spec, section 4. The Agent's own LLM
+    calls are charged to the caller's active turn budget via
+    Agent8088ChatModel (browser_llm.py), so a multi-step task can't spend
+    tokens outside the user's existing budget ceiling.
+    """
+    from browser_use import Agent, BrowserProfile
+    from browser_use.browser import ProxySettings
+    from agent8088.browser_llm import build_browser_chat_model
+    from agent8088.browser_proxy import start_ssrf_filtering_proxy
+
+    proxy_url, stop_proxy = start_ssrf_filtering_proxy(
+        lambda target_url: _egress_check(target_url) or _ssrf_check(target_url))
+    try:
+        llm = build_browser_chat_model(client, MODEL_NAME, budget=_active_budget)
+        profile = BrowserProfile(proxy=ProxySettings(server=proxy_url))
+        agent = Agent(
+            task=task,
+            llm=llm,
+            browser_profile=profile,
+            initial_actions=[{"navigate": {"url": url, "new_tab": False}}],
+        )
+        history = await asyncio.wait_for(
+            agent.run(max_steps=BROWSER_MAX_STEPS),
+            timeout=BROWSER_TASK_TIMEOUT_SECONDS,
+        )
+    finally:
+        stop_proxy()
+
+    result = history.final_result() or "(The task did not produce a final result.)"
+    if not history.is_done():
+        result += "\n\n(Note: the browsing task hit its step or time limit before finishing.)"
+    return result
+
+
 def _exec_browser(args: dict) -> str:
-    """Load a page in a headless browser and return its text, optionally scoped to
-    a CSS selector. Handles JS-rendered pages that curl cannot. SSRF-guarded.
-    Degrades with install instructions when Playwright isn't present.
+    """Load a page and complete a task on it in a real headless browser --
+    click, fill forms, navigate, and extract information via natural-
+    language instructions. SSRF-guarded on every request the session makes,
+    not just the first navigation. Degrades with install instructions when
+    Playwright isn't present.
 
     `playwright` the Python package is a core dependency (always installed),
     but the Chromium *browser binary* is a separate ~280 MB download the
     installer fetches afterward and can fail or be skipped independently
     (network blip, disk space, antivirus). `_playwright_available` alone
-    cannot see that gap - it would report available and let the missing-binary
-    case fall through to playwright's own multi-paragraph "Executable doesn't
-    exist" error, which reads as a crash rather than an install step. Checking
-    the resolved executable_path up front, inside the same driver session
-    launch() would use, catches that case with the same clear message as a
-    fully-missing install.
+    cannot see that gap - it would report available and let the missing-
+    binary case fall through to a multi-paragraph "Executable doesn't
+    exist" error. Checking the resolved executable_path up front, with the
+    same Playwright session browser-use itself will use, catches that case
+    with a clear message instead.
     """
+    global _active_role
+
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
@@ -3437,13 +3481,10 @@ def _exec_browser(args: dict) -> str:
     # Keep Chromium's ~280MB download inside $AGENT8088_HOME rather than the
     # OS-default shared cache (~/.cache/ms-playwright etc.) - that shared
     # cache can belong to other Playwright-using projects on the same
-    # machine, so `agent8088 --uninstall` cannot safely delete it. Installing
-    # into our own subdirectory means the existing home-directory wipe
-    # already covers it, with no separate cleanup logic needed.
+    # machine, so `agent8088 --uninstall` cannot safely delete it.
     os.environ.setdefault(
         "PLAYWRIGHT_BROWSERS_PATH", str(_agent_data_dir() / "playwright-browsers")
     )
-    selector = str(args.get("selector") or "").strip()
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
@@ -3451,38 +3492,26 @@ def _exec_browser(args: dict) -> str:
                 return ("Playwright's Chromium browser is not installed. Install it with:\n"
                         "  playwright install chromium\n"
                         "Until then, use web_search or get_page_title instead.")
-            browser = p.chromium.launch(headless=True)
-            try:
-                page = browser.new_page()
-                blocked_requests = []
-
-                def guard_request(route):
-                    request_url = route.request.url
-                    if request_url.startswith(("data:", "blob:", "about:")):
-                        route.continue_()
-                        return
-                    reason = _egress_check(request_url) or _ssrf_check(request_url)
-                    if reason:
-                        blocked_requests.append(reason)
-                        route.abort()
-                    else:
-                        route.continue_()
-
-                page.route("**/*", guard_request)
-                page.goto(url, timeout=BROWSER_TIMEOUT_MS, wait_until="domcontentloaded")
-                if blocked_requests:
-                    return blocked_requests[0]
-                if selector:
-                    text = "\n".join(el.inner_text() for el in page.query_selector_all(selector))
-                else:
-                    text = page.inner_text("body")
-                title = page.title()
-            finally:
-                browser.close()
     except Exception as e:
         return f"Browser error: {e}"
-    text = re.sub(r'\n{3,}', '\n\n', (text or "").strip())
-    return _wrap_untrusted(_strip_special_tokens(f"Title: {title}\n\n{text[:5000]}"), url)
+
+    task = str(args.get("task") or "").strip()
+    if not task:
+        return "Error: browser tool requires 'task'."
+
+    saved_role, _active_role = _active_role, "subagent:browser"
+    try:
+        result = asyncio.run(_run_browser_agent(url, task))
+    except asyncio.TimeoutError:
+        result = (f"Browser error: task exceeded the {BROWSER_TASK_TIMEOUT_SECONDS}s "
+                  f"time limit (raise browser_task_timeout_seconds in config.txt).")
+    except Exception as e:
+        result = f"Browser error: {e}"
+    finally:
+        _active_role = saved_role
+
+    result = re.sub(r'\n{3,}', '\n\n', (result or "").strip())
+    return _wrap_untrusted(_strip_special_tokens(result[:5000]), url)
 
 
 # ---------------------------------------------------------------------------

@@ -57,15 +57,23 @@ def test_missing_chromium_binary_returns_clean_install_instructions(monkeypatch,
     assert launch_calls == []
 
 
-def test_present_chromium_binary_proceeds_to_launch(monkeypatch, tmp_path):
-    launch_calls = []
+def test_present_chromium_binary_proceeds_to_run_the_browser_agent(monkeypatch, tmp_path):
     present_path = tmp_path / "chrome.exe"
     present_path.write_text("stub")
-    _install_fake_sync_playwright(monkeypatch, str(present_path), launch_calls)
+    _install_fake_sync_playwright(monkeypatch, str(present_path), launch_calls=[])
 
-    result = A._exec_browser({"url": "https://example.com"})
+    calls = []
 
-    # It gets past the Chromium-presence check and attempts to launch (which
-    # our fake deliberately raises on) - proving the check does not block a
-    # genuinely-installed Chromium.
-    assert launch_calls or "Browser error" in result
+    async def fake_run_browser_agent(url, task):
+        calls.append((url, task))
+        return "ok"
+
+    monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
+
+    result = A._exec_browser({"url": "https://example.com", "task": "extract the heading"})
+
+    # It gets past the Chromium-presence check and reaches the browser-use
+    # agent runner - proving the check does not block a genuinely-installed
+    # Chromium.
+    assert calls == [("https://example.com", "extract the heading")]
+    assert "ok" in result
