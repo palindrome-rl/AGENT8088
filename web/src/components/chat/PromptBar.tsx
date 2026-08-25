@@ -19,7 +19,7 @@ export function PromptBar() {
   const [showCommands, setShowCommands] = useState(false)
   const [commandFilter, setCommandFilter] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const { isStreaming } = useSessionStore()
+  const { isStreaming, addMessage } = useSessionStore()
   const { send: wsSend } = useWebSocket()
 
   const filteredCommands = commandFilter
@@ -33,6 +33,7 @@ export function PromptBar() {
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
       wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
     } else {
+      addMessage({ role: 'user', content: trimmed })
       wsSend({ type: 'chat', text: trimmed })
     }
     setText('')
