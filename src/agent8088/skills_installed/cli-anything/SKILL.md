@@ -27,6 +27,10 @@ software.
 5. Run installed harnesses with `cli_anything_run`. Pass arguments as an array,
    include `--json` whenever supported, and use the user's project directory as
    `cwd`.
+   Use syntax already present in the loaded harness skill; call `--help` only
+   after a command actually rejects that syntax. Batch independent calls in one
+   response, while keeping operations that consume newly-created indexes
+   sequential.
 6. If no suitable harness exists, load `references/build.md` and generate one
    in the user's workspace. Never generate it inside Agent8088's installation.
 

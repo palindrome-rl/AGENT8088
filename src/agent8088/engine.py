@@ -4665,6 +4665,12 @@ def _plan_mode_block_message() -> str:
 def _run_cli_anything_tool(name: str, args: dict, timeout: int,
                            approval_key: str, allow_plan: bool) -> str:
     """Run the optional CLI-Anything adapter through Agent8088's policy layer."""
+    missing = next(
+        (param for param in TOOL_REQUIRED_PARAMS.get(name, []) if not args.get(param)),
+        None,
+    )
+    if missing:
+        return _tool_arg_missing_error(name, missing)
     if name == "cli_anything_status":
         return json.dumps(cli_anything.status(CONFIG_PATH, timeout=timeout), indent=2)
 
@@ -5386,11 +5392,18 @@ def _scan_json_object(text: str, start: int, limit: int = None) -> str:
     return text[start:limit]
 
 
+def _normalize_tool_markers(text: str) -> str:
+    text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
+    return re.sub(
+        r"✿(FUNCTION|ARGS)[^:\w\s]{0,3}\s*:",
+        lambda match: f"✿{match.group(1)}✿:",
+        text,
+    )
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
-    text = _outside_fenced_code(text)
-    text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
-    text = text.replace("✿ARGS⃣:", "✿ARGS✿:")
+    text = _normalize_tool_markers(_outside_fenced_code(text))
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
@@ -5485,6 +5498,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
 
 
 def strip_tool_json(text: str) -> str:
+    text = _normalize_tool_markers(text)
     parts = _MARKDOWN_FENCE_RE.split(text)
     for index in range(0, len(parts), 2):
         part = parts[index]
@@ -6793,7 +6807,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 
 
 CLI_ANYTHING_MIN_TURNS = 20
-CLI_ANYTHING_MAX_TURNS = 40
+CLI_ANYTHING_MAX_TURNS = 60
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 

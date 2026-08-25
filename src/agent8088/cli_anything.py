@@ -464,8 +464,8 @@ def installed_skill(config_path: Path | str, name: object, *, timeout: int = 15)
             "operands: hidden parts stay in the editable project but are excluded "
             "from export. Verify final exported solids with `import info`; "
             "`document info` also counts hidden dependency parts. Paths passed to "
-            "the harness are relative to `cwd`; when `cwd` is `artifacts/engine`, "
-            "use `engine_project.json`, not `artifacts/engine/engine_project.json`.\n"
+            "the harness are relative to `cwd`; when `cwd` is the artifact "
+            "directory, pass leaf filenames and do not repeat `cwd` in paths.\n"
             "FreeCAD command arguments named `INDEX` are zero-based list indexes, "
             "not the one-based persistent `id`. Agent8088 adds an `index` field to "
             "part creation and boolean results; always reuse that `index` in later "
@@ -508,7 +508,7 @@ def _freecad_remove_error(argv: list[str], workdir: Path) -> str | None:
 def _resolve_freecad_measurement(result: str, argv: list[str], workdir: Path,
                                  root: Path, timeout: int,
                                  path_prefix: Path | None) -> str:
-    """Resolve measurements the harness defers for boolean parts."""
+    """Use FreeCAD itself for measurements instead of JSON approximations."""
     try:
         payload = json.loads(result)
         command = argv.index("measure")
@@ -517,7 +517,11 @@ def _resolve_freecad_measurement(result: str, argv: list[str], workdir: Path,
         project_flag = next(flag for flag in ("-p", "--project") if flag in argv)
         project_path = Path(argv[argv.index(project_flag) + 1])
         project_path = project_path if project_path.is_absolute() else workdir / project_path
-        if payload.get("deferred") is not True or kind not in {"bounding-box", "volume"}:
+        supported = {
+            "area", "volume", "center-of-mass", "bounding-box", "inertia",
+            "check-geometry",
+        }
+        if kind not in supported or not isinstance(payload, dict) or "error" in payload:
             return result
     except (ValueError, StopIteration, IndexError, TypeError, AttributeError,
             json.JSONDecodeError):
@@ -531,20 +535,56 @@ from cli_anything.freecad.utils.freecad_backend import run_macro_content
 from cli_anything.freecad.utils.freecad_macro_gen import generate_macro, _safe_name
 
 project = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-target_name = _safe_name(project["parts"][int(sys.argv[2])]["name"])
+part = project["parts"][int(sys.argv[2])]
 with tempfile.TemporaryDirectory(prefix="agent8088-freecad-measure-") as temporary:
-    macro = generate_macro(project, str(Path(temporary) / "measure.step"), "step")
+    if part["type"] == "imported":
+        source = Path(part["params"]["source_path"])
+        macro = """import FreeCAD
+import Part
+doc = FreeCAD.newDocument("MeasureDoc")
+Part.insert(%r, doc.Name)
+doc.recompute()
+shapes = [obj.Shape for obj in doc.Objects if hasattr(obj, "Shape") and not obj.Shape.isNull()]
+shape = shapes[0] if len(shapes) == 1 else Part.makeCompound(shapes)
+""" % str(source)
+    else:
+        target_name = _safe_name(part["name"])
+        macro = generate_macro(project, str(Path(temporary) / "measure.step"), "step")
+        macro += "\nshape = doc.getObject(%r).Shape\n" % target_name
     macro += """
 import json
-target = doc.getObject(%r)
-box = target.Shape.BoundBox
+box = shape.BoundBox
+solids = list(shape.Solids)
+measured = solids or [shape]
+volume = sum(item.Volume for item in measured)
+area = sum(item.Area for item in measured)
+if volume:
+    center = [
+        sum(item.Volume * getattr(item.CenterOfMass, axis) for item in measured) / volume
+        for axis in ("x", "y", "z")
+    ]
+else:
+    center = [box.Center.x, box.Center.y, box.Center.z]
+inertia = {"Ixx": 0.0, "Iyy": 0.0, "Izz": 0.0}
+for item in measured:
+    matrix = item.MatrixOfInertia
+    dx = item.CenterOfMass.x - center[0]
+    dy = item.CenterOfMass.y - center[1]
+    dz = item.CenterOfMass.z - center[2]
+    inertia["Ixx"] += matrix.A11 + item.Volume * (dy * dy + dz * dz)
+    inertia["Iyy"] += matrix.A22 + item.Volume * (dx * dx + dz * dz)
+    inertia["Izz"] += matrix.A33 + item.Volume * (dx * dx + dy * dy)
 print("AGENT8088_METRICS=" + json.dumps({
-    "volume": target.Shape.Volume,
+    "area": area,
+    "volume": volume,
+    "center_of_mass": center,
     "min": {"x": box.XMin, "y": box.YMin, "z": box.ZMin},
     "max": {"x": box.XMax, "y": box.YMax, "z": box.ZMax},
     "size": {"x": box.XLength, "y": box.YLength, "z": box.ZLength},
+    "inertia": inertia,
+    "valid": shape.isValid(),
 }))
-""" % target_name
+"""
     print(json.dumps(run_macro_content(macro)))
 '''
     done = _run(
@@ -561,10 +601,17 @@ print("AGENT8088_METRICS=" + json.dumps({
         metrics = json.loads(backend["stdout"].split(marker, 1)[1].splitlines()[0])
         if done.returncode or backend["returncode"]:
             return result
-        if kind == "volume":
-            payload["volume"] = metrics["volume"]
-        else:
+        if kind in {"area", "volume"}:
+            payload[kind] = metrics[kind]
+        elif kind == "center-of-mass":
+            payload["center_of_mass"] = metrics["center_of_mass"]
+        elif kind == "bounding-box":
             payload.update({key: metrics[key] for key in ("min", "max", "size")})
+        elif kind == "inertia":
+            payload["inertia"] = metrics["inertia"]
+        else:
+            payload["valid"] = metrics["valid"]
+            payload["issues"] = [] if metrics["valid"] else ["FreeCAD shape validation failed"]
         payload["deferred"] = False
         return json.dumps(payload, indent=2)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError):

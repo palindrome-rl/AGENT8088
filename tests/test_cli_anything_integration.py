@@ -89,6 +89,15 @@ def test_cli_anything_keycap_argument_markup_keeps_arguments(engine):
     ]
 
 
+def test_cli_anything_cross_mark_tool_markup_keeps_arguments(engine):
+    expected = {"name": "freecad", "arguments": ["--json", "export", "presets"], "cwd": "."}
+    text = f"✿FUNCTION✗: cli_anything_run ✿ARGS✗: {json.dumps(expected)}"
+
+    assert engine.find_tool_calls(text, {"cli_anything_run"}) == [
+        {"name": "cli_anything_run", "arguments": expected}
+    ]
+
+
 def test_explicit_execute_shell_prohibition_is_enforced(monkeypatch, engine):
     responses = [
         '✿FUNCTION✿: execute_shell ✿ARGS✿: {"command":"echo forbidden"}',
@@ -146,6 +155,13 @@ def test_cli_anything_status_does_not_require_permission(engine, monkeypatch, tm
     engine.PERMISSION_MODE = "readonly"
     result = engine.run_tool("cli_anything_status", {})
     assert json.loads(result)["available"] is False
+
+
+def test_cli_anything_missing_arguments_gets_a_recoverable_error(engine):
+    result = engine.run_tool("cli_anything_run", {})
+
+    assert "was called with no arguments" in result
+    assert "'name'" in result
 
 
 def test_cli_anything_setup_uses_normal_permission_escalation(engine, monkeypatch):
@@ -625,8 +641,11 @@ def test_freecad_resolves_deferred_boolean_measurement(monkeypatch, tmp_path):
                 }), stderr="",
             )
         backend = {"returncode": 0, "stdout": (
-            'AGENT8088_METRICS={"volume": 42.0, "min": {"x": 0, "y": 1, "z": 2}, '
-            '"max": {"x": 10, "y": 21, "z": 32}, "size": {"x": 10, "y": 20, "z": 30}}'
+            'AGENT8088_METRICS={"area": 84.0, "volume": 42.0, '
+            '"center_of_mass": [5, 11, 17], "min": {"x": 0, "y": 1, "z": 2}, '
+            '"max": {"x": 10, "y": 21, "z": 32}, '
+            '"size": {"x": 10, "y": 20, "z": 30}, '
+            '"inertia": {"Ixx": 1, "Iyy": 2, "Izz": 3}, "valid": true}'
         )}
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(backend), stderr="")
 
