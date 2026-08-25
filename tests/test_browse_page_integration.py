@@ -56,11 +56,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def local_test_page():
+def local_test_page(monkeypatch):
     server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    # _exec_browser's pre-flight _ssrf_check blocks ALL loopback addresses by
+    # design - including this fixture's own test server. Allowlist exactly
+    # this dynamic port through the real SSRF_ALLOW_HOSTS mechanism (the same
+    # escape hatch _ssrf_check's config already supports) rather than
+    # disabling the check: test_ssrf_proxy_blocks_a_request_the_page_itself_makes
+    # still needs _ssrf_check to genuinely block the unrelated metadata IP it
+    # probes mid-session, so the check itself must stay live.
+    monkeypatch.setattr(A, "SSRF_ALLOW_HOSTS", A.SSRF_ALLOW_HOSTS | {f"127.0.0.1:{port}"})
     try:
         yield f"http://127.0.0.1:{port}/"
     finally:
