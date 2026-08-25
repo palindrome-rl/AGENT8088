@@ -32,7 +32,7 @@ def test_connect_to_blocked_target_is_refused():
         stop()
 
 
-def test_connect_to_allowed_target_establishes_tunnel():
+def test_connect_to_allowed_target_establishes_tunnel_and_relays_data():
     proxy_url, stop = start_ssrf_filtering_proxy(lambda url: None)
     port = int(proxy_url.rsplit(":", 1)[1])
     # Bind a local "upstream" server to CONNECT through to, so the test has no
@@ -42,8 +42,19 @@ def test_connect_to_allowed_target_establishes_tunnel():
     upstream.listen(1)
     upstream_port = upstream.getsockname()[1]
     try:
-        code, _ = _connect_raw(port, f"127.0.0.1:{upstream_port}")
-        assert code == 200
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        client.sendall(f"CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        conn, _ = upstream.accept()
+        response = client.recv(4096)
+        assert response.startswith(b"HTTP/1.1 200")
+        # Prove the tunnel actually relays data in both directions, not just
+        # that the handshake succeeded.
+        client.sendall(b"ping")
+        assert conn.recv(4096) == b"ping"
+        conn.sendall(b"pong")
+        assert client.recv(4096) == b"pong"
+        client.close()
+        conn.close()
     finally:
         stop()
         upstream.close()
