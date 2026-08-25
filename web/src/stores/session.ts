@@ -21,6 +21,7 @@ interface SessionState {
   }>
 
   setMessages: (messages: ChatMessage[]) => void
+  clearChat: () => void
   addMessage: (message: ChatMessage) => void
   setStatus: (status: StatusInfo) => void
   setStreaming: (streaming: boolean) => void
@@ -43,6 +44,15 @@ export const useSessionStore = create<SessionState>((set) => ({
   planSteps: [],
 
   setMessages: (messages) => set({ messages }),
+  clearChat: () => set({
+    messages: [],
+    status: null,
+    isStreaming: false,
+    streamingText: '',
+    streamingReasoning: [],
+    toolEvents: [],
+    planSteps: [],
+  }),
   addMessage: (message) => set((s) => ({ messages: [...s.messages, message] })),
   setStatus: (status) => set({ status }),
   setStreaming: (streaming) => set({ isStreaming: streaming }),

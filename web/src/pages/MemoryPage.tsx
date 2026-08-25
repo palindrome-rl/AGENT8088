@@ -145,6 +145,8 @@ function ContextCard({ fact, onForget, forgetting }: {
       <div className="mb-2 flex items-start justify-between gap-2">
         <p className="text-sm text-zinc-200">{fact.text}</p>
         <button
+          type="button"
+          aria-label={`Forget ${fact.id}`}
           onClick={() => onForget(fact.id)}
           disabled={forgetting}
           className="shrink-0 rounded p-1 text-zinc-600 opacity-0 transition-opacity hover:bg-red-500/10 hover:text-red-400 group-hover:opacity-100"

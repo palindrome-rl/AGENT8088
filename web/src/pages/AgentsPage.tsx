@@ -92,7 +92,7 @@ function LaunchModal({ agent, onClose }: LaunchModalProps) {
             <Bot className="h-4 w-4 text-brand-cyan" />
             <h3 className="text-sm font-semibold text-zinc-100">Launch {agent.name}</h3>
           </div>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
+          <button type="button" aria-label="Close agent launcher" onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
             <X className="h-4 w-4" />
           </button>
         </div>

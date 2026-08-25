@@ -125,7 +125,7 @@ function AddModal({ onClose }: AddModalProps) {
             <Plus className="h-4 w-4 text-brand-cyan" />
             <h3 className="text-sm font-semibold text-zinc-100">Add MCP Server</h3>
           </div>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
+          <button type="button" aria-label="Close MCP dialog" onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -364,6 +364,8 @@ export default function McpPage() {
                   </td>
                   <td className="px-3 py-2.5">
                     <button
+                      type="button"
+                      aria-label={`Remove ${srv.name}`}
                       onClick={() => handleRemove(srv.name)}
                       disabled={removing === srv.name && removeMutation.isPending}
                       className="rounded p-1 text-zinc-500 transition-colors hover:bg-red-500/10 hover:text-red-400 disabled:opacity-50"

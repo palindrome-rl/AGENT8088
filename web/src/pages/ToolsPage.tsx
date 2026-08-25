@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   Wrench, Play, X, Loader2, CheckCircle2, XCircle, ChevronDown, ChevronRight,
@@ -101,7 +101,7 @@ function InvokerModal({ tool, onClose }: InvokerModalProps) {
             <h3 className="text-sm font-semibold text-zinc-100">{tool.name}</h3>
             <ModeBadge mode={tool.mode} />
           </div>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
+          <button type="button" aria-label="Close tool invoker" onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -261,10 +261,15 @@ export default function ToolsPage() {
               {filtered.map((tool) => {
                 const isOpen = expanded.has(tool.name)
                 return (
-                  <tbody key={tool.name}>
+                  <Fragment key={tool.name}>
                     <tr className="border-b border-zinc-800/50 transition-colors hover:bg-zinc-900/30">
                       <td className="px-3 py-2.5">
-                        <button onClick={() => toggle(tool.name)} className="text-zinc-500 hover:text-zinc-200">
+                        <button
+                          type="button"
+                          aria-label={`${isOpen ? 'Collapse' : 'Expand'} ${tool.name}`}
+                          onClick={() => toggle(tool.name)}
+                          className="text-zinc-500 hover:text-zinc-200"
+                        >
                           {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
                         </button>
                       </td>
@@ -279,6 +284,7 @@ export default function ToolsPage() {
                       <td className="px-3 py-2.5"><EnabledDot enabled={tool.enabled} /></td>
                       <td className="px-3 py-2.5">
                         <button
+                          type="button"
                           onClick={() => setInvokerTool(tool)}
                           className="flex items-center gap-1 rounded border border-zinc-800 px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:border-brand-primary hover:text-brand-cyan"
                         >
@@ -334,7 +340,7 @@ export default function ToolsPage() {
                         </td>
                       </tr>
                     )}
-                  </tbody>
+                  </Fragment>
                 )
               })}
             </tbody>

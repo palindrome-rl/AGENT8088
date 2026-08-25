@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { Send, Square, Plus, Mic, ChevronDown } from 'lucide-react'
+import { Send, Square, Plus, Mic } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { cn } from '@/lib/utils'
@@ -165,10 +165,17 @@ export function PromptBar() {
             Sources
           </div>
           <div className="p-1">
-            {['Add photos & files', 'Web search', 'Memory recall'].map((src, i) => (
+            {['Web search', 'Memory recall'].map((src, i) => (
               <button
                 key={src}
+                type="button"
                 onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  setText(src === 'Web search' ? '/search ' : '/memory ')
+                  setDismissed(true)
+                  setPlusOpen(false)
+                  inputRef.current?.focus()
+                }}
                 className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50"
                 style={{ animation: `fade-up 200ms cubic-bezier(0.23,1,0.32,1) ${i * 60}ms both` }}
               >

@@ -2,6 +2,9 @@ import { create } from 'zustand'
 
 type Theme = 'dark' | 'light'
 
+const savedTheme = typeof window !== 'undefined' ? window.localStorage.getItem('agent8088-theme') : null
+const initialTheme: Theme = savedTheme === 'light' ? 'light' : 'dark'
+
 interface UIState {
   sidebarCollapsed: boolean
   commandPaletteOpen: boolean
@@ -28,14 +31,21 @@ interface UIState {
 export const useUIStore = create<UIState>((set) => ({
   sidebarCollapsed: false,
   commandPaletteOpen: false,
-  theme: 'dark',
+  theme: initialTheme,
   approvalPending: null,
   planApprovalPending: null,
 
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
-  toggleTheme: () => set((s) => ({ theme: s.theme === 'dark' ? 'light' : 'dark' })),
-  setTheme: (theme) => set({ theme }),
+  toggleTheme: () => set((s) => {
+    const theme = s.theme === 'dark' ? 'light' : 'dark'
+    window.localStorage.setItem('agent8088-theme', theme)
+    return { theme }
+  }),
+  setTheme: (theme) => {
+    window.localStorage.setItem('agent8088-theme', theme)
+    set({ theme })
+  },
   setApprovalPending: (approval) => set({ approvalPending: approval }),
   setPlanApprovalPending: (plan) => set({ planApprovalPending: plan }),
 }))

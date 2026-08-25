@@ -35,7 +35,7 @@ export function ChatPanel() {
           <div className="flex h-full flex-col items-center justify-center px-6">
             {/* Logo image */}
             <div className="mb-4">
-              <img src="/logo.png" alt="Agent8088" className="h-10 w-auto" style={{ mixBlendMode: theme === 'dark' ? 'screen' : 'normal' }} />
+              <img src="/logo.png" alt="Agent8088" className="h-[90px] w-auto" style={{ mixBlendMode: theme === 'dark' ? 'screen' : 'normal', filter: theme === 'light' ? 'invert(1)' : undefined }} />
             </div>
 
             <p className="mb-5 text-[13px] text-zinc-500 dark:text-zinc-500">
@@ -126,7 +126,7 @@ function PixelLoader({ theme }: { theme: string }) {
           animation: 'shimmer-text 1.4s linear infinite',
         }}
       >
-        Churning
+        Generating
       </span>
       <span className="font-mono text-[12px] text-zinc-400 dark:text-zinc-500 tabular-nums">
         {elapsed}

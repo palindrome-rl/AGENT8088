@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronRight, Wrench, Check, Loader2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, Check, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /* ─────────────────────────────────────────────────────────

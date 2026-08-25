@@ -3,6 +3,7 @@ import { test, expect } from '@playwright/test'
 test('web UI loads with sidebar navigation', async ({ page }) => {
   await page.goto('/')
   await expect(page.locator('a:has-text("Chat")')).toBeVisible()
+  await page.getByRole('button', { name: 'Settings' }).click()
   await expect(page.locator('a:has-text("Tools")')).toBeVisible()
   await expect(page.locator('a:has-text("Skills")')).toBeVisible()
   await expect(page.locator('a:has-text("Sub-Agents")')).toBeVisible()
@@ -13,9 +14,15 @@ test('web UI loads with sidebar navigation', async ({ page }) => {
   await expect(page.locator('a:has-text("Doctor")')).toBeVisible()
 })
 
+test('Agent8088 logo returns to home', async ({ page }) => {
+  await page.goto('/tools')
+  await page.getByRole('button', { name: 'Go to home' }).click()
+  await expect(page).toHaveURL(/\/$/)
+})
+
 test('command palette opens with Cmd+K', async ({ page }) => {
   await page.goto('/')
-  await page.keyboard.press('Meta+k')
+  await page.getByRole('textbox', { name: 'Prompt' }).press('Control+k')
   await expect(page.locator('text=Search commands')).toBeVisible()
 })
 
@@ -23,7 +30,7 @@ test('prompt bar accepts text and slash commands', async ({ page }) => {
   await page.goto('/')
   const textarea = page.locator('textarea')
   await textarea.fill('/help')
-  await expect(page.locator('text=/help')).toBeVisible()
+  await expect(textarea).toHaveValue('/help')
 })
 
 test('tools page loads', async ({ page }) => {

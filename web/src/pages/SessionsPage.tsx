@@ -59,7 +59,7 @@ function NewSessionDialog({ open, onClose, onCreate, isCreating }: {
       >
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-sm font-semibold text-zinc-100">New Session</h3>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
+          <button type="button" aria-label="Close new session dialog" onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -118,7 +118,7 @@ function CompactDialog({ open, onClose, onCompact, isCompacting }: {
       >
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-sm font-semibold text-zinc-100">Compact Session</h3>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
+          <button type="button" aria-label="Close compact session dialog" onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
             <X className="h-4 w-4" />
           </button>
         </div>
