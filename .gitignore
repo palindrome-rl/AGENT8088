@@ -64,5 +64,13 @@ src/agent8088/gateway/platforms/whatsapp_bridge/node_modules/
 artifacts/*
 !artifacts/.gitkeep
 
+# AGENT8088_HOME pointed in-repo for local testing — config, sessions, memory
+# db, model cache, sandbox state. Local runtime state, never source.
+.agent8088/
+
+# Claude Code session runtime state (scheduled-wakeup lock, etc.) — not project
+# content, and specific to whichever machine/session created it.
+.claude/*.lock
+
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/

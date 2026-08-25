@@ -31,6 +31,19 @@ dependencies = [
     # when the installer's best-effort step happened to succeed, and its failure
     # was silent: search degraded to having no backend at all, with nothing said.
     "ddgs>=9,<10",
+    # Document reading and writing. Core for the same reason playwright is: a
+    # user who hands the agent a .xlsx should not have to discover that reading
+    # it depends on which extras their installer happened to complete. .docx and
+    # .pptx are read with stdlib zipfile, so only .xlsx and .pdf reading need a
+    # library -- openpyxl and pypdf are both pure Python. The other three are for
+    # writing, done by generated code through execute_shell (see the `documents`
+    # skill); python-docx and python-pptx pull lxml, which is a C extension but
+    # ships wheels for every desktop platform this project supports.
+    "openpyxl>=3.1,<4",
+    "pypdf>=4,<7",
+    "python-docx>=1.1,<2",
+    "python-pptx>=0.6.23,<2",
+    "reportlab>=4,<5",
 ]
 
 [project.optional-dependencies]

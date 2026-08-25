@@ -102,7 +102,7 @@ The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`
 | Command | Purpose |
 | --- | --- |
 | `agent8088` | Start an interactive session. |
-| `agent8088 --uninstall` | Remove the install dir, config, and env vars. |
+| `agent8088 --uninstall` | Remove the install dir, config, env vars, and cron/scheduled-task entries. Add `--workspace` to also remove trace logs + WhatsApp session data, or `--dry-run` to preview first. |
 | `agent8088 --gateway-setup` | Configure Slack, Discord, WhatsApp, Telegram, or email. |
 | `agent8088 --gateway` | Run the messaging gateway. |
 | `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |

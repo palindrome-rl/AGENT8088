@@ -1504,6 +1504,25 @@ def _stream_view(reasoning_parts, content):
 _session_allowlist = set()  # patterns approved for the rest of the session
 
 
+def _drain_queued_keys():
+    """Discard any keystrokes buffered in stdin before an interactive prompt.
+
+    On Windows, when the Rich Live spinner stops and an InquirerPy picker
+    launches, a stray Enter from the terminal transition can be sitting in
+    the input buffer. The picker reads it as an immediate confirmation of
+    the default (which is 'deny' for escalations — fail-closed), so the
+    prompt appears to auto-deny without the user pressing anything. Draining
+    the buffer first ensures only a deliberate keypress reaches the picker.
+    """
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        except (ImportError, OSError):
+            pass
+
+
 def _permission_choice(question, options, typed_prompt, typed_map, default):
     """Ask the user to pick one of `options` — a list of (value, label).
 
@@ -1523,6 +1542,7 @@ def _permission_choice(question, options, typed_prompt, typed_map, default):
         except ImportError:
             pass
         else:
+            _drain_queued_keys()
             return inquirer.select(
                 message=question,
                 choices=[Choice(value, name=label) for value, label in options],
@@ -1957,6 +1977,7 @@ def cmd_help(_):
         ("/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs"),
         ("/audit [on|off]", "Verify each step against the real files after it runs"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
+        ("/paste [q]", "Analyze an image from the OS clipboard (Windows/macOS)"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
         ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
         ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
@@ -2334,15 +2355,19 @@ def cmd_raw(rest):
     console.print(f"[dim]finish_reason={fr}[/dim]")
 
 
-def cmd_image(rest):
+def cmd_image(rest, resolver=None):
     parts = rest.split(None, 1)
     if not parts:
         console.print("[red]usage:[/red] /image <path-or-url> [question]")
         return
     ref = parts[0]
     question = parts[1] if len(parts) > 1 else "Describe this image."
+    # A path typed directly into /image is the same "the user typed this by
+    # hand" case the bare-paste feature exists for — no reason /image should
+    # be more restrictive than pasting the same path with no command at all.
+    resolver = resolver or A.resolve_pasted_path
     try:
-        msg = A.build_image_message(question, [ref])
+        msg = A.build_image_message(question, [ref], resolver=resolver)
     except Exception as e:
         console.print(f"[red]error:[/red] {e}")
         return
@@ -2361,6 +2386,136 @@ def cmd_image(rest):
     _save_active_session()
 
 
+def cmd_paste(rest):
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        console.print("[red]error:[/red] Pillow is not installed")
+        return
+    try:
+        img = ImageGrab.grabclipboard()
+    except NotImplementedError:
+        # ImageGrab.grabclipboard() only implements clipboard access on
+        # Windows/macOS; Linux needs xclip/wl-clipboard and Pillow raises this
+        # instead of silently returning None there.
+        console.print("[red]error:[/red] clipboard image paste isn't supported on this platform")
+        return
+    if img is None:
+        console.print("[red]error:[/red] clipboard has no image")
+        return
+    import tempfile
+    fd, tmp_name = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    img.save(tmp_path, "PNG")
+    try:
+        # A temp file, not something the user pasted a path to — resolve_pasted_path
+        # is right here too: it's the agent's own trusted output, not a model-chosen
+        # read, so the same "bypass ALLOWED_PATHS, keep the sensitive floor" rule fits.
+        cmd_image(f"{tmp_path} {rest}".strip(), resolver=A.resolve_pasted_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Bare-path paste detection — a file path typed or pasted with nothing else
+# (or a path plus a trailing question, same shape as /image) reads or
+# analyzes it immediately rather than being sent to the model as chat text.
+# Only fires when the candidate resolves to a real file on disk, which is
+# what keeps this from ever misfiring on ordinary chat that merely looks
+# path-shaped.
+# ---------------------------------------------------------------------------
+def _detect_pasted_file(line: str):
+    """Find a real, existing file path anywhere in the line — not just as the
+    first token — so "describe this image C:\\...\\photo.png" triggers the
+    same as a bare path pasted alone. Whatever text remains once the path is
+    removed becomes the question, matching /image's <path> [question] shape
+    regardless of where in the sentence the path actually sits.
+
+    The only guard against misfiring on ordinary chat is that the candidate
+    must resolve to a file that genuinely exists on disk.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("/"):
+        return None
+
+    # Quoted spans first (a Windows drag-drop path containing a space is
+    # quoted), then bare whitespace-delimited tokens not already inside one
+    # of those spans — a bare token never contains a space, so this is safe.
+    spans = []
+    for m in re.finditer(r'"([^"]+)"|\'([^\']+)\'', stripped):
+        spans.append((m.group(1) or m.group(2), m.span()))
+    covered = [s for _, s in spans]
+    for m in re.finditer(r"\S+", stripped):
+        if any(m.start() >= a and m.end() <= b for a, b in covered):
+            continue
+        spans.append((m.group(0), m.span()))
+    spans.sort(key=lambda item: item[1][0])
+
+    for candidate, (start, end) in spans:
+        try:
+            path = Path(candidate.strip()).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path = path.resolve()
+        except OSError:
+            continue
+        if path.is_file():
+            question = (stripped[:start] + stripped[end:]).strip()
+            return path, question
+
+    # Unquoted Windows paths with spaces (e.g. "C:\...\Palindrome Business
+    # Plan.pdf") were split into tokens by the \S+ scan above, none of which
+    # resolved to a file. Re-join consecutive tokens starting from a
+    # drive-letter token (X:\) and check if the joined path is a real file —
+    # the same "must exist on disk" guard against misfiring on chat.
+    drive_re = re.compile(r"^[A-Za-z]:[\\/]")
+    for i, (candidate, (start, _)) in enumerate(spans):
+        if not drive_re.match(candidate):
+            continue
+        for j in range(len(spans), i, -1):  # longest match first
+            joined = " ".join(s[0] for s in spans[i:j])
+            try:
+                path = Path(joined).resolve()
+            except OSError:
+                continue
+            if path.is_file():
+                end = spans[j - 1][1][1]
+                question = (stripped[:start] + stripped[end:]).strip()
+                return path, question
+    return None
+
+
+def _handle_pasted_file(path, question):
+    # Check the sensitive-file floor before touching the file at all, for
+    # both branches below — extract_text() has no floor of its own, so
+    # skipping this would let a pasted-path .docx read a credential file that
+    # a bare read_text call would refuse.
+    try:
+        resolved = A.resolve_pasted_path(str(path))
+    except ValueError as e:
+        console.print(f"[red]error:[/red] {e}")
+        return True
+
+    suffix = resolved.suffix.lower()
+    if suffix in A._IMAGE_MIME:
+        cmd_image(f"{resolved} {question}".strip(), resolver=A.resolve_pasted_path)
+        return True
+
+    try:
+        text = A.documents.extract_text(str(resolved), A.MAX_DOCUMENT_BYTES)
+    except ValueError as e:
+        console.print(f"[red]error:[/red] {e}")
+        return True
+    if text is None:
+        try:
+            text = A._read_text_limited(resolved)
+        except (ValueError, UnicodeDecodeError):
+            return False  # not text either — let it fall through as chat
+    body = A._paginate_read(text, {}, resolved)
+    instruction = question or f"Here is the content of {resolved.name}."
+    do_chat(f"{instruction}\n\n{body}")
+    return True
 def cmd_model(rest):
     raw_arg = rest.strip()
     arg = raw_arg.lower()
@@ -3817,7 +3972,7 @@ def _configure_custom_models_endpoint():
 COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
-    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
+    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,
     "audit": cmd_audit,
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
@@ -4186,6 +4341,275 @@ def _remove_agent8088_config_exports():
             rc.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
             removed += 1
     return removed
+
+
+def _remove_agent8088_path_exports():
+    """Remove the exact PATH line install.sh's setup_path() appended.
+
+    Matched by exact line content, not a substring on link_dir - a user's own
+    hand-written PATH edit that happens to mention the same directory in a
+    different form (quoting, order, appended comment) is left alone rather
+    than guessed at.
+    """
+    link_dir = _agent8088_link_dir()
+    path_line = f'export PATH="{link_dir}:$PATH"'
+    removed = 0
+    for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
+               Path.home() / ".bashrc", Path.home() / ".bash_profile",
+               Path.home() / ".profile"):
+        if not rc.exists() or not rc.is_file():
+            continue
+        lines = rc.read_text(encoding="utf-8", errors="ignore").splitlines()
+        kept = [line for line in lines if line.strip() != path_line]
+        if kept != lines:
+            rc.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            removed += 1
+    return removed
+
+
+def _remove_agent8088_crontab_entries():
+    """Remove crontab lines this process added (marked with engine._CRON_MARKER).
+
+    Leaves every other line - including ones from other software - untouched.
+    """
+    from agent8088.engine import _CRON_MARKER
+
+    try:
+        current = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if current.returncode != 0:
+        return 0  # no crontab for this user, or `crontab` unavailable
+
+    lines = current.stdout.splitlines()
+    kept = [line for line in lines if _CRON_MARKER not in line]
+    if kept == lines:
+        return 0
+
+    payload = "\n".join(kept) + ("\n" if kept else "")
+    try:
+        subprocess.run(["crontab", "-"], input=payload, capture_output=True,
+                        text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    return len(lines) - len(kept)
+
+
+def _default_agent8088_trace_dir():
+    return Path.home() / "Documents" / "agent8088" / "traces"
+
+
+def _default_agent8088_whatsapp_session_dir():
+    return Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
+
+
+def _remove_agent8088_workspace_data():
+    """Remove the trace-log and WhatsApp session directories, but only when
+    they're still at the compiled-in default path. A path the user pointed
+    somewhere else (AGENT8088_TRACE_DIR, or a custom whatsapp_session_dir in
+    config.txt) is left alone rather than guessed at - it may not even be
+    agent8088-exclusive storage.
+
+    Opt-in only (see the --workspace flag on --uninstall) - user-generated
+    data is not deleted unless asked for, even though program files and
+    installation side effects are.
+    """
+    def _prune_empty_ancestors(path, stop_at):
+        parent = path.parent
+        while parent != stop_at and parent.exists():
+            try:
+                next(parent.iterdir())
+                break  # not empty
+            except StopIteration:
+                pass
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    removed = 0
+    default_trace_dir = _default_agent8088_trace_dir()
+    if "AGENT8088_TRACE_DIR" not in os.environ and default_trace_dir.exists():
+        shutil.rmtree(default_trace_dir, ignore_errors=True)
+        removed += 1
+        _prune_empty_ancestors(default_trace_dir, Path.home() / "Documents")
+
+    default_wa_dir = _default_agent8088_whatsapp_session_dir()
+    if default_wa_dir.exists():
+        shutil.rmtree(default_wa_dir, ignore_errors=True)
+        removed += 1
+        _prune_empty_ancestors(default_wa_dir, Path.home() / ".local" / "share")
+
+    return removed
+
+
+def _shared_playwright_cache_dir():
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ms-playwright"
+
+
+def _warn_shared_playwright_cache():
+    """Playwright's default browser cache can be shared with other projects
+    on this machine - never delete it automatically. New agent8088 installs
+    avoid this entirely (see engine.py's _exec_browser setting
+    PLAYWRIGHT_BROWSERS_PATH), but a pre-existing install's Chromium download
+    still lives there.
+    """
+    cache_dir = _shared_playwright_cache_dir()
+    if not cache_dir.exists():
+        return
+    print(f"Note: Playwright's Chromium browser was left in place at {cache_dir}")
+    print("  It may be shared with other projects on this machine, so it wasn't removed.")
+    if os.name == "nt":
+        print(f'  To remove it yourself: Remove-Item -Recurse -Force "{cache_dir}"')
+    else:
+        print(f'  To remove it yourself: rm -rf "{cache_dir}"')
+
+
+def _agent8088_searxng_container_exists():
+    """Whether the agent8088-managed SearXNG container currently exists.
+
+    Read-only - used by the pre-delete preview/--dry-run. Docker being absent
+    or the container never having been provisioned both count as "no".
+    """
+    status = searxng_provision.status()
+    return status.get("detail") not in ("docker is not installed", "container does not exist")
+
+
+def _remove_agent8088_searxng_container():
+    """Stop and remove the agent8088-managed SearXNG Docker container.
+
+    `searxng_provision.start()` runs it with `--restart unless-stopped`, so
+    Docker itself keeps the container alive - and restarts it on reboot -
+    until something explicitly removes it. Deleting $AGENT8088_HOME never
+    touches it, since a running container isn't a file. Docker being absent,
+    or the container never having been started, are both silent no-ops here.
+    """
+    if not _agent8088_searxng_container_exists():
+        return False
+    result = searxng_provision.stop()
+    return bool(result.get("ok"))
+
+
+def _windows_owned_path_entries(home):
+    """Every Windows user-PATH entry an agent8088 install can add.
+
+    Shared by the actual removal (_run_windows_uninstall) and the read-only
+    preview (_describe_agent8088_side_effects) so the two can't drift apart.
+    """
+    return (
+        _agent8088_link_dir(),
+        home / "bin",
+        home / "agent8088" / "venv" / "Scripts",
+        home / "git" / "cmd",
+        home / "git" / "bin",
+        home / "git" / "usr" / "bin",
+        home / "node",
+    )
+
+
+def _remove_windows_scheduled_tasks(home):
+    """Delete every Task Scheduler entry this install registered.
+
+    scheduled-tasks.json (inside home) is the authoritative list of task IDs
+    this install created - read it before home gets purged, and delete each
+    task by its exact `Agent8088-<id>` name so nothing else on the machine's
+    task list is touched.
+    """
+    registry = home / "scheduled-tasks.json"
+    try:
+        entries = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(entries, list):
+        return 0
+
+    scheduler = shutil.which("schtasks.exe") or shutil.which("schtasks") or "schtasks.exe"
+    removed = 0
+    for entry in entries:
+        task_id = str(entry.get("id", ""))
+        if not re.fullmatch(r"[0-9a-f]{16}", task_id):
+            continue
+        task_name = f"Agent8088-{task_id}"
+        try:
+            subprocess.run([scheduler, "/Delete", "/TN", task_name, "/F"],
+                            capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        removed += 1
+    return removed
+
+
+def _describe_agent8088_side_effects(home, include_workspace=False):
+    """List every agent8088-owned side effect found outside $AGENT8088_HOME,
+    for the pre-delete confirmation prompt and --dry-run. Read-only - detects,
+    never removes.
+    """
+    lines = []
+    if os.name == "nt":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_QUERY_VALUE)
+            try:
+                user_path, _ = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                user_path = ""
+            finally:
+                winreg.CloseKey(key)
+        except OSError:
+            user_path = ""
+
+        def _normal(value):
+            value = os.path.expandvars(str(value).strip().strip('"'))
+            return os.path.normcase(os.path.normpath(value))
+
+        owned = {_normal(p) for p in _windows_owned_path_entries(home)}
+        present = [e for e in user_path.split(";") if e.strip() and _normal(e) in owned]
+        if present:
+            lines.append(f"{len(present)} PATH entr{'y' if len(present) == 1 else 'ies'} in the Windows user environment")
+
+        try:
+            entries = json.loads((home / "scheduled-tasks.json").read_text(encoding="utf-8"))
+            if isinstance(entries, list) and entries:
+                lines.append(f"{len(entries)} Windows Task Scheduler entr{'y' if len(entries) == 1 else 'ies'}")
+        except (OSError, ValueError):
+            pass
+    else:
+        link_dir = _agent8088_link_dir()
+        path_line = f'export PATH="{link_dir}:$PATH"'
+        for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
+                   Path.home() / ".bashrc", Path.home() / ".bash_profile",
+                   Path.home() / ".profile"):
+            if rc.exists() and path_line in rc.read_text(encoding="utf-8", errors="ignore").splitlines():
+                lines.append(f"PATH line in {rc}")
+        try:
+            current = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=20)
+            if current.returncode == 0:
+                from agent8088.engine import _CRON_MARKER
+                marked = [l for l in current.stdout.splitlines() if _CRON_MARKER in l]
+                if marked:
+                    lines.append(f"{len(marked)} crontab entr{'y' if len(marked) == 1 else 'ies'}")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if _agent8088_searxng_container_exists():
+        lines.append(f"SearXNG Docker container ({searxng_provision.CONTAINER_NAME})")
+
+    if include_workspace:
+        default_trace_dir = _default_agent8088_trace_dir()
+        if "AGENT8088_TRACE_DIR" not in os.environ and default_trace_dir.exists():
+            lines.append(f"Trace log directory: {default_trace_dir}")
+        default_wa_dir = _default_agent8088_whatsapp_session_dir()
+        if default_wa_dir.exists():
+            lines.append(f"WhatsApp session directory: {default_wa_dir}")
+
+    return lines
 
 
 def _remove_windows_user_environment(*owned_path_entries):
@@ -4621,7 +5045,7 @@ def _stop_windows_processes(processes):
     return stopped
 
 
-def _run_windows_uninstall(home):
+def _run_windows_uninstall(home, workspace=False):
     # Everything the rest of this run needs is imported up front. The purge below
     # deletes the library this interpreter is running out of - a managed Python
     # lives inside the install too - so any later import could land on a file
@@ -4639,21 +5063,26 @@ def _run_windows_uninstall(home):
         print(message, flush=True)
 
     link_dir = _agent8088_link_dir()
-    managed_bin = home / "bin"
-    legacy_scripts = home / "agent8088" / "venv" / "Scripts"
 
-    environment_result = _remove_windows_user_environment(link_dir, managed_bin, legacy_scripts)
+    environment_result = _remove_windows_user_environment(*_windows_owned_path_entries(home))
     if environment_result is None:
         _say("Uninstall stopped: the Windows user environment could not be updated.")
         return False
     if environment_result:
         _say("Removed Agent8088 entries from the user PATH.")
 
+    if _remove_agent8088_searxng_container():
+        _say("Removed the SearXNG Docker container.")
+
     if not home.exists():
         _say(f"Install directory not found: {home}")
         _remove_windows_launcher_dir(link_dir)
         _say("Agent8088 user environment entries removed.")
         return True
+
+    removed_tasks = _remove_windows_scheduled_tasks(home)
+    if removed_tasks:
+        _say(f"Removed {removed_tasks} scheduled task(s) from Windows Task Scheduler.")
 
     blockers = _windows_processes_in_tree(home)
     if blockers:
@@ -4662,6 +5091,12 @@ def _run_windows_uninstall(home):
             _say(f"  {name} (pid {pid})")
         _say("Stopping them; Windows cannot delete a running program.")
         _stop_windows_processes(blockers)
+
+    if workspace:
+        removed_data = _remove_agent8088_workspace_data()
+        if removed_data:
+            _say(f"Removed {removed_data} workspace data director{'y' if removed_data == 1 else 'ies'}.")
+    _warn_shared_playwright_cache()
 
     with _UninstallActivity("Deleting Agent8088 files"):
         leftovers = _purge_install_tree(home)
@@ -4687,19 +5122,32 @@ def _run_windows_uninstall(home):
     return True
 
 
-def _run_uninstall():
+def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
     import shutil
     import stat
     home = _agent8088_home()
+    side_effects = _describe_agent8088_side_effects(home, include_workspace=workspace)
     print(f"This will permanently remove Agent8088 from: {home}")
-    try:
-        answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
-    except EOFError:
-        print("Uninstall cancelled.")
-        return False
-    if answer.strip() != "yes":
-        print("Uninstall cancelled.")
-        return False
+    if side_effects:
+        print("It will also remove:")
+        for line in side_effects:
+            print(f"  - {line}")
+    if not workspace:
+        print("(trace logs and the WhatsApp session directory are kept - pass --workspace or --all to remove them too)")
+
+    if dry_run:
+        print("(--dry-run: nothing was removed)")
+        return True
+
+    if not assume_yes:
+        try:
+            answer = input("Are you sure you want to remove Agent8088? Type yes to continue: ")
+        except EOFError:
+            print("Uninstall cancelled.")
+            return False
+        if answer.strip() != "yes":
+            print("Uninstall cancelled.")
+            return False
     if not _safe_uninstall_home(home):
         print(f"Refusing to remove unsafe path: {home}")
         return False
@@ -4721,7 +5169,13 @@ def _run_uninstall():
             pass
 
     if os.name == "nt":
-        return _run_windows_uninstall(home)
+        return _run_windows_uninstall(home, workspace=workspace)
+
+    if _remove_agent8088_searxng_container():
+        print("Removed the SearXNG Docker container.")
+        # Stopping it first, before the directory it bind-mounts is deleted,
+        # avoids the container racing this rmtree and leaving a freshly
+        # written file behind for _clear_readonly to trip over.
 
     if home.exists():
         shutil.rmtree(home, onerror=_clear_readonly)
@@ -4753,6 +5207,13 @@ def _run_uninstall():
         pass
     if os.name != "nt":
         _remove_agent8088_config_exports()
+        _remove_agent8088_path_exports()
+        _remove_agent8088_crontab_entries()
+    if workspace:
+        removed_data = _remove_agent8088_workspace_data()
+        if removed_data:
+            print(f"Removed {removed_data} workspace data director{'y' if removed_data == 1 else 'ies'}.")
+    _warn_shared_playwright_cache()
     print("Done. Open a NEW terminal for PATH to refresh.")
     return True
 
@@ -5032,9 +5493,17 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     home = _agent8088_home()
     config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
-        print(f"Config not found: {config_path}")
-        print("Run the installer first.")
-        return
+        # Seed from the packaged template so the wizard has defaults to edit.
+        # The old behaviour — refusing to run and telling the user to "run the
+        # installer first" — was a dead end when the config had been deleted or
+        # never created: --setup is the tool that creates it.
+        packaged = Path(__file__).with_name("config.txt")
+        try:
+            content = packaged.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_text(config_path, content)
     content = config_path.read_text(encoding="utf-8")
     def _current(key):
         m = _re.search(rf'^{_re.escape(key)}=(.*)$', content, _re.MULTILINE)
@@ -5267,9 +5736,16 @@ def _run_gateway_setup():
     home = _agent8088_home()
     config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
     if not config_path.exists():
-        print(f"Config not found: {config_path}")
-        print("Run `agent8088 --setup` first to create a base config.")
-        return
+        # Seed from the packaged template — same fix as _run_setup. The old
+        # "run --setup first" message was a dead end when --setup itself
+        # also refused on a missing config.
+        packaged = Path(__file__).with_name("config.txt")
+        try:
+            content = packaged.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_private_text(config_path, content)
     content = config_path.read_text(encoding="utf-8")
 
     def _current(key):
@@ -5635,6 +6111,20 @@ def main():
     parser.add_argument("--mode", choices=["readonly", "full-auto"],
                         default=None, help="set the permission mode at startup")
     parser.add_argument("--uninstall", "-uninstall", action="store_true", help="remove agent8088 install dir + env vars, then exit")
+    # Program files and installation side effects (PATH entries,
+    # cron/scheduled tasks) are always removed, but user-generated data is
+    # opt-in - deleting a user's trace logs or WhatsApp session by default
+    # would be a surprising thing for --uninstall to do without being asked.
+    parser.add_argument("--workspace", action="store_true",
+                        help="with --uninstall: also remove trace logs and the WhatsApp session directory")
+    parser.add_argument("--all", action="store_true",
+                        help="with --uninstall: shorthand for --workspace")
+    parser.add_argument("--yes", action="store_true",
+                        help="with --uninstall: skip the confirmation prompt")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="with --uninstall: never prompt; requires --yes")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --uninstall: print what would be removed, remove nothing")
     parser.add_argument("--update", action="store_true",
                         help=f"update to the latest commit of {UPDATE_BRANCH} + reinstall, then exit")
     parser.add_argument("--force", action="store_true",
@@ -5678,7 +6168,14 @@ def main():
         return rc if isinstance(rc, int) else 0
 
     if args.uninstall:
-        uninstall_ok = _run_uninstall()
+        if args.non_interactive and not args.yes:
+            print("--non-interactive requires --yes.")
+            return 1 if os.name == "nt" else None
+        uninstall_ok = _run_uninstall(
+            workspace=args.workspace or args.all,
+            assume_yes=args.yes,
+            dry_run=args.dry_run,
+        )
         return (0 if uninstall_ok else 1) if os.name == "nt" else None
     if args.update:
         _run_update(force=args.force)
@@ -5763,6 +6260,9 @@ def main():
                     console.print(f"[red]error:[/red] {e}")
             else:
                 console.print(f"[red]unknown command:[/red] /{cmd}  (try /help)")
+            continue
+        pasted = _detect_pasted_file(line)
+        if pasted and _handle_pasted_file(*pasted):
             continue
         try:
             do_chat(line)

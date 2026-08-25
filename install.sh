@@ -962,6 +962,11 @@ install_deps() {
     if [ "$_playwright_installed" = true ]; then
         log_info "Installing Playwright Chromium browser (~280 MB)..."
         _chromium_rc=0
+        # Match engine.py's _exec_browser default so the browser this step
+        # downloads is the one the runtime actually looks for - and so it
+        # lives inside $AGENT8088_HOME, where uninstall already cleans up
+        # rather than the OS-shared ms-playwright cache other tools may use.
+        export PLAYWRIGHT_BROWSERS_PATH="$AGENT8088_HOME/playwright-browsers"
         run_with_timeout "$T_CHROMIUM" "$_py" -m playwright install chromium \
             >/dev/null 2>&1 || _chromium_rc=$?
         if [ "$_chromium_rc" -eq 0 ]; then
