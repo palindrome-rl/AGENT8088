@@ -49,9 +49,9 @@ async def lifespan(app: FastAPI):
     # Same initialization the CLI does in main() before starting the REPL
     A.resolve_auto_search_provider()
     A.verify_sandbox_backend()
-    log.info("Agent8088 web server ready")
+    print(f"Agent8088 web server ready", flush=True)
     yield
-    log.info("Agent8088 web server shutting down")
+    print("Agent8088 web server shutting down", flush=True)
 
 
 app = FastAPI(title="Agent8088 Web Bridge", version="0.1.0", lifespan=lifespan)
@@ -944,5 +944,5 @@ def run_web_server(host: str = "127.0.0.1", port: int = 8180, dev: bool = False)
         # Try to mount the built frontend
         dist_dir = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
         _mount_static(app, dist_dir)
-    log.info(f"Agent8088 web UI on http://{host}:{port}")
+    print(f"Agent8088 web UI on http://{host}:{port}", flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning")
