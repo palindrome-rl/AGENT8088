@@ -350,6 +350,7 @@ def _save_preferences():
 
 
 def _active_skills():
+    A.set_disabled_skills(S.disabled_skills)
     return {name: skill for name, skill in A.SKILL_PACKAGES.items()
             if name not in S.disabled_skills}
 
@@ -364,6 +365,7 @@ def _active_tool_specs():
         allowed &= {
             "present_plan", "read_text", "calculate", "describe_capabilities",
             "git_status", "git_diff", "git_log", "last_output", "web_search",
+            "view_skill",
         }
     return {name: spec for name, spec in A.TOOL_SPECS.items() if name in allowed}
 
@@ -1971,6 +1973,7 @@ def cmd_help(_):
         ("/agents", "List available sub-agent profiles"),
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
         ("/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session"),
+        ("/cli-anything [task]", "Use CLI-Anything to find, run, build, refine, test, or validate an application CLI"),
         ("/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs"),
         ("/audit [on|off]", "Verify each step against the real files after it runs"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
@@ -2153,6 +2156,22 @@ def cmd_skills(rest):
                   "disabled" if name in S.disabled_skills else "active",
                   ", ".join(sorted(s["tools"])) or "—", s["description"])
     console.print(t)
+
+
+def cmd_cli_anything(rest):
+    task = (rest or "").strip()
+    if not task:
+        state = A.cli_anything.status(A.CONFIG_PATH)
+        label = (f"ready (CLI-Hub {state['version']})" if state["available"]
+                 else "available on demand; not set up yet")
+        console.print(f"[#237dd7]CLI-Anything:[/#237dd7] {label}")
+        console.print("[dim]usage: /cli-anything <task>[/dim]")
+        return
+    do_chat(
+        "Use the installed CLI-Anything skill for this task. Load its SKILL.md "
+        "first, preserve Agent8088's permissions and sandbox boundaries, and "
+        f"complete or clearly report blockers: {task}"
+    )
 
 
 def _read_key(fd):
@@ -2732,6 +2751,10 @@ def cmd_doctor(rest):
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}")
     t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
     t.add_row("Web search", "ok" if A.web_search._ddgs_installed() else "[red]ddgs broken - run /doctor --fix[/red]")
+    cli_state = A.cli_anything.status(A.CONFIG_PATH)
+    cli_label = (f"ready (CLI-Hub {cli_state['version']})" if cli_state["available"]
+                 else "available on demand")
+    t.add_row("CLI-Anything", cli_label)
     console.print(t)
 
     if fix:
@@ -2763,6 +2786,7 @@ def cmd_dump(_rest):
     active = _active_provider_name()
     provider = A.PROVIDERS.get(active, {})
     sandbox = A.sandbox_status()
+    cli_state = A.cli_anything.status(A.CONFIG_PATH)
 
     lines = [
         f"Agent8088 diagnostic dump — {__version__}",
@@ -2782,6 +2806,12 @@ def cmd_dump(_rest):
         f"Requested: {sandbox['requested']}",
         f"Resolved: {sandbox['resolved']} ({sandbox['verification']})",
         f"Detail: {sandbox['detail']}",
+        "",
+        "## CLI-Anything",
+        f"Available: {cli_state['available']}",
+        f"Version: {cli_state['version'] or 'not installed'}",
+        f"Expected version: {cli_state['expected_version']}",
+        f"Runtime path: {cli_state['root']}",
         "",
         "## Configuration",
         f"Config path: {A.CONFIG_PATH} (exists={A.CONFIG_PATH.exists()})",
@@ -3944,7 +3974,7 @@ COMMANDS = {
     "capabilities": cmd_capabilities,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,
     "audit": cmd_audit,
-    "skills": cmd_skills,
+    "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
     "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "search": cmd_search,

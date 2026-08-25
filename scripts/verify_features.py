@@ -60,7 +60,9 @@ check("system.md loaded (not the stub)", "Agent8088 Skill Document" in A.BASE_SY
 check("tool docs reach the prompt", "spawn_subagent(" in A.SYSTEM_PROMPT)
 check("new tools present",
       all(t in A.TOOL_NAMES for t in
-          ("git_status", "schedule_task", "run_sandboxed", "browse_page")))
+          ("git_status", "schedule_task", "run_sandboxed", "browse_page",
+           "view_skill", "cli_anything_status", "cli_anything_list",
+           "cli_anything_skill", "cli_anything_run")))
 
 # ------------------------------------------------------------- 2. SUBAGENTS
 section("2. SUBAGENTS")

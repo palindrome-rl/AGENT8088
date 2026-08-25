@@ -28,8 +28,15 @@ get_weather|Get the forecast for a city|mode=http_get|args=city|url=https://wttr
 
 Format: `name|description|key=value|key=value...`
 
-Available modes: `shell`, `http_get`, `read_text`, `write_text`, `python_eval`,
-`browser`, `docker`, `cron`, `subagent`, `plan`, `last_output`.
+Available package-tool modes: `shell`, `http_get`, `read_text`, `write_text`,
+`python_eval`, `browser`, `docker`, `cron`, `subagent`, `plan`, and
+`last_output`. The internal `skill` and `cli_anything` modes are reserved for
+Agent8088 core tools and cannot be used to bypass their resource and permission
+checks.
+
+Set `progressive: true` in SKILL.md frontmatter for a large skill. Only its
+name, description, and activation hint enter the initial prompt; the agent must
+load `SKILL.md` and permitted text resources through `view_skill` when needed.
 
 **Note:** `|` is the field separator — never use it inside a description.
 

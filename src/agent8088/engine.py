@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import documents, memory, web_search
+from agent8088 import cli_anything, documents, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -1284,10 +1284,6 @@ def grant_escalation(change_type: str = ""):
         _local_fallback_grant = False
         _pending_approval_key = ""
         return
-    if change_type == "local_execution":
-        _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
-        _pending_approval_key = ""
-        return
     _one_shot_grant = _pending_approval_key or True
     _pending_approval_key = ""
     _local_fallback_grant = False
@@ -2133,6 +2129,8 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
             "description": meta.get("description", default_tool_description(name)),
             "version": meta.get("version", "0"),
             "category": meta.get("category", "general"),
+            "progressive": str(meta.get("progressive", "false")).strip().lower()
+                           in {"1", "true", "yes", "on"},
             "path": str(pkg),
             "prose": body.strip(),
             "tools": tools,
@@ -2160,9 +2158,50 @@ def render_skill_docs(skills: dict) -> str:
     for name, skill in skills.items():
         prose = (skill.get("prose") or "").strip()
         lines.append(f"\n### {name}\n{skill['description']}")
-        if prose:
+        if skill.get("progressive"):
+            lines.append(
+                f"Load this skill only when it matches the user's request: call "
+                f"view_skill(name={name!r}, resource='SKILL.md')."
+            )
+        elif prose:
             lines.append(prose)
     return "\n".join(lines)
+
+
+_SKILL_RESOURCE_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml"}
+_MAX_SKILL_RESOURCE_BYTES = 512 * 1024
+DISABLED_SKILLS = set()
+
+
+def set_disabled_skills(names) -> None:
+    """Synchronize the active CLI session's disabled-skill boundary."""
+    global DISABLED_SKILLS
+    DISABLED_SKILLS = set(names or ()) & set(SKILL_PACKAGES)
+
+
+def read_skill_resource(name: str, resource: str) -> str:
+    """Read one installed skill resource without allowing path traversal."""
+    skill = SKILL_PACKAGES.get(str(name or "").strip())
+    if not skill:
+        raise ValueError(f"Unknown skill: {name or '(missing name)'}")
+    if skill["name"] in DISABLED_SKILLS:
+        raise ValueError(f"Skill is disabled for this session: {skill['name']}")
+    root = Path(skill["path"]).resolve(strict=True)
+    relative = str(resource or "SKILL.md").strip().replace("\\", "/")
+    if not relative or relative.startswith("/"):
+        raise ValueError("Skill resource must be a relative path.")
+    # Check containment before requiring the file to exist. Besides producing a
+    # clear refusal, this avoids leaking whether an escaped path exists.
+    target = (root / relative).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Skill resource path escapes the installed skill.") from exc
+    if not target.is_file() or target.suffix.lower() not in _SKILL_RESOURCE_SUFFIXES:
+        raise ValueError("Skill resource must be a supported text file.")
+    if target.stat().st_size > _MAX_SKILL_RESOURCE_BYTES:
+        raise ValueError("Skill resource is too large to load.")
+    return target.read_text(encoding="utf-8")
 
 
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
@@ -4752,6 +4791,114 @@ def _plan_mode_block_message() -> str:
             "call normally. Do not claim any of it is done before that happens.")
 
 
+def _run_cli_anything_tool(name: str, args: dict, timeout: int,
+                           approval_key: str, allow_plan: bool) -> str:
+    """Run the optional CLI-Anything adapter through Agent8088's policy layer."""
+    missing = next(
+        (param for param in TOOL_REQUIRED_PARAMS.get(name, []) if not args.get(param)),
+        None,
+    )
+    if missing:
+        return _tool_arg_missing_error(name, missing)
+    if name == "cli_anything_status":
+        return json.dumps(cli_anything.status(CONFIG_PATH, timeout=timeout), indent=2)
+
+    local_tools = {"cli_anything_skill"}
+    network_tools = {"cli_anything_list", "cli_anything_search", "cli_anything_info"}
+    mutation_tools = {
+        "cli_anything_setup", "cli_anything_install", "cli_anything_update",
+        "cli_anything_uninstall", "cli_anything_run",
+    }
+    if name not in local_tools | network_tools | mutation_tools:
+        return f"Unknown CLI-Anything tool: {name}"
+    if PERMISSION_MODE == "plan-only" and allow_plan and name not in local_tools:
+        return _plan_mode_block_message()
+
+    if name in local_tools:
+        display = f"{name}: {str(args.get('name') or '')[:100]}"
+        policy_mode = "read"
+    elif name in network_tools:
+        detail = (str(args.get("query") or args.get("name") or "").strip())[:160]
+        leak = _outbound_secret_check(detail) or _outbound_secret_check(
+            json.dumps(args, default=str))
+        if leak:
+            _audit("tool_call", tool=name, mode="browser", decision="denied",
+                   detail=detail, reason="outbound_secret")
+            return leak
+        if not check_permission("browser", cli_anything.CLI_HUB_REGISTRY,
+                                approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="browser",
+                   decision="blocked", detail=detail,
+                   change_type="network_request")
+            return request_escalation(
+                target_mode="edit",
+                paths=[cli_anything.CLI_HUB_REGISTRY],
+                change_type="network_request",
+                reason="Contact the official CLI-Anything catalog?",
+            )
+        blocked = _egress_check(cli_anything.CLI_HUB_REGISTRY) or _ssrf_check(
+            cli_anything.CLI_HUB_REGISTRY)
+        if blocked:
+            return blocked
+        policy_mode = "browser"
+        display = f"{name}: {detail}"
+    else:
+        if name == "cli_anything_run":
+            raw_cwd = str(args.get("cwd") or PROJECT_ROOT)
+            try:
+                cwd = Path(raw_cwd).expanduser().resolve(strict=True)
+            except OSError as exc:
+                return f"Error: Working directory is unavailable: {exc}"
+            if not cwd.is_dir():
+                return f"Error: Working directory does not exist: {cwd}"
+            zone = _check_path_zone(cwd)
+            if zone == "blocked":
+                return f"Error: CLI-Anything working directory is blocked: {cwd}"
+            args = dict(args)
+            args["cwd"] = str(cwd)
+        display = f"{name}: {str(args.get('name') or 'runtime')[:100]}"
+        if not check_permission("shell", display, host=True,
+                                approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="shell",
+                   decision="blocked", detail=display,
+                   change_type="local_execution")
+            return request_escalation(
+                target_mode="edit",
+                paths=[display],
+                change_type="local_execution",
+                reason=("Run this CLI-Anything operation on the host? "
+                        "It may install packages or change application files."),
+            )
+        policy_mode = "shell"
+
+    _audit("tool_call", tool=name, mode=policy_mode, decision="allowed",
+           detail=display[:200])
+    try:
+        if name == "cli_anything_skill":
+            result = cli_anything.installed_skill(
+                CONFIG_PATH, args.get("name"), timeout=timeout)
+        elif name == "cli_anything_setup":
+            result = cli_anything.setup(CONFIG_PATH, timeout=timeout)
+        elif name == "cli_anything_list":
+            result = cli_anything.list_clis(CONFIG_PATH, timeout=timeout)
+        elif name == "cli_anything_search":
+            result = cli_anything.search(CONFIG_PATH, args.get("query"), timeout=timeout)
+        elif name == "cli_anything_info":
+            result = cli_anything.info(CONFIG_PATH, args.get("name"), timeout=timeout)
+        elif name in {"cli_anything_install", "cli_anything_update", "cli_anything_uninstall"}:
+            action = name.removeprefix("cli_anything_")
+            result = cli_anything.manage(
+                CONFIG_PATH, action, args.get("name"), timeout=timeout)
+        else:
+            result = cli_anything.run(
+                CONFIG_PATH, args.get("name"), args.get("arguments"),
+                args.get("cwd") or PROJECT_ROOT, timeout=timeout)
+    except (OSError, RuntimeError, TypeError, ValueError,
+            subprocess.SubprocessError) as exc:
+        result = f"Error: {exc}"
+    return _wrap_untrusted(str(result), f"CLI-Anything operation: {name}")
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
@@ -4763,6 +4910,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
     approval_key = _tool_call_key(name, args)
+
+    if mode == "skill":
+        try:
+            return read_skill_resource(args.get("name", ""), args.get("resource", "SKILL.md"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            return f"Error: {exc}"
+
+    if mode == "cli_anything":
+        return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"
@@ -5401,9 +5557,18 @@ def _scan_json_object(text: str, start: int, limit: int = None) -> str:
     return text[start:limit]
 
 
+def _normalize_tool_markers(text: str) -> str:
+    text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
+    return re.sub(
+        r"✿(FUNCTION|ARGS)[^:\w\s]{0,3}\s*:",
+        lambda match: f"✿{match.group(1)}✿:",
+        text,
+    )
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
-    text = _outside_fenced_code(text)
+    text = _normalize_tool_markers(_outside_fenced_code(text))
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
     for m in re.finditer(r'✿(.*?)✿', text, re.DOTALL):
@@ -5498,6 +5663,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
 
 
 def strip_tool_json(text: str) -> str:
+    text = _normalize_tool_markers(text)
     parts = _MARKDOWN_FENCE_RE.split(text)
     for index in range(0, len(parts), 2):
         part = parts[index]
@@ -6502,6 +6668,10 @@ def describe_capabilities() -> str:
     # --- Skills and subagents ---
     lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
     lines += [f"- {s}" for s in sorted(SKILL_PACKAGES)] or ["- none installed"]
+    cli_state = cli_anything.status(CONFIG_PATH)
+    cli_detail = (f"ready (CLI-Hub {cli_state['version']})"
+                  if cli_state["available"] else "available on demand")
+    lines.append(f"- CLI-Anything runtime: {cli_detail}")
     lines.append("")
     lines.append(f"## Subagents ({len(SUBAGENT_SPECS)})")
     lines += [f"- {a}" for a in sorted(SUBAGENT_SPECS)] or ["- none configured"]
@@ -6698,9 +6868,12 @@ _TOOL_RESULT_PREFIX = "Tool result ("
 
 def _tool_result_for_model(name: str, result: str) -> str:
     """Keep ordinary tool context small while letting the auditor inspect files."""
-    limit = 12_000 if _active_role == "subagent:auditor" and name in {
-        "read_text", "last_output"
-    } else 3_000
+    if name == "cli_anything_skill":
+        limit = 32_000
+    elif _active_role == "subagent:auditor" and name in {"read_text", "last_output"}:
+        limit = 12_000
+    else:
+        limit = 3_000
     if len(result) <= limit:
         return result
     return (result[:limit]
@@ -6798,6 +6971,35 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
     return False
 
 
+CLI_ANYTHING_MIN_TURNS = 20
+CLI_ANYTHING_MAX_TURNS = 60
+CLI_ANYTHING_EXTENSION_TURNS = 5
+
+
+def _cli_anything_requested(messages: list[dict]) -> bool:
+    return any(
+        "cli-anything" in str(message.get("content") or "").casefold()
+        for message in messages
+        if message.get("role") == "user"
+    )
+
+
+def _execute_shell_forbidden(messages: list[dict]) -> bool:
+    return any(
+        re.search(r"\b(?:do not|don't|never)\s+(?:use|call)\s+execute_shell\b",
+                  str(message.get("content") or ""), re.IGNORECASE)
+        for message in messages
+        if message.get("role") == "user"
+        and not str(message.get("content") or "").startswith(_TOOL_RESULT_PREFIX)
+    )
+
+
+def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
+    """Give an explicit CLI-Anything task room for its install-and-run workflow."""
+    return (max(max_turns, CLI_ANYTHING_MIN_TURNS)
+            if _cli_anything_requested(messages) else max_turns)
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -6821,7 +7023,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     spin = spin or (lambda msg: nullcontext())
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
-    seen = set()      # (name, args) signatures already run -> breaks loops
+    last_completed = None  # consecutive identical call -> (signature, output)
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
@@ -6831,6 +7033,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     plan_mutation_retries = 0
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
+    forced_stop = False
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -6842,11 +7045,19 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": 0, "type": "preflight_refusal", "content": refusal})
         return refusal
 
-    for turn in range(max_turns):
+    turn_limit = _turn_limit_for_messages(messages, max_turns)
+    dynamic_cli = _cli_anything_requested(messages)
+    no_execute_shell = _execute_shell_forbidden(messages)
+    hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
+    for turn in range(hard_turn_limit):
+        if turn >= turn_limit:
+            break
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools
         )
+        if no_execute_shell:
+            round_allowed_tools.discard("execute_shell")
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
@@ -7055,16 +7266,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                      "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                     continue
 
-            if "__parse_error__" not in args and sig in seen:  # exact repeat -> feed cached output instead of re-running
-                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, _last_tool_output)}"
-                          if _last_tool_output else f"Already tried {name} with no output. Give your final answer now.")
+            # Only consecutive repeats are safe to cache. A matching read after
+            # another tool call may observe state that changed in between.
+            if ("__parse_error__" not in args and last_completed
+                    and sig == last_completed[0]):
+                previous_output = last_completed[1]
+                cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
+                          if previous_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
                 if turn_tools is not None:
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
 
-            if "__parse_error__" not in args:
-                seen.add(sig)
             # The user may have hit ESC while this response was still streaming.
             # Without a check here the tool they just cancelled runs anyway, and
             # the interrupt is only noticed at the top of the next turn — after
@@ -7088,7 +7301,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # a sub-run the text travels on as evidence the step failed.
             if _is_missing_argument_error(result) and missing_args_retries < 2:
                 missing_args_retries += 1
-                seen.discard(sig)
                 messages.append({"role": "user", "content": result})
                 if trace is not None:
                     trace.append({"turn": turn, "type": "missing_tool_args",
@@ -7104,19 +7316,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # pending approval was filed as a completed one, so the retry the
                 # user had just authorised was answered from the escalation text.
                 search_results[_search_signature(str(args.get("query") or ""))] = result
-                if not _search_was_usable(result):
-                    # An errored or empty search must stay retryable, and the
-                    # byte-exact `seen` guard above would otherwise block the
-                    # identical retry before the equivalence check runs. Same
-                    # discard the escalation path uses.
-                    seen.discard(sig)
             searched = searched or (name == "web_search" and _search_was_usable(result))
 
-            # A granted escalation retries the exact call once; remove it from the
-            # repeat guard before asking the UI for approval.
             blocked = result.startswith("ESCALATION_REQUEST\x1f")
-            if blocked:
-                seen.discard(sig)
 
             if on_result:
                 on_result(name, result)
@@ -7143,6 +7345,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Permission denied by the user. You remain in readonly mode. "
                     "Tell the user what you could not do and why the task cannot be completed."})
                 continue
+
+            if ("__parse_error__" not in args
+                    and not (name == "web_search" and not _search_was_usable(result))):
+                last_completed = (sig, result)
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}
@@ -7179,19 +7385,31 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed:
             forcing = False
+            if (dynamic_cli and turn + 1 == turn_limit
+                    and turn_limit < hard_turn_limit
+                    and tool_outputs and not _plan_step_failed(tool_outputs[-1])):
+                turn_limit = min(
+                    turn_limit + CLI_ANYTHING_EXTENSION_TURNS, hard_turn_limit
+                )
         elif forcing:
+            forced_stop = True
             break
         else:
             forcing = True
             messages.append({"role": "user", "content":
                 "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
 
-    # Max turns reached or forced stop: return the best answer we have.
-    fallback_source = "\n\n".join(tool_outputs) or _last_tool_output
-    fallback = _guard_answer(fallback_source[:3000] if fallback_source else "Could not complete the task.")
+    # Max turns reached or forced stop: report the failure, not the beginning of
+    # accumulated tool context (which is usually a skill document).
+    reason = ("stopped because repeated tool calls made no progress"
+              if forced_stop else f"reached the {turn_limit}-turn limit before completing the task")
+    latest = tool_outputs[-1] if tool_outputs else _last_tool_output
+    fallback = f"Error: Agent {reason}."
+    if latest:
+        fallback += f"\n\nLatest tool result:\n{latest[:2500]}"
+    fallback = _guard_answer(fallback)
     if on_answer:
         on_answer(fallback)
     if trace is not None:
-        trace.append({"turn": -1, "type": "max_turns",
-                      "content": _last_tool_output[:3000] if _last_tool_output else fallback})
+        trace.append({"turn": -1, "type": "max_turns", "content": fallback})
     return fallback

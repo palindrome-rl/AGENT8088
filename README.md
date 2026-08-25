@@ -33,7 +33,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 | **Work safely by default** | `readonly` is the default. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
 | **Delegate without losing context** | Five restricted sub-agent profiles handle exploration, research, coding, verification, and general-purpose work in separate runs. |
-| **Use tools without lock-in** | 21 built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
+| **Use tools without lock-in** | Built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, CLI-Anything, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
 | **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store. Nothing leaves your machine. |
 | **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
@@ -108,6 +108,7 @@ The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`
 | `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |
 | `/plan <task>` | Research, propose a plan, and wait for your approval before mutations. |
 | `/capabilities` | Show the live tool, MCP, sandbox, skill, sub-agent, and guardrail configuration. |
+| `/cli-anything <task>` | Find, install, run, build, refine, test, or validate an application CLI through the experimental CLI-Anything integration. |
 | `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
 | `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report. |
 
@@ -124,6 +125,27 @@ Agent8088 has three permission modes:
 | **`plan-only`** | Research and present a plan first; approved work then uses the regular permission path. |
 
 Some actions are blocked in every mode: credential paths, shell startup-file writes, destructive Git operations such as `push` and `reset --hard`, and system-prompt exfiltration. See the [security guide](docs/wiki/03-permissions-and-security.md) for the exact boundaries and configuration.
+
+### CLI-Anything integration *(experimental)*
+
+Agent8088 can use the [HKUDS CLI-Anything](https://github.com/HKUDS/CLI-Anything)
+ecosystem without turning it into a second agent. Agent8088 remains responsible
+for planning, permissions, sandboxing, and verification; application-specific
+`cli-anything-*` commands run as subordinate adapters.
+
+```text
+/cli-anything find an existing CLI for image editing
+/cli-anything use the GIMP harness to create a 1024x1024 project
+/cli-anything build a harness for ./my-application
+```
+
+The bundled skill is lazy-loaded. CLI-Hub itself is installed only after first
+use and approval, into an environment isolated from Agent8088's own Python
+packages. Automatic package management is initially restricted to reviewed
+Python harness entries; public npm, uv, bundled, and generic shell installers
+remain visible for manual review. After installing a harness, Agent8088 loads
+its packaged `SKILL.md` before execution so application-specific prerequisites
+and command guidance remain available without eagerly expanding the prompt.
 
 ---
 

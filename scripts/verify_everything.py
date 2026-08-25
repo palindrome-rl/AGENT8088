@@ -128,7 +128,7 @@ ok("skills loaded",
    {"documentation-writing", "documents", "github-code-review", "plan",
     "systematic-debugging", "test-driven-development",
     "github-pr-workflow", "grounded-citations", "document-to-action-items",
-    "spike", "humanizer", "simplify-code"} <= set(E.SKILL_PACKAGES),
+    "spike", "humanizer", "simplify-code", "cli-anything"} <= set(E.SKILL_PACKAGES),
    ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
@@ -311,6 +311,17 @@ expected_tools = {
     "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
     "browse_page": "browser",
+    "view_skill": "skill",
+    "cli_anything_status": "cli_anything",
+    "cli_anything_setup": "cli_anything",
+    "cli_anything_list": "cli_anything",
+    "cli_anything_search": "cli_anything",
+    "cli_anything_info": "cli_anything",
+    "cli_anything_install": "cli_anything",
+    "cli_anything_update": "cli_anything",
+    "cli_anything_uninstall": "cli_anything",
+    "cli_anything_skill": "cli_anything",
+    "cli_anything_run": "cli_anything",
     # Shares write_text with write_file deliberately: every guard keyed on that
     # mode then applies to it too, with no second gate to keep in sync.
     "create_document": "write_text",

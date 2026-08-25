@@ -80,3 +80,26 @@ def test_retry_after_length_cutoff_gets_a_bigger_budget(monkeypatch, engine):
     expected_retry_budget = min(engine.MAX_COMPLETION_TOKENS * 2, engine.CONTEXT_WINDOW)
     assert calls[1] == expected_retry_budget
     assert calls[1] > calls[0]
+
+
+def test_turn_limit_reports_error_and_latest_tool_result(monkeypatch, engine):
+    responses = iter((
+        '✿FUNCTION✿: read_text ✿ARGS✿: {"filename": "first"}',
+        '✿FUNCTION✿: read_text ✿ARGS✿: {"filename": "second"}',
+    ))
+    results = iter(("old skill text", "latest failure"))
+
+    def completion(*_args, **_kwargs):
+        return _stop_response(next(responses))
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    monkeypatch.setattr(engine, "exec_tool", lambda *_args, **_kwargs: next(results))
+
+    answer = engine.run_agent(
+        [{"role": "user", "content": "test"}], max_turns=2,
+        system_prompt="", tools_def=[], allowed_tools={"read_text"},
+    )
+
+    assert answer.startswith("Error: Agent reached the 2-turn limit")
+    assert "latest failure" in answer
+    assert "old skill text" not in answer

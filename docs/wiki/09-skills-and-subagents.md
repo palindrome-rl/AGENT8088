@@ -122,6 +122,12 @@ that get merged into the agent's context.
 Loaded skills appear in the system prompt under `## Installed skills`, and in
 `/status`.
 
+Large skills may declare `progressive: true`. Agent8088 initially advertises
+only their metadata and loads `SKILL.md` or a referenced text resource through
+the path-confined `view_skill` tool when the skill is relevant. This prevents a
+large methodology from consuming context on unrelated turns. Disabled skills
+cannot be loaded through that tool.
+
 ### Managing them
 
 ```
@@ -152,6 +158,24 @@ does not get to replace the real one. A directory without `SKILL.md` is skipped
 rather than erroring.
 
 ---
+
+### CLI-Anything
+
+The bundled experimental `cli-anything` skill connects Agent8088 to the HKUDS
+CLI-Anything methodology and catalog. It supports two paths:
+
+1. Discover and run an existing `cli-anything-*` application harness.
+2. Build, refine, test, or validate a new harness when the catalog has no match.
+
+For the first path, Agent8088 lists or searches the official catalog, installs
+one reviewed harness, then loads that package's own `SKILL.md` before invoking
+its structured one-shot command. Harness guidance and output are treated as
+untrusted reference content and cannot override Agent8088's permission layer.
+
+CLI-Hub is created lazily in `integrations/cli-anything` beside Agent8088's
+configuration, not in Agent8088's main virtual environment. Catalog access,
+package changes, harness execution, workspace writes, and host-application
+access continue through Agent8088's normal permission checks.
 
 ## SkillOpt
 
