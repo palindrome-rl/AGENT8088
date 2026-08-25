@@ -14,6 +14,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
                  [--update] [--force] [--setup] [--model-setup] [--sandbox-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
+                 [--web] [--web-port PORT] [--web-host HOST] [--web-dev]
 ```
 
 | Flag | Purpose |
@@ -31,6 +32,10 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mcp-http` | Use HTTP transport (with `--mcp-serve`) |
 | `--mcp-port PORT` | MCP HTTP port (default `8931`) |
 | `--mcp-host HOST` | MCP bind host (default `127.0.0.1`) |
+| `--web` | Launch the web UI instead of the terminal REPL |
+| `--web-port PORT` | Web UI server port (default `8180`) |
+| `--web-host HOST` | Web UI bind host (default `127.0.0.1`) |
+| `--web-dev` | Run the web backend without serving built frontend files; use with Vite |
 | `--update` | Pull latest code + reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove the install dir, shim, PATH/config lines, and crontab/scheduled-task entries, then exit. Trace logs and the WhatsApp session dir are kept unless `--workspace`/`--all` is also passed |
@@ -41,6 +46,44 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--dry-run` | With `--uninstall`: print what would be removed, remove nothing |
 
 Run with no flags for the interactive REPL.
+
+## Web UI
+
+The web UI is the browser interface to the same Agent8088 engine, sessions,
+tools, permissions, and configuration used by the CLI.
+
+### Production
+
+Build the frontend, then launch the server from the repository root:
+
+```sh
+cd web && npm install && npm run build
+cd ..
+agent8088 --web
+```
+
+Open `http://127.0.0.1:8180`.
+
+Use the web flags to change the server settings:
+
+```sh
+agent8088 --web --web-port 3000
+agent8088 --web --web-host 0.0.0.0
+```
+
+### Development
+
+Run the backend and Vite in separate terminals:
+
+```sh
+# Terminal 1
+PYTHONPATH=src python -m agent8088.cli --web --web-dev
+
+# Terminal 2
+cd web && npm run dev
+```
+
+Open `http://127.0.0.1:5180`. Vite proxies `/api` and `/ws` to the backend.
 
 ### What `--uninstall` does and doesn't remove
 
