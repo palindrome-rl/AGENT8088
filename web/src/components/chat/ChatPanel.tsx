@@ -70,16 +70,14 @@ export function ChatPanel() {
           </div>
         )}
 
-        {/* Streaming response with fade-in */}
+        {/* Streaming response with word-by-word reveal */}
         {isStreaming && streamingText && (
           <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
             <ThinkingTrace />
             {toolEvents.map((tool, i) => (
               <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
             ))}
-            <div className="stream-cursor text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200">
-              {streamingText}
-            </div>
+            <StreamingReveal text={streamingText} />
           </div>
         )}
         <ApprovalCard />
@@ -134,6 +132,35 @@ function PixelLoader({ theme }: { theme: string }) {
         {elapsed}
       </span>
     </div>
+  )
+}
+
+/** Beautiful UI streaming text — words resolve out of blur as they arrive */
+function StreamingReveal({ text }: { text: string }) {
+  const words = text.split(' ')
+
+  return (
+    <p className="text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200">
+      {words.map((word, i) => (
+        <span
+          key={i}
+          className="inline"
+          style={{
+            animation: i === words.length - 1
+              ? 'word-reveal 200ms ease-out both'
+              : 'word-reveal 200ms ease-out both',
+            filter: i === words.length - 1 ? 'blur(0px)' : 'none',
+          }}
+        >
+          {word}{' '}
+        </span>
+      ))}
+      {/* Blinking cursor while streaming */}
+      <span
+        className="ml-0.5 inline-block h-3.5 w-0.5 translate-y-0.5 rounded-full bg-brand-cyan"
+        style={{ animation: 'blink 1s step-end infinite' }}
+      />
+    </p>
   )
 }
 
