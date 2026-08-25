@@ -195,6 +195,54 @@ def test_an_explicit_telemetry_opt_in_is_respected(fake_browser_use, monkeypatch
     assert os.environ["ANONYMIZED_TELEMETRY"] == "true"
 
 
+def test_browser_use_logging_defaults_to_quiet(fake_browser_use, monkeypatch):
+    """browser-use's own step-by-step log (Eval/Memory/Next goal/...) prints
+    straight to the console, redundant with the properly-formatted answer
+    _run_browser_agent already returns - quiet by default, same as the main
+    loop's own hidden chain-of-thought."""
+    calls = []
+    monkeypatch.setattr(A, "_set_browser_use_log_verbosity", lambda verbose: calls.append(verbose))
+    monkeypatch.setattr(A, "SHOW_REASONING", False)
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    assert calls == [False]
+
+
+def test_browser_use_logging_follows_the_reasoning_toggle(fake_browser_use, monkeypatch):
+    """/reasoning on (aliased /think on) restores it - same toggle that
+    controls the main loop's own thinking display."""
+    calls = []
+    monkeypatch.setattr(A, "_set_browser_use_log_verbosity", lambda verbose: calls.append(verbose))
+    monkeypatch.setattr(A, "SHOW_REASONING", True)
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    assert calls == [True]
+
+
+def test_set_browser_use_log_verbosity_quiets_litellm_by_default():
+    import logging
+    logger = logging.getLogger("LiteLLM")
+    original_level = logger.level
+    try:
+        A._set_browser_use_log_verbosity(False)
+        assert logger.level == logging.WARNING
+    finally:
+        logger.setLevel(original_level)
+
+
+def test_set_browser_use_log_verbosity_restores_info_when_verbose():
+    import logging
+    logger = logging.getLogger("LiteLLM")
+    original_level = logger.level
+    try:
+        A._set_browser_use_log_verbosity(True)
+        assert logger.level == logging.INFO
+    finally:
+        logger.setLevel(original_level)
+
+
 def test_the_profile_is_built_from_the_security_kwargs(fake_browser_use):
     asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
 

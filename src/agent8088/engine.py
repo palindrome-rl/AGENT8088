@@ -3400,6 +3400,38 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "25"))
 BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "300"))
 
+# Mirrors cli.py's S.show_reasoning (toggled by /reasoning, aliased /think) -
+# see cmd_reasoning and Session.__init__. Kept as a plain engine.py global
+# rather than imported from cli.py so this module has no dependency on the
+# CLI (it must also work under --mcp-serve/--gateway, which don't use cli.py).
+SHOW_REASONING = False
+
+
+def _set_browser_use_log_verbosity(verbose: bool) -> None:
+    """browser-use's own step-by-step log (Eval/Memory/Next goal/...) and
+    litellm's "completion() model=..." lines print straight to the console,
+    bypassing agent8088's own tool-result display entirely - the actual
+    answer already reaches the user through _run_browser_agent's return
+    value, shown properly in the browse_page result. Quiet by default, same
+    as the main loop's own chain-of-thought; /reasoning on (or /think on)
+    restores it.
+
+    browser-use ships an explicit "result" logging level for exactly this
+    (BROWSER_USE_LOGGING_LEVEL=result config / setup_logging(log_level=...))
+    - force_setup=True bypasses its "only configure once per process" guard
+    so this reflects the *current* toggle state on every call, not just
+    whichever state was active the first time browse_page ever ran."""
+    from browser_use.logging_config import setup_logging as _browser_use_setup_logging
+
+    _browser_use_setup_logging(log_level="info" if verbose else "result", force_setup=True)
+    litellm_level = logging.INFO if verbose else logging.WARNING
+    logging.getLogger("LiteLLM").setLevel(litellm_level)
+    try:
+        import litellm
+        litellm.suppress_debug_info = not verbose
+    except Exception:
+        pass
+
 # Host patterns the browsing agent is forbidden from navigating to, enforced by
 # browser-use's own security watchdog *before* Chromium issues the request.
 #
@@ -3548,6 +3580,7 @@ async def _run_browser_agent(url: str, task: str) -> str:
     # in through the environment keeps their setting.
     os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
     os.environ.setdefault("BROWSER_USE_CLOUD_SYNC", "false")
+    _set_browser_use_log_verbosity(SHOW_REASONING)
 
     from browser_use import Agent, BrowserProfile
     from agent8088.browser_llm import build_browser_chat_model

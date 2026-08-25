@@ -220,6 +220,7 @@ class Session:
             self.max_turns = 10
         self.show_trace = config.get("show_trace", "0").lower() in {"1", "true", "on", "yes"}
         self.show_reasoning = config.get("show_reasoning", "0").lower() in {"1", "true", "on", "yes"}
+        A.SHOW_REASONING = self.show_reasoning
         self.last_trace = None
         self.conversation_trace = []
         self.trace_path = ""
@@ -3432,6 +3433,7 @@ def cmd_reasoning(rest):
         S.show_reasoning = False
     else:
         S.show_reasoning = not S.show_reasoning
+    A.SHOW_REASONING = S.show_reasoning
     state = "on" if S.show_reasoning else "off"
     note = "  [dim](secrets & system text are masked even when shown)[/dim]" if S.show_reasoning else ""
     console.print(f"reasoning display: [{'green' if S.show_reasoning else 'red'}]{state}[/]{note}")
