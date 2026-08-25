@@ -4,6 +4,8 @@ navigation - see docs/superpowers/specs/2026-08-25-browser-use-integration-desig
 section 4 for why this exists (browser-use has no page.route()-style hook)."""
 import http.client
 import socket
+import struct
+import time
 
 import pytest
 
@@ -76,6 +78,26 @@ def test_check_target_receives_a_url_shaped_string_for_connect():
     assert len(seen) == 1
     assert "example.com" in seen[0]
     assert "443" in seen[0]
+
+
+def test_a_client_reset_mid_request_is_not_logged_as_a_crash(capsys):
+    """Chromium routinely opens and abandons connections (speculative
+    preconnects, cancelled requests). A hard RST while the proxy is still
+    reading the request line used to print a full ConnectionResetError
+    traceback to stderr, which reads as a crash even though nothing failed -
+    forcing an RST (SO_LINGER with a zero timeout) reproduces exactly that."""
+    proxy_url, stop = start_ssrf_filtering_proxy(lambda url: None)
+    port = int(proxy_url.rsplit(":", 1)[1])
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()  # RST arrives at the proxy before any request line is sent
+        time.sleep(0.2)  # let the server thread observe and handle the reset
+    finally:
+        stop()
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "ConnectionResetError" not in captured.err
 
 
 def test_plain_http_get_to_blocked_target_is_refused():

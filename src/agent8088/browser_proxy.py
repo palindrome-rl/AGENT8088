@@ -117,6 +117,20 @@ class _SSRFFilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPSer
         super().__init__(("127.0.0.1", 0), _SSRFFilteringHandler)
         self.check_target = check_target
 
+    def handle_error(self, request, client_address):
+        # Chromium routinely opens and abandons connections (speculative
+        # preconnects, cancelled requests) - socketserver's default
+        # handle_error() prints the resulting ConnectionResetError/
+        # BrokenPipeError as a full traceback to stderr, which reads as a
+        # crash even though nothing actually failed. Suppress just those
+        # two expected, harmless cases; anything else still prints normally
+        # so a genuine bug in the proxy isn't silenced.
+        import sys
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, (ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
 
 def start_ssrf_filtering_proxy(
     check_target: Callable[[str], Optional[str]],
