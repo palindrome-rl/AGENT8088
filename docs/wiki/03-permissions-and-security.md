@@ -227,8 +227,24 @@ Matching is dot-anchored on the host: `example.com` covers `docs.example.com`
 but **not** `evilexample.com`.
 
 Enforced on every outbound path — `web_search`, `get_page_title`, `browse_page`,
-both HTTP tool modes, image URL fetches, **HTTP redirects**, and in-browser
-subresource requests.
+both HTTP tool modes, image URL fetches and **HTTP redirects**.
+
+`browse_page` is the one path where the guard is not a single function call, and
+it is worth knowing how it is enforced. The browsing session runs behind a local
+filtering proxy, and every request Chromium makes through that proxy — the first
+navigation, redirects, clicked links, form posts, and requests the page itself
+makes — runs the same domain and SSRF checks. Chromium refuses to send loopback
+and link-local targets through a proxy at all, so a second, independent layer
+sits in front of it: the browsing agent is forbidden outright from navigating to
+loopback, link-local, private, and other reserved addresses. Unless
+`ssrf_allow_hosts` or `ssrf_allow_private` is set, it also refuses to navigate
+to a bare IP address of any kind — that is what catches an internal address
+written in an obfuscated form (`http://2130706433/` is `127.0.0.1`); use a
+hostname for a public site. Remaining caveat: that second layer
+covers navigation, so a *subresource* request a page makes to another port on
+your own machine (`http://127.0.0.1:<port>/...`) is the one case neither layer
+catches. Set `ssrf_allow_hosts` deliberately, and treat pages you hand to
+`browse_page` as untrusted.
 
 The policy runs *before* the SSRF check, which is a DNS lookup. A host the policy
 already rejects is never resolved, so the attempt never reaches that domain's
@@ -413,6 +429,19 @@ token and cost estimates, finish reason, and sanitized error class/status.
 Prompts, model responses, tool arguments, paths, and credentials are excluded.
 Telemetry never sends data to a remote service and never interrupts an agent
 turn if its local file cannot be written.
+
+### Third-party telemetry in `browse_page`
+
+`browse_page` is built on the `browser-use` library, which ships anonymized
+telemetry **on by default** and posts task text, visited URLs, extracted page
+content and the model name to a third-party analytics endpoint on every run.
+That traffic comes from the library itself, so the egress policy, the SSRF
+check and the audit trail never see it. Agent8088 therefore sets
+`ANONYMIZED_TELEMETRY=false` and `BROWSER_USE_CLOUD_SYNC=false` before starting
+a browsing session. Both are `setdefault`s: export either variable yourself and
+your choice is kept. For the same reason, the browser extensions `browser-use`
+would otherwise download from Google's CRX endpoint and inject into every page
+are disabled.
 
 ## Content defense
 

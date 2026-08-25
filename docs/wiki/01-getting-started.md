@@ -52,12 +52,16 @@ Install the extras you actually need:
 | *(base)* | CLI, all 21 tools, MCP client and server, `browse_page`, keyless web search |
 | `gateway` | Slack, WhatsApp, Discord, Telegram and Email adapters |
 | `dev` | `pytest` for the test suite |
-| `litellm` | Only for a provider profile with `api_mode=litellm` |
+| `litellm` | Alias — `litellm` is already a base dependency |
 
-Playwright and `ddgs` are **base** dependencies, not extras — `browse_page` and
-the keyless search fallback should not depend on how someone installed. The
-`browser` and `search` extras still exist as aliases so older install commands
-keep working.
+Playwright, `browser-use`, `litellm` and `ddgs` are **base** dependencies, not
+extras — `browse_page` and the keyless search fallback should not depend on how
+someone installed. The `browser`, `search` and `litellm` extras still exist as
+aliases so older install commands keep working.
+
+`browser-use` (the interactive-browsing engine behind `browse_page`) needs
+Python 3.11 or newer, so it is skipped on a Python 3.10 install; everything else
+still installs and `browse_page` says so if you call it.
 
 > Without the `gateway` extra the Slack/Discord tests fail at import rather
 > than skipping — see [Troubleshooting](13-troubleshooting.md).

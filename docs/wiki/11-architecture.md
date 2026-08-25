@@ -225,13 +225,16 @@ and edit.
 ## Concurrency
 
 Mostly single-threaded and synchronous — deliberately, since it's an
-interactive tool. Two exceptions:
+interactive tool. Three exceptions:
 
 - **MCP client** runs an asyncio loop on a dedicated background thread, with a
   synchronous facade (`MCPRuntime`) over it, so the rest of the engine stays
   sync.
 - **Gateway** is async end to end (Slack Socket Mode, `discord.py`), calling
   into the sync engine from the adapter layer.
+- **`browse_page`** runs one `asyncio.run()` per call (the browsing library is
+  async-only) alongside a short-lived filtering proxy on its own background
+  thread. Both end with the tool call, so nothing async outlives it.
 
 ## Known architectural gaps
 
@@ -250,13 +253,8 @@ Honest list, for anyone extending this:
   than completing the task. This is a limitation of the underlying model's
   instruction-following, not of `browse_page` itself.
 
-This was discovered directly during this feature's own live testing:
-against a real configured provider, three of four end-to-end scenarios
-verified working correctly, but a fourth failed consistently because that
-specific model repeatedly returned markdown-fenced JSON that couldn't be
-parsed — a documented, out-of-scope model-compliance limitation rather
-than a `browse_page` defect (see the design spec's Open Questions section
-and the implementation plan's Global Constraints for the related
-`use_vision=False` requirement, which exists for the same class of reason:
-`browse_page` must degrade gracefully across whatever model a user has
-configured, not assume one particular model's capabilities).
+  For the same reason, `browse_page` never asks the model for a screenshot:
+  many providers Agent8088 supports are text-only, so vision is off
+  unconditionally rather than assuming one particular model's capabilities.
+  If a task stops early, try it again with a model that follows a strict
+  output format reliably.
