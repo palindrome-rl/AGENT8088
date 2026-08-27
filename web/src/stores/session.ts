@@ -20,8 +20,12 @@ interface SessionState {
     status: 'pending' | 'running' | 'done' | 'failed'
     result?: string
   }>
+  rawResult: { content: string; reasoning?: string; tool_calls?: unknown } | null
+  rawLoading: boolean
 
   setMessages: (messages: ChatMessage[]) => void
+  setRawResult: (result: SessionState['rawResult']) => void
+  setRawLoading: (loading: boolean) => void
   setSessionName: (name: string) => void
   clearChat: () => void
   addMessage: (message: ChatMessage) => void
@@ -45,8 +49,12 @@ export const useSessionStore = create<SessionState>((set) => ({
   streamingReasoning: [],
   toolEvents: [],
   planSteps: [],
+  rawResult: null,
+  rawLoading: false,
 
   setMessages: (messages) => set({ messages }),
+  setRawResult: (rawResult) => set({ rawResult }),
+  setRawLoading: (rawLoading) => set({ rawLoading }),
   setSessionName: (sessionName) => set({ sessionName }),
   clearChat: () => set({
     messages: [],

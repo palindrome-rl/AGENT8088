@@ -92,12 +92,57 @@ function wireSocket(ws: WebSocket) {
         void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
         break
       case 'command_result':
+        if (data.command.toLowerCase() === 'raw') {
+          // Parse the raw model call result (content, reasoning, tool_calls)
+          let parsed: { content: string; reasoning?: string; tool_calls?: unknown } | null = null
+          try {
+            const obj = typeof data.structured === 'string' ? JSON.parse(data.structured) : data.structured
+            if (obj && typeof obj === 'object') {
+              parsed = {
+                content: (obj as Record<string, unknown>).content as string ?? data.result,
+                reasoning: (obj as Record<string, unknown>).reasoning as string | undefined,
+                tool_calls: (obj as Record<string, unknown>).tool_calls,
+              }
+            }
+          } catch {
+            // structured isn't JSON — fall back to plain result text
+          }
+          if (!parsed) {
+            parsed = { content: data.result }
+          }
+          useSessionStore.getState().setRawResult(parsed)
+          useSessionStore.getState().setRawLoading(false)
+        }
         if (data.result.toLowerCase().startsWith('unknown command')) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
         }
-        if (['new', 'resume', 'reset', 'compact'].includes(data.command.toLowerCase())) {
+        // Display command output for commands that produce user-visible text
+        // (parity with CLI — every /command prints to console; the web UI
+        // should show that output in the chat). Skip 'raw' (handled above
+        // with structured parsing) and session ops (handled with notifications).
+        const cmd = data.command.toLowerCase()
+        const sessionOps = ['new', 'resume', 'reset', 'compact']
+        if (!sessionOps.includes(cmd) &&
+            !data.result.toLowerCase().startsWith('unknown command') &&
+            !data.result.toLowerCase().startsWith('error') &&
+            cmd !== 'raw' &&
+            data.result.trim().length > 0) {
+          addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+        }
+        if (sessionOps.includes(cmd)) {
           void syncSession()
           void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
+          // Show success notification for session operations (parity with CLI output)
+          if (!data.result.toLowerCase().startsWith('unknown command') &&
+              !data.result.toLowerCase().startsWith('error')) {
+            const notices: Record<string, string> = {
+              new: '✓ New session created',
+              resume: '✓ Session resumed',
+              reset: '✓ Session reset',
+              compact: '✓ Session compacted',
+            }
+            addMessage({ role: 'assistant', content: notices[cmd] ?? scrubMarkup(data.result) })
+          }
         }
         break
     }

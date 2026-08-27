@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Settings, Loader2, AlertCircle, ChevronDown, Check,
-  Sliders, Gauge, Shield, FileText, Server,
+  Sliders, Gauge, Shield, FileText, Server, Activity,
 } from 'lucide-react'
 import type { ConfigInfo, ProviderInfo } from '@/types/api'
 import { cn } from '@/lib/utils'
@@ -70,6 +70,16 @@ interface LimitsResponse {
   denial_breaker_threshold: number
   context_window: number
   max_completion_tokens: number
+}
+
+interface SandboxResponse {
+  resolved: string
+  verification: string
+  detail?: string
+}
+
+interface CapabilitiesResponse {
+  report: string
 }
 
 // ---- Section wrapper ----
@@ -481,6 +491,66 @@ function AuditToggle({ onToggle, toggling }: { onToggle: (enable: boolean) => vo
   )
 }
 
+// ---- Sandbox Panel ----
+
+function SandboxPanel({ sandbox, onSetMode, setting }: {
+  sandbox: SandboxResponse | undefined
+  onSetMode: (mode: string) => void
+  setting: boolean
+}) {
+  const modes = ['auto', 'native', 'docker', 'local'] as const
+  const resolved = sandbox?.resolved ?? '—'
+  const verification = sandbox?.verification ?? ''
+  const healthy = verification === 'ok' || verification === 'verified'
+
+  return (
+    <div className="space-y-4">
+      {/* Current backend with health indicator */}
+      <div className="flex items-center gap-2 rounded-lg border border-brand-border/30 bg-brand-primary/5 px-3 py-2.5">
+        <span
+          className={cn(
+            'h-2.5 w-2.5 rounded-full',
+            healthy ? 'bg-green-500' : verification === 'error' || verification === 'failed' ? 'bg-red-500' : 'bg-yellow-500',
+          )}
+        />
+        <span className="text-sm text-zinc-400">Backend:</span>
+        <span className="font-mono text-sm text-brand-cyan">{resolved}</span>
+        {verification && (
+          <span className={cn(
+            'ml-auto text-xs',
+            healthy ? 'text-green-400' : verification === 'error' || verification === 'failed' ? 'text-red-400' : 'text-yellow-400',
+          )}>
+            {verification}
+          </span>
+        )}
+      </div>
+
+      {sandbox?.detail && (
+        <p className="text-xs text-zinc-500">{sandbox.detail}</p>
+      )}
+
+      {/* Mode buttons */}
+      <div className="flex gap-2">
+        {modes.map((m) => (
+          <button
+            key={m}
+            onClick={() => onSetMode(m)}
+            disabled={setting}
+            className={cn(
+              'flex-1 rounded-lg border px-3 py-2 text-sm font-medium transition-colors disabled:opacity-40',
+              resolved === m || resolved === `sandbox:${m}`
+                ? 'border-brand-primary/50 bg-brand-primary/15 text-brand-cyan'
+                : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:border-zinc-700',
+            )}
+          >
+            {m}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ---- Provider Card ----
 
 function ProviderCard({ name, info }: { name: string; info: ProviderInfo }) {
@@ -553,6 +623,23 @@ export default function ConfigPage() {
   // Audit
   const auditMutation = useMutation({
     mutationFn: (enable: boolean) => postJSON<ActionResponse>('/api/audit', { enable }),
+  })
+
+  // Sandbox
+  const sandboxQuery = useQuery({
+    queryKey: ['sandbox'],
+    queryFn: () => fetchJSON<SandboxResponse>('/api/sandbox'),
+  })
+
+  const sandboxMutation = useMutation({
+    mutationFn: (mode: string) => postJSON<ActionResponse>('/api/sandbox', { mode }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sandbox'] }),
+  })
+
+  // Capabilities
+  const capabilitiesQuery = useQuery({
+    queryKey: ['capabilities'],
+    queryFn: () => fetchJSON<CapabilitiesResponse>('/api/capabilities'),
   })
 
   return (
@@ -636,6 +723,31 @@ export default function ConfigPage() {
               <p className="mt-2 text-xs text-green-400">✓ Updated</p>
             )}
           </Section>
+
+          {/* Sandbox */}
+          <Section icon={Shield} title="Sandbox" subtitle="Execution isolation backend">
+            {sandboxQuery.isLoading ? (
+              <div className="flex items-center gap-2 text-sm text-zinc-400">
+                <Loader2 className="h-4 w-4 animate-spin text-brand-cyan" /> Loading sandbox…
+              </div>
+            ) : sandboxQuery.isError ? (
+              <div className="flex items-center gap-2 text-sm text-red-400">
+                <AlertCircle className="h-4 w-4" /> Failed to load sandbox
+              </div>
+            ) : (
+              <SandboxPanel
+                sandbox={sandboxQuery.data}
+                onSetMode={(mode) => sandboxMutation.mutate(mode)}
+                setting={sandboxMutation.isPending}
+              />
+            )}
+            {sandboxMutation.data?.error && (
+              <p className="mt-2 text-xs text-red-400">{sandboxMutation.data.error}</p>
+            )}
+            {sandboxMutation.data?.ok && (
+              <p className="mt-2 text-xs text-green-400">✓ Sandbox mode: {sandboxMutation.data.mode}</p>
+            )}
+          </Section>
         </div>
 
         {/* Right column */}
@@ -705,6 +817,23 @@ export default function ConfigPage() {
           </div>
         </Section>
       )}
+
+      {/* Capabilities */}
+      <Section icon={Activity} title="Capabilities" subtitle="Runtime capability report">
+        {capabilitiesQuery.isLoading ? (
+          <div className="flex items-center gap-2 text-sm text-zinc-400">
+            <Loader2 className="h-4 w-4 animate-spin text-brand-cyan" /> Loading capabilities…
+          </div>
+        ) : capabilitiesQuery.isError ? (
+          <div className="flex items-center gap-2 text-sm text-red-400">
+            <AlertCircle className="h-4 w-4" /> Failed to load capabilities
+          </div>
+        ) : (
+          <pre className="max-h-96 overflow-auto rounded-lg border border-zinc-800 bg-zinc-950 p-4 text-xs text-zinc-300 whitespace-pre-wrap break-words font-mono">
+            {capabilitiesQuery.data?.report}
+          </pre>
+        )}
+      </Section>
     </div>
   )
 }

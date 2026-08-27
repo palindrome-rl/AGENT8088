@@ -1,16 +1,17 @@
 import { useRef, useEffect, useState } from 'react'
 import { useSessionStore } from '@/stores/session'
+import { useUIStore } from '@/stores/ui'
 import { MessageBubble } from './MessageBubble'
 import { ToolChip } from './ToolChip'
 import { ThinkingTrace } from './ThinkingTrace'
 import { ApprovalCard } from './ApprovalCard'
 import { PromptBar } from './PromptBar'
-import { useUIStore } from '@/stores/ui'
+import { RawPanel } from './RawPanel'
 import { scrubMarkup } from '@/lib/scrub'
 
 export function ChatPanel() {
   const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
-  const { theme } = useUIStore()
+  const { theme, rawPanelOpen } = useUIStore()
   const scrollRef = useRef<HTMLDivElement>(null)
   const [showLoader, setShowLoader] = useState(false)
 
@@ -83,6 +84,7 @@ export function ChatPanel() {
         )}
         <ApprovalCard />
       </div>
+      {rawPanelOpen && <RawPanel />}
       <PromptBar />
     </div>
   )

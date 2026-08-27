@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Send, Square, Plus, Mic } from 'lucide-react'
+import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
+import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
+import { ImageUpload } from './ImageUpload'
 
 /* ─────────────────────────────────────────────────────────
  * PROMPT BAR — Beautiful UI style
@@ -13,11 +15,12 @@ import { cn } from '@/lib/utils'
 
 /* Mirrors backend COMMANDS (cli.py) — interactive-only commands (exit/quit/
  * stop/approve/deny) are excluded: they either terminate the REPL or expect
- * stdin the web UI doesn't have. */
+ * stdin the web UI doesn't have. 'search' is excluded — it's not a real CLI
+ * command (web search is a tool, not a slash command). */
 const COMMANDS = [
   'help', 'tools', 'tool', 'capabilities', 'agents', 'agent', 'plan', 'image',
   'paste', 'audit', 'skills', 'cli-anything', 'raw', 'model', 'models', 'mcp',
-  'config', 'status', 'doctor', 'dump', 'sandbox', 'mode', 'search',
+  'config', 'status', 'doctor', 'dump', 'sandbox', 'mode',
   'new', 'sessions', 'resume', 'reset', 'compact',
   'history', 'trace', 'reasoning', 'think', 'verbose', 'usage', 'temp',
   'maxturns', 'limits', 'save', 'clear', 'memory',
@@ -41,6 +44,8 @@ export function PromptBar() {
   const [text, setText] = useState('')
   const [dismissed, setDismissed] = useState(false)
   const [plusOpen, setPlusOpen] = useState(false)
+  const [showImageUpload, setShowImageUpload] = useState(false)
+  const [pasteImage, setPasteImage] = useState<string | null>(null)
   const [listening, setListening] = useState(false)
   const [expanded, setExpanded] = useState(false)
   const [sessionError, setSessionError] = useState('')
@@ -49,6 +54,7 @@ export function PromptBar() {
   const controlsRef = useRef<HTMLDivElement>(null)
   const { isStreaming, sessionName, addMessage, setSessionName } = useSessionStore()
   const { send: wsSend } = useWebSocket()
+  const { rawPanelOpen, toggleRawPanel } = useUIStore()
   const queryClient = useQueryClient()
 
   const token = dismissed ? null : parseToken(text)
@@ -130,6 +136,8 @@ export function PromptBar() {
     setText('')
     setDismissed(false)
     setPlusOpen(false)
+    setShowImageUpload(false)
+    setPasteImage(null)
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -211,22 +219,25 @@ export function PromptBar() {
             Sources
           </div>
           <div className="p-1">
-            {['Web search', 'Memory recall'].map((src, i) => (
+            {[
+              { label: 'Web search', Icon: Plus, action: () => { setText('/search '); inputRef.current?.focus() } },
+              { label: 'Memory recall', Icon: Plus, action: () => { setText('/memory '); inputRef.current?.focus() } },
+              { label: 'Image analysis', Icon: ImagePlus, action: () => { setShowImageUpload(true) } },
+            ].map(({ label, Icon, action }, i) => (
               <button
-                key={src}
+                key={label}
                 type="button"
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => {
-                  setText(src === 'Web search' ? '/search ' : '/memory ')
+                  action()
                   setDismissed(true)
                   setPlusOpen(false)
-                  inputRef.current?.focus()
                 }}
                 className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50"
                 style={{ animation: `fade-up 200ms cubic-bezier(0.23,1,0.32,1) ${i * 60}ms both` }}
               >
-                <Plus className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="text-[12.5px] font-medium text-zinc-700 dark:text-zinc-200">{src}</span>
+                <Icon className="h-3.5 w-3.5 text-zinc-400" />
+                <span className="text-[12.5px] font-medium text-zinc-700 dark:text-zinc-200">{label}</span>
               </button>
             ))}
           </div>
@@ -235,6 +246,13 @@ export function PromptBar() {
 
       {/* ── composer ───────────────────────────────────── */}
       <div className="mx-auto w-full max-w-2xl">
+        {/* ── image upload panel ──────────────────────── */}
+        {showImageUpload && (
+          <ImageUpload
+            initialImage={pasteImage}
+            onClose={() => { setShowImageUpload(false); setPasteImage(null) }}
+          />
+        )}
         <div
           className={cn(
             'relative flex flex-col overflow-hidden border bg-white dark:bg-zinc-900/50 transition-[border-color] duration-150',
@@ -288,6 +306,56 @@ export function PromptBar() {
 
             {/* Controls row */}
             <div className={cn('flex items-center gap-1', expanded ? 'w-full justify-end' : 'shrink-0')}>
+              {/* Raw model call toggle */}
+              <button
+                type="button"
+                aria-label="Raw model call"
+                aria-expanded={rawPanelOpen}
+                title="Raw model call"
+                onClick={toggleRawPanel}
+                className={cn(
+                  'flex h-7 w-7 items-center justify-center rounded-lg transition-all active:scale-95',
+                  rawPanelOpen
+                    ? 'bg-brand-primary/15 text-brand-cyan'
+                    : 'text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200',
+                )}
+              >
+                <Terminal className="h-4 w-4" />
+              </button>
+
+              {/* Paste image from clipboard */}
+              <button
+                type="button"
+                aria-label="Paste image from clipboard"
+                onClick={async () => {
+                  try {
+                    const items = await navigator.clipboard.read()
+                    for (const item of items) {
+                      for (const type of item.types) {
+                        if (type.startsWith('image/')) {
+                          const blob = await item.getType(type)
+                          const reader = new FileReader()
+                          reader.onload = () => {
+                            setPasteImage(reader.result as string)
+                            setShowImageUpload(true)
+                          }
+                          reader.readAsDataURL(blob)
+                          return
+                        }
+                      }
+                    }
+                    // No image in clipboard — open panel for manual paste
+                    setShowImageUpload(true)
+                  } catch {
+                    // Clipboard API unavailable — open panel for manual paste
+                    setShowImageUpload(true)
+                  }
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-lg text-zinc-400 transition-all hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200 active:scale-95"
+              >
+                <Clipboard className="h-4 w-4" />
+              </button>
+
               {/* Dictation */}
               <button
                 type="button"

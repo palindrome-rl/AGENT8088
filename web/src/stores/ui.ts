@@ -19,6 +19,7 @@ interface UIState {
     id: string
     plan: string
   } | null
+  rawPanelOpen: boolean
 
   toggleSidebar: () => void
   setCommandPaletteOpen: (open: boolean) => void
@@ -26,6 +27,8 @@ interface UIState {
   setTheme: (theme: Theme) => void
   setApprovalPending: (approval: UIState['approvalPending']) => void
   setPlanApprovalPending: (plan: UIState['planApprovalPending']) => void
+  toggleRawPanel: () => void
+  setRawPanelOpen: (open: boolean) => void
 }
 
 export const useUIStore = create<UIState>((set) => ({
@@ -34,6 +37,7 @@ export const useUIStore = create<UIState>((set) => ({
   theme: initialTheme,
   approvalPending: null,
   planApprovalPending: null,
+  rawPanelOpen: false,
 
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setCommandPaletteOpen: (open) => set({ commandPaletteOpen: open }),
@@ -48,4 +52,6 @@ export const useUIStore = create<UIState>((set) => ({
   },
   setApprovalPending: (approval) => set({ approvalPending: approval }),
   setPlanApprovalPending: (plan) => set({ planApprovalPending: plan }),
+  toggleRawPanel: () => set((s) => ({ rawPanelOpen: !s.rawPanelOpen })),
+  setRawPanelOpen: (open) => set({ rawPanelOpen: open }),
 }))
