@@ -1736,9 +1736,19 @@ def _native_tool_text(message) -> str:
             continue
         arguments = getattr(function, "arguments", None) or "{}"
         try:
-            arguments = json.dumps(json.loads(arguments))
-        except (TypeError, json.JSONDecodeError):
-            arguments = "{}"
+            # The tolerant loader, not plain json.loads: a provider that sends
+            # a literal newline inside an argument value (common when the value
+            # is code or a long task description) is emitting technically
+            # invalid JSON that is still perfectly recoverable.
+            arguments = json.dumps(_loads_tool_args(arguments))
+        except Exception:
+            # Pass the raw blob through rather than substituting "{}". Both
+            # ✿ARGS✿ paths in find_tool_calls turn unparseable arguments into
+            # an explicit __parse_error__, whereas "{}" would look like the
+            # model sent no arguments at all — making the tool report a
+            # required field as missing and blame the model for an omission
+            # that never happened.
+            arguments = str(arguments)
         lines.append(f"✿FUNCTION✿: {function.name} ✿ARGS✿: {arguments}")
     return "\n".join(lines)
 
@@ -5895,8 +5905,48 @@ def _normalize_tool_markers(text: str) -> str:
     )
 
 
+# Only whitespace and an opening code fence may sit between a bare ✿FUNCTION✿
+# line and the argument object it belongs to. Deliberately strict: scanning
+# past arbitrary prose would let an unrelated JSON object elsewhere in the
+# reply be adopted as this call's arguments, which is a worse failure than
+# reporting the arguments missing.
+_ARGS_AFTER_FUNCTION_RE = re.compile(r"\s*(?:`{3,}[^\n]*\n\s*)?\{")
+
+
+def _args_after_function_marker(text: str, name: str):
+    """Recover the argument object for a ✿FUNCTION✿ line that has no ✿ARGS✿.
+
+    Models routinely put the arguments in a following ```json fence instead of
+    after an ✿ARGS✿ marker (observed live from glm-5.2 via Ollama Cloud), and
+    find_tool_calls works on fence-stripped text so a documentation example
+    cannot execute itself — which discarded exactly those arguments and left a
+    bare tool name. The tool then reported its required argument as missing,
+    blaming the model for omitting what it had in fact supplied, on every
+    retry. `text` here is the ORIGINAL reply with fences intact; this is only
+    ever reached once a ✿FUNCTION✿ marker was already found OUTSIDE a fence,
+    so a fully fenced example still never becomes a call.
+    """
+    marker = re.search(r"✿FUNCTION✿\s*:\s*" + re.escape(name), text)
+    if not marker:
+        return {}
+    opener = _ARGS_AFTER_FUNCTION_RE.match(text, marker.end())
+    if not opener:
+        return {}  # genuinely no arguments — the tool's own error is honest
+    raw_args = _scan_json_object(text, opener.end() - 1)
+    try:
+        return _loads_tool_args(raw_args)
+    except Exception:
+        # An argument object was clearly intended but is broken. Same reason
+        # as the ✿ARGS✿ path: flag the parse failure rather than let it look
+        # like the model passed nothing.
+        return {"__parse_error__": raw_args[:400]}
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
+    # Kept with fences intact for _args_after_function_marker: arguments the
+    # model put in a ```json fence are invisible in the stripped text below.
+    unstripped = _normalize_tool_markers(text)
     text = _normalize_tool_markers(_outside_fenced_code(text))
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
@@ -5947,20 +5997,35 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 if resolved in allowed:
                     calls.append({"name": resolved,
                                   "arguments": {"__parse_error__": loose.group(2).strip()[:400]}})
-        if not calls and "✿ARGS✿" not in text:  # loose ✿FUNCTION✿ line, genuinely no args
+        # A loose ✿FUNCTION✿ line with no ✿ARGS✿ marker. "No marker" is NOT
+        # proof the model passed no arguments — it may have put them in a
+        # following fence or on the next line bare, so look for the object
+        # before concluding they are missing (see _args_after_function_marker).
+        if not calls and "✿ARGS✿" not in text:
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
                 resolved = _resolve_tool_name(m2.group(1))
                 if resolved in allowed:
-                    calls.append({"name": resolved, "arguments": {}})
+                    calls.append({
+                        "name": resolved,
+                        "arguments": _args_after_function_marker(unstripped, m2.group(1)),
+                    })
     # 3) bare JSON {"name": "...", "arguments": {...}}
+    # The arguments object's extent is found by counting braces, for the same
+    # reason the ✿ARGS✿ branch above does it: a non-greedy `(\{.*?\})` stops at
+    # the first '}' and truncates any nested object, which made the whole call
+    # unparseable and silently dropped it. MCP tools declare their own
+    # parameter schemas and can legitimately take nested objects.
     if not calls:
-        for m in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
+        for m in re.finditer(
+                r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(?=\{)', text, re.DOTALL):
+            resolved = _resolve_tool_name(m.group(1))
+            if resolved not in allowed:
+                continue
             try:
-                resolved = _resolve_tool_name(m.group(1))
-                if resolved in allowed:
-                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
-                    break
+                calls.append({"name": resolved,
+                              "arguments": _loads_tool_args(_scan_json_object(text, m.end()))})
+                break
             except Exception:
                 pass
     # 4) tool name followed by an inline {"command": "..."}
