@@ -115,7 +115,9 @@ async def invoke_tool(name: str, body: dict = None):
     """Execute a single tool directly (parity with /tool <name> <args>)."""
     A = _eng()
     args = body or {}
-    result = A.run_tool(name, args)
+    # run_tool can take minutes (shell, docker, browser) — keep it off the loop.
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: A.run_tool(name, args))
     return {"name": name, "result": result}
 
 
@@ -177,7 +179,9 @@ async def run_agent(name: str, body: dict = None):
     """Launch a sub-agent (parity with /agent <name> <task>)."""
     A = _eng()
     task = (body or {}).get("task", "")
-    result = A.run_tool("spawn_subagent", {"agent_type": name, "task": task})
+    # Sub-agents run multi-turn conversations — must not block the event loop.
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: A.run_tool("spawn_subagent", {"agent_type": name, "task": task}))
     return {"agent": name, "result": result}
 
 
@@ -377,9 +381,13 @@ async def compact_session(body: SessionActionBody):
     )
     A = _eng()
     try:
-        summary = A.run_agent(
-            [{"role": "user", "content": summary_prompt}],
-            max_turns=1, temperature=0.0,
+        # The summarization turn is a full model call — keep it off the loop.
+        summary = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: A.run_agent(
+                [{"role": "user", "content": summary_prompt}],
+                max_turns=1, temperature=0.0,
+            ),
         )
         C.S.messages[:] = [{"role": "assistant", "content": f"[Compacted summary]\n{summary}"}] + recent
         C._save_active_session()
@@ -964,18 +972,24 @@ async def _handle_command(ws: WebSocket, msg: dict, C):
         return
     try:
         # Capture console output — cmd_* functions print to Rich console.
-        # For the web UI, we redirect to capture their text output.
+        # Run the handler off the event loop: some commands (doctor, dump,
+        # mcp) probe the network or shell and can take seconds.
         import io
         from rich.console import Console as RichConsole
-        buf = io.StringIO()
-        temp_console = RichConsole(file=buf, force_terminal=False, no_color=True, width=120)
-        original_console = C.console
-        C.console = temp_console
-        try:
-            handler(args)
-        finally:
-            C.console = original_console
-        output = buf.getvalue()
+        loop = asyncio.get_running_loop()
+
+        def _exec_command():
+            buf = io.StringIO()
+            temp_console = RichConsole(file=buf, force_terminal=False, no_color=True, width=120)
+            original_console = C.console
+            C.console = temp_console
+            try:
+                handler(args)
+            finally:
+                C.console = original_console
+            return buf.getvalue()
+
+        output = await loop.run_in_executor(None, _exec_command)
         await ws.send_json({"type": "command_result", "command": command,
                             "result": output})
     except Exception as exc:
