@@ -143,6 +143,23 @@ body {
   50% { transform: scaleY(1); }
 }
 
+/* Beautiful UI — primitive card padding & footer */
+.primitive-card-pad {
+  padding: 14px 16px 12px;
+}
+.primitive-card-footer {
+  padding: 10px 14px;
+  border-top: 1px solid var(--line, rgba(39, 39, 42, 0.5));
+}
+.primitive-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  padding: 4px;
+  transition: background-color 100ms ease, color 100ms ease;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
