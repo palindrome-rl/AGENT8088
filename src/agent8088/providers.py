@@ -17,7 +17,7 @@ BUILTIN_PROVIDERS = {
     "moonshot":     {"label": "Moonshot (Kimi)", "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY", "default_model": "kimi-k2.6"},
     "qwen":         {"label": "Qwen (DashScope)", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key_env": "DASHSCOPE_API_KEY", "default_model": "qwen-plus"},
     "ollama-cloud": {"label": "Ollama Cloud", "base_url": "https://ollama.com/v1", "api_key_env": "OLLAMA_API_KEY", "default_model": "gpt-oss:120b"},
-    "copilot":      {"label": "GitHub Models (retired Jul 2026)", "base_url": "https://api.githubcopilot.com", "api_key_env": "GH_TOKEN", "default_model": "gpt-4o-mini"},
+    "anthropic":    {"label": "Anthropic (Claude)", "base_url": "https://api.anthropic.com/v1/", "api_key_env": "ANTHROPIC_API_KEY", "default_model": "claude-sonnet-4-6"},
 }
 for _name, _provider in BUILTIN_PROVIDERS.items():
     _provider["native_tools"] = _name != "ollama"
@@ -36,7 +36,7 @@ FALLBACK_MODELS = {
     "moonshot":     ["kimi-k2.6", "moonshot-v1-8k", "moonshot-v1-32k"],
     "qwen":         ["qwen-plus", "qwen-max", "qwen-turbo"],
     "ollama-cloud": ["gpt-oss:120b", "qwen3:14b", "llama3.3"],
-    "copilot":      ["gpt-4o-mini", "gpt-4o", "claude-sonnet-4"],  # endpoint retired Jul 2026
+    "anthropic":    ["claude-sonnet-4-6", "claude-opus-5", "claude-haiku-3.5"],
 }
 
 # OpenAI-compatible /v1/models responses normally expose only an id, owner and
@@ -216,6 +216,24 @@ def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL
                 out = data.get("outputTokenLimit")
                 if ctx:
                     return int(ctx), int(out) if out else None
+        except Exception:
+            pass
+
+    # Strategy 2b: Anthropic Models API (returns max_input_tokens + max_tokens)
+    if provider_name == "anthropic" or "anthropic.com" in base_url:
+        try:
+            import httpx
+            r = httpx.get(f"{base_url}/models", headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }, timeout=timeout)
+            if r.status_code == 200:
+                for m in r.json().get("data", []):
+                    if m.get("id") == model_id:
+                        ctx = m.get("max_input_tokens")
+                        out = m.get("max_tokens")
+                        if ctx:
+                            return int(ctx), int(out) if out else None
         except Exception:
             pass
 
