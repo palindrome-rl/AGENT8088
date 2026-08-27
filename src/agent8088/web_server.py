@@ -741,23 +741,45 @@ async def websocket_endpoint(ws: WebSocket):
                 # use a threading.Event shared with the agent thread.
                 _interrupt_event.set()
             elif msg_type == "approval":
-                _pending_approval["approved"] = msg.get("approved", False)
-                _pending_approval["session_scope"] = msg.get("session_scope", False)
-                _pending_approval["event"].set()
+                esc_id = msg.get("id", "")
+                entry = _pending_approvals.get(esc_id)
+                if entry is not None:
+                    entry["approved"] = msg.get("approved", False)
+                    entry["session_scope"] = msg.get("session_scope", False)
+                    entry["event"].set()
             elif msg_type == "plan_approval":
-                _pending_plan_approval["mode"] = msg.get("mode", "")
-                _pending_plan_approval["event"].set()
+                plan_id = msg.get("id", "")
+                entry = _pending_plan_approvals.get(plan_id)
+                if entry is not None:
+                    entry["mode"] = msg.get("mode", "")
+                    entry["event"].set()
     except WebSocketDisconnect:
         manager.disconnect(ws)
+        _fail_pending_waits()
     except Exception as exc:
         log.error("WebSocket error: %s", exc)
         manager.disconnect(ws)
+        _fail_pending_waits()
 
 
 # --- Shared state for interrupt + approval flows (engine runs in a thread) ---
+# Approvals are keyed by escalation id so a timed-out or superseded prompt can
+# never read the verdict meant for a different escalation.
+_pending_approvals: dict = {}
+_pending_plan_approvals: dict = {}
 _interrupt_event = threading.Event()
-_pending_approval: dict = {"event": threading.Event(), "approved": False, "session_scope": False}
-_pending_plan_approval: dict = {"event": threading.Event(), "mode": ""}
+
+
+def _fail_pending_waits():
+    """On WS disconnect, release every waiting escalation/plan prompt as denied."""
+    for entry in _pending_approvals.values():
+        entry.setdefault("approved", False)
+        entry["event"].set()
+    _pending_approvals.clear()
+    for entry in _pending_plan_approvals.values():
+        entry["mode"] = ""
+        entry["event"].set()
+    _pending_plan_approvals.clear()
 
 
 async def _handle_chat(ws: WebSocket, msg: dict, A, C):
@@ -819,21 +841,53 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         )
 
     def on_escalation(name, result):
-        """Approval flow — send to WebSocket, wait for response."""
-        esc_id = f"esc-{int(time.time()*1000)}"
-        change_type = "write"
+        """Approval flow — send to WebSocket, wait for a keyed response.
+
+        Each escalation gets a fresh id + state so a timed-out or superseded
+        prompt can never read a verdict meant for a different escalation.
+        """
+        esc_id = f"esc-{int(time.time()*1000)}-{id(result)}"
+        entry = {"event": threading.Event(), "approved": False, "session_scope": False}
+        _pending_approvals[esc_id] = entry
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "escalation", "tool_name": name,
-                          "change_type": change_type, "description": result[:1000],
+                          "change_type": "write", "description": result[:1000],
                           "id": esc_id}),
             loop,
         )
-        _pending_approval["event"].clear()
-        _pending_approval["event"].wait(timeout=300)
-        approved = _pending_approval.get("approved", False)
+        entry["event"].wait(timeout=300)
+        entry = _pending_approvals.pop(esc_id, entry)
+        approved = entry.get("approved", False)
         if approved:
             A.grant_escalation()
         return approved
+
+    def _plan_on_step(idx, total, step_text, tool_name, status, result):
+        """Render plan checklists in the UI (mirrors the CLI's _plan_on_step)."""
+        asyncio.run_coroutine_threadsafe(
+            ws.send_json({"type": "plan_step", "index": idx, "total": total,
+                          "step_text": step_text, "tool_name": tool_name,
+                          "status": status, "result": result}),
+            loop,
+        )
+
+    def _plan_on_escalation(escalation_text):
+        """Route plan write-step escalations to the ApprovalCard."""
+        return on_escalation("plan", escalation_text)
+
+    def _plan_on_approval(escalation_text):
+        """Plan (execute_plan) approval — keyed like tool escalations."""
+        plan_id = f"plan-{int(time.time()*1000)}-{id(escalation_text)}"
+        entry = {"event": threading.Event(), "mode": ""}
+        _pending_plan_approvals[plan_id] = entry
+        asyncio.run_coroutine_threadsafe(
+            ws.send_json({"type": "plan_approval", "plan": escalation_text[:2000],
+                          "id": plan_id}),
+            loop,
+        )
+        entry["event"].wait(timeout=300)
+        entry = _pending_plan_approvals.pop(plan_id, entry)
+        return entry.get("mode", "") == "approved"
 
     def on_answer(answer):
         elapsed = time.time() - turn_start
@@ -847,6 +901,12 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     # Run the agent in a thread to not block the event loop
     def _run():
         try:
+            # Wire plan execution callbacks so execute_plan renders the
+            # checklist and routes escalations to the UI (CLI does the same
+            # in do_chat; without these, plan-only mode dead-ends in the UI).
+            A._plan_on_step = _plan_on_step
+            A._plan_on_escalation = _plan_on_escalation
+            A._plan_on_approval = _plan_on_approval
             answer = A.run_agent(
                 S.messages,
                 max_turns=C._turn_max_turns(A.PERMISSION_MODE),
@@ -882,6 +942,10 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                 ws.send_json({"type": "error", "message": str(exc)}),
                 loop,
             )
+        finally:
+            A._plan_on_step = None
+            A._plan_on_escalation = None
+            A._plan_on_approval = None
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()

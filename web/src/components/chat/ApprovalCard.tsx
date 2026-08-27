@@ -9,7 +9,7 @@ export function ApprovalCard() {
   if (!approvalPending) return null
 
   const handleResponse = (approved: boolean, sessionScope: boolean) => {
-    send({ type: 'approval', approved, session_scope: sessionScope })
+    send({ type: 'approval', approved, session_scope: sessionScope, id: approvalPending.id })
     setApprovalPending(null)
   }
 

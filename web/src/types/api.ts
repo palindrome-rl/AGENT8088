@@ -180,8 +180,8 @@ export type WSClientMessage =
   | { type: 'chat'; text: string }
   | { type: 'command'; command: string; args?: string }
   | { type: 'interrupt' }
-  | { type: 'approval'; approved: boolean; session_scope: boolean }
-  | { type: 'plan_approval'; mode: string }
+  | { type: 'approval'; approved: boolean; session_scope: boolean; id: string }
+  | { type: 'plan_approval'; mode: string; id: string }
 
 export type WSEvent =
   | { type: 'status'; data: StatusInfo }
