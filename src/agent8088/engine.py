@@ -1551,7 +1551,7 @@ def _maybe_probe_context_window():
     if "context_window" in APP_CONFIG:
         return  # global override exists — no probe needed
     try:
-        probed = probe_model_context_window(client, MODEL_NAME)
+        probed = probe_model_context_window(client, MODEL_NAME, provider_name=name)
     except Exception:
         probed = None
     if probed and probed > 0:

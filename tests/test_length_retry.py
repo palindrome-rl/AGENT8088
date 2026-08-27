@@ -84,17 +84,23 @@ def test_retry_after_length_cutoff_gets_a_bigger_budget(monkeypatch, engine):
     assert calls[1] > calls[0]
 
 
-@pytest.mark.parametrize("model", ["glm-5.2", "glm-5.3-flash"])
-def test_known_active_model_uses_its_reviewed_output_limit(monkeypatch, engine, model):
+@pytest.mark.parametrize("ctx,comp", [("1048576", "131072"), ("262144", "32768")])
+def test_provider_config_override_sets_token_limits(monkeypatch, engine, ctx, comp):
+    """Per-provider config keys (provider.<name>.context_window / max_completion_tokens)
+    are the supported way to set model-specific limits without a hardcoded catalog."""
     monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
     monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
-    monkeypatch.setattr(engine, "MODEL_NAME", model)
-    engine.PROVIDERS["ollama-cloud"] = {"model": model}
+    monkeypatch.setattr(engine, "MODEL_NAME", "glm-5.3-flash")
+    engine.PROVIDERS["ollama-cloud"] = {
+        "model": "glm-5.3-flash",
+        "context_window": ctx,
+        "max_completion_tokens": comp,
+    }
 
     context, completion = engine._active_model_token_limits()
 
-    assert context == 1_048_576
-    assert completion == 131_072
+    assert context == int(ctx)
+    assert completion == int(comp)
 
 
 def test_agent_call_receives_the_active_models_completion_limit(monkeypatch, engine):
@@ -102,7 +108,11 @@ def test_agent_call_receives_the_active_models_completion_limit(monkeypatch, eng
     monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
     monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
     monkeypatch.setattr(engine, "MODEL_NAME", "glm-5.2")
-    engine.PROVIDERS["ollama-cloud"] = {"model": "glm-5.2"}
+    engine.PROVIDERS["ollama-cloud"] = {
+        "model": "glm-5.2",
+        "context_window": "1048576",
+        "max_completion_tokens": "131072",
+    }
 
     def _fake(messages, tools, max_tokens=None, **kw):
         seen.append(max_tokens)
@@ -116,7 +126,7 @@ def test_agent_call_receives_the_active_models_completion_limit(monkeypatch, eng
     assert seen == [131_072]
 
 
-def test_provider_token_override_wins_over_known_model(monkeypatch, engine):
+def test_provider_token_override_wins_over_global_config(monkeypatch, engine):
     monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
     monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
     monkeypatch.setattr(engine, "MODEL_NAME", "glm-5.3-flash")
@@ -125,20 +135,29 @@ def test_provider_token_override_wins_over_known_model(monkeypatch, engine):
         "context_window": "200000",
         "max_completion_tokens": "24000",
     }
+    engine.APP_CONFIG["context_window"] = "32768"
+    engine.APP_CONFIG["max_completion_tokens"] = "8192"
 
     assert engine._active_model_token_limits() == (200_000, 24_000)
 
 
-def test_unknown_model_keeps_conservative_defaults(monkeypatch, engine):
-    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "custom")
-    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "custom")
-    monkeypatch.setattr(engine, "MODEL_NAME", "private-model")
-    engine.PROVIDERS["custom"] = {"model": "private-model"}
+def test_probe_result_is_used_when_no_config_override(monkeypatch, engine):
+    """When no per-provider or global config is set, a probed value stored in
+    PROVIDERS[name] is used — this is how the endpoint probe feeds limits."""
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "MODEL_NAME", "kimi-k2.6")
+    engine.PROVIDERS["ollama-cloud"] = {
+        "model": "kimi-k2.6",
+        "context_window": "262144",  # probed via /api/show, session-only
+    }
+    engine.APP_CONFIG.pop("context_window", None)
+    engine.APP_CONFIG.pop("max_completion_tokens", None)
 
-    assert engine._active_model_token_limits() == (
-        engine.CONTEXT_WINDOW,
-        engine.MAX_COMPLETION_TOKENS,
-    )
+    context, completion = engine._active_model_token_limits()
+    assert context == 262144
+    # completion falls back to MAX_COMPLETION_TOKENS (probe doesn't set it)
+    assert completion == engine.MAX_COMPLETION_TOKENS
 
 
 def test_turn_limit_reports_error_and_latest_tool_result(monkeypatch, engine):
@@ -220,7 +239,8 @@ def test_set_provider_limit_takes_effect_next_turn(monkeypatch, tmp_path, engine
 # ---------------------------------------------------------------------------
 
 def test_probe_finds_context_window_on_model_object():
-    """probe_model_context_window reads a non-standard context_window field."""
+    """probe_model_context_window reads a non-standard context_window field
+    from /v1/models (the OpenAI-compatible fallback path)."""
     from agent8088 import providers
 
     class _M:
@@ -231,14 +251,14 @@ def test_probe_finds_context_window_on_model_object():
         data = [_M()]
 
     class _Client:
-        def models_list(self):
-            pass
+        base_url = "http://non-ollama.example.com/v1"
+        api_key = ""
         class models:
             @staticmethod
             def list():
                 return _Resp()
 
-    result = providers.probe_model_context_window(_Client(), "test-model")
+    result = providers.probe_model_context_window(_Client(), "test-model", provider_name="custom")
     assert result == 256000
 
 
@@ -247,18 +267,19 @@ def test_probe_returns_none_when_no_field():
 
     class _M:
         id = "no-ctx-model"
-        # no context_window / max_context_length / etc.
 
     class _Resp:
         data = [_M()]
 
     class _Client:
+        base_url = "http://non-ollama.example.com/v1"
+        api_key = ""
         class models:
             @staticmethod
             def list():
                 return _Resp()
 
-    result = providers.probe_model_context_window(_Client(), "no-ctx-model")
+    result = providers.probe_model_context_window(_Client(), "no-ctx-model", provider_name="custom")
     assert result is None
 
 
@@ -266,13 +287,40 @@ def test_probe_returns_none_on_endpoint_error():
     from agent8088 import providers
 
     class _Client:
+        base_url = "http://non-ollama.example.com/v1"
+        api_key = ""
         class models:
             @staticmethod
             def list():
                 raise ConnectionError("endpoint down")
 
-    result = providers.probe_model_context_window(_Client(), "any-model")
+    result = providers.probe_model_context_window(_Client(), "any-model", provider_name="custom")
     assert result is None
+
+
+def test_probe_uses_ollama_api_show_for_llama_provider(monkeypatch):
+    """For ollama/ollama-cloud providers, the probe queries /api/show and reads
+    model_info['<arch>.context_length']."""
+    import httpx as _real_httpx
+    from agent8088 import providers
+
+    class _FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"model_info": {"llama.context_length": 131072}}
+
+    def _fake_post(url, **kwargs):
+        assert "/api/show" in url
+        return _FakeResponse()
+
+    monkeypatch.setattr(_real_httpx, "post", _fake_post)
+
+    class _Client:
+        base_url = "http://localhost:11434/v1"
+        api_key = "ollama"
+
+    result = providers.probe_model_context_window(_Client(), "llama3.3", provider_name="ollama")
+    assert result == 131072
 
 
 def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
@@ -287,7 +335,7 @@ def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
     class _FakeClient:
         pass
 
-    def _fake_probe(client, model_id, timeout=5):
+    def _fake_probe(client, model_id, provider_name="", timeout=5):
         return 786432
 
     monkeypatch.setattr(engine, "client", _FakeClient())

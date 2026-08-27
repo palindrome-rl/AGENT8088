@@ -40,29 +40,23 @@ FALLBACK_MODELS = {
 }
 
 # OpenAI-compatible /v1/models responses normally expose only an id, owner and
-# creation time. They do not standardize context or output limits, so known
-# limits live here rather than being guessed from a model name at request time.
-# Provider-specific config values remain the escape hatch for private endpoints
-# and take precedence over this catalog in engine._active_model_token_limits().
-MODEL_TOKEN_LIMITS = {
-    ("ollama-cloud", "glm-5.2"): {
-        "context_window": 1_048_576,
-        "max_completion_tokens": 131_072,
-    },
-    ("ollama-cloud", "glm-5.3-flash"): {
-        "context_window": 1_048_576,
-        "max_completion_tokens": 131_072,
-    },
-}
+# creation time. Context and output limits are NOT standardized there. Instead,
+# probe_model_context_window queries the provider's native model-info endpoint
+# (Ollama's /api/show for ollama/ollama-cloud, /v1/models for others) and reads
+# whatever context-length field the endpoint publishes. Provider-specific config
+# values (provider.<name>.context_window) remain the escape hatch for private
+# endpoints and take precedence over the probe in engine._active_model_token_limits().
 
 
 def model_token_limits(provider_name, model_id):
-    """Return reviewed limits for one exact provider/model pairing."""
-    key = (
-        str(provider_name or "").strip().lower(),
-        str(model_id or "").strip().lower(),
-    )
-    return dict(MODEL_TOKEN_LIMITS.get(key, {}))
+    """Return reviewed limits for one exact provider/model pairing.
+
+    No hardcoded catalog — limits are probed from the endpoint at runtime via
+    probe_model_context_window. This function is kept as a stable import target
+    for engine._active_model_token_limits but always returns empty: the probe
+    writes session-only values into PROVIDERS[name] directly.
+    """
+    return {}
 
 import csv, hashlib, json, os, stat, subprocess, sys, tempfile, time
 from pathlib import Path, PureWindowsPath
@@ -171,13 +165,42 @@ def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, 
         return list(FALLBACK_MODELS.get(provider_name, [])) if fallback else []
 
 
-def probe_model_context_window(client, model_id, timeout=MODEL_LIST_TIMEOUT_SECONDS):
+def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL_LIST_TIMEOUT_SECONDS):
     """Best-effort: ask the endpoint for the model's context window.
 
-    OpenAI-compatible /v1/models rarely publishes this, so we look for a
-    non-standard field on the model object. Returns int or None on miss.
-    Never raises — the caller (activate_model) treats None as "use fallback".
+    Two strategies, tried in order:
+    1. Ollama native /api/show — Ollama and Ollama Cloud publish real
+       model_info with "<arch>.context_length" in the response. This is the
+       reliable path for ollama/ollama-cloud providers.
+    2. OpenAI-compatible /v1/models — most providers don't publish context
+       here, but some add non-standard fields (context_window,
+       max_context_length, max_input_tokens, context_length).
+
+    Returns int or None on miss. Never raises — the caller treats None as
+    "use fallback".
     """
+    base_url = str(getattr(client, "base_url", "")).rstrip("/")
+    api_key = str(getattr(client, "api_key", ""))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    # Strategy 1: Ollama /api/show (works for ollama, ollama-cloud, and any
+    # Ollama-compatible endpoint that serves the native API alongside /v1).
+    if provider_name in ("ollama", "ollama-cloud") or "ollama" in base_url:
+        try:
+            import httpx
+            # The native API lives at the host root, not under /v1.
+            show_url = base_url.replace("/v1", "") + "/api/show"
+            r = httpx.post(show_url, json={"model": model_id},
+                           headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                info = r.json().get("model_info", {})
+                for key, value in info.items():
+                    if key.endswith("context_length") and isinstance(value, int):
+                        return value
+        except Exception:
+            pass
+
+    # Strategy 2: OpenAI-compatible /v1/models — look for non-standard fields.
     try:
         fetch_client = (client.with_options(timeout=timeout)
                         if hasattr(client, "with_options") else client)
