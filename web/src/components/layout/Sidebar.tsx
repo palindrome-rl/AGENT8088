@@ -18,7 +18,6 @@ import type { ChatMessage, SessionInfo } from '@/types/api'
  * ───────────────────────────────────────────────────────── */
 
 const settingsItems = [
-  { to: '/artifacts', label: 'Artifacts', icon: FolderOpen },
   { to: '/tools', label: 'Tools', icon: Wrench },
   { to: '/skills', label: 'Skills', icon: BookOpen },
   { to: '/agents', label: 'Sub-Agents', icon: Bot },
@@ -226,6 +225,18 @@ export function Sidebar() {
           >
             <MessageSquare className="h-[18px] w-[18px] shrink-0" />
             {!sidebarCollapsed && <span className="truncate">Chat</span>}
+          </NavLink>
+          <NavLink
+            to="/artifacts"
+            className={({ isActive }) => cn(
+              'flex h-8 items-center gap-2.5 rounded-lg px-2 text-left text-[13px] transition-colors duration-150 active:scale-[0.98]',
+              isActive
+                ? 'bg-zinc-100 dark:bg-zinc-800/60 text-zinc-900 dark:text-zinc-100'
+                : 'text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800/40 hover:text-zinc-900 dark:hover:text-zinc-200',
+            )}
+          >
+            <FolderOpen className="h-[18px] w-[18px] shrink-0" />
+            {!sidebarCollapsed && <span className="truncate">Artifacts</span>}
           </NavLink>
         </nav>
 
