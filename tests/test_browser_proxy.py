@@ -110,3 +110,22 @@ def test_plain_http_get_to_blocked_target_is_refused():
         assert resp.status == 403
     finally:
         stop()
+
+
+@pytest.mark.parametrize("method", ["DELETE", "PATCH", "OPTIONS"])
+def test_plain_http_delete_patch_options_are_forwarded_not_rejected_as_unsupported(method):
+    """BaseHTTPRequestHandler answers 501 Unsupported method for any verb
+    without a matching do_<VERB> - DELETE/PATCH/OPTIONS never got one, so a
+    plain-HTTP page issuing a REST DELETE/PATCH call, or a CORS preflight
+    OPTIONS, failed through this proxy regardless of the SSRF policy. Routing
+    a *blocked* target proves it now reaches check_target - a 501 here means
+    the request never got that far."""
+    proxy_url, stop = start_ssrf_filtering_proxy(lambda url: "Blocked: test policy.")
+    port = int(proxy_url.rsplit(":", 1)[1])
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(method, "http://10.0.0.5/some/path")
+        resp = conn.getresponse()
+        assert resp.status == 403
+    finally:
+        stop()

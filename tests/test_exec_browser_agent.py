@@ -166,6 +166,7 @@ class _FakeAgent:
 
     instances = []
     hang = False  # set by the timeout test to make run() never return
+    close_raises = None  # set by the close-failure test to make close() fail
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -179,6 +180,8 @@ class _FakeAgent:
         return _FakeHistory()
 
     async def close(self):
+        if _FakeAgent.close_raises is not None:
+            raise _FakeAgent.close_raises
         self.closed = True
 
 
@@ -192,6 +195,7 @@ def fake_browser_use(monkeypatch):
 
     _FakeAgent.instances = []
     _FakeAgent.hang = False
+    _FakeAgent.close_raises = None
     profiles = []
     llm_calls = []
 
@@ -459,6 +463,48 @@ def test_the_browser_is_closed_when_the_task_times_out(fake_browser_use, monkeyp
         asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
 
     assert fake_browser_use.agents[0].closed is True
+
+
+def test_a_failed_agent_close_is_logged_not_silently_swallowed(fake_browser_use, caplog):
+    """The old code caught any close() failure with a bare `except Exception:
+    pass` - a wedged Chromium process could survive past the 30s timeout with
+    zero visibility that cleanup didn't finish. It must at least be logged."""
+    import logging
+    _FakeAgent.close_raises = RuntimeError("close boom")
+
+    with caplog.at_level(logging.WARNING, logger="agent8088.engine"):
+        asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    assert any("close" in r.message and "close boom" in r.message
+               for r in caplog.records)
+
+
+def test_the_browser_profile_temp_dir_is_removed_after_a_normal_run(fake_browser_use):
+    """BrowserProfile's own validator silently mkdtemp()s a user-data-dir
+    whenever one isn't passed in, and browser-use's own cleanup only matches
+    a different temp-dir prefix ('browseruse-tmp-', not
+    'browser-use-user-data-dir-') - so that directory is never removed and
+    every browse_page call leaks a few MB on disk. Passing an explicit dir
+    means _run_browser_agent owns the directory's lifecycle and can actually
+    delete it once the run is done."""
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    kwargs = fake_browser_use.profiles[0]
+    assert kwargs.get("user_data_dir")
+    assert not os.path.exists(kwargs["user_data_dir"])
+
+
+def test_the_browser_profile_temp_dir_is_removed_even_when_the_task_times_out(
+        fake_browser_use, monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_TASK_TIMEOUT_SECONDS", 1)
+    _FakeAgent.hang = True
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    kwargs = fake_browser_use.profiles[0]
+    assert kwargs.get("user_data_dir")
+    assert not os.path.exists(kwargs["user_data_dir"])
 
 
 def test_the_task_timeout_is_clamped_to_the_tool_timeout_ceiling(monkeypatch):

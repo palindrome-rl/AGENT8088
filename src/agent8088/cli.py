@@ -3290,6 +3290,7 @@ def cmd_resume(rest):
     S.max_turns = int(data.get("max_turns", 10))
     S.show_trace = bool(data.get("show_trace", False))
     S.show_reasoning = bool(data.get("show_reasoning", False))
+    A.SHOW_REASONING = S.show_reasoning
     S.disabled_skills = set(data.get("disabled_skills", [])) & set(A.SKILL_PACKAGES)
     S.verbose = data.get("verbose", "on") if data.get("verbose") in {"on", "off", "full"} else "on"
     S.usage_mode = data.get("usage_mode", "tokens") if data.get("usage_mode") in {"off", "tokens", "full"} else "tokens"

@@ -3650,11 +3650,17 @@ async def _run_browser_agent(url: str, task: str) -> str:
 
     proxy_url, stop_proxy = start_ssrf_filtering_proxy(
         lambda target_url: _egress_check(target_url) or _ssrf_check(target_url))
+    # Left unset, BrowserProfile's own field validator silently mkdtemp()s a
+    # user-data-dir under the OS temp dir - and browser-use's cleanup code
+    # only recognizes a different temp-dir prefix, so that directory is never
+    # removed. Owning the path here means it can actually be deleted below.
+    user_data_dir = tempfile.mkdtemp(prefix="agent8088-browser-profile-")
     agent = None
     try:
         llm = build_browser_chat_model(
             client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS)
-        profile = BrowserProfile(**_browser_profile_kwargs(proxy_url))
+        profile = BrowserProfile(
+            user_data_dir=user_data_dir, **_browser_profile_kwargs(proxy_url))
         agent = Agent(
             task=task,
             llm=llm,
@@ -3698,9 +3704,11 @@ async def _run_browser_agent(url: str, task: str) -> str:
         if agent is not None:
             try:
                 await asyncio.wait_for(agent.close(), timeout=30)
-            except Exception:
-                pass
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "browse_page: agent.close() did not finish cleanly: %s", e)
         stop_proxy()
+        shutil.rmtree(user_data_dir, ignore_errors=True)
 
     result = history.final_result() or "(The task did not produce a final result.)"
     if not history.is_done():

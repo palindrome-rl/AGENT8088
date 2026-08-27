@@ -83,6 +83,15 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         self._do_forward("PUT")
 
+    def do_DELETE(self):
+        self._do_forward("DELETE")
+
+    def do_PATCH(self):
+        self._do_forward("PATCH")
+
+    def do_OPTIONS(self):
+        self._do_forward("OPTIONS")
+
     @staticmethod
     def _relay(client_sock, upstream_sock):
         def pipe(src, dst):
