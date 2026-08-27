@@ -620,6 +620,93 @@ async def get_history():
     return {"messages": C.S.messages, "conversation_trace": C.S.conversation_trace}
 
 
+# === Artifacts browser ===
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
+TEXT_EXTS = {".txt", ".md", ".py", ".json", ".csv", ".yaml", ".yml", ".html",
+             ".css", ".js", ".ts", ".tsx", ".sh", ".log", ".xml", ".drawio", ".toml"}
+
+
+def _safe_artifact_path(A, rel: str) -> Path | None:
+    """Resolve rel under ARTIFACTS_ROOT; None if it escapes or hits pycache."""
+    base = A.ARTIFACTS_ROOT.resolve()
+    target = (base / rel).resolve() if rel else base
+    if target != base and base not in target.parents:
+        return None
+    if any(part == "__pycache__" for part in target.parts[len(base.parts):]):
+        return None
+    return target
+
+
+@app.get("/api/artifacts")
+async def list_artifacts(rel: str = ""):
+    """List one directory under artifacts/ with type info per entry."""
+    A = _eng()
+    target = _safe_artifact_path(A, rel)
+    if target is None or not target.exists() or not target.is_dir():
+        return {"error": f"not found: {rel}"}
+    base = A.ARTIFACTS_ROOT.resolve()
+    items = []
+    try:
+        for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+            if entry.name.startswith(".") or entry.name == "__pycache__":
+                continue
+            rel_child = str(entry.relative_to(base))
+            if entry.is_dir():
+                try:
+                    count = sum(1 for child in entry.glob("*")
+                                if not (child.name.startswith(".") or child.name == "__pycache__"))
+                except OSError:
+                    count = 0
+                items.append({"name": entry.name, "path": rel_child, "type": "dir",
+                              "size": None, "modified": entry.stat().st_mtime})
+            else:
+                ext = entry.suffix.lower()
+                items.append({
+                    "name": entry.name, "path": rel_child,
+                    "type": "image" if ext in IMAGE_EXTS else "text" if ext in TEXT_EXTS else "file",
+                    "size": entry.stat().st_size,
+                    "modified": entry.stat().st_mtime,
+                })
+    except OSError as exc:
+        return {"error": str(exc)}
+    return {
+        "root": str(base),
+        "cwd": rel,
+        "parent": str(Path(rel).parent) if rel else None,
+        "items": items,
+    }
+
+
+@app.get("/api/artifacts/file")
+async def get_artifact_file(rel: str):
+    """Serve one artifact file (inline for images, download otherwise)."""
+    from fastapi.responses import FileResponse
+    A = _eng()
+    target = _safe_artifact_path(A, rel)
+    if target is None or not target.is_file():
+        return {"error": f"not found: {rel}"}
+    media = "image/svg+xml" if target.suffix == ".svg" else None
+    return FileResponse(target, filename=target.name, media_type=media)
+
+
+@app.get("/api/artifacts/content")
+async def get_artifact_content(rel: str):
+    """Text content of a text artifact (inline preview)."""
+    A = _eng()
+    target = _safe_artifact_path(A, rel)
+    if target is None or not target.is_file():
+        return {"error": f"not found: {rel}"}
+    if target.suffix.lower() not in TEXT_EXTS:
+        return {"error": "binary file — use /api/artifacts/file"}
+    if target.stat().st_size > 1_000_000:
+        return {"error": "file too large for preview (>1MB)"}
+    try:
+        return {"path": rel, "content": target.read_text(encoding="utf-8", errors="replace")}
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"error": str(exc)}
+
+
 class PrefBody(BaseModel):
     temperature: float | None = None
     max_turns: int | None = None
