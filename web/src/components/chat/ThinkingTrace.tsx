@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useSessionStore } from '@/stores/session'
+import { scrubMarkup } from '@/lib/scrub'
 
 /* ─────────────────────────────────────────────────────────
  * THINKING — Beautiful UI-style expandable trace
@@ -126,7 +127,7 @@ export function ThinkingTrace() {
                   </svg>
                 )}
                 <span className="min-w-0 text-[12.5px] leading-relaxed text-zinc-600 dark:text-zinc-400 font-mono">
-                  {streamingReasoning.join('')}
+                  {scrubMarkup(streamingReasoning.join(''))}
                 </span>
               </div>
             </div>

@@ -2,6 +2,7 @@ import { useCallback, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
+import { scrubMarkup } from '@/lib/scrub'
 import type { ChatMessage, StatusInfo, WSClientMessage, WSEvent } from '@/types/api'
 
 /* ─────────────────────────────────────────────────────────
@@ -72,7 +73,7 @@ function wireSocket(ws: WebSocket) {
         setPlanApprovalPending({ id: data.id, plan: data.plan })
         break
       case 'answer':
-        addMessage({ role: 'assistant', content: data.text })
+        addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
         setStreaming(false)
         resetStreaming()
         break
@@ -82,7 +83,7 @@ function wireSocket(ws: WebSocket) {
         break
       case 'error':
         console.error('Agent error:', data.message)
-        addMessage({ role: 'assistant', content: `Error: ${data.message}` })
+        addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}` })
         setStreaming(false)
         resetStreaming()
         break
@@ -92,7 +93,7 @@ function wireSocket(ws: WebSocket) {
         break
       case 'command_result':
         if (data.result.toLowerCase().startsWith('unknown command')) {
-          addMessage({ role: 'assistant', content: data.result })
+          addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
         }
         if (['new', 'resume', 'reset', 'compact'].includes(data.command.toLowerCase())) {
           void syncSession()

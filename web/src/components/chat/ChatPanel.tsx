@@ -6,6 +6,7 @@ import { ThinkingTrace } from './ThinkingTrace'
 import { ApprovalCard } from './ApprovalCard'
 import { PromptBar } from './PromptBar'
 import { useUIStore } from '@/stores/ui'
+import { scrubMarkup } from '@/lib/scrub'
 
 export function ChatPanel() {
   const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
@@ -77,7 +78,7 @@ export function ChatPanel() {
             {toolEvents.map((tool, i) => (
               <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
             ))}
-            <StreamingReveal text={streamingText} />
+            <StreamingReveal text={scrubMarkup(streamingText)} />
           </div>
         )}
         <ApprovalCard />

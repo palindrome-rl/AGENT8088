@@ -1,6 +1,7 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { CodeBlock } from './CodeBlock'
+import { scrubMarkup } from '@/lib/scrub'
 
 import type { ChatMessage } from '@/types/api'
 
@@ -24,6 +25,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
       <div className="w-fit max-w-[85%] rounded-2xl rounded-tl-md border border-zinc-200 bg-zinc-100/90 px-4 py-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/90">
         <div className="mb-1.5 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Agent8088</div>
         <div className="prose prose-sm max-w-none text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0">
+          {/* Scrub tool-call protocol: history messages are stored raw */}
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
@@ -43,7 +45,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
               },
             }}
           >
-            {message.content}
+            {scrubMarkup(message.content)}
           </ReactMarkdown>
         </div>
       </div>

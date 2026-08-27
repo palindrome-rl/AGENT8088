@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -40,6 +41,149 @@ def _cl():
         from agent8088 import cli as _c
         _cli = _c
     return _cli
+
+
+# === Tool-call markup scrubbing ===
+# The engine's tool protocol rides in the CONTENT channel: the model literally
+# types `<flower>FUNCTION<flower>: name <flower>ARGS<flower>: {...}` as ordinary
+# output. The CLI hides it from the live view with ProseStream hold-back and
+# strips it from final answers with strip_tool_json - but the web streamed raw
+# deltas and rendered raw history messages, so the markup leaked into chat
+# bubbles. The helpers below are the web equivalents. The engine is NOT
+# modified; session history and model context stay raw.
+#
+# Sentinels are built from unicode escapes so this file stays ASCII-clean.
+
+_FLOWER = "\u273f"                      # the flower sentinel char
+_FUNC = _FLOWER + "FUNCTION" + _FLOWER  # FUNCTION header sentinel
+_ARGS = _FLOWER + "ARGS" + _FLOWER      # ARGS header sentinel
+_TC_OPEN = "\u003ctool_call\u003e"
+_TC_CLOSE = "\u003c/tool_call\u003e"
+_MASK_OPEN = "\u003c|mask_start|\u003e"
+_MASK_CLOSE = "\u003c|mask_end|\u003e"
+
+_FUNC_BLOCK_RE = re.compile(re.escape(_FUNC) + r".*?" + re.escape(_ARGS) + r"\s*:\s*\{.*?\}", re.DOTALL)
+_BARE_BLOCK_RE = re.compile(re.escape(_FLOWER) + r"\{.*?\}" + re.escape(_FLOWER), re.DOTALL)
+_THINK_RE = re.compile(re.escape(_TC_OPEN) + r".*?" + re.escape(_TC_CLOSE), re.DOTALL)
+_MASK_RE = re.compile(re.escape(_MASK_OPEN) + r".*?" + re.escape(_MASK_CLOSE), re.DOTALL)
+_FRAG_RE = re.compile(re.escape(_FLOWER) + r"[^" + re.escape(_FLOWER) + r"\n]*" + re.escape(_FLOWER))
+
+
+def scrub_markup(text: str) -> str:
+    """Remove tool-call protocol from user-visible strings (UI display only -
+    session history and model context stay raw)."""
+    if not text:
+        return text
+    text = _FUNC_BLOCK_RE.sub("", text)
+    text = _BARE_BLOCK_RE.sub("", text)
+    text = _THINK_RE.sub("", text)
+    text = _MASK_RE.sub("", text)
+    text = _FRAG_RE.sub("", text)
+    return text.replace(_FLOWER, "")
+
+
+class _StreamScrubber:
+    """Incrementally strips tool-call protocol from streamed content deltas.
+
+    Web equivalent of the CLI's ProseStream: hold back any suffix that could
+    still grow into a sentinel, drop confirmed call blocks whole, emit clean
+    prose. Handles FUNCTION/ARGS blocks (brace-matched), bare {...} wrapped
+    in flowers, tool_call tags, and mask spans. Partial sentinels at the
+    buffer tail are withheld until they resolve; a runaway unterminated
+    block is dropped after _MAX_HOLD bytes rather than stalling the stream.
+    """
+
+    _OPENERS = (_FUNC, _ARGS, _FLOWER + "{", _TC_OPEN, _MASK_OPEN)
+    _ENDS = {
+        _FUNC: "brace",
+        _ARGS: _FLOWER,
+        _FLOWER + "{": "brace-flower",
+        _TC_OPEN: _TC_CLOSE,
+        _MASK_OPEN: _MASK_CLOSE,
+    }
+    _MAX_HOLD = 8192
+
+    def __init__(self):
+        self._buf = ""
+        self._end = None  # end-marker mode while inside a dropped block
+        self._depth = 0
+
+    def feed(self, delta: str) -> str:
+        self._buf += delta
+        out = []
+        while True:
+            if self._end is not None:
+                if not self._consume_block():
+                    break
+                continue
+            starts = [(self._buf.find(op), op) for op in self._OPENERS]
+            starts = [(i, op) for i, op in starts if i != -1]
+            if starts:
+                i, op = min(starts)
+                out.append(self._buf[:i])
+                self._buf = self._buf[i:]
+                self._end = self._ENDS[op]
+                self._depth = 0
+                continue
+            # No full opener: hold back any suffix that could still grow
+            # into one, emit the rest.
+            keep = 0
+            for op in self._OPENERS:
+                for k in range(min(len(op) - 1, len(self._buf)), 0, -1):
+                    if self._buf.endswith(op[:k]):
+                        keep = max(keep, k)
+                        break
+            emit = len(self._buf) - keep
+            if emit > 0:
+                out.append(self._buf[:emit])
+                self._buf = self._buf[emit:]
+            break
+        if len(self._buf) > self._MAX_HOLD:
+            # Runaway unterminated block - drop it, resume emitting.
+            self._buf = ""
+            self._end = None
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest, self._buf, self._end, self._depth = self._buf, "", None, 0
+        return rest
+
+    def _consume_block(self) -> bool:
+        """Try to finish dropping the current block. True = done."""
+        if self._end == _TC_CLOSE or self._end == _MASK_CLOSE:
+            j = self._buf.find(self._end)
+            if j == -1:
+                self._buf = ""  # everything buffered is inside the block
+                return False
+            self._buf = self._buf[j + len(self._end):]
+        elif self._end == _FLOWER:
+            j = self._buf.find(_FLOWER, 1)
+            if j == -1:
+                self._buf = ""
+                return False
+            self._buf = self._buf[j + 1:]
+        else:  # brace-matched JSON block
+            i = 0
+            while i < len(self._buf):
+                ch = self._buf[i]
+                if ch == "{" :
+                    self._depth += 1
+                elif ch == "}":
+                    self._depth -= 1
+                    if self._depth <= 0:
+                        rest = self._buf[i + 1:]
+                        if self._end == "brace-flower" and rest.startswith(_FLOWER):
+                            rest = rest[1:]
+                        self._buf = rest
+                        self._end = None
+                        self._depth = 0
+                        return True
+                i += 1
+            self._buf = ""  # consumed into the block; keep waiting
+            return False
+        self._end = None
+        self._depth = 0
+        return True
 
 
 # --- Lifespan: initialize engine once ---
@@ -894,6 +1038,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     trace = [] if S.show_trace else None
     turn_start = time.time()
     tokens_ref = [0]
+    scrubber = _StreamScrubber()  # per-turn: strips tool-call markup from the live stream
 
     # Capture the running event loop BEFORE spawning the thread —
     # asyncio.get_event_loop() called from a worker thread crashes or
@@ -914,8 +1059,13 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         # Count characters, not chunks — each callback is one streaming delta
         # of arbitrary size, so += 1 wildly overstated "tokens".
         tokens_ref[0] += len(delta)
+        # Strip tool-call protocol from the live stream (web equivalent of the
+        # CLI's ProseStream) so markup never flashes in the chat bubble.
+        clean = scrubber.feed(delta)
+        if not clean:
+            return
         asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "token", "kind": kind, "delta": delta}),
+            ws.send_json({"type": "token", "kind": kind, "delta": clean}),
             loop,
         )
 
@@ -935,7 +1085,8 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
 
     def on_result(name, result):
         asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "tool_result", "name": name, "result": result[:5000]}),
+            ws.send_json({"type": "tool_result", "name": name,
+                          "result": scrub_markup(result)[:5000]}),
             loop,
         )
 
@@ -950,7 +1101,8 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         _pending_approvals[esc_id] = entry
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "escalation", "tool_name": name,
-                          "change_type": "write", "description": result[:1000],
+                          "change_type": "write",
+                          "description": scrub_markup(result)[:1000],
                           "id": esc_id}),
             loop,
         )
@@ -991,7 +1143,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     def on_answer(answer):
         elapsed = time.time() - turn_start
         asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "answer", "text": answer,
+            ws.send_json({"type": "answer", "text": scrub_markup(answer),
                           "usage": {"seconds": elapsed, "tokens": tokens_ref[0],
                                     "context": C._estimate_context_pct()}}),
             loop,
@@ -1038,7 +1190,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
             import traceback
             traceback.print_exc()
             asyncio.run_coroutine_threadsafe(
-                ws.send_json({"type": "error", "message": str(exc)}),
+                ws.send_json({"type": "error", "message": scrub_markup(str(exc))}),
                 loop,
             )
         finally:
@@ -1082,7 +1234,7 @@ async def _handle_command(ws: WebSocket, msg: dict, C):
 
         output = await loop.run_in_executor(None, _exec_command)
         await ws.send_json({"type": "command_result", "command": command,
-                            "result": output})
+                            "result": scrub_markup(output)})
     except Exception as exc:
         await ws.send_json({"type": "command_result", "command": command,
                              "result": f"error: {exc}"})
