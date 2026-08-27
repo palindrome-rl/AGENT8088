@@ -11,7 +11,7 @@ export function PlanApprovalCard() {
   if (!planApprovalPending) return null
 
   const handleResponse = (mode: string) => {
-    send({ type: 'plan_approval', mode })
+    send({ type: 'plan_approval', mode, id: planApprovalPending.id })
     setPlanApprovalPending(null)
   }
 
