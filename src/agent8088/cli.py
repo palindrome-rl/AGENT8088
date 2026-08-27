@@ -2743,6 +2743,8 @@ def cmd_doctor(rest):
     t.add_column("Check", style="#00edff", no_wrap=True)
     t.add_column("Result", style="#237dd7")
     t.add_row("Model", f"{active}:{A.MODEL_NAME}")
+    model_context, model_output = A._active_model_token_limits()
+    t.add_row("Model token limits", f"{model_context:,} context / {model_output:,} output")
     t.add_row("Endpoint", str(endpoint or "provider-managed"))
     t.add_row("Reachability", _endpoint_probe(endpoint) if endpoint else "provider-managed")
     t.add_row("Authentication", auth)

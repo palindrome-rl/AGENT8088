@@ -39,8 +39,11 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.api_key_env` | Name of the env var / `.env` entry holding the key. **Preferred.** |
 | `provider.<name>.api_key` | Literal key. Legacy — migrated to `.env` on first run. |
 | `provider.<name>.api_mode` | `openai` (default) or `litellm`. |
+| `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
+| `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `fallback_models` | Comma-separated `provider:model` chain, tried on 429/503/connection errors. |
 | `context_window` | Token budget for history trimming. |
+| `max_completion_tokens` | Global output-token ceiling when the active model has no reviewed limit or provider override. |
 | `timeout_seconds` | Per-request timeout (default `120`). |
 
 Sampling: `frequency_penalty`, `presence_penalty` (temperature is a runtime

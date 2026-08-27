@@ -39,6 +39,31 @@ FALLBACK_MODELS = {
     "copilot":      ["gpt-4o-mini", "gpt-4o", "claude-sonnet-4"],
 }
 
+# OpenAI-compatible /v1/models responses normally expose only an id, owner and
+# creation time. They do not standardize context or output limits, so known
+# limits live here rather than being guessed from a model name at request time.
+# Provider-specific config values remain the escape hatch for private endpoints
+# and take precedence over this catalog in engine._active_model_token_limits().
+MODEL_TOKEN_LIMITS = {
+    ("ollama-cloud", "glm-5.2"): {
+        "context_window": 1_048_576,
+        "max_completion_tokens": 131_072,
+    },
+    ("ollama-cloud", "glm-5.3-flash"): {
+        "context_window": 1_048_576,
+        "max_completion_tokens": 131_072,
+    },
+}
+
+
+def model_token_limits(provider_name, model_id):
+    """Return reviewed limits for one exact provider/model pairing."""
+    key = (
+        str(provider_name or "").strip().lower(),
+        str(model_id or "").strip().lower(),
+    )
+    return dict(MODEL_TOKEN_LIMITS.get(key, {}))
+
 import csv, hashlib, json, os, stat, subprocess, sys, tempfile, time
 from pathlib import Path, PureWindowsPath
 

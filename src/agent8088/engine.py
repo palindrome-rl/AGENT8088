@@ -1422,6 +1422,46 @@ ACTIVE_PROVIDER = (_initial_provider if _initial_provider in PROVIDERS
                    else DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else "")
 
 
+def _positive_int(value, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _active_model_token_limits() -> tuple[int, int]:
+    """Return (context window, completion ceiling) for the active model.
+
+    Most OpenAI-compatible model-list endpoints do not publish either value.
+    Resolution is therefore explicit and deterministic: a provider profile
+    override wins, then a global config override, then reviewed model metadata,
+    and finally the conservative legacy defaults.
+    """
+    from agent8088.providers import model_token_limits
+
+    provider_name = ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    profile = PROVIDERS.get(provider_name, {})
+    known = model_token_limits(provider_name, MODEL_NAME)
+    context_value = profile.get("context_window")
+    if context_value in (None, ""):
+        context_value = (
+            APP_CONFIG.get("context_window")
+            if "context_window" in APP_CONFIG
+            else known.get("context_window")
+        )
+    completion_value = profile.get("max_completion_tokens")
+    if completion_value in (None, ""):
+        completion_value = (
+            APP_CONFIG.get("max_completion_tokens")
+            if "max_completion_tokens" in APP_CONFIG
+            else known.get("max_completion_tokens")
+        )
+    context = _positive_int(context_value, CONTEXT_WINDOW)
+    completion = _positive_int(completion_value, MAX_COMPLETION_TOKENS)
+    return context, min(completion, context)
+
+
 def activate_model(provider: str = "", model: str = ""):
     """Select and persist a configured provider and optional model."""
     global client, MODEL_NAME, ACTIVE_PROVIDER, DEFAULT_PROVIDER
@@ -1646,7 +1686,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                                      on_token, interrupt_check, trace, turn,
                                      max_tokens=None):
     emitted = False
-    max_tokens = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
+    max_tokens = max_tokens if max_tokens is not None else _active_model_token_limits()[1]
 
     def tracked_token(kind, delta):
         nonlocal emitted
@@ -6677,7 +6717,9 @@ def describe_capabilities() -> str:
     """
     lines = ["# Agent8088 capabilities", ""]
 
+    model_context, model_output = _active_model_token_limits()
     lines += [f"Model: {MODEL_NAME}",
+              f"Model token limits: {model_context:,} context / {model_output:,} output",
               f"Permission mode: {PERMISSION_MODE}",
               f"Sandbox backend: {_resolve_sandbox_backend()}",
               f"Max turns per request: {APP_CONFIG.get('max_turns', '10')}",
@@ -7122,9 +7164,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # After a length cutoff, the one retry gets a bigger budget (capped by
         # the model's context window) — the same fixed budget would just
         # reproduce the same cutoff if the model reasons a similar amount again.
+        turn_context_window, turn_completion_limit = _active_model_token_limits()
         turn_max_tokens = (
-            min(MAX_COMPLETION_TOKENS * 2, CONTEXT_WINDOW)
-            if length_retries else MAX_COMPLETION_TOKENS
+            min(turn_completion_limit * 2, turn_context_window)
+            if length_retries else turn_completion_limit
         )
         try:
             with spin("thinking..."):

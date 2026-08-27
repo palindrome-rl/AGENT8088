@@ -55,6 +55,11 @@ def gen_step():
 The tool injects `PARAMS` from the provided JSON. Never redefine it. `gen_step`
 takes no arguments and returns a build123d `Shape` or a labeled `Compound`.
 
+Keep the generator compact. Use small helper functions and loops for repeated
+features such as windows, holes, columns, fasteners, or floor elements instead
+of emitting nearly identical construction statements for every instance. Make
+one complete `generate_cad_model` call; do not narrate the source before calling.
+
 Allowed imports are build123d, math, dataclasses, and typing. File IO,
 network access, process execution, dynamic imports, private/dunder access, and
 calls such as `open`, `eval`, or `exec` are rejected. The tool owns every export;

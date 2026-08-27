@@ -4,6 +4,8 @@ bigger budget on retry — not the 'split large work across calls' advice and
 the same unchanged budget, which just reproduces the same failure.
 """
 
+import pytest
+
 
 def _length_response(content):
     return type("R", (), {"choices": [type("C", (), {
@@ -80,6 +82,63 @@ def test_retry_after_length_cutoff_gets_a_bigger_budget(monkeypatch, engine):
     expected_retry_budget = min(engine.MAX_COMPLETION_TOKENS * 2, engine.CONTEXT_WINDOW)
     assert calls[1] == expected_retry_budget
     assert calls[1] > calls[0]
+
+
+@pytest.mark.parametrize("model", ["glm-5.2", "glm-5.3-flash"])
+def test_known_active_model_uses_its_reviewed_output_limit(monkeypatch, engine, model):
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "MODEL_NAME", model)
+    engine.PROVIDERS["ollama-cloud"] = {"model": model}
+
+    context, completion = engine._active_model_token_limits()
+
+    assert context == 1_048_576
+    assert completion == 131_072
+
+
+def test_agent_call_receives_the_active_models_completion_limit(monkeypatch, engine):
+    seen = []
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "MODEL_NAME", "glm-5.2")
+    engine.PROVIDERS["ollama-cloud"] = {"model": "glm-5.2"}
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        seen.append(max_tokens)
+        return _stop_response("done")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    result = engine.run_agent(
+        [{"role": "user", "content": "build it"}], max_turns=1
+    )
+    assert result == "done"
+    assert seen == [131_072]
+
+
+def test_provider_token_override_wins_over_known_model(monkeypatch, engine):
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "MODEL_NAME", "glm-5.3-flash")
+    engine.PROVIDERS["ollama-cloud"] = {
+        "model": "glm-5.3-flash",
+        "context_window": "200000",
+        "max_completion_tokens": "24000",
+    }
+
+    assert engine._active_model_token_limits() == (200_000, 24_000)
+
+
+def test_unknown_model_keeps_conservative_defaults(monkeypatch, engine):
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "custom")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "custom")
+    monkeypatch.setattr(engine, "MODEL_NAME", "private-model")
+    engine.PROVIDERS["custom"] = {"model": "private-model"}
+
+    assert engine._active_model_token_limits() == (
+        engine.CONTEXT_WINDOW,
+        engine.MAX_COMPLETION_TOKENS,
+    )
 
 
 def test_turn_limit_reports_error_and_latest_tool_result(monkeypatch, engine):
