@@ -36,12 +36,13 @@ type HealthState = 'ok' | 'warn' | 'fail' | 'unknown'
 
 function classifyHealth(value: string): HealthState {
   const v = value.toLowerCase()
-  if (v.includes('ok') || v.includes('ready') || v.includes('set') || v.includes('found') || v.includes('available on demand')) {
+  if (v.includes('ok') || v.includes('ready') || v.includes('set') || v.includes('found')
+      || v.includes('not required') || v.includes('provider-managed')) {
     if (v.includes('available on demand')) return 'warn'
     return 'ok'
   }
-  if (v.includes('broken') || v.includes('missing') || v.includes('fail') || v.includes('error') || v.includes('not required')) return 'fail'
-  if (v.includes('provider-managed') || v.includes('unknown')) return 'unknown'
+  if (v.includes('broken') || v.includes('missing') || v.includes('fail') || v.includes('error')) return 'fail'
+  if (v.includes('unknown')) return 'unknown'
   return 'warn'
 }
 

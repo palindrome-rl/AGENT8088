@@ -11,6 +11,9 @@ import { cn } from '@/lib/utils'
  * dictation, and send. Pop-in menus, gliding highlight.
  * ───────────────────────────────────────────────────────── */
 
+/* Mirrors backend COMMANDS (cli.py) — interactive-only commands (exit/quit/
+ * stop/approve/deny) are excluded: they either terminate the REPL or expect
+ * stdin the web UI doesn't have. */
 const COMMANDS = [
   'help', 'tools', 'tool', 'capabilities', 'agents', 'agent', 'plan', 'image',
   'paste', 'audit', 'skills', 'cli-anything', 'raw', 'model', 'models', 'mcp',
@@ -18,7 +21,6 @@ const COMMANDS = [
   'new', 'sessions', 'resume', 'reset', 'compact',
   'history', 'trace', 'reasoning', 'think', 'verbose', 'usage', 'temp',
   'maxturns', 'limits', 'save', 'clear', 'memory',
-  'exit', 'quit', 'stop', 'approve', 'deny',
 ]
 
 function generatedSessionName() {
