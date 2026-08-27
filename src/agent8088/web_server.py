@@ -49,9 +49,11 @@ async def lifespan(app: FastAPI):
     # Same initialization the CLI does in main() before starting the REPL
     A.resolve_auto_search_provider()
     A.verify_sandbox_backend()
-    print(f"Agent8088 web server ready", flush=True)
+    # log.info, not print — printing after uvicorn closes stdout crashes with
+    # "I/O operation on closed file".
+    log.info("Agent8088 web server ready")
     yield
-    print("Agent8088 web server shutting down", flush=True)
+    log.info("Agent8088 web server shutting down")
 
 
 app = FastAPI(title="Agent8088 Web Bridge", version="0.1.0", lifespan=lifespan)
@@ -822,7 +824,9 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         return nullcontext()
 
     def on_token(kind, delta):
-        tokens_ref[0] += 1
+        # Count characters, not chunks — each callback is one streaming delta
+        # of arbitrary size, so += 1 wildly overstated "tokens".
+        tokens_ref[0] += len(delta)
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "token", "kind": kind, "delta": delta}),
             loop,
@@ -1020,6 +1024,11 @@ def run_web_server(host: str = "127.0.0.1", port: int = 8180, dev: bool = False)
     if not dev:
         # Try to mount the built frontend
         dist_dir = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
+        if not dist_dir.exists():
+            log.warning(
+                "web/dist not found — production UI will 404. "
+                "Run 'cd web && npm install && npm run build' first, or use --web-dev."
+            )
         _mount_static(app, dist_dir)
     print(f"Agent8088 web UI on http://{host}:{port}", flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning")

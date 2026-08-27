@@ -213,11 +213,12 @@ export default function MemoryPage() {
     queryFn: () => fetchJSON<MemoryStatus>('/api/memory/status'),
   })
 
-  // Search query (only fires when user submits)
+  // Memory search — fires ONLY on submit, never per keystroke.
+  const [submittedQuery, setSubmittedQuery] = useState('')
   const searchQueryFn = useQuery({
-    queryKey: ['memory', 'search', searchQuery],
-    queryFn: () => fetchJSON<SearchResponse>(`/api/memory/search?q=${encodeURIComponent(searchQuery)}`),
-    enabled: searchQuery.length > 0,
+    queryKey: ['memory', 'search', submittedQuery],
+    queryFn: () => fetchJSON<SearchResponse>(`/api/memory/search?q=${encodeURIComponent(submittedQuery)}`),
+    enabled: false,
   })
 
   // Toggle mutation
@@ -231,7 +232,7 @@ export default function MemoryPage() {
     mutationFn: (text: string) => postJSON<ActionResponse>('/api/memory/add', { text }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['memory', 'status'] })
-      if (searchQuery) queryClient.invalidateQueries({ queryKey: ['memory', 'search', searchQuery] })
+      if (submittedQuery) queryClient.invalidateQueries({ queryKey: ['memory', 'search', submittedQuery] })
     },
   })
 
@@ -240,14 +241,15 @@ export default function MemoryPage() {
     mutationFn: (factId: string) => deleteJSON<ActionResponse>(`/api/memory/${factId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['memory', 'status'] })
-      if (searchQuery) queryClient.invalidateQueries({ queryKey: ['memory', 'search', searchQuery] })
+      if (submittedQuery) queryClient.invalidateQueries({ queryKey: ['memory', 'search', submittedQuery] })
     },
   })
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
     if (searchQuery.trim()) {
-      searchQueryFn.refetch()
+      setSubmittedQuery(searchQuery.trim())
+      void searchQueryFn.refetch()
     }
   }
 
@@ -367,7 +369,7 @@ export default function MemoryPage() {
                 key={fact.id}
                 fact={fact}
                 onForget={(id) => forgetMutation.mutate(id)}
-                forgetting={forgetMutation.isPending}
+                forgetting={forgetMutation.variables === fact.id && forgetMutation.isPending}
               />
             ))}
           </div>

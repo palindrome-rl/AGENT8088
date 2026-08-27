@@ -89,6 +89,9 @@ export function Sidebar() {
   }, [settingsOpen])
 
   const handleNewChat = async () => {
+    // /reset overwrites the saved session file with empty messages — confirm
+    // first, this is not recoverable.
+    if (!window.confirm('Reset active session? Its saved messages will be cleared.')) return
     try {
       const response = await fetch('/api/sessions/reset', { method: 'POST' })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)

@@ -412,7 +412,7 @@ export default function SessionsPage() {
       {/* Dialogs */}
       <NewSessionDialog
         open={newSessionOpen}
-        onClose={() => setNewSessionOpen(false)}
+        onClose={() => { setNewSessionOpen(false); newMutation.reset() }}
         onCreate={(name) => newMutation.mutate(name)}
         isCreating={newMutation.isPending}
       />
