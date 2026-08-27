@@ -2174,6 +2174,47 @@ def cmd_cli_anything(rest):
     )
 
 
+def cmd_task(rest):
+    """Start, resume, or inspect a restart-safe model task."""
+    from agent8088.task_runtime import TaskStore, run_task, store_path
+    store = TaskStore(A.APP_CONFIG.get("task_db_path") or store_path(A.CONFIG_PATH))
+    parts = (rest or "").strip().split(None, 1)
+    action = parts[0].lower() if parts else "list"
+    if action in {"list", "status"}:
+        rows = store.list()
+        if not rows:
+            console.print("[dim]No durable tasks.[/dim]")
+        for row in rows:
+            console.print(f"{row['id'][:12]}  {row['state']:<10}  {row['goal'][:100]}")
+        store.close()
+        return
+    if action not in {"start", "resume"}:
+        console.print("[dim]usage: /task start <goal> | /task resume <id> | /task list[/dim]")
+        store.close()
+        return
+    task_id = parts[1].strip() if action == "resume" and len(parts) > 1 else None
+    goal = parts[1].strip() if action == "start" and len(parts) > 1 else ""
+    if action == "start" and not goal:
+        console.print("[red]A task goal is required.[/red]")
+        store.close()
+        return
+
+    def agent(messages, **kwargs):
+        return A.run_agent(
+            messages, temperature=S.temperature,
+            system_prompt=_session_system_prompt,
+            tools_def=lambda: A.build_tools_def(_active_tool_specs()),
+            allowed_tools=lambda: set(_active_tool_specs()), **kwargs,
+        )
+
+    row = run_task(goal, agent, store=store, workspace=A.PROJECT_ROOT,
+                   task_id=task_id, max_slices=8, slice_turns=max(4, S.max_turns))
+    console.print(f"[bold]task {row['id']}[/bold] → {row['state']} (slice {row['slice_no']})")
+    if row["last_answer"]:
+        console.print(row["last_answer"])
+    store.close()
+
+
 def _read_key(fd):
     """Read one keypress in cbreak mode, decoding arrow keys.
     Returns 'up'/'down'/'left'/'right'/'enter'/'esc' or the literal character."""
@@ -3984,6 +4025,7 @@ COMMANDS = {
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
     "memory": cmd_memory,
+    "task": cmd_task,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 

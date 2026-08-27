@@ -5422,6 +5422,14 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
         args = json.loads(arguments)
     except Exception:
         return "Invalid JSON"
+    # Durable task runs record intent before a side effect and its result after it.
+    # Import lazily so ordinary interactive turns keep the existing dependency graph.
+    try:
+        from agent8088.task_runtime import current_runtime
+        runtime = current_runtime()
+    except Exception:
+        runtime = None
+    operation_id = runtime.before_tool(name, args) if runtime else None
 
     # Taken before the call runs: once it has written, the previous state is the
     # one thing that cannot be reconstructed.
@@ -5449,6 +5457,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
 
     # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
     result = _redact_secrets(result)
+    if runtime and operation_id:
+        runtime.after_tool(operation_id, result)
 
     if (TOOL_SPECS.get(name, {}).get("mode") or "").lower() != "last_output":
         _last_tool_output, _last_tool_name = result, name
