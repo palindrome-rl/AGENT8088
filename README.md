@@ -49,13 +49,13 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/Build123_Dev/install.sh | AGENT8088_BRANCH=Build123_Dev bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+$env:AGENT8088_BRANCH = "Build123_Dev"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/Build123_Dev/install.ps1)
 ```
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
