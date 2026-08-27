@@ -191,6 +191,7 @@ CHROMIUM_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
 SANDBOX_INSTALLED=false
+CAD_RUNTIME_INSTALLED=false
 
 # Detect non-interactive mode (curl | bash). When stdin is not a terminal,
 # read -p fails with EOF, causing set -e to abort.
@@ -258,6 +259,7 @@ T_CHROMIUM=$((600     * TIMEOUT_SCALE))   # ~150 MB browser download
 T_NODE_DL=$((180      * TIMEOUT_SCALE))   # ~30 MB tarball
 T_PIP=$((300          * TIMEOUT_SCALE))   # gateway extras: tens of MB of wheels
 T_GIT=$((600          * TIMEOUT_SCALE))   # shallow clone: small, but a stalled fetch hangs
+T_CAD_RUNTIME=$((1800 * TIMEOUT_SCALE))   # OpenCascade/VTK wheels + STEP smoke test
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
 # premature cut fails the install outright -- but it is still the largest
@@ -1037,6 +1039,134 @@ install_deps() {
 }
 
 # ----------------------------------------------------------------------------
+# Isolated build123d + text-to-cad runtime. This replaces the desktop FreeCAD
+# dependency and stays outside the core venv so its OpenCascade/VTK stack cannot
+# destabilize chat, search, or documents. Failure is optional and explicit.
+# ----------------------------------------------------------------------------
+install_cad_runtime() {
+    local _root="$AGENT8088_HOME/integrations/cad"
+    local _venv="$_root/venv"
+    local _py="$_venv/bin/python"
+    local _requirements="$INSTALL_DIR/src/agent8088/cad_runtime_requirements.txt"
+    local _verifier="$INSTALL_DIR/scripts/verify_cad_runtime.py"
+    local _probe="from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.26'"
+    local _dependencies_ready=false
+
+    if [ -x "$_py" ] && run_with_timeout 30 "$_py" -I -c "$_probe" >/dev/null 2>&1; then
+        _dependencies_ready=true
+        log_info "build123d + text-to-cad CAD dependencies already installed"
+    fi
+    if [ ! -f "$_requirements" ] || [ ! -f "$_verifier" ]; then
+        warn_stage 1 "$T_CAD_RUNTIME" "Advanced CAD runtime" \
+            "packaged runtime requirements are missing" \
+            "rerun the Agent8088 installer from a complete checkout"
+        return 0
+    fi
+
+    mkdir -p "$_root"
+    local _rc=0
+    if [ "$_dependencies_ready" != true ] && [ "$DISTRO" = "termux" ]; then
+        log_info "Installing isolated build123d + text-to-cad CAD runtime..."
+        if ! python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+            warn_stage 1 "$T_CAD_RUNTIME" "Advanced CAD runtime" \
+                "cadgen needs Python 3.11 or newer" \
+                "upgrade Termux Python, then rerun the installer"
+            return 0
+        fi
+        run_with_timeout "$T_VENV" python -m venv --clear "$_venv" >/dev/null 2>&1 || _rc=$?
+        if [ "$_rc" -eq 0 ]; then
+            run_with_timeout "$T_CAD_RUNTIME" "$_py" -m pip install \
+                --requirement "$_requirements" >/dev/null 2>&1 || _rc=$?
+        fi
+    elif [ "$_dependencies_ready" != true ]; then
+        log_info "Installing isolated build123d + text-to-cad CAD runtime..."
+        # cadgen 0.4.26 requires 3.11+, independently of the core agent's
+        # supported Python. uv keeps this managed interpreter isolated.
+        run_with_timeout "$T_VENV" "$UV_CMD" python install 3.11 \
+            >/dev/null 2>&1 || _rc=$?
+        if [ "$_rc" -eq 0 ]; then
+            run_with_timeout "$T_VENV" "$UV_CMD" venv --python 3.11 \
+                --clear "$_venv" >/dev/null 2>&1 || _rc=$?
+        fi
+        if [ "$_rc" -eq 0 ]; then
+            run_with_timeout "$T_CAD_RUNTIME" "$UV_CMD" pip install --python "$_py" \
+                --requirement "$_requirements" >/dev/null 2>&1 || _rc=$?
+        fi
+    fi
+    if [ "$_rc" -ne 0 ] || [ ! -x "$_py" ]; then
+        warn_stage "$_rc" "$T_CAD_RUNTIME" "Advanced CAD runtime" \
+            "isolated dependency install failed" \
+            "rerun with AGENT8088_TIMEOUT_SCALE=3 on a slow link"
+        return 0
+    fi
+
+    # The preview renderer is part of the CAD runtime contract. Install the
+    # Chromium revision matching this isolated runtime's pinned Playwright.
+    export PLAYWRIGHT_BROWSERS_PATH="$AGENT8088_HOME/playwright-browsers"
+    _rc=0
+    run_with_timeout "$T_CHROMIUM" "$_py" -m playwright install chromium \
+        >/dev/null 2>&1 || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        warn_stage "$_rc" "$T_CHROMIUM" "Advanced CAD runtime" \
+            "preview browser installation failed" \
+            "rerun with AGENT8088_TIMEOUT_SCALE=3 on a slow link"
+        return 0
+    fi
+
+    # cadgen currently depends on the VTK-enabled OpenCascade wheel. On a
+    # minimal Linux image importing OCP needs libGL.so.1 even for headless STEP
+    # work. Playwright's optional system-dependency stage often installs it,
+    # but CAD must not silently depend on that unrelated stage succeeding.
+    # Do not introduce another password prompt for an optional component:
+    # install only as root or through an already-authorized/passwordless sudo.
+    if [ "$OS" = "linux" ] && ! "$_py" -c \
+            "import ctypes; ctypes.CDLL('libGL.so.1')" >/dev/null 2>&1; then
+        local _libgl_pkg="" _priv_mode="" _libgl_rc=1
+        case "$DISTRO" in
+            ubuntu|debian) _libgl_pkg="libgl1" ;;
+            fedora)        _libgl_pkg="libglvnd-glx" ;;
+            arch)          _libgl_pkg="libglvnd" ;;
+        esac
+        _priv_mode="$(_privileged_run_mode)"
+        if [ -n "$_libgl_pkg" ]; then
+            log_info "Installing the headless CAD system library ($_libgl_pkg)..."
+            case "$_priv_mode" in
+                direct)
+                    case "$DISTRO" in
+                        ubuntu|debian) run_with_timeout "$T_PIP" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$_libgl_pkg" >/dev/null 2>&1 && _libgl_rc=0 ;;
+                        fedora) run_with_timeout "$T_PIP" dnf install -y "$_libgl_pkg" >/dev/null 2>&1 && _libgl_rc=0 ;;
+                        arch) run_with_timeout "$T_PIP" pacman -S --noconfirm "$_libgl_pkg" >/dev/null 2>&1 && _libgl_rc=0 ;;
+                    esac
+                    ;;
+                sudo)
+                    case "$DISTRO" in
+                        ubuntu|debian) run_with_timeout "$T_PIP" sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$_libgl_pkg" >/dev/null 2>&1 && _libgl_rc=0 ;;
+                        fedora) run_with_timeout "$T_PIP" sudo -n dnf install -y "$_libgl_pkg" >/dev/null 2>&1 && _libgl_rc=0 ;;
+                        arch) run_with_timeout "$T_PIP" sudo -n pacman -S --noconfirm "$_libgl_pkg" >/dev/null 2>&1 && _libgl_rc=0 ;;
+                    esac
+                    ;;
+            esac
+        fi
+        if [ "$_libgl_rc" -ne 0 ]; then
+            log_warn "Advanced CAD needs libGL.so.1; automatic setup had no existing elevated access."
+            [ -n "$_libgl_pkg" ] && log_info "  Install it manually, then rerun: sudo <package-manager> install $_libgl_pkg"
+        fi
+    fi
+
+    # Real worker round trip: build, export, reopen, validate, and render.
+    _rc=0
+    run_with_timeout 240 "$_py" -I "$_verifier" >/dev/null 2>&1 || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        warn_stage "$_rc" 240 "Advanced CAD runtime" \
+            "installed packages failed the STEP and preview round-trip smoke test" \
+            "rerun the installer and inspect OpenCascade or Chromium loading errors"
+        return 0
+    fi
+    CAD_RUNTIME_INSTALLED=true
+    log_success "build123d + text-to-cad CAD runtime installed and verified"
+}
+
+# ----------------------------------------------------------------------------
 # Stage 5b: Node.js (for WhatsApp bridge) + npm install
 # ----------------------------------------------------------------------------
 # WhatsApp's bridge is a Node.js process (Baileys). Without Node on PATH the
@@ -1493,6 +1623,11 @@ verify_install() {
     else
         echo "  Browser:  Chromium missing (browse_page will show install instructions)"
     fi
+    if [ "$CAD_RUNTIME_INSTALLED" = true ]; then
+        echo "  CAD:      build123d + text-to-cad runtime installed and verified"
+    else
+        echo "  CAD:      advanced CAD runtime unavailable (core agent still works)"
+    fi
     if [ "$WHATSAPP_BRIDGE_READY" = true ]; then
         echo "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"
     elif [ "$NODE_INSTALLED" = true ]; then
@@ -1598,6 +1733,7 @@ main() {
     check_git
     clone_repo
     install_deps
+    install_cad_runtime
     install_node_bridge
     install_embedding_model
     install_native_sandbox

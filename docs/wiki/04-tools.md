@@ -44,8 +44,10 @@ is what the permission layer gates on — see
 | `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
 | `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
 | `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
-| `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert an existing CAD file between STEP/IGES/STL/OBJ/BREP/FCStd/DXF via FreeCAD. |
+| `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert a supported solid CAD file through the isolated build123d runtime. |
 | `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
+| `generate_cad_model` | `write_text` | `filename`, `source`, `parameters`, `formats` | prompt | Generate a parameterized STEP-first model, validate it, and render a preview. |
+| `validate_cad_model` | `write_text` | `filename`, `render` | prompt | Reopen and validate a STEP model and optionally render an isometric preview. |
 
 `*` optional argument.
 
@@ -75,29 +77,30 @@ of them instead of needing a parallel set that could drift.
 
 ## CAD
 
-Reading is automatic: point `read_text` at a `.step`, `.stp`, `.iges`, `.igs`,
-`.stl`, `.obj`, `.brep`, `.dxf` or `.fcstd` and it comes back as a text summary —
-object tree, bounding box, volume, surface area.
+Reading is automatic for STEP, BREP, and STL. The isolated CAD worker reopens
+the artifact and reports its bounding box, solid count, volume, and topology
+validity rather than interpreting it as text.
 
-`convert_cad` converts between those formats. `create_cad_part` builds a
-primitive (box, cylinder, sphere, cone, tube) from a dimension string like
-`50x30x10` or `r10x50`, with the output format taken from the filename
-extension — no code generation, which is the point: it is the deterministic
-floor for when writing FreeCAD Python defeats the model.
+`create_cad_part` is the structured, no-code path for one box, cylinder, sphere,
+cone, or tube. `generate_cad_model` is the advanced path: build123d constructs
+the parametric geometry while text-to-cad/cadgen manages STEP-first generation,
+topology validation, and preview rendering. It retains the source, JSON
+parameters, STEP, report, preview, and requested STL/3MF/GLB/BREP exports.
+`validate_cad_model` can repeat the reopen, topology, and render checks later.
 
-All of it needs **FreeCAD** installed. The Windows installer attempts it via
-WinGet, and `AGENT8088_FREECAD` can point at a portable extraction's
-`freecadcmd.exe` instead — FreeCAD publishes a no-install `.7z` that avoids
-elevation. When it is absent, every CAD path says so and names the install
-command rather than failing obscurely.
+Both upstream engines are pinned in a dedicated Python 3.11
+`integrations/cad/venv` environment installed on a best-effort basis by both
+platform installers. A
+CAD-stage failure never blocks the core agent, and `/doctor` reports whether
+the exact runtime versions are ready. Native `.FCStd` feature trees are not
+created; validated STEP is the canonical editable interchange artifact.
 
-PDF is deliberately **not** a `convert_cad` target. Exporting a 3D model to PDF
-means generating a TechDraw drawing — template, projection direction, scale —
-not a format conversion, and the naive page-and-view export that resembles one
-produces an empty sheet.
+PDF is deliberately **not** a `convert_cad` target. A useful 3D-to-PDF result
+requires a drawing definition (template, projection, dimensions, and scale),
+not a format conversion.
 
-Both CAD write tools share `mode=write_text` for the same reason
-`create_document` does, and both are excluded from the plan auditor: they verify
+All CAD write tools share `mode=write_text` for the same reason
+`create_document` does, and all are excluded from the plan auditor: they verify
 their own output on disk, while the auditor runs in a disposable sandbox copy
 that cannot see the real file, so auditing them yields verdicts from the
 auditor's own blindness.

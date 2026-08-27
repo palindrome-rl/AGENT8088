@@ -38,6 +38,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 | **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
+| **Generate verified CAD** | Build parameterized mechanical parts and assemblies with build123d, then use text-to-cad for STEP-first generation, topology checks, secondary exports, and rendered preview verification. |
 
 ---
 
@@ -68,6 +69,7 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
 | Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
+| Advanced CAD runtime (build123d + text-to-cad) | yes (isolated, optional) | yes (isolated, optional) |
 
 ### Supported platforms
 
@@ -146,6 +148,23 @@ Python harness entries; public npm, uv, bundled, and generic shell installers
 remain visible for manual review. After installing a harness, Agent8088 loads
 its packaged `SKILL.md` before execution so application-specific prerequisites
 and command guidance remain available without eagerly expanding the prompt.
+
+### Verified CAD generation *(experimental)*
+
+Agent8088's built-in CAD path uses [build123d](https://github.com/gumyr/build123d)
+for OpenCascade geometry and the pinned
+[text-to-cad](https://github.com/earthtojake/text-to-cad) `cadgen` workflow for
+STEP-first generation, topology validation, and isometric preview rendering.
+The dependencies live in a dedicated environment under
+`integrations/cad/venv`, with a managed Python 3.11 interpreter, so they cannot
+change the core agent's Python packages or its supported Python version.
+
+Simple boxes, cylinders, spheres, cones, and tubes use a structured primitive
+tool. Parameterized parts and assemblies retain their build123d source and JSON
+parameters, then must produce a valid STEP model, report, and preview before the
+agent reports success. STL, 3MF, GLB, and BREP can be requested as secondary
+exports. This backend intentionally does not create native `.FCStd` feature
+trees; STEP is its canonical editable interchange format.
 
 ---
 

@@ -201,6 +201,7 @@ $ChromiumInstalled = $false
 $NodeInstalled = $false
 $WhatsAppBridgeReady = $false
 $SandboxInstalled = $false
+$CadRuntimeInstalled = $false
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -248,6 +249,7 @@ $TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
 $TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
 $TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
 $TLibreOffice = 1800 * $TimeoutScale  # ~350 MB MSI plus dependency resolution/install
+$TCadRuntime  = 1800 * $TimeoutScale  # OpenCascade/VTK wheels plus runtime smoke test
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
 # premature cut fails the install outright -- but it is still the largest
@@ -864,70 +866,106 @@ function Install-LibreOffice {
 }
 
 # ----------------------------------------------------------------------------
-# FreeCAD (headless freecadcmd) - CAD inspection, format conversion, and
-# parametric part generation. Used by the cad tools and skill; nothing in
-# engine.py requires it to exist.
-#
-# Same contract as Install-LibreOffice above: detect first, install via WinGet,
-# and on failure register a skipped stage rather than aborting setup. FreeCAD
-# is ~1GB, so a slow or interrupted download must not take the whole install
-# down with it.
-#
-# AGENT8088_FREECAD lets someone point at a portable extraction instead --
-# FreeCAD publishes a no-install .7z, which avoids the elevation an MSI-style
-# install needs. Detection honours that variable, so this step failing is
-# recoverable without admin rights.
+# Isolated build123d + text-to-cad runtime. This replaces the desktop FreeCAD
+# dependency. It is deliberately outside the core venv: cadgen's OpenCascade,
+# VTK and scientific wheels are large and must not destabilize chat, search or
+# document dependencies. A failed optional CAD stage never blocks Agent8088.
 # ----------------------------------------------------------------------------
-function Install-FreeCAD {
-    $freecadNames = @("freecadcmd.exe", "FreeCADCmd.exe")
-    # The official installer defaults to a per-user, no-elevation install
-    # under %LOCALAPPDATA%\Programs, not Program Files -- confirmed on a real
-    # install; this was a guess when first written (see cad.py's own note).
-    $freecadDirs = @(
-        "$env:ProgramFiles\FreeCAD 1.1\bin",
-        "$env:ProgramFiles\FreeCAD\bin",
-        "${env:ProgramFiles(x86)}\FreeCAD 1.1\bin",
-        "${env:ProgramFiles(x86)}\FreeCAD\bin",
-        "$env:LOCALAPPDATA\Programs\FreeCAD 1.1\bin",
-        "$env:LOCALAPPDATA\Programs\FreeCAD\bin"
-    )
-    $candidates = foreach ($dir in $freecadDirs) {
-        foreach ($name in $freecadNames) { Join-Path $dir $name }
-    }
-    if ($env:AGENT8088_FREECAD) { $candidates = @($env:AGENT8088_FREECAD) + $candidates }
+function Install-CadRuntime {
+    $runtimeRoot = Join-Path $Agent8088Home "integrations\cad"
+    $runtimeVenv = Join-Path $runtimeRoot "venv"
+    $runtimePy = Join-Path $runtimeVenv "Scripts\python.exe"
+    $requirements = Join-Path $InstallDir "src\agent8088\cad_runtime_requirements.txt"
+    $worker = Join-Path $InstallDir "src\agent8088\cad_worker.py"
+    $verifier = Join-Path $InstallDir "scripts\verify_cad_runtime.py"
+    $probe = "from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.26'"
+    $dependenciesReady = $false
 
-    $existing = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($existing) {
-        Write-Success "FreeCAD found at $existing"
-        return $true
+    if (Test-Path -LiteralPath $runtimePy) {
+        $ready = Invoke-WithTimeout -FilePath $runtimePy `
+            -Arguments @("-I", "-c", $probe) -TimeoutSec 30 -Activity "Checking advanced CAD runtime"
+        if (-not $ready.TimedOut -and $ready.ExitCode -eq 0) {
+            $dependenciesReady = $true
+            Write-Info "build123d + text-to-cad CAD dependencies already installed"
+        } else {
+            Write-Warn "Existing CAD runtime is incomplete - rebuilding it"
+        }
     }
 
-    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $winget) {
-        Write-Warn "WinGet not found - cannot install FreeCAD automatically."
-        Register-SkippedStage -Label "FreeCAD" `
-            -Reason "no WinGet available" `
-            -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
+    if (-not (Test-Path -LiteralPath $requirements) -or
+        -not (Test-Path -LiteralPath $worker) -or
+        -not (Test-Path -LiteralPath $verifier)) {
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "packaged runtime files are missing" `
+            -Fix "rerun the Agent8088 installer from a complete checkout"
         return $false
     }
 
-    Write-Info "Installing FreeCAD (needed for CAD inspection, conversion, and part generation; ~1GB) ..."
-    & $winget.Source install --id FreeCAD.FreeCAD --exact --source winget `
-        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
-    $wingetExit = $LASTEXITCODE
+    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+    if (-not $dependenciesReady) {
+        Write-Info "Installing isolated build123d + text-to-cad CAD runtime..."
+        # cadgen 0.4.26 requires Python 3.11+, while Agent8088 core intentionally
+        # still supports 3.10. Keep that requirement inside this isolated runtime.
+        $cadPython = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("python", "install", "3.11") -TimeoutSec $TVenv `
+            -Activity "Installing managed Python 3.11 for advanced CAD"
+        if ($cadPython.TimedOut -or $cadPython.ExitCode -ne 0) {
+            $why = if ($cadPython.TimedOut) { "timed out" } else { "uv exit $($cadPython.ExitCode)" }
+            Register-SkippedStage -Label "Advanced CAD runtime" `
+                -Reason "managed Python 3.11 install failed ($why)" `
+                -Fix "rerun the installer; the core agent works without advanced CAD"
+            return $false
+        }
+        $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("venv", "--python", "3.11", "--clear", $runtimeVenv) `
+            -TimeoutSec $TVenv -Activity "Creating isolated CAD environment"
+        if ($venvResult.TimedOut -or $venvResult.ExitCode -ne 0 -or -not (Test-Path $runtimePy)) {
+            $why = if ($venvResult.TimedOut) { "timed out" } else { "uv exit $($venvResult.ExitCode)" }
+            Register-SkippedStage -Label "Advanced CAD runtime" -Reason "venv creation failed ($why)" `
+                -Fix "rerun the installer; the core agent works without advanced CAD"
+            return $false
+        }
 
-    $installed = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($installed) {
-        Write-Success "FreeCAD installed at $installed"
-        return $true
+        $installResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $runtimePy, "--requirement", $requirements) `
+            -TimeoutSec $TCadRuntime -Activity "Installing build123d and text-to-cad"
+        if ($installResult.TimedOut -or $installResult.ExitCode -ne 0) {
+            $why = if ($installResult.TimedOut) { "timed out after $([int]($TCadRuntime / 60))m" } else { "uv exit $($installResult.ExitCode)" }
+            Register-SkippedStage -Label "Advanced CAD runtime" -Reason "dependency install failed ($why)" `
+                -Fix "rerun the installer; set AGENT8088_TIMEOUT_SCALE=3 on a slow link"
+            return $false
+        }
     }
 
-    Write-Warn "FreeCAD install did not complete (WinGet exit $wingetExit)."
-    Register-SkippedStage -Label "FreeCAD" `
-        -Reason "WinGet install failed (exit $wingetExit)" `
-        -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
-    return $false
+    # The preview renderer is part of the CAD runtime contract. Install the
+    # browser revision matching the pinned Playwright package, even if the core
+    # agent currently happens to use the same revision.
+    $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $Agent8088Home "playwright-browsers"
+    $browser = Invoke-WithTimeout -FilePath $runtimePy `
+        -Arguments @("-m", "playwright", "install", "chromium") `
+        -TimeoutSec $TChromium -Activity "Installing advanced CAD preview browser"
+    if ($browser.TimedOut -or $browser.ExitCode -ne 0) {
+        $why = if ($browser.TimedOut) { "timed out" } else { "Playwright exit $($browser.ExitCode)" }
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "preview browser install failed ($why)" `
+            -Fix "rerun the installer; set AGENT8088_TIMEOUT_SCALE=3 on a slow link"
+        return $false
+    }
+
+    # A real round trip catches missing native wheels, invalid OpenCascade
+    # output, and a browser that installs but cannot render a CAD preview.
+    $smoke = Invoke-WithTimeout -FilePath $runtimePy `
+        -Arguments @("-I", $verifier) -TimeoutSec 240 -Activity "Verifying advanced CAD generation and preview"
+    if ($smoke.TimedOut -or $smoke.ExitCode -ne 0) {
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "installed packages failed the STEP and preview round-trip smoke test" `
+            -Fix "rerun the installer; inspect antivirus blocks if OpenCascade or Chromium cannot start"
+        return $false
+    }
+
+    $script:CadRuntimeInstalled = $true
+    Write-Success "build123d + text-to-cad CAD runtime installed and verified"
+    return $true
 }
 
 function ConvertTo-PowerShellLiteral {
@@ -2460,6 +2498,11 @@ function Verify-Install {
     } else {
         Write-Host "  Browser:  Chromium missing (browse_page will show install instructions)"
     }
+    if ($script:CadRuntimeInstalled) {
+        Write-Host "  CAD:      build123d + text-to-cad runtime installed and verified"
+    } else {
+        Write-Host "  CAD:      advanced CAD runtime unavailable (core agent still works)"
+    }
     if ($script:WhatsAppBridgeReady) {
         Write-Host "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"
     } elseif ($script:NodeInstalled) {
@@ -2604,7 +2647,7 @@ try {
     Install-Gateway-Extras
     Install-Node-Bridge
     Install-LibreOffice
-    Install-FreeCAD
+    Install-CadRuntime
     Install-Embedding-Model
     Install-Native-Sandbox
     if (-not (Setup-Path)) {

@@ -2738,7 +2738,10 @@ _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 # noise that costs a model call and tokens, and on a `fail` verdict can revert
 # correct work. Excluded here: convert_document checks output_path.exists() and
 # the byte count itself; there is no model-authored logic to second-guess.
-_NON_AUDITABLE_TOOLS = {"convert_document", "convert_cad", "create_cad_part"}
+_NON_AUDITABLE_TOOLS = {
+    "convert_document", "convert_cad", "create_cad_part",
+    "generate_cad_model", "validate_cad_model",
+}
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
 
@@ -5343,6 +5346,28 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             result = cad.create_cad_part(target, str(args.get("shape", "")),
                                          str(args.get("dimensions", "")))
             _last_write_diff = None  # binary output — a text diff would be noise
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path instead.")
+            return result
+        if name == "generate_cad_model":
+            result = cad.generate_cad_model(
+                target,
+                content,
+                str(args.get("parameters", "{}")),
+                str(args.get("formats", "step,stl")),
+            )
+            _last_write_diff = None
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path instead.")
+            return result
+        if name == "validate_cad_model":
+            render_value = str(args.get("render", "true")).strip().lower()
+            result = cad.validate_cad_model(
+                target, render=render_value not in {"0", "false", "no", "off"}
+            )
+            _last_write_diff = None
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path instead.")

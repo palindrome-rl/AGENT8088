@@ -23,6 +23,19 @@ def _create_cad_part(engine, path, shape, dimensions):
         "create_cad_part", json.dumps({"filename": str(path), "shape": shape, "dimensions": dimensions}))
 
 
+def _generate_cad_model(engine, path, source, parameters="{}", formats="step,stl"):
+    return engine.exec_tool("generate_cad_model", json.dumps({
+        "filename": str(path), "source": source,
+        "parameters": parameters, "formats": formats,
+    }))
+
+
+def _validate_cad_model(engine, path, render=True):
+    return engine.exec_tool("validate_cad_model", json.dumps({
+        "filename": str(path), "render": render,
+    }))
+
+
 @pytest.fixture
 def ready(engine, tmp_path):
     engine.PERMISSION_MODE = "full-auto"
@@ -36,6 +49,11 @@ def test_convert_cad_is_registered_with_the_write_mode(engine):
 
 def test_create_cad_part_is_registered_with_the_write_mode(engine):
     assert engine.TOOL_SPECS["create_cad_part"]["mode"] == "write_text"
+
+
+def test_advanced_cad_tools_are_registered_with_the_write_mode(engine):
+    assert engine.TOOL_SPECS["generate_cad_model"]["mode"] == "write_text"
+    assert engine.TOOL_SPECS["validate_cad_model"]["mode"] == "write_text"
 
 
 def test_convert_cad_is_excluded_from_the_auditor(engine):
@@ -61,6 +79,11 @@ def test_create_cad_part_is_excluded_from_the_auditor(engine):
     assert engine._plan_step_is_auditable("create_cad_part", "") is False
     assert engine._plan_step_is_auditable("create_cad_part", "file exists") is False
     assert engine._plan_step_is_auditable("write_file", "") is True
+
+
+def test_advanced_cad_tools_are_excluded_from_the_auditor(engine):
+    assert engine._plan_step_is_auditable("generate_cad_model", "") is False
+    assert engine._plan_step_is_auditable("validate_cad_model", "") is False
 
 
 def test_convert_cad_description_survived_the_pipe_delimited_registry(engine):
@@ -112,6 +135,39 @@ def test_create_cad_part_flows_through_to_cad_module(engine, tmp_path, monkeypat
     assert seen["shape"] == "box"
     assert seen["dimensions"] == "50x30x10"
     assert seen["path"].endswith("out.step")
+
+
+def test_generate_cad_model_flows_through_with_structured_source(engine, tmp_path, monkeypatch):
+    engine.PERMISSION_MODE = "full-auto"
+    engine.ALLOWED_PATHS = [tmp_path]
+    seen = {}
+
+    def fake_generate(path, source, parameters, formats, timeout=600):
+        seen.update(path=str(path), source=source, parameters=parameters, formats=formats)
+        return "Generated and verified model.step"
+
+    monkeypatch.setattr(engine.cad, "generate_cad_model", fake_generate)
+    source = "from build123d import Box\ndef gen_step():\n    return Box(1, 2, 3)"
+    result = _generate_cad_model(engine, tmp_path / "model.step", source, '{"x":1}', "step")
+    assert "Generated and verified" in result
+    assert seen["source"] == source
+    assert seen["parameters"] == '{"x":1}'
+
+
+def test_validate_cad_model_flows_through_and_parses_false(engine, tmp_path, monkeypatch):
+    engine.PERMISSION_MODE = "full-auto"
+    engine.ALLOWED_PATHS = [tmp_path]
+    model = tmp_path / "model.step"
+    model.write_bytes(b"step")
+    seen = {}
+
+    def fake_validate(path, render=True, timeout=300):
+        seen["render"] = render
+        return "Validated model.step"
+
+    monkeypatch.setattr(engine.cad, "validate_cad_model", fake_validate)
+    assert "Validated" in _validate_cad_model(engine, model, "false")
+    assert seen["render"] is False
 
 
 @pytest.mark.parametrize("mode", ["readonly", "plan-only"])
@@ -167,3 +223,20 @@ def test_create_cad_part_cannot_target_a_sensitive_path(engine, tmp_path, monkey
     target = tmp_path / "id_rsa"
     result = _create_cad_part(engine, target, "box", "50x30x10")
     assert "Error" in result or "denied" in result.lower()
+
+
+@pytest.mark.parametrize("tool", ["generate_cad_model", "validate_cad_model"])
+def test_advanced_cad_tools_are_gated_outside_full_auto(engine, tmp_path, monkeypatch, tool):
+    engine.PERMISSION_MODE = "readonly"
+    engine.ALLOWED_PATHS = [tmp_path]
+    target = tmp_path / "model.step"
+    target.write_bytes(b"step")
+    monkeypatch.setattr(
+        engine.cad, tool,
+        lambda *a, **k: pytest.fail("CAD backend must not run before the write gate"),
+    )
+    if tool == "generate_cad_model":
+        result = _generate_cad_model(engine, target, "def gen_step():\n    pass")
+    else:
+        result = _validate_cad_model(engine, target)
+    assert result.startswith("ESCALATION_REQUEST\x1f") or "denied" in result.lower()
