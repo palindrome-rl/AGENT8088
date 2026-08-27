@@ -384,3 +384,41 @@ def test_advanced_cad_tools_are_gated_outside_full_auto(engine, tmp_path, monkey
     else:
         result = _validate_cad_model(engine, target)
     assert result.startswith("ESCALATION_REQUEST\x1f") or "denied" in result.lower()
+# The CAD contract is injected into the system prompt while the same round
+# filters the tool schema. Those two must agree: the first version named
+# generate_cad_model unconditionally, so a request with no advanced-geometry
+# keyword hid the tool, the model followed the prompt anyway, and the call came
+# back "Unknown tool 'generate_cad_model' - not available."
+GENERATION_TOOLS = ("generate_cad_design", "generate_cad_model")
+
+
+@pytest.mark.parametrize("available", [
+    {"create_cad_part", "generate_cad_design", "generate_cad_model"},
+    {"create_cad_part", "generate_cad_design"},
+    {"create_cad_part"},
+    set(),
+])
+def test_cad_contract_never_names_an_unavailable_generation_tool(engine, available):
+    contract = engine._cad_runtime_instruction(available)
+    for tool in GENERATION_TOOLS:
+        if tool in available:
+            continue
+        directive = [
+            line for line in contract.splitlines()
+            if tool in line and "NOT available" not in line and "Do not call" not in line
+        ]
+        assert not directive, (
+            f"contract directs the model to {tool}, which is not in the round's schema: "
+            f"{directive}"
+        )
+
+
+def test_cad_contract_directs_to_the_declarative_tool_when_it_is_the_only_one(engine):
+    contract = engine._cad_runtime_instruction({"create_cad_part", "generate_cad_design"})
+    assert "use generate_cad_design" in contract
+    assert "generate_cad_model is NOT available" in contract
+
+
+def test_cad_contract_stops_generation_talk_once_the_retry_budget_is_gone(engine):
+    contract = engine._cad_runtime_instruction({"create_cad_part"})
+    assert "No CAD generation tool is available" in contract

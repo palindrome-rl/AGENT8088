@@ -7247,15 +7247,40 @@ def _advanced_cad_source_requested(messages: list[dict]) -> bool:
     ))
 
 
-def _cad_runtime_instruction() -> str:
-    """Small dynamic routing contract with the actual output location."""
+def _cad_runtime_instruction(available: set[str] | None = None) -> str:
+    """Small dynamic routing contract with the actual output location.
+
+    The routing line is built from the tools that survived this round's
+    filter. Naming a tool the model cannot call makes it emit a call that
+    comes back "Unknown tool", so the contract tracks the schema instead of
+    describing the full toolset unconditionally.
+    """
+    available = available if available is not None else set()
+    if "generate_cad_design" not in available:
+        routing = (
+            "- No CAD generation tool is available for the rest of this request. "
+            "Do not call generate_cad_design or generate_cad_model. Report the last "
+            "specific failure and the artifacts already produced.\n"
+        )
+    elif "generate_cad_model" in available:
+        routing = (
+            "- Use create_cad_part for one primitive. For complex parts/assemblies use "
+            "generate_cad_design first. Use generate_cad_model only when the declarative "
+            "schema cannot express the requested geometry.\n"
+        )
+    else:
+        routing = (
+            "- Use create_cad_part for one primitive. For every complex part or assembly "
+            "use generate_cad_design. generate_cad_model is NOT available for this "
+            "request and calling it will fail: the declarative schema covers this "
+            "geometry. Express bored holes, pockets and repeated features with cut "
+            "primitives plus rotate and placements.\n"
+        )
     return (
         "CAD EXECUTION CONTRACT (active for this request):\n"
         f"- Generated files belong in {ARTIFACTS_ROOT}. Pass a bare .step filename; "
         "the tool resolves it there. Never guess C:/artifacts or inspect paths with a shell.\n"
-        "- Use create_cad_part for one primitive. For complex parts/assemblies use "
-        "generate_cad_design first. Use generate_cad_model only when the declarative "
-        "schema cannot express the requested geometry.\n"
+        + routing +
         "- For an existing artifact or after successful generation, use open_cad_viewer "
         "for interactive review. Do not start a server or browser through a shell. Unless "
         "the user declined visual review, hand generated CAD to the Viewer before the final answer.\n"
@@ -7368,7 +7393,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         if cad_generation:
             round_system_prompt = (
                 (round_system_prompt or current_system_prompt())
-                + "\n\n" + _cad_runtime_instruction()
+                + "\n\n" + _cad_runtime_instruction(round_allowed_tools)
             )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
