@@ -11,7 +11,11 @@ tokens outside the user's existing turn budget ceiling.
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from pydantic import ValidationError
 from browser_use.llm.litellm import ChatLiteLLM
+from browser_use.llm.litellm.serializer import LiteLLMMessageSerializer
+from browser_use.llm.schema import SchemaOptimizer
+from browser_use.llm.views import ChatInvokeCompletion
 
 
 @dataclass
@@ -23,10 +27,62 @@ class Agent8088ChatModel(ChatLiteLLM):
             over = self.budget.exceeded()
             if over:
                 raise RuntimeError(over)
-        result = await super().ainvoke(messages, output_format, **kwargs)
+        try:
+            result = await super().ainvoke(messages, output_format, **kwargs)
+        except ValidationError:
+            # Some OpenAI-compatible providers (observed: Ollama Cloud
+            # serving glm-5.2) accept response_format=json_schema without
+            # error but silently ignore it and return plain prose. browser-
+            # use's ChatLiteLLM has no fallback for that - the resulting
+            # ValidationError from output_format.model_validate_json(content)
+            # propagates straight out, and browser-use's own Agent retries
+            # the identical request up to max_retries times, which fails the
+            # same way every time since the provider's behavior never
+            # changes. json_object mode is far more widely supported;
+            # retrying with it (plus an explicit schema instruction) is a
+            # one-shot recovery, not a second full retry loop.
+            if output_format is None:
+                raise
+            result = await self._ainvoke_json_object_fallback(
+                messages, output_format, **kwargs)
         if self.budget is not None and result.usage is not None:
             self.budget.add_tokens(result.usage.prompt_tokens, result.usage.completion_tokens)
         return result
+
+    async def _ainvoke_json_object_fallback(self, messages, output_format, **kwargs):
+        from litellm import acompletion
+
+        schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+        litellm_messages = LiteLLMMessageSerializer.serialize(messages)
+        litellm_messages = litellm_messages + [{
+            "role": "system",
+            "content": (
+                "Respond with ONLY a single JSON object matching this schema, "
+                f"and no other text:\n{schema}"
+            ),
+        }]
+
+        params: dict = {
+            "model": self.model,
+            "messages": litellm_messages,
+            "response_format": {"type": "json_object"},
+        }
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            params["max_tokens"] = self.max_tokens
+        if self.api_key:
+            params["api_key"] = self.api_key
+        if self.api_base:
+            params["api_base"] = self.api_base
+
+        response = await acompletion(**params)
+        content = response.choices[0].message.content or ""
+        parsed = output_format.model_validate_json(content)
+        return ChatInvokeCompletion(
+            completion=parsed,
+            usage=self._parse_usage(response),
+        )
 
 
 def build_browser_chat_model(

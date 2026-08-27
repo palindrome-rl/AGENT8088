@@ -2,7 +2,10 @@
 already-configured provider (no second LLM credential path) and charges
 every call to the caller's existing turn budget, so a browsing task can't
 spend tokens the user's budget ceiling doesn't know about."""
+from types import SimpleNamespace
+
 import pytest
+from pydantic import BaseModel
 
 from agent8088.browser_llm import Agent8088ChatModel, build_browser_chat_model
 
@@ -108,6 +111,138 @@ async def test_ainvoke_without_a_budget_still_works(monkeypatch):
 
     monkeypatch.setattr(
         "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+
+    result = await model.ainvoke([])
+
+    assert result.completion == "done"
+
+
+class _Output(BaseModel):
+    thinking: str
+    answer: str
+
+
+@pytest.mark.asyncio
+async def test_ainvoke_falls_back_to_json_object_mode_when_strict_schema_is_ignored(
+        monkeypatch):
+    """Some providers (observed: Ollama Cloud serving glm-5.2) accept a
+    response_format=json_schema request without error but simply ignore it
+    and return plain prose - browser-use's own ChatLiteLLM has no fallback
+    for this, so output_format.model_validate_json(content) raises a
+    pydantic ValidationError that propagates straight out of ainvoke().
+    browser-use's Agent retries the exact same request up to max_retries
+    times, which fails identically every time since the provider's behavior
+    never changes, burning the whole step. The fix has to happen here, one
+    layer below browser-use's retry loop, by falling back to the far more
+    widely-supported json_object mode plus an explicit schema instruction -
+    verified directly against Ollama Cloud to actually produce valid JSON
+    where json_schema mode did not."""
+    from pydantic import ValidationError
+
+    model = Agent8088ChatModel(model="openai/glm-5.2", budget=None)
+
+    async def fake_super_ainvoke(self, messages, output_format=None, **kwargs):
+        try:
+            output_format.model_validate_json("The sky is blue today.")
+        except ValidationError as exc:
+            raise exc from None
+
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"thinking": "ok", "answer": "The sky is blue."}'))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    result = await model.ainvoke([], output_format=_Output)
+
+    assert result.completion == _Output(thinking="ok", answer="The sky is blue.")
+    assert calls[0]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_json_object_fallback_charges_the_budget(monkeypatch):
+    budget = _FakeBudget()
+    model = Agent8088ChatModel(model="openai/glm-5.2", budget=budget)
+
+    async def fake_super_ainvoke(self, messages, output_format=None, **kwargs):
+        from pydantic import ValidationError
+        try:
+            output_format.model_validate_json("not json")
+        except ValidationError as exc:
+            raise exc from None
+
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+
+    async def fake_acompletion(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"thinking": "ok", "answer": "fine"}'))],
+            usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    await model.ainvoke([], output_format=_Output)
+
+    assert budget.charged == [(7, 3)]
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_unparseable_fallback_response_still_raises(monkeypatch):
+    """The fallback is a best-effort recovery, not a guarantee - if the
+    provider ignores json_object mode too, the caller must still see a
+    failure rather than a silently wrong/empty result."""
+    model = Agent8088ChatModel(model="openai/glm-5.2", budget=None)
+
+    async def fake_super_ainvoke(self, messages, output_format=None, **kwargs):
+        from pydantic import ValidationError
+        try:
+            output_format.model_validate_json("nope")
+        except ValidationError as exc:
+            raise exc from None
+
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+
+    async def fake_acompletion(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="still not json"))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    with pytest.raises(Exception):
+        await model.ainvoke([], output_format=_Output)
+
+
+@pytest.mark.asyncio
+async def test_non_structured_calls_are_unaffected_by_the_fallback(monkeypatch):
+    """output_format=None means no schema was requested in the first place -
+    the fallback must never trigger for a plain text completion."""
+    model = Agent8088ChatModel(model="openai/glm-5.2", budget=None)
+
+    async def fake_super_ainvoke(self, messages, output_format=None, **kwargs):
+        return _FakeCompletion(_FakeUsage(prompt_tokens=2, completion_tokens=2))
+
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+
+    async def fake_acompletion(**kwargs):
+        raise AssertionError("fallback must not run for a plain-text call")
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
 
     result = await model.ainvoke([])
 
