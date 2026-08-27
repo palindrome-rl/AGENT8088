@@ -4040,9 +4040,10 @@ _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 # Main REPL
 # ---------------------------------------------------------------------------
 def _estimate_context_pct():
-    """Rough ~4-chars-per-token estimate against CONTEXT_WINDOW — good enough for a
-    progress hint, not meant to be exact. Image parts count as a flat allowance
-    rather than their (huge) base64 length, which would peg the meter at 100%."""
+    """Rough ~4-chars-per-token estimate against the active model's context
+    window — good enough for a progress hint, not meant to be exact. Image
+    parts count as a flat allowance rather than their (huge) base64 length,
+    which would peg the meter at 100%."""
     chars = len(A.SYSTEM_PROMPT)
     for m in S.messages:
         content = m.get("content")
@@ -4054,9 +4055,10 @@ def _estimate_context_pct():
                     chars += 3000  # flat per-image allowance
         else:
             chars += len(content or "")
-    if not A.CONTEXT_WINDOW:
+    ctx_window, _ = A._active_model_token_limits()
+    if not ctx_window:
         return 0
-    return min(100, int(100 * (chars // 4) / A.CONTEXT_WINDOW))
+    return min(100, int(100 * (chars // 4) / ctx_window))
 
 
 def _prompt_label():
@@ -4079,11 +4081,14 @@ def _status_bar_fragments():
     pct = _estimate_context_pct()
     filled = min(10, max(0, pct // 10))
     last = S.last_usage or {}
+    ctx_window, ctx_output = A._active_model_token_limits()
+    ctx_label = f"{ctx_window // 1024}K" if ctx_window >= 1024 else str(ctx_window)
     return [
         ("fg:#00edff bold", " ◆ 8088 "),
         ("fg:#237dd7 bold", f"· {_active_provider_name()}:{A.MODEL_NAME}"[:28]),
         ("", " │ "),
         ("fg:#237dd7", f"{'█' * filled}{'░' * (10 - filled)} {pct}% ctx"),
+        ("fg:#0077B6", f" {ctx_label}"),
         ("", " │ "),
         ("fg:#237dd7", A.PERMISSION_MODE),
         ("", " │ "),
