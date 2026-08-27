@@ -2638,7 +2638,7 @@ def save_model_profile(path, name, api_mode, model, base_url="", api_key_env="")
 
 def configure_model_profile():
     """Configure a model profile from inside the running REPL."""
-    _run_setup(config_path=A.CONFIG_PATH, include_workspace=False, activate_runtime=True, heading="Model setup")
+    _run_setup(config_path=_resolve_config_path(), include_workspace=False, activate_runtime=True, heading="Model setup")
 
 
 def cmd_config(_):
