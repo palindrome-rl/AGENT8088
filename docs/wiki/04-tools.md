@@ -46,8 +46,10 @@ is what the permission layer gates on — see
 | `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
 | `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert a supported solid CAD file through the isolated build123d runtime. |
 | `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
+| `generate_cad_design` | `write_text` | `filename`, `design`, `formats` | prompt | Compile bounded declarative JSON to a validated STEP-first model and preview. |
 | `generate_cad_model` | `write_text` | `filename`, `source`, `parameters`, `formats` | prompt | Generate a parameterized STEP-first model, validate it, and render a preview. |
 | `validate_cad_model` | `write_text` | `filename`, `render` | prompt | Reopen and validate a STEP model and optionally render an isometric preview. |
+| `open_cad_viewer` | `read_text` | `filename`, `open_browser` | âœ… | Open a supported artifact in the managed loopback text-to-cad Viewer. |
 
 `*` optional argument.
 
@@ -82,15 +84,36 @@ the artifact and reports its bounding box, solid count, volume, and topology
 validity rather than interpreting it as text.
 
 `create_cad_part` is the structured, no-code path for one box, cylinder, sphere,
-cone, or tube. `generate_cad_model` is the advanced path: build123d constructs
-the parametric geometry while text-to-cad/cadgen manages STEP-first generation,
-topology validation, and preview rendering. It retains the source, JSON
-parameters, STEP, report, preview, and requested STL/3MF/GLB/BREP exports.
-`validate_cad_model` can repeat the reopen, topology, and render checks later.
+cone, or tube. `generate_cad_design` is preferred for complex parts and
+assemblies: it compiles a bounded, type-checked JSON schema with parameters,
+named components, placements, fusions, and cuts. `generate_cad_model` is the
+advanced Python escape hatch for build123d operations outside that schema.
+text-to-cad/cadgen supplies STEP-first generation/export, per-solid topology
+validation, and preview rendering in both workflows. Volumetric assembly
+overlap is rejected independently, while touching mating faces remain valid and
+are not mislabeled as a self-intersecting body. The tools retain design/source, parameters, STEP,
+report, preview, and requested STL/3MF/GLB/BREP exports. `validate_cad_model`
+can repeat the reopen, topology, interference, and render checks later.
+
+During a CAD-generation turn, generic shell and file-writing tools are removed
+from the model-visible tool set. The agent receives the real artifacts location,
+uses a bare output filename, and gets at most two failed generation attempts.
+This avoids shell path guessing, repeated approval loops, and unbounded source
+rewrites consuming the model's time or token budget.
+
+`open_cad_viewer` complements deterministic validation with interactive review
+of STEP/STP, STL, 3MF, GLB, and DXF artifacts. The managed text-to-cad Viewer
+provides an assembly tree, part visibility/focus, display and clipping modes,
+exploded layouts, annotations, screenshots, and interactive measurements. Its
+server binds only to `127.0.0.1`, receives only the artifact directory, and is
+started through the guarded tool rather than shell-generated commands. The
+prebuilt Viewer is installed from a commit- and checksum-pinned upstream
+archive; development/npm sources are not executed. STEP remains authoritative
+because measurements on triangulated formats snap to mesh vertices.
 
 Both upstream engines are pinned in a dedicated Python 3.11
 `integrations/cad/venv` environment installed on a best-effort basis by both
-platform installers. A
+platform installers. The same stage installs and smoke-tests the pinned Viewer. A
 CAD-stage failure never blocks the core agent, and `/doctor` reports whether
 the exact runtime versions are ready. Native `.FCStd` feature trees are not
 created; validated STEP is the canonical editable interchange artifact.

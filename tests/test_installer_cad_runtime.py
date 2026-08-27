@@ -18,14 +18,16 @@ def test_windows_installer_uses_a_dedicated_runtime_not_freecad():
 def test_windows_installer_pins_both_engines_and_smoke_tests_geometry():
     requirements = (ROOT / "src/agent8088/cad_runtime_requirements.txt").read_text()
     assert "build123d==0.11.1" in requirements
-    assert "cadgen==0.4.26" in requirements
+    assert "cadgen==0.4.28" in requirements
     assert "cad_runtime_requirements.txt" in INSTALLER
     assert '@("python", "install", "3.11")' in INSTALLER
     assert '@("venv", "--python", "3.11"' in INSTALLER
     assert "cad_worker.py" in INSTALLER
     assert "verify_cad_runtime.py" in INSTALLER
+    assert "install_cad_viewer.py" in INSTALLER
+    assert '"--viewer-root", $viewerRoot' in INSTALLER
     assert '@("-m", "playwright", "install", "chromium")' in INSTALLER
-    assert "STEP and preview round-trip smoke test" in INSTALLER
+    assert "STEP, preview, and Viewer round-trip smoke test" in INSTALLER
 
 
 def test_windows_cad_failure_is_optional_and_actionable():
@@ -47,6 +49,8 @@ def test_linux_installer_has_the_same_optional_runtime_contract():
     assert "venv --python 3.11" in section
     assert '"$_py" -m playwright install chromium' in section
     assert '"$_py" -I "$_verifier"' in section
+    assert '"$_py" -I "$_viewer_installer"' in section
+    assert '--viewer-root "$_viewer_root"' in section
     assert "libGL.so.1" in section
     assert "libgl1" in section
     assert "libglvnd-glx" in section
@@ -63,3 +67,11 @@ def test_packaging_contains_worker_requirements_renderer_and_license():
         "cad_snapshot_runtime/TEXT_TO_CAD_LICENSE.txt",
     ):
         assert name in project
+
+
+def test_viewer_installer_is_commit_and_checksum_pinned():
+    installer = (ROOT / "scripts/install_cad_viewer.py").read_text(encoding="utf-8")
+    assert 'VIEWER_VERSION = "0.4.28"' in installer
+    assert 'VIEWER_COMMIT = "0e94cd1d2b5fa2013d89aa9504ecadcf16ce39f6"' in installer
+    assert 'VIEWER_ARCHIVE_SHA256 = "8a349d4287407c79392e736c9d2e2d9c52e0427a58d168a4f325f926dfd7b7d1"' in installer
+    assert 'parts[0] not in {"dist", "server_py"}' in installer

@@ -1049,14 +1049,16 @@ install_cad_runtime() {
     local _py="$_venv/bin/python"
     local _requirements="$INSTALL_DIR/src/agent8088/cad_runtime_requirements.txt"
     local _verifier="$INSTALL_DIR/scripts/verify_cad_runtime.py"
-    local _probe="from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.26'"
+    local _viewer_installer="$INSTALL_DIR/scripts/install_cad_viewer.py"
+    local _viewer_root="$_root/viewer"
+    local _probe="from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.28'"
     local _dependencies_ready=false
 
     if [ -x "$_py" ] && run_with_timeout 30 "$_py" -I -c "$_probe" >/dev/null 2>&1; then
         _dependencies_ready=true
         log_info "build123d + text-to-cad CAD dependencies already installed"
     fi
-    if [ ! -f "$_requirements" ] || [ ! -f "$_verifier" ]; then
+    if [ ! -f "$_requirements" ] || [ ! -f "$_verifier" ] || [ ! -f "$_viewer_installer" ]; then
         warn_stage 1 "$T_CAD_RUNTIME" "Advanced CAD runtime" \
             "packaged runtime requirements are missing" \
             "rerun the Agent8088 installer from a complete checkout"
@@ -1080,7 +1082,7 @@ install_cad_runtime() {
         fi
     elif [ "$_dependencies_ready" != true ]; then
         log_info "Installing isolated build123d + text-to-cad CAD runtime..."
-        # cadgen 0.4.26 requires 3.11+, independently of the core agent's
+        # cadgen 0.4.28 requires 3.11+, independently of the core agent's
         # supported Python. uv keeps this managed interpreter isolated.
         run_with_timeout "$T_VENV" "$UV_CMD" python install 3.11 \
             >/dev/null 2>&1 || _rc=$?
@@ -1097,6 +1099,16 @@ install_cad_runtime() {
         warn_stage "$_rc" "$T_CAD_RUNTIME" "Advanced CAD runtime" \
             "isolated dependency install failed" \
             "rerun with AGENT8088_TIMEOUT_SCALE=3 on a slow link"
+        return 0
+    fi
+
+    _rc=0
+    run_with_timeout "$T_CAD_RUNTIME" "$_py" -I "$_viewer_installer" \
+        --target "$_viewer_root" >/dev/null 2>&1 || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        warn_stage "$_rc" "$T_CAD_RUNTIME" "Advanced CAD runtime" \
+            "checksum-pinned CAD Viewer installation failed" \
+            "rerun the installer; the core agent works without advanced CAD"
         return 0
     fi
 
@@ -1155,15 +1167,16 @@ install_cad_runtime() {
 
     # Real worker round trip: build, export, reopen, validate, and render.
     _rc=0
-    run_with_timeout 240 "$_py" -I "$_verifier" >/dev/null 2>&1 || _rc=$?
+    run_with_timeout 300 "$_py" -I "$_verifier" \
+        --viewer-root "$_viewer_root" >/dev/null 2>&1 || _rc=$?
     if [ "$_rc" -ne 0 ]; then
-        warn_stage "$_rc" 240 "Advanced CAD runtime" \
-            "installed packages failed the STEP and preview round-trip smoke test" \
+        warn_stage "$_rc" 300 "Advanced CAD runtime" \
+            "installed packages failed the STEP, preview, and Viewer round-trip smoke test" \
             "rerun the installer and inspect OpenCascade or Chromium loading errors"
         return 0
     fi
     CAD_RUNTIME_INSTALLED=true
-    log_success "build123d + text-to-cad CAD runtime installed and verified"
+    log_success "build123d + text-to-cad CAD runtime and Viewer installed and verified"
 }
 
 # ----------------------------------------------------------------------------
@@ -1624,7 +1637,7 @@ verify_install() {
         echo "  Browser:  Chromium missing (browse_page will show install instructions)"
     fi
     if [ "$CAD_RUNTIME_INSTALLED" = true ]; then
-        echo "  CAD:      build123d + text-to-cad runtime installed and verified"
+        echo "  CAD:      build123d + text-to-cad runtime and Viewer installed and verified"
     else
         echo "  CAD:      advanced CAD runtime unavailable (core agent still works)"
     fi

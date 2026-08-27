@@ -15,13 +15,25 @@ and snapshot review. Do not write FreeCAD Python and do not run CAD source with
 - One box, cylinder, sphere, cone, or tube: `create_cad_part`.
 - Convert an existing supported artifact: `convert_cad`.
 - Validate or render an existing STEP: `validate_cad_model`.
-- Any part with features, an assembly, or a parameterized design:
-  `generate_cad_model`.
+- Open an existing or generated artifact for interactive visual review:
+  `open_cad_viewer`.
+- Any part with features, an assembly, or a parameterized design expressible
+  with boxes, cylinders, spheres, cones, tubes, placements, fusions and cuts:
+  `generate_cad_design` (preferred).
+- Geometry requiring lofts, sweeps, sketches, selectors, or other advanced
+  build123d operations: `generate_cad_model` (escape hatch).
 
-`generate_cad_model` is the normal path for serious CAD. It retains the Python
-source and JSON parameters, generates STEP, exports requested secondary formats,
-reopens and validates the geometry, and renders an isometric preview before it
-can report success.
+Both complex-model tools generate STEP, export requested secondary formats,
+reopen and validate every solid independently, check bounded assembly
+interference, and render an isometric preview before reporting success.
+`generate_cad_design` retains a type-checked `.design.json` plus parameters and
+does not execute model-authored Python, so use it whenever its schema fits.
+
+After successful generation or modification, call `open_cad_viewer` with the
+canonical STEP unless the user explicitly declines interactive review. The PNG
+snapshot is deterministic evidence for automated verification; the Viewer is
+the human review surface for assembly trees, selection, measurement, clipping,
+exploded layouts, and annotations. Neither replaces topology/interference checks.
 
 ## CAD brief before source
 
@@ -38,7 +50,41 @@ Before calling the tool, establish internally:
 Do not ask a question when the user explicitly asked you to make reasonable
 engineering assumptions. Record those assumptions in the final response.
 
-## Source contract
+## Declarative design contract (preferred)
+
+Use a bare filename such as `house.step`; Agent8088 resolves it to its artifacts
+directory. Never guess `C:/artifacts`, call a shell to discover the current
+directory, or write a separate script.
+
+The schema has millimetre units, editable parameters, and uniquely named
+components. Each component fuses its `add` primitives, then applies its `cut`
+primitives. Numeric fields may be arithmetic expressions referencing parameters.
+Every primitive supports `at`, `rotate`, and a compact `placements` array.
+
+```json
+{
+  "schema_version": 1,
+  "name": "bracket",
+  "units": "mm",
+  "parameters": {"length": 80, "width": 50, "height": 8, "hole_r": 3.4},
+  "components": [{
+    "name": "plate",
+    "add": [{"type": "box", "size": ["length", "width", "height"]}],
+    "cut": [{
+      "type": "cylinder", "radius": "hole_r", "height": "height + 2",
+      "at": [15, 15, -1], "placements": [[0, 0, 0], [50, 0, 0]]
+    }]
+  }]
+}
+```
+
+Primitive-specific fields are: box `size`; cylinder `radius,height`; sphere
+`radius`; cone `radius1,radius2,height`; tube
+`outer_radius,inner_radius,height`. Use separate named components when the user
+wants separate solids. Avoid overlapping solids; exact touching faces are valid
+mating contact and are not misclassified as self-intersection.
+
+## Python source contract (advanced escape hatch)
 
 Pass a `.step` filename, a JSON parameter object, and Python source defining
 exactly one entry point:
@@ -114,8 +160,11 @@ STEP outside the generator; generator source does not import cadgen directly.
 Success requires all requested files plus a report and preview. Pay attention to
 the returned bounding box, solid count, volume, and validity findings.
 
-When generation fails:
+When generation fails, repair the named field or component once. Agent8088 stops
+after two failed generation attempts in one turn instead of spending the whole
+time/token budget on variants.
 
+- Invalid design/expression: correct only the named schema field.
 - Boolean failure: enlarge or offset the tool so faces cross instead of touch.
 - Fillet failure: reduce the radius or filter the exact intended edges.
 - Loft failure: use compatible profiles and consistent orientation.
@@ -128,6 +177,17 @@ Never claim success from a Python exit code. The CAD tools make disk artifacts,
 reopen them, validate BREP topology, and render a snapshot; report their actual
 result.
 
+## Interactive visual verification
+
+Use the managed Viewer only through `open_cad_viewer`; never start its Python
+server, Node tooling, or a browser from generated code. It binds to loopback and
+opens only the authorized artifact directory. For STEP, verify labels and part
+structure in the assembly tree, hide/show major components, inspect an exploded
+layout, and use clipping where internal clearances matter. Mesh measurements are
+vertex-based approximations; use STEP geometry/report values for authoritative
+dimensions. If the Viewer cannot start, preserve and report the verified STEP,
+JSON report, and PNG rather than regenerating otherwise valid geometry.
+
 ## Outputs
 
 STEP is the canonical portable CAD artifact. Supported secondary outputs are
@@ -137,7 +197,8 @@ opened in FreeCAD but is not a native PartDesign history.
 
 The normal advanced-model bundle contains:
 
-- `<name>.step.py` — retained parametric build123d source.
+- `<name>.design.json` - retained declarative design (preferred workflow), or
+  `<name>.step.py` - retained parametric build123d source (advanced workflow).
 - `<name>.params.json` — exposed parameters.
 - `<name>.step` — canonical BREP model.
 - `<name>.preview.png` — deterministic isometric review image.

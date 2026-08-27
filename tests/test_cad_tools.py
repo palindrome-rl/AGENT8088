@@ -9,8 +9,16 @@ gets silently truncated — a real bug hit once already this session on
 convert_document's own row).
 """
 import json
+from pathlib import Path
 
 import pytest
+
+
+def _response(content):
+    return type("R", (), {"choices": [type("C", (), {
+        "message": type("M", (), {"content": content})(),
+        "finish_reason": "stop",
+    })()]})()
 
 
 def _convert_cad(engine, path, fmt):
@@ -30,9 +38,21 @@ def _generate_cad_model(engine, path, source, parameters="{}", formats="step,stl
     }))
 
 
+def _generate_cad_design(engine, path, design, formats="step,stl"):
+    return engine.exec_tool("generate_cad_design", json.dumps({
+        "filename": str(path), "design": design, "formats": formats,
+    }))
+
+
 def _validate_cad_model(engine, path, render=True):
     return engine.exec_tool("validate_cad_model", json.dumps({
         "filename": str(path), "render": render,
+    }))
+
+
+def _open_cad_viewer(engine, path, open_browser=True):
+    return engine.exec_tool("open_cad_viewer", json.dumps({
+        "filename": str(path), "open_browser": open_browser,
     }))
 
 
@@ -52,8 +72,93 @@ def test_create_cad_part_is_registered_with_the_write_mode(engine):
 
 
 def test_advanced_cad_tools_are_registered_with_the_write_mode(engine):
+    assert engine.TOOL_SPECS["generate_cad_design"]["mode"] == "write_text"
     assert engine.TOOL_SPECS["generate_cad_model"]["mode"] == "write_text"
     assert engine.TOOL_SPECS["validate_cad_model"]["mode"] == "write_text"
+
+
+def test_cad_viewer_is_registered_with_the_existing_read_gate(engine):
+    assert engine.TOOL_SPECS["open_cad_viewer"]["mode"] == "read_text"
+    assert engine.TOOL_SPECS["open_cad_viewer"]["path_arg"] == "filename"
+
+
+def test_cad_generation_request_disables_generic_execution_and_injects_real_artifacts_path(
+        engine, monkeypatch):
+    seen = {}
+
+    def completion(messages, tools, system_prompt=None, **kwargs):
+        seen["tools"] = tools
+        seen["system"] = system_prompt
+        return _response("done")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    tools = [
+        {"type": "function", "function": {"name": name}}
+        for name in (
+            "execute_shell", "run_sandboxed", "write_file",
+            "generate_cad_design", "generate_cad_model", "open_cad_viewer",
+        )
+    ]
+    result = engine.run_agent(
+        [{"role": "user", "content": "Generate a parametric CAD house with build123d"}],
+        max_turns=1, system_prompt="base", tools_def=tools,
+        allowed_tools={
+            "execute_shell", "run_sandboxed", "write_file",
+            "generate_cad_design", "generate_cad_model", "open_cad_viewer",
+        },
+    )
+    assert result == "done"
+    rendered = json.dumps(seen["tools"])
+    assert "generate_cad_design" in rendered
+    assert "execute_shell" not in rendered
+    assert "run_sandboxed" not in rendered
+    assert "write_file" not in rendered
+    assert "generate_cad_model" not in rendered
+    assert "open_cad_viewer" in rendered
+    assert str(engine.ARTIFACTS_ROOT) in seen["system"]
+    assert "Never guess C:/artifacts" in seen["system"]
+    assert "use open_cad_viewer" in seen["system"]
+
+
+def test_old_cad_turn_does_not_restrict_an_unrelated_followup(engine):
+    assert engine._cad_generation_requested([
+        {"role": "user", "content": "Generate a CAD bracket"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "Now tell me a joke"},
+    ]) is False
+
+
+def test_advanced_geometry_keeps_python_escape_hatch_available(engine):
+    assert engine._advanced_cad_source_requested([
+        {"role": "user", "content": "Generate a CAD impeller with lofts and fillets"},
+    ]) is True
+
+
+def test_cad_generation_stops_after_two_backend_failures(engine, monkeypatch):
+    attempts = iter(("{}", '{"components":[]}', '{"schema_version":1}'))
+
+    def completion(*args, **kwargs):
+        design = next(attempts, '{"name":"still-looping"}')
+        return _response(
+            '✿FUNCTION✿: generate_cad_design ✿ARGS✿: '
+            + json.dumps({"filename": "house.step", "design": design, "formats": "step"})
+        )
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    executions = []
+
+    def execute(name, args, **kwargs):
+        executions.append(name)
+        return "CAD design generation failed: [invalid_design] bad component"
+
+    monkeypatch.setattr(engine, "exec_tool", execute)
+    engine.run_agent(
+        [{"role": "user", "content": "Generate a CAD house using build123d"}],
+        max_turns=4, system_prompt="base",
+        tools_def=[{"type": "function", "function": {"name": "generate_cad_design"}}],
+        allowed_tools={"generate_cad_design"},
+    )
+    assert executions == ["generate_cad_design", "generate_cad_design"]
 
 
 def test_convert_cad_is_excluded_from_the_auditor(engine):
@@ -82,6 +187,7 @@ def test_create_cad_part_is_excluded_from_the_auditor(engine):
 
 
 def test_advanced_cad_tools_are_excluded_from_the_auditor(engine):
+    assert engine._plan_step_is_auditable("generate_cad_design", "") is False
     assert engine._plan_step_is_auditable("generate_cad_model", "") is False
     assert engine._plan_step_is_auditable("validate_cad_model", "") is False
 
@@ -154,6 +260,23 @@ def test_generate_cad_model_flows_through_with_structured_source(engine, tmp_pat
     assert seen["parameters"] == '{"x":1}'
 
 
+def test_generate_cad_design_flows_through_as_structured_json(engine, tmp_path, monkeypatch):
+    engine.PERMISSION_MODE = "full-auto"
+    engine.ALLOWED_PATHS = [tmp_path]
+    seen = {}
+
+    def fake_generate(path, design, formats, timeout=600):
+        seen.update(path=str(path), design=design, formats=formats)
+        return "Generated and verified model.step"
+
+    monkeypatch.setattr(engine.cad, "generate_cad_design", fake_generate)
+    design = '{"schema_version":1,"components":[]}'
+    result = _generate_cad_design(engine, tmp_path / "model.step", design, "step")
+    assert "Generated and verified" in result
+    assert seen["design"] == design
+    assert seen["formats"] == "step"
+
+
 def test_validate_cad_model_flows_through_and_parses_false(engine, tmp_path, monkeypatch):
     engine.PERMISSION_MODE = "full-auto"
     engine.ALLOWED_PATHS = [tmp_path]
@@ -168,6 +291,25 @@ def test_validate_cad_model_flows_through_and_parses_false(engine, tmp_path, mon
     monkeypatch.setattr(engine.cad, "validate_cad_model", fake_validate)
     assert "Validated" in _validate_cad_model(engine, model, "false")
     assert seen["render"] is False
+
+
+def test_open_cad_viewer_flows_through_and_parses_false(engine, tmp_path, monkeypatch):
+    engine.PERMISSION_MODE = "readonly"
+    engine.ALLOWED_PATHS = [tmp_path]
+    model = tmp_path / "model.step"
+    model.write_bytes(b"step")
+    seen = {}
+
+    def fake_open(path, workspace=None, launch_browser=True, timeout=45):
+        seen.update(path=Path(path), workspace=Path(workspace), launch=launch_browser)
+        return "CAD Viewer ready: http://127.0.0.1:3245/"
+
+    monkeypatch.setattr(engine.cad, "open_cad_viewer", fake_open)
+    result = _open_cad_viewer(engine, model, "false")
+    assert result.startswith("CAD Viewer ready")
+    assert seen["path"] == model
+    assert seen["workspace"] == model.parent
+    assert seen["launch"] is False
 
 
 @pytest.mark.parametrize("mode", ["readonly", "plan-only"])
@@ -225,7 +367,7 @@ def test_create_cad_part_cannot_target_a_sensitive_path(engine, tmp_path, monkey
     assert "Error" in result or "denied" in result.lower()
 
 
-@pytest.mark.parametrize("tool", ["generate_cad_model", "validate_cad_model"])
+@pytest.mark.parametrize("tool", ["generate_cad_design", "generate_cad_model", "validate_cad_model"])
 def test_advanced_cad_tools_are_gated_outside_full_auto(engine, tmp_path, monkeypatch, tool):
     engine.PERMISSION_MODE = "readonly"
     engine.ALLOWED_PATHS = [tmp_path]
@@ -235,7 +377,9 @@ def test_advanced_cad_tools_are_gated_outside_full_auto(engine, tmp_path, monkey
         engine.cad, tool,
         lambda *a, **k: pytest.fail("CAD backend must not run before the write gate"),
     )
-    if tool == "generate_cad_model":
+    if tool == "generate_cad_design":
+        result = _generate_cad_design(engine, target, '{"components":[]}')
+    elif tool == "generate_cad_model":
         result = _generate_cad_model(engine, target, "def gen_step():\n    pass")
     else:
         result = _validate_cad_model(engine, target)

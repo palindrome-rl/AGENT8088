@@ -38,7 +38,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 | **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
-| **Generate verified CAD** | Build parameterized mechanical parts and assemblies with build123d, then use text-to-cad for STEP-first generation, topology checks, secondary exports, and rendered preview verification. |
+| **Generate and inspect verified CAD** | Build parameterized mechanical parts and assemblies with build123d, use text-to-cad for STEP-first validation and rendered checks, then review the result in its managed interactive CAD Viewer. |
 
 ---
 
@@ -69,7 +69,7 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
 | Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
-| Advanced CAD runtime (build123d + text-to-cad) | yes (isolated, optional) | yes (isolated, optional) |
+| Advanced CAD runtime + interactive Viewer (build123d + text-to-cad) | yes (isolated, optional) | yes (isolated, optional) |
 
 ### Supported platforms
 
@@ -160,11 +160,23 @@ The dependencies live in a dedicated environment under
 change the core agent's Python packages or its supported Python version.
 
 Simple boxes, cylinders, spheres, cones, and tubes use a structured primitive
-tool. Parameterized parts and assemblies retain their build123d source and JSON
-parameters, then must produce a valid STEP model, report, and preview before the
-agent reports success. STL, 3MF, GLB, and BREP can be requested as secondary
+tool. Complex parts and assemblies prefer a bounded declarative JSON design
+that build123d compiles deterministically; advanced build123d Python remains an
+escape hatch for lofts, sweeps, and other geometry outside that schema. The
+worker validates each solid independently, rejects volumetric assembly overlap,
+and requires a STEP model, report, and text-to-cad preview before reporting
+success. It also bounds primitive/component counts and stops repeated failed
+generation attempts. STL, 3MF, GLB, and BREP can be requested as secondary
 exports. This backend intentionally does not create native `.FCStd` feature
 trees; STEP is its canonical editable interchange format.
+
+The same isolated installation includes text-to-cad's browser Viewer. Agent8088
+can open validated STEP/STP, STL, 3MF, GLB, and DXF artifacts for assembly-tree
+inspection, part visibility/focus, display and clipping modes, exploded layouts,
+annotations, screenshots, and interactive measurement. The server is started
+through a dedicated tool, binds only to `127.0.0.1`, and is restricted to the
+artifact directory. Its reviewed prebuilt runtime is pinned to one upstream
+commit and checksum; npm dependencies are neither installed nor executed.
 
 ---
 

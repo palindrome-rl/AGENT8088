@@ -2857,7 +2857,7 @@ _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 # the byte count itself; there is no model-authored logic to second-guess.
 _NON_AUDITABLE_TOOLS = {
     "convert_document", "convert_cad", "create_cad_part",
-    "generate_cad_model", "validate_cad_model",
+    "generate_cad_design", "generate_cad_model", "validate_cad_model",
 }
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
@@ -5412,6 +5412,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
 
     if mode == "read_text":
+        if name == "open_cad_viewer":
+            open_value = str(args.get("open_browser", "true")).strip().lower()
+            return cad.open_cad_viewer(
+                read_target,
+                workspace=read_target.parent,
+                launch_browser=open_value not in {"0", "false", "no", "off"},
+            )
         # Documents are extracted to text first. Deliberately handled inside the
         # existing read mode rather than as a new tool: this way a .docx read
         # goes through the same sensitive-file floor, read path zones and
@@ -5472,6 +5479,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 target,
                 content,
                 str(args.get("parameters", "{}")),
+                str(args.get("formats", "step,stl")),
+            )
+            _last_write_diff = None
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path instead.")
+            return result
+        if name == "generate_cad_design":
+            result = cad.generate_cad_design(
+                target,
+                content,
                 str(args.get("formats", "step,stl")),
             )
             _last_write_diff = None
@@ -7158,6 +7176,68 @@ def _execute_shell_forbidden(messages: list[dict]) -> bool:
     )
 
 
+def _cad_generation_requested(messages: list[dict]) -> bool:
+    """True for an explicit create/modify/export CAD request from the user."""
+    turns = _genuine_user_turns(messages)
+    text = _message_text(turns[-1]) if turns else ""
+    has_cad = bool(re.search(
+        r"\b(?:cad|build123d|text-to-cad|freecad|step|stl|3mf|brep|iges)\b",
+        text, re.IGNORECASE,
+    ))
+    has_action = bool(re.search(
+        r"\b(?:build|create|generate|model|design|convert|export|modify|edit|render|preview)\b",
+        text, re.IGNORECASE,
+    ))
+    return has_cad and has_action
+
+
+def _advanced_cad_source_requested(messages: list[dict]) -> bool:
+    """Whether the latest request names geometry outside the JSON compiler."""
+    turns = _genuine_user_turns(messages)
+    text = _message_text(turns[-1]) if turns else ""
+    return bool(re.search(
+        r"\b(?:lofts?|sweeps?|sketch(?:es)?|splines?|helices|helix|threads?|"
+        r"gears?|fillets?|chamfers?|drafts?|shelling|joints?|selectors?|"
+        r"bezier|nurbs)\b",
+        text, re.IGNORECASE,
+    ))
+
+
+def _cad_runtime_instruction() -> str:
+    """Small dynamic routing contract with the actual output location."""
+    return (
+        "CAD EXECUTION CONTRACT (active for this request):\n"
+        f"- Generated files belong in {ARTIFACTS_ROOT}. Pass a bare .step filename; "
+        "the tool resolves it there. Never guess C:/artifacts or inspect paths with a shell.\n"
+        "- Use create_cad_part for one primitive. For complex parts/assemblies use "
+        "generate_cad_design first. Use generate_cad_model only when the declarative "
+        "schema cannot express the requested geometry.\n"
+        "- For an existing artifact or after successful generation, use open_cad_viewer "
+        "for interactive review. Do not start a server or browser through a shell. Unless "
+        "the user declined visual review, hand generated CAD to the Viewer before the final answer.\n"
+        "- Make one compact, complete generation call. Use parameters, placements, and "
+        "loops/schema repetition instead of repeated source statements.\n"
+        "- Do not use execute_shell, run_sandboxed, or write_file for CAD generation. "
+        "The CAD tools own generation, export, validation, and preview.\n"
+        "- If generation fails, repair the named field/component once. Do not rewrite "
+        "the entire design or keep retrying variants."
+    )
+
+
+def _tool_definition_name(definition: dict) -> str:
+    function = definition.get("function") if isinstance(definition, dict) else None
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return str(definition.get("name") or "") if isinstance(definition, dict) else ""
+
+
+def _filter_tool_definitions(definitions, allowed: set[str]):
+    """Keep the model-visible tool schema synchronized with runnable names."""
+    if not isinstance(definitions, list):
+        return definitions
+    return [item for item in definitions if _tool_definition_name(item) in allowed]
+
+
 def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
     """Give an explicit CLI-Anything task room for its install-and-run workflow."""
     return (max(max_turns, CLI_ANYTHING_MIN_TURNS)
@@ -7198,6 +7278,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
+    cad_failures = 0
+    cad_generation_stopped = False
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -7212,6 +7294,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     turn_limit = _turn_limit_for_messages(messages, max_turns)
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
+    cad_generation = _cad_generation_requested(messages)
+    advanced_cad_source = _advanced_cad_source_requested(messages)
     hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
@@ -7222,7 +7306,26 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         )
         if no_execute_shell:
             round_allowed_tools.discard("execute_shell")
+        if cad_generation:
+            # CAD creation has purpose-built, bounded tools. Removing generic
+            # execution/write escape hatches prevents path-discovery shell calls
+            # and raw scripts from competing with the verified workflow.
+            round_allowed_tools.difference_update({
+                "execute_shell", "run_sandboxed", "write_file",
+            })
+            if not advanced_cad_source:
+                round_allowed_tools.discard("generate_cad_model")
+        if cad_generation_stopped:
+            round_allowed_tools.difference_update({
+                "generate_cad_design", "generate_cad_model",
+            })
+        round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
+        if cad_generation:
+            round_system_prompt = (
+                (round_system_prompt or current_system_prompt())
+                + "\n\n" + _cad_runtime_instruction()
+            )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         # Resource ceiling. Checked before the model call so an exhausted budget
@@ -7473,6 +7576,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 continue
             executed = True
             tool_outputs.append(result)
+            if name in {"generate_cad_design", "generate_cad_model"}:
+                if result.startswith(("CAD generation failed", "CAD design generation failed")):
+                    cad_failures += 1
+                    if cad_failures >= 2:
+                        cad_generation_stopped = True
+                        result += (
+                            "\nCAD retry budget exhausted after two failed generation attempts. "
+                            "Do not call another generation tool in this turn; report the latest "
+                            "specific failure and preserved artifacts."
+                        )
+                else:
+                    cad_failures = 0
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
                 # answered from it. An escalation is not a result — recording it

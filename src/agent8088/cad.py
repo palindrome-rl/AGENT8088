@@ -20,8 +20,14 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +35,13 @@ from .documents import _readable_or_reason
 
 MAX_CAD_BYTES = 200 * 1024 * 1024
 MAX_GENERATOR_BYTES = 256 * 1024
+MAX_DESIGN_BYTES = 256 * 1024
 
-CADGEN_VERSION = "0.4.26"
+CADGEN_VERSION = "0.4.28"
 BUILD123D_VERSION = "0.11.1"
+CAD_VIEWER_VERSION = "0.4.28"
+CAD_VIEWER_COMMIT = "0e94cd1d2b5fa2013d89aa9504ecadcf16ce39f6"
+CAD_VIEWER_SHA256 = "8a349d4287407c79392e736c9d2e2d9c52e0427a58d168a4f325f926dfd7b7d1"
 
 CAD_EXTENSIONS = (
     ".step", ".stp", ".stl", ".3mf", ".glb", ".brep",
@@ -68,7 +78,47 @@ def cad_runtime_python() -> Path:
     return root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def cad_runtime_status(timeout: int = 15) -> dict[str, Any]:
+def cad_viewer_root() -> Path:
+    """Resolve the checksum-pinned text-to-cad Viewer release."""
+    override = os.environ.get("AGENT8088_CAD_VIEWER_HOME", "").strip()
+    if override:
+        return Path(override).expanduser().resolve(strict=False)
+    manifest = cad_runtime_root() / "viewer" / "current.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        root = Path(str(payload.get("root") or "")).resolve(strict=False)
+        releases = (manifest.parent / "releases").resolve(strict=False)
+        root.relative_to(releases)
+        if (
+            str(payload.get("version")) == CAD_VIEWER_VERSION
+            and str(payload.get("commit")) == CAD_VIEWER_COMMIT
+            and str(payload.get("sha256")) == CAD_VIEWER_SHA256
+            and root.name == CAD_VIEWER_COMMIT
+        ):
+            return root
+    except (OSError, ValueError, TypeError):
+        pass
+    return cad_runtime_root() / "viewer" / "missing"
+
+
+def cad_viewer_status() -> dict[str, Any]:
+    root = cad_viewer_root()
+    required = (
+        root / "LICENSE",
+        root / "dist" / "index.html",
+        root / "server_py" / "server.py",
+        root / "server_py" / "start_viewer.py",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    return {
+        "available": not missing,
+        "version": CAD_VIEWER_VERSION,
+        "root": str(root),
+        "missing": missing,
+    }
+
+
+def cad_runtime_status(timeout: int = 45) -> dict[str, Any]:
     """Return a real import probe for the isolated CAD runtime."""
     python = cad_runtime_python()
     result: dict[str, Any] = {
@@ -77,6 +127,7 @@ def cad_runtime_status(timeout: int = 15) -> dict[str, Any]:
         "root": str(cad_runtime_root()),
         "cadgen": CADGEN_VERSION,
         "build123d": BUILD123D_VERSION,
+        "viewer": cad_viewer_status(),
     }
     if not python.is_file():
         result["reason"] = "runtime interpreter is missing"
@@ -97,8 +148,10 @@ def cad_runtime_status(timeout: int = 15) -> dict[str, Any]:
         return result
     versions = (done.stdout or "").strip().split("|")
     if done.returncode == 0 and versions == [BUILD123D_VERSION, CADGEN_VERSION]:
-        result["available"] = True
+        result["available"] = bool(result["viewer"]["available"])
         result["installed_versions"] = versions
+        if not result["available"]:
+            result["reason"] = "CAD Viewer runtime is missing or incomplete"
     else:
         detail = (done.stderr or done.stdout or f"exit {done.returncode}").strip()
         result["reason"] = detail[:500]
@@ -123,6 +176,137 @@ def _worker_env() -> dict[str, str]:
     env["PYTHONIOENCODING"] = "utf-8"
     env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_agent_home() / "playwright-browsers"))
     return env
+
+
+def _viewer_server_info(port: int, workspace: Path | None = None,
+                        timeout: float = 1.0) -> dict[str, Any] | None:
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{int(port)}/__cad/server",
+            headers={"User-Agent": "Agent8088-CAD-Viewer/1"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("app") == "cad-viewer":
+            if workspace is not None:
+                served = Path(str(payload.get("rootDir") or "")).resolve(strict=False)
+                if os.path.normcase(str(served)) != os.path.normcase(str(workspace.resolve())):
+                    return None
+            return payload
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    return None
+
+
+def _port_is_bindable(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def _viewer_url(workspace: Path, path: Path, port: int) -> str:
+    directory = workspace.as_posix()
+    if os.name == "nt" and not directory.startswith("/"):
+        directory = "/" + directory
+    url_path = urllib.parse.quote(directory, safe="/:")
+    relative = path.relative_to(workspace).as_posix()
+    return f"http://127.0.0.1:{port}{url_path}?" + urllib.parse.urlencode({"file": relative})
+
+
+def open_cad_viewer(path, workspace=None, launch_browser: bool = True,
+                    timeout: int = 45) -> str:
+    """Start or reuse the managed loopback Viewer and open one CAD artifact."""
+    path = Path(path).expanduser().resolve(strict=False)
+    if not path.is_file():
+        return f"Cannot open CAD Viewer: {path} does not exist."
+    supported = {".step", ".stp", ".stl", ".3mf", ".glb", ".dxf"}
+    if path.suffix.lower() not in supported:
+        return "Cannot open CAD Viewer: unsupported file type " + path.suffix.lower()
+    root = Path(workspace).expanduser().resolve(strict=False) if workspace else path.parent
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return "Cannot open CAD Viewer: the artifact is outside the authorized workspace."
+    viewer = cad_viewer_status()
+    if not viewer["available"]:
+        return (
+            "CAD Viewer is not installed. Re-run the Agent8088 installer to install "
+            f"the pinned text-to-cad Viewer {CAD_VIEWER_VERSION} runtime."
+        )
+    python = cad_runtime_python()
+    if not python.is_file():
+        return _NOT_INSTALLED_MESSAGE
+
+    selected_port = next(
+        (port for port in range(3245, 3256) if _viewer_server_info(port, root)),
+        None,
+    )
+    # Only look for a new port after checking the whole managed range for an
+    # existing verified Viewer. This avoids spawning duplicate servers merely
+    # because an earlier port happens to be free.
+    if selected_port is None:
+        selected_port = next(
+            (port for port in range(3245, 3256) if _port_is_bindable(port)),
+            None,
+        )
+    if selected_port is None:
+        return "Could not start CAD Viewer: ports 3245-3255 are unavailable."
+
+    if _viewer_server_info(selected_port, root) is None:
+        viewer_root = Path(viewer["root"])
+        state_root = cad_runtime_root() / "viewer" / "state"
+        state_root.mkdir(parents=True, exist_ok=True)
+        log_path = state_root / f"viewer-{selected_port}.log"
+        env = _worker_env()
+        env["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(viewer_root), env.get("PYTHONPATH", "")) if item
+        )
+        command = [
+            str(python), "-m", "server_py.server", "--host", "127.0.0.1",
+            "--port", str(selected_port),
+        ]
+        process_options: dict[str, Any]
+        if os.name == "nt":
+            process_options = {
+                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            }
+        else:
+            process_options = {"start_new_session": True}
+        try:
+            with log_path.open("ab", buffering=0) as log:
+                subprocess.Popen(
+                    command, cwd=str(root), env=env, stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=subprocess.STDOUT, close_fds=True,
+                    **process_options,
+                )
+        except OSError as exc:
+            return f"Could not start CAD Viewer: {exc}"
+
+        deadline = time.monotonic() + max(3, int(timeout))
+        while time.monotonic() < deadline:
+            if _viewer_server_info(selected_port, root):
+                break
+            time.sleep(0.2)
+        else:
+            try:
+                detail = log_path.read_text(encoding="utf-8", errors="replace")[-1000:].strip()
+            except OSError:
+                detail = ""
+            return "CAD Viewer did not become ready." + (f" Log: {detail}" if detail else "")
+
+    url = _viewer_url(root, path, selected_port)
+    opened = False
+    if launch_browser:
+        try:
+            opened = bool(webbrowser.open(url, new=2))
+        except webbrowser.Error:
+            opened = False
+    action = "Opened" if opened else "CAD Viewer ready"
+    return f"{action}: {url}"
 
 
 def _run_worker(request: dict[str, Any], timeout: int) -> dict[str, Any]:
@@ -203,7 +387,44 @@ def _format_metrics(data: dict[str, Any]) -> str:
     reasons = validity.get("reasons") or []
     if reasons:
         lines.append("Validation findings: " + ", ".join(str(item) for item in reasons))
+    interference = data.get("assembly_interference") or {}
+    if interference:
+        if not interference.get("checked"):
+            lines.append("Assembly interference: not checked (" + str(interference.get("reason")) + ")")
+        else:
+            count = len(interference.get("interferences") or [])
+            lines.append(f"Assembly interference: {count} overlapping solid pair(s)")
+    if data.get("component_count") is not None:
+        lines.append(f"Named components: {int(data.get('component_count') or 0)}")
     return "\n".join(lines)
+
+
+def _worker_failure(prefix: str, result: dict[str, Any]) -> str:
+    """Return a stable, actionable CAD failure without leaking a traceback."""
+    message = str(result.get("error") or "unknown CAD error")
+    code = str(result.get("error_code") or "cad_runtime_error")
+    retryable = bool(result.get("retryable"))
+    guidance = {
+        "invalid_design": (
+            "Correct the named field/expression only. Keep the same output filename and "
+            "do not use execute_shell or generated file-writing code."
+        ),
+        "invalid_geometry": (
+            "Repair only the failing component or boolean. Avoid coincident/tangential "
+            "cuts; do not rewrite the whole design."
+        ),
+        "assembly_interference": (
+            "Move or resize only the reported solid pairs so their common volume is zero. "
+            "Exact face contact is allowed; volumetric overlap is always rejected."
+        ),
+        "runtime_timeout": (
+            "Reduce primitive count or requested secondary formats, then retry once."
+        ),
+    }.get(code, "Do not retry unchanged; report this runtime failure.")
+    return (
+        f"{prefix}: [{code}] {message}\n"
+        f"Retryable: {'yes' if retryable else 'no'}. {guidance}"
+    )
 
 
 def extract_info(path, max_bytes: int = MAX_CAD_BYTES):
@@ -401,7 +622,7 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
         "formats": requested, "workspace": str(path.parent.resolve()),
     }, timeout=timeout)
     if not result.get("ok"):
-        return f"CAD generation failed: {result.get('error', 'unknown CAD error')}"
+        return _worker_failure("CAD generation failed", result)
 
     expected = [path, source_path, params_path, report_path, preview_path]
     for item in requested:
@@ -419,6 +640,70 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
     )
 
 
+def generate_cad_design(path, design: str, formats: str = "step,stl",
+                        timeout: int = 600) -> str:
+    """Compile a bounded declarative design and verify its complete artifact bundle."""
+    path = Path(path)
+    if path.suffix.lower() not in (".step", ".stp"):
+        return "Declarative CAD generation requires a .step output filename."
+    if not isinstance(design, str) or not design.strip():
+        return "CAD design must be a non-empty JSON object."
+    if len(design.encode("utf-8")) > MAX_DESIGN_BYTES:
+        return f"CAD design is too large (limit: {MAX_DESIGN_BYTES} bytes)."
+    try:
+        payload = json.loads(design)
+    except json.JSONDecodeError as exc:
+        return f"CAD design must be valid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return "CAD design must be a JSON object."
+
+    requested = []
+    for item in (formats or "step").split(","):
+        value = item.strip().lower().lstrip(".")
+        if value and value not in requested:
+            requested.append(value)
+    unsupported = [item for item in requested if item not in CONVERTIBLE_CAD_TARGETS]
+    if unsupported:
+        return "Unsupported CAD output format(s): " + ", ".join(unsupported) + "."
+    if "step" not in requested:
+        requested.insert(0, "step")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    design_path = path.with_suffix(".design.json")
+    params_path = path.with_suffix(".params.json")
+    report_path = path.with_suffix(".report.json")
+    preview_path = path.with_suffix(".preview.png")
+    design_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+    )
+    params = payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {}
+    params_path.write_text(
+        json.dumps(params, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+    )
+    result = _run_worker({
+        "action": "generate_design", "design": str(design_path.resolve()),
+        "output": str(path.resolve()), "report": str(report_path.resolve()),
+        "preview": str(preview_path.resolve()), "formats": requested,
+        "workspace": str(path.parent.resolve()),
+    }, timeout=timeout)
+    if not result.get("ok"):
+        return _worker_failure("CAD design generation failed", result)
+
+    expected = [path, design_path, params_path, report_path, preview_path]
+    for item in requested:
+        if item != "step":
+            expected.append(path.with_suffix("." + item))
+    failures = [problem for item in expected if (problem := _existing_artifact(item, item.name))]
+    if failures:
+        return "CAD design generation failed verification: " + "; ".join(failures)
+    artifacts = "\n".join(f"  - {item}" for item in expected)
+    return (
+        f"Generated and verified {path.name} from a declarative build123d design "
+        "with text-to-cad validation and snapshot review.\n"
+        + _format_metrics(result) + "\nArtifacts:\n" + artifacts
+    )
+
+
 def validate_cad_model(path, render: bool = True, timeout: int = 300) -> str:
     """Reopen, validate and optionally render an existing STEP model."""
     path = Path(path)
@@ -433,7 +718,7 @@ def validate_cad_model(path, render: bool = True, timeout: int = 300) -> str:
         "workspace": str(path.parent.resolve()),
     }, timeout=timeout)
     if not result.get("ok"):
-        return f"CAD validation failed: {result.get('error', 'unknown CAD error')}"
+        return _worker_failure("CAD validation failed", result)
     expected = [report] + ([preview] if preview else [])
     failures = [problem for item in expected if (problem := _existing_artifact(item, item.name))]
     if failures:

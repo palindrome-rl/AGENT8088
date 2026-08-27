@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import struct
 import sys
 import traceback
@@ -22,6 +23,241 @@ _BLOCKED_METHODS = {
     "communicate", "dump", "dumps", "load", "loads", "popen", "read", "run",
     "save", "saveas", "send", "system", "write",
 }
+
+_DESIGN_PRIMITIVES = {"box", "cylinder", "sphere", "cone", "tube"}
+_MAX_DESIGN_COMPONENTS = 256
+_MAX_DESIGN_PRIMITIVES = 2048
+_MAX_PLACEMENTS_PER_PRIMITIVE = 512
+_MAX_ABS_DIMENSION_MM = 1_000_000.0
+
+
+def _expression_value(value: Any, parameters: dict[str, Any]) -> float:
+    """Resolve one finite number or a small arithmetic expression.
+
+    Declarative CAD deliberately has no Python escape hatch. Expressions may
+    reference numeric parameters and use arithmetic only; calls, attributes,
+    indexing and every other Python construct are refused.
+    """
+    if isinstance(value, bool):
+        raise TypeError("boolean is not a CAD dimension")
+    if isinstance(value, (int, float)):
+        result = float(value)
+    elif isinstance(value, str):
+        try:
+            tree = ast.parse(value.strip(), mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(f"invalid CAD expression {value!r}") from exc
+
+        def evaluate(node: ast.AST) -> float:
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                    and not isinstance(node.value, bool):
+                return float(node.value)
+            if isinstance(node, ast.Name):
+                if node.id not in parameters:
+                    raise ValueError(f"unknown CAD parameter: {node.id}")
+                return _expression_value(parameters[node.id], parameters)
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                operand = evaluate(node.operand)
+                return operand if isinstance(node.op, ast.UAdd) else -operand
+            if isinstance(node, ast.BinOp) and isinstance(
+                    node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+                left, right = evaluate(node.left), evaluate(node.right)
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                if isinstance(node.op, ast.Div):
+                    return left / right
+                if abs(right) > 8:
+                    raise ValueError("CAD expression exponent is outside -8..8")
+                return left ** right
+            raise ValueError("CAD expressions allow only numbers, parameters, and arithmetic")
+
+        result = evaluate(tree)
+    else:
+        raise TypeError(
+            f"CAD dimension must be a number or expression, got {type(value).__name__}"
+        )
+    if not math.isfinite(result):
+        raise ValueError("CAD dimension must be finite")
+    if abs(result) > _MAX_ABS_DIMENSION_MM:
+        raise ValueError(
+            f"CAD dimension exceeds the {_MAX_ABS_DIMENSION_MM:g} mm safety bound"
+        )
+    return float(result)
+
+
+def _vector(value: Any, parameters: dict[str, Any], field: str) -> tuple[float, float, float]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{field} must contain exactly three values")
+    return tuple(_expression_value(item, parameters) for item in value)
+
+
+def _primitive_shape(spec: dict[str, Any], parameters: dict[str, Any]):
+    """Compile one reviewed JSON primitive into build123d geometry."""
+    from build123d import Align, Box, Cone, Cylinder, Pos, Rot, Sphere
+
+    kind = str(spec.get("type") or "").strip().lower()
+    if kind not in _DESIGN_PRIMITIVES:
+        raise ValueError(
+            f"unsupported declarative primitive {kind!r}; use one of "
+            + ", ".join(sorted(_DESIGN_PRIMITIVES))
+        )
+    corner_align = (Align.MIN, Align.MIN, Align.MIN)
+    axis_align = (Align.CENTER, Align.CENTER, Align.MIN)
+    if kind == "box":
+        size = _vector(spec.get("size"), parameters, "box.size")
+        if any(item <= 0 for item in size):
+            raise ValueError("box dimensions must be greater than zero")
+        shape = Box(*size, align=corner_align)
+    elif kind == "cylinder":
+        radius = _expression_value(spec.get("radius"), parameters)
+        height = _expression_value(spec.get("height"), parameters)
+        if radius <= 0 or height <= 0:
+            raise ValueError("cylinder radius and height must be greater than zero")
+        shape = Cylinder(radius, height, align=axis_align)
+    elif kind == "sphere":
+        radius = _expression_value(spec.get("radius"), parameters)
+        if radius <= 0:
+            raise ValueError("sphere radius must be greater than zero")
+        shape = Sphere(radius)
+    elif kind == "cone":
+        radius1 = _expression_value(spec.get("radius1"), parameters)
+        radius2 = _expression_value(spec.get("radius2"), parameters)
+        height = _expression_value(spec.get("height"), parameters)
+        if radius1 < 0 or radius2 < 0 or not (radius1 or radius2) or height <= 0:
+            raise ValueError("cone radii must be non-negative and height positive")
+        shape = Cone(radius1, radius2, height, align=axis_align)
+    else:
+        outer = _expression_value(spec.get("outer_radius"), parameters)
+        inner = _expression_value(spec.get("inner_radius"), parameters)
+        height = _expression_value(spec.get("height"), parameters)
+        if inner <= 0 or outer <= inner or height <= 0:
+            raise ValueError("tube requires outer_radius > inner_radius > 0 and height > 0")
+        shape = (
+            Cylinder(outer, height, align=axis_align)
+            - Cylinder(inner, height, align=axis_align)
+        )
+
+    rotate = _vector(spec.get("rotate", [0, 0, 0]), parameters, "rotate")
+    at = _vector(spec.get("at", [0, 0, 0]), parameters, "at")
+    if any(rotate):
+        shape = Rot(*rotate) * shape
+    if any(at):
+        shape = Pos(*at) * shape
+    return shape
+
+
+def _expanded_primitives(spec: dict[str, Any], parameters: dict[str, Any]):
+    """Yield one primitive at each declared placement without source expansion."""
+    placements = spec.get("placements")
+    if placements is None:
+        yield _primitive_shape(spec, parameters)
+        return
+    if not isinstance(placements, list) or not placements:
+        raise ValueError("placements must be a non-empty array of [x, y, z] vectors")
+    if len(placements) > _MAX_PLACEMENTS_PER_PRIMITIVE:
+        raise ValueError(
+            f"one primitive may have at most {_MAX_PLACEMENTS_PER_PRIMITIVE} placements"
+        )
+    base_at = _vector(spec.get("at", [0, 0, 0]), parameters, "at")
+    for placement in placements:
+        offset = _vector(placement, parameters, "placement")
+        instance = dict(spec)
+        instance.pop("placements", None)
+        instance["at"] = [base_at[index] + offset[index] for index in range(3)]
+        yield _primitive_shape(instance, parameters)
+
+
+def _build_design(design: dict[str, Any]):
+    """Compile the bounded declarative schema to a labeled build123d assembly."""
+    if int(design.get("schema_version", 1)) != 1:
+        raise ValueError("unsupported CAD design schema_version; expected 1")
+    if str(design.get("units", "mm")).lower() != "mm":
+        raise ValueError("declarative CAD currently requires millimetres")
+    if str(design.get("interference_policy", "error")).lower() != "error":
+        raise ValueError(
+            "declarative CAD always rejects volumetric assembly overlap; "
+            "interference_policy cannot disable this validation"
+        )
+    from build123d import Compound
+
+    parameters = design.get("parameters") or {}
+    if not isinstance(parameters, dict):
+        raise TypeError("design.parameters must be a JSON object")
+    # Resolve every scalar once up front. This catches cycles/unknown names
+    # before OpenCascade starts doing expensive work.
+    for name, value in parameters.items():
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError(f"invalid CAD parameter name: {name!r}")
+        _expression_value(value, parameters)
+
+    components = design.get("components")
+    if not isinstance(components, list) or not components:
+        raise ValueError("design.components must be a non-empty array")
+    if len(components) > _MAX_DESIGN_COMPONENTS:
+        raise ValueError(f"design exceeds {_MAX_DESIGN_COMPONENTS} components")
+    names: set[str] = set()
+    built = []
+    solid_names: list[str] = []
+    primitive_count = 0
+    for index, component in enumerate(components):
+        if not isinstance(component, dict):
+            raise TypeError(f"component {index} must be a JSON object")
+        name = str(component.get("name") or "").strip()
+        if not name or name in names:
+            raise ValueError(f"component names must be non-empty and unique: {name!r}")
+        names.add(name)
+        additions = component.get("add")
+        cuts = component.get("cut") or []
+        if not isinstance(additions, list) or not additions:
+            raise ValueError(f"component {name!r} needs a non-empty add array")
+        if not isinstance(cuts, list):
+            raise TypeError(f"component {name!r} cut must be an array")
+        add_shapes = []
+        for primitive in additions:
+            if not isinstance(primitive, dict):
+                raise TypeError(f"component {name!r} has a non-object primitive")
+            instances = list(_expanded_primitives(primitive, parameters))
+            primitive_count += len(instances)
+            add_shapes.extend(instances)
+        if primitive_count > _MAX_DESIGN_PRIMITIVES:
+            raise ValueError(f"design exceeds {_MAX_DESIGN_PRIMITIVES} primitive instances")
+        shape = add_shapes[0]
+        if len(add_shapes) > 1:
+            shape = shape.fuse(*add_shapes[1:])
+        for primitive in cuts:
+            if not isinstance(primitive, dict):
+                raise TypeError(f"component {name!r} has a non-object cut")
+            for cutter in _expanded_primitives(primitive, parameters):
+                primitive_count += 1
+                if primitive_count > _MAX_DESIGN_PRIMITIVES:
+                    raise ValueError(f"design exceeds {_MAX_DESIGN_PRIMITIVES} primitive instances")
+                shape = shape - cutter
+        shape.label = name
+        built.append(shape)
+        component_solids = list(shape.solids())
+        solid_names.extend(
+            name if len(component_solids) == 1 else f"{name}[{index}]"
+            for index in range(len(component_solids))
+        )
+    assembly = built[0] if len(built) == 1 else Compound(children=built)
+    assembly.label = str(design.get("name") or "assembly")
+    return assembly, parameters, names, solid_names, primitive_count
+
+
+def _name_interferences(interference: dict[str, Any], solid_names: list[str]) -> None:
+    """Attach stable component labels to pairwise solid findings in place."""
+    for item in interference.get("interferences") or []:
+        left, right = int(item["solid_a"]), int(item["solid_b"])
+        if left < len(solid_names):
+            item["component_a"] = solid_names[left]
+        if right < len(solid_names):
+            item["component_b"] = solid_names[right]
 
 
 def _validate_generator_source(path: Path) -> None:
@@ -115,12 +351,17 @@ def _metrics(shape, *, mesh: bool = False) -> dict[str, Any]:
     # surface through OCP's solid self-intersection checker crashes the native
     # process on Windows instead of raising. Mesh exports are validated by
     # existence and successful parse; BREP topology is validated here.
-    raw_validity = (
-        {"reasons": [], "volumes": []}
-        if mesh
-        else check_occurrence_shape(shape.wrapped)
-    )
-    reasons = list(raw_validity.get("reasons") or [])
+    # text-to-cad's validity contract is explicitly per leaf occurrence. Passing
+    # an assembly Compound here made the BOP self-intersection checker treat
+    # ordinary coincident mating faces as a self-intersecting *single* body.
+    # Validate each solid independently and keep assembly interference separate.
+    per_solid = [] if mesh else [check_occurrence_shape(solid.wrapped) for solid in solids]
+    reasons: list[str] = []
+    for index, finding in enumerate(per_solid):
+        for reason in finding.get("reasons") or []:
+            labelled = f"solid[{index}]:{reason}"
+            if labelled not in reasons:
+                reasons.append(labelled)
     if not mesh and not solids:
         reasons.append("no solid bodies")
     if not mesh and volume <= 0:
@@ -132,12 +373,52 @@ def _metrics(shape, *, mesh: bool = False) -> dict[str, Any]:
         "validity": {
             "ok": not reasons,
             "reasons": reasons,
-            "volumes": raw_validity.get("volumes") or [],
+            "volumes": [float(solid.volume) for solid in solids],
+            "scope": "per-solid",
         },
     }
     if mesh:
         result["mesh_count"] = 1
     return result
+
+
+def _assembly_interference(shape, *, max_solids: int = 64,
+                           tolerance: float = 1e-5) -> dict[str, Any]:
+    """Bounded pairwise overlap check; touching faces are not interference."""
+    solids = list(shape.solids())
+    if len(solids) < 2:
+        return {"checked": True, "pair_count": 0, "interferences": []}
+    pair_count = len(solids) * (len(solids) - 1) // 2
+    if len(solids) > max_solids:
+        return {
+            "checked": False,
+            "pair_count": pair_count,
+            "reason": f"skipped above bounded {max_solids}-solid interference limit",
+            "interferences": [],
+        }
+    findings = []
+    boxes = [solid.bounding_box() for solid in solids]
+    for left in range(len(solids)):
+        a = boxes[left]
+        for right in range(left + 1, len(solids)):
+            b = boxes[right]
+            separated = (
+                a.max.X <= b.min.X or b.max.X <= a.min.X
+                or a.max.Y <= b.min.Y or b.max.Y <= a.min.Y
+                or a.max.Z <= b.min.Z or b.max.Z <= a.min.Z
+            )
+            if separated:
+                continue
+            common = solids[left].intersect(solids[right])
+            overlap = sum(float(item.volume) for item in common.solids()) if common else 0.0
+            if overlap > tolerance:
+                findings.append({"solid_a": left, "solid_b": right, "volume": overlap})
+                if len(findings) >= 50:
+                    return {
+                        "checked": True, "pair_count": pair_count,
+                        "interferences": findings, "truncated": True,
+                    }
+    return {"checked": True, "pair_count": pair_count, "interferences": findings}
 
 
 def _glb_metrics(path: Path) -> dict[str, Any]:
@@ -332,7 +613,7 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
 
 def _require_workspace_paths(request: dict[str, Any]) -> None:
     workspace = Path(request["workspace"]).resolve()
-    for key in ("input", "output", "source", "params", "report", "preview"):
+    for key in ("input", "output", "source", "design", "params", "report", "preview"):
         raw = str(request.get(key) or "").strip()
         if not raw:
             continue
@@ -386,7 +667,8 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             **_metrics(reopened, mesh=output.suffix.lower() == ".stl"),
         }
 
-    if action in {"generate", "validate"}:
+    if action in {"generate", "generate_design", "validate"}:
+        solid_names: list[str] = []
         if action == "generate":
             from cadgen.generation import generate_step_targets
 
@@ -399,6 +681,14 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             )
             if exit_code:
                 raise RuntimeError(f"text-to-cad generation failed (exit {exit_code})")
+        elif action == "generate_design":
+            design_path = Path(request["design"]).resolve()
+            design = json.loads(design_path.read_text(encoding="utf-8"))
+            if not isinstance(design, dict):
+                raise TypeError("CAD design must be a JSON object")
+            output = Path(request["output"]).resolve()
+            shape, parameters, component_names, solid_names, primitive_count = _build_design(design)
+            _write_shape(shape, output)
         else:
             output = Path(request["input"]).resolve()
 
@@ -408,8 +698,11 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         result = _metrics(shape)
         if not result["validity"]["ok"]:
             raise RuntimeError("generated STEP failed validation: " + ", ".join(result["validity"]["reasons"]))
+        interference = _assembly_interference(shape)
+        if solid_names:
+            _name_interferences(interference, solid_names)
 
-        if action == "generate":
+        if action in {"generate", "generate_design"}:
             requested = [str(name) for name in (request.get("formats") or []) if name != "step"]
             mesh_outputs = [
                 (name, output.with_suffix("." + name))
@@ -429,12 +722,45 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         report_payload = {
             "engine": {"geometry": "build123d", "workflow": "text-to-cad/cadgen"},
             "source": str(request.get("source") or ""),
+            "design": str(request.get("design") or ""),
             "step": str(output),
             "preview": preview_text,
+            "assembly_interference": interference,
             **result,
         }
+        if action == "generate_design":
+            report_payload["component_names"] = sorted(component_names)
+            report_payload["component_count"] = len(component_names)
+            report_payload["primitive_count"] = primitive_count
+            report_payload["parameters"] = parameters
+            report_payload["solid_names"] = solid_names
         _write_report(report, report_payload)
-        return {"ok": True, "report": str(report), "preview": preview_text, **result}
+        if action in {"generate", "generate_design"} and interference.get("interferences"):
+            pairs = interference["interferences"]
+            summaries = []
+            for item in pairs[:20]:
+                left = item.get("component_a") or f"solid[{item['solid_a']}]"
+                right = item.get("component_b") or f"solid[{item['solid_b']}]"
+                summaries.append(
+                    f"{left} vs {right} ({float(item['volume']):.6g} mm^3)"
+                )
+            summary = ", ".join(summaries)
+            return {
+                "ok": False, "error_code": "assembly_interference", "retryable": True,
+                "error": "overlapping assembly solids detected: " + summary,
+                "report": str(report), "preview": preview_text,
+                "assembly_interference": interference, **result,
+            }
+        return {
+            "ok": True, "report": str(report), "preview": preview_text,
+            "assembly_interference": report_payload["assembly_interference"],
+            **({
+                "component_names": sorted(component_names),
+                "component_count": len(component_names),
+                "primitive_count": primitive_count,
+            } if action == "generate_design" else {}),
+            **result,
+        }
 
     raise ValueError(f"unknown CAD worker action: {action}")
 
@@ -450,7 +776,20 @@ def main(argv: list[str] | None = None) -> int:
             raise TypeError("CAD request must be a JSON object")
         result = _action(request)
     except Exception as exc:  # noqa: BLE001 - worker boundary returns structured failures
-        result = {"ok": False, "error": str(exc), "traceback": traceback.format_exc(limit=12)}
+        message = str(exc)
+        lower = message.lower()
+        if "syntax" in lower or "constructor arguments" in lower or "expression" in lower:
+            code, retryable = "invalid_design", True
+        elif "validation" in lower or "topology" in lower or "solid" in lower:
+            code, retryable = "invalid_geometry", True
+        elif "timed out" in lower or "lock" in lower:
+            code, retryable = "runtime_timeout", True
+        else:
+            code, retryable = "cad_runtime_error", False
+        result = {
+            "ok": False, "error": message, "error_code": code,
+            "retryable": retryable, "traceback": traceback.format_exc(limit=12),
+        }
     print(RESULT_START)
     print(json.dumps(result, ensure_ascii=False))
     print(RESULT_END)

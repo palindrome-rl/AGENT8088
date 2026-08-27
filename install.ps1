@@ -878,7 +878,9 @@ function Install-CadRuntime {
     $requirements = Join-Path $InstallDir "src\agent8088\cad_runtime_requirements.txt"
     $worker = Join-Path $InstallDir "src\agent8088\cad_worker.py"
     $verifier = Join-Path $InstallDir "scripts\verify_cad_runtime.py"
-    $probe = "from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.26'"
+    $viewerInstaller = Join-Path $InstallDir "scripts\install_cad_viewer.py"
+    $viewerRoot = Join-Path $runtimeRoot "viewer"
+    $probe = "from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.28'"
     $dependenciesReady = $false
 
     if (Test-Path -LiteralPath $runtimePy) {
@@ -894,7 +896,8 @@ function Install-CadRuntime {
 
     if (-not (Test-Path -LiteralPath $requirements) -or
         -not (Test-Path -LiteralPath $worker) -or
-        -not (Test-Path -LiteralPath $verifier)) {
+        -not (Test-Path -LiteralPath $verifier) -or
+        -not (Test-Path -LiteralPath $viewerInstaller)) {
         Register-SkippedStage -Label "Advanced CAD runtime" `
             -Reason "packaged runtime files are missing" `
             -Fix "rerun the Agent8088 installer from a complete checkout"
@@ -904,7 +907,7 @@ function Install-CadRuntime {
     New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
     if (-not $dependenciesReady) {
         Write-Info "Installing isolated build123d + text-to-cad CAD runtime..."
-        # cadgen 0.4.26 requires Python 3.11+, while Agent8088 core intentionally
+        # cadgen 0.4.28 requires Python 3.11+, while Agent8088 core intentionally
         # still supports 3.10. Keep that requirement inside this isolated runtime.
         $cadPython = Invoke-WithTimeout -FilePath $script:UvCmd `
             -Arguments @("python", "install", "3.11") -TimeoutSec $TVenv `
@@ -937,6 +940,17 @@ function Install-CadRuntime {
         }
     }
 
+    $viewerInstall = Invoke-WithTimeout -FilePath $runtimePy `
+        -Arguments @("-I", $viewerInstaller, "--target", $viewerRoot) `
+        -TimeoutSec $TCadRuntime -Activity "Installing text-to-cad CAD Viewer"
+    if ($viewerInstall.TimedOut -or $viewerInstall.ExitCode -ne 0) {
+        $why = if ($viewerInstall.TimedOut) { "timed out" } else { "viewer installer exit $($viewerInstall.ExitCode)" }
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "CAD Viewer install failed ($why)" `
+            -Fix "rerun the installer; the download is checksum-pinned and safe to retry"
+        return $false
+    }
+
     # The preview renderer is part of the CAD runtime contract. Install the
     # browser revision matching the pinned Playwright package, even if the core
     # agent currently happens to use the same revision.
@@ -955,16 +969,17 @@ function Install-CadRuntime {
     # A real round trip catches missing native wheels, invalid OpenCascade
     # output, and a browser that installs but cannot render a CAD preview.
     $smoke = Invoke-WithTimeout -FilePath $runtimePy `
-        -Arguments @("-I", $verifier) -TimeoutSec 240 -Activity "Verifying advanced CAD generation and preview"
+        -Arguments @("-I", $verifier, "--viewer-root", $viewerRoot) `
+        -TimeoutSec 300 -Activity "Verifying CAD generation, preview, and Viewer"
     if ($smoke.TimedOut -or $smoke.ExitCode -ne 0) {
         Register-SkippedStage -Label "Advanced CAD runtime" `
-            -Reason "installed packages failed the STEP and preview round-trip smoke test" `
+            -Reason "installed packages failed the STEP, preview, and Viewer round-trip smoke test" `
             -Fix "rerun the installer; inspect antivirus blocks if OpenCascade or Chromium cannot start"
         return $false
     }
 
     $script:CadRuntimeInstalled = $true
-    Write-Success "build123d + text-to-cad CAD runtime installed and verified"
+    Write-Success "build123d + text-to-cad CAD runtime and Viewer installed and verified"
     return $true
 }
 
@@ -2499,7 +2514,7 @@ function Verify-Install {
         Write-Host "  Browser:  Chromium missing (browse_page will show install instructions)"
     }
     if ($script:CadRuntimeInstalled) {
-        Write-Host "  CAD:      build123d + text-to-cad runtime installed and verified"
+        Write-Host "  CAD:      build123d + text-to-cad runtime and Viewer installed and verified"
     } else {
         Write-Host "  CAD:      advanced CAD runtime unavailable (core agent still works)"
     }

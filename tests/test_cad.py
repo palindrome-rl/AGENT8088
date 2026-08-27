@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.parse
 from pathlib import Path
+
+import pytest
 
 from agent8088 import cad, cad_worker
 
@@ -37,6 +40,68 @@ def test_runtime_status_requires_the_exact_pinned_versions(monkeypatch, tmp_path
         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "0.11.0|0.4.26\n", ""),
     )
     assert cad.cad_runtime_status()["available"] is False
+
+
+def test_viewer_status_requires_a_complete_pinned_release(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT8088_CAD_VIEWER_HOME", str(tmp_path))
+    assert cad.cad_viewer_status()["available"] is False
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "server_py").mkdir()
+    (tmp_path / "LICENSE").write_text("MIT")
+    (tmp_path / "dist/index.html").write_text("<html></html>")
+    (tmp_path / "server_py/server.py").write_text("pass")
+    (tmp_path / "server_py/start_viewer.py").write_text("pass")
+    assert cad.cad_viewer_status()["available"] is True
+
+
+def test_viewer_url_encodes_workspace_and_relative_file(tmp_path):
+    workspace = tmp_path / "CAD output with spaces"
+    model = workspace / "nested folder" / "part one.step"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"step")
+    url = cad._viewer_url(workspace, model, 3245)
+    parsed = urllib.parse.urlsplit(url)
+    assert parsed.hostname == "127.0.0.1"
+    assert parsed.port == 3245
+    assert urllib.parse.unquote(parsed.path).replace("/", "\\").lower().endswith(
+        str(workspace).replace("/", "\\").lower()
+    )
+    assert urllib.parse.parse_qs(parsed.query) == {"file": ["nested folder/part one.step"]}
+
+
+def test_open_viewer_rejects_missing_unsupported_and_outside_workspace(tmp_path):
+    assert "does not exist" in cad.open_cad_viewer(tmp_path / "missing.step")
+    unsupported = tmp_path / "part.fcstd"
+    unsupported.write_bytes(b"x")
+    assert "unsupported file type" in cad.open_cad_viewer(unsupported)
+    model = tmp_path / "part.step"
+    model.write_bytes(b"step")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    assert "outside the authorized workspace" in cad.open_cad_viewer(model, workspace)
+
+
+def test_open_viewer_reuses_only_a_verified_loopback_server(monkeypatch, tmp_path):
+    model = tmp_path / "part.step"
+    model.write_bytes(b"step")
+    monkeypatch.setattr(cad, "cad_viewer_status", lambda: {
+        "available": True, "version": cad.CAD_VIEWER_VERSION,
+        "root": str(tmp_path / "viewer"), "missing": [],
+    })
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"x")
+    monkeypatch.setenv("AGENT8088_CAD_PYTHON", str(python))
+    monkeypatch.setattr(cad, "_viewer_server_info", lambda port, workspace=None, timeout=1: (
+        {"app": "cad-viewer"} if port == 3247 else None
+    ))
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *a, **k: pytest.fail("healthy Viewer must be reused")
+    )
+    monkeypatch.setattr(cad.webbrowser, "open", lambda *a, **k: True)
+
+    result = cad.open_cad_viewer(model)
+
+    assert result.startswith("Opened: http://127.0.0.1:3247")
 
 
 def test_missing_runtime_is_actionable(monkeypatch, tmp_path):
@@ -163,6 +228,55 @@ def test_generate_success_returns_complete_bundle(monkeypatch, tmp_path):
     assert "model.params.json" in result
 
 
+def test_declarative_design_requires_json_object(tmp_path):
+    assert "valid JSON" in cad.generate_cad_design(tmp_path / "x.step", "{")
+    assert "JSON object" in cad.generate_cad_design(tmp_path / "x.step", "[]")
+    assert "requires a .step" in cad.generate_cad_design(tmp_path / "x.stl", "{}")
+
+
+def test_declarative_design_writes_inputs_and_requires_bundle(monkeypatch, tmp_path):
+    design = {
+        "schema_version": 1, "units": "mm", "parameters": {"x": 5},
+        "components": [{"name": "body", "add": [{"type": "box", "size": ["x", 2, 3]}]}],
+    }
+
+    def complete(request, timeout):
+        for key in ("output", "report", "preview"):
+            Path(request[key]).write_bytes(b"artifact")
+        Path(request["output"]).with_suffix(".stl").write_bytes(b"mesh")
+        return {**_ok_result(), "component_count": 1, "assembly_interference": {
+            "checked": True, "pair_count": 0, "interferences": [],
+        }}
+
+    monkeypatch.setattr(cad, "_run_worker", complete)
+    model = tmp_path / "model.step"
+    result = cad.generate_cad_design(model, json.dumps(design), "step,stl")
+    assert "Generated and verified model.step" in result
+    assert json.loads(model.with_suffix(".design.json").read_text()) == design
+    assert json.loads(model.with_suffix(".params.json").read_text()) == {"x": 5}
+    assert "Named components: 1" in result
+
+
+def test_declarative_expression_language_is_bounded():
+    params = {"length": 80, "half": "length / 2"}
+    assert cad_worker._expression_value("half + 5", params) == 45.0
+    for unsafe in (
+        "open('x')", "length.__class__", "unknown + 1", "2 ** 100", "999999 ** 2",
+    ):
+        with pytest.raises(ValueError):
+            cad_worker._expression_value(unsafe, params)
+
+
+def test_declarative_design_cannot_disable_interference_validation():
+    with pytest.raises(ValueError, match="always rejects"):
+        cad_worker._build_design({
+            "schema_version": 1, "units": "mm", "interference_policy": "report",
+            "components": [{
+                "name": "body", "add": [{"type": "box", "size": [1, 1, 1]}],
+            }],
+        })
+
+
 def test_validate_requires_report_and_preview(monkeypatch, tmp_path):
     model = tmp_path / "model.step"
     model.write_bytes(b"step")
@@ -242,3 +356,12 @@ def test_worker_rejects_paths_outside_the_authorized_workspace(tmp_path):
         assert "outside" in str(exc)
     else:
         raise AssertionError("out-of-workspace path was accepted")
+
+
+def test_worker_path_guard_includes_declarative_design(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with pytest.raises(ValueError, match="outside"):
+        cad_worker._require_workspace_paths({
+            "workspace": str(workspace), "design": str(tmp_path / "outside.design.json"),
+        })
