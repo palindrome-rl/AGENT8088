@@ -1551,11 +1551,13 @@ def _maybe_probe_context_window():
     if "context_window" in APP_CONFIG:
         return  # global override exists — no probe needed
     try:
-        probed = probe_model_context_window(client, MODEL_NAME, provider_name=name)
+        probed_ctx, probed_out = probe_model_context_window(client, MODEL_NAME, provider_name=name)
     except Exception:
-        probed = None
-    if probed and probed > 0:
-        PROVIDERS[name]["context_window"] = str(probed)
+        probed_ctx, probed_out = None, None
+    if probed_ctx and probed_ctx > 0:
+        PROVIDERS[name]["context_window"] = str(probed_ctx)
+    if probed_out and probed_out > 0 and not PROVIDERS[name].get("max_completion_tokens"):
+        PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
 
 
 def _native_tools_enabled(tools, provider_name: str = "") -> bool:

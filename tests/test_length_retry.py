@@ -150,14 +150,14 @@ def test_probe_result_is_used_when_no_config_override(monkeypatch, engine):
     engine.PROVIDERS["ollama-cloud"] = {
         "model": "kimi-k2.6",
         "context_window": "262144",  # probed via /api/show, session-only
+        "max_completion_tokens": "32768",  # probed from top_provider or model_info
     }
     engine.APP_CONFIG.pop("context_window", None)
     engine.APP_CONFIG.pop("max_completion_tokens", None)
 
     context, completion = engine._active_model_token_limits()
     assert context == 262144
-    # completion falls back to MAX_COMPLETION_TOKENS (probe doesn't set it)
-    assert completion == engine.MAX_COMPLETION_TOKENS
+    assert completion == 32768
 
 
 def test_turn_limit_reports_error_and_latest_tool_result(monkeypatch, engine):
@@ -258,8 +258,34 @@ def test_probe_finds_context_window_on_model_object():
             def list():
                 return _Resp()
 
-    result = providers.probe_model_context_window(_Client(), "test-model", provider_name="custom")
-    assert result == 256000
+    ctx, out = providers.probe_model_context_window(_Client(), "test-model", provider_name="custom")
+    assert ctx == 256000
+    assert out is None
+
+
+def test_probe_finds_top_provider_max_completion_tokens():
+    """OpenRouter exposes max_completion_tokens inside top_provider dict."""
+    from agent8088 import providers
+
+    class _M:
+        id = "test-or-model"
+        context_length = 200000
+        top_provider = {"max_completion_tokens": 8192}
+
+    class _Resp:
+        data = [_M()]
+
+    class _Client:
+        base_url = "http://openrouter.example.com/v1"
+        api_key = ""
+        class models:
+            @staticmethod
+            def list():
+                return _Resp()
+
+    ctx, out = providers.probe_model_context_window(_Client(), "test-or-model", provider_name="openrouter")
+    assert ctx == 200000
+    assert out == 8192
 
 
 def test_probe_returns_none_when_no_field():
@@ -279,8 +305,9 @@ def test_probe_returns_none_when_no_field():
             def list():
                 return _Resp()
 
-    result = providers.probe_model_context_window(_Client(), "no-ctx-model", provider_name="custom")
-    assert result is None
+    ctx, out = providers.probe_model_context_window(_Client(), "no-ctx-model", provider_name="custom")
+    assert ctx is None
+    assert out is None
 
 
 def test_probe_returns_none_on_endpoint_error():
@@ -294,8 +321,9 @@ def test_probe_returns_none_on_endpoint_error():
             def list():
                 raise ConnectionError("endpoint down")
 
-    result = providers.probe_model_context_window(_Client(), "any-model", provider_name="custom")
-    assert result is None
+    ctx, out = providers.probe_model_context_window(_Client(), "any-model", provider_name="custom")
+    assert ctx is None
+    assert out is None
 
 
 def test_probe_uses_ollama_api_show_for_llama_provider(monkeypatch):
@@ -319,8 +347,34 @@ def test_probe_uses_ollama_api_show_for_llama_provider(monkeypatch):
         base_url = "http://localhost:11434/v1"
         api_key = "ollama"
 
-    result = providers.probe_model_context_window(_Client(), "llama3.3", provider_name="ollama")
-    assert result == 131072
+    ctx, out = providers.probe_model_context_window(_Client(), "llama3.3", provider_name="ollama")
+    assert ctx == 131072
+    assert out is None
+
+
+def test_probe_uses_google_native_api_for_gemini(monkeypatch):
+    """For gemini, the probe queries Google's native /v1beta/models/{id}."""
+    import httpx as _real_httpx
+    from agent8088 import providers
+
+    class _FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"inputTokenLimit": 1048576, "outputTokenLimit": 65536}
+
+    def _fake_get(url, **kwargs):
+        assert "generativelanguage.googleapis.com" in url
+        return _FakeResponse()
+
+    monkeypatch.setattr(_real_httpx, "get", _fake_get)
+
+    class _Client:
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        api_key = "test-key"
+
+    ctx, out = providers.probe_model_context_window(_Client(), "gemini-2.5-flash", provider_name="gemini")
+    assert ctx == 1048576
+    assert out == 65536
 
 
 def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
@@ -336,7 +390,7 @@ def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
         pass
 
     def _fake_probe(client, model_id, provider_name="", timeout=5):
-        return 786432
+        return 786432, 16384
 
     monkeypatch.setattr(engine, "client", _FakeClient())
     import agent8088.providers as _prov
@@ -345,6 +399,7 @@ def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
     engine._maybe_probe_context_window()
 
     assert engine.PROVIDERS["probeprov"]["context_window"] == "786432"
+    assert engine.PROVIDERS["probeprov"]["max_completion_tokens"] == "16384"
 
 
 def test_maybe_probe_skips_when_context_already_set(monkeypatch, engine):

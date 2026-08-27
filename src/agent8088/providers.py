@@ -166,41 +166,60 @@ def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, 
 
 
 def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL_LIST_TIMEOUT_SECONDS):
-    """Best-effort: ask the endpoint for the model's context window.
+    """Best-effort: ask the endpoint for the model's context window and output limit.
 
-    Two strategies, tried in order:
-    1. Ollama native /api/show — Ollama and Ollama Cloud publish real
-       model_info with "<arch>.context_length" in the response. This is the
-       reliable path for ollama/ollama-cloud providers.
-    2. OpenAI-compatible /v1/models — most providers don't publish context
-       here, but some add non-standard fields (context_window,
-       max_context_length, max_input_tokens, context_length).
+    Returns (context_window, max_completion_tokens) or (None, None) on miss.
+    Never raises — the caller treats None as "use fallback".
 
-    Returns int or None on miss. Never raises — the caller treats None as
-    "use fallback".
+    Strategies tried in order, by provider:
+    1. Ollama native /api/show — ollama/ollama-cloud publish model_info with
+       "<arch>.context_length". The reliable path for Ollama providers.
+    2. Google native /v1beta/models/{id} — gemini publishes inputTokenLimit
+       and outputTokenLimit that the OpenAI-compatible layer doesn't expose.
+    3. OpenAI-compatible /v1/models — OpenRouter, Groq, and others add
+       non-standard fields (context_length, context_window, top_provider).
+       Most OpenAI endpoints don't publish anything here.
     """
     base_url = str(getattr(client, "base_url", "")).rstrip("/")
     api_key = str(getattr(client, "api_key", ""))
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-    # Strategy 1: Ollama /api/show (works for ollama, ollama-cloud, and any
-    # Ollama-compatible endpoint that serves the native API alongside /v1).
+    # Strategy 1: Ollama /api/show
     if provider_name in ("ollama", "ollama-cloud") or "ollama" in base_url:
         try:
             import httpx
-            # The native API lives at the host root, not under /v1.
             show_url = base_url.replace("/v1", "") + "/api/show"
             r = httpx.post(show_url, json={"model": model_id},
                            headers=headers, timeout=timeout)
             if r.status_code == 200:
                 info = r.json().get("model_info", {})
+                ctx = None
                 for key, value in info.items():
                     if key.endswith("context_length") and isinstance(value, int):
-                        return value
+                        ctx = value
+                        break
+                if ctx:
+                    return ctx, None
         except Exception:
             pass
 
-    # Strategy 2: OpenAI-compatible /v1/models — look for non-standard fields.
+    # Strategy 2: Google native API (gemini)
+    if provider_name == "gemini" or "googleapis" in base_url:
+        try:
+            import httpx
+            model_clean = model_id.replace("models/", "")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_clean}"
+            r = httpx.get(url, headers={"x-goog-api-key": api_key}, timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                ctx = data.get("inputTokenLimit")
+                out = data.get("outputTokenLimit")
+                if ctx:
+                    return int(ctx), int(out) if out else None
+        except Exception:
+            pass
+
+    # Strategy 3: OpenAI-compatible /v1/models
     try:
         fetch_client = (client.with_options(timeout=timeout)
                         if hasattr(client, "with_options") else client)
@@ -208,14 +227,29 @@ def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL
         norm = _normalize_model_id("", model_id)
         for m in resp.data:
             if _normalize_model_id("", str(getattr(m, "id", ""))) == norm:
-                for attr in ("context_window", "max_context_length",
-                             "max_input_tokens", "context_length"):
+                ctx = None
+                for attr in ("context_length", "context_window",
+                             "max_context_length", "max_input_tokens"):
                     v = getattr(m, attr, None)
                     if v:
                         try:
-                            return int(v)
+                            ctx = int(v)
                         except (TypeError, ValueError):
                             pass
+                    if ctx:
+                        break
+                # OpenRouter puts max_completion_tokens inside top_provider
+                out = None
+                tp = getattr(m, "top_provider", None)
+                if isinstance(tp, dict):
+                    out = tp.get("max_completion_tokens")
+                    if out:
+                        try:
+                            out = int(out)
+                        except (TypeError, ValueError):
+                            out = None
+                if ctx:
+                    return ctx, out
     except Exception:
         pass
-    return None
+    return None, None
