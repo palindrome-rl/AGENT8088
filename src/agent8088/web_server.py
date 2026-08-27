@@ -403,9 +403,6 @@ class MemoryAddBody(BaseModel):
 @app.post("/api/memory/add")
 async def memory_add(body: MemoryAddBody):
     """Add a fact to memory."""
-    A = _eng()
-    from agent8088.memory import store as _store_mod
-    active_store = _store_mod.store if hasattr(_store_mod, 'store') else None
     from agent8088.memory import store as _mem_store
     s = _mem_store()
     if s is None:
@@ -416,7 +413,6 @@ async def memory_add(body: MemoryAddBody):
     except Exception as exc:
         return {"error": str(exc)}
 
-
 @app.delete("/api/memory/{fact_id}")
 async def memory_forget(fact_id: str):
     """Forget a memory by ID."""
@@ -425,7 +421,10 @@ async def memory_forget(fact_id: str):
     if s is None:
         return {"error": "memory is not enabled"}
     try:
-        s.delete(fact_id, user_id="owner")
+        # MemoryStore.delete(memory_id) — no user_id kwarg (TypeError otherwise).
+        deleted = s.delete(fact_id)
+        if not deleted:
+            return {"error": f"memory not found: {fact_id}"}
         return {"ok": True}
     except Exception as exc:
         return {"error": str(exc)}
