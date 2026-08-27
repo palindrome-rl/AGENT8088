@@ -4338,6 +4338,21 @@ def _agent8088_home():
     return Path.home() / ".agent8088"
 
 
+def _resolve_config_path():
+    """Resolve the active config.txt path, matching engine.py's precedence.
+
+    AGENT8088_CONFIG env > CWD ./config.txt > ~/.agent8088/config.txt >
+    %LOCALAPPDATA%/agent8088/config.txt. A CWD ./config.txt is exclusive
+    — setup writes go there, not the global install.
+    """
+    if os.environ.get("AGENT8088_CONFIG"):
+        return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+    cwd_config = Path.cwd() / "config.txt"
+    if cwd_config.exists():
+        return cwd_config
+    return Path(_agent8088_home() / "config.txt")
+
+
 def _agent8088_link_dir():
     if os.environ.get("AGENT8088_LINK_DIR"):
         return Path(os.environ["AGENT8088_LINK_DIR"]).expanduser()
@@ -5538,8 +5553,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
     from agent8088 import providers as provider_registry
-    home = _agent8088_home()
-    config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    config_path = Path(config_path) if config_path else _resolve_config_path()
     if not config_path.exists():
         # Seed from the packaged template so the wizard has defaults to edit.
         # The old behaviour — refusing to run and telling the user to "run the
@@ -5781,8 +5795,7 @@ def _run_gateway_setup():
     import subprocess
     import shutil
 
-    home = _agent8088_home()
-    config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    config_path = _resolve_config_path()
     if not config_path.exists():
         # Seed from the packaged template — same fix as _run_setup. The old
         # "run --setup first" message was a dead end when --setup itself
