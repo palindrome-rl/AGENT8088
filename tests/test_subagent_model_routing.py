@@ -167,3 +167,19 @@ def test_exec_subagent_env_override():
         assert kwargs.get("model_name") == "gemini-2.0-flash"
 
 
+def test_builtin_subagent_profiles_loaded():
+    from agent8088 import engine as eng
+    specs = eng.load_subagent_specs(eng.AGENTS_DIR)
+    assert "explore" in specs
+    assert specs["explore"]["model"] == "haiku"
+    assert "researcher" in specs
+    assert specs["researcher"]["model"] == "flash"
+    assert "coder" in specs
+    assert specs["coder"]["model"] == "inherit"
+    assert "auditor" in specs
+    assert specs["auditor"]["model"] == "inherit"
+    assert "general-purpose" in specs
+    assert specs["general-purpose"]["model"] == "inherit"
+
+
+
