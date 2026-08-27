@@ -158,6 +158,7 @@ sensitive-file floor still applies unconditionally.
 | `/limits <key> <value>` | Change one — **persists to `config.txt`** |
 | `/limits subagent <name> <turns>` | Per-profile sub-agent round cap |
 | `/limits tool <name> <seconds>` | Per-tool timeout |
+| `/limits provider <name> <key> <value>` | Per-provider token limit (`context_window` or `max_completion_tokens`) |
 | `/config` | Active config + file path |
 | `/capabilities` | What the agent can do and which guardrails are in force |
 | `/doctor [--fix]` | Environment health check; `--fix` repairs a broken web-search install |

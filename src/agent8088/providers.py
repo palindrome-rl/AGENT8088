@@ -169,3 +169,30 @@ def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, 
         return models
     except Exception:
         return list(FALLBACK_MODELS.get(provider_name, [])) if fallback else []
+
+
+def probe_model_context_window(client, model_id, timeout=MODEL_LIST_TIMEOUT_SECONDS):
+    """Best-effort: ask the endpoint for the model's context window.
+
+    OpenAI-compatible /v1/models rarely publishes this, so we look for a
+    non-standard field on the model object. Returns int or None on miss.
+    Never raises — the caller (activate_model) treats None as "use fallback".
+    """
+    try:
+        fetch_client = (client.with_options(timeout=timeout)
+                        if hasattr(client, "with_options") else client)
+        resp = fetch_client.models.list()
+        norm = _normalize_model_id("", model_id)
+        for m in resp.data:
+            if _normalize_model_id("", str(getattr(m, "id", ""))) == norm:
+                for attr in ("context_window", "max_context_length",
+                             "max_input_tokens", "context_length"):
+                    v = getattr(m, attr, None)
+                    if v:
+                        try:
+                            return int(v)
+                        except (TypeError, ValueError):
+                            pass
+    except Exception:
+        pass
+    return None

@@ -2573,6 +2573,8 @@ def cmd_model(rest):
         return
     active = _active_provider_name()
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
+    _ctx, _out = A._active_model_token_limits()
+    console.print(f"[dim]  context: {_ctx:,} · max output: {_out:,}[/dim]")
     banner()
 
 
@@ -3555,8 +3557,27 @@ def _show_limits():
     for name in sorted(A.SUBAGENT_SPECS):
         st.add_row(name, str(A.SUBAGENT_SPECS[name]["max_turns"]))
     console.print(st)
+
+    _provider_rows = [
+        (name, A.PROVIDERS[name].get("context_window"),
+         A.PROVIDERS[name].get("max_completion_tokens"))
+        for name in sorted(A.PROVIDERS)
+        if A.PROVIDERS[name].get("context_window")
+        or A.PROVIDERS[name].get("max_completion_tokens")
+    ]
+    if _provider_rows:
+        pt = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+        pt.add_column("Provider", style="#237dd7")
+        pt.add_column("Context", style="#237dd7")
+        pt.add_column("Max output", style="#237dd7")
+        for name, ctx, comp in _provider_rows:
+            pt.add_row(name, str(ctx or "—"), str(comp or "—"))
+        console.print(pt)
+
+    active_ctx, active_out = A._active_model_token_limits()
+    console.print(f"[dim]Active model: {active_ctx:,} context / {active_out:,} output[/dim]")
     console.print("[dim]/limits <key> <value> · /limits subagent <name> <turns> · "
-                  "/limits tool <name> <seconds>[/dim]")
+                  "/limits tool <name> <seconds> · /limits provider <name> <key> <value>[/dim]")
 
 
 def _memory_set_enabled(want: bool) -> None:
@@ -3843,6 +3864,16 @@ def cmd_limits(rest):
                 console.print("[red]usage:[/red] /limits tool <name> <seconds>")
                 return
             _report_limit_change(A.set_tool_timeout(parts[1], parts[2]))
+            return
+        if parts[0] == "provider":
+            if len(parts) != 4:
+                console.print("[red]usage:[/red] /limits provider <name> <key> <value>")
+                return
+            _, name, pkey, pvalue = parts
+            try:
+                _report_limit_change(A.set_provider_limit(name, pkey, pvalue))
+            except (KeyError, ValueError) as e:
+                console.print(f"[red]error:[/red] {e}")
             return
         if len(parts) != 2:
             console.print("[red]usage:[/red] /limits <key> <value>")

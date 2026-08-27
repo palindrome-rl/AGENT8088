@@ -235,6 +235,8 @@ process and this file so the change survives a restart:
 /limits max_turn_seconds 60
 /limits subagent explore 12
 /limits tool browse_page 90
+/limits provider glm context_window 1048576
+/limits provider custom max_completion_tokens 32768
 ```
 
 Raising a limit is allowed and reported as such, with a further warning past a

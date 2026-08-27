@@ -229,11 +229,19 @@ def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
     return migrated
 
 
-# Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
+# Config path: AGENT8088_CONFIG env var > CWD ./config.txt > ~/.agent8088/config.txt
+#             > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
+# A CWD ./config.txt is exclusive — the two files never interact (no merge,
+# no global read). This lets a project directory own its full config (provider,
+# keys, token limits) without polluting the global install, and /limits
+# provider writes stay local when CWD config is active.
+_cwd_config = Path.cwd() / "config.txt"
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
 if os.environ.get("AGENT8088_CONFIG"):
     CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+elif _cwd_config.exists():
+    CONFIG_PATH = _cwd_config
 elif _user_config.exists():
     CONFIG_PATH = _user_config
 elif _win_config.exists():
@@ -476,6 +484,35 @@ def set_tool_timeout(tool: str, seconds: int) -> dict:
     return {"key": key, "old": old, "new": seconds,
             "direction": "looser" if seconds > old else "tighter" if seconds < old else "same",
             "over_ceiling": False, "ceiling": None}
+
+
+_PROVIDER_LIMIT_KEYS = ("context_window", "max_completion_tokens")
+
+
+def set_provider_limit(provider: str, key: str, value: str) -> dict:
+    """Change one provider's token limit. Persisted as provider.<name>.<key>.
+
+    Mirrors set_subagent_turns: mutates the live PROVIDERS dict, APP_CONFIG,
+    and config.txt so the change survives a restart. _active_model_token_limits
+    reads PROVIDERS[name] first, so the next turn picks up the new value.
+    """
+    if provider not in PROVIDERS:
+        raise KeyError(provider)
+    if key not in _PROVIDER_LIMIT_KEYS:
+        raise ValueError(f"unknown provider limit: {key}")
+    new = int(value)
+    if new < 1:
+        raise ValueError("must be >= 1")
+    old_raw = PROVIDERS[provider].get(key)
+    old = _positive_int(old_raw, 0)
+    PROVIDERS[provider][key] = str(new)
+    config_key = f"provider.{provider}.{key}"
+    APP_CONFIG[config_key] = str(new)
+    update_simple_config(CONFIG_PATH, {config_key: new})
+    return {"key": config_key, "old": old, "new": new, "provider": provider,
+            "direction": "looser" if new > old else "tighter" if new < old else "same",
+            "over_ceiling": False, "ceiling": None}
+
 
 # --- Approval policy ---
 # There is deliberately no separate "approval mode" axis: PERMISSION_MODE already
@@ -1494,7 +1531,31 @@ def activate_model(provider: str = "", model: str = ""):
         update_simple_config(CONFIG_PATH, {"model_name": selected_model})
         APP_CONFIG["model_name"] = selected_model
         MODEL_NAME = selected_model
+    _maybe_probe_context_window()
     return client, MODEL_NAME
+
+
+def _maybe_probe_context_window():
+    """Best-effort: if the active provider has no context_window set, probe
+    the endpoint. On hit, store it session-only in PROVIDERS (not persisted —
+    the user can /limits provider to make it stick). Never blocks or raises."""
+    try:
+        from agent8088.providers import probe_model_context_window
+    except ImportError:
+        return
+    name = ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    if not name or name not in PROVIDERS:
+        return
+    if PROVIDERS[name].get("context_window"):
+        return  # already set — no probe needed
+    if "context_window" in APP_CONFIG:
+        return  # global override exists — no probe needed
+    try:
+        probed = probe_model_context_window(client, MODEL_NAME)
+    except Exception:
+        probed = None
+    if probed and probed > 0:
+        PROVIDERS[name]["context_window"] = str(probed)
 
 
 def _native_tools_enabled(tools, provider_name: str = "") -> bool:

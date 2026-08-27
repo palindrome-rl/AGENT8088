@@ -162,3 +162,204 @@ def test_turn_limit_reports_error_and_latest_tool_result(monkeypatch, engine):
     assert answer.startswith("Error: Agent reached the 2-turn limit")
     assert "latest failure" in answer
     assert "old skill text" not in answer
+
+
+# ---------------------------------------------------------------------------
+# Gap 1: /limits provider live override (set_provider_limit)
+# ---------------------------------------------------------------------------
+
+def test_set_provider_limit_writes_to_providers_and_config(monkeypatch, tmp_path, engine):
+    """set_provider_limit mutates PROVIDERS, APP_CONFIG, and config.txt."""
+    monkeypatch.setattr(engine, "CONFIG_PATH", tmp_path / "config.txt")
+    engine.PROVIDERS["testprov"] = {"model": "m1"}
+    engine.APP_CONFIG.clear()
+
+    result = engine.set_provider_limit("testprov", "max_completion_tokens", "50000")
+
+    assert result["new"] == 50000
+    assert engine.PROVIDERS["testprov"]["max_completion_tokens"] == "50000"
+    assert engine.APP_CONFIG["provider.testprov.max_completion_tokens"] == "50000"
+    assert "provider.testprov.max_completion_tokens=50000" in (tmp_path / "config.txt").read_text()
+
+
+def test_set_provider_limit_rejects_unknown_provider(monkeypatch, engine):
+    with pytest.raises(KeyError):
+        engine.set_provider_limit("nonexistent", "context_window", "1000")
+
+
+def test_set_provider_limit_rejects_unknown_key(monkeypatch, engine):
+    engine.PROVIDERS["testprov2"] = {"model": "m"}
+    with pytest.raises(ValueError, match="unknown provider limit"):
+        engine.set_provider_limit("testprov2", "temperature", "0.5")
+
+
+def test_set_provider_limit_rejects_non_positive(monkeypatch, engine):
+    engine.PROVIDERS["testprov3"] = {"model": "m"}
+    with pytest.raises(ValueError):
+        engine.set_provider_limit("testprov3", "context_window", "0")
+
+
+def test_set_provider_limit_takes_effect_next_turn(monkeypatch, tmp_path, engine):
+    """After set_provider_limit, _active_model_token_limits picks up the new value."""
+    monkeypatch.setattr(engine, "CONFIG_PATH", tmp_path / "config.txt")
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "provX")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "provX")
+    monkeypatch.setattr(engine, "MODEL_NAME", "m")
+    engine.PROVIDERS["provX"] = {"model": "m"}
+
+    engine.set_provider_limit("provX", "context_window", "500000")
+    engine.set_provider_limit("provX", "max_completion_tokens", "60000")
+
+    _ctx_after, _out_after = engine._active_model_token_limits()
+    assert _ctx_after == 500000
+    assert _out_after == 60000
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: best-effort endpoint probe (probe_model_context_window + _maybe_probe)
+# ---------------------------------------------------------------------------
+
+def test_probe_finds_context_window_on_model_object():
+    """probe_model_context_window reads a non-standard context_window field."""
+    from agent8088 import providers
+
+    class _M:
+        id = "test-model"
+        context_window = 256000
+
+    class _Resp:
+        data = [_M()]
+
+    class _Client:
+        def models_list(self):
+            pass
+        class models:
+            @staticmethod
+            def list():
+                return _Resp()
+
+    result = providers.probe_model_context_window(_Client(), "test-model")
+    assert result == 256000
+
+
+def test_probe_returns_none_when_no_field():
+    from agent8088 import providers
+
+    class _M:
+        id = "no-ctx-model"
+        # no context_window / max_context_length / etc.
+
+    class _Resp:
+        data = [_M()]
+
+    class _Client:
+        class models:
+            @staticmethod
+            def list():
+                return _Resp()
+
+    result = providers.probe_model_context_window(_Client(), "no-ctx-model")
+    assert result is None
+
+
+def test_probe_returns_none_on_endpoint_error():
+    from agent8088 import providers
+
+    class _Client:
+        class models:
+            @staticmethod
+            def list():
+                raise ConnectionError("endpoint down")
+
+    result = providers.probe_model_context_window(_Client(), "any-model")
+    assert result is None
+
+
+def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
+    """_maybe_probe_context_window stores a probed value in PROVIDERS but
+    does NOT persist to config.txt."""
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "probeprov")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "probeprov")
+    monkeypatch.setattr(engine, "MODEL_NAME", "probed-model")
+    engine.PROVIDERS["probeprov"] = {"model": "probed-model"}
+    engine.APP_CONFIG.pop("context_window", None)
+
+    class _FakeClient:
+        pass
+
+    def _fake_probe(client, model_id, timeout=5):
+        return 786432
+
+    monkeypatch.setattr(engine, "client", _FakeClient())
+    import agent8088.providers as _prov
+    monkeypatch.setattr(_prov, "probe_model_context_window", _fake_probe)
+
+    engine._maybe_probe_context_window()
+
+    assert engine.PROVIDERS["probeprov"]["context_window"] == "786432"
+
+
+def test_maybe_probe_skips_when_context_already_set(monkeypatch, engine):
+    """If the provider already has context_window, no probe runs."""
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "hasctx")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "hasctx")
+    monkeypatch.setattr(engine, "MODEL_NAME", "m")
+    engine.PROVIDERS["hasctx"] = {"model": "m", "context_window": "999999"}
+
+    probe_called = []
+    import agent8088.providers as _prov
+    monkeypatch.setattr(_prov, "probe_model_context_window",
+                        lambda *a, **kw: probe_called.append(1) or 123)
+
+    engine._maybe_probe_context_window()
+
+    assert probe_called == []  # probe was not called
+    assert engine.PROVIDERS["hasctx"]["context_window"] == "999999"
+
+
+# ---------------------------------------------------------------------------
+# Gap 3: CWD config.txt isolation
+# ---------------------------------------------------------------------------
+
+def test_cwd_config_is_selected_when_present(monkeypatch, tmp_path):
+    """When ./config.txt exists in CWD, it is used exclusively (no global)."""
+    import importlib
+    import sys
+    from pathlib import Path
+
+    local_config = tmp_path / "config.txt"
+    local_config.write_text("default_provider=localprov\nmodel_name=local-model\n")
+
+    monkeypatch.delenv("AGENT8088_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from agent8088 import engine as mod
+    reloaded = importlib.reload(mod)
+
+    assert reloaded.CONFIG_PATH.resolve() == local_config.resolve()
+    assert reloaded.APP_CONFIG.get("default_provider") == "localprov"
+    assert reloaded.APP_CONFIG.get("model_name") == "local-model"
+
+
+def test_cwd_config_isolated_from_global(monkeypatch, tmp_path):
+    """/limits provider writes go to the CWD config, not the global."""
+    import importlib
+    import sys
+    from pathlib import Path
+
+    local_config = tmp_path / "config.txt"
+    local_config.write_text("default_provider=localprov\n")
+
+    monkeypatch.delenv("AGENT8088_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from agent8088 import engine as mod
+    reloaded = importlib.reload(mod)
+
+    reloaded.PROVIDERS["localprov"] = {"model": "local-model"}
+    reloaded.set_provider_limit("localprov", "context_window", "200000")
+
+    content = local_config.read_text()
+    assert "provider.localprov.context_window=200000" in content
