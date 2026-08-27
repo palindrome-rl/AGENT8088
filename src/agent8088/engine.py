@@ -2395,6 +2395,8 @@ _DEFAULT_SUBAGENT_PROFILE = {
     "tools": sorted(n for n in TOOL_NAMES if n != "spawn_subagent"),
     "max_turns": 8,
     "permission": "",
+    "model": "inherit",
+    "provider": "",
     "system_prompt": (
         "You are a focused sub-agent spawned to complete ONE delegated task with a "
         "fresh context. Use your tools actively. When done, reply with a concise final "
@@ -2422,6 +2424,9 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 # honoured: a profile may restrict itself below the caller's mode,
                 # never widen past it.
                 "permission": meta.get("permission", "").strip().lower(),
+                # Subagent model configuration (Claude Code style frontmatter)
+                "model": meta.get("model", "").strip(),
+                "provider": meta.get("provider", "").strip(),
                 "system_prompt": body.strip() or _DEFAULT_SUBAGENT_PROFILE["system_prompt"],
             }
     if DEFAULT_SUBAGENT not in specs:
