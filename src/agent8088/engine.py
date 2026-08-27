@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
+import ast, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -354,6 +354,14 @@ MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
 MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
 COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
 COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
+
+# --- Retry before failover ---
+# Retries the same provider this many times (with exponential backoff) before
+# falling through the fallback_models chain. 0 = immediate failover.
+API_MAX_RETRIES = max(0, int(APP_CONFIG.get("api_max_retries", "3")))
+API_RETRY_INITIAL_DELAY_MS = max(0, int(APP_CONFIG.get("api_retry_initial_delay_ms", "500")))
+API_RETRY_MAX_DELAY_MS = max(1, int(APP_CONFIG.get("api_retry_max_delay_ms", "10000")))
+API_RETRY_JITTER_RATIO = max(0.0, min(1.0, float(APP_CONFIG.get("api_retry_jitter_ratio", "0.1"))))
 
 # --- Write blast radius: bounds how much damage one turn can do ---
 # The permission layer decides WHETHER a write is allowed; these bound HOW MANY
@@ -1759,6 +1767,35 @@ def _retryable_model_error(error: Exception) -> bool:
     return any(marker in name or marker in text for marker in retryable)
 
 
+def _extract_retry_after(error):
+    """Parse Retry-After header (seconds or HTTP-date) from an OpenAI SDK error."""
+    resp = getattr(error, "response", None)
+    if not resp or not hasattr(resp, "headers"):
+        return None
+    raw = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw) * 1000)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        return max(0, int((dt.timestamp() - time.time()) * 1000))
+    except Exception:
+        return None
+
+
+def _retry_delay(retry_attempt, retry_after_ms=None):
+    if retry_after_ms and retry_after_ms <= API_RETRY_MAX_DELAY_MS:
+        return retry_after_ms / 1000.0
+    exponent = min(retry_attempt - 1, 1024)
+    delay = min(API_RETRY_INITIAL_DELAY_MS * 2 ** exponent, API_RETRY_MAX_DELAY_MS)
+    jitter = 1 - API_RETRY_JITTER_RATIO + 2 * API_RETRY_JITTER_RATIO * random.random()
+    return (delay * jitter) / 1000.0
+
+
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
                                      on_token, interrupt_check, trace, turn,
                                      max_tokens=None):
@@ -1772,21 +1809,28 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             on_token(kind, delta)
 
     token_handler = tracked_token if on_token else None
-    try:
-        return create_completion(
-            client, messages, tools, temperature=temperature,
-            max_tokens=max_tokens,
-            system_prompt=system_prompt, on_token=token_handler,
-            interrupt_check=interrupt_check,
-            provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
-            telemetry_attempt="primary",
-        )
-    except AgentInterrupted:
-        raise
-    except Exception as primary_error:
-        if emitted or not _retryable_model_error(primary_error):
+    last_error = None
+    for attempt in range(1, API_MAX_RETRIES + 2):  # 1 initial try + API_MAX_RETRIES retries
+        try:
+            return create_completion(
+                client, messages, tools, temperature=temperature,
+                max_tokens=max_tokens,
+                system_prompt=system_prompt, on_token=token_handler,
+                interrupt_check=interrupt_check,
+                provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+                telemetry_attempt="primary",
+            )
+        except AgentInterrupted:
             raise
-        last_error = primary_error
+        except Exception as primary_error:
+            if emitted or not _retryable_model_error(primary_error):
+                raise
+            last_error = primary_error
+            retry_after_ms = _extract_retry_after(primary_error)
+            if retry_after_ms is not None and retry_after_ms > API_RETRY_MAX_DELAY_MS:
+                break  # skip remaining retries, fall through to fallback chain
+            if attempt <= API_MAX_RETRIES:
+                time.sleep(_retry_delay(attempt, retry_after_ms))
 
     for provider_name, model_name in _fallback_targets():
         if provider_name == (ACTIVE_PROVIDER or DEFAULT_PROVIDER) and model_name == MODEL_NAME:
