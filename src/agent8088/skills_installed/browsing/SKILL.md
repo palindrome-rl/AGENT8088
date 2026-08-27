@@ -1,9 +1,8 @@
 ---
 name: browsing
 description: Practical guidance for driving browse_page reliably — task design, session/login state, error meanings, and verifying results on multi-step tasks.
-version: 1.1.0
+version: 1.2.0
 category: workflow
-progressive: true
 ---
 
 `browse_page` launches a separate browsing sub-agent with its own step loop
