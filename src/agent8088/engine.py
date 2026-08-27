@@ -1475,7 +1475,7 @@ def _positive_int(value, fallback: int) -> int:
     return parsed if parsed > 0 else fallback
 
 
-def _active_model_token_limits() -> tuple[int, int]:
+def _active_model_token_limits(provider_name: str = "", model_name: str = "") -> tuple[int, int]:
     """Return (context window, completion ceiling) for the active model.
 
     Most OpenAI-compatible model-list endpoints do not publish either value.
@@ -1485,9 +1485,10 @@ def _active_model_token_limits() -> tuple[int, int]:
     """
     from agent8088.providers import model_token_limits
 
-    provider_name = ACTIVE_PROVIDER or DEFAULT_PROVIDER
-    profile = PROVIDERS.get(provider_name, {})
-    known = model_token_limits(provider_name, MODEL_NAME)
+    active_provider = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    active_model = model_name or MODEL_NAME
+    profile = PROVIDERS.get(active_provider, {})
+    known = model_token_limits(active_provider, active_model)
     context_value = profile.get("context_window")
     if context_value in (None, ""):
         context_value = (
@@ -1798,9 +1799,13 @@ def _retry_delay(retry_attempt, retry_after_ms=None):
 
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
                                      on_token, interrupt_check, trace, turn,
-                                     max_tokens=None):
+                                     max_tokens=None, client_override=None,
+                                     provider_override=None, model_override=None):
+    active_client = client_override if client_override is not None else client
+    active_provider = provider_override or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    active_model = model_override or MODEL_NAME
     emitted = False
-    max_tokens = max_tokens if max_tokens is not None else _active_model_token_limits()[1]
+    max_tokens = max_tokens if max_tokens is not None else _active_model_token_limits(active_provider, active_model)[1]
 
     def tracked_token(kind, delta):
         nonlocal emitted
@@ -1813,11 +1818,12 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     for attempt in range(1, API_MAX_RETRIES + 2):  # 1 initial try + API_MAX_RETRIES retries
         try:
             return create_completion(
-                client, messages, tools, temperature=temperature,
+                active_client, messages, tools, temperature=temperature,
                 max_tokens=max_tokens,
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check,
-                provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+                model_name=active_model,
+                provider_name=active_provider,
                 telemetry_attempt="primary",
             )
         except AgentInterrupted:
@@ -1833,7 +1839,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 time.sleep(_retry_delay(attempt, retry_after_ms))
 
     for provider_name, model_name in _fallback_targets():
-        if provider_name == (ACTIVE_PROVIDER or DEFAULT_PROVIDER) and model_name == MODEL_NAME:
+        if provider_name == active_provider and model_name == active_model:
             continue
         try:
             fallback_client, _ = get_client(provider_name)
@@ -3348,7 +3354,11 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     global _last_tool_output, _last_tool_name, _last_write_diff
     global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
     global _local_fallback_grant, _remote_git_grant, _active_role
-    global _sandbox_readonly
+    global _sandbox_readonly, SUBAGENT_SPECS
+
+    # Dynamically reload subagent specifications so on-the-fly markdown
+    # changes and newly created subagents are immediately accessible.
+    SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR)
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -3363,6 +3373,22 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     if profile is None:
         available = ", ".join(sorted(SUBAGENT_SPECS)) or "(none)"
         return f"Error: unknown agent_type '{type_name}'. Available: {available}."
+
+    # Model resolution for subagent (Claude Code / Antigravity style)
+    from agent8088.providers import resolve_subagent_target
+    raw_model = (
+        args.get("model")
+        or os.environ.get("AGENT8088_SUBAGENT_MODEL")
+        or os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
+        or profile.get("model")
+        or "inherit"
+    )
+    raw_provider = args.get("provider") or profile.get("provider") or ""
+    sub_provider, sub_model = resolve_subagent_target(
+        raw_model, raw_provider or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    )
+    sub_client, default_m = get_client(sub_provider)
+    target_model = sub_model or default_m or MODEL_NAME
 
     # Restrict to the profile's tools that actually exist; sub-agents never get
     # spawn_subagent (bounds recursion in addition to the depth guard).
@@ -3422,6 +3448,9 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             # Share the parent's ceiling. A fresh budget here would be a free
             # bypass: delegate to a subagent and the limit starts over.
             budget=_active_budget,
+            client=sub_client,
+            provider_name=sub_provider,
+            model_name=target_model,
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
@@ -7298,7 +7327,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_escalation=None,
                     on_token=None, interrupt_check=None, trace=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
-                    depth=0, budget=None):
+                    depth=0, budget=None, client=None, provider_name=None,
+                    model_name=None):
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -7393,7 +7423,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # After a length cutoff, the one retry gets a bigger budget (capped by
         # the model's context window) — the same fixed budget would just
         # reproduce the same cutoff if the model reasons a similar amount again.
-        turn_context_window, turn_completion_limit = _active_model_token_limits()
+        loop_client = client
+        loop_provider = provider_name
+        loop_model = model_name
+        turn_context_window, turn_completion_limit = _active_model_token_limits(loop_provider, loop_model)
         turn_max_tokens = (
             min(turn_completion_limit * 2, turn_context_window)
             if length_retries else turn_completion_limit
@@ -7405,6 +7438,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
                     max_tokens=turn_max_tokens,
+                    client_override=loop_client,
+                    provider_override=loop_provider,
+                    model_override=loop_model,
                 )
         except AgentInterrupted:
             raise
