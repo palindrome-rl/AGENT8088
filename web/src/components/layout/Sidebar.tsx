@@ -1,7 +1,7 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
-  FolderClock, Settings, Stethoscope,
+  FolderClock, FolderOpen, Settings, Stethoscope,
   PanelLeftClose, PanelLeftOpen, Sun, Moon, Search, X, Plus,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
@@ -18,6 +18,7 @@ import type { ChatMessage, SessionInfo } from '@/types/api'
  * ───────────────────────────────────────────────────────── */
 
 const settingsItems = [
+  { to: '/artifacts', label: 'Artifacts', icon: FolderOpen },
   { to: '/tools', label: 'Tools', icon: Wrench },
   { to: '/skills', label: 'Skills', icon: BookOpen },
   { to: '/agents', label: 'Sub-Agents', icon: Bot },

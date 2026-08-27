@@ -156,6 +156,21 @@ export interface McpServerInfo {
   error: string
 }
 
+export interface ArtifactItem {
+  name: string
+  path: string
+  type: 'dir' | 'image' | 'text' | 'file'
+  size: number | null
+  modified: number
+}
+
+export interface ArtifactsListing {
+  root: string
+  cwd: string
+  parent: string | null
+  items: ArtifactItem[]
+}
+
 export interface SandboxStatus {
   resolved: string
   verification: string
