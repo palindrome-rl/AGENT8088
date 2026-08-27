@@ -1535,10 +1535,14 @@ def activate_model(provider: str = "", model: str = ""):
     return client, MODEL_NAME
 
 
+_PROBED_LIMITS = {}
+
+
 def _maybe_probe_context_window():
-    """Best-effort: if the active provider has no context_window set, probe
-    the endpoint. On hit, store it session-only in PROVIDERS (not persisted —
-    the user can /limits provider to make it stick). Never blocks or raises."""
+    """Best-effort: if the active model has no context_window set, probe
+    the endpoint. Cached per (provider, model) so switching models on the same
+    provider re-probes. Stored session-only (not persisted — the user can
+    /limits provider to make it stick). Never blocks or raises."""
     try:
         from agent8088.providers import probe_model_context_window
     except ImportError:
@@ -1546,14 +1550,24 @@ def _maybe_probe_context_window():
     name = ACTIVE_PROVIDER or DEFAULT_PROVIDER
     if not name or name not in PROVIDERS:
         return
+    model = MODEL_NAME
+    cache_key = (name, model)
+    if cache_key in _PROBED_LIMITS:
+        ctx, out = _PROBED_LIMITS[cache_key]
+        if ctx:
+            PROVIDERS[name]["context_window"] = str(ctx)
+        if out:
+            PROVIDERS[name]["max_completion_tokens"] = str(out)
+        return
     if PROVIDERS[name].get("context_window"):
-        return  # already set — no probe needed
+        return  # explicit config override — no probe needed
     if "context_window" in APP_CONFIG:
         return  # global override exists — no probe needed
     try:
-        probed_ctx, probed_out = probe_model_context_window(client, MODEL_NAME, provider_name=name)
+        probed_ctx, probed_out = probe_model_context_window(client, model, provider_name=name)
     except Exception:
         probed_ctx, probed_out = None, None
+    _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
     if probed_ctx and probed_ctx > 0:
         PROVIDERS[name]["context_window"] = str(probed_ctx)
     if probed_out and probed_out > 0 and not PROVIDERS[name].get("max_completion_tokens"):

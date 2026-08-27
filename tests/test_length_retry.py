@@ -380,6 +380,7 @@ def test_probe_uses_google_native_api_for_gemini(monkeypatch):
 def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
     """_maybe_probe_context_window stores a probed value in PROVIDERS but
     does NOT persist to config.txt."""
+    engine._PROBED_LIMITS.clear()
     monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "probeprov")
     monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "probeprov")
     monkeypatch.setattr(engine, "MODEL_NAME", "probed-model")
@@ -400,10 +401,55 @@ def test_maybe_probe_stores_in_providers_session_only(monkeypatch, engine):
 
     assert engine.PROVIDERS["probeprov"]["context_window"] == "786432"
     assert engine.PROVIDERS["probeprov"]["max_completion_tokens"] == "16384"
+    assert ("probeprov", "probed-model") in engine._PROBED_LIMITS
+
+
+def test_probe_reprobes_when_switching_models_on_same_provider(monkeypatch, engine):
+    """Switching models on the same provider must re-probe — context window
+    is per-model, not per-provider."""
+    engine._PROBED_LIMITS.clear()
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
+    engine.PROVIDERS["ollama-cloud"] = {"model": "kimi-k2.6"}
+    engine.APP_CONFIG.pop("context_window", None)
+
+    probe_calls = []
+
+    def _fake_probe(client, model_id, provider_name="", timeout=5):
+        if "kimi" in model_id:
+            probe_calls.append(("kimi", 262144))
+            return 262144, None
+        else:
+            probe_calls.append(("qwen", 131072))
+            return 131072, None
+
+    class _FakeClient:
+        pass
+
+    monkeypatch.setattr(engine, "client", _FakeClient())
+    import agent8088.providers as _prov
+    monkeypatch.setattr(_prov, "probe_model_context_window", _fake_probe)
+
+    # Switch to kimi — should probe and get 262144
+    monkeypatch.setattr(engine, "MODEL_NAME", "kimi-k2.6")
+    engine.PROVIDERS["ollama-cloud"]["model"] = "kimi-k2.6"
+    engine._maybe_probe_context_window()
+    assert engine.PROVIDERS["ollama-cloud"]["context_window"] == "262144"
+
+    # Clear the provider's context_window to simulate switching models
+    # (activate_model doesn't clear it, but _PROBED_LIMITS cache prevents reuse)
+    # Switch to qwen — should re-probe and get 131072
+    monkeypatch.setattr(engine, "MODEL_NAME", "qwen3.5:397b")
+    engine.PROVIDERS["ollama-cloud"]["model"] = "qwen3.5:397b"
+    engine.PROVIDERS["ollama-cloud"]["context_window"] = None
+    engine._maybe_probe_context_window()
+    assert engine.PROVIDERS["ollama-cloud"]["context_window"] == "131072"
+    assert len(probe_calls) == 2  # both models were probed
 
 
 def test_maybe_probe_skips_when_context_already_set(monkeypatch, engine):
     """If the provider already has context_window, no probe runs."""
+    engine._PROBED_LIMITS.clear()
     monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "hasctx")
     monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "hasctx")
     monkeypatch.setattr(engine, "MODEL_NAME", "m")
