@@ -78,6 +78,37 @@ class TaskStore:
         return [dict(row) for row in self.db.execute(
             "SELECT * FROM tasks ORDER BY updated_at DESC").fetchall()]
 
+    def resolve(self, task_ref: str) -> dict:
+        """Find one task by its full id or the short id shown by `/task list`."""
+        task = self.get(task_ref)
+        if task:
+            return task
+        rows = self.db.execute("SELECT * FROM tasks WHERE id LIKE ?", (f"{task_ref}%",)).fetchall()
+        if len(rows) != 1:
+            raise KeyError(task_ref)
+        return dict(rows[0])
+
+    def recent_operations(self, task_id: str, limit: int = 12) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT * FROM task_operations WHERE task_id=? ORDER BY started_at DESC LIMIT ?",
+            (task_id, limit),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def cancel(self, task_id: str) -> dict:
+        task = self.get(task_id)
+        if not task:
+            raise KeyError(task_id)
+        if task["state"] == "completed":
+            return task
+        self.db.execute(
+            "UPDATE tasks SET state='cancelled', error='ended by user', updated_at=? WHERE id=?",
+            (_now(), task_id),
+        )
+        self.event(task_id, "cancelled", {})
+        self.db.commit()
+        return self.get(task_id)
+
     def update(self, task_id: str, **fields) -> None:
         allowed = {"state", "slice_no", "messages_json", "last_answer", "error"}
         fields = {k: v for k, v in fields.items() if k in allowed}
@@ -196,6 +227,7 @@ def store_path(config_path: str | Path) -> Path:
 def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | Path,
              task_id: str | None = None, max_slices: int = 8, slice_turns: int = 8,
              verify: Callable[[dict, str], bool | tuple[bool, str]] | None = None,
+             on_slice: Callable[[dict, str], None] | None = None,
              **agent_kwargs) -> dict:
     """Run bounded model slices, checkpointing after every tool and slice.
 
@@ -205,6 +237,8 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         task = store.get(task_id)
         if not task:
             raise KeyError(task_id)
+        if task["state"] in {"completed", "cancelled"}:
+            return task
         # The model API receives its system prompt separately. Drop any stale
         # in-band system messages from an interrupted pre-runtime run.
         messages = [m for m in json.loads(task["messages_json"])
@@ -219,7 +253,12 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
     store.recover()
     for _ in range(max_slices):
         task = store.get(task_id)
+        if task["state"] == "cancelled":
+            break
         store.update(task_id, state="running", slice_no=int(task["slice_no"]) + 1, error="")
+        task = store.get(task_id)
+        if on_slice:
+            on_slice(task, "running")
         runtime.bind(messages)
         try:
             with runtime.active():
@@ -229,6 +268,10 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
             break
         store.checkpoint(task_id, messages=_compact(messages), answer=answer)
         task = store.get(task_id)
+        if task["state"] == "cancelled":
+            break
+        if on_slice:
+            on_slice(task, "checkpointed")
         if verify:
             try:
                 verdict = verify(task, answer)
@@ -253,4 +296,7 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         store.checkpoint(task_id, messages=_compact(messages), state="queued")
     else:
         store.update(task_id, state="paused")
-    return store.get(task_id)
+    task = store.get(task_id)
+    if on_slice:
+        on_slice(task, task["state"])
+    return task

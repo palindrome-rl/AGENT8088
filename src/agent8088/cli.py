@@ -2189,27 +2189,82 @@ def cmd_task(rest):
             console.print(f"{row['id'][:12]}  {row['state']:<10}  {row['goal'][:100]}")
         store.close()
         return
-    if action not in {"start", "resume"}:
-        console.print("[dim]usage: /task start <goal> | /task resume <id> | /task list[/dim]")
+    if action not in {"start", "resume", "end", "output"}:
+        console.print("[dim]usage: /task start <goal> | /task resume <id> | /task end <id> | /task output <id> | /task list[/dim]")
         store.close()
         return
-    task_id = parts[1].strip() if action == "resume" and len(parts) > 1 else None
+    task_ref = parts[1].strip() if action in {"resume", "end", "output"} and len(parts) > 1 else ""
     goal = parts[1].strip() if action == "start" and len(parts) > 1 else ""
     if action == "start" and not goal:
         console.print("[red]A task goal is required.[/red]")
         store.close()
         return
+    if action in {"resume", "end", "output"} and not task_ref:
+        console.print(f"[red]A task id is required for /task {action}.[/red]")
+        store.close()
+        return
+    if action in {"resume", "end", "output"}:
+        try:
+            task = store.resolve(task_ref)
+        except KeyError:
+            console.print(f"[red]No unique task matches[/red] '{task_ref}'.")
+            store.close()
+            return
+    else:
+        task = None
+    if action == "end":
+        row = store.cancel(task["id"])
+        console.print(f"[bold]task {row['id']}[/bold] → {row['state']}")
+        store.close()
+        return
+    if action == "output":
+        console.print(f"[bold]task {task['id']}[/bold] → {task['state']} (slice {task['slice_no']})")
+        console.print(Panel(Text(task["last_answer"] or "(no answer yet)"),
+                            title="[#237dd7]latest answer[/#237dd7]", box=box.ROUNDED,
+                            border_style="#0077B6"))
+        for op in store.recent_operations(task["id"]):
+            preview = str(op["result"]).strip().replace("\n", " ")
+            line = Text("  ⎿ ", style="dim")
+            line.append(op["tool"], style="bold")
+            line.append(f" · {op['state']}", style="dim")
+            if preview:
+                line.append(f" · {preview[:160]}" + ("…" if len(preview) > 160 else ""), style="dim")
+            console.print(line)
+        store.close()
+        return
+
+    def task_calls(calls):
+        for call in calls:
+            line = Text("⏺ ", style="#237dd7")
+            line.append(call["name"], style="bold")
+            summary = _tool_summary(call["name"], call.get("arguments"))
+            if summary:
+                line.append(" · ", style="dim")
+                line.append(summary, style="dim")
+            console.print(line)
+
+    def task_result(name, result):
+        preview = str(result).strip().replace("\n", " ")
+        line = Text("  ⎿ ", style="dim")
+        line.append(preview[:160] + ("…" if len(preview) > 160 else ""), style="dim")
+        console.print(line)
+
+    def task_slice(task, event):
+        label = f"task {task['id'][:8]} · slice {task['slice_no']} · {event}"
+        console.print(Text(f"◐ {label}", style="#237dd7"))
 
     def agent(messages, **kwargs):
         return A.run_agent(
             messages, temperature=S.temperature,
             system_prompt=_session_system_prompt,
             tools_def=lambda: A.build_tools_def(_active_tool_specs()),
-            allowed_tools=lambda: set(_active_tool_specs()), **kwargs,
+            allowed_tools=lambda: set(_active_tool_specs()),
+            spin=status_cm, on_calls=task_calls, on_result=task_result, **kwargs,
         )
 
     row = run_task(goal, agent, store=store, workspace=A.PROJECT_ROOT,
-                   task_id=task_id, max_slices=8, slice_turns=max(4, S.max_turns))
+                   task_id=task["id"] if task else None, max_slices=8, slice_turns=max(4, S.max_turns),
+                   on_slice=task_slice)
     console.print(f"[bold]task {row['id']}[/bold] → {row['state']} (slice {row['slice_no']})")
     if row["last_answer"]:
         console.print(row["last_answer"])
