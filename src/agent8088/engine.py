@@ -3542,7 +3542,21 @@ def _exec_create_subagent(args: dict) -> str:
                     f"{shown}{more}.")
         model = resolved or "inherit"
 
-    description = str(args.get("description") or "").strip() or f"Custom sub-agent: {name}."
+    # Collapse newlines out of anything that lands inside the '---' block.
+    # description is free text from the caller; without this, an embedded
+    # "\n---\n" prematurely closes the frontmatter block early, pushing the
+    # real tools/max_turns/model lines (and the real prompt) into what
+    # _parse_frontmatter_md treats as the body -- silently widening the
+    # sub-agent to its default tool set and smuggling attacker-authored
+    # instructions into its system prompt, invisible from the short
+    # description /agents displays. model is normalized too, defensively,
+    # since it comes from a provider's own model-list response.
+    def _sanitize_frontmatter_value(v: str) -> str:
+        return " ".join(str(v).split())
+
+    description = (_sanitize_frontmatter_value(args.get("description") or "")
+                    or f"Custom sub-agent: {name}.")
+    model = _sanitize_frontmatter_value(model)
 
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
