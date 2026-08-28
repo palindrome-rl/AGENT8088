@@ -52,7 +52,11 @@ def _protect_private_file(path: Path) -> None:
     if identity.returncode or not re.fullmatch(r"S-\d(?:-\d+)+", sid):
         raise OSError("Could not determine the current Windows user SID.")
     for acl_args in (
-        ["/grant:r", f"*{sid}:(R,W)"],
+        # Modify (not R,W): os.replace() renames the temp file over the target,
+        # and a rename needs DELETE on the source. Folders without
+        # FILE_DELETE_CHILD on the parent (e.g. OneDrive-synced dirs) then fail
+        # with WinError 5. M keeps the file private to the SID but allows delete.
+        ["/grant:r", f"*{sid}:(M)"],
         ["/inheritance:r"],
     ):
         result = subprocess.run(
@@ -1580,6 +1584,12 @@ def _maybe_probe_context_window():
         PROVIDERS[name]["context_window"] = str(probed_ctx)
     if probed_out and probed_out > 0 and not PROVIDERS[name].get("max_completion_tokens"):
         PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
+
+
+# Probe once at import: without this, a fresh launch shows the conservative
+# 32k/8k defaults in /doctor until the user reconfigures via /model setup,
+# because activate_model is the only other caller.
+_maybe_probe_context_window()
 
 
 def _native_tools_enabled(tools, provider_name: str = "") -> bool:
