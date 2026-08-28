@@ -160,10 +160,14 @@ The dependencies live in a dedicated environment under
 change the core agent's Python packages or its supported Python version.
 
 Simple boxes, cylinders, spheres, cones, and tubes use a structured primitive
-tool. Complex parts and assemblies use a bounded, natively structured design
-object that build123d compiles deterministically; advanced build123d Python
-remains an escape hatch for fillets, chamfers, sketches, lofts, sweeps, shells,
-and other geometry outside that exact schema. The worker validates each solid
+tool. Individual parts use a bounded, natively structured design object that
+build123d compiles deterministically; advanced build123d Python remains a
+single-part escape hatch for fillets, chamfers, sketches, lofts, sweeps, shells,
+and other geometry outside that exact schema. Complex assemblies use a
+checkpointed project workflow: one component is generated and validated per
+model response, successful parts persist across retries, and a source-free
+placement specification produces the final assembly. This avoids requiring one
+model output to contain an entire robot, building, or mechanism. The worker validates each solid
 independently, rejects volumetric assembly overlap, and compares request-derived
 bounding-box, part-count, and named-component checks before reporting success.
 It requires a STEP model, report, and text-to-cad preview, bounds source and

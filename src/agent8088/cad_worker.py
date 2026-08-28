@@ -39,6 +39,11 @@ _DESIGN_FIELDS = {
     "verification", "interference_policy",
 }
 _COMPONENT_FIELDS = {"name", "add", "cut"}
+_ASSEMBLY_FIELDS = {
+    "schema_version", "name", "units", "parameters", "occurrences",
+    "verification", "interference_policy",
+}
+_OCCURRENCE_FIELDS = {"name", "component", "input", "at", "rotate"}
 _PRIMITIVE_COMMON_FIELDS = {"type", "at", "rotate", "placements"}
 _PRIMITIVE_FIELDS = {
     "box": {"size"},
@@ -297,6 +302,87 @@ def _build_design(design: dict[str, Any]):
         assembly, parameters, names, solid_names, primitive_count,
         component_metrics,
     )
+
+
+def _build_project_assembly(spec: dict[str, Any], workspace: Path):
+    """Load verified component STEP files and apply bounded placements."""
+    unknown = set(spec) - _ASSEMBLY_FIELDS
+    if unknown:
+        raise ValueError(
+            "assembly has unsupported field(s): " + ", ".join(sorted(unknown))
+        )
+    if int(spec.get("schema_version", 1)) != 1:
+        raise ValueError("unsupported CAD assembly schema_version; expected 1")
+    if str(spec.get("units", "mm")).lower() != "mm":
+        raise ValueError("CAD project assemblies require millimetres")
+    if str(spec.get("interference_policy", "error")).lower() != "error":
+        raise ValueError("CAD project assemblies always reject volumetric overlap")
+    parameters = spec.get("parameters") or {}
+    if not isinstance(parameters, dict):
+        raise TypeError("assembly.parameters must be a JSON object")
+    for name, value in parameters.items():
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError(f"invalid CAD parameter name: {name!r}")
+        _expression_value(value, parameters, (name,))
+
+    occurrences = spec.get("occurrences")
+    if not isinstance(occurrences, list) or not occurrences:
+        raise ValueError("assembly.occurrences must be a non-empty array")
+    if len(occurrences) > 512:
+        raise ValueError("assembly exceeds 512 occurrences")
+    from build123d import Compound, Pos, Rot
+
+    built = []
+    names: set[str] = set()
+    component_metrics: dict[str, dict[str, Any]] = {}
+    solid_names: list[str] = []
+    for index, occurrence in enumerate(occurrences):
+        if not isinstance(occurrence, dict):
+            raise TypeError(f"assembly occurrence {index} must be a JSON object")
+        extra = set(occurrence) - _OCCURRENCE_FIELDS
+        if extra:
+            raise ValueError(
+                f"assembly occurrence {index} has unsupported field(s): "
+                + ", ".join(sorted(extra))
+            )
+        name = str(occurrence.get("name") or "").strip()
+        if not name or name in names:
+            raise ValueError(f"assembly occurrence names must be non-empty and unique: {name!r}")
+        names.add(name)
+        raw_input = str(occurrence.get("input") or "").strip()
+        if not raw_input:
+            raise ValueError(f"assembly occurrence {name!r} has no component input")
+        input_path = (workspace / raw_input).resolve()
+        try:
+            input_path.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError(
+                f"assembly occurrence {name!r} input is outside its authorized workspace"
+            ) from exc
+        if input_path.suffix.lower() not in {".step", ".stp"} or not input_path.is_file():
+            raise ValueError(f"assembly occurrence {name!r} component STEP is missing")
+        shape = _load_shape(input_path)
+        rotate = _vector(occurrence.get("rotate", [0, 0, 0]), parameters, "rotate")
+        at = _vector(occurrence.get("at", [0, 0, 0]), parameters, "at")
+        if any(rotate):
+            shape = Rot(*rotate) * shape
+        if any(at):
+            shape = Pos(*at) * shape
+        shape.label = name
+        built.append(shape)
+        solids = list(shape.solids())
+        component_metrics[name] = {
+            "solid_count": len(solids),
+            "volume": sum(float(solid.volume) for solid in solids),
+            "bounding_box": _bbox(shape),
+        }
+        solid_names.extend(
+            name if len(solids) == 1 else f"{name}[{solid_index}]"
+            for solid_index in range(len(solids))
+        )
+    assembly = built[0] if len(built) == 1 else Compound(children=built)
+    assembly.label = str(spec.get("name") or "assembly")
+    return assembly, parameters, names, solid_names, component_metrics
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -913,7 +999,9 @@ def _write_report(path: Path, payload: dict[str, Any]) -> None:
 
 def _require_workspace_paths(request: dict[str, Any]) -> None:
     workspace = Path(request["workspace"]).resolve()
-    for key in ("input", "output", "source", "design", "params", "report", "preview"):
+    for key in (
+        "input", "output", "source", "design", "assembly", "params", "report", "preview",
+    ):
         raw = str(request.get(key) or "").strip()
         if not raw:
             continue
@@ -967,7 +1055,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             **_metrics(reopened, mesh=output.suffix.lower() == ".stl"),
         }
 
-    if action in {"generate", "generate_design", "validate"}:
+    if action in {"generate", "generate_design", "assemble_project", "validate"}:
         solid_names: list[str] = []
         component_metrics: dict[str, dict[str, Any]] = {}
         request_verification = {
@@ -1002,6 +1090,19 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
                 component_metrics,
             ) = _build_design(design)
             _write_shape(shape, output)
+        elif action == "assemble_project":
+            assembly_path = Path(request["assembly"]).resolve()
+            assembly = json.loads(assembly_path.read_text(encoding="utf-8"))
+            if not isinstance(assembly, dict):
+                raise TypeError("CAD assembly must be a JSON object")
+            output = Path(request["output"]).resolve()
+            (
+                shape, parameters, component_names, solid_names,
+                component_metrics,
+            ) = _build_project_assembly(
+                assembly, Path(request["workspace"]).resolve()
+            )
+            _write_shape(shape, output)
         else:
             output = Path(request["input"]).resolve()
 
@@ -1018,6 +1119,11 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             request_verification = _verify_design_expectations(
                 design, result, component_metrics, parameters,
             )
+        elif action == "assemble_project":
+            request_verification = _verify_geometry_expectations(
+                assembly.get("verification"), result, component_metrics,
+                parameters, component_checks=True,
+            )
         elif action == "generate":
             request_verification = _verify_geometry_expectations(
                 request.get("verification"), result, {}, parameters,
@@ -1031,7 +1137,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         generation_valid = (
             not interference.get("interferences") and request_verification["ok"]
         )
-        if action in {"generate", "generate_design"} and generation_valid:
+        if action in {"generate", "generate_design", "assemble_project"} and generation_valid:
             requested = [str(name) for name in (request.get("formats") or []) if name != "step"]
             mesh_outputs = [
                 (name, output.with_suffix("." + name))
@@ -1052,21 +1158,24 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             "engine": {"geometry": "build123d", "workflow": "text-to-cad/cadgen"},
             "source": str(request.get("source") or ""),
             "design": str(request.get("design") or ""),
+            "assembly": str(request.get("assembly") or ""),
             "step": str(output),
             "preview": preview_text,
             "assembly_interference": interference,
             "request_verification": request_verification,
             **result,
         }
-        if action == "generate_design":
+        if action in {"generate_design", "assemble_project"}:
             report_payload["component_names"] = sorted(component_names)
             report_payload["component_count"] = len(component_names)
-            report_payload["primitive_count"] = primitive_count
             report_payload["parameters"] = parameters
             report_payload["solid_names"] = solid_names
             report_payload["component_metrics"] = component_metrics
+            if action == "generate_design":
+                report_payload["primitive_count"] = primitive_count
         _write_report(report, report_payload)
-        if action in {"generate", "generate_design"} and interference.get("interferences"):
+        if action in {"generate", "generate_design", "assemble_project"} \
+                and interference.get("interferences"):
             pairs = interference["interferences"]
             summaries = []
             for item in pairs[:20]:
@@ -1082,7 +1191,8 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
                 "report": str(report), "preview": preview_text,
                 "assembly_interference": interference, **result,
             }
-        if action in {"generate", "generate_design"} and not request_verification["ok"]:
+        if action in {"generate", "generate_design", "assemble_project"} \
+                and not request_verification["ok"]:
             summaries = []
             for item in request_verification["failures"][:20]:
                 summaries.append(
@@ -1103,8 +1213,9 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             **({
                 "component_names": sorted(component_names),
                 "component_count": len(component_names),
-                "primitive_count": primitive_count,
-            } if action == "generate_design" else {}),
+                **({"primitive_count": primitive_count}
+                   if action == "generate_design" else {}),
+            } if action in {"generate_design", "assemble_project"} else {}),
             **result,
         }
 
@@ -1129,7 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
         if "outside its authorized workspace" in lower:
             code, retryable = "cad_runtime_error", False
         elif (
-            action_hint in {"generate", "generate_design"}
+            action_hint in {"generate", "generate_design", "assemble_project"}
             and isinstance(exc, (TypeError, ValueError))
         ) or any(marker in lower for marker in (
             "syntax", "constructor arguments", "expression",

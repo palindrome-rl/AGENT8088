@@ -17,11 +17,13 @@ and snapshot review. Do not write FreeCAD Python and do not run CAD source with
 - Validate or render an existing STEP: `validate_cad_model`.
 - Open an existing or generated artifact for interactive visual review:
   `open_cad_viewer`.
-- Any part with features, an assembly, or a parameterized design expressible
-  with boxes, cylinders, spheres, cones, tubes, placements, fusions and cuts:
-  `generate_cad_design` (preferred).
-- Geometry requiring lofts, sweeps, sketches, selectors, or other advanced
+- One part expressible with boxes, cylinders, spheres, cones, tubes,
+  placements, fusions and cuts: `generate_cad_design` (preferred).
+- One part requiring lofts, sweeps, sketches, selectors, or other advanced
   build123d operations: `generate_cad_model` (escape hatch).
+- Every multi-component, movable, robotic, architectural, or otherwise complex
+  assembly: the checkpointed `cad_project_create`,
+  `cad_project_add_component`, and `cad_project_finalize` workflow below.
 
 Both complex-model tools generate STEP, reopen and validate every solid
 independently, check bounded assembly interference, and render an isometric
@@ -127,10 +129,10 @@ Advanced-model verification supports expected overall bounding-box `size`,
 `min`, and `max`, an absolute tolerance, and total solid count. Secondary
 exports are withheld if the generated STEP misses those targets.
 
-Keep the generator compact. Use small helper functions and loops for repeated
+Keep the single-part generator compact. Use small helper functions and loops for repeated
 features such as windows, holes, columns, fasteners, or floor elements instead
-of emitting nearly identical construction statements for every instance. Make
-one complete `generate_cad_model` call; do not narrate the source before calling.
+of emitting nearly identical construction statements for every instance. Never
+put a complete assembly in one `generate_cad_model` call.
 
 Allowed imports are build123d, math, dataclasses, and typing. File IO,
 network access, process execution, dynamic imports, private/dunder access, and
@@ -160,28 +162,26 @@ centered origin. Translate geometry with `Pos(x, y, z) * shape`. If a full
 
 ## Assemblies
 
-Keep every requested component as a separate labeled solid. Prefer `Pos` and
-`Rot` for placement and return a `Compound` with labeled children.
-Do not fuse an assembly unless the user asks for one printable body.
+Complex assemblies are persistent projects, not one model response:
 
-```python
-from build123d import *
+1. Call `cad_project_create` once with a `.cadproject.json` manifest, shared
+   parameters, requested output formats, and final request-derived checks.
+2. Call `cad_project_add_component` for exactly one named component and stop.
+   Wait for the tool to build, reopen, validate, render, and checkpoint that
+   component before authoring the next one. Source defines one `gen_step()` part.
+3. Repeat step 2 one component per response. If a component fails, repair only
+   that component with the same name; completed components are reused.
+4. Call `cad_project_finalize` with a compact `occurrences` array containing
+   unique occurrence names, component names, and optional `at`/`rotate` vectors.
+   The finalizer accepts no generated Python.
+5. Open the verified STEP with `open_cad_viewer`.
 
-def gen_step():
-    base = Box(PARAMS["base_x"], PARAMS["base_y"], PARAMS["base_z"])
-    base.label = "base"
-    post = Pos(0, 0, PARAMS["base_z"]) * Cylinder(
-        PARAMS["post_radius"], PARAMS["post_height"]
-    )
-    post.label = "post"
-    assembly = Compound(children=[base, post])
-    assembly.label = "assembly"
-    return assembly
-```
-
-For assemblies, use labeled build123d `Compound` children and explicit
-`Location` transforms. text-to-cad/cadgen consumes and verifies the resulting
-STEP outside the generator; generator source does not import cadgen directly.
+Call `cad_project_status` before resuming interrupted work. Do not issue multiple
+project calls in one response: later calls would have been authored without the
+previous validation result. The final worker reloads the validated component
+STEP files, applies bounded transforms, rejects volumetric interference, checks
+the full request, emits secondary formats only after success, and preserves the
+manifest for deterministic resume.
 
 ## Validation and repair
 
