@@ -18,6 +18,19 @@ from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion
 
 
+def _unfence_json_object(content: str) -> str:
+    """Return JSON wrapped in a Markdown fence as plain JSON."""
+    original = content
+    content = content.strip()
+    fence_size = len(content) - len(content.lstrip("`"))
+    if not 1 <= fence_size <= 3 or not content.endswith("`" * fence_size):
+        return original
+    content = content[fence_size:-fence_size].lstrip()
+    if content[:4].lower() == "json":
+        content = content[4:].lstrip()
+    return content if content.startswith("{") else original
+
+
 @dataclass
 class Agent8088ChatModel(ChatLiteLLM):
     budget: Optional[Any] = None  # duck-typed engine._TurnBudget: .exceeded() / .add_tokens()
@@ -78,7 +91,7 @@ class Agent8088ChatModel(ChatLiteLLM):
 
         response = await acompletion(**params)
         content = response.choices[0].message.content or ""
-        parsed = output_format.model_validate_json(content)
+        parsed = output_format.model_validate_json(_unfence_json_object(content))
         return ChatInvokeCompletion(
             completion=parsed,
             usage=self._parse_usage(response),

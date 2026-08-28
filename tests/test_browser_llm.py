@@ -156,7 +156,7 @@ async def test_ainvoke_falls_back_to_json_object_mode_when_strict_schema_is_igno
         calls.append(kwargs)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(
-                content='{"thinking": "ok", "answer": "The sky is blue."}'))],
+                content='`json\n{"thinking": "ok", "answer": "The sky is blue."}\n`'))],
             usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
         )
 
