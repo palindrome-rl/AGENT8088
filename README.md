@@ -160,15 +160,17 @@ The dependencies live in a dedicated environment under
 change the core agent's Python packages or its supported Python version.
 
 Simple boxes, cylinders, spheres, cones, and tubes use a structured primitive
-tool. Complex parts and assemblies prefer a bounded declarative JSON design
-that build123d compiles deterministically; advanced build123d Python remains an
-escape hatch for lofts, sweeps, and other geometry outside that schema. The
-worker validates each solid independently, rejects volumetric assembly overlap,
-and requires a STEP model, report, and text-to-cad preview before reporting
-success. It also bounds primitive/component counts and stops repeated failed
-generation attempts. STL, 3MF, GLB, and BREP can be requested as secondary
-exports. This backend intentionally does not create native `.FCStd` feature
-trees; STEP is its canonical editable interchange format.
+tool. Complex parts and assemblies use a bounded, natively structured design
+object that build123d compiles deterministically; advanced build123d Python
+remains an escape hatch for fillets, chamfers, sketches, lofts, sweeps, shells,
+and other geometry outside that exact schema. The worker validates each solid
+independently, rejects volumetric assembly overlap, and compares request-derived
+bounding-box, part-count, and named-component checks before reporting success.
+It requires a STEP model, report, and text-to-cad preview, bounds source and
+iteration complexity, and stops repeated failed generation attempts. STL, 3MF,
+GLB, and BREP are emitted only after the canonical STEP passes validation. This
+backend intentionally does not create native `.FCStd` feature trees; STEP is its
+canonical editable interchange format.
 
 The same isolated installation includes text-to-cad's browser Viewer. Agent8088
 can open validated STEP/STP, STL, 3MF, GLB, and DXF artifacts for assembly-tree

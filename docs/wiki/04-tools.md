@@ -85,14 +85,17 @@ validity rather than interpreting it as text.
 
 `create_cad_part` is the structured, no-code path for one box, cylinder, sphere,
 cone, or tube. `generate_cad_design` is preferred for complex parts and
-assemblies: it compiles a bounded, type-checked JSON schema with parameters,
-named components, placements, fusions, and cuts. `generate_cad_model` is the
-advanced Python escape hatch for build123d operations outside that schema.
+assemblies: it receives a native structured object and compiles a bounded,
+type-checked schema with parameters, named components, placements, fusions,
+cuts, and request-derived dimensional checks. `generate_cad_model` remains the
+advanced Python escape hatch for build123d operations outside that exact schema.
 text-to-cad/cadgen supplies STEP-first generation/export, per-solid topology
 validation, and preview rendering in both workflows. Volumetric assembly
 overlap is rejected independently, while touching mating faces remain valid and
-are not mislabeled as a self-intersecting body. The tools retain design/source, parameters, STEP,
-report, preview, and requested STL/3MF/GLB/BREP exports. `validate_cad_model`
+are not mislabeled as a self-intersecting body. Secondary exports are withheld
+when the STEP misses a declared dimension/count or has interference. The tools
+retain design/source, parameters, STEP, report, preview, and verified
+STL/3MF/GLB/BREP exports. `validate_cad_model`
 can repeat the reopen, topology, interference, and render checks later.
 
 During a CAD-generation turn, generic shell and file-writing tools are removed

@@ -3048,6 +3048,11 @@ def _search_provider_rows():
         schema = provider.setup_schema()
         try:
             available = provider.is_available(ctx)
+            # A configured loopback URL does not mean the SearXNG service is
+            # running. Use the same short health probe as startup so the
+            # status table does not call a stopped container "ready".
+            if provider.name == "searxng" and available:
+                available = A.web_search.probe_searxng(ctx)
         except Exception:  # noqa: BLE001 — /search status must list every backend regardless
             available = False
         keys = ", ".join(v["key"] for v in schema.get("env_vars") or [])

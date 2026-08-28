@@ -52,7 +52,11 @@ def _protect_private_file(path: Path) -> None:
     if identity.returncode or not re.fullmatch(r"S-\d(?:-\d+)+", sid):
         raise OSError("Could not determine the current Windows user SID.")
     for acl_args in (
-        ["/grant:r", f"*{sid}:(R,W)"],
+        # Modify (not R,W): os.replace() renames the temp file over the target,
+        # and a rename needs DELETE on the source. Folders without
+        # FILE_DELETE_CHILD on the parent (e.g. OneDrive-synced dirs) then fail
+        # with WinError 5. M keeps the file private to the SID but allows delete.
+        ["/grant:r", f"*{sid}:(M)"],
         ["/inheritance:r"],
     ):
         result = subprocess.run(
@@ -1583,6 +1587,12 @@ def _maybe_probe_context_window():
         PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
 
 
+# Probe once at import: without this, a fresh launch shows the conservative
+# 32k/8k defaults in /doctor until the user reconfigures via /model setup,
+# because activate_model is the only other caller.
+_maybe_probe_context_window()
+
+
 def _native_tools_enabled(tools, provider_name: str = "") -> bool:
     if not tools:
         return False
@@ -2079,6 +2089,113 @@ def build_tools_def(tool_specs: dict) -> list:
             for param in spec["args"]:
                 arg_types = spec.get("arg_types", {})
                 props[param] = {"type": arg_types.get(param, "string")}
+            if name == "generate_cad_design" and "design" in props:
+                # A nested object is materially more reliable than asking the
+                # model to JSON-escape an entire CAD program inside a string.
+                # Keep this schema intentionally bounded to the operations the
+                # reviewed compiler actually implements.
+                scalar = {"oneOf": [{"type": "number"}, {"type": "string"}]}
+                vector = {"type": "array", "items": scalar, "minItems": 3,
+                          "maxItems": 3}
+                primitive = {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": [
+                            "box", "cylinder", "sphere", "cone", "tube",
+                        ]},
+                        "size": vector,
+                        "radius": scalar,
+                        "radius1": scalar,
+                        "radius2": scalar,
+                        "outer_radius": scalar,
+                        "inner_radius": scalar,
+                        "height": scalar,
+                        "at": vector,
+                        "rotate": vector,
+                        "placements": {"type": "array", "items": vector},
+                    },
+                    "required": ["type"],
+                    "additionalProperties": False,
+                }
+                bbox_check = {
+                    "type": "object",
+                    "properties": {
+                        "size": vector,
+                        "min": vector,
+                        "max": vector,
+                    },
+                    "additionalProperties": False,
+                }
+                component_check = {
+                    "type": "object",
+                    "properties": {
+                        "solid_count": {"type": "integer", "minimum": 1},
+                        "bounding_box": bbox_check,
+                    },
+                    "additionalProperties": False,
+                }
+                props["design"] = {
+                    "type": "object",
+                    "properties": {
+                        "schema_version": {"type": "integer", "enum": [1]},
+                        "name": {"type": "string"},
+                        "units": {"type": "string", "enum": ["mm"]},
+                        "parameters": {"type": "object", "additionalProperties": scalar},
+                        "components": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "add": {"type": "array", "items": primitive,
+                                            "minItems": 1},
+                                    "cut": {"type": "array", "items": primitive},
+                                },
+                                "required": ["name", "add"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "verification": {
+                            "type": "object",
+                            "minProperties": 1,
+                            "properties": {
+                                "tolerance": scalar,
+                                "overall_bounding_box": bbox_check,
+                                "solid_count": {"type": "integer", "minimum": 1},
+                                "component_count": {"type": "integer", "minimum": 1},
+                                "components": {
+                                    "type": "object",
+                                    "additionalProperties": component_check,
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["schema_version", "units", "parameters", "components",
+                                 "verification"],
+                    "additionalProperties": False,
+                }
+            if name == "generate_cad_model" and "verification" in props:
+                scalar = {"oneOf": [{"type": "number"}, {"type": "string"}]}
+                vector = {"type": "array", "items": scalar, "minItems": 3,
+                          "maxItems": 3}
+                props["verification"] = {
+                    "type": "object",
+                    "minProperties": 1,
+                    "properties": {
+                        "tolerance": scalar,
+                        "overall_bounding_box": {
+                            "type": "object",
+                            "properties": {
+                                "size": vector, "min": vector, "max": vector,
+                            },
+                            "additionalProperties": False,
+                        },
+                        "solid_count": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                }
             params = {"type": "object", "properties": props,
                       "required": required_params(spec)}
         result.append({
@@ -2132,6 +2249,15 @@ def _resolve_tool_name(name):
     Canonical names pass through unchanged; unknown names pass through too
     (so the TOOL_NAMES check fails naturally and the call is skipped)."""
     return TOOL_ALIASES.get(name, name)
+
+
+def _structured_text_argument(value, default="") -> str:
+    """Serialize structured built-in tool arguments without Python repr syntax."""
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
 
 
 RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
@@ -5415,7 +5541,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return (f"Error: this turn has already written {_turn_writes} files, "
                     f"the max_writes_per_turn limit. Stop writing and report what "
                     f"you have done, or raise max_writes_per_turn in config.txt.")
-        write_size = len(str(args.get(spec.get("content_arg") or "content", "")))
+        write_size = len(_structured_text_argument(
+            args.get(spec.get("content_arg") or "content", "")
+        ).encode("utf-8"))
         if MAX_WRITE_BYTES and write_size > MAX_WRITE_BYTES:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="max_write_bytes")
@@ -5598,6 +5726,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 read_target,
                 workspace=read_target.parent,
                 launch_browser=open_value not in {"0", "false", "no", "off"},
+                timeout=timeout,
             )
         # Documents are extracted to text first. Deliberately handled inside the
         # existing read mode rather than as a new tool: this way a .docx read
@@ -5619,7 +5748,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "write_text":
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
-        content = str(args.get(content_arg, ""))
+        content = _structured_text_argument(args.get(content_arg, ""))
         _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -5640,7 +5769,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                            f"artifacts/; pass that absolute path instead.")
             return result
         if name == "convert_cad":
-            result = cad.convert_cad(target, str(args.get("format", "")))
+            result = cad.convert_cad(
+                target, str(args.get("format", "")), timeout=timeout,
+            )
             _last_write_diff = None  # binary output — a text diff would be noise
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
@@ -5648,7 +5779,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return result
         if name == "create_cad_part":
             result = cad.create_cad_part(target, str(args.get("shape", "")),
-                                         str(args.get("dimensions", "")))
+                                         str(args.get("dimensions", "")),
+                                         timeout=timeout)
             _last_write_diff = None  # binary output — a text diff would be noise
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
@@ -5658,8 +5790,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             result = cad.generate_cad_model(
                 target,
                 content,
-                str(args.get("parameters", "{}")),
+                _structured_text_argument(args.get("parameters"), "{}"),
                 str(args.get("formats", "step,stl")),
+                timeout=timeout,
+                verification=_structured_text_argument(
+                    args.get("verification"), "{}"
+                ),
             )
             _last_write_diff = None
             if shadowed is not None:
@@ -5671,6 +5807,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 target,
                 content,
                 str(args.get("formats", "step,stl")),
+                timeout=timeout,
             )
             _last_write_diff = None
             if shadowed is not None:
@@ -5680,7 +5817,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if name == "validate_cad_model":
             render_value = str(args.get("render", "true")).strip().lower()
             result = cad.validate_cad_model(
-                target, render=render_value not in {"0", "false", "no", "off"}
+                target, render=render_value not in {"0", "false", "no", "off"},
+                timeout=timeout,
             )
             _last_write_diff = None
             if shadowed is not None:
@@ -7357,41 +7495,80 @@ def _execute_shell_forbidden(messages: list[dict]) -> bool:
 
 
 def _cad_generation_requested(messages: list[dict]) -> bool:
-    """True for an explicit create/modify/export CAD request from the user."""
+    """True for an explicit CAD request or an unambiguous CAD continuation.
+
+    Looking only at the last message made ``retry it`` and ``export it to STL``
+    lose the bounded CAD toolset. Inheriting every old CAD turn is equally
+    unsafe because ``now tell me a joke`` must restore the normal tools. Only a
+    deliberately small set of continuation verbs inherits the most recent CAD
+    request.
+    """
     turns = _genuine_user_turns(messages)
     text = _message_text(turns[-1]) if turns else ""
-    has_cad = bool(re.search(
+    cad_pattern = re.compile(
         r"\b(?:cad|build123d|text-to-cad|freecad|step|stl|3mf|brep|iges)\b",
-        text, re.IGNORECASE,
-    ))
-    has_action = bool(re.search(
+        re.IGNORECASE,
+    )
+    action_pattern = re.compile(
         r"\b(?:build|create|generate|model|design|convert|export|modify|edit|render|preview)\b",
+        re.IGNORECASE,
+    )
+    if cad_pattern.search(text) and action_pattern.search(text):
+        return True
+    continuation = re.search(
+        r"\b(?:try|retry|continue|resume|fix|repair|redo|regenerate|adjust|change|"
+        r"modify|edit|export|convert|render|preview)\b",
         text, re.IGNORECASE,
-    ))
-    return has_cad and has_action
+    )
+    if not continuation:
+        return False
+    if len(turns) < 2:
+        return False
+    previous = _message_text(turns[-2])
+    return bool(cad_pattern.search(previous) and action_pattern.search(previous))
 
 
-def _advanced_cad_source_requested(messages: list[dict]) -> bool:
-    """Whether the latest request names geometry outside the JSON compiler."""
-    turns = _genuine_user_turns(messages)
-    text = _message_text(turns[-1]) if turns else ""
-    return bool(re.search(
-        r"\b(?:lofts?|sweeps?|sketch(?:es)?|splines?|helices|helix|threads?|"
-        r"gears?|fillets?|chamfers?|drafts?|shelling|joints?|selectors?|"
-        r"bezier|nurbs)\b",
-        text, re.IGNORECASE,
-    ))
+def _cad_runtime_instruction(available: set[str] | None = None) -> str:
+    """Small dynamic routing contract with the actual output location.
 
-
-def _cad_runtime_instruction() -> str:
-    """Small dynamic routing contract with the actual output location."""
+    The routing line is built from the tools that survived this round's
+    filter. Naming a tool the model cannot call makes it emit a call that
+    comes back "Unknown tool", so the contract tracks the schema instead of
+    describing the full toolset unconditionally.
+    """
+    available = available if available is not None else set()
+    if "generate_cad_design" not in available:
+        routing = (
+            "- No CAD generation tool is available for the rest of this request. "
+            "Do not call generate_cad_design or generate_cad_model. Report the last "
+            "specific failure and the artifacts already produced.\n"
+        )
+    elif "generate_cad_model" in available:
+        routing = (
+            "- Use create_cad_part for exactly one primitive. Use generate_cad_design "
+            "for assemblies made from boxes, cylinders, spheres, cones, tubes, placements, "
+            "fusions, and cuts. Include its verification object with expected overall size, "
+            "solid/component counts, and component checks derived from the request. Use "
+            "generate_cad_model directly for fillets, chamfers, sketches, lofts, sweeps, "
+            "shells, curved profiles, joints, or any geometry outside that exact schema. "
+            "In advanced source, translate shapes with Pos(x, y, z) * shape; never call "
+            "Location(x, y, z) or Location(z=...), which build123d rejects. "
+            "Both generation tools require request-derived verification; never weaken a "
+            "declared target to make an incorrect model pass.\n"
+        )
+    else:
+        routing = (
+            "- Use create_cad_part for one primitive. For every complex part or assembly "
+            "use generate_cad_design. generate_cad_model is NOT available for this "
+            "request and calling it will fail: the declarative schema covers this "
+            "geometry. Express bored holes, pockets and repeated features with cut "
+            "primitives plus rotate and placements.\n"
+        )
     return (
         "CAD EXECUTION CONTRACT (active for this request):\n"
         f"- Generated files belong in {ARTIFACTS_ROOT}. Pass a bare .step filename; "
         "the tool resolves it there. Never guess C:/artifacts or inspect paths with a shell.\n"
-        "- Use create_cad_part for one primitive. For complex parts/assemblies use "
-        "generate_cad_design first. Use generate_cad_model only when the declarative "
-        "schema cannot express the requested geometry.\n"
+        + routing +
         "- For an existing artifact or after successful generation, use open_cad_viewer "
         "for interactive review. Do not start a server or browser through a shell. Unless "
         "the user declined visual review, hand generated CAD to the Viewer before the final answer.\n"
@@ -7476,7 +7653,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
     cad_generation = _cad_generation_requested(messages)
-    advanced_cad_source = _advanced_cad_source_requested(messages)
     hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
@@ -7494,8 +7670,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             round_allowed_tools.difference_update({
                 "execute_shell", "run_sandboxed", "write_file",
             })
-            if not advanced_cad_source:
-                round_allowed_tools.discard("generate_cad_model")
         if cad_generation_stopped:
             round_allowed_tools.difference_update({
                 "generate_cad_design", "generate_cad_model",
@@ -7505,7 +7679,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         if cad_generation:
             round_system_prompt = (
                 (round_system_prompt or current_system_prompt())
-                + "\n\n" + _cad_runtime_instruction()
+                + "\n\n" + _cad_runtime_instruction(round_allowed_tools)
             )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
