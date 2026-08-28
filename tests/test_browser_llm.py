@@ -166,6 +166,7 @@ async def test_ainvoke_falls_back_to_json_object_mode_when_strict_schema_is_igno
 
     assert result.completion == _Output(thinking="ok", answer="The sky is blue.")
     assert calls[0]["response_format"] == {"type": "json_object"}
+    assert calls[0]["num_retries"] == model.max_retries
 
 
 @pytest.mark.asyncio

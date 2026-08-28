@@ -79,6 +79,7 @@ class Agent8088ChatModel(ChatLiteLLM):
             "model": self.model,
             "messages": litellm_messages,
             "response_format": {"type": "json_object"},
+            "num_retries": self.max_retries,
         }
         if self.temperature is not None:
             params["temperature"] = self.temperature

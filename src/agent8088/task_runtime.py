@@ -162,15 +162,15 @@ class TaskStore:
             })
         self.db.commit()
 
-    def recover(self) -> int:
-        """Mark work interrupted by a process death as resumable, never successful."""
+    def recover(self, task_id: str) -> int:
+        """Mark one task interrupted by a process death as resumable."""
         cur = self.db.execute(
             "UPDATE task_operations SET state='unknown', finished_at=? "
-            "WHERE state='started'", (_now(),),
+            "WHERE task_id=? AND state='started'", (_now(), task_id),
         )
         self.db.execute(
             "UPDATE tasks SET state='paused', error='process interrupted', updated_at=? "
-            "WHERE state='running'", (_now(),),
+            "WHERE id=? AND state='running'", (_now(), task_id),
         )
         self.db.commit()
         return cur.rowcount
@@ -239,6 +239,8 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
             raise KeyError(task_id)
         if task["state"] in {"completed", "cancelled"}:
             return task
+        store.recover(task_id)
+        task = store.get(task_id)
         # The model API receives its system prompt separately. Drop any stale
         # in-band system messages from an interrupted pre-runtime run.
         messages = [m for m in json.loads(task["messages_json"])
@@ -250,7 +252,6 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
                      "until the requested verification has actually passed.\n\n" + goal}]
         task_id = store.create(goal, workspace, messages)
     runtime = TaskRuntime(store, task_id)
-    store.recover()
     for _ in range(max_slices):
         task = store.get(task_id)
         if task["state"] == "cancelled":

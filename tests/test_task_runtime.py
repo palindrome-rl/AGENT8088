@@ -41,3 +41,16 @@ def test_cancelled_task_does_not_resume(tmp_path):
     row = run_task("ignored", lambda *_args, **_kwargs: "should not run",
                    store=store, workspace=tmp_path, task_id=task_id)
     assert row["state"] == "cancelled"
+
+
+def test_resuming_a_task_does_not_pause_another_running_task(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    first = store.create("resume me", tmp_path, [{"role": "user", "content": "first"}])
+    other = store.create("leave me alone", tmp_path, [{"role": "user", "content": "second"}])
+    store.update(first, state="running")
+    store.update(other, state="running")
+
+    run_task("ignored", lambda *_args, **_kwargs: "unused", store=store,
+             workspace=tmp_path, task_id=first, max_slices=0)
+
+    assert store.get(other)["state"] == "running"
