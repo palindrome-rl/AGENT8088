@@ -525,6 +525,26 @@ def _verify_design_expectations(
     )
 
 
+def _solid_labels(shape) -> list[str]:
+    """Per-solid component names recovered from the STEP assembly tree.
+
+    cadgen's export keeps labels on Compound children (one child per named
+    component), while the flattened .solids() lose them. Map every solid to
+    its child's label, falling back to solid[index]."""
+    names: list[str] = []
+    for index, solid in enumerate(shape.solids()):
+        owner = ""
+        for child in shape.children:
+            try:
+                if solid in child.solids():
+                    owner = str(getattr(child, "label", "") or "").strip()
+                    break
+            except Exception:
+                continue
+        names.append(owner or f"solid[{index}]")
+    return names
+
+
 def _name_interferences(interference: dict[str, Any], solid_names: list[str]) -> None:
     """Attach stable component labels to pairwise solid findings in place."""
     for item in interference.get("interferences") or []:
@@ -533,6 +553,63 @@ def _name_interferences(interference: dict[str, Any], solid_names: list[str]) ->
             item["component_a"] = solid_names[left]
         if right < len(solid_names):
             item["component_b"] = solid_names[right]
+
+
+def _parse_allowed_contact(value: Any, component_names: set[str]) -> set[frozenset[str]]:
+    """Validate an allowed_contact declaration into comparable name pairs.
+
+    Accepts a list of [component_a, component_b] pairs. Names must match
+    declared components exactly. Multi-solid components keep their base name
+    (the "<name>[index]" suffixes apply to solid_names, not components).
+    """
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        raise TypeError("allowed_contact must be an array of [name_a, name_b] pairs")
+    pairs: set[frozenset[str]] = set()
+    for entry in value:
+        if (not isinstance(entry, (list, tuple)) or len(entry) != 2
+                or not all(isinstance(name, str) and name for name in entry)):
+            raise TypeError(
+                "each allowed_contact entry must be a [component_a, component_b] pair"
+            )
+        left, right = entry
+        for name in (left, right):
+            if name not in component_names:
+                raise ValueError(f"allowed_contact names an unknown component: {name!r}")
+        if left == right:
+            raise ValueError("allowed_contact pair names must differ")
+        pairs.add(frozenset((left, right)))
+    return pairs
+
+
+def _exempt_interference(
+    interference: dict[str, Any],
+    solid_names: list[str],
+    allowed: set[frozenset[str]],
+) -> None:
+    """Drop declared-contact pairs from interference findings in place.
+
+    Only exact component-name pairs are exempted; every undeclared overlap
+    still fails. Findings carry the base component name when a component is
+    multi-solid, so "<name>[index]" entries are trimmed before matching.
+    """
+    def base(name: str) -> str:
+        return name.split("[", 1)[0]
+
+    interference["allowed_contact"] = sorted("/".join(sorted(pair)) for pair in allowed)
+    original = interference.get("interferences") or []
+    kept = []
+    exempted = 0
+    for item in original:
+        left = base(item.get("component_a") or "")
+        right = base(item.get("component_b") or "")
+        if left and right and frozenset((left, right)) in allowed:
+            exempted += 1
+            continue
+        kept.append(item)
+    interference["interferences"] = kept
+    interference["exempted_count"] = exempted
 
 
 def _validate_generator_source(path: Path) -> None:
@@ -1115,6 +1192,28 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         interference = _assembly_interference(shape)
         if solid_names:
             _name_interferences(interference, solid_names)
+        # Intended-contact exemption: design declarations and, for the
+        # generate path, caller-passed pairs (validated against the reopened
+        # STEP's component labels) remove exactly those named pairs.
+        if action == "generate_design":
+            try:
+                allowed_contact = _parse_allowed_contact(
+                    design.get("allowed_contact"), set(component_names)
+                )
+            except (TypeError, ValueError):
+                allowed_contact = set()
+        else:
+            allowed_contact = _parse_allowed_contact(
+                request.get("allowed_contact"), set()
+            )
+        if allowed_contact and interference.get("interferences"):
+            if not solid_names:
+                labels = _solid_labels(shape)
+                if labels:
+                    _name_interferences(interference, labels)
+            names_for_match = solid_names or _solid_labels(shape)
+            if names_for_match:
+                _exempt_interference(interference, names_for_match, allowed_contact)
         if action == "generate_design":
             request_verification = _verify_design_expectations(
                 design, result, component_metrics, parameters,
