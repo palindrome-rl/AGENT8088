@@ -128,7 +128,7 @@ ok("skills loaded",
    {"documentation-writing", "documents", "github-code-review", "plan",
     "systematic-debugging", "test-driven-development",
     "github-pr-workflow", "grounded-citations", "document-to-action-items",
-    "spike", "humanizer", "simplify-code", "cli-anything"} <= set(E.SKILL_PACKAGES),
+    "spike", "humanizer", "simplify-code", "cli-anything", "cad"} <= set(E.SKILL_PACKAGES),
    ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
@@ -326,6 +326,8 @@ expected_tools = {
     # mode then applies to it too, with no second gate to keep in sync.
     "create_document": "write_text",
     "convert_document": "write_text",
+    "convert_cad": "write_text",
+    "create_cad_part": "write_text",
 }
 ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")

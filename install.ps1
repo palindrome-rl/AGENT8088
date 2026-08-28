@@ -247,6 +247,7 @@ $TNpm         = 300 * $TimeoutScale   # 142 small packages, mostly round-trips
 $TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
 $TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
 $TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
+$TLibreOffice = 1800 * $TimeoutScale  # ~350 MB MSI plus dependency resolution/install
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
 # premature cut fails the install outright -- but it is still the largest
@@ -833,9 +834,14 @@ function Install-LibreOffice {
     }
 
     Write-Info "Installing LibreOffice (needed for .docx/.pptx to PDF conversion and legacy .doc/.ppt/.xls) ..."
-    & $winget.Source install --id TheDocumentFoundation.LibreOffice --exact --source winget `
-        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
-    $wingetExit = $LASTEXITCODE
+    $wingetResult = Invoke-WithTimeout -FilePath $winget.Source `
+        -Arguments @(
+            "install", "--id", "TheDocumentFoundation.LibreOffice", "--exact",
+            "--source", "winget", "--accept-source-agreements",
+            "--accept-package-agreements", "--disable-interactivity"
+        ) `
+        -TimeoutSec $TLibreOffice -CaptureOutput -Activity "Downloading and installing LibreOffice"
+    $wingetExit = $wingetResult.ExitCode
 
     $installed = $sofficePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($installed) {
@@ -843,10 +849,84 @@ function Install-LibreOffice {
         return $true
     }
 
-    Write-Warn "LibreOffice install did not complete (WinGet exit $wingetExit)."
+    $wingetReason = if ($wingetResult.TimedOut) {
+        "timed out after $TLibreOffice seconds"
+    } elseif ($wingetResult.Error) {
+        "could not start: $($wingetResult.Error)"
+    } else {
+        "WinGet exit $wingetExit"
+    }
+    Write-Warn "LibreOffice install did not complete ($wingetReason)."
     Register-SkippedStage -Label "LibreOffice" `
-        -Reason "WinGet install failed (exit $wingetExit)" `
+        -Reason "WinGet install failed ($wingetReason)" `
         -Fix "install LibreOffice manually from https://www.libreoffice.org/download/, then rerun"
+    return $false
+}
+
+# ----------------------------------------------------------------------------
+# FreeCAD (headless freecadcmd) - CAD inspection, format conversion, and
+# parametric part generation. Used by the cad tools and skill; nothing in
+# engine.py requires it to exist.
+#
+# Same contract as Install-LibreOffice above: detect first, install via WinGet,
+# and on failure register a skipped stage rather than aborting setup. FreeCAD
+# is ~1GB, so a slow or interrupted download must not take the whole install
+# down with it.
+#
+# AGENT8088_FREECAD lets someone point at a portable extraction instead --
+# FreeCAD publishes a no-install .7z, which avoids the elevation an MSI-style
+# install needs. Detection honours that variable, so this step failing is
+# recoverable without admin rights.
+# ----------------------------------------------------------------------------
+function Install-FreeCAD {
+    $freecadNames = @("freecadcmd.exe", "FreeCADCmd.exe")
+    # The official installer defaults to a per-user, no-elevation install
+    # under %LOCALAPPDATA%\Programs, not Program Files -- confirmed on a real
+    # install; this was a guess when first written (see cad.py's own note).
+    $freecadDirs = @(
+        "$env:ProgramFiles\FreeCAD 1.1\bin",
+        "$env:ProgramFiles\FreeCAD\bin",
+        "${env:ProgramFiles(x86)}\FreeCAD 1.1\bin",
+        "${env:ProgramFiles(x86)}\FreeCAD\bin",
+        "$env:LOCALAPPDATA\Programs\FreeCAD 1.1\bin",
+        "$env:LOCALAPPDATA\Programs\FreeCAD\bin"
+    )
+    $candidates = foreach ($dir in $freecadDirs) {
+        foreach ($name in $freecadNames) { Join-Path $dir $name }
+    }
+    if ($env:AGENT8088_FREECAD) { $candidates = @($env:AGENT8088_FREECAD) + $candidates }
+
+    $existing = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($existing) {
+        Write-Success "FreeCAD found at $existing"
+        return $true
+    }
+
+    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $winget) {
+        Write-Warn "WinGet not found - cannot install FreeCAD automatically."
+        Register-SkippedStage -Label "FreeCAD" `
+            -Reason "no WinGet available" `
+            -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
+        return $false
+    }
+
+    Write-Info "Installing FreeCAD (needed for CAD inspection, conversion, and part generation; ~1GB) ..."
+    & $winget.Source install --id FreeCAD.FreeCAD --exact --source winget `
+        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
+    $wingetExit = $LASTEXITCODE
+
+    $installed = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($installed) {
+        Write-Success "FreeCAD installed at $installed"
+        return $true
+    }
+
+    Write-Warn "FreeCAD install did not complete (WinGet exit $wingetExit)."
+    Register-SkippedStage -Label "FreeCAD" `
+        -Reason "WinGet install failed (exit $wingetExit)" `
+        -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
     return $false
 }
 
@@ -2524,6 +2604,7 @@ try {
     Install-Gateway-Extras
     Install-Node-Bridge
     Install-LibreOffice
+    Install-FreeCAD
     Install-Embedding-Model
     Install-Native-Sandbox
     if (-not (Setup-Path)) {
