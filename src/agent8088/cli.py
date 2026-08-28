@@ -2200,16 +2200,38 @@ def cmd_task(rest):
         store.close()
         return
 
+    def task_calls(calls):
+        for call in calls:
+            line = Text("⏺ ", style="#237dd7")
+            line.append(call["name"], style="bold")
+            summary = _tool_summary(call["name"], call.get("arguments"))
+            if summary:
+                line.append(" · ", style="dim")
+                line.append(summary, style="dim")
+            console.print(line)
+
+    def task_result(name, result):
+        preview = str(result).strip().replace("\n", " ")
+        line = Text("  ⎿ ", style="dim")
+        line.append(preview[:160] + ("…" if len(preview) > 160 else ""), style="dim")
+        console.print(line)
+
+    def task_slice(task, event):
+        label = f"task {task['id'][:8]} · slice {task['slice_no']} · {event}"
+        console.print(Text(f"◐ {label}", style="#237dd7"))
+
     def agent(messages, **kwargs):
         return A.run_agent(
             messages, temperature=S.temperature,
             system_prompt=_session_system_prompt,
             tools_def=lambda: A.build_tools_def(_active_tool_specs()),
-            allowed_tools=lambda: set(_active_tool_specs()), **kwargs,
+            allowed_tools=lambda: set(_active_tool_specs()),
+            spin=status_cm, on_calls=task_calls, on_result=task_result, **kwargs,
         )
 
     row = run_task(goal, agent, store=store, workspace=A.PROJECT_ROOT,
-                   task_id=task_id, max_slices=8, slice_turns=max(4, S.max_turns))
+                   task_id=task_id, max_slices=8, slice_turns=max(4, S.max_turns),
+                   on_slice=task_slice)
     console.print(f"[bold]task {row['id']}[/bold] → {row['state']} (slice {row['slice_no']})")
     if row["last_answer"]:
         console.print(row["last_answer"])

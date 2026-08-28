@@ -196,6 +196,7 @@ def store_path(config_path: str | Path) -> Path:
 def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | Path,
              task_id: str | None = None, max_slices: int = 8, slice_turns: int = 8,
              verify: Callable[[dict, str], bool | tuple[bool, str]] | None = None,
+             on_slice: Callable[[dict, str], None] | None = None,
              **agent_kwargs) -> dict:
     """Run bounded model slices, checkpointing after every tool and slice.
 
@@ -220,6 +221,9 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
     for _ in range(max_slices):
         task = store.get(task_id)
         store.update(task_id, state="running", slice_no=int(task["slice_no"]) + 1, error="")
+        task = store.get(task_id)
+        if on_slice:
+            on_slice(task, "running")
         runtime.bind(messages)
         try:
             with runtime.active():
@@ -229,6 +233,8 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
             break
         store.checkpoint(task_id, messages=_compact(messages), answer=answer)
         task = store.get(task_id)
+        if on_slice:
+            on_slice(task, "checkpointed")
         if verify:
             try:
                 verdict = verify(task, answer)
@@ -253,4 +259,7 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         store.checkpoint(task_id, messages=_compact(messages), state="queued")
     else:
         store.update(task_id, state="paused")
-    return store.get(task_id)
+    task = store.get(task_id)
+    if on_slice:
+        on_slice(task, task["state"])
+    return task
