@@ -1,73 +1,69 @@
 import pytest
 from pathlib import Path
-from agent8088.providers import resolve_subagent_target, MODEL_TIERS
+from unittest.mock import patch, MagicMock
 
-def test_resolve_subagent_target_tier_aliases():
-    # Anthropic tier mappings
-    prov, model = resolve_subagent_target("haiku", "anthropic")
-    assert prov == "anthropic"
+from agent8088 import providers
+from agent8088.providers import resolve_subagent_model
+
+
+# ---------------------------------------------------------------------------
+# resolve_subagent_model
+# ---------------------------------------------------------------------------
+
+def test_resolve_subagent_model_inherit_and_empty():
+    assert resolve_subagent_model("", "anthropic") == ("", "")
+    assert resolve_subagent_model("inherit", "anthropic") == ("", "")
+    assert resolve_subagent_model("INHERIT", "anthropic") == ("", "")
+
+
+def test_resolve_subagent_model_valid_model():
+    with patch("agent8088.providers.list_models", return_value=["claude-haiku-3.5", "claude-sonnet-4-6"]):
+        model, warning = resolve_subagent_model("claude-haiku-3.5", "anthropic")
     assert model == "claude-haiku-3.5"
+    assert warning == ""
 
-    prov, model = resolve_subagent_target("sonnet", "anthropic")
-    assert prov == "anthropic"
-    assert model == "claude-sonnet-4-6"
 
-    # Gemini tier mappings
-    prov, model = resolve_subagent_target("flash", "gemini")
-    assert prov == "gemini"
-    assert model == "gemini-2.0-flash"
-
-    prov, model = resolve_subagent_target("pro", "gemini")
-    assert prov == "gemini"
-    assert model == "gemini-2.5-pro"
-
-    # OpenAI tier mappings
-    prov, model = resolve_subagent_target("flash", "openai")
-    assert prov == "openai"
-    assert model == "gpt-4o-mini"
-
-    # DeepSeek tier mappings
-    prov, model = resolve_subagent_target("flash", "deepseek")
-    assert prov == "deepseek"
-    assert model == "deepseek-chat"
-
-    prov, model = resolve_subagent_target("pro", "deepseek")
-    assert prov == "deepseek"
-    assert model == "deepseek-reasoner"
-
-def test_resolve_subagent_target_inherit_and_empty():
-    prov, model = resolve_subagent_target("inherit", "anthropic")
-    assert prov == "anthropic"
+def test_resolve_subagent_model_unknown_model():
+    with patch("agent8088.providers.list_models", return_value=["claude-haiku-3.5", "claude-sonnet-4-6"]):
+        model, warning = resolve_subagent_model("made-up-model", "anthropic")
     assert model == ""
+    assert warning
+    assert "made-up-model" in warning
 
-    prov, model = resolve_subagent_target("", "gemini")
-    assert prov == "gemini"
+
+def test_resolve_subagent_model_cross_provider_rejected():
+    model, warning = resolve_subagent_model("gemini:gemini-2.0-flash", "anthropic")
     assert model == ""
-
-    prov, model = resolve_subagent_target(None, "openai")
-    assert prov == "openai"
-    assert model == ""
-
-def test_resolve_subagent_target_cross_provider():
-    prov, model = resolve_subagent_target("gemini:gemini-2.0-flash", "anthropic")
-    assert prov == "gemini"
-    assert model == "gemini-2.0-flash"
-
-    prov, model = resolve_subagent_target("gemini:flash", "anthropic")
-    assert prov == "gemini"
-    assert model == "gemini-2.0-flash"
-
-    prov, model = resolve_subagent_target("deepseek:pro", "ollama")
-    assert prov == "deepseek"
-    assert model == "deepseek-reasoner"
-
-def test_resolve_subagent_target_explicit_model_id():
-    prov, model = resolve_subagent_target("custom-model-id", "openai")
-    assert prov == "openai"
-    assert model == "custom-model-id"
+    assert warning
+    assert "cross-provider" in warning
 
 
-def test_load_subagent_specs_parses_model_and_provider(tmp_path):
+def test_resolve_subagent_model_empty_list_skips_validation():
+    with patch("agent8088.providers.list_models", return_value=[]):
+        model, warning = resolve_subagent_model("whatever-model-id", "anthropic")
+    assert model == "whatever-model-id"
+    assert warning == ""
+
+
+def test_resolve_subagent_model_ollama_colon_id_not_cross_provider():
+    # "gpt-oss" is not a registered provider prefix, so this must NOT be
+    # treated as cross-provider routing even though it contains a colon.
+    with patch("agent8088.providers.list_models", return_value=["gpt-oss:120b"]):
+        model, warning = resolve_subagent_model("gpt-oss:120b", "ollama-cloud")
+    assert model == "gpt-oss:120b"
+    assert warning == ""
+
+
+def test_model_tiers_and_resolve_subagent_target_removed():
+    assert not hasattr(providers, "MODEL_TIERS")
+    assert not hasattr(providers, "resolve_subagent_target")
+
+
+# ---------------------------------------------------------------------------
+# load_subagent_specs
+# ---------------------------------------------------------------------------
+
+def test_load_subagent_specs_parses_model_no_provider_key(tmp_path):
     from agent8088.engine import load_subagent_specs
 
     agent_file = tmp_path / "fast-explorer.md"
@@ -76,50 +72,123 @@ name: fast-explorer
 description: Fast explorer agent
 tools: read_text, execute_shell
 max_turns: 5
-model: haiku
+model: claude-haiku-3.5
 ---
 Fast explorer prompt
 """, encoding="utf-8")
 
     specs = load_subagent_specs(tmp_path)
     assert "fast-explorer" in specs
-    assert specs["fast-explorer"]["model"] == "haiku"
+    assert specs["fast-explorer"]["model"] == "claude-haiku-3.5"
     assert specs["fast-explorer"]["max_turns"] == 5
+    assert "provider" not in specs["fast-explorer"]
 
-    # Test explicit provider:model frontmatter
-    cross_file = tmp_path / "gemini-auditor.md"
-    cross_file.write_text("""---
-name: gemini-auditor
-description: Gemini-powered auditor
+
+def test_load_subagent_specs_merges_builtin_and_user_dirs(tmp_path):
+    from agent8088.engine import load_subagent_specs
+
+    builtin_dir = tmp_path / "builtin"
+    user_dir = tmp_path / "user"
+    builtin_dir.mkdir()
+    user_dir.mkdir()
+
+    (builtin_dir / "coder.md").write_text("""---
+name: coder
+description: builtin coder
 tools: read_text
-max_turns: 4
-model: gemini:flash
+model: inherit
 ---
-Auditor prompt
+Coder prompt
 """, encoding="utf-8")
 
-    specs_updated = load_subagent_specs(tmp_path)
-    assert "gemini-auditor" in specs_updated
-    assert specs_updated["gemini-auditor"]["model"] == "gemini:flash"
+    (user_dir / "my-agent.md").write_text("""---
+name: my-agent
+description: user agent
+tools: read_text
+model: inherit
+---
+My agent prompt
+""", encoding="utf-8")
+
+    specs = load_subagent_specs(builtin_dir, user_dir)
+    assert "coder" in specs
+    assert specs["coder"]["builtin"] is True
+    assert "my-agent" in specs
+    assert specs["my-agent"]["builtin"] is False
 
 
-def test_exec_subagent_scoped_model_routing():
-    from unittest.mock import patch
+def test_load_subagent_specs_user_dir_wins_on_name_collision(tmp_path):
+    from agent8088.engine import load_subagent_specs
+
+    builtin_dir = tmp_path / "builtin"
+    user_dir = tmp_path / "user"
+    builtin_dir.mkdir()
+    user_dir.mkdir()
+
+    (builtin_dir / "coder.md").write_text("""---
+name: coder
+description: builtin coder
+tools: read_text
+model: inherit
+---
+Builtin coder prompt
+""", encoding="utf-8")
+
+    (user_dir / "coder.md").write_text("""---
+name: coder
+description: user override coder
+tools: read_text, execute_shell
+model: claude-sonnet-4-6
+---
+User coder prompt
+""", encoding="utf-8")
+
+    specs = load_subagent_specs(builtin_dir, user_dir)
+    assert specs["coder"]["builtin"] is False
+    assert specs["coder"]["description"] == "user override coder"
+    assert specs["coder"]["model"] == "claude-sonnet-4-6"
+
+
+def test_load_subagent_specs_user_agents_dir_none(tmp_path):
+    from agent8088.engine import load_subagent_specs
+
+    (tmp_path / "solo.md").write_text("""---
+name: solo
+description: solo agent
+tools: read_text
+model: inherit
+---
+Solo prompt
+""", encoding="utf-8")
+
+    specs = load_subagent_specs(tmp_path, None)
+    assert "solo" in specs
+    assert specs["solo"]["builtin"] is True
+
+
+# ---------------------------------------------------------------------------
+# _exec_subagent
+# ---------------------------------------------------------------------------
+
+def _base_profile(**overrides):
+    profile = {
+        "name": "fast_agent",
+        "description": "Fast explorer",
+        "tools": ["read_text"],
+        "max_turns": 4,
+        "permission": "readonly",
+        "model": "inherit",
+        "builtin": True,
+        "system_prompt": "You are fast",
+    }
+    profile.update(overrides)
+    return profile
+
+
+def test_exec_subagent_inherit_uses_session_model():
     from agent8088 import engine as eng
 
-    test_specs = {
-        "fast_agent": {
-            "name": "fast_agent",
-            "description": "Fast explorer",
-            "tools": ["read_text"],
-            "max_turns": 4,
-            "permission": "readonly",
-            "model": "haiku",
-            "provider": "",
-            "system_prompt": "You are fast",
-        }
-    }
-
+    test_specs = {"fast_agent": _base_profile(model="inherit")}
     with patch.dict(eng.SUBAGENT_SPECS, test_specs, clear=True), \
          patch("agent8088.engine.load_subagent_specs", return_value=test_specs), \
          patch("agent8088.engine.ACTIVE_PROVIDER", "anthropic"), \
@@ -127,59 +196,170 @@ def test_exec_subagent_scoped_model_routing():
          patch("agent8088.engine.run_agent") as mock_run:
         mock_run.return_value = "Done"
         res = eng._exec_subagent({"agent_type": "fast_agent", "task": "Search files"})
-        assert "Done" in res
-        assert mock_run.called
-        kwargs = mock_run.call_args.kwargs
-        assert kwargs.get("provider_name") == "anthropic"
-        assert kwargs.get("model_name") == "claude-haiku-3.5"
+    assert "Done" in res
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs.get("model_name") == "claude-sonnet-4-6"
 
 
-def test_exec_subagent_env_override():
-    import os
-    from unittest.mock import patch
+def test_exec_subagent_available_model_used():
     from agent8088 import engine as eng
 
-    test_specs = {
-        "default_agent": {
-            "name": "default_agent",
-            "description": "Default agent",
-            "tools": ["read_text"],
-            "max_turns": 4,
-            "permission": "readonly",
-            "model": "inherit",
-            "provider": "",
-            "system_prompt": "You are default",
-        }
-    }
-
-    with patch.dict(os.environ, {"AGENT8088_SUBAGENT_MODEL": "haiku"}), \
-         patch.dict(eng.SUBAGENT_SPECS, test_specs, clear=True), \
+    test_specs = {"fast_agent": _base_profile(model="claude-haiku-3.5")}
+    with patch.dict(eng.SUBAGENT_SPECS, test_specs, clear=True), \
          patch("agent8088.engine.load_subagent_specs", return_value=test_specs), \
-         patch("agent8088.engine.ACTIVE_PROVIDER", "gemini"), \
-         patch("agent8088.engine.MODEL_NAME", "gemini-2.5-pro"), \
+         patch("agent8088.engine.ACTIVE_PROVIDER", "anthropic"), \
+         patch("agent8088.engine.MODEL_NAME", "claude-sonnet-4-6"), \
+         patch("agent8088.providers.list_models", return_value=["claude-haiku-3.5"]), \
          patch("agent8088.engine.run_agent") as mock_run:
         mock_run.return_value = "Done"
-        res = eng._exec_subagent({"agent_type": "default_agent", "task": "Scan repo"})
-        assert "Done" in res
-        assert mock_run.called
-        kwargs = mock_run.call_args.kwargs
-        assert kwargs.get("provider_name") == "gemini"
-        assert kwargs.get("model_name") == "gemini-2.0-flash"
+        res = eng._exec_subagent({"agent_type": "fast_agent", "task": "Search files"})
+    assert "Done" in res
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs.get("model_name") == "claude-haiku-3.5"
 
 
-def test_builtin_subagent_profiles_loaded():
+def test_exec_subagent_unavailable_model_falls_back_with_warning():
     from agent8088 import engine as eng
-    specs = eng.load_subagent_specs(eng.AGENTS_DIR)
-    assert "explore" in specs
-    assert specs["explore"]["model"] == "haiku"
-    assert "researcher" in specs
-    assert specs["researcher"]["model"] == "flash"
-    assert "coder" in specs
-    assert specs["coder"]["model"] == "inherit"
-    assert "auditor" in specs
-    assert specs["auditor"]["model"] == "inherit"
-    assert "general-purpose" in specs
-    assert specs["general-purpose"]["model"] == "inherit"
+
+    test_specs = {"fast_agent": _base_profile(model="nonexistent-model")}
+    with patch.dict(eng.SUBAGENT_SPECS, test_specs, clear=True), \
+         patch("agent8088.engine.load_subagent_specs", return_value=test_specs), \
+         patch("agent8088.engine.ACTIVE_PROVIDER", "anthropic"), \
+         patch("agent8088.engine.MODEL_NAME", "claude-sonnet-4-6"), \
+         patch("agent8088.providers.list_models", return_value=["claude-haiku-3.5"]), \
+         patch("agent8088.engine.run_agent") as mock_run:
+        mock_run.return_value = "Done"
+        res = eng._exec_subagent({"agent_type": "fast_agent", "task": "Search files"})
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs.get("model_name") == "claude-sonnet-4-6"
+    assert "nonexistent-model" in res
+    assert "not available" in res
 
 
+def test_exec_subagent_does_not_fetch_second_client():
+    from agent8088 import engine as eng
 
+    test_specs = {"fast_agent": _base_profile(model="inherit")}
+    with patch.dict(eng.SUBAGENT_SPECS, test_specs, clear=True), \
+         patch("agent8088.engine.load_subagent_specs", return_value=test_specs), \
+         patch("agent8088.engine.ACTIVE_PROVIDER", "anthropic"), \
+         patch("agent8088.engine.MODEL_NAME", "claude-sonnet-4-6"), \
+         patch("agent8088.engine.run_agent") as mock_run, \
+         patch("agent8088.engine.get_client") as mock_get_client:
+        mock_run.return_value = "Done"
+        eng._exec_subagent({"agent_type": "fast_agent", "task": "Search files"})
+    mock_get_client.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _exec_create_subagent
+# ---------------------------------------------------------------------------
+
+def test_exec_create_subagent_writes_outside_artifacts(tmp_path, monkeypatch):
+    from agent8088 import engine as eng
+
+    if not hasattr(eng, "_exec_create_subagent"):
+        pytest.skip("_exec_create_subagent not implemented yet")
+
+    monkeypatch.setattr(eng, "USER_AGENTS_DIR", tmp_path)
+    eng._exec_create_subagent({
+        "name": "speed-scout",
+        "description": "Scouts fast",
+        "tools": "read_text",
+        "max_turns": 4,
+        "model": "inherit",
+        "prompt": "You scout fast.",
+    })
+
+    written_path = tmp_path / "speed-scout.md"
+    assert written_path.exists()
+    assert "artifacts" not in written_path.parts
+
+
+def test_exec_create_subagent_round_trips(tmp_path, monkeypatch):
+    from agent8088 import engine as eng
+    from agent8088.engine import load_subagent_specs
+
+    if not hasattr(eng, "_exec_create_subagent"):
+        pytest.skip("_exec_create_subagent not implemented yet")
+
+    monkeypatch.setattr(eng, "USER_AGENTS_DIR", tmp_path)
+    eng._exec_create_subagent({
+        "name": "speed-scout",
+        "description": "Scouts fast",
+        "tools": "read_text, execute_shell",
+        "max_turns": 6,
+        "model": "inherit",
+        "prompt": "You scout fast.",
+    })
+
+    empty_builtin_dir = tmp_path.parent / "empty_builtin"
+    empty_builtin_dir.mkdir(exist_ok=True)
+    specs = load_subagent_specs(empty_builtin_dir, tmp_path)
+    assert "speed-scout" in specs
+    assert specs["speed-scout"]["tools"] == ["read_text", "execute_shell"]
+    assert specs["speed-scout"]["max_turns"] == 6
+    assert specs["speed-scout"]["model"] == "inherit"
+
+
+def test_exec_create_subagent_rejects_invalid_name(tmp_path, monkeypatch):
+    from agent8088 import engine as eng
+
+    if not hasattr(eng, "_exec_create_subagent"):
+        pytest.skip("_exec_create_subagent not implemented yet")
+
+    monkeypatch.setattr(eng, "USER_AGENTS_DIR", tmp_path)
+    eng._exec_create_subagent({
+        "name": "../evil",
+        "description": "bad",
+        "tools": "read_text",
+        "model": "inherit",
+        "prompt": "bad",
+    })
+    assert list(tmp_path.glob("*.md")) == []
+
+    eng._exec_create_subagent({
+        "name": "Bad Name",
+        "description": "bad",
+        "tools": "read_text",
+        "model": "inherit",
+        "prompt": "bad",
+    })
+    assert list(tmp_path.glob("*.md")) == []
+
+
+def test_exec_create_subagent_refuses_builtin_name(tmp_path, monkeypatch):
+    from agent8088 import engine as eng
+
+    if not hasattr(eng, "_exec_create_subagent"):
+        pytest.skip("_exec_create_subagent not implemented yet")
+
+    monkeypatch.setattr(eng, "USER_AGENTS_DIR", tmp_path)
+    result = eng._exec_create_subagent({
+        "name": "coder",
+        "description": "trying to override a builtin",
+        "tools": "read_text",
+        "model": "inherit",
+        "prompt": "bad",
+    })
+    assert not (tmp_path / "coder.md").exists()
+    assert isinstance(result, str)
+
+
+def test_exec_create_subagent_rejects_unknown_tools(tmp_path, monkeypatch):
+    from agent8088 import engine as eng
+
+    if not hasattr(eng, "_exec_create_subagent"):
+        pytest.skip("_exec_create_subagent not implemented yet")
+
+    monkeypatch.setattr(eng, "USER_AGENTS_DIR", tmp_path)
+    result = eng._exec_create_subagent({
+        "name": "bogus-tools-agent",
+        "description": "bad tools",
+        "tools": "not_a_real_tool, also_fake",
+        "model": "inherit",
+        "prompt": "bad",
+    })
+    assert not (tmp_path / "bogus-tools-agent.md").exists()
+    assert isinstance(result, str)
+    assert "not_a_real_tool" in result

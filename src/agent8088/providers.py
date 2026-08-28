@@ -39,92 +39,24 @@ FALLBACK_MODELS = {
     "anthropic":    ["claude-sonnet-4-6", "claude-opus-5", "claude-haiku-3.5"],
 }
 
-MODEL_TIERS = {
-    "anthropic": {
-        "flash_lite": "claude-haiku-3.5",
-        "haiku": "claude-haiku-3.5",
-        "flash": "claude-haiku-3.5",
-        "sonnet": "claude-sonnet-4-6",
-        "pro": "claude-sonnet-4-6",
-        "opus": "claude-opus-5",
-    },
-    "gemini": {
-        "flash_lite": "gemini-2.0-flash-lite",
-        "haiku": "gemini-2.0-flash",
-        "flash": "gemini-2.0-flash",
-        "sonnet": "gemini-2.5-pro",
-        "pro": "gemini-2.5-pro",
-    },
-    "openai": {
-        "flash_lite": "gpt-4o-mini",
-        "haiku": "gpt-4o-mini",
-        "flash": "gpt-4o-mini",
-        "sonnet": "gpt-4o",
-        "pro": "gpt-4o",
-    },
-    "deepseek": {
-        "flash_lite": "deepseek-chat",
-        "haiku": "deepseek-chat",
-        "flash": "deepseek-chat",
-        "pro": "deepseek-reasoner",
-        "sonnet": "deepseek-chat",
-    },
-    "ollama": {
-        "flash_lite": "qwen14b-tooluse-v3",
-        "haiku": "qwen14b-tooluse-v3",
-        "flash": "qwen14b-tooluse-v3",
-        "pro": "qwen2.5-coder:32b",
-    },
-    "ollama-cloud": {
-        "flash_lite": "qwen3:14b",
-        "haiku": "qwen3:14b",
-        "flash": "qwen3:14b",
-        "pro": "gpt-oss:120b",
-    },
-    "groq": {
-        "flash_lite": "llama-3.1-8b-instant",
-        "haiku": "llama-3.1-8b-instant",
-        "flash": "llama-3.1-8b-instant",
-        "pro": "llama-3.3-70b-versatile",
-        "sonnet": "llama-3.3-70b-versatile",
-    },
-    "cerebras": {
-        "flash_lite": "gemma-4-31b",
-        "haiku": "gemma-4-31b",
-        "flash": "gemma-4-31b",
-        "pro": "gpt-oss-120b",
-    },
-    "mistral": {
-        "flash_lite": "mistral-small-2603",
-        "haiku": "mistral-small-2603",
-        "flash": "mistral-small-2603",
-        "pro": "mistral-large-2512",
-    },
-}
 
+def resolve_subagent_model(raw: str, provider: str, client=None) -> tuple[str, str]:
+    """Return (model_id, warning). Empty model_id means "use the session model".
 
-def resolve_subagent_target(raw_model_str: str, default_provider: str) -> tuple[str, str]:
-    """Parse raw model string into (provider_name, model_name).
-
-    Supports:
-    - 'provider:model_or_tier' (e.g. 'gemini:flash', 'openai:gpt-4o-mini')
-    - 'tier_alias' (e.g. 'haiku', 'flash', 'pro') -> resolved via default_provider
-    - 'exact_model' (e.g. 'gemini-2.0-flash') -> used as-is on default_provider
-    - 'inherit' or '' -> returns (default_provider, '')
+    Subagents run on the active provider only. A model must be one the provider
+    actually offers; anything else falls back to the session model with a warning.
     """
-    if not raw_model_str or str(raw_model_str).strip().lower() in ("inherit", ""):
-        return default_provider, ""
-    raw = str(raw_model_str).strip()
-    provider = default_provider
-    model_or_tier = raw
-    if ":" in raw:
-        prefix, _, rest = raw.partition(":")
-        if prefix.strip() in BUILTIN_PROVIDERS:
-            provider = prefix.strip()
-            model_or_tier = rest.strip()
-    provider_tiers = MODEL_TIERS.get(provider, {})
-    resolved_model = provider_tiers.get(model_or_tier.lower(), model_or_tier)
-    return provider, resolved_model
+    raw = (raw or "").strip()
+    if not raw or raw.lower() == "inherit":
+        return "", ""
+    if ":" in raw and raw.split(":", 1)[0] in BUILTIN_PROVIDERS:
+        return "", (f"cross-provider model '{raw}' is no longer supported; "
+                    f"using the session model")
+    available = list_models(provider, client=client, fallback=False)
+    if available and raw not in available:
+        return "", (f"model '{raw}' is not available on {provider}; "
+                    f"using the session model")
+    return raw, ""
 
 
 # OpenAI-compatible /v1/models responses normally expose only an id, owner and

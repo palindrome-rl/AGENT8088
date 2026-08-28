@@ -2225,6 +2225,10 @@ def render_tool_docs(specs: dict) -> str:
     for name, s in specs.items():
         args = ", ".join(s["args"]) or "no args"
         lines.append(f"- {name}({args}): {s['description']}")
+        if name == "spawn_subagent":
+            agent_types = sorted(globals().get("SUBAGENT_SPECS") or {})
+            if agent_types:
+                lines.append(f"  Available agent_type values: {', '.join(agent_types)}.")
     return "\n".join(lines)
 
 
@@ -2391,7 +2395,17 @@ _last_write_diff = []
 # ---------------------------------------------------------------------------
 # Subagents — profiles loaded from agents/*.md (frontmatter + body prompt)
 # ---------------------------------------------------------------------------
+def _agent_data_dir() -> Path:
+    if os.environ.get("AGENT8088_HOME"):
+        return Path(os.environ["AGENT8088_HOME"]).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088"
+    return Path.home() / ".agent8088"
+
+
 AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expanduser()
+USER_AGENTS_DIR = Path(APP_CONFIG.get("user_agents_dir",
+                                      str(_agent_data_dir() / "agents"))).expanduser()
 DEFAULT_SUBAGENT = APP_CONFIG.get("default_subagent", "general-purpose")
 SUBAGENT_MAX_DEPTH = int(APP_CONFIG.get("subagent_max_depth", "1"))
 
@@ -2402,7 +2416,7 @@ _DEFAULT_SUBAGENT_PROFILE = {
     "max_turns": 8,
     "permission": "",
     "model": "inherit",
-    "provider": "",
+    "builtin": True,
     "system_prompt": (
         "You are a focused sub-agent spawned to complete ONE delegated task with a "
         "fresh context. Use your tools actively. When done, reply with a concise final "
@@ -2411,10 +2425,12 @@ _DEFAULT_SUBAGENT_PROFILE = {
 }
 
 
-def load_subagent_specs(agents_dir: Path) -> dict:
+def load_subagent_specs(agents_dir: Path, user_agents_dir: Path = None) -> dict:
     specs = {}
-    if agents_dir.exists() and agents_dir.is_dir():
-        for path in sorted(agents_dir.glob("*.md")):
+    for source_dir, is_builtin in ((agents_dir, True), (user_agents_dir, False)):
+        if not source_dir or not source_dir.exists() or not source_dir.is_dir():
+            continue
+        for path in sorted(source_dir.glob("*.md")):
             meta, body = _parse_frontmatter_md(path.read_text())
             name = meta.get("name") or path.stem
             specs[name] = {
@@ -2432,15 +2448,16 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 "permission": meta.get("permission", "").strip().lower(),
                 # Subagent model configuration (Claude Code style frontmatter)
                 "model": meta.get("model", "").strip(),
-                "provider": meta.get("provider", "").strip(),
                 "system_prompt": body.strip() or _DEFAULT_SUBAGENT_PROFILE["system_prompt"],
+                # Provenance so the CLI can refuse to delete a built-in profile.
+                "builtin": is_builtin,
             }
     if DEFAULT_SUBAGENT not in specs:
         specs[DEFAULT_SUBAGENT] = dict(_DEFAULT_SUBAGENT_PROFILE, name=DEFAULT_SUBAGENT)
     return specs
 
 
-SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR)
+SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 
 # UI hook: a presentation layer (e.g. the Rich CLI) may set this to a factory
 #   subagent_ui(agent_type, task, depth) -> dict of run_agent hooks
@@ -3348,6 +3365,82 @@ def _cap_subagent_answer(answer: str) -> str:
               "Ask it a narrower question if you need the rest.]")
 
 
+_VALID_SUBAGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _exec_create_subagent(args: dict) -> str:
+    """Write a new custom sub-agent profile to USER_AGENTS_DIR/<name>.md.
+
+    Bypasses resolve_write_path on purpose: this tool has no path_arg (see
+    tools.txt), the destination is always derived from `name` under the
+    fixed user agents directory, never from a caller-supplied path.
+    """
+    name = str(args.get("name") or "").strip().lower()
+    if not name or not _VALID_SUBAGENT_NAME.match(name) or ".." in name or "/" in name or "\\" in name:
+        return ("Error: 'name' must match [a-z0-9][a-z0-9_-]* (lowercase, no path "
+                "separators, no '..'). Got: {!r}".format(args.get("name", "")))
+
+    builtins = load_subagent_specs(AGENTS_DIR)
+    if name in builtins:
+        return (f"Error: '{name}' is a built-in agent profile and cannot be "
+                f"overwritten. Choose a different name.")
+
+    raw_tools = str(args.get("tools") or "").strip()
+    if raw_tools:
+        tools = [t for t in (s.strip() for s in raw_tools.split(",")) if t]
+        invalid = [t for t in tools if t not in TOOL_NAMES]
+        if invalid:
+            return (f"Error: unknown tool(s): {', '.join(invalid)}. "
+                    f"Valid tools: {', '.join(sorted(TOOL_NAMES))}")
+    else:
+        tools = ["read_text", "execute_shell"]
+    tools = [t for t in tools if t != "spawn_subagent"]
+
+    try:
+        max_turns = int(str(args.get("max_turns") or 8).strip())
+    except ValueError:
+        max_turns = 8
+    max_turns = max(1, min(20, max_turns))
+
+    raw_model = str(args.get("model") or "").strip()
+    model = "inherit"
+    if raw_model and raw_model.lower() != "inherit":
+        from agent8088.providers import resolve_subagent_model, list_models
+        provider = ACTIVE_PROVIDER or DEFAULT_PROVIDER
+        resolved, warning = resolve_subagent_model(raw_model, provider, client)
+        if warning:
+            available = list_models(provider, client=client, fallback=True) or []
+            shown = ", ".join(available[:15])
+            more = f" and {len(available) - 15} more" if len(available) > 15 else ""
+            return (f"Error: {warning}. Available models on {provider}: "
+                    f"{shown}{more}.")
+        model = resolved or "inherit"
+
+    description = str(args.get("description") or "").strip() or f"Custom sub-agent: {name}."
+
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return "Error: 'prompt' (the sub-agent's system prompt / body) is required."
+
+    frontmatter = (
+        "---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        f"tools: {', '.join(tools)}\n"
+        f"max_turns: {max_turns}\n"
+        f"model: {model}\n"
+        "---\n"
+        "\n"
+        f"{prompt}\n"
+    )
+    target = USER_AGENTS_DIR / f"{name}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(frontmatter, encoding="utf-8", newline="")
+
+    return (f"Created sub-agent profile '{name}' at {target}. "
+            f"Use it via spawn_subagent with agent_type='{name}'.")
+
+
 def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
@@ -3358,7 +3451,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
 
     # Dynamically reload subagent specifications so on-the-fly markdown
     # changes and newly created subagents are immediately accessible.
-    SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR)
+    SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -3374,21 +3467,14 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         available = ", ".join(sorted(SUBAGENT_SPECS)) or "(none)"
         return f"Error: unknown agent_type '{type_name}'. Available: {available}."
 
-    # Model resolution for subagent (Claude Code / Antigravity style)
-    from agent8088.providers import resolve_subagent_target
-    raw_model = (
-        args.get("model")
-        or os.environ.get("AGENT8088_SUBAGENT_MODEL")
-        or os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
-        or profile.get("model")
-        or "inherit"
-    )
-    raw_provider = args.get("provider") or profile.get("provider") or ""
-    sub_provider, sub_model = resolve_subagent_target(
-        raw_model, raw_provider or ACTIVE_PROVIDER or DEFAULT_PROVIDER
-    )
-    sub_client, default_m = get_client(sub_provider)
-    target_model = sub_model or default_m or MODEL_NAME
+    # Model resolution for subagent: active provider only, no cross-provider routing.
+    from agent8088.providers import resolve_subagent_model
+    raw_model = (args.get("model") or profile.get("model") or "").strip()
+    sub_model, model_warning = resolve_subagent_model(
+        raw_model, ACTIVE_PROVIDER or DEFAULT_PROVIDER, client)
+    target_model = sub_model or MODEL_NAME
+    if model_warning:
+        _log.warning("spawn_subagent: %s", model_warning)
 
     # Restrict to the profile's tools that actually exist; sub-agents never get
     # spawn_subagent (bounds recursion in addition to the depth guard).
@@ -3448,8 +3534,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             # Share the parent's ceiling. A fresh budget here would be a free
             # bypass: delegate to a subagent and the limit starts over.
             budget=_active_budget,
-            client=sub_client,
-            provider_name=sub_provider,
+            client=client,
+            provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
             model_name=target_model,
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
@@ -3463,6 +3549,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
              _permission_floor_readonly, _sandbox_readonly) = saved_permission
 
     answer = _cap_subagent_answer(answer)
+    if model_warning:
+        answer = f"[note: {model_warning}]\n\n{answer}"
     if ui.get("done"):
         ui["done"](answer)
     return f"[subagent:{type_name}] {answer}"
@@ -3725,14 +3813,6 @@ def _which_executable(name: str) -> str | None:
             if executable:
                 return executable
     return shutil.which(name)
-
-
-def _agent_data_dir() -> Path:
-    if os.environ.get("AGENT8088_HOME"):
-        return Path(os.environ["AGENT8088_HOME"]).expanduser()
-    if sys.platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088"
-    return Path.home() / ".agent8088"
 
 
 _DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
@@ -5128,6 +5208,28 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                           and not _ddgs_only_chain())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
+
+    if name == "create_subagent":
+        # Handled outside the write_text path machinery: this tool has no
+        # path_arg (see tools.txt) — the destination is always derived from
+        # `name` under USER_AGENTS_DIR, never a caller-supplied path, so
+        # resolve_write_path has nothing to resolve. It still writes to disk,
+        # so it takes the same permission gate every other write does; placing
+        # it after the plan-only check above keeps both gates in force.
+        target = str(USER_AGENTS_DIR / f"{str(args.get('name') or '').strip().lower()}.md")
+        if not check_permission("write_text", target, approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="write_text",
+                   decision="blocked", detail=target, change_type="new_file")
+            return request_escalation(
+                target_mode="edit",
+                paths=[target],
+                change_type="new_file",
+                reason=f"Tool '{name}' requires write_text access, which is "
+                       f"blocked in {PERMISSION_MODE} mode.",
+            )
+        _audit("tool_call", tool=name, mode="write_text", decision="allowed",
+               detail=target)
+        return _exec_create_subagent(args)
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None

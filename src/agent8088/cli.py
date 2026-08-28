@@ -1970,7 +1970,7 @@ def cmd_help(_):
         ("/tools", "List every tool with its args, mode, and description"),
         ("/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails"),
         ("/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)"),
-        ("/agents", "List available sub-agent profiles"),
+        ("/agents [new|edit|delete|models]", "List, create, edit, or delete sub-agent profiles"),
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
         ("/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session"),
         ("/cli-anything [task]", "Use CLI-Anything to find, run, build, refine, test, or validate an application CLI"),
@@ -2278,19 +2278,142 @@ def cmd_agent(rest):
     _run_subagent(name, task)
 
 
-def cmd_agents(_):
+def _cmd_agents_list():
     t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
-              caption="run one with  /agent  (arrow-key picker)  or  /agent <name> <task>",
+              caption="run one with  /agent  (arrow-key picker)  or  /agent <name> <task>  ·  "
+                      "manage with  /agents new|edit|delete|models",
               caption_style="dim")
     t.add_column("Name", style="#237dd7")
+    t.add_column("Source", style="#237dd7")
     t.add_column("Max turns", style="#237dd7")
+    t.add_column("Model", style="#237dd7")
     t.add_column("Tools", style="#237dd7")
     t.add_column("Description", style="#237dd7")
     for name in sorted(A.SUBAGENT_SPECS):
         p = A.SUBAGENT_SPECS[name]
         tools = ", ".join(t_ for t_ in p["tools"] if t_ in A.TOOL_NAMES) or "—"
-        t.add_row(name, str(p["max_turns"]), tools, p["description"])
+        source = "built-in" if p.get("builtin") else "custom"
+        model = p.get("model") or "inherit"
+        t.add_row(name, source, str(p["max_turns"]), model, tools, p["description"])
     console.print(t)
+
+    provider = _active_provider_name()
+    models = _fetch_models_for_provider(provider)
+    if models:
+        shown = ", ".join(models[:10])
+        more = f", and {len(models) - 10} more" if len(models) > 10 else ""
+        console.print(f"[dim]{provider} offers {len(models)} models — {shown}{more}.  "
+                      f"/agents models for the full list.[/dim]")
+    else:
+        console.print(f"[dim]{provider}: could not fetch the model list right now.[/dim]")
+
+
+def _cmd_agents_models():
+    provider = _active_provider_name()
+    models = _fetch_models_for_provider(provider)
+    if not models:
+        console.print(f"[dim]{provider}: could not fetch the model list right now.[/dim]")
+        return
+    t = Table(title=f"{provider} models ({len(models)})", box=box.SIMPLE, title_style="bold #00edff")
+    t.add_column("Model", style="#237dd7")
+    for m in models:
+        t.add_row(m)
+    console.print(t)
+
+
+def _cmd_agents_new(rest):
+    name = rest.strip() or _custom_prompt("Name (lowercase, e.g. my-agent):")
+    name = name.strip().lower()
+    description = _custom_prompt("Description:")
+    tools = _custom_prompt("Tools (comma-separated, blank = read_text, execute_shell):")
+    max_turns = _custom_prompt("Max turns:", default="8")
+    provider = _active_provider_name()
+    models = ["inherit (use session model)"] + _fetch_models_for_provider(provider)
+    model_choice = _choice_prompt("Model:", models, models[0])
+    model = "" if model_choice.startswith("inherit") else model_choice
+    console.print("[dim]Enter the sub-agent's system prompt. End with an empty line.[/dim]")
+    prompt_lines = []
+    while True:
+        try:
+            line = console.input()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line:
+            break
+        prompt_lines.append(line)
+    prompt = "\n".join(prompt_lines)
+    result = A._exec_create_subagent({
+        "name": name,
+        "description": description,
+        "tools": tools,
+        "max_turns": max_turns,
+        "model": model,
+        "prompt": prompt,
+    })
+    console.print(result)
+
+
+def _cmd_agents_edit(name):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /agents edit <name>")
+        return
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    profile = A.SUBAGENT_SPECS.get(name)
+    if profile is None:
+        console.print(f"[red]unknown agent:[/red] {name}")
+        return
+    if profile.get("builtin"):
+        console.print(f"[red]'{name}' is built-in and cannot be edited.[/red] "
+                      f"Use [#237dd7]/agents new {name}[/#237dd7] to shadow it with a custom version.")
+        return
+    path = A.USER_AGENTS_DIR / f"{name}.md"
+    editor = os.environ.get("EDITOR") or ("notepad" if sys.platform == "win32" else "vi")
+    subprocess.run([editor, str(path)])
+
+
+def _cmd_agents_delete(name):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /agents delete <name>")
+        return
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    profile = A.SUBAGENT_SPECS.get(name)
+    if profile is None:
+        console.print(f"[red]unknown agent:[/red] {name}")
+        return
+    if profile.get("builtin"):
+        console.print(f"[red]'{name}' is built-in and cannot be deleted.[/red]")
+        return
+    path = A.USER_AGENTS_DIR / f"{name}.md"
+    try:
+        confirm = console.input(f"Delete '{name}' ({path})? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        confirm = ""
+    if confirm != "y":
+        console.print("[dim]cancelled[/dim]")
+        return
+    path.unlink(missing_ok=True)
+    console.print(f"[#237dd7]deleted[/#237dd7] {path}")
+
+
+def cmd_agents(rest):
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    parts = (rest or "").strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    if not sub:
+        _cmd_agents_list()
+    elif sub == "models":
+        _cmd_agents_models()
+    elif sub == "new":
+        _cmd_agents_new(arg)
+    elif sub == "edit":
+        _cmd_agents_edit(arg)
+    elif sub == "delete":
+        _cmd_agents_delete(arg)
+    else:
+        console.print("[red]usage:[/red] /agents [new [name]|edit <name>|delete <name>|models]")
 
 
 def cmd_tool(rest):
