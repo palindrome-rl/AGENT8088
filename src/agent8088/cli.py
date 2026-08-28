@@ -2261,6 +2261,7 @@ def cmd_task(rest):
     def agent(messages, **kwargs):
         return A.run_agent(
             messages, temperature=S.temperature,
+            memory_capture=False,
             system_prompt=_session_system_prompt,
             tools_def=lambda: A.build_tools_def(_active_tool_specs()),
             allowed_tools=lambda: set(_active_tool_specs()),

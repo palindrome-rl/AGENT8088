@@ -438,6 +438,9 @@ def test_the_agent_is_built_without_vision_thinking_or_the_judge(fake_browser_us
     kwargs = fake_browser_use.agents[0].kwargs
     assert kwargs["use_vision"] is False
     assert kwargs["use_thinking"] is False
+    assert kwargs["llm_timeout"] == A.TIMEOUT_SECONDS
+    assert kwargs["max_actions_per_step"] == 1
+    assert "current browser state" in kwargs["extend_system_message"]
     assert kwargs["use_judge"] is False
 
 

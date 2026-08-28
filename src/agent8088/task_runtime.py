@@ -249,7 +249,9 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         messages = [{"role": "user", "content":
                      "This is a durable task. Work in small, concrete tool steps. "
                      "Checkpointed progress survives a restart. Do not claim completion "
-                     "until the requested verification has actually passed.\n\n" + goal}]
+                     "until the requested verification has actually passed. End a verified "
+                     "final answer with TASK_COMPLETE; otherwise end it with TASK_PROGRESS.\n\n"
+                     + goal}]
         task_id = store.create(goal, workspace, messages)
     runtime = TaskRuntime(store, task_id)
     for _ in range(max_slices):
@@ -292,7 +294,8 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         messages = _compact(messages)
         messages.append({"role": "user", "content":
             "Continue this durable task from the checkpoint. Do one concrete next action "
-            "with tools, then report TASK_PROGRESS. Never claim completion without proof."
+            "with tools. Report TASK_COMPLETE if the task is now fully complete and "
+            "verified; otherwise report TASK_PROGRESS. Never claim completion without proof."
             + (f"\nVerifier feedback: {feedback}" if feedback else "")})
         store.checkpoint(task_id, messages=_compact(messages), state="queued")
     else:

@@ -24,6 +24,16 @@ call and "now do the thing" as a second call — the second call starts over at
 a logged-out state and will fail confusingly (wrong page, missing elements,
 or the model incorrectly assuming it's "already logged in").
 
+Inside that call, advance a stateful flow by clicking the site's visible links
+or buttons. Do not use a direct `navigate` action to jump to a later URL after
+login, adding to a cart, or filling a wizard: a full page reload can discard
+client-side state even though the browser session itself is unchanged.
+
+After an `input` action reports success, submit the form once even if the next
+DOM summary does not display the field value. Retry typing only when the site
+returns a validation error; otherwise repeated typing wastes the step budget
+and can make a correctly filled form look broken.
+
 This is the opposite of the general task-sizing advice below, and it wins
 when the two conflict: a login-gated checkout, a multi-page wizard, or
 anything else that depends on state set up earlier belongs in **one** call

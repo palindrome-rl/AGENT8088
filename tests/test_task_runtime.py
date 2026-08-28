@@ -54,3 +54,19 @@ def test_resuming_a_task_does_not_pause_another_running_task(tmp_path):
              workspace=tmp_path, task_id=first, max_slices=0)
 
     assert store.get(other)["state"] == "running"
+
+
+def test_task_tells_the_agent_how_to_finish(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    prompts = []
+    answers = iter(("still working TASK_PROGRESS", "done TASK_COMPLETE"))
+
+    def agent(messages, **_):
+        prompts.append(messages[-1]["content"])
+        return next(answers)
+
+    row = run_task("checkout", agent, store=store, workspace=tmp_path,
+                   max_slices=2, slice_turns=1)
+
+    assert row["state"] == "completed"
+    assert all("TASK_COMPLETE" in prompt for prompt in prompts)

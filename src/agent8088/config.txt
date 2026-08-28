@@ -66,7 +66,9 @@ default_provider=ollama
 # provider.openrouter.api_key=sk-or-...
 
 timeout_seconds=120
-# max_tool_timeout_seconds=300
+# max_tool_timeout_seconds=600
+# browser_max_steps=500
+# browser_task_timeout_seconds=600
 
 # --- display ---
 # Pygments theme for the code the agent reads and writes: file listings, diffs

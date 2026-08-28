@@ -333,7 +333,7 @@ READ_PAGE_LINES = int(APP_CONFIG.get("read_page_lines", "200"))
 MAX_DOCUMENT_BYTES = int(APP_CONFIG.get("max_document_bytes", str(25 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
-MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "300")))
+MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "600")))
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
@@ -2061,6 +2061,8 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- A direct request to run a command MUST call execute_shell.")
     if "web_search" in specs:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
+    if "browse_page" in specs:
+        lines.append("- A multi-step website workflow MUST use one browse_page call whose task contains the entire end-to-end workflow. Do not split login, cart, checkout, or navigation across browse_page calls: each call starts a fresh browser session.")
     if "convert_document" in specs:
         lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
     if "create_document" in specs:
@@ -3407,8 +3409,8 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 # Browser — real page rendering via Playwright (optional dependency)
 # ---------------------------------------------------------------------------
-BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "25"))
-BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "300"))
+BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "500"))
+BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "600"))
 
 # Mirrors cli.py's S.show_reasoning (toggled by /reasoning, aliased /think) -
 # see cmd_reasoning and Session.__init__. Kept as a plain engine.py global
@@ -3697,6 +3699,21 @@ async def _run_browser_agent(url: str, task: str, executable_path: str | None = 
             # A free-form thinking field can consume a small model's entire
             # output budget before it emits a browser action.
             use_thinking=False,
+            # Browser Use otherwise guesses 75s for an unknown model name. Use
+            # Agent8088's provider timeout so a slow local completion is not
+            # discarded and retried just before it arrives.
+            llm_timeout=TIMEOUT_SECONDS,
+            # A small model often batches actions for the old DOM after the
+            # first click navigates. One action per fresh state trades calls for
+            # reliability and prevents the stale-index cascade seen in checkout.
+            max_actions_per_step=1,
+            extend_system_message=(
+                "Reliability rules: use only element indices from the current "
+                "browser state. After navigation, inspect the new state before "
+                "acting. After an input action reports success, submit the form "
+                "once even if a later DOM summary omits the value. Retry typing "
+                "only when the site displays a validation error."
+            ),
             # browser-use defaults use_judge=True: after every completed task
             # it runs one more full LLM call to self-critique the result. Its
             # own verdict doesn't retry or change what's returned - it's
@@ -7240,7 +7257,7 @@ class _TurnBudget:
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
 def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
-              memory_background=False, **kwargs):
+              memory_background=False, memory_capture=True, **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
 
@@ -7290,9 +7307,10 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             _last_audit_share = budget.audit_share() if budget is not None else 0.0
             # After the answer, never in front of it. An interrupted or failed
             # turn leaves `answer` None and teaches nothing.
-            _capture_turn_memory(messages, answer, identity=memory_identity,
-                                 run_id=memory_run_id,
-                                 in_background=memory_background)
+            if memory_capture:
+                _capture_turn_memory(messages, answer, identity=memory_identity,
+                                     run_id=memory_run_id,
+                                     in_background=memory_background)
         _active_budget = previous
 
 
@@ -7469,6 +7487,17 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
+    user_turns = _genuine_user_turns(messages)
+    durable_browser_goal = next((str(message.get("content") or "")
+                                 for message in user_turns
+                                 if str(message.get("content") or "").startswith(
+                                     "This is a durable task.")), "")
+    browser_goal = ((durable_browser_goal.split("\n\n", 1)[-1]
+                     if durable_browser_goal else "")
+                    or (str(user_turns[-1].get("content") or "")
+                        if user_turns else ""))
+    durable_start = (re.search(r"https?://[^\s<>\]\)]+", durable_browser_goal)
+                     if durable_browser_goal else None)
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -7548,6 +7577,21 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
+        for call in calls:
+            if call["name"] == "browse_page" and browser_goal:
+                call["arguments"] = dict(call.get("arguments") or {})
+                if durable_start:
+                    call["arguments"]["url"] = durable_start.group(0).rstrip(".,")
+                call["arguments"]["task"] = (
+                    "Complete the entire original user request in this same browser "
+                    "session. In stateful flows, move between pages by clicking the "
+                    "site's visible links or buttons; do not navigate directly to a "
+                    "later URL after login or a state change, because a full reload "
+                    "may discard in-memory state. After an input action reports success, "
+                    "submit the form once even if the next page summary omits the field "
+                    "value; retry typing only if the site shows a validation error. "
+                    f"Original user request:\n{browser_goal}"
+                )
         finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
             warning = (

@@ -17,6 +17,7 @@ def test_task_forwards_permission_requests_to_the_cli(monkeypatch):
                 "last_answer": agent([])}
 
     def fake_run_agent(_messages, **kwargs):
+        assert kwargs["memory_capture"] is False
         assert kwargs["on_escalation"]("write_text", "ESCALATION_REQUEST\x1f"
                                         "write_text\x1fwrite\x1fwork\x1ftest")
         return "TASK_COMPLETE"
