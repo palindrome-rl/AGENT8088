@@ -28,3 +28,14 @@ def test_checkpoint_and_resume(tmp_path):
     stored = store.db.execute("SELECT args_json FROM task_operations WHERE id=?", (op,)).fetchone()[0]
     assert "do-not-store" not in stored
     assert "redacted" in stored
+    assert store.recent_operations(row["id"])[-1]["id"] == op
+
+
+def test_cancelled_task_does_not_resume(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    task_id = store.create("stop", tmp_path, [{"role": "user", "content": "stop"}])
+    assert store.resolve(task_id[:12])["id"] == task_id
+    store.cancel(task_id)
+    row = run_task("ignored", lambda *_args, **_kwargs: "should not run",
+                   store=store, workspace=tmp_path, task_id=task_id)
+    assert row["state"] == "cancelled"
