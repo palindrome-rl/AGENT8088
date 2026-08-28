@@ -76,7 +76,7 @@ class TaskStore:
 
     def list(self) -> list[dict]:
         return [dict(row) for row in self.db.execute(
-            "SELECT * FROM tasks ORDER BY updated_at DESC").fetchall()]
+            "SELECT * FROM tasks WHERE state != 'cancelled' ORDER BY updated_at DESC").fetchall()]
 
     def resolve(self, task_ref: str) -> dict:
         """Find one task by its full id or the short id shown by `/task list`."""
