@@ -9,6 +9,8 @@ never being set at all) shipped precisely because the only coverage of "does
 the profile actually do what we think" was a live end-to-end test that could
 not distinguish "the proxy blocked it" from "nothing answered".
 """
+import sys
+
 import pytest
 
 from agent8088 import engine as A
@@ -55,6 +57,11 @@ def test_launch_args_are_headless(tmp_path):
     # this is what actually keeps a real window off the user's screen.
     assert any(a.startswith("--headless") for a in profile.get_args())
     assert "--start-maximized" not in profile.get_args()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only Chrome flag")
+def test_launch_args_do_not_access_the_macos_login_keychain(tmp_path):
+    assert "--use-mock-keychain" in _profile(tmp_path).get_args()
 
 
 @pytest.mark.parametrize("host", [

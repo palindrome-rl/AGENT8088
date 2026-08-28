@@ -3578,6 +3578,11 @@ def _browser_profile_kwargs(proxy_url: str) -> dict:
         # _egress_check/_ssrf_check and the audit log entirely.
         "enable_default_extensions": False,
     }
+    if sys.platform == "darwin":
+        # Chrome otherwise asks macOS for the login keychain password even
+        # with a fresh automation profile. This disposable browser never
+        # needs the user's stored credentials.
+        kwargs["args"] = ["--use-mock-keychain"]
     if SSRF_ALLOW_PRIVATE:
         # The operator has explicitly opted every private range back in; the
         # proxy's own check is a no-op in this mode too.
@@ -3633,7 +3638,7 @@ def _browser_use_available() -> bool:
         return False
 
 
-async def _run_browser_agent(url: str, task: str) -> str:
+async def _run_browser_agent(url: str, task: str, executable_path: str | None = None) -> str:
     """Drive one browser-use Agent run and return its final result text.
 
     Every request the browser makes passes through a fresh local SSRF-
@@ -3670,7 +3675,8 @@ async def _run_browser_agent(url: str, task: str) -> str:
         llm = build_browser_chat_model(
             client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS)
         profile = BrowserProfile(
-            user_data_dir=user_data_dir, **_browser_profile_kwargs(proxy_url))
+            user_data_dir=user_data_dir, executable_path=executable_path,
+            **_browser_profile_kwargs(proxy_url))
         agent = Agent(
             task=task,
             llm=llm,
@@ -3688,6 +3694,9 @@ async def _run_browser_agent(url: str, task: str) -> str:
             # which would hit the same failure - only False fully disables
             # both the automatic per-step screenshot and that action.
             use_vision=False,
+            # A free-form thinking field can consume a small model's entire
+            # output budget before it emits a browser action.
+            use_thinking=False,
             # browser-use defaults use_judge=True: after every completed task
             # it runs one more full LLM call to self-critique the result. Its
             # own verdict doesn't retry or change what's returned - it's
@@ -3780,10 +3789,12 @@ def _exec_browser(args: dict) -> str:
     os.environ.setdefault(
         "PLAYWRIGHT_BROWSERS_PATH", str(_agent_data_dir() / "playwright-browsers")
     )
+    executable_path = None
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            if not os.path.exists(p.chromium.executable_path):
+            executable_path = p.chromium.executable_path
+            if not os.path.exists(executable_path):
                 return ("Playwright's Chromium browser is not installed. Install it with:\n"
                         "  playwright install chromium\n"
                         "Until then, use web_search or get_page_title instead.")
@@ -3792,7 +3803,7 @@ def _exec_browser(args: dict) -> str:
 
     saved_role, _active_role = _active_role, "subagent:browser"
     try:
-        result = asyncio.run(_run_browser_agent(url, task))
+        result = asyncio.run(_run_browser_agent(url, task, executable_path))
     except asyncio.TimeoutError:
         knob = ("max_tool_timeout_seconds"
                 if BROWSER_TASK_TIMEOUT_SECONDS > MAX_TOOL_TIMEOUT_SECONDS
@@ -7498,12 +7509,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
-        # After a length cutoff, the one retry gets a bigger budget (capped by
-        # the model's context window) — the same fixed budget would just
-        # reproduce the same cutoff if the model reasons a similar amount again.
+        # After a length cutoff, first allow a larger retry, then force one
+        # short answer/tool-call attempt for models with an 8k output ceiling.
         turn_max_tokens = (
-            min(MAX_COMPLETION_TOKENS * 2, CONTEXT_WINDOW)
-            if length_retries else MAX_COMPLETION_TOKENS
+            MAX_COMPLETION_TOKENS if not length_retries else
+            min(MAX_COMPLETION_TOKENS * 2, CONTEXT_WINDOW) if length_retries == 1 else
+            min(1024, MAX_COMPLETION_TOKENS)
         )
         try:
             with spin("thinking..."):
@@ -7563,9 +7574,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
-            if length_retries < 1:
+            if length_retries < 2:
                 length_retries += 1
-                messages.append({"role": "user", "content": retry_instruction})
+                messages.append({"role": "user", "content": (
+                    retry_instruction if length_retries == 1 else
+                    "Your last two responses reached the output limit. Reply within 200 tokens "
+                    "with exactly one complete tool call or a final answer. Do not include analysis "
+                    "or thinking."
+                )})
                 continue
             answer = _guard_answer(warning)
             if on_answer:

@@ -9,6 +9,7 @@ call run_agent()'s own loop uses - so a multi-step browsing task can't spend
 tokens outside the user's existing turn budget ceiling.
 """
 from dataclasses import dataclass
+import json
 from typing import Any, Optional
 
 from pydantic import ValidationError
@@ -29,6 +30,25 @@ def _unfence_json_object(content: str) -> str:
     if content[:4].lower() == "json":
         content = content[4:].lstrip()
     return content if content.startswith("{") else original
+
+
+def _parse_structured_output(output_format, content: str):
+    content = _unfence_json_object(content)
+    try:
+        return output_format.model_validate_json(content)
+    except ValidationError:
+        try:
+            value = json.loads(content)
+        except json.JSONDecodeError:
+            raise
+        if "action" not in getattr(output_format, "model_fields", {}) or not isinstance(value, dict):
+            raise
+        actions = value.get("action")
+        if actions is not None and (not isinstance(actions, list)
+                                    or any(action for action in actions)):
+            raise
+        value["action"] = []
+        return output_format.model_validate(value)
 
 
 @dataclass
@@ -92,7 +112,7 @@ class Agent8088ChatModel(ChatLiteLLM):
 
         response = await acompletion(**params)
         content = response.choices[0].message.content or ""
-        parsed = output_format.model_validate_json(_unfence_json_object(content))
+        parsed = _parse_structured_output(output_format, content)
         return ChatInvokeCompletion(
             completion=parsed,
             usage=self._parse_usage(response),

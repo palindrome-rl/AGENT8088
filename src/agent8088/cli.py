@@ -2244,6 +2244,8 @@ def cmd_task(rest):
             console.print(line)
 
     def task_result(name, result):
+        if str(result).startswith("ESCALATION_REQUEST\x1f"):
+            return
         preview = str(result).strip().replace("\n", " ")
         line = Text("  ⎿ ", style="dim")
         line.append(preview[:160] + ("…" if len(preview) > 160 else ""), style="dim")
@@ -2253,13 +2255,17 @@ def cmd_task(rest):
         label = f"task {task['id'][:8]} · slice {task['slice_no']} · {event}"
         console.print(Text(f"◐ {label}", style="#237dd7"))
 
+    def task_escalation(_name, result):
+        return _handle_escalation(result)
+
     def agent(messages, **kwargs):
         return A.run_agent(
             messages, temperature=S.temperature,
             system_prompt=_session_system_prompt,
             tools_def=lambda: A.build_tools_def(_active_tool_specs()),
             allowed_tools=lambda: set(_active_tool_specs()),
-            spin=status_cm, on_calls=task_calls, on_result=task_result, **kwargs,
+            spin=status_cm, on_calls=task_calls, on_result=task_result,
+            on_escalation=task_escalation, **kwargs,
         )
 
     row = run_task(goal, agent, store=store, workspace=A.PROJECT_ROOT,

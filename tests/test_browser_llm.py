@@ -5,7 +5,7 @@ spend tokens the user's budget ceiling doesn't know about."""
 from types import SimpleNamespace
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agent8088.browser_llm import Agent8088ChatModel, build_browser_chat_model
 
@@ -122,6 +122,14 @@ class _Output(BaseModel):
     answer: str
 
 
+class _Action(BaseModel):
+    wait: int
+
+
+class _ActionOutput(BaseModel):
+    action: list[_Action]
+
+
 @pytest.mark.asyncio
 async def test_ainvoke_falls_back_to_json_object_mode_when_strict_schema_is_ignored(
         monkeypatch):
@@ -196,6 +204,32 @@ async def test_json_object_fallback_charges_the_budget(monkeypatch):
     await model.ainvoke([], output_format=_Output)
 
     assert budget.charged == [(7, 3)]
+
+
+@pytest.mark.asyncio
+async def test_json_object_fallback_turns_empty_browser_actions_into_a_retryable_list(monkeypatch):
+    model = Agent8088ChatModel(model="openai/test", budget=None)
+
+    async def fake_super_ainvoke(self, messages, output_format=None, **kwargs):
+        try:
+            output_format.model_validate_json('{"action": [{}]}')
+        except ValidationError as exc:
+            raise exc from None
+
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+
+    async def fake_acompletion(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"action": [{}]}'))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    result = await model.ainvoke([], output_format=_ActionOutput)
+
+    assert result.completion.action == []
 
 
 @pytest.mark.asyncio

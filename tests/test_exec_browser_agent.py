@@ -59,15 +59,15 @@ def test_runs_the_browser_agent_and_wraps_the_result(monkeypatch, tmp_path):
     _install_present_chromium(monkeypatch, tmp_path)
     calls = []
 
-    async def fake_run_browser_agent(url, task):
-        calls.append((url, task))
+    async def fake_run_browser_agent(url, task, executable_path=None):
+        calls.append((url, task, executable_path))
         return "The heading says Hello."
 
     monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
 
     result = A._exec_browser({"url": "https://example.com", "task": "read the heading"})
 
-    assert calls == [("https://example.com", "read the heading")]
+    assert calls == [("https://example.com", "read the heading", str(tmp_path / "chrome.exe"))]
     assert "The heading says Hello." in result
     assert "<<<EXTERNAL_UNTRUSTED_CONTENT" in result
 
@@ -76,7 +76,7 @@ def test_sets_and_restores_active_role_around_the_run(monkeypatch, tmp_path):
     _install_present_chromium(monkeypatch, tmp_path)
     seen_role = {}
 
-    async def fake_run_browser_agent(url, task):
+    async def fake_run_browser_agent(url, task, executable_path=None):
         seen_role["during"] = A._active_role
         return "ok"
 
@@ -92,7 +92,7 @@ def test_sets_and_restores_active_role_around_the_run(monkeypatch, tmp_path):
 def test_active_role_restored_even_when_the_run_raises(monkeypatch, tmp_path):
     _install_present_chromium(monkeypatch, tmp_path)
 
-    async def fake_run_browser_agent(url, task):
+    async def fake_run_browser_agent(url, task, executable_path=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
@@ -110,7 +110,7 @@ def test_ctrl_c_during_the_run_is_reraised_not_swallowed(monkeypatch, tmp_path):
     follows, it must never turn the interrupt itself into a quiet return."""
     _install_present_chromium(monkeypatch, tmp_path)
 
-    async def fake_run_browser_agent(url, task):
+    async def fake_run_browser_agent(url, task, executable_path=None):
         raise KeyboardInterrupt()
 
     monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
@@ -133,7 +133,7 @@ def test_ctrl_c_during_the_run_silences_the_asyncio_shutdown_warning(monkeypatch
     original_level = logger.level
     logger.setLevel(logging.NOTSET)
 
-    async def fake_run_browser_agent(url, task):
+    async def fake_run_browser_agent(url, task, executable_path=None):
         raise KeyboardInterrupt()
 
     monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
@@ -422,7 +422,7 @@ def test_the_profile_is_built_from_the_security_kwargs(fake_browser_use):
     assert kwargs["prohibited_domains"]
 
 
-def test_the_agent_is_built_with_vision_and_the_judge_both_disabled(fake_browser_use):
+def test_the_agent_is_built_without_vision_thinking_or_the_judge(fake_browser_use):
     """use_vision=False: browser-use's default (True) sends a screenshot
     every step and hard-errors against a model that doesn't accept image
     input - this adapter has to work with whatever model is configured, not
@@ -437,6 +437,7 @@ def test_the_agent_is_built_with_vision_and_the_judge_both_disabled(fake_browser
 
     kwargs = fake_browser_use.agents[0].kwargs
     assert kwargs["use_vision"] is False
+    assert kwargs["use_thinking"] is False
     assert kwargs["use_judge"] is False
 
 
