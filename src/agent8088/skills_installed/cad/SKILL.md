@@ -23,9 +23,10 @@ and snapshot review. Do not write FreeCAD Python and do not run CAD source with
 - Geometry requiring lofts, sweeps, sketches, selectors, or other advanced
   build123d operations: `generate_cad_model` (escape hatch).
 
-Both complex-model tools generate STEP, export requested secondary formats,
-reopen and validate every solid independently, check bounded assembly
-interference, and render an isometric preview before reporting success.
+Both complex-model tools generate STEP, reopen and validate every solid
+independently, check bounded assembly interference, and render an isometric
+preview before reporting success. Secondary formats are emitted only after the
+canonical STEP passes those checks.
 `generate_cad_design` retains a type-checked `.design.json` plus parameters and
 does not execute model-authored Python, so use it whenever its schema fits.
 
@@ -56,10 +57,13 @@ Use a bare filename such as `house.step`; Agent8088 resolves it to its artifacts
 directory. Never guess `C:/artifacts`, call a shell to discover the current
 directory, or write a separate script.
 
-The schema has millimetre units, editable parameters, and uniquely named
-components. Each component fuses its `add` primitives, then applies its `cut`
-primitives. Numeric fields may be arithmetic expressions referencing parameters.
-Every primitive supports `at`, `rotate`, and a compact `placements` array.
+The tool receives `design` as a structured object (not JSON text embedded inside
+another string). The schema has millimetre units, editable parameters, uniquely
+named components, and request-derived verification checks. Each component fuses
+its `add` primitives, then applies its `cut` primitives. Numeric fields may be
+arithmetic expressions referencing parameters. Every primitive supports `at`,
+`rotate`, and a compact `placements` array. Unknown or misspelled fields are
+rejected rather than silently ignored.
 
 ```json
 {
@@ -74,7 +78,19 @@ Every primitive supports `at`, `rotate`, and a compact `placements` array.
       "type": "cylinder", "radius": "hole_r", "height": "height + 2",
       "at": [15, 15, -1], "placements": [[0, 0, 0], [50, 0, 0]]
     }]
-  }]
+  }],
+  "verification": {
+    "tolerance": 0.05,
+    "overall_bounding_box": {"size": ["length", "width", "height"]},
+    "solid_count": 1,
+    "component_count": 1,
+    "components": {
+      "plate": {
+        "solid_count": 1,
+        "bounding_box": {"size": ["length", "width", "height"]}
+      }
+    }
+  }
 }
 ```
 
@@ -84,10 +100,17 @@ Primitive-specific fields are: box `size`; cylinder `radius,height`; sphere
 wants separate solids. Avoid overlapping solids; exact touching faces are valid
 mating contact and are not misclassified as self-intersection.
 
+`verification` is mandatory in model-visible tool calls. Derive it from the
+user's brief; never invent a looser target merely to make a build pass. It may
+check the overall `size`, `min`, and/or `max`, exact total solid/component counts,
+and the same bounding-box/solid-count facts for named components. A mismatch is
+a retryable generation failure, and secondary exports are withheld until the
+canonical STEP matches.
+
 ## Python source contract (advanced escape hatch)
 
-Pass a `.step` filename, a JSON parameter object, and Python source defining
-exactly one entry point:
+Pass a `.step` filename, a structured parameter object, request-derived
+`verification`, and Python source defining exactly one entry point:
 
 ```python
 from build123d import *
@@ -100,6 +123,9 @@ def gen_step():
 
 The tool injects `PARAMS` from the provided JSON. Never redefine it. `gen_step`
 takes no arguments and returns a build123d `Shape` or a labeled `Compound`.
+Advanced-model verification supports expected overall bounding-box `size`,
+`min`, and `max`, an absolute tolerance, and total solid count. Secondary
+exports are withheld if the generated STEP misses those targets.
 
 Keep the generator compact. Use small helper functions and loops for repeated
 features such as windows, holes, columns, fasteners, or floor elements instead
@@ -128,12 +154,14 @@ surfaces. Avoid tangential booleans; extend cutting tools beyond the target.
 Remember that build123d primitives are centered on some axes by default. Set
 `align=(Align.MIN, Align.MIN, Align.MIN)` when dimensions and positions are
 specified from a lower-corner datum; do not compensate later for an accidental
-centered origin.
+centered origin. Translate geometry with `Pos(x, y, z) * shape`. If a full
+`Location` is required, its position is one tuple: `Location((x, y, z))`.
+`Location(x, y, z)` and `Location(z=value)` are invalid build123d calls.
 
 ## Assemblies
 
-Keep every requested component as a separate labeled solid. Use `Location`,
-`Pos`, and `Rot` for placement and return a `Compound` with labeled children.
+Keep every requested component as a separate labeled solid. Prefer `Pos` and
+`Rot` for placement and return a `Compound` with labeled children.
 Do not fuse an assembly unless the user asks for one printable body.
 
 ```python

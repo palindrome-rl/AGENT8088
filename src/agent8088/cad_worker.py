@@ -29,9 +29,28 @@ _MAX_DESIGN_COMPONENTS = 256
 _MAX_DESIGN_PRIMITIVES = 2048
 _MAX_PLACEMENTS_PER_PRIMITIVE = 512
 _MAX_ABS_DIMENSION_MM = 1_000_000.0
+_MAX_GENERATOR_AST_NODES = 12_000
+_MAX_GENERATOR_PARAMETER_ITEMS = 10_000
+_MAX_GENERATOR_COLLECTION_ITEMS = 4_096
+_MAX_GENERATOR_RANGE_ITERATIONS = 4_096
+
+_DESIGN_FIELDS = {
+    "schema_version", "name", "units", "parameters", "components",
+    "verification", "interference_policy",
+}
+_COMPONENT_FIELDS = {"name", "add", "cut"}
+_PRIMITIVE_COMMON_FIELDS = {"type", "at", "rotate", "placements"}
+_PRIMITIVE_FIELDS = {
+    "box": {"size"},
+    "cylinder": {"radius", "height"},
+    "sphere": {"radius"},
+    "cone": {"radius1", "radius2", "height"},
+    "tube": {"outer_radius", "inner_radius", "height"},
+}
 
 
-def _expression_value(value: Any, parameters: dict[str, Any]) -> float:
+def _expression_value(value: Any, parameters: dict[str, Any],
+                      resolving: tuple[str, ...] = ()) -> float:
     """Resolve one finite number or a small arithmetic expression.
 
     Declarative CAD deliberately has no Python escape hatch. Expressions may
@@ -57,7 +76,12 @@ def _expression_value(value: Any, parameters: dict[str, Any]) -> float:
             if isinstance(node, ast.Name):
                 if node.id not in parameters:
                     raise ValueError(f"unknown CAD parameter: {node.id}")
-                return _expression_value(parameters[node.id], parameters)
+                if node.id in resolving:
+                    chain = " -> ".join((*resolving, node.id))
+                    raise ValueError(f"cyclic CAD parameter expression: {chain}")
+                return _expression_value(
+                    parameters[node.id], parameters, (*resolving, node.id)
+                )
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
                 operand = evaluate(node.operand)
                 return operand if isinstance(node.op, ast.UAdd) else -operand
@@ -106,6 +130,11 @@ def _primitive_shape(spec: dict[str, Any], parameters: dict[str, Any]):
         raise ValueError(
             f"unsupported declarative primitive {kind!r}; use one of "
             + ", ".join(sorted(_DESIGN_PRIMITIVES))
+        )
+    unknown = set(spec) - _PRIMITIVE_COMMON_FIELDS - _PRIMITIVE_FIELDS[kind]
+    if unknown:
+        raise ValueError(
+            f"{kind} primitive has unsupported field(s): {', '.join(sorted(unknown))}"
         )
     corner_align = (Align.MIN, Align.MIN, Align.MIN)
     axis_align = (Align.CENTER, Align.CENTER, Align.MIN)
@@ -175,6 +204,11 @@ def _expanded_primitives(spec: dict[str, Any], parameters: dict[str, Any]):
 
 def _build_design(design: dict[str, Any]):
     """Compile the bounded declarative schema to a labeled build123d assembly."""
+    unknown_design = set(design) - _DESIGN_FIELDS
+    if unknown_design:
+        raise ValueError(
+            "design has unsupported field(s): " + ", ".join(sorted(unknown_design))
+        )
     if int(design.get("schema_version", 1)) != 1:
         raise ValueError("unsupported CAD design schema_version; expected 1")
     if str(design.get("units", "mm")).lower() != "mm":
@@ -194,7 +228,7 @@ def _build_design(design: dict[str, Any]):
     for name, value in parameters.items():
         if not isinstance(name, str) or not name.isidentifier():
             raise ValueError(f"invalid CAD parameter name: {name!r}")
-        _expression_value(value, parameters)
+        _expression_value(value, parameters, (name,))
 
     components = design.get("components")
     if not isinstance(components, list) or not components:
@@ -203,11 +237,18 @@ def _build_design(design: dict[str, Any]):
         raise ValueError(f"design exceeds {_MAX_DESIGN_COMPONENTS} components")
     names: set[str] = set()
     built = []
+    component_metrics: dict[str, dict[str, Any]] = {}
     solid_names: list[str] = []
     primitive_count = 0
     for index, component in enumerate(components):
         if not isinstance(component, dict):
             raise TypeError(f"component {index} must be a JSON object")
+        unknown_component = set(component) - _COMPONENT_FIELDS
+        if unknown_component:
+            raise ValueError(
+                f"component {index} has unsupported field(s): "
+                + ", ".join(sorted(unknown_component))
+            )
         name = str(component.get("name") or "").strip()
         if not name or name in names:
             raise ValueError(f"component names must be non-empty and unique: {name!r}")
@@ -241,13 +282,161 @@ def _build_design(design: dict[str, Any]):
         shape.label = name
         built.append(shape)
         component_solids = list(shape.solids())
+        component_metrics[name] = {
+            "solid_count": len(component_solids),
+            "volume": sum(float(solid.volume) for solid in component_solids),
+            "bounding_box": _bbox(shape),
+        }
         solid_names.extend(
             name if len(component_solids) == 1 else f"{name}[{index}]"
             for index in range(len(component_solids))
         )
     assembly = built[0] if len(built) == 1 else Compound(children=built)
     assembly.label = str(design.get("name") or "assembly")
-    return assembly, parameters, names, solid_names, primitive_count
+    return (
+        assembly, parameters, names, solid_names, primitive_count,
+        component_metrics,
+    )
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _verify_geometry_expectations(
+        spec: Any, overall: dict[str, Any],
+        components: dict[str, dict[str, Any]], parameters: dict[str, Any],
+        *, component_checks: bool,
+) -> dict[str, Any]:
+    """Compare generated geometry with model-declared, request-derived checks."""
+    if spec is None:
+        return {
+            "provided": False,
+            "ok": True,
+            "checks": [],
+            "failures": [],
+            "note": "No request-specific dimensional checks were supplied.",
+        }
+    if not isinstance(spec, dict):
+        raise TypeError("design.verification must be a JSON object")
+    allowed = {
+        "tolerance", "overall_bounding_box", "solid_count",
+    }
+    if component_checks:
+        allowed.update({"component_count", "components"})
+    unknown = set(spec) - allowed
+    if unknown:
+        raise ValueError(
+            "design.verification has unsupported field(s): "
+            + ", ".join(sorted(unknown))
+        )
+    if not (set(spec) & {
+            "overall_bounding_box", "solid_count", "component_count", "components"}):
+        raise ValueError(
+            "design.verification must contain at least one geometry check"
+        )
+    tolerance = _expression_value(spec.get("tolerance", 0.05), parameters)
+    if tolerance <= 0:
+        raise ValueError("design.verification.tolerance must be greater than zero")
+
+    checks: list[dict[str, Any]] = []
+
+    def exact(name: str, expected: int, actual: int) -> None:
+        checks.append({
+            "name": name, "expected": expected, "actual": actual,
+            "ok": expected == actual,
+        })
+
+    def bbox(prefix: str, expected: Any, actual: dict[str, Any]) -> None:
+        if not isinstance(expected, dict):
+            raise TypeError(f"{prefix} must be a JSON object")
+        unknown_bbox = set(expected) - {"size", "min", "max"}
+        if unknown_bbox:
+            raise ValueError(
+                f"{prefix} has unsupported field(s): "
+                + ", ".join(sorted(unknown_bbox))
+            )
+        if not expected:
+            raise ValueError(f"{prefix} must contain size, min, or max")
+        for field in ("size", "min", "max"):
+            if field not in expected:
+                continue
+            wanted = list(_vector(expected[field], parameters, f"{prefix}.{field}"))
+            observed = [float(item) for item in actual[field]]
+            deltas = [abs(observed[i] - wanted[i]) for i in range(3)]
+            checks.append({
+                "name": f"{prefix}.{field}", "expected": wanted,
+                "actual": observed, "tolerance": tolerance,
+                "delta": deltas, "ok": all(delta <= tolerance for delta in deltas),
+            })
+
+    if "solid_count" in spec:
+        exact(
+            "solid_count", _positive_int(spec["solid_count"], "verification.solid_count"),
+            int(overall["solid_count"]),
+        )
+    if "component_count" in spec:
+        exact(
+            "component_count",
+            _positive_int(spec["component_count"], "verification.component_count"),
+            len(components),
+        )
+    if "overall_bounding_box" in spec:
+        bbox(
+            "overall_bounding_box", spec["overall_bounding_box"],
+            overall["bounding_box"],
+        )
+    component_specs = spec.get("components") or {}
+    if not isinstance(component_specs, dict):
+        raise TypeError("design.verification.components must be a JSON object")
+    for name, expected in component_specs.items():
+        if name not in components:
+            raise ValueError(f"verification references unknown component: {name!r}")
+        if not isinstance(expected, dict):
+            raise TypeError(f"verification for component {name!r} must be a JSON object")
+        unknown_component = set(expected) - {"solid_count", "bounding_box"}
+        if unknown_component:
+            raise ValueError(
+                f"verification for component {name!r} has unsupported field(s): "
+                + ", ".join(sorted(unknown_component))
+            )
+        if not expected:
+            raise ValueError(f"verification for component {name!r} is empty")
+        actual = components[name]
+        if "solid_count" in expected:
+            exact(
+                f"components.{name}.solid_count",
+                _positive_int(
+                    expected["solid_count"],
+                    f"verification.components.{name}.solid_count",
+                ),
+                int(actual["solid_count"]),
+            )
+        if "bounding_box" in expected:
+            bbox(
+                f"components.{name}.bounding_box",
+                expected["bounding_box"], actual["bounding_box"],
+            )
+    failures = [item for item in checks if not item["ok"]]
+    return {
+        "provided": True,
+        "ok": not failures,
+        "tolerance": tolerance,
+        "checks": checks,
+        "failures": failures,
+    }
+
+
+def _verify_design_expectations(
+        design: dict[str, Any], overall: dict[str, Any],
+        components: dict[str, dict[str, Any]], parameters: dict[str, Any],
+) -> dict[str, Any]:
+    return _verify_geometry_expectations(
+        design.get("verification"), overall, components, parameters,
+        component_checks=True,
+    )
 
 
 def _name_interferences(interference: dict[str, Any], solid_names: list[str]) -> None:
@@ -267,6 +456,11 @@ def _validate_generator_source(path: Path) -> None:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
         raise ValueError(f"generator syntax error: {exc}") from exc
+    nodes = list(ast.walk(tree))
+    if len(nodes) > _MAX_GENERATOR_AST_NODES:
+        raise ValueError(
+            f"generator exceeds the {_MAX_GENERATOR_AST_NODES}-node complexity bound"
+        )
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     generators = [node for node in functions if node.name == "gen_step"]
     if len(generators) != 1 or generators[0].args.args:
@@ -281,7 +475,18 @@ def _validate_generator_source(path: Path) -> None:
     ]
     if len(param_assignments) != 1:
         raise ValueError("generator parameters may not replace the injected PARAMS object")
-    for node in ast.walk(tree):
+    assignment = param_assignments[0]
+    try:
+        raw_params = ast.literal_eval(assignment.value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("injected PARAMS must be a literal JSON-compatible object") from exc
+    _validate_generator_parameters(raw_params)
+    for node in nodes:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
+                and not isinstance(node.value, bool):
+            numeric = float(node.value)
+            if not math.isfinite(numeric) or abs(numeric) > _MAX_ABS_DIMENSION_MM:
+                raise ValueError("generator numeric literal is outside the finite CAD bound")
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".", 1)[0] not in _ALLOWED_IMPORT_ROOTS:
@@ -309,8 +514,103 @@ def _validate_generator_source(path: Path) -> None:
             raise ValueError(f"generator I/O call is not allowed: {node.func.attr}()")
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _BLOCKED_CALLS:
             raise ValueError(f"generator call is not allowed: {node.func.id}()")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "range":
+            iterations = _bounded_range_iterations(node, raw_params)
+            if iterations > _MAX_GENERATOR_RANGE_ITERATIONS:
+                raise ValueError(
+                    "generator range exceeds the "
+                    f"{_MAX_GENERATOR_RANGE_ITERATIONS}-iteration bound"
+                )
         elif isinstance(node, (ast.AsyncFunctionDef, ast.Await, ast.While, ast.Yield, ast.YieldFrom)):
             raise ValueError("async, while-loop, and generator execution are not allowed in CAD source")
+
+
+def _validate_generator_parameters(parameters: Any) -> None:
+    """Bound JSON parameters before generated source can expand them."""
+    seen = 0
+
+    def visit(value: Any, depth: int) -> None:
+        nonlocal seen
+        seen += 1
+        if seen > _MAX_GENERATOR_PARAMETER_ITEMS:
+            raise ValueError(
+                f"generator parameters exceed {_MAX_GENERATOR_PARAMETER_ITEMS} values"
+            )
+        if depth > 16:
+            raise ValueError("generator parameters exceed the nesting-depth bound")
+        if value is None or isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if not math.isfinite(numeric) or abs(numeric) > _MAX_ABS_DIMENSION_MM:
+                raise ValueError("generator parameter is outside the finite CAD bound")
+            return
+        if isinstance(value, str):
+            if len(value) > 4096:
+                raise ValueError("generator parameter string is too long")
+            return
+        if isinstance(value, list):
+            if len(value) > _MAX_GENERATOR_COLLECTION_ITEMS:
+                raise ValueError(
+                    "generator parameter collection exceeds the "
+                    f"{_MAX_GENERATOR_COLLECTION_ITEMS}-item bound"
+                )
+            for item in value:
+                visit(item, depth + 1)
+            return
+        if isinstance(value, dict):
+            if len(value) > _MAX_GENERATOR_COLLECTION_ITEMS:
+                raise ValueError(
+                    "generator parameter object exceeds the "
+                    f"{_MAX_GENERATOR_COLLECTION_ITEMS}-item bound"
+                )
+            for key, item in value.items():
+                if not isinstance(key, str) or len(key) > 256:
+                    raise ValueError("generator parameter keys must be short strings")
+                visit(item, depth + 1)
+            return
+        raise TypeError(
+            f"generator parameter has unsupported type: {type(value).__name__}"
+        )
+
+    if not isinstance(parameters, dict):
+        raise TypeError("injected PARAMS must be a JSON object")
+    visit(parameters, 0)
+
+
+def _bounded_range_value(node: ast.AST, parameters: dict[str, Any]) -> int:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+            and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _bounded_range_value(node.operand, parameters)
+        return value if isinstance(node.op, ast.UAdd) else -value
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) \
+            and node.value.id == "PARAMS":
+        key = node.slice
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            value = parameters.get(key.value)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    raise ValueError(
+        "generator range bounds must be integer literals or integer PARAMS values"
+    )
+
+
+def _bounded_range_iterations(call: ast.Call, parameters: dict[str, Any]) -> int:
+    if call.keywords or not 1 <= len(call.args) <= 3:
+        raise ValueError("generator range() must use one to three positional bounds")
+    values = [_bounded_range_value(item, parameters) for item in call.args]
+    if len(values) == 1:
+        start, stop, step = 0, values[0], 1
+    elif len(values) == 2:
+        start, stop, step = values[0], values[1], 1
+    else:
+        start, stop, step = values
+    if step == 0:
+        raise ValueError("generator range() step cannot be zero")
+    return len(range(start, stop, step))
 
 
 def _load_shape(path: Path):
@@ -669,11 +969,21 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
 
     if action in {"generate", "generate_design", "validate"}:
         solid_names: list[str] = []
+        component_metrics: dict[str, dict[str, Any]] = {}
+        request_verification = {
+            "provided": False, "ok": True, "checks": [], "failures": [],
+            "note": "Not applicable to this workflow.",
+        }
         if action == "generate":
             from cadgen.generation import generate_step_targets
 
             source = Path(request["source"]).resolve()
             output = Path(request["output"]).resolve()
+            parameters = json.loads(
+                Path(request["params"]).resolve().read_text(encoding="utf-8")
+            )
+            if not isinstance(parameters, dict):
+                raise TypeError("CAD parameters must be a JSON object")
             _validate_generator_source(source)
             exit_code = generate_step_targets(
                 [f"{source}={output}"], force=True, verbose=False,
@@ -687,7 +997,10 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(design, dict):
                 raise TypeError("CAD design must be a JSON object")
             output = Path(request["output"]).resolve()
-            shape, parameters, component_names, solid_names, primitive_count = _build_design(design)
+            (
+                shape, parameters, component_names, solid_names, primitive_count,
+                component_metrics,
+            ) = _build_design(design)
             _write_shape(shape, output)
         else:
             output = Path(request["input"]).resolve()
@@ -701,8 +1014,24 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         interference = _assembly_interference(shape)
         if solid_names:
             _name_interferences(interference, solid_names)
+        if action == "generate_design":
+            request_verification = _verify_design_expectations(
+                design, result, component_metrics, parameters,
+            )
+        elif action == "generate":
+            request_verification = _verify_geometry_expectations(
+                request.get("verification"), result, {}, parameters,
+                component_checks=False,
+            )
 
-        if action in {"generate", "generate_design"}:
+        # Secondary formats are release artifacts, not debugging evidence. Do
+        # not publish them when the canonical STEP fails an assembly or
+        # request-specific check. Keep the STEP/report/preview for one bounded
+        # repair attempt.
+        generation_valid = (
+            not interference.get("interferences") and request_verification["ok"]
+        )
+        if action in {"generate", "generate_design"} and generation_valid:
             requested = [str(name) for name in (request.get("formats") or []) if name != "step"]
             mesh_outputs = [
                 (name, output.with_suffix("." + name))
@@ -726,6 +1055,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             "step": str(output),
             "preview": preview_text,
             "assembly_interference": interference,
+            "request_verification": request_verification,
             **result,
         }
         if action == "generate_design":
@@ -734,6 +1064,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             report_payload["primitive_count"] = primitive_count
             report_payload["parameters"] = parameters
             report_payload["solid_names"] = solid_names
+            report_payload["component_metrics"] = component_metrics
         _write_report(report, report_payload)
         if action in {"generate", "generate_design"} and interference.get("interferences"):
             pairs = interference["interferences"]
@@ -751,9 +1082,24 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
                 "report": str(report), "preview": preview_text,
                 "assembly_interference": interference, **result,
             }
+        if action in {"generate", "generate_design"} and not request_verification["ok"]:
+            summaries = []
+            for item in request_verification["failures"][:20]:
+                summaries.append(
+                    f"{item['name']} expected {item['expected']!r}, "
+                    f"got {item['actual']!r}"
+                )
+            return {
+                "ok": False, "error_code": "verification_mismatch", "retryable": True,
+                "error": "request-specific CAD verification failed: " + "; ".join(summaries),
+                "report": str(report), "preview": preview_text,
+                "request_verification": request_verification,
+                "assembly_interference": interference, **result,
+            }
         return {
             "ok": True, "report": str(report), "preview": preview_text,
             "assembly_interference": report_payload["assembly_interference"],
+            "request_verification": request_verification,
             **({
                 "component_names": sorted(component_names),
                 "component_count": len(component_names),
@@ -768,17 +1114,26 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     result: dict[str, Any]
+    action_hint = ""
     try:
         if len(args) != 1:
             raise ValueError("CAD worker requires one JSON request path")
         request = json.loads(Path(args[0]).read_text(encoding="utf-8"))
         if not isinstance(request, dict):
             raise TypeError("CAD request must be a JSON object")
+        action_hint = str(request.get("action") or "")
         result = _action(request)
     except Exception as exc:  # noqa: BLE001 - worker boundary returns structured failures
         message = str(exc)
         lower = message.lower()
-        if "syntax" in lower or "constructor arguments" in lower or "expression" in lower:
+        if "outside its authorized workspace" in lower:
+            code, retryable = "cad_runtime_error", False
+        elif (
+            action_hint in {"generate", "generate_design"}
+            and isinstance(exc, (TypeError, ValueError))
+        ) or any(marker in lower for marker in (
+            "syntax", "constructor arguments", "expression",
+        )):
             code, retryable = "invalid_design", True
         elif "validation" in lower or "topology" in lower or "solid" in lower:
             code, retryable = "invalid_geometry", True

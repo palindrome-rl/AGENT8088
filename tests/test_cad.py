@@ -163,6 +163,21 @@ def test_run_worker_timeout_is_plain_language(monkeypatch, tmp_path):
     assert result == {"ok": False, "error": "CAD operation timed out after 1s."}
 
 
+def test_invalid_build123d_location_failure_includes_exact_repair_syntax():
+    result = cad._worker_failure(
+        "CAD generation failed",
+        {
+            "error": "Invalid positional arguments: (0, 0, -1)",
+            "error_code": "invalid_design",
+            "retryable": True,
+        },
+    )
+
+    assert "Pos(x, y, z) * shape" in result
+    assert "Location((x, y, z))" in result
+    assert "Location(x, y, z)" in result
+
+
 def test_primitive_input_validation_never_needs_the_runtime(tmp_path):
     assert "Unknown shape" in cad.create_cad_part(tmp_path / "x.step", "torus", "10x5")
     assert "Supported output formats" in cad.create_cad_part(tmp_path / "x.docx", "box", "1x2x3")
@@ -193,6 +208,9 @@ def test_generate_requires_step_source_and_parameter_object(tmp_path):
     assert "non-empty" in cad.generate_cad_model(tmp_path / "x.step", "")
     assert "JSON object" in cad.generate_cad_model(tmp_path / "x.step", source, "[]")
     assert "Unsupported" in cad.generate_cad_model(tmp_path / "x.step", source, "{}", "dxf")
+    assert "verification must be a JSON object" in cad.generate_cad_model(
+        tmp_path / "x.step", source, verification="[]"
+    )
 
 
 def test_generate_writes_reproducible_inputs_and_requires_every_artifact(monkeypatch, tmp_path):
@@ -222,10 +240,13 @@ def test_generate_success_returns_complete_bundle(monkeypatch, tmp_path):
         return _ok_result()
 
     monkeypatch.setattr(cad, "_run_worker", complete)
+    obsolete = tmp_path / "model.design.json"
+    obsolete.write_text("stale declarative recipe")
     result = cad.generate_cad_model(tmp_path / "model.step", source)
     assert "Generated and verified model.step" in result
     assert "model.preview.png" in result
     assert "model.params.json" in result
+    assert not obsolete.exists()
 
 
 def test_declarative_design_requires_json_object(tmp_path):
@@ -250,11 +271,14 @@ def test_declarative_design_writes_inputs_and_requires_bundle(monkeypatch, tmp_p
 
     monkeypatch.setattr(cad, "_run_worker", complete)
     model = tmp_path / "model.step"
+    obsolete = model.with_suffix(".step.py")
+    obsolete.write_text("stale advanced recipe")
     result = cad.generate_cad_design(model, json.dumps(design), "step,stl")
     assert "Generated and verified model.step" in result
     assert json.loads(model.with_suffix(".design.json").read_text()) == design
     assert json.loads(model.with_suffix(".params.json").read_text()) == {"x": 5}
     assert "Named components: 1" in result
+    assert not obsolete.exists()
 
 
 def test_declarative_expression_language_is_bounded():
@@ -265,6 +289,69 @@ def test_declarative_expression_language_is_bounded():
     ):
         with pytest.raises(ValueError):
             cad_worker._expression_value(unsafe, params)
+
+
+def test_declarative_expression_reports_parameter_cycles():
+    with pytest.raises(ValueError, match="cyclic CAD parameter expression"):
+        cad_worker._expression_value("a", {"a": "b", "b": "a"}, ("root",))
+
+
+def test_design_verification_checks_request_dimensions_and_named_components():
+    result = {
+        "solid_count": 1,
+        "bounding_box": {"min": [0, 0, 0], "max": [80, 50, 8], "size": [80, 50, 8]},
+    }
+    components = {
+        "plate": {
+            "solid_count": 1, "volume": 30000,
+            "bounding_box": {
+                "min": [0, 0, 0], "max": [80, 50, 8], "size": [80, 50, 8],
+            },
+        },
+    }
+    design = {"verification": {
+        "tolerance": 0.01,
+        "overall_bounding_box": {"size": [80, 50, 8]},
+        "solid_count": 1, "component_count": 1,
+        "components": {"plate": {
+            "solid_count": 1, "bounding_box": {"max": [80, 50, 8]},
+        }},
+    }}
+    verification = cad_worker._verify_design_expectations(
+        design, result, components, {},
+    )
+    assert verification["provided"] is True
+    assert verification["ok"] is True
+    assert len(verification["checks"]) == 5
+
+
+def test_design_verification_returns_actionable_mismatch():
+    result = {
+        "solid_count": 1,
+        "bounding_box": {"min": [0, 0, 0], "max": [79, 50, 8], "size": [79, 50, 8]},
+    }
+    verification = cad_worker._verify_design_expectations(
+        {"verification": {
+            "tolerance": 0.05,
+            "overall_bounding_box": {"size": [80, 50, 8]},
+        }},
+        result, {}, {},
+    )
+    assert verification["ok"] is False
+    assert verification["failures"][0]["name"] == "overall_bounding_box.size"
+
+
+def test_design_verification_rejects_empty_or_unknown_checks():
+    overall = {
+        "solid_count": 1,
+        "bounding_box": {"min": [0, 0, 0], "max": [1, 1, 1], "size": [1, 1, 1]},
+    }
+    with pytest.raises(ValueError, match="at least one geometry check"):
+        cad_worker._verify_design_expectations({"verification": {}}, overall, {}, {})
+    with pytest.raises(ValueError, match="unsupported field"):
+        cad_worker._verify_design_expectations(
+            {"verification": {"overall_size": [1, 1, 1]}}, overall, {}, {},
+        )
 
 
 def test_declarative_design_cannot_disable_interference_validation():
@@ -299,6 +386,48 @@ def test_generator_guard_accepts_normal_build123d_source(tmp_path):
         encoding="utf-8",
     )
     cad_worker._validate_generator_source(source)
+
+
+def test_generator_guard_accepts_bounded_parameterized_loops(tmp_path):
+    source = tmp_path / "safe_loop.step.py"
+    source.write_text(
+        "PARAMS = {'count': 12}\n"
+        "from build123d import Box, Pos\n"
+        "def gen_step():\n"
+        "    parts = []\n"
+        "    for index in range(PARAMS['count']):\n"
+        "        parts.append(Pos(index * 2, 0, 0) * Box(1, 1, 1))\n"
+        "    return parts[0].fuse(*parts[1:])\n",
+        encoding="utf-8",
+    )
+    cad_worker._validate_generator_source(source)
+
+
+def test_generator_guard_rejects_unbounded_source_expansion(tmp_path):
+    source = tmp_path / "huge_loop.step.py"
+    source.write_text(
+        "PARAMS = {'count': 100000}\n"
+        "from build123d import Box\n"
+        "def gen_step():\n"
+        "    for index in range(PARAMS['count']):\n"
+        "        Box(1, 1, 1)\n"
+        "    return Box(1, 1, 1)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="iteration bound"):
+        cad_worker._validate_generator_source(source)
+
+
+def test_generator_guard_rejects_out_of_bounds_parameters(tmp_path):
+    source = tmp_path / "huge_parameter.step.py"
+    source.write_text(
+        "PARAMS = {'length': 1000001}\n"
+        "from build123d import Box\n"
+        "def gen_step():\n    return Box(PARAMS['length'], 1, 1)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="finite CAD bound"):
+        cad_worker._validate_generator_source(source)
 
 
 def test_generator_guard_rejects_file_process_dynamic_and_export_escape_hatches(tmp_path):

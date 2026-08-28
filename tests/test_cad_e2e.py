@@ -15,6 +15,191 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _response(content):
+    return type("R", (), {"choices": [type("C", (), {
+        "message": type("M", (), {"content": content})(),
+        "finish_reason": "stop",
+    })()]})()
+
+
+def _cad_tool_definitions(engine):
+    wanted = {"generate_cad_design", "generate_cad_model", "open_cad_viewer"}
+    return [
+        item for item in engine.build_tools_def(engine.TOOL_SPECS)
+        if item["function"]["name"] in wanted
+    ]
+
+
+def test_agent_loop_structured_design_to_viewer_handoff(engine, tmp_path, monkeypatch):
+    """The same outer JSON shape a model emits must reach the real CAD worker."""
+    model = tmp_path / "verified angle bracket.step"
+    design = {
+        "schema_version": 1,
+        "name": "verified_angle_bracket",
+        "units": "mm",
+        "parameters": {"base_x": 60, "base_y": 40, "base_z": 6, "wall_h": 30},
+        "components": [
+            {
+                "name": "base_plate",
+                "add": [{"type": "box", "size": ["base_x", "base_y", "base_z"]}],
+                "cut": [{
+                    "type": "cylinder", "radius": 3.25, "height": "base_z + 2",
+                    "at": [12, 10, -1], "placements": [[0, 0, 0], [36, 0, 0]],
+                }],
+            },
+            {
+                "name": "upright",
+                "add": [{
+                    "type": "box", "size": [6, "base_y", "wall_h"],
+                    "at": [27, 0, "base_z"],
+                }],
+            },
+        ],
+        "verification": {
+            "tolerance": 0.05,
+            "overall_bounding_box": {"size": [60, 40, 36], "min": [0, 0, 0]},
+            "solid_count": 2,
+            "component_count": 2,
+            "components": {
+                "base_plate": {
+                    "solid_count": 1,
+                    "bounding_box": {"size": [60, 40, 6]},
+                },
+                "upright": {
+                    "solid_count": 1,
+                    "bounding_box": {"size": [6, 40, 30], "min": [27, 0, 6]},
+                },
+            },
+        },
+    }
+    calls = []
+
+    def completion(messages, tools, **kwargs):
+        round_index = len(calls)
+        schema_names = {item["function"]["name"] for item in tools}
+        assert {"generate_cad_design", "generate_cad_model", "open_cad_viewer"} <= schema_names
+        if round_index == 0:
+            definition = next(
+                item for item in tools
+                if item["function"]["name"] == "generate_cad_design"
+            )
+            assert definition["function"]["parameters"]["properties"]["design"]["type"] == "object"
+            calls.append("generate_cad_design")
+            return _response(
+                "✿FUNCTION✿: generate_cad_design ✿ARGS✿: "
+                + json.dumps({
+                    "filename": str(model), "design": design, "formats": "step",
+                })
+            )
+        if round_index == 1:
+            assert "Generated and verified" in messages[-1]["content"]
+            calls.append("open_cad_viewer")
+            return _response(
+                "✿FUNCTION✿: open_cad_viewer ✿ARGS✿: "
+                + json.dumps({"filename": str(model), "open_browser": False})
+            )
+        assert "CAD Viewer ready" in messages[-1]["content"]
+        calls.append("final")
+        return _response("The bracket was generated, verified, and handed to the CAD Viewer.")
+
+    engine.PERMISSION_MODE = "full-auto"
+    engine.ALLOWED_PATHS = [tmp_path]
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    answer = engine.run_agent(
+        [{"role": "user", "content": "Create and preview a parametric CAD angle bracket"}],
+        max_turns=3,
+        system_prompt="base",
+        tools_def=_cad_tool_definitions(engine),
+        allowed_tools={"generate_cad_design", "generate_cad_model", "open_cad_viewer"},
+    )
+    assert calls == ["generate_cad_design", "open_cad_viewer", "final"]
+    assert "generated, verified" in answer
+    report = json.loads(model.with_suffix(".report.json").read_text(encoding="utf-8"))
+    assert report["request_verification"]["ok"] is True
+    assert report["assembly_interference"]["interferences"] == []
+    assert report["solid_count"] == 2
+    assert report["bounding_box"]["size"] == pytest.approx([60, 40, 36])
+    assert model.with_suffix(".preview.png").stat().st_size > 0
+
+
+def test_agent_loop_advanced_build123d_call_is_structured_and_verified(
+        engine, tmp_path, monkeypatch):
+    model = tmp_path / "filleted mounting plate.step"
+    source = """from build123d import Align, Axis, Box, Cylinder, Pos
+
+def gen_step():
+    body = Box(
+        PARAMS["length"], PARAMS["width"], PARAMS["height"],
+        align=(Align.MIN, Align.MIN, Align.MIN),
+    )
+    body = body.fillet(PARAMS["fillet"], body.edges().filter_by(Axis.Z))
+    for x in PARAMS["hole_x"]:
+        body = body - Pos(x, PARAMS["width"] / 2, -1) * Cylinder(
+            PARAMS["hole_radius"], PARAMS["height"] + 2,
+            align=(Align.CENTER, Align.CENTER, Align.MIN),
+        )
+    boss = Pos(PARAMS["length"] / 2, PARAMS["width"] / 2, PARAMS["height"]) * Cylinder(
+        PARAMS["boss_radius"], PARAMS["boss_height"],
+        align=(Align.CENTER, Align.CENTER, Align.MIN),
+    )
+    result = body + boss
+    result.label = "filleted_mounting_plate"
+    return result
+"""
+    parameters = {
+        "length": 80, "width": 50, "height": 8, "fillet": 2,
+        "hole_x": [15, 65], "hole_radius": 3.4,
+        "boss_radius": 10, "boss_height": 12,
+    }
+    verification = {
+        "tolerance": 0.05,
+        "overall_bounding_box": {"size": [80, 50, 20], "min": [0, 0, 0]},
+        "solid_count": 1,
+    }
+    calls = 0
+
+    def completion(messages, tools, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            definition = next(
+                item for item in tools
+                if item["function"]["name"] == "generate_cad_model"
+            )
+            required = definition["function"]["parameters"]["required"]
+            assert "verification" in required
+            assert definition["function"]["parameters"]["properties"]["parameters"]["type"] == "object"
+            return _response(
+                "✿FUNCTION✿: generate_cad_model ✿ARGS✿: "
+                + json.dumps({
+                    "filename": str(model), "source": source,
+                    "parameters": parameters, "verification": verification,
+                    "formats": "step",
+                })
+            )
+        assert "Request-specific checks" in messages[-1]["content"]
+        return _response("The advanced mounting plate passed its engineering checks.")
+
+    engine.PERMISSION_MODE = "full-auto"
+    engine.ALLOWED_PATHS = [tmp_path]
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    answer = engine.run_agent(
+        [{"role": "user", "content": "Generate a filleted build123d CAD mounting plate"}],
+        max_turns=2,
+        system_prompt="base",
+        tools_def=_cad_tool_definitions(engine),
+        allowed_tools={"generate_cad_design", "generate_cad_model", "open_cad_viewer"},
+    )
+    assert calls == 2
+    assert "passed" in answer
+    report = json.loads(model.with_suffix(".report.json").read_text(encoding="utf-8"))
+    assert report["request_verification"]["ok"] is True
+    assert report["validity"]["ok"] is True
+    assert report["solid_count"] == 1
+    assert report["bounding_box"]["size"] == pytest.approx([80, 50, 20])
+    assert model.with_suffix(".preview.png").stat().st_size > 0
+
+
 def test_parameterized_part_all_formats_and_preview_round_trip(tmp_path):
     output_dir = tmp_path / "CAD output with spaces"
     output_dir.mkdir()
@@ -52,7 +237,12 @@ def gen_step():
     return model
 """
     result = cad.generate_cad_model(
-        model, source, json.dumps(params), "step,stl,3mf,glb,brep", timeout=900
+        model, source, json.dumps(params), "step,stl,3mf,glb,brep", timeout=900,
+        verification=json.dumps({
+            "tolerance": 0.05,
+            "overall_bounding_box": {"size": [80, 50, 20]},
+            "solid_count": 1,
+        }),
     )
     assert "Generated and verified" in result, result
 
@@ -68,6 +258,8 @@ def gen_step():
     assert report["solid_count"] == 1
     assert report["volume"] > 0
     assert report["bounding_box"]["size"] == pytest.approx([80, 50, 20])
+    assert report["request_verification"]["ok"] is True
+    assert report["request_verification"]["provided"] is True
 
     inspection = cad.extract_info(model)
     assert "Geometry: valid" in inspection
@@ -177,6 +369,20 @@ def test_declarative_two_storey_house_round_trip(tmp_path):
     design = {
         "schema_version": 1, "name": "two_storey_house", "units": "mm",
         "parameters": p, "components": components,
+        "verification": {
+            "tolerance": 0.05,
+            "overall_bounding_box": {"size": [180, 138, 91]},
+            "component_count": 13,
+            "components": {
+                "roof": {
+                    "solid_count": 1,
+                    "bounding_box": {
+                        "size": [180, 132, 4],
+                        "min": [0, -12, 69],
+                    },
+                },
+            },
+        },
     }
     model = tmp_path / "two_storey_house.step"
     result = cad.generate_cad_design(model, json.dumps(design), "step,stl", timeout=900)
@@ -187,6 +393,8 @@ def test_declarative_two_storey_house_round_trip(tmp_path):
     assert report["validity"]["scope"] == "per-solid"
     assert report["assembly_interference"]["interferences"] == []
     assert report["component_count"] == 13
+    assert report["request_verification"]["ok"] is True
+    assert report["request_verification"]["provided"] is True
     assert report["solid_count"] >= 13
     assert report["bounding_box"]["size"][0] == pytest.approx(180)
     assert report["bounding_box"]["size"][1] == pytest.approx(138)
@@ -209,3 +417,26 @@ def test_declarative_design_refuses_overlapping_assembly_by_default(tmp_path):
     assert report["assembly_interference"]["interferences"][0]["volume"] == pytest.approx(500)
     assert report["assembly_interference"]["interferences"][0]["component_a"] == "a"
     assert report["assembly_interference"]["interferences"][0]["component_b"] == "b"
+
+
+def test_declarative_mismatch_withholds_secondary_exports(tmp_path):
+    design = {
+        "schema_version": 1, "units": "mm", "parameters": {},
+        "components": [
+            {"name": "body", "add": [{"type": "box", "size": [10, 20, 30]}]},
+        ],
+        "verification": {
+            "tolerance": 0.01,
+            "overall_bounding_box": {"size": [11, 20, 30]},
+            "solid_count": 1,
+            "component_count": 1,
+        },
+    }
+    model = tmp_path / "mismatch.step"
+    result = cad.generate_cad_design(model, json.dumps(design), "step,stl", timeout=300)
+    assert "verification_mismatch" in result
+    assert "overall_bounding_box.size" in result
+    assert model.is_file()
+    assert model.with_suffix(".report.json").is_file()
+    assert model.with_suffix(".preview.png").is_file()
+    assert not model.with_suffix(".stl").exists()

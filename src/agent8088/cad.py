@@ -36,6 +36,7 @@ from .documents import _readable_or_reason
 MAX_CAD_BYTES = 200 * 1024 * 1024
 MAX_GENERATOR_BYTES = 256 * 1024
 MAX_DESIGN_BYTES = 256 * 1024
+MAX_VERIFICATION_BYTES = 64 * 1024
 
 CADGEN_VERSION = "0.4.28"
 BUILD123D_VERSION = "0.11.1"
@@ -367,6 +368,16 @@ def _existing_artifact(path: Path, label: str) -> str | None:
     return None
 
 
+def _remove_obsolete_recipe(path: Path, suffix: str) -> str | None:
+    """Remove a recipe from the alternate generator after verified success."""
+    obsolete = path.with_suffix(suffix)
+    try:
+        obsolete.unlink(missing_ok=True)
+    except OSError as exc:
+        return f"could not remove obsolete recipe {obsolete.name}: {exc}"
+    return None
+
+
 def _format_metrics(data: dict[str, Any]) -> str:
     bbox = data.get("bounding_box") or {}
     size = bbox.get("size") or []
@@ -396,6 +407,11 @@ def _format_metrics(data: dict[str, Any]) -> str:
             lines.append(f"Assembly interference: {count} overlapping solid pair(s)")
     if data.get("component_count") is not None:
         lines.append(f"Named components: {int(data.get('component_count') or 0)}")
+    request_checks = data.get("request_verification") or {}
+    if request_checks.get("provided"):
+        checks = request_checks.get("checks") or []
+        passed = sum(1 for item in checks if item.get("ok"))
+        lines.append(f"Request-specific checks: {passed}/{len(checks)} passed")
     return "\n".join(lines)
 
 
@@ -404,10 +420,21 @@ def _worker_failure(prefix: str, result: dict[str, Any]) -> str:
     message = str(result.get("error") or "unknown CAD error")
     code = str(result.get("error_code") or "cad_runtime_error")
     retryable = bool(result.get("retryable"))
+    placement_hint = ""
+    if code == "invalid_design" and (
+            "Invalid positional arguments" in message
+            or "Unexpected keyword arguments" in message
+        ):
+        placement_hint = (
+            " For build123d placement, use Pos(x, y, z) * shape or "
+            "Location((x, y, z)); Location(x, y, z) and Location(z=...) "
+            "are not valid constructors."
+        )
     guidance = {
         "invalid_design": (
             "Correct the named field/expression only. Keep the same output filename and "
             "do not use execute_shell or generated file-writing code."
+            + placement_hint
         ),
         "invalid_geometry": (
             "Repair only the failing component or boolean. Avoid coincident/tangential "
@@ -416,6 +443,10 @@ def _worker_failure(prefix: str, result: dict[str, Any]) -> str:
         "assembly_interference": (
             "Move or resize only the reported solid pairs so their common volume is zero. "
             "Exact face contact is allowed; volumetric overlap is always rejected."
+        ),
+        "verification_mismatch": (
+            "Repair only the named dimension, placement, or component count. Keep the "
+            "declared target unchanged and retry once; unverified secondary exports were withheld."
         ),
         "runtime_timeout": (
             "Reduce primitive count or requested secondary formats, then retry once."
@@ -573,7 +604,8 @@ def create_cad_part(path, shape: str, dimensions: str, timeout: int = 300) -> st
 
 
 def generate_cad_model(path, source: str, parameters: str = "{}",
-                       formats: str = "step,stl", timeout: int = 600) -> str:
+                       formats: str = "step,stl", timeout: int = 600,
+                       verification: str | dict | None = None) -> str:
     """Generate a verified STEP-first model from constrained gen_step() source."""
     path = Path(path)
     if path.suffix.lower() not in (".step", ".stp"):
@@ -588,6 +620,24 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
         return f"CAD parameters must be a JSON object: {exc}"
     if not isinstance(params, dict):
         return "CAD parameters must be a JSON object."
+    if verification is None:
+        checks = None
+        encoded_checks = ""
+    elif isinstance(verification, dict):
+        checks = verification
+        encoded_checks = json.dumps(checks, ensure_ascii=False)
+    else:
+        if not isinstance(verification, str):
+            return "CAD verification must be a JSON object."
+        encoded_checks = verification or "{}"
+        try:
+            checks = json.loads(encoded_checks)
+        except json.JSONDecodeError as exc:
+            return f"CAD verification must be a JSON object: {exc}"
+    if checks is not None and not isinstance(checks, dict):
+        return "CAD verification must be a JSON object."
+    if len(encoded_checks.encode("utf-8")) > MAX_VERIFICATION_BYTES:
+        return f"CAD verification is too large (limit: {MAX_VERIFICATION_BYTES} bytes)."
 
     requested = []
     for item in (formats or "step").split(","):
@@ -619,7 +669,8 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
         "action": "generate", "source": str(source_path.resolve()),
         "output": str(path.resolve()), "params": str(params_path.resolve()),
         "report": str(report_path.resolve()), "preview": str(preview_path.resolve()),
-        "formats": requested, "workspace": str(path.parent.resolve()),
+        "formats": requested, "verification": checks,
+        "workspace": str(path.parent.resolve()),
     }, timeout=timeout)
     if not result.get("ok"):
         return _worker_failure("CAD generation failed", result)
@@ -631,6 +682,8 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
     failures = [problem for item in expected if (problem := _existing_artifact(item, item.name))]
     if failures:
         return "CAD generation failed verification: " + "; ".join(failures)
+    if problem := _remove_obsolete_recipe(path, ".design.json"):
+        return "CAD generation completed, but artifact cleanup failed: " + problem
 
     artifacts = "\n".join(f"  - {item}" for item in expected)
     return (
@@ -696,6 +749,8 @@ def generate_cad_design(path, design: str, formats: str = "step,stl",
     failures = [problem for item in expected if (problem := _existing_artifact(item, item.name))]
     if failures:
         return "CAD design generation failed verification: " + "; ".join(failures)
+    if problem := _remove_obsolete_recipe(path, ".step.py"):
+        return "CAD design generation completed, but artifact cleanup failed: " + problem
     artifacts = "\n".join(f"  - {item}" for item in expected)
     return (
         f"Generated and verified {path.name} from a declarative build123d design "
