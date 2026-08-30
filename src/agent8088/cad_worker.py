@@ -10,6 +10,15 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+# This script runs as `python -I cad_worker.py request.json` (see
+# cad.py:_run_worker) -- isolated mode does NOT add the script's own
+# directory to sys.path (verified empirically), so sibling first-party
+# modules need an explicit path entry before they can be imported. Untrusted
+# model-generated gen_step() source is unaffected -- it is still restricted
+# to _ALLOWED_IMPORT_ROOTS by _validate_generator_source below, regardless
+# of what this trusted worker script itself can import.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 RESULT_START = "AGENT8088_CAD_RESULT_START"
 RESULT_END = "AGENT8088_CAD_RESULT_END"
 
@@ -40,9 +49,12 @@ _DESIGN_FIELDS = {
 }
 _COMPONENT_FIELDS = {"name", "add", "cut"}
 _ASSEMBLY_FIELDS = {
-    "schema_version", "name", "units", "parameters", "occurrences",
+    "schema_version", "name", "units", "parameters", "components", "mates",
     "verification", "interference_policy",
 }
+_ASSEMBLY_COMPONENT_FIELDS = {"name", "input", "ports"}
+_ASSEMBLY_PORT_FIELDS = {"at", "axis"}
+_ASSEMBLY_MATE_FIELDS = {"type", "a", "b", "module", "teeth_a", "teeth_b"}
 _OCCURRENCE_FIELDS = {"name", "component", "input", "at", "rotate"}
 _PRIMITIVE_COMMON_FIELDS = {"type", "at", "rotate", "placements"}
 _PRIMITIVE_FIELDS = {
@@ -305,14 +317,28 @@ def _build_design(design: dict[str, Any]):
 
 
 def _build_project_assembly(spec: dict[str, Any], workspace: Path):
-    """Load verified component STEP files and apply bounded placements."""
+    """Load verified component STEP files and place them from declared mates.
+
+    Positions are computed here, from named ports on each component, never
+    from a model-supplied at/rotate vector -- see cad_mates.py. One component
+    (the first declared) is the placement root and keeps its as-built
+    location; every other component's position is derived by walking the
+    mate graph outward from the root via build123d's own RigidJoint (see
+    cad_mates.apply_mate). A mate edge that reaches an already-placed
+    component (a closed loop, e.g. three jaws and a scroll disc all mating
+    to one housing) is not used as a second placement constraint -- it is
+    left for the interference check to verify, matching this project's
+    explicit scope: one static valid configuration, not a kinematic solve.
+    """
+    import cad_mates
+
     unknown = set(spec) - _ASSEMBLY_FIELDS
     if unknown:
         raise ValueError(
             "assembly has unsupported field(s): " + ", ".join(sorted(unknown))
         )
-    if int(spec.get("schema_version", 1)) != 1:
-        raise ValueError("unsupported CAD assembly schema_version; expected 1")
+    if int(spec.get("schema_version", 1)) != 2:
+        raise ValueError("unsupported CAD assembly schema_version; expected 2")
     if str(spec.get("units", "mm")).lower() != "mm":
         raise ValueError("CAD project assemblies require millimetres")
     if str(spec.get("interference_policy", "error")).lower() != "error":
@@ -325,51 +351,150 @@ def _build_project_assembly(spec: dict[str, Any], workspace: Path):
             raise ValueError(f"invalid CAD parameter name: {name!r}")
         _expression_value(value, parameters, (name,))
 
-    occurrences = spec.get("occurrences")
-    if not isinstance(occurrences, list) or not occurrences:
-        raise ValueError("assembly.occurrences must be a non-empty array")
-    if len(occurrences) > 512:
-        raise ValueError("assembly exceeds 512 occurrences")
-    from build123d import Compound, Pos, Rot
+    components_spec = spec.get("components")
+    if not isinstance(components_spec, list) or not components_spec:
+        raise ValueError("assembly.components must be a non-empty array")
+    if len(components_spec) > 512:
+        raise ValueError("assembly exceeds 512 components")
+    mates_spec = spec.get("mates") or []
+    if not isinstance(mates_spec, list):
+        raise TypeError("assembly.mates must be an array")
 
-    built = []
+    shapes: dict[str, Any] = {}
+    local_ports: dict[str, dict[str, Any]] = {}
     names: set[str] = set()
-    component_metrics: dict[str, dict[str, Any]] = {}
-    solid_names: list[str] = []
-    for index, occurrence in enumerate(occurrences):
-        if not isinstance(occurrence, dict):
-            raise TypeError(f"assembly occurrence {index} must be a JSON object")
-        extra = set(occurrence) - _OCCURRENCE_FIELDS
+    order: list[str] = []
+    for index, component in enumerate(components_spec):
+        if not isinstance(component, dict):
+            raise TypeError(f"assembly component {index} must be a JSON object")
+        extra = set(component) - _ASSEMBLY_COMPONENT_FIELDS
         if extra:
             raise ValueError(
-                f"assembly occurrence {index} has unsupported field(s): "
+                f"assembly component {index} has unsupported field(s): "
                 + ", ".join(sorted(extra))
             )
-        name = str(occurrence.get("name") or "").strip()
+        name = str(component.get("name") or "").strip()
         if not name or name in names:
-            raise ValueError(f"assembly occurrence names must be non-empty and unique: {name!r}")
+            raise ValueError(f"assembly component names must be non-empty and unique: {name!r}")
         names.add(name)
-        raw_input = str(occurrence.get("input") or "").strip()
+        order.append(name)
+        raw_input = str(component.get("input") or "").strip()
         if not raw_input:
-            raise ValueError(f"assembly occurrence {name!r} has no component input")
+            raise ValueError(f"assembly component {name!r} has no input")
         input_path = (workspace / raw_input).resolve()
         try:
             input_path.relative_to(workspace)
         except ValueError as exc:
             raise ValueError(
-                f"assembly occurrence {name!r} input is outside its authorized workspace"
+                f"assembly component {name!r} input is outside its authorized workspace"
             ) from exc
         if input_path.suffix.lower() not in {".step", ".stp"} or not input_path.is_file():
-            raise ValueError(f"assembly occurrence {name!r} component STEP is missing")
+            raise ValueError(f"assembly component {name!r} STEP is missing")
         shape = _load_shape(input_path)
-        rotate = _vector(occurrence.get("rotate", [0, 0, 0]), parameters, "rotate")
-        at = _vector(occurrence.get("at", [0, 0, 0]), parameters, "at")
-        if any(rotate):
-            shape = Rot(*rotate) * shape
-        if any(at):
-            shape = Pos(*at) * shape
         shape.label = name
-        built.append(shape)
+        shapes[name] = shape
+
+        ports: dict[str, Any] = {}
+        raw_ports = component.get("ports") or {}
+        if not isinstance(raw_ports, dict):
+            raise TypeError(f"assembly component {name!r} ports must be a JSON object")
+        for port_name, port_spec in raw_ports.items():
+            if not isinstance(port_spec, dict):
+                raise TypeError(f"port {name}.{port_name} must be a JSON object")
+            port_extra = set(port_spec) - _ASSEMBLY_PORT_FIELDS
+            if port_extra:
+                raise ValueError(
+                    f"port {name}.{port_name} has unsupported field(s): "
+                    + ", ".join(sorted(port_extra))
+                )
+            at = _vector(port_spec.get("at", [0, 0, 0]), parameters, f"{name}.{port_name}.at")
+            axis = _vector(port_spec.get("axis", [0, 0, 1]), parameters, f"{name}.{port_name}.axis")
+            ports[port_name] = cad_mates.port_from_axis(at, axis)
+        local_ports[name] = ports
+
+    # Adjacency: for each mate, both endpoints get an entry naming the other
+    # side and which of the mate's "a"/"b" roles they played, so gear_mesh's
+    # teeth_a/teeth_b (defined relative to a/b, not to placement order) map
+    # onto whichever side turns out to be "fixed" vs "moving" during the walk.
+    adjacency: dict[str, list[dict[str, Any]]] = {name: [] for name in order}
+    for index, mate in enumerate(mates_spec):
+        if not isinstance(mate, dict):
+            raise TypeError(f"assembly mate {index} must be a JSON object")
+        extra = set(mate) - _ASSEMBLY_MATE_FIELDS
+        if extra:
+            raise ValueError(
+                f"assembly mate {index} has unsupported field(s): " + ", ".join(sorted(extra))
+            )
+        mate_type = str(mate.get("type") or "")
+        if mate_type not in cad_mates.MATE_TYPES:
+            raise ValueError(
+                f"assembly mate {index} has unknown type {mate_type!r}; "
+                f"expected one of {cad_mates.MATE_TYPES}"
+            )
+        a_ref, b_ref = str(mate.get("a") or ""), str(mate.get("b") or "")
+        if "." not in a_ref or "." not in b_ref:
+            raise ValueError(f"assembly mate {index} 'a'/'b' must be \"Component.port\"")
+        a_comp, a_port = a_ref.split(".", 1)
+        b_comp, b_port = b_ref.split(".", 1)
+        for comp in (a_comp, b_comp):
+            if comp not in names:
+                raise ValueError(f"assembly mate {index} references unknown component: {comp!r}")
+        if mate_type == "gear_mesh":
+            for field in ("module", "teeth_a", "teeth_b"):
+                if mate.get(field) is None:
+                    raise ValueError(f"assembly mate {index} (gear_mesh) requires {field!r}")
+        entry = {"mate": mate, "index": index}
+        adjacency[a_comp].append({**entry, "role": "a", "my_port": a_port,
+                                   "other": b_comp, "other_port": b_port})
+        adjacency[b_comp].append({**entry, "role": "b", "my_port": b_port,
+                                   "other": a_comp, "other_port": a_port})
+
+    root = order[0]
+    placed = {root}
+    used_mates: set[int] = set()
+    from collections import deque
+    queue = deque([root])
+    while queue:
+        current = queue.popleft()
+        for edge in adjacency.get(current, []):
+            if edge["index"] in used_mates or edge["other"] in placed:
+                continue
+            used_mates.add(edge["index"])
+            fixed_name, moving_name = current, edge["other"]
+            fixed_port_name, moving_port_name = edge["my_port"], edge["other_port"]
+            fixed_port = local_ports[fixed_name].get(fixed_port_name)
+            moving_port = local_ports[moving_name].get(moving_port_name)
+            if fixed_port is None:
+                raise ValueError(f"mate {edge['index']} references unknown port: {fixed_name}.{fixed_port_name}")
+            if moving_port is None:
+                raise ValueError(f"mate {edge['index']} references unknown port: {moving_name}.{moving_port_name}")
+            mate = edge["mate"]
+            kwargs: dict[str, Any] = {}
+            if mate["type"] == "gear_mesh":
+                teeth_fixed = mate["teeth_a"] if edge["role"] == "a" else mate["teeth_b"]
+                teeth_moving = mate["teeth_b"] if edge["role"] == "a" else mate["teeth_a"]
+                kwargs = {"module": mate["module"], "teeth_fixed": teeth_fixed, "teeth_moving": teeth_moving}
+            cad_mates.apply_mate(
+                mate["type"], shapes[fixed_name], fixed_port, shapes[moving_name], moving_port,
+                **kwargs,
+            )
+            placed.add(moving_name)
+            queue.append(moving_name)
+    unplaced = set(order) - placed
+    if unplaced:
+        raise ValueError(
+            "assembly has no mate path from the root component to: "
+            + ", ".join(sorted(unplaced))
+            + f" (root: {root!r})"
+        )
+
+    from build123d import Compound
+
+    built = [shapes[name] for name in order]
+    component_metrics: dict[str, dict[str, Any]] = {}
+    solid_names: list[str] = []
+    for name in order:
+        shape = shapes[name]
         solids = list(shape.solids())
         component_metrics[name] = {
             "solid_count": len(solids),
@@ -382,7 +507,8 @@ def _build_project_assembly(spec: dict[str, Any], workspace: Path):
         )
     assembly = built[0] if len(built) == 1 else Compound(children=built)
     assembly.label = str(spec.get("name") or "assembly")
-    return assembly, parameters, names, solid_names, component_metrics
+    exempted = cad_mates.exempted_pairs(mates_spec)
+    return assembly, parameters, names, solid_names, component_metrics, exempted
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -1135,6 +1261,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
     if action in {"generate", "generate_design", "assemble_project", "validate"}:
         solid_names: list[str] = []
         component_metrics: dict[str, dict[str, Any]] = {}
+        mate_exempted_pairs: set[frozenset[str]] = set()
         request_verification = {
             "provided": False, "ok": True, "checks": [], "failures": [],
             "note": "Not applicable to this workflow.",
@@ -1175,7 +1302,7 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             output = Path(request["output"]).resolve()
             (
                 shape, parameters, component_names, solid_names,
-                component_metrics,
+                component_metrics, mate_exempted_pairs,
             ) = _build_project_assembly(
                 assembly, Path(request["workspace"]).resolve()
             )
@@ -1192,7 +1319,9 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
         interference = _assembly_interference(shape)
         if solid_names:
             _name_interferences(interference, solid_names)
-        # Intended-contact exemption: design declarations and, for the
+        # Intended-contact exemption: design declarations, mate-derived pairs
+        # (assemble_project -- a declared press_fit/gear_mesh mate IS the
+        # contact declaration, see cad_mates.exempted_pairs) and, for the
         # generate path, caller-passed pairs (validated against the reopened
         # STEP's component labels) remove exactly those named pairs.
         if action == "generate_design":
@@ -1202,6 +1331,8 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
                 )
             except (TypeError, ValueError):
                 allowed_contact = set()
+        elif action == "assemble_project":
+            allowed_contact = mate_exempted_pairs
         else:
             allowed_contact = _parse_allowed_contact(
                 request.get("allowed_contact"), set()
