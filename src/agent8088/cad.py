@@ -415,6 +415,32 @@ def _format_metrics(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _parse_allowed_contact_arg(value) -> list:
+    """Normalize an allowed_contact argument into validated [a, b] pairs.
+
+    Accepts '' (none), a JSON string like [["A","B"], ...], or an
+    already-parsed list of pairs — the tool layer may hand either form over,
+    and rejecting the native-array form here cost a whole generation once.
+    Component names cannot be validated here (the worker knows the final
+    names); malformed input fails fast instead of reaching the worker."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"allowed_contact must be JSON pairs: {exc}") from exc
+    if not isinstance(value, list):
+        raise ValueError("allowed_contact must be an array of [a, b] pairs")
+    for entry in value:
+        if (not isinstance(entry, list) or len(entry) != 2
+                or not all(isinstance(name, str) and name for name in entry)):
+            raise ValueError("each allowed_contact entry must be [component_a, component_b]")
+    return value
+
+
 def _worker_failure(prefix: str, result: dict[str, Any]) -> str:
     """Return a stable, actionable CAD failure without leaking a traceback."""
     message = str(result.get("error") or "unknown CAD error")
@@ -442,7 +468,8 @@ def _worker_failure(prefix: str, result: dict[str, Any]) -> str:
         ),
         "assembly_interference": (
             "Move or resize only the reported solid pairs so their common volume is zero. "
-            "Exact face contact is allowed; volumetric overlap is always rejected."
+            "Exact face contact is allowed; volumetric overlap is always rejected unless "
+            "the pair is declared in allowed_contact."
         ),
         "verification_mismatch": (
             "Repair only the named dimension, placement, or component count. Keep the "
@@ -452,10 +479,46 @@ def _worker_failure(prefix: str, result: dict[str, Any]) -> str:
             "Reduce primitive count or requested secondary formats, then retry once."
         ),
     }.get(code, "Do not retry unchanged; report this runtime failure.")
-    return (
+    hint = _build123d_error_hint(message)
+    text = (
         f"{prefix}: [{code}] {message}\n"
         f"Retryable: {'yes' if retryable else 'no'}. {guidance}"
     )
+    if hint:
+        text += f"\n{hint}"
+    return text
+
+
+def _build123d_error_hint(message: str) -> str:
+    """One-line repair hint for common build123d mistakes, '' when none match.
+
+    These are the errors that otherwise cost a full re-think: the model sees
+    the raw exception and re-reasons from scratch instead of applying the
+    known fix. Each hint names the pattern, not the whole theory — the cad
+    skill's references carry the full diagnosis."""
+    text = str(message or "")
+    if "'Align' and" in text or "'Align' object" in text or (
+            "unsupported operand" in text and "Align" in text):
+        return ("Hint: align arithmetic is invalid — construct the primitive with "
+                "align=(Align.CENTER, ...), then place it with Pos(...) * shape. "
+                "Never add/subtract an Align enum.")
+    if "is_valid()" in text and "not callable" in text:
+        return ("Hint: Face.is_valid is a property — use `if not face.is_valid:` "
+                "without parentheses.")
+    if "BRep_API: command not done" in text:
+        return ("Hint: fillet/boolean rejected the geometry — reduce the radius, "
+                "filter to the exact intended edges, or extend the cutting tool "
+                "past both faces (see references/build123d-modeling.md).")
+    if "no attribute 'make_face'" in text:
+        return ("Hint: build the profile with `Plane(...) * Polygon(...)` and pass "
+                "it to extrude(); Polyline has no make_face.")
+    if "Null TopoDS_Shape" in text or "Null shape" in text:
+        return ("Hint: an earlier boolean produced an invalid intermediate — repair "
+                "the named feature's cut/fuse before this step.")
+    if "volume is 0" in text.lower() or "zero volume" in text.lower():
+        return ("Hint: a re-wrapped Solid measures zero — return the Solid directly "
+                "as a compound child instead of re-wrapping it.")
+    return ""
 
 
 def extract_info(path, max_bytes: int = MAX_CAD_BYTES):
@@ -605,7 +668,8 @@ def create_cad_part(path, shape: str, dimensions: str, timeout: int = 300) -> st
 
 def generate_cad_model(path, source: str, parameters: str = "{}",
                        formats: str = "step,stl", timeout: int = 600,
-                       verification: str | dict | None = None) -> str:
+                       verification: str | dict | None = None,
+                       allowed_contact="") -> str:
     """Generate a verified STEP-first model from constrained gen_step() source."""
     path = Path(path)
     if path.suffix.lower() not in (".step", ".stp"):
@@ -670,6 +734,7 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
         "output": str(path.resolve()), "params": str(params_path.resolve()),
         "report": str(report_path.resolve()), "preview": str(preview_path.resolve()),
         "formats": requested, "verification": checks,
+        "allowed_contact": _parse_allowed_contact_arg(allowed_contact),
         "workspace": str(path.parent.resolve()),
     }, timeout=timeout)
     if not result.get("ok"):

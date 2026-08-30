@@ -537,6 +537,12 @@ def set_provider_limit(provider: str, key: str, value: str) -> dict:
 # 0 disables. A single approval resets the count.
 DENIAL_BREAKER_THRESHOLD = int(APP_CONFIG.get("denial_breaker_threshold", "3"))
 
+# Failed CAD generation attempts tolerated in one turn before the generation
+# tools are withdrawn and the model must report. Complex assemblies need more
+# diagnosis-repair cycles than simple parts; the old hardcoded 2 stopped
+# legitimate work. 0 disables the cap (turn/max_turns still bound the run).
+CAD_MAX_GENERATION_ATTEMPTS = int(APP_CONFIG.get("cad_max_generation_attempts", "4"))
+
 # Unattended runs (cron / scheduled) have no operator to answer a prompt.
 #   deny     refuse the gated action and tell the model why (fail closed)
 #   approve  treat the gate as granted — the always-on floor still applies
@@ -1668,6 +1674,20 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
     return response
 
 
+def _is_unknown_param_error(exc: Exception) -> bool:
+    """Whether an API rejection looks like an unrecognized-request-field 400."""
+    text = str(exc)
+    status = getattr(exc, "status_code", None)
+    if status is not None and int(status) != 400:
+        return False
+    lowered = text.lower()
+    return ("unknown" in lowered or "unexpected" in lowered
+            or "unrecognized" in lowered or "unsupported" in lowered) and (
+        "reasoning_effort" in lowered or "extra_body" in lowered
+        or "argument" in lowered or "parameter" in lowered or "field" in lowered
+    )
+
+
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = ""):
@@ -1726,11 +1746,33 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     )
     if _native_tools_enabled(tools, provider_name):
         request_options["tools"] = tools
+    # Optional per-provider reasoning dial (provider.<name>.reasoning_effort).
+    # Some OpenAI-compatible layers accept reasoning_effort, others 400 on the
+    # unknown field — retry clean once on that specific rejection.
+    effort = ""
+    if provider_name:
+        effort = str((PROVIDERS.get(provider_name) or {}).get("reasoning_effort") or "").strip()
+    if effort:
+        request_options["extra_body"] = {"reasoning_effort": effort}
     _raise_if_interrupted(interrupt_check)
     if on_token is None:
-        return client.chat.completions.create(**request_options)
+        try:
+            return client.chat.completions.create(**request_options)
+        except Exception as exc:
+            if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
+                return client.chat.completions.create(**request_options)
+            raise
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
-    stream = client.chat.completions.create(**request_options, stream=True)
+    try:
+        stream = client.chat.completions.create(**request_options, stream=True)
+    except Exception as exc:
+        if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
+            return _create_completion(
+                client, messages, tools, max_tokens=max_tokens,
+                system_prompt=system_prompt, temperature=temperature,
+                on_token=on_token, interrupt_check=interrupt_check,
+                model_name=model_name, provider_name=provider_name)
+        raise
     collected, tool_chunks, finish_reason = [], {}, None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
     try:
@@ -7683,6 +7725,14 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
             "Pos(x, y, z) * shape; never call Location(x, y, z) or Location(z=...). "
             "Every generation call requires request-derived verification, which must never "
             "be weakened to make incorrect geometry pass.\n"
+            "- PLAN-THEN-EMIT for complex single parts: before your FIRST generation call "
+            "on a feature-heavy request, reply once in plain text (no tool call) with a "
+            "BUILD PLAN of at most 20 lines: named components, a parameter table, "
+            "allowed_contact pairs, datum/orientation convention, and expected bounding "
+            "box. Then, on the next turn, emit ONE complete generate_cad_model call "
+            "implementing exactly that plan — no further prose. Keep the generator "
+            "compact (helpers, loops, parameters); the plan carries the reasoning so "
+            "the code call stays small.\n"
         )
     elif "generate_cad_design" in available:
         routing = (
@@ -7772,6 +7822,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     forced_stop = False
     cad_failures = 0
     cad_generation_stopped = False
+    # Plan-then-emit gate: after the model has produced text (its BUILD PLAN)
+    # on a CAD turn, the next turn gets one nudge to convert the plan into the
+    # single generation call. Never blocks a turn that already calls a tool.
+    cad_plan_pending = False
     cad_decomposition_required = False
 
     # Fast path: a request for internal instructions/config is a policy refusal —
@@ -8000,8 +8054,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             answer = strip_tool_json(content)
 
+            # Plan-then-emit gate: on a CAD turn the model was asked for a BUILD
+            # PLAN first. When its text-only reply IS that plan, nudge once to
+            # emit the single generation call instead of returning the plan to
+            # the user. Bounded: one injection, then the answer flows normally.
+            if (cad_generation and not cad_plan_pending and not cad_decomposition_required
+                    and answer and len(answer.splitlines()) >= 3
+                    and round_allowed_tools & {"generate_cad_design",
+                                               "generate_cad_model"}):
+                cad_plan_pending = True
+                messages.append({"role": "user", "content":
+                    "Plan received — now emit the single generation call "
+                    "(generate_cad_model or generate_cad_design) implementing it. "
+                    "No more prose: one tool call, complete code, no narration."
+                })
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "cad_plan_ack"})
+                continue
+
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
-            # returning nothing (some models emit only chain-of-thought and stall).
             if not answer and empty_retries < 1 and not forcing and not unknown:
                 empty_retries += 1
                 if on_result:
@@ -8113,18 +8184,22 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 continue
             executed = True
             tool_outputs.append(result)
-            if name in {"generate_cad_design", "generate_cad_model"}:
+            if name in {"generate_cad_design", "generate_cad_model",
+                        "cad_project_add_component"}:
                 if result.startswith(("CAD generation failed", "CAD design generation failed")):
                     cad_failures += 1
-                    if cad_failures >= 2:
+                    if (CAD_MAX_GENERATION_ATTEMPTS > 0
+                            and cad_failures >= CAD_MAX_GENERATION_ATTEMPTS):
                         cad_generation_stopped = True
                         result += (
-                            "\nCAD retry budget exhausted after two failed generation attempts. "
-                            "Do not call another generation tool in this turn; report the latest "
-                            "specific failure and preserved artifacts."
+                            f"\nCAD retry budget exhausted after {cad_failures} failed "
+                            "generation attempts. Do not call another generation tool in "
+                            "this turn; report the latest specific failure and preserved "
+                            "artifacts."
                         )
                 else:
                     cad_failures = 0
+                    cad_plan_pending = False
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
                 # answered from it. An escalation is not a result — recording it
