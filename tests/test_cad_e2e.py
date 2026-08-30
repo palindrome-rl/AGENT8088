@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from agent8088 import cad
+from agent8088 import cad, cad_project
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AGENT8088_RUN_CAD_E2E") != "1",
@@ -28,6 +28,230 @@ def _cad_tool_definitions(engine):
         item for item in engine.build_tools_def(engine.TOOL_SPECS)
         if item["function"]["name"] in wanted
     ]
+
+
+def _cad_project_tool_definitions(engine):
+    wanted = {
+        "cad_project_create",
+        "cad_project_add_component",
+        "cad_project_finalize",
+        "cad_project_status",
+        "generate_cad_design",
+        "generate_cad_model",
+        "open_cad_viewer",
+    }
+    return [
+        item
+        for item in engine.build_tools_def(engine.TOOL_SPECS)
+        if item["function"]["name"] in wanted
+    ]
+
+
+def test_checkpointed_project_builds_components_and_reopens_final_step(tmp_path):
+    """Real OCC round trip for the bounded multi-response assembly workflow."""
+    manifest = tmp_path / "fixture" / "project.cadproject.json"
+    assert "Created staged CAD project" in cad_project.create(
+        manifest,
+        "fixture",
+        {},
+        {
+            "tolerance": 0.05,
+            "overall_bounding_box": {"size": [24, 10, 4], "min": [0, 0, 0]},
+            "solid_count": 2,
+            "component_count": 2,
+        },
+        "step,stl",
+    )
+    base_source = """from build123d import Align, Box
+
+def gen_step():
+    return Box(10, 10, 2, align=(Align.MIN, Align.MIN, Align.MIN))
+"""
+    post_source = """from build123d import Align, Box
+
+def gen_step():
+    return Box(4, 4, 4, align=(Align.MIN, Align.MIN, Align.MIN))
+"""
+    assert "Built and checkpointed" in cad_project.add_component(
+        manifest,
+        "Base",
+        base_source,
+        {},
+        {"solid_count": 1, "overall_bounding_box": {"size": [10, 10, 2]}},
+    )
+    assert "Built and checkpointed" in cad_project.add_component(
+        manifest,
+        "Post",
+        post_source,
+        {},
+        {"solid_count": 1, "overall_bounding_box": {"size": [4, 4, 4]}},
+    )
+    final = cad_project.finalize(
+        manifest,
+        {
+            "occurrences": [
+                {"name": "Base", "component": "Base"},
+                {"name": "Post", "component": "Post", "at": [20, 0, 0]},
+            ],
+            "verification": {
+                "tolerance": 0.05,
+                "overall_bounding_box": {"size": [24, 10, 4], "min": [0, 0, 0]},
+                "solid_count": 2,
+                "component_count": 2,
+            },
+        },
+        "step,stl",
+    )
+    assert "Finalized and verified" in final, final
+    model = manifest.parent / "fixture.step"
+    report = json.loads(model.with_suffix(".report.json").read_text())
+    assert report["request_verification"]["ok"] is True
+    assert report["assembly_interference"]["interferences"] == []
+    assert report["component_names"] == ["Base", "Post"]
+    assert report["solid_count"] == 2
+    assert report["bounding_box"]["size"] == pytest.approx([24, 10, 4])
+    assert model.with_suffix(".stl").stat().st_size > 0
+    assert model.with_suffix(".preview.png").stat().st_size > 0
+    assert "Validated fixture.step" in cad.validate_cad_model(model, render=False)
+
+
+def test_agent_loop_executes_real_checkpointed_project_one_stage_at_a_time(
+    engine, tmp_path, monkeypatch
+):
+    """Model-shaped calls traverse engine gates, OCC, finalization, and Viewer."""
+    manifest = tmp_path / "robot" / "project.cadproject.json"
+    model = manifest.parent / "robot.step"
+    final_checks = {
+        "tolerance": 0.05,
+        "overall_bounding_box": {"size": [24, 10, 4], "min": [0, 0, 0]},
+        "solid_count": 2,
+        "component_count": 2,
+    }
+    base_source = (
+        "from build123d import Align, Box\n\n"
+        "def gen_step():\n"
+        "    return Box(10, 10, 2, align=(Align.MIN, Align.MIN, Align.MIN))\n"
+    )
+    post_source = (
+        "from build123d import Align, Box\n\n"
+        "def gen_step():\n"
+        "    return Box(4, 4, 4, align=(Align.MIN, Align.MIN, Align.MIN))\n"
+    )
+    calls = []
+
+    def tool_call(name, arguments):
+        return _response(
+            f"✿FUNCTION✿: {name} ✿ARGS✿: " + json.dumps(arguments)
+        )
+
+    def completion(messages, tools, **kwargs):
+        names = {item["function"]["name"] for item in tools}
+        assert {
+            "cad_project_create",
+            "cad_project_add_component",
+            "cad_project_finalize",
+            "open_cad_viewer",
+        } <= names
+        stage = len(calls)
+        if stage == 0:
+            calls.append("create")
+            return tool_call(
+                "cad_project_create",
+                {
+                    "filename": str(manifest),
+                    "name": "robot",
+                    "parameters": {},
+                    "verification": final_checks,
+                    "formats": "step",
+                },
+            )
+        if stage == 1:
+            assert "Created staged CAD project" in messages[-1]["content"]
+            calls.append("base")
+            return tool_call(
+                "cad_project_add_component",
+                {
+                    "filename": str(manifest),
+                    "name": "Base",
+                    "source": base_source,
+                    "parameters": {},
+                    "verification": {
+                        "solid_count": 1,
+                        "overall_bounding_box": {"size": [10, 10, 2]},
+                    },
+                },
+            )
+        if stage == 2:
+            assert "Built and checkpointed" in messages[-1]["content"]
+            calls.append("post")
+            return tool_call(
+                "cad_project_add_component",
+                {
+                    "filename": str(manifest),
+                    "name": "Post",
+                    "source": post_source,
+                    "parameters": {},
+                    "verification": {
+                        "solid_count": 1,
+                        "overall_bounding_box": {"size": [4, 4, 4]},
+                    },
+                },
+            )
+        if stage == 3:
+            assert "Built and checkpointed" in messages[-1]["content"]
+            calls.append("finalize")
+            return tool_call(
+                "cad_project_finalize",
+                {
+                    "filename": str(manifest),
+                    "assembly": {
+                        "occurrences": [
+                            {"name": "Base", "component": "Base"},
+                            {
+                                "name": "Post",
+                                "component": "Post",
+                                "at": [20, 0, 0],
+                            },
+                        ],
+                        "verification": final_checks,
+                    },
+                    "formats": "step",
+                },
+            )
+        if stage == 4:
+            assert "Finalized and verified" in messages[-1]["content"]
+            calls.append("viewer")
+            return tool_call(
+                "open_cad_viewer",
+                {"filename": str(model), "open_browser": False},
+            )
+        assert "CAD Viewer ready" in messages[-1]["content"]
+        calls.append("final")
+        return _response("The staged robot fixture is generated and verified.")
+
+    engine.PERMISSION_MODE = "full-auto"
+    engine.ALLOWED_PATHS = [tmp_path]
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    answer = engine.run_agent(
+        [{"role": "user", "content": "Generate a complex robotic CAD assembly"}],
+        max_turns=6,
+        system_prompt="base",
+        tools_def=_cad_project_tool_definitions(engine),
+        allowed_tools={
+            "cad_project_create",
+            "cad_project_add_component",
+            "cad_project_finalize",
+            "cad_project_status",
+            "generate_cad_design",
+            "generate_cad_model",
+            "open_cad_viewer",
+        },
+    )
+    assert answer == "The staged robot fixture is generated and verified."
+    assert calls == ["create", "base", "post", "finalize", "viewer", "final"]
+    report = json.loads(model.with_suffix(".report.json").read_text())
+    assert report["request_verification"]["ok"] is True
+    assert report["solid_count"] == 2
 
 
 def test_agent_loop_structured_design_to_viewer_handoff(engine, tmp_path, monkeypatch):

@@ -49,6 +49,10 @@ is what the permission layer gates on — see
 | `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
 | `generate_cad_design` | `write_text` | `filename`, `design`, `formats` | prompt | Compile bounded declarative JSON to a validated STEP-first model and preview. |
 | `generate_cad_model` | `write_text` | `filename`, `source`, `parameters`, `formats` | prompt | Generate a parameterized STEP-first model, validate it, and render a preview. |
+| `cad_project_create` | `write_text` | `filename`, `name`, `parameters`, `verification`, `formats` | prompt | Start or safely resume a checkpointed complex-assembly project. |
+| `cad_project_add_component` | `write_text` | `filename`, `name`, `source`, `parameters`, `verification` | prompt | Generate, reopen, validate, and checkpoint exactly one component. |
+| `cad_project_finalize` | `write_text` | `filename`, `assembly`, `formats` | prompt | Assemble validated components from bounded placements and verify the result. |
+| `cad_project_status` | `read_text` | `filename` | ✅ | Read compact project progress without loading component source. |
 | `validate_cad_model` | `write_text` | `filename`, `render` | prompt | Reopen and validate a STEP model and optionally render an isometric preview. |
 | `open_cad_viewer` | `read_text` | `filename`, `open_browser` | âœ… | Open a supported artifact in the managed loopback text-to-cad Viewer. |
 
@@ -85,11 +89,19 @@ the artifact and reports its bounding box, solid count, volume, and topology
 validity rather than interpreting it as text.
 
 `create_cad_part` is the structured, no-code path for one box, cylinder, sphere,
-cone, or tube. `generate_cad_design` is preferred for complex parts and
-assemblies: it receives a native structured object and compiles a bounded,
+cone, or tube. `generate_cad_design` is preferred for individual parts: it
+receives a native structured object and compiles a bounded,
 type-checked schema with parameters, named components, placements, fusions,
 cuts, and request-derived dimensional checks. `generate_cad_model` remains the
-advanced Python escape hatch for build123d operations outside that exact schema.
+single-part Python escape hatch for build123d operations outside that exact schema.
+Multi-component, robotic, architectural, movable, and otherwise complex
+assemblies use `cad_project_create`, then exactly one
+`cad_project_add_component` per model response, followed by
+`cad_project_finalize`. Component STEP files and validation reports are
+checkpointed, so an output cutoff or failed part repairs only that part instead
+of discarding the whole design. Finalization accepts placements rather than
+generated source, reloads every verified component, and independently checks
+the completed assembly. `cad_project_status` makes interrupted work resumable.
 text-to-cad/cadgen supplies STEP-first generation/export, per-solid topology
 validation, and preview rendering in both workflows. Volumetric assembly
 overlap is rejected independently, while touching mating faces remain valid and
@@ -101,8 +113,11 @@ can repeat the reopen, topology, interference, and render checks later.
 
 During a CAD-generation turn, generic shell and file-writing tools are removed
 from the model-visible tool set. The agent receives the real artifacts location,
-uses a bare output filename, and gets at most two failed generation attempts.
-This avoids shell path guessing, repeated approval loops, and unbounded source
+uses a bare output filename, and executes only one project checkpoint operation
+per model response. If a response reaches the provider's output ceiling, its
+unusable partial source is discarded and the retry is routed to the staged
+project workflow without pretending the model supports a larger limit. This
+avoids shell path guessing, repeated approval loops, and unbounded source
 rewrites consuming the model's time or token budget.
 
 `open_cad_viewer` complements deterministic validation with interactive review
