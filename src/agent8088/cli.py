@@ -199,6 +199,7 @@ class _SubStatusLine:
 # Load the real Agent8088 engine
 # ---------------------------------------------------------------------------
 from agent8088 import engine as A
+from agent8088 import fusion
 from agent8088 import searxng_provision
 from agent8088.logging_setup import configure_logging
 
@@ -1976,6 +1977,8 @@ def cmd_help(_):
         ("/cli-anything [task]", "Use CLI-Anything to find, run, build, refine, test, or validate an application CLI"),
         ("/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs"),
         ("/audit [on|off]", "Verify each step against the real files after it runs"),
+        ("/fusion setup", "Pick a default fusion panel and judge once, interactively"),
+        ("/fusion <query>", "Ask the panel in parallel; a blind judge picks the best answer"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/paste [q]", "Analyze an image from the OS clipboard (Windows/macOS)"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
@@ -3283,6 +3286,211 @@ def cmd_audit(rest):
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
 
 
+def _fusion_panel_table(results):
+    t = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Provider", style="#237dd7")
+    t.add_column("Model", style="#237dd7")
+    t.add_column("Status")
+    for r in results:
+        status = "[green]ok[/green]" if r.error is None else f"[red]{r.error}[/red]"
+        t.add_row(r.member.provider, r.member.model, status)
+    return t
+
+
+def _parse_fusion_flags(rest):
+    """Pull optional leading `--panel <spec>` / `--judge <spec>` flags off a
+    /fusion command line. Either flag may appear, in either order, before the
+    question text. Returns (panel_specs_or_None, judge_spec_or_None, query)."""
+    panel_specs = None
+    judge_spec = None
+    while True:
+        stripped = rest.lstrip()
+        if stripped.startswith("--panel "):
+            value, _, rest = stripped[len("--panel "):].partition(" ")
+            panel_specs = [s for s in value.split(",") if s.strip()]
+        elif stripped.startswith("--judge "):
+            value, _, rest = stripped[len("--judge "):].partition(" ")
+            judge_spec = value
+        else:
+            rest = stripped
+            break
+    return panel_specs, judge_spec, rest.strip()
+
+
+def _fusion_available_providers():
+    """Provider names with a working API key, for the setup picker."""
+    return sorted(name for name, info in A.PROVIDERS.items() if A._provider_api_key(info))
+
+
+def _cmd_fusion_setup(_rest):
+    """Interactive one-time configuration: pick the fusion panel and judge
+    once, save to config.txt, and every plain `/fusion <question>` afterward
+    uses them — no flags needed."""
+    available = _fusion_available_providers()
+    if not available:
+        console.print("[red]no providers with a working API key are configured — "
+                       "set one up with /model first.[/red]")
+        return
+
+    current_max = str(A.APP_CONFIG.get("fusion_max_panel", "6"))
+    max_panel_input = _custom_prompt("Max panel size:", default=current_max)
+    try:
+        max_panel = max(1, int(max_panel_input))
+    except ValueError:
+        console.print(f"[yellow]'{max_panel_input}' isn't a number — keeping {current_max}.[/yellow]")
+        max_panel = max(1, int(current_max) if current_max.isdigit() else 6)
+
+    console.print(f"[dim]Providers with a working key: {', '.join(available)}[/dim]")
+    chosen = _multi_choice_prompt(
+        "Panel providers (check none to keep auto-discovering, up to the max above):",
+        available)
+    if len(chosen) > max_panel:
+        console.print(f"[yellow]picked {len(chosen)}, keeping only the first {max_panel} "
+                       f"(max panel size) — {', '.join(chosen[max_panel:])} dropped.[/yellow]")
+        chosen = chosen[:max_panel]
+
+    panel_specs = []
+    for provider in chosen:
+        models = _fetch_models_for_provider(provider)
+        default_model = A.PROVIDERS[provider].get("model", "")
+        if models:
+            choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
+            choice = _choice_prompt(f"Model for {provider}:", choices, choices[0])
+            model = default_model if choice.startswith("(default)") else choice
+        else:
+            model = _custom_prompt(f"Model for {provider}:", default=default_model)
+        panel_specs.append(f"{provider}:{model}" if model else provider)
+
+    judge_choices = ["(auto) session's current model"] + available
+    judge_choice = _choice_prompt("Judge:", judge_choices, judge_choices[0])
+    if judge_choice.startswith("(auto)"):
+        judge_provider, judge_model = "", ""
+    else:
+        judge_provider = judge_choice
+        models = _fetch_models_for_provider(judge_provider)
+        default_model = A.PROVIDERS[judge_provider].get("model", "")
+        if models:
+            choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
+            choice = _choice_prompt(f"Model for judge ({judge_provider}):", choices, choices[0])
+            judge_model = "" if choice.startswith("(default)") else choice
+        else:
+            judge_model = ""
+
+    values = {
+        "fusion_panel": ",".join(panel_specs),
+        "fusion_judge_provider": judge_provider,
+        "fusion_judge_model": judge_model,
+        "fusion_max_panel": max_panel,
+    }
+    A.update_simple_config(A.CONFIG_PATH, values)
+    A.APP_CONFIG.update({k: str(v) for k, v in values.items()})
+
+    if panel_specs:
+        console.print(f"[#237dd7]fusion panel set:[/#237dd7] {', '.join(panel_specs)}")
+    else:
+        console.print(f"[#237dd7]fusion panel:[/#237dd7] auto-discover, up to {max_panel} providers")
+    console.print(f"[#237dd7]fusion judge:[/#237dd7] "
+                   f"{judge_provider + ':' + judge_model if judge_provider else 'auto (session model)'}")
+    console.print("[dim]Saved. Plain /fusion <question> will use this now — "
+                   "no restart needed.[/dim]")
+
+
+def cmd_fusion(rest):
+    """Send one query to every model on the panel in parallel, then have a
+    blind judge pick the best answer. Read-only — makes no writes, so no
+    confirmation gate.
+
+    Run `/fusion setup` once to pick a default panel and judge interactively —
+    after that, plain `/fusion <question>` just uses them, no flags needed.
+    Optional flags before the question override the saved config for one call:
+      /fusion --panel gemini:gemini-3-pro,ollama-cloud:kimi-k3 --judge anthropic:claude-sonnet-4-6 <question>
+    """
+    if rest.strip().lower() == "setup":
+        _cmd_fusion_setup(rest)
+        return
+
+    panel_specs, judge_spec, query = _parse_fusion_flags(rest)
+    if not query:
+        console.print("[red]usage:[/red] /fusion <question>")
+        console.print("[dim]no panel set up yet? run [/dim][#237dd7]/fusion setup[/#237dd7]")
+        return
+
+    max_panel = int(A.APP_CONFIG.get("fusion_max_panel", "6"))
+    member_timeout_s = float(A.APP_CONFIG.get("fusion_member_timeout_s", "60.0"))
+    max_workers = int(A.APP_CONFIG.get("fusion_max_workers", "8"))
+    panel_max_tokens = int(A.APP_CONFIG.get("fusion_panel_max_tokens", "1200"))
+    judge_max_tokens = int(A.APP_CONFIG.get("fusion_judge_max_tokens", "500"))
+    judge_provider = str(A.APP_CONFIG.get("fusion_judge_provider", "")).strip() or None
+    judge_model = str(A.APP_CONFIG.get("fusion_judge_model", "")).strip() or None
+
+    if judge_spec:
+        judge_provider, _, judge_model = judge_spec.partition(":")
+        judge_provider = judge_provider.strip() or None
+        judge_model = judge_model.strip() or None
+
+    if not panel_specs:
+        configured_panel = str(A.APP_CONFIG.get("fusion_panel", "")).strip()
+        if configured_panel:
+            panel_specs = [s for s in configured_panel.split(",") if s.strip()]
+
+    if panel_specs:
+        try:
+            panel = fusion.build_explicit_panel(panel_specs)
+        except ValueError as exc:
+            console.print(f"[red]--panel error:[/red] {exc}")
+            return
+    else:
+        panel = fusion.discover_panel(max_panel_size=max_panel)
+
+    if not panel:
+        console.print("[red]no providers with a working API key are configured[/red]")
+        return
+
+    console.print(f"[dim]asking {len(panel)} models "
+                  f"({', '.join(f'{m.provider}:{m.model}' for m in panel)})...[/dim]")
+
+    with status_cm("running fusion..."):
+        result = fusion.run_fusion(
+            query,
+            panel=panel,
+            judge_provider=judge_provider,
+            judge_model=judge_model,
+            max_panel_size=max_panel,
+            member_timeout_s=member_timeout_s,
+            max_workers=max_workers,
+            max_tokens=panel_max_tokens,
+            judge_max_tokens=judge_max_tokens,
+        )
+
+    if result.winner_index is None:
+        console.print(f"[red]fusion failed:[/red] {result.judge_error}")
+        if result.results:
+            console.print(_fusion_panel_table(result.results))
+        return
+
+    console.print(_fusion_panel_table(result.results))
+
+    if not result.judge_parsed and result.judge_raw:
+        winner = result.results[result.winner_index]
+        console.print(f"[yellow]judge output could not be parsed — showing "
+                      f"{winner.member.provider}:{winner.member.model}'s answer instead[/yellow]")
+
+    console.print(Panel(Text(result.winner_answer), title="Fusion Answer",
+                         box=box.ROUNDED, border_style="#00C8FF"))
+
+    if result.judge_parsed or not result.judge_raw:
+        console.print(f"[dim]Verdict: {result.verdict}[/dim]")
+    else:
+        raw = result.judge_raw.strip()[:300]
+        console.print(f"[dim]judge output (unparsed): {raw}[/dim]")
+
+    footer = f"[dim]tokens: {result.total_input_tokens}/{result.total_output_tokens} in/out"
+    if result.total_cost_usd is not None:
+        footer += f" · est. cost: ${result.total_cost_usd:.4f}"
+    footer += "[/dim]"
+    console.print(footer)
+
+
 def _print_line(line, args):
     if getattr(args, "json", False):
         print(line)
@@ -4121,6 +4329,31 @@ def _choice_prompt(message, choices, default=""):
             print("Invalid choice.")
 
 
+def _multi_choice_prompt(message, choices, checked=()):
+    """Checkbox picker — space to toggle, enter to confirm. Falls back to a
+    numbered comma-separated prompt on a non-interactive terminal."""
+    try:
+        from InquirerPy import inquirer
+        from InquirerPy.base.control import Choice
+        options = [Choice(c, enabled=c in checked) for c in choices]
+        return inquirer.checkbox(message=message, choices=options,
+                                  instruction="(space to toggle, enter to confirm)").execute()
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        print(message)
+        for index, choice in enumerate(choices, 1):
+            marker = " (default)" if choice in checked else ""
+            print(f"  {index}. {choice}{marker}")
+        value = input("Numbers, comma-separated (blank = none): ").strip()
+        if not value:
+            return []
+        picked = []
+        for part in value.split(","):
+            part = part.strip()
+            if part.isdigit() and 1 <= int(part) <= len(choices):
+                picked.append(choices[int(part) - 1])
+        return picked
+
+
 def _configure_custom_models_endpoint():
     try:
         endpoint = _custom_prompt("OpenAI-compatible URL:")
@@ -4149,7 +4382,7 @@ COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,
-    "audit": cmd_audit,
+    "audit": cmd_audit, "fusion": cmd_fusion,
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
     "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,

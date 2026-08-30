@@ -114,6 +114,8 @@ sensitive-file floor still applies unconditionally.
 | `/reasoning` | Toggle reasoning display |
 | `/think` | Extended thinking mode |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
+| `/fusion setup` | Interactively pick a default panel and judge (checkbox pickers), saved to `config.txt` |
+| `/fusion <query>` | Ask the panel in parallel; a blind judge picks the best answer. `--panel p:m,...`/`--judge p:m` flags override the saved config for one call |
 
 ### Tools and execution
 

@@ -46,6 +46,19 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `max_completion_tokens` | Global output-token ceiling when the active model has no reviewed limit or provider override. |
 | `timeout_seconds` | Per-request timeout (default `120`). |
 
+### Fusion
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fusion_panel` | `""` | `provider:model,provider:model,...`; empty = auto-discover every provider with a working key. Overridden per-call by `/fusion --panel ...` |
+| `fusion_judge_provider` | `""` | Provider to use as judge; empty = the currently active provider |
+| `fusion_judge_model` | `""` | Model to use as judge; empty = the session's current model |
+| `fusion_max_panel` | `6` | Maximum number of models in the panel |
+| `fusion_member_timeout_s` | `60` | Per-panel-member timeout in seconds |
+| `fusion_max_workers` | `8` | Thread pool size for parallel panel calls |
+| `fusion_panel_max_tokens` | `1200` | Max completion tokens per panel member |
+| `fusion_judge_max_tokens` | `500` | Max completion tokens for the judge |
+
 Sampling: `frequency_penalty`, `presence_penalty` (temperature is a runtime
 setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 
