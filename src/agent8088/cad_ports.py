@@ -24,11 +24,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from build123d import Location
-
-from .cad_mates import Port
-
 WAREHOUSE_KINDS = ("warehouse.fastener", "warehouse.gear")
+
+# Ports are returned as plain {"at": (x,y,z), "axis": (x,y,z)} tuples, not
+# Location objects -- this is the only form that needs to survive a
+# round-trip through JSON (create() stores it in the manifest; finalize()
+# rebuilds real cad_mates.Port objects from these exact numbers via
+# cad_mates.port_from_axis). Building a Port here would just be discarded.
 
 
 def _fastener(params: dict[str, Any]):
@@ -45,7 +47,7 @@ def _fastener(params: dict[str, Any]):
     if not size or length is None:
         raise ValueError("warehouse.fastener requires 'size' and 'length' params")
     part = SocketHeadCapScrew(size=str(size), length=float(length))
-    ports = {"bearing_face": Port(Location((0, 0, 0)))}
+    ports = {"bearing_face": {"at": (0.0, 0.0, 0.0), "axis": (0.0, 0.0, 1.0)}}
     return part, ports
 
 
@@ -62,7 +64,7 @@ def _gear(params: dict[str, Any]):
         pressure_angle=float(params["pressure_angle"]),
         thickness=float(params["thickness"]),
     )
-    ports = {"bore": Port(Location((0, 0, 0)))}
+    ports = {"bore": {"at": (0.0, 0.0, 0.0), "axis": (0.0, 0.0, 1.0)}}
     return part, ports
 
 
@@ -72,12 +74,13 @@ _RESOLVERS = {
 }
 
 
-def resolve(kind: str, params: dict[str, Any]) -> tuple[Any, dict[str, Port]]:
-    """Build a warehouse-kind part and return (geometry, {port_name: Port}).
+def resolve(kind: str, params: dict[str, Any]) -> tuple[Any, dict[str, dict[str, tuple]]]:
+    """Build a warehouse-kind part and return (geometry, {port_name: {at, axis}}).
 
     Raises ValueError for an unknown kind or invalid/missing params -- the
-    caller (cad_project.create) reports this back plainly rather than
-    silently falling through to a custom/model-authored build."""
+    caller (cad_project.create, via a worker round trip) reports this back
+    plainly rather than silently falling through to a custom/model-authored
+    build."""
     resolver = _RESOLVERS.get(kind)
     if resolver is None:
         raise ValueError(f"unknown warehouse kind {kind!r}; expected one of {WAREHOUSE_KINDS}")

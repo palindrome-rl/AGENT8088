@@ -1258,6 +1258,29 @@ def _action(request: dict[str, Any]) -> dict[str, Any]:
             **_metrics(reopened, mesh=output.suffix.lower() == ".stl"),
         }
 
+    if action == "resolve_warehouse_part":
+        import cad_ports
+
+        kind = str(request.get("kind") or "")
+        params = request.get("warehouse_params") or {}
+        if not isinstance(params, dict):
+            raise TypeError("resolve_warehouse_part warehouse_params must be a JSON object")
+        part, ports = cad_ports.resolve(kind, params)
+        output = Path(request["output"]).resolve()
+        _write_shape(part, output)
+        _verify_export(output)
+        reopened = _load_shape(output)
+        result = _metrics(reopened)
+        if not result["validity"]["ok"]:
+            raise RuntimeError(
+                "warehouse part failed validation: " + ", ".join(result["validity"]["reasons"])
+            )
+        return {
+            "ok": True,
+            "ports": {name: {"at": list(p["at"]), "axis": list(p["axis"])} for name, p in ports.items()},
+            **result,
+        }
+
     if action in {"generate", "generate_design", "assemble_project", "validate"}:
         solid_names: list[str] = []
         component_metrics: dict[str, dict[str, Any]] = {}
