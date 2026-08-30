@@ -17,12 +17,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import cad
+from . import cad, cad_ports
 
 PROJECT_SUFFIX = ".cadproject.json"
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2
 MAX_PROJECT_COMPONENTS = 64
 MAX_PROJECT_OCCURRENCES = 512
+MAX_CUSTOM_REPAIR_ATTEMPTS = 3
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 
 
@@ -40,6 +41,23 @@ def _json_object(value: str | dict | None, label: str, *, default=None) -> dict:
         raise TypeError(f"{label} must be a JSON object")
     if not isinstance(payload, dict):
         raise TypeError(f"{label} must be a JSON object")
+    return payload
+
+
+def _json_array(value: str | list | None, label: str, *, default=None) -> list:
+    if value is None or value == "":
+        payload = [] if default is None else default
+    elif isinstance(value, list):
+        payload = value
+    elif isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label} must be a JSON array: {exc}") from exc
+    else:
+        raise TypeError(f"{label} must be a JSON array")
+    if not isinstance(payload, list):
+        raise TypeError(f"{label} must be a JSON array")
     return payload
 
 
@@ -112,23 +130,108 @@ def _load(path) -> tuple[Path, dict[str, Any]]:
         raise TypeError("project parameters must be an object")
     if not isinstance(payload.get("components"), dict):
         raise TypeError("project components must be an object")
+    if not isinstance(payload.get("parts"), dict):
+        raise TypeError("project parts must be an object")
+    if not isinstance(payload.get("mates"), list):
+        raise TypeError("project mates must be an array")
     return manifest, payload
+
+
+MATE_TYPES = ("coaxial", "face_to_face", "press_fit", "gear_mesh")
+
+
+def _parse_parts(parts_value, label: str) -> dict[str, dict[str, Any]]:
+    """Validate the declared part list into {name: {kind, description|params}}.
+
+    Structural validation only -- a warehouse part's params are checked for
+    real by cad.build_warehouse_component when it actually gets built a few
+    lines below; a custom part's geometry is checked by add_component later,
+    since there is nothing to check yet but a free-text description.
+    """
+    raw = _json_array(parts_value, label)
+    if not raw:
+        raise ValueError(f"{label} must be a non-empty array")
+    if len(raw) > MAX_PROJECT_COMPONENTS:
+        raise ValueError(f"{label} is limited to {MAX_PROJECT_COMPONENTS} parts")
+    parsed: dict[str, dict[str, Any]] = {}
+    for index, part in enumerate(raw):
+        if not isinstance(part, dict):
+            raise ValueError(f"{label}[{index}] must be an object")
+        part_name = _safe_name(part.get("name", ""), f"{label}[{index}] name")
+        if part_name in parsed:
+            raise ValueError(f"duplicate part name: {part_name!r}")
+        kind = str(part.get("kind") or "custom").strip()
+        if kind == "custom":
+            parsed[part_name] = {
+                "kind": "custom",
+                "description": str(part.get("description") or ""),
+            }
+        elif kind in cad_ports.WAREHOUSE_KINDS:
+            part_params = part.get("params")
+            if not isinstance(part_params, dict):
+                raise ValueError(f"part {part_name!r} ({kind}) requires a 'params' object")
+            parsed[part_name] = {"kind": kind, "params": part_params}
+        else:
+            raise ValueError(
+                f"part {part_name!r} has unknown kind {kind!r}; expected 'custom' or "
+                f"one of {cad_ports.WAREHOUSE_KINDS}"
+            )
+    return parsed
+
+
+def _parse_mates(mates_value, part_names: set[str], label: str) -> list[dict[str, Any]]:
+    raw = _json_array(mates_value, label, default=[])
+    if len(raw) > MAX_PROJECT_OCCURRENCES:
+        raise ValueError(f"{label} is limited to {MAX_PROJECT_OCCURRENCES} mates")
+    parsed: list[dict[str, Any]] = []
+    for index, mate in enumerate(raw):
+        if not isinstance(mate, dict):
+            raise ValueError(f"{label}[{index}] must be an object")
+        mate_type = str(mate.get("type") or "")
+        if mate_type not in MATE_TYPES:
+            raise ValueError(
+                f"{label}[{index}] has unknown type {mate_type!r}; expected one of {MATE_TYPES}"
+            )
+        a_ref, b_ref = str(mate.get("a") or ""), str(mate.get("b") or "")
+        if "." not in a_ref or "." not in b_ref:
+            raise ValueError(f"{label}[{index}] 'a'/'b' must be \"PartName.port\"")
+        for ref in (a_ref, b_ref):
+            comp = ref.split(".", 1)[0]
+            if comp not in part_names:
+                raise ValueError(f"{label}[{index}] references unknown part: {comp!r}")
+        entry = {"type": mate_type, "a": a_ref, "b": b_ref}
+        if mate_type == "gear_mesh":
+            for field in ("module", "teeth_a", "teeth_b"):
+                if mate.get(field) is None:
+                    raise ValueError(f"{label}[{index}] (gear_mesh) requires {field!r}")
+                entry[field] = mate[field]
+        parsed.append(entry)
+    return parsed
 
 
 def create(
     path,
     name: str,
+    parts: str | list,
+    mates: str | list = "[]",
     parameters: str | dict = "{}",
     verification: str | dict | None = None,
     formats: str = "step,stl",
 ) -> str:
-    """Create an idempotent project manifest without overwriting prior work."""
+    """Create an idempotent project manifest declaring the FULL assembly up
+    front -- every part and every inter-part connection -- rather than
+    discovering it one cad_project_add_component call at a time. A part
+    declared with a warehouse.* kind is built here immediately, deterministically,
+    with no model round trip; only kind: "custom" parts need a later
+    cad_project_add_component call."""
     try:
         manifest = _manifest_path(path)
         project_name = _safe_name(name, "project name")
         params = _json_object(parameters, "project parameters")
         checks = _json_object(verification, "project verification", default={})
         requested = _formats(formats, default="step,stl")
+        parsed_parts = _parse_parts(parts, "parts")
+        parsed_mates = _parse_mates(mates, set(parsed_parts), "mates")
     except (TypeError, ValueError) as exc:
         return f"CAD project creation failed: {exc}."
     encoded = json.dumps({"parameters": params, "verification": checks})
@@ -148,6 +251,8 @@ def create(
             existing.get("parameters") != params
             or existing.get("verification") != checks
             or existing.get("formats") != requested
+            or existing.get("parts") != parsed_parts
+            or existing.get("mates") != parsed_mates
         ):
             return (
                 "CAD project creation failed: this manifest already contains a "
@@ -163,16 +268,57 @@ def create(
         "parameters": params,
         "verification": checks,
         "formats": requested,
+        "parts": parsed_parts,
+        "mates": parsed_mates,
         "components": {},
         "assembly": None,
     }
-    _atomic_json(manifest, payload)
     (manifest.parent / "components").mkdir(parents=True, exist_ok=True)
-    return (
-        f"Created staged CAD project {project_name!r} at {manifest}.\n"
-        "Components: 0 built. Call cad_project_add_component for exactly one "
-        "component, then wait for its validation result."
+
+    prebuilt: list[str] = []
+    failed: list[str] = []
+    for part_name, part in parsed_parts.items():
+        if part["kind"] == "custom":
+            continue
+        output = manifest.parent / "components" / f"{part_name}.step"
+        result = cad.build_warehouse_component(output, part["kind"], part["params"])
+        if not result.get("ok"):
+            failed.append(f"{part_name}: {result.get('error')}")
+            continue
+        payload["components"][part_name] = {
+            "status": "built",
+            "kind": part["kind"],
+            "step": output.relative_to(manifest.parent).as_posix(),
+            "ports": result.get("ports") or {},
+        }
+        prebuilt.append(part_name)
+
+    _atomic_json(manifest, payload)
+
+    if failed:
+        return (
+            "CAD project creation failed while auto-building warehouse part(s):\n"
+            + "\n".join(f"  - {item}" for item in failed)
+            + "\nFix the failing part's params and call cad_project_create again "
+            "with the same manifest filename and an unchanged specification "
+            "otherwise, or correct just the failing part(s)."
+        )
+
+    custom_remaining = sorted(
+        n for n, p in parsed_parts.items() if p["kind"] == "custom"
     )
+    lines = [f"Created staged CAD project {project_name!r} at {manifest}."]
+    if prebuilt:
+        lines.append(f"Auto-built {len(prebuilt)} warehouse part(s) with zero model "
+                      f"turns: {', '.join(sorted(prebuilt))}.")
+    if custom_remaining:
+        lines.append(
+            f"{len(custom_remaining)} custom part(s) still need "
+            f"cad_project_add_component: {', '.join(custom_remaining)}."
+        )
+    else:
+        lines.append("All parts are built. Call cad_project_finalize.")
+    return "\n".join(lines)
 
 
 def status(path) -> str:
@@ -203,33 +349,65 @@ def add_component(
     source: str,
     parameters: str | dict = "{}",
     verification: str | dict | None = None,
+    ports: str | dict | None = None,
     timeout: int = 600,
 ) -> str:
-    """Build, validate, and checkpoint one constrained build123d component."""
+    """Build, validate, and checkpoint one constrained build123d component.
+
+    Only for parts declared kind: "custom" at cad_project_create -- a
+    warehouse.* part is already built, with zero model turns, by create()
+    itself. Bounded to MAX_CUSTOM_REPAIR_ATTEMPTS real build attempts per
+    component name; once exhausted, further calls are refused rather than
+    letting a stuck component consume an unbounded number of turns."""
     try:
         manifest, project = _load(path)
         component_name = _safe_name(name, "component name")
         local_params = _json_object(parameters, "component parameters")
         checks = _json_object(verification, "component verification")
+        port_specs = _json_object(ports, "component ports", default={})
     except (TypeError, ValueError) as exc:
         return f"CAD project component failed: {exc}."
     if not checks:
         return "CAD project component failed: verification must contain at least one check."
     if not isinstance(source, str) or not source.strip():
         return "CAD project component failed: source must define a non-empty gen_step() function."
+    part = project["parts"].get(component_name)
+    if part is None:
+        return (
+            f"CAD project component failed: {component_name!r} was not declared in "
+            "cad_project_create's parts list."
+        )
+    if part.get("kind") != "custom":
+        return (
+            f"CAD project component failed: {component_name!r} is a {part.get('kind')!r} "
+            "part -- it was already built by cad_project_create, not add_component."
+        )
+    for port_name, port_spec in port_specs.items():
+        if not isinstance(port_spec, dict) or "at" not in port_spec:
+            return (
+                f"CAD project component failed: port {component_name}.{port_name!r} "
+                "must be an object with at least an 'at': [x,y,z] field."
+            )
+
     components = project["components"]
-    if component_name not in components and len(components) >= MAX_PROJECT_COMPONENTS:
-        return f"CAD project component failed: projects are limited to {MAX_PROJECT_COMPONENTS} components."
+    existing = components.get(component_name) or {}
+    attempts = int(existing.get("attempts") or 0)
+    if existing.get("status") != "built" and attempts >= MAX_CUSTOM_REPAIR_ATTEMPTS:
+        return (
+            f"CAD project component failed: {component_name!r} has used its "
+            f"{MAX_CUSTOM_REPAIR_ATTEMPTS}-attempt repair budget without validating. "
+            "Rework the approach for this component rather than retrying the same one, "
+            "or ask for the budget to be raised if the design genuinely needs it."
+        )
 
     merged_params = dict(project["parameters"])
     merged_params.update(local_params)
     digest_payload = json.dumps(
-        {"source": source, "parameters": merged_params, "verification": checks},
+        {"source": source, "parameters": merged_params, "verification": checks, "ports": port_specs},
         sort_keys=True,
         ensure_ascii=False,
     )
     digest = hashlib.sha256(digest_payload.encode("utf-8")).hexdigest()
-    existing = components.get(component_name) or {}
     output = manifest.parent / "components" / f"{component_name}.step"
     report = output.with_suffix(".report.json")
     if (
@@ -254,6 +432,7 @@ def add_component(
     success = result.startswith("Generated and verified ")
     components[component_name] = {
         "status": "built" if success else "failed",
+        "kind": "custom",
         "digest": digest,
         "step": output.relative_to(manifest.parent).as_posix(),
         "source": output.with_suffix(".step.py")
@@ -262,15 +441,19 @@ def add_component(
         "report": report.relative_to(manifest.parent).as_posix(),
         "parameters": local_params,
         "verification": checks,
+        "ports": port_specs,
+        "attempts": attempts + 1,
     }
     if not success:
         components[component_name]["last_error"] = result[:1500]
     project["assembly"] = None
     _atomic_json(manifest, project)
     if not success:
+        remaining = MAX_CUSTOM_REPAIR_ATTEMPTS - (attempts + 1)
         return (
-            f"CAD project component {component_name!r} did not validate. Repair only "
-            "this component and call cad_project_add_component with the same name.\n"
+            f"CAD project component {component_name!r} did not validate "
+            f"({remaining} repair attempt(s) left). Repair only this component and "
+            "call cad_project_add_component with the same name.\n"
             + result
         )
     try:
@@ -279,72 +462,58 @@ def add_component(
     except (OSError, json.JSONDecodeError, TypeError):
         metrics = "Component artifact and report were created."
     ready = sum(1 for item in components.values() if item.get("status") == "built")
+    total = len(project["parts"])
     return (
         f"Built and checkpointed CAD component {component_name!r}.\n{metrics}\n"
-        f"Progress: {ready} component(s) ready. Add the next component with one "
-        "tool call, or finalize the assembly."
+        f"Progress: {ready}/{total} part(s) ready. Add the next custom component "
+        "with one tool call, or finalize the assembly if all parts are built."
     )
 
 
-def finalize(path, assembly: str | dict, formats: str = "", timeout: int = 900) -> str:
-    """Assemble verified component STEP files from a bounded placement object."""
+def finalize(path, verification: str | dict | None = None, formats: str = "",
+             timeout: int = 900) -> str:
+    """Assemble every declared part from its mates -- no placement argument.
+
+    Unlike the old occurrence-based finalize, this needs nothing from the
+    model beyond an optional final verification override: every part and
+    every mate was already declared at cad_project_create, so positions are
+    computed here from that same declaration, not authored again."""
     try:
         manifest, project = _load(path)
-        spec = _json_object(assembly, "assembly")
+        checks = _json_object(verification, "assembly verification", default=None)
         requested = _formats(formats or ",".join(project.get("formats") or ["step"]))
     except (TypeError, ValueError) as exc:
         return f"CAD project finalization failed: {exc}."
-    occurrences = spec.get("occurrences")
-    if not isinstance(occurrences, list) or not occurrences:
-        return "CAD project finalization failed: assembly.occurrences must be a non-empty array."
-    if len(occurrences) > MAX_PROJECT_OCCURRENCES:
-        return f"CAD project finalization failed: assembly is limited to {MAX_PROJECT_OCCURRENCES} occurrences."
 
+    parts = project["parts"]
     components = project["components"]
-    expanded = []
-    seen: set[str] = set()
-    for index, occurrence in enumerate(occurrences):
-        if not isinstance(occurrence, dict):
-            return f"CAD project finalization failed: occurrence {index} must be an object."
-        unknown = set(occurrence) - {"name", "component", "at", "rotate"}
-        if unknown:
-            return (
-                f"CAD project finalization failed: occurrence {index} has unsupported fields: "
-                + ", ".join(sorted(unknown))
-                + "."
-            )
-        try:
-            occurrence_name = _safe_name(occurrence.get("name", ""), "occurrence name")
-            component_name = _safe_name(
-                occurrence.get("component", ""), "occurrence component"
-            )
-        except ValueError as exc:
-            return f"CAD project finalization failed: {exc}."
-        if occurrence_name in seen:
-            return f"CAD project finalization failed: duplicate occurrence name {occurrence_name!r}."
-        seen.add(occurrence_name)
-        component = components.get(component_name)
-        if not component or component.get("status") != "built":
-            return f"CAD project finalization failed: component {component_name!r} is not built and verified."
-        expanded.append(
-            {
-                "name": occurrence_name,
-                "component": component_name,
-                "input": component["step"],
-                "at": occurrence.get("at", [0, 0, 0]),
-                "rotate": occurrence.get("rotate", [0, 0, 0]),
-            }
+    unbuilt = [name for name in parts if components.get(name, {}).get("status") != "built"]
+    if unbuilt:
+        return (
+            "CAD project finalization failed: these parts are not built yet: "
+            + ", ".join(sorted(unbuilt))
+            + ". Call cad_project_add_component for each custom one first."
         )
 
-    checks = spec.get("verification") or project.get("verification")
-    if not isinstance(checks, dict) or not checks:
-        return "CAD project finalization failed: assembly verification must contain geometry checks."
+    expanded_components = []
+    for part_name in parts:
+        component = components[part_name]
+        expanded_components.append({
+            "name": part_name,
+            "input": component["step"],
+            "ports": component.get("ports") or {},
+        })
+
+    checks = checks if checks else (project.get("verification") or None)
+    if not checks:
+        return "CAD project finalization failed: no verification checks are available."
     expanded_spec = {
-        "schema_version": 1,
+        "schema_version": 2,
         "name": project["name"],
         "units": "mm",
         "parameters": project["parameters"],
-        "occurrences": expanded,
+        "components": expanded_components,
+        "mates": project["mates"],
         "verification": checks,
         "interference_policy": "error",
     }
@@ -396,7 +565,7 @@ def finalize(path, assembly: str | dict, formats: str = "", timeout: int = 900) 
         "spec": assembly_path.relative_to(root).as_posix(),
         "report": report_path.relative_to(root).as_posix(),
         "preview": preview_path.relative_to(root).as_posix(),
-        "occurrence_count": len(expanded),
+        "component_count": len(expanded_components),
     }
     _atomic_json(manifest, project)
     artifacts = "\n".join(f"  - {item}" for item in expected)

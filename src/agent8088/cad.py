@@ -758,6 +758,33 @@ def generate_cad_model(path, source: str, parameters: str = "{}",
     )
 
 
+def build_warehouse_component(path, kind: str, params: dict, timeout: int = 120) -> dict:
+    """Build a bd_warehouse-backed component (fastener, gear, ...) with zero
+    model involvement -- see cad_ports.py for supported kinds. Returns a
+    structured dict rather than a formatted string, unlike the other
+    generate_* functions here: the caller (cad_project.create) needs the
+    named ports back as data to store in the project manifest, not a
+    message to relay to the model.
+
+    {"ok": True, "ports": {name: {"at": [...], "axis": [...]}}, "metrics": {...}}
+    or {"ok": False, "error": "..."}.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in (".step", ".stp"):
+        return {"ok": False, "error": "warehouse component output must be a .step filename"}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result = _run_worker({
+        "action": "resolve_warehouse_part", "kind": kind, "warehouse_params": params,
+        "output": str(path.resolve()), "workspace": str(path.parent.resolve()),
+    }, timeout=timeout)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error") or "unknown CAD error"}
+    problem = _existing_artifact(path, "warehouse component")
+    if problem:
+        return {"ok": False, "error": problem}
+    return {"ok": True, "ports": result.get("ports") or {}, "metrics": result}
+
+
 def generate_cad_design(path, design: str, formats: str = "step,stl",
                         timeout: int = 600) -> str:
     """Compile a bounded declarative design and verify its complete artifact bundle."""
