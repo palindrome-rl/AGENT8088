@@ -218,7 +218,8 @@ cannot hand itself a fresh write budget.
 | `tools_file` | Path to `tools.txt` (the tool registry). |
 | `system_file` | Path to `system.md` (base prompt). |
 | `user_file` | Path to `USER.md` (persona). |
-| `skills_dir` / `agents_dir` | Skill packages and sub-agent profiles. |
+| `skills_dir` / `agents_dir` | Skill packages and bundled sub-agent profiles. |
+| `user_agents_dir` | Your own sub-agent profiles, merged over `agents_dir`. Defaults to `%LOCALAPPDATA%\agent8088\agents` (POSIX: `~/.agent8088/agents`) so they survive an upgrade. |
 | `subagent_max_depth` | Recursion limit for `spawn_subagent`. |
 | `default_subagent` | Profile used when none is named. |
 | `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |

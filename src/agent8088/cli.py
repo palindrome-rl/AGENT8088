@@ -2387,10 +2387,10 @@ def _cmd_agents_delete(name):
         return
     path = A.USER_AGENTS_DIR / f"{name}.md"
     try:
-        confirm = console.input(f"Delete '{name}' ({path})? [y/N] ").strip().lower()
+        if not _confirm_destructive(f"Delete sub-agent '{name}'", str(path)):
+            console.print("[dim]cancelled[/dim]")
+            return
     except (EOFError, KeyboardInterrupt):
-        confirm = ""
-    if confirm != "y":
         console.print("[dim]cancelled[/dim]")
         return
     path.unlink(missing_ok=True)
