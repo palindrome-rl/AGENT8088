@@ -21,12 +21,16 @@ and snapshot review. Do not write FreeCAD Python and do not run CAD source with
    tubes, placements, fusions and cuts (no fillets, chamfers, mirrors, or
    sketches) → `generate_cad_design` (preferred; type-checked, no
    model-authored Python).
-6. Everything else → `generate_cad_model` (full build123d Python via one
-   `gen_step()` function). Route here whenever the brief names fillets,
-   chamfers, mirrors, serrations, ribs, lofts, sweeps, sketches, selectors,
-   gears, threads — or any feature the five declarative primitives cannot
-   express. **When in doubt, use `generate_cad_model`**: it is the universal
-   path and is always available for CAD requests.
+6. Every multi-component, movable, robotic, architectural, or otherwise
+   complex assembly → the staged `cad_project_*` workflow (see "Staged
+   assembly workflow" below). Required — never put a whole assembly in one
+   `generate_cad_model` call.
+7. Everything else (a single part) → `generate_cad_model` (full build123d
+   Python via one `gen_step()` function). Route here whenever the brief names
+   fillets, chamfers, mirrors, serrations, ribs, lofts, sweeps, sketches,
+   selectors, gears, threads — or any feature the five declarative primitives
+   cannot express. **When in doubt, use `generate_cad_model`**: it is the
+   universal single-part path and is always available for CAD requests.
 
 Both complex-model tools generate STEP, export requested secondary formats,
 reopen and validate every solid independently, check bounded assembly
@@ -125,7 +129,46 @@ source.** It carries the hard-won traps: fillet ladders that degrade silently,
 `Plane.rotated()` composing in world axes, `.located()` discarding rotations,
 align datums, multi-tool boolean batching, inverted solids passing validity.
 
+## Staged assembly workflow (cad_project_*)
+
+Declare the whole assembly in **one** `cad_project_create` call — every part
+and every connection between them — instead of discovering it one component
+at a time:
+
+- **`parts`**: array of `{name, kind, ...}`. `kind: "custom"` needs a
+  `description` and a later `cad_project_add_component` call with real
+  build123d source. `kind: "warehouse.fastener"` or `"warehouse.gear"` needs a
+  `params` object instead and is built immediately, deterministically, with
+  **zero further model turns** — do not write source for these; `create`
+  already built them by the time it returns.
+- **`mates`**: array of `{type, a, b}` connecting `"PartName.port_name"`
+  pairs. `type` is one of `coaxial` (align two axes — a pin in a bore),
+  `face_to_face` (coincident faces), `press_fit` (like coaxial, plus
+  auto-exempted from interference — this *replaces* `allowed_contact` for the
+  assembly workflow: a declared press_fit or gear_mesh mate already says the
+  pair is expected to touch), or `gear_mesh` (needs `module`, `teeth_a`,
+  `teeth_b` too; positions two gears at their pitch-circle center distance).
+- Positions are **never** authored by you. `cad_project_finalize` takes no
+  placement argument at all — it computes every part's location from the
+  mates you already declared. If a part needs to mate with something, give it
+  a named port in `cad_project_add_component`'s `ports` field: `{port_name:
+  {at: [x,y,z], axis: [x,y,z]}}`, where `axis` points away from that part's
+  own body, toward whatever it will mate with.
+- `cad_project_add_component` is bounded to 3 real repair attempts per
+  component name. A 4th call after 3 failures is refused — rework the
+  approach for that component rather than retrying the same broken one.
+- A part connecting to two other parts simultaneously (e.g. a shared housing
+  with jaws mating on one side and a scroll mechanism on the other) is fine —
+  the assembly only needs to be one valid *static* configuration, not a
+  proof that the mechanism can move through its full range.
+
 ## Mechanism playbook (moving assemblies)
+
+This is about geometry *within* one `generate_cad_model` call or one
+`cad_project_add_component`'s custom part — placing features inside a single
+component's own `gen_step()`. Positioning *between* separate parts in a
+staged project uses the mates in "Staged assembly workflow" above, not `Pos`/
+`Rot` on a whole component.
 
 For grippers, linkages, hinges, and any assembly with pins/pivots (full
 detail in `references/positioning.md`):
