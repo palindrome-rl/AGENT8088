@@ -228,7 +228,12 @@ def judge(
     completion_fn: CompletionFn = None,
     rng: random.Random = None,
 ) -> "FusionResult":
-    """Blind the survivors, ask the judge model to pick a winner."""
+    """Blind the survivors, ask the judge model to pick a winner.
+
+    A judge whose max_tokens budget cuts it off before it emits its WINNER
+    marker (reasoning models spend the budget thinking) is retried once at
+    double the token budget. Reasoning tokens count against max_tokens, so
+    a thoughtful judge can be starved of the room it needs to answer."""
     if completion_fn is None:
         completion_fn = A.create_completion
 
@@ -253,12 +258,12 @@ def judge(
         "WINNER: <letter>\nVERDICT: <2-4 sentences explaining why this answer is best>"
     )
 
-    try:
-        response = completion_fn(
+    def _call_judge(judge_max_tokens: int):
+        return completion_fn(
             judge_client,
             [{"role": "user", "content": prompt}],
             [],
-            max_tokens=max_tokens,
+            max_tokens=judge_max_tokens,
             system_prompt=JUDGE_SYSTEM_PROMPT,
             temperature=0.0,
             on_token=None,
@@ -267,15 +272,32 @@ def judge(
             provider_name=judge_provider,
             telemetry_attempt="fusion_judge",
         )
-    except Exception as exc:
-        result.judge_error = f"{type(exc).__name__}: {exc}"
-        return result
 
-    raw = A._strip_reasoning(response.choices[0].message.content or "")
+    total_input = 0
+    total_output = 0
+    raw = ""
+    # One retry at 2x tokens: a reasoning judge can burn the entire budget
+    # thinking and never reach WINNER:/VERDICT:. ponytail: fixed 2 attempts,
+    # a configurable ladder is not warranted until a case needs three.
+    for attempt_index, budget in enumerate((max_tokens, max_tokens * 2)):
+        try:
+            response = _call_judge(budget)
+        except Exception as exc:
+            result.judge_error = f"{type(exc).__name__}: {exc}"
+            return result
+        usage, _source = A._model_usage(response)
+        total_input += usage.get("input_tokens") or 0
+        total_output += usage.get("output_tokens") or 0
+        raw = A._strip_reasoning(response.choices[0].message.content or "")
+        _winner, verdict_text = _parse_verdict(raw)
+        if _WINNER_RE.search(raw):
+            break
+        if attempt_index == 0:
+            continue
+
     result.judge_raw = raw
-    usage, _source = A._model_usage(response)
-    result.total_input_tokens += usage.get("input_tokens") or 0
-    result.total_output_tokens += usage.get("output_tokens") or 0
+    result.total_input_tokens += total_input
+    result.total_output_tokens += total_output
 
     winner_letter, verdict_text = _parse_verdict(raw)
     if winner_letter is None or (ord(winner_letter.upper()) - ord("A")) >= len(labels):

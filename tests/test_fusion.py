@@ -265,6 +265,86 @@ def test_run_fusion_judge_unparseable_falls_back_to_first_survivor(monkeypatch, 
 
 
 # ---------------------------------------------------------------------------
+# judge truncation retry (reasoning judges burn the budget before WINNER:)
+# ---------------------------------------------------------------------------
+
+def test_run_fusion_judge_truncated_retries_at_double_tokens(monkeypatch, engine):
+    """Reasoning judges (e.g. glm-5.3) can exhaust fusion_judge_max_tokens on
+    thinking and get cut off before emitting WINNER:/VERDICT:. The judge must
+    be retried once at double the token budget instead of falling back."""
+    panel = _fixed_panel(["p1", "p2", "p3"])
+    monkeypatch.setattr(fusion, "discover_panel", lambda max_panel_size=6: panel)
+    monkeypatch.setattr(fusion.random, "shuffle", lambda seq: None)
+    monkeypatch.setattr(engine, "get_client", lambda name: (SimpleNamespace(name=name), "judge-model"))
+
+    judge_calls = []
+
+    def fake_completion(client, messages, tools, **kw):
+        provider = kw["provider_name"]
+        if provider == "judge":
+            judge_calls = calls.count("judge")
+            calls.append(provider)
+            if judge_calls == 0:
+                return _fake_response(
+                    "WINNER: B\nVERDICT: it is more thorough."[:10],  # truncated mid-thought
+                    input_tokens=5, output_tokens=kw["max_tokens"])
+            return _fake_response("WINNER: B\nVERDICT: it is more thorough.",
+                                  input_tokens=5, output_tokens=7)
+        calls.append(provider)
+        return _fake_response(f"answer from {provider}", input_tokens=1, output_tokens=2)
+
+    calls = []
+
+    fake_completion.__defaults__ = ()
+    def fake_completion2(client, messages, tools, **kw):
+        return fake_completion(client, messages, tools, **kw)
+
+    # simpler: wrap
+    def completion(client, messages, tools, **kw):
+        provider = kw["provider_name"]
+        return _fake_response("WINNER: B\nVERDICT: ok", input_tokens=5, output_tokens=7)
+
+    def tracked(client, messages, tools, **kw):
+        provider = kw["provider_name"]
+        calls.append(provider)
+        if provider == "judge" and calls.count("judge") == 1:
+            return _fake_response("Answer B look", input_tokens=5, output_tokens=7)
+        if provider == "judge":
+            return _fake_response("WINNER: B\nVERDICT: more thorough.", input_tokens=5, output_tokens=7)
+        return _fake_response(f"answer from {provider}", input_tokens=1, output_tokens=2)
+
+    result = fusion.run_fusion("q", judge_provider="judge",
+                                judge_max_tokens=500, completion_fn=tracked)
+
+    assert result.judge_parsed is True
+    assert result.winner_answer == "answer from p2"
+    assert calls.count("judge") == 2, "judge should be retried exactly once after truncation"
+
+
+def test_run_fusion_judge_truncation_retry_still_unparseable_falls_back(monkeypatch, engine):
+    panel = _fixed_panel(["p1", "p2", "p3"])
+    monkeypatch.setattr(fusion, "discover_panel", lambda max_panel_size=6: panel)
+    monkeypatch.setattr(fusion.random, "shuffle", lambda seq: None)
+    monkeypatch.setattr(engine, "get_client", lambda name: (SimpleNamespace(name=name), "judge-model"))
+
+    calls = []
+
+    def fake_completion(client, messages, tools, **kw):
+        provider = kw["provider_name"]
+        calls.append(provider)
+        if provider == "judge":
+            # truncated both times: no WINNER marker ever
+            return _fake_response("rambling reasoning cut off here", output_tokens=0)
+        return _fake_response(f"answer from {provider}")
+
+    result = fusion.run_fusion("q", judge_provider="judge", completion_fn=fake_completion)
+
+    assert calls.count("judge") == 2, "give up after one retry"
+    assert result.judge_parsed is False
+    assert result.winner_answer == "answer from p1"  # first-survivor fallback still works
+
+
+# ---------------------------------------------------------------------------
 # judge() blinding
 # ---------------------------------------------------------------------------
 
