@@ -69,6 +69,17 @@ timeout_seconds=120
 # max_tool_timeout_seconds=600
 # browser_max_steps=500
 # browser_task_timeout_seconds=600
+# browse_page runs headless by default. Set this to 0 to watch the browser
+# work in a real window — useful for demos and for debugging a stuck selector.
+# Visibility only: the SSRF proxy and every other guard are unaffected.
+# Override for one run with AGENT8088_BROWSER_HEADLESS=0.
+# browser_headless=1
+# Where the visible window opens, as "W,H" and "X,Y". Ignored when headless.
+# Handy for a side-by-side screen recording: keep the terminal on the left and
+# put the browser on the right.
+# browser_window_size=1280,900
+# browser_window_position=680,0
+# Both also accept AGENT8088_BROWSER_WINDOW_SIZE / _POSITION for one run.
 
 # --- display ---
 # Pygments theme for the code the agent reads and writes: file listings, diffs

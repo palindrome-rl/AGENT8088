@@ -3411,6 +3411,17 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "500"))
 BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "600"))
+# Headless is the right default for a tool that runs unattended, but it leaves
+# no way to *watch* a run - which is exactly what a demo or a stuck-selector
+# debugging session needs. Opt in with browser_headless=0, or per-run with
+# AGENT8088_BROWSER_HEADLESS=0. Visibility only; every other guard is unchanged.
+BROWSER_HEADLESS = APP_CONFIG.get("browser_headless", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+# Only meaningful when the window is visible: a browsing window that lands on
+# top of the terminal defeats the point of watching, and the window is rebuilt
+# per browse_page call so dragging it never sticks. "W,H" and "X,Y".
+BROWSER_WINDOW_SIZE = APP_CONFIG.get("browser_window_size", "").strip()
+BROWSER_WINDOW_POSITION = APP_CONFIG.get("browser_window_position", "").strip()
 
 # Mirrors cli.py's S.show_reasoning (toggled by /reasoning, aliased /think) -
 # see cmd_reasoning and Session.__init__. Kept as a plain engine.py global
@@ -3554,6 +3565,36 @@ def _browser_task_timeout() -> int:
     return min(max(1, BROWSER_TASK_TIMEOUT_SECONDS), MAX_TOOL_TIMEOUT_SECONDS)
 
 
+def _browser_headless() -> bool:
+    """Whether this browsing session hides its window.
+
+    Env beats config so a single run can be watched without editing config.txt.
+    Anything unrecognised falls back to the config value rather than guessing.
+    """
+    override = os.environ.get("AGENT8088_BROWSER_HEADLESS", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return BROWSER_HEADLESS
+
+
+def _browser_window_pair(value: str) -> dict:
+    """Parse a "W,H"/"X,Y" setting into BrowserProfile's ViewportSize shape.
+
+    Returned as a dict rather than Chromium flags on purpose: browser-use
+    computes its own --window-size/--window-position and its values win, so a
+    raw arg is silently discarded. Anything not exactly two integers is dropped.
+
+    Callers pass the env override ahead of the config value, so a demo can be
+    placed from the command line without editing config.txt at all.
+    """
+    parts = [part.strip() for part in str(value or "").split(",")]
+    if len(parts) != 2 or not all(re.fullmatch(r"-?\d{1,5}", part) for part in parts):
+        return {}
+    return {"width": int(parts[0]), "height": int(parts[1])}
+
+
 def _browser_profile_kwargs(proxy_url: str) -> dict:
     """Build the BrowserProfile(...) kwargs for one browsing session.
 
@@ -3572,8 +3613,9 @@ def _browser_profile_kwargs(proxy_url: str) -> dict:
         "proxy": ProxySettings(server=proxy_url, bypass="<-loopback>"),
         # browser-use defaults headless to "headful if a display exists", which
         # pops a real visible window on any desktop. browse_page is documented
-        # as a headless tool and runs unattended, so pin it.
-        "headless": True,
+        # as a headless tool and runs unattended, so pin it - unless the
+        # operator explicitly asked to watch (see BROWSER_HEADLESS).
+        "headless": _browser_headless(),
         # browser-use downloads three CRX extensions from clients2.google.com
         # on first launch and injects them into every page. Those downloads are
         # made by browser-use itself, not through the proxy, so they bypass
@@ -3585,6 +3627,16 @@ def _browser_profile_kwargs(proxy_url: str) -> dict:
         # with a fresh automation profile. This disposable browser never
         # needs the user's stored credentials.
         kwargs["args"] = ["--use-mock-keychain"]
+    if not kwargs["headless"]:
+        # Placement only matters for a window someone is actually watching.
+        for field, setting in (
+                ("window_size", os.environ.get("AGENT8088_BROWSER_WINDOW_SIZE")
+                 or BROWSER_WINDOW_SIZE),
+                ("window_position", os.environ.get("AGENT8088_BROWSER_WINDOW_POSITION")
+                 or BROWSER_WINDOW_POSITION)):
+            pair = _browser_window_pair(setting)
+            if pair:
+                kwargs[field] = pair
     if SSRF_ALLOW_PRIVATE:
         # The operator has explicitly opted every private range back in; the
         # proxy's own check is a no-op in this mode too.

@@ -195,3 +195,165 @@ def test_default_extensions_are_off(tmp_path):
 
     assert profile.enable_default_extensions is False
     assert not any("--load-extension" in a for a in profile.get_args())
+
+
+# --- browser_headless: the visible-window opt-in -----------------------------
+# headless was hard-pinned, which is the right default for an unattended tool
+# but leaves no way to *watch* a browsing run (demos, debugging a selector).
+# The opt-in must be explicit and must not weaken any other guard.
+
+def test_headless_stays_on_by_default(monkeypatch):
+    monkeypatch.delenv("AGENT8088_BROWSER_HEADLESS", raising=False)
+    monkeypatch.setattr(A, "BROWSER_HEADLESS", True, raising=False)
+
+    assert A._browser_profile_kwargs("http://127.0.0.1:45671")["headless"] is True
+
+
+def test_config_can_opt_into_a_visible_window(monkeypatch):
+    monkeypatch.delenv("AGENT8088_BROWSER_HEADLESS", raising=False)
+    monkeypatch.setattr(A, "BROWSER_HEADLESS", False, raising=False)
+
+    assert A._browser_profile_kwargs("http://127.0.0.1:45671")["headless"] is False
+
+
+def test_env_var_overrides_config_both_ways(monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_HEADLESS", True, raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    assert A._browser_profile_kwargs("http://127.0.0.1:45671")["headless"] is False
+
+    monkeypatch.setattr(A, "BROWSER_HEADLESS", False, raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "1")
+    assert A._browser_profile_kwargs("http://127.0.0.1:45671")["headless"] is True
+
+
+def test_visible_window_keeps_every_other_guard(monkeypatch):
+    """A demo window must not become a hole in the SSRF posture."""
+    monkeypatch.setattr(A, "BROWSER_HEADLESS", False, raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert kwargs["proxy"].server == "http://127.0.0.1:45671"
+    assert kwargs["proxy"].bypass == "<-loopback>"
+    assert kwargs["enable_default_extensions"] is False
+    # The deny-list/IP-literal guards are chosen by the SSRF config, never by
+    # whether a window is on screen.
+    assert "prohibited_domains" in kwargs or A.SSRF_ALLOW_PRIVATE
+
+
+# --- browser_window: placement for a side-by-side recording ------------------
+# A visible window that lands on top of the terminal defeats the purpose of
+# watching a run, and the window is re-created per browse_page call, so
+# dragging it does not stick. Placement therefore has to be configuration.
+# These assert the *compiled Chromium flags*, because browser-use computes its
+# own window geometry and an unrecognised kwarg would be silently discarded.
+
+def test_no_window_geometry_when_headless(monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "1")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "1280,900", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "680,0", raising=False)
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert "window_size" not in kwargs
+    assert "window_position" not in kwargs
+
+
+def test_window_geometry_reaches_the_chromium_command_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "1280,900", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "680,0", raising=False)
+
+    args = _profile(tmp_path).get_args()
+
+    assert "--window-size=1280,900" in args
+    assert "--window-position=680,0" in args
+
+
+def test_unset_window_config_leaves_geometry_alone(monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "", raising=False)
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert "window_size" not in kwargs
+    assert "window_position" not in kwargs
+
+
+def test_malformed_window_config_is_dropped_not_forwarded(tmp_path, monkeypatch):
+    """Garbage must not reach Chromium as an extra switch."""
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "wide; --disable-web-security", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "1024x768", raising=False)
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+    assert "window_size" not in kwargs and "window_position" not in kwargs
+    assert not any("disable-web-security" in a for a in _profile(tmp_path).get_args())
+
+
+def test_visible_window_still_keeps_the_mock_keychain_flag(monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "1280,900", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "", raising=False)
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    if sys.platform == "darwin":
+        assert kwargs["args"] == ["--use-mock-keychain"]
+
+
+# --- window geometry from the environment ------------------------------------
+# The effective config.txt is ~/.agent8088/config.txt, which outranks the copy
+# bundled in a checkout - so a demo run from a worktree needs a route that
+# touches no config file at all.
+
+def test_env_supplies_window_geometry_without_any_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "", raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_SIZE", "1280,900")
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_POSITION", "680,0")
+
+    args = _profile(tmp_path).get_args()
+
+    assert "--window-size=1280,900" in args
+    assert "--window-position=680,0" in args
+
+
+def test_env_geometry_beats_config_geometry(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "800,600", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "0,0", raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_SIZE", "1440,980")
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_POSITION", "700,40")
+
+    args = _profile(tmp_path).get_args()
+
+    assert "--window-size=1440,980" in args
+    assert "--window-position=700,40" in args
+    assert "--window-size=800,600" not in args
+
+
+def test_env_geometry_is_still_ignored_when_headless(monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "1")
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_SIZE", "1280,900")
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_POSITION", "680,0")
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert "window_size" not in kwargs
+    assert "window_position" not in kwargs
+
+
+def test_malformed_env_geometry_is_dropped(monkeypatch):
+    monkeypatch.setenv("AGENT8088_BROWSER_HEADLESS", "0")
+    monkeypatch.setattr(A, "BROWSER_WINDOW_SIZE", "", raising=False)
+    monkeypatch.setattr(A, "BROWSER_WINDOW_POSITION", "", raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_SIZE", "1280x900")
+    monkeypatch.setenv("AGENT8088_BROWSER_WINDOW_POSITION", "; rm -rf /")
+
+    kwargs = A._browser_profile_kwargs("http://127.0.0.1:45671")
+
+    assert "window_size" not in kwargs
+    assert "window_position" not in kwargs
