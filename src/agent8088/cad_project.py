@@ -237,6 +237,16 @@ def create(
     encoded = json.dumps({"parameters": params, "verification": checks})
     if len(encoded.encode("utf-8")) > cad.MAX_VERIFICATION_BYTES:
         return "CAD project creation failed: parameters and verification are too large."
+    # Resume semantics. An earlier version persisted the manifest even when a
+    # warehouse part failed to build, then rejected the corrected retry as
+    # "a different project specification" -- while add_component refused the
+    # same part as "already built". That left no way forward but a new
+    # filename, and a real run burned ~4 restarts cycling through them.
+    #
+    # Drift is therefore only rejected for parts that are ACTUALLY BUILT
+    # (protecting verified geometry); anything not yet built is free to be
+    # corrected in place, on the same manifest.
+    carried: dict[str, Any] = {}
     if manifest.exists():
         try:
             _, existing = _load(manifest)
@@ -247,19 +257,26 @@ def create(
                 f"CAD project creation failed: {manifest.name} already belongs to "
                 f"{existing.get('name')!r}. Use another manifest filename."
             )
-        if (
-            existing.get("parameters") != params
-            or existing.get("verification") != checks
-            or existing.get("formats") != requested
-            or existing.get("parts") != parsed_parts
-            or existing.get("mates") != parsed_mates
-        ):
+        existing_parts = existing.get("parts") or {}
+        carried = {
+            name: component
+            for name, component in (existing.get("components") or {}).items()
+            if component.get("status") == "built"
+        }
+        changed_built = sorted(
+            name for name in carried
+            if parsed_parts.get(name) != existing_parts.get(name)
+        )
+        if changed_built:
             return (
-                "CAD project creation failed: this manifest already contains a "
-                "different project specification. Use cad_project_status to resume "
-                "it, or choose a new manifest filename."
+                "CAD project creation failed: these parts are already built and "
+                "verified, so their specification cannot be changed in place: "
+                + ", ".join(changed_built)
+                + ". Keep them as they were declared, or use a new manifest filename "
+                "to start over."
             )
-        return status(manifest)
+        # Drop carried components whose part is no longer declared at all.
+        carried = {n: c for n, c in carried.items() if n in parsed_parts}
 
     payload = {
         "schema_version": PROJECT_SCHEMA_VERSION,
@@ -270,7 +287,7 @@ def create(
         "formats": requested,
         "parts": parsed_parts,
         "mates": parsed_mates,
-        "components": {},
+        "components": carried,
         "assembly": None,
     }
     (manifest.parent / "components").mkdir(parents=True, exist_ok=True)
@@ -280,6 +297,8 @@ def create(
     for part_name, part in parsed_parts.items():
         if part["kind"] == "custom":
             continue
+        if part_name in payload["components"]:
+            continue  # already built on an earlier call — never rebuild good geometry
         output = manifest.parent / "components" / f"{part_name}.step"
         result = cad.build_warehouse_component(output, part["kind"], part["params"])
         if not result.get("ok"):
@@ -293,19 +312,24 @@ def create(
         }
         prebuilt.append(part_name)
 
+    # Persist whatever succeeded, always. A partial result is progress to build
+    # on next call, not state to throw away -- and because drift is only
+    # rejected for built parts, the corrected retry lands on this same manifest.
     _atomic_json(manifest, payload)
 
     if failed:
         return (
-            "CAD project creation failed while auto-building warehouse part(s):\n"
+            "Some warehouse part(s) could not be built:\n"
             + "\n".join(f"  - {item}" for item in failed)
-            + "\nFix the failing part's params and call cad_project_create again "
-            "with the same manifest filename and an unchanged specification "
-            "otherwise, or correct just the failing part(s)."
+            + f"\n\nEverything else was saved to {manifest.name}. Fix only the "
+            "failing part's params and call cad_project_create again with the SAME "
+            "filename — already-built parts are kept and will not be rebuilt. Do "
+            "not start a new project file."
         )
 
     custom_remaining = sorted(
-        n for n, p in parsed_parts.items() if p["kind"] == "custom"
+        n for n, p in parsed_parts.items()
+        if p["kind"] == "custom" and n not in payload["components"]
     )
     lines = [f"Created staged CAD project {project_name!r} at {manifest}."]
     if prebuilt:
@@ -328,13 +352,30 @@ def status(path) -> str:
     except (TypeError, ValueError) as exc:
         return f"CAD project status failed: {exc}."
     components = project["components"]
+    parts = project.get("parts") or {}
+    built = sum(1 for name in parts
+                if components.get(name, {}).get("status") == "built")
     lines = [
         f"CAD project: {project['name']}",
         f"Manifest: {manifest}",
-        f"Components: {len(components)}/{MAX_PROJECT_COMPONENTS}",
+        f"Parts: {built}/{len(parts)} built",
     ]
-    for name in sorted(components):
-        lines.append(f"  - {name}: {components[name].get('status', 'unknown')}")
+    # Show every DECLARED part with its kind and real state -- not just the
+    # components dict, which omits parts that were declared but never built
+    # and so hid exactly the state a stuck run needed to see.
+    for name in sorted(parts):
+        kind = parts[name].get("kind", "?")
+        component = components.get(name)
+        if component is None:
+            state = ("not built — fix params and re-run cad_project_create"
+                     if kind != "custom" else "not built — needs cad_project_add_component")
+        else:
+            state = component.get("status", "unknown")
+            if state == "failed":
+                attempts = component.get("attempts", 0)
+                remaining = max(0, MAX_CUSTOM_REPAIR_ATTEMPTS - attempts)
+                state = f"failed ({remaining} repair attempt(s) left)"
+        lines.append(f"  - {name} [{kind}]: {state}")
     assembly = project.get("assembly") or {}
     if assembly.get("status") == "built":
         lines.append(f"Assembly: built ({assembly.get('step')})")
@@ -378,9 +419,21 @@ def add_component(
             "cad_project_create's parts list."
         )
     if part.get("kind") != "custom":
+        # Only claim it is built if it actually is. Saying "already built" about
+        # a warehouse part whose auto-build FAILED is how a real run deadlocked:
+        # finalize refused it as unbuilt, add_component refused it as built.
+        already = project["components"].get(component_name, {}).get("status") == "built"
+        if already:
+            return (
+                f"CAD project component failed: {component_name!r} is a "
+                f"{part.get('kind')!r} part that cad_project_create already built. "
+                "Do not write source for it."
+            )
         return (
             f"CAD project component failed: {component_name!r} is a {part.get('kind')!r} "
-            "part -- it was already built by cad_project_create, not add_component."
+            "part, so it is built from params by cad_project_create, not from source "
+            "here. Its auto-build has not succeeded yet — fix its params and call "
+            "cad_project_create again with the same manifest filename."
         )
     for port_name, port_spec in port_specs.items():
         if not isinstance(port_spec, dict) or "at" not in port_spec:

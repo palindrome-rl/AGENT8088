@@ -137,10 +137,30 @@ at a time:
 
 - **`parts`**: array of `{name, kind, ...}`. `kind: "custom"` needs a
   `description` and a later `cad_project_add_component` call with real
-  build123d source. `kind: "warehouse.fastener"` or `"warehouse.gear"` needs a
-  `params` object instead and is built immediately, deterministically, with
-  **zero further model turns** — do not write source for these; `create`
-  already built them by the time it returns.
+  build123d source. A warehouse kind needs a `params` object instead and is
+  built immediately, deterministically, with **zero further model turns** — do
+  not write source for these; `create` already built them by the time it
+  returns. Exact param contracts:
+
+  | kind | required `params` |
+  |---|---|
+  | `warehouse.gear` | `module`, `tooth_count`, `pressure_angle`, `thickness` — all four |
+  | `warehouse.fastener` | `size`, `length` |
+
+  A fastener `size` **must carry its thread pitch**: `"M6-1"`, not `"M6"` and
+  not `"M6-1.0"`. Valid values are a fixed set: `M1.6-0.35, M2-0.4, M2.5-0.45,
+  M3-0.5, M4-0.7, M5-0.8, M6-1, M8-1.25, M10-1.5, M12-1.75, M14-2, M16-2,
+  M20-2.5, M24-3, M30-3.5, M36-4, M42-4.5, M48-5, M56-5.5, M64-6`.
+
+- **Correcting a mistake**: call `cad_project_create` again with the **same
+  manifest filename**. Parts that already built are kept and never rebuilt;
+  only the ones you fixed get built. Never start a new project file to work
+  around a failed part. `cad_project_status` shows every declared part with its
+  kind and whether it is built.
+- **Keep the create call small.** `verification` and `parameters` are optional —
+  omit them unless they are actually needed (verification can be supplied at
+  `cad_project_finalize` instead). A large deeply-nested payload is the single
+  most common cause of an unparseable tool call.
 - **`mates`**: array of `{type, a, b}` connecting `"PartName.port_name"`
   pairs. `type` is one of `coaxial` (align two axes — a pin in a bore),
   `face_to_face` (coincident faces), `press_fit` (like coaxial, plus

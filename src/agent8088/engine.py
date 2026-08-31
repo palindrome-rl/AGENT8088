@@ -5031,6 +5031,17 @@ def _is_missing_argument_error(result: str) -> bool:
     return bool(_MISSING_ARG_RE.match((result or "").lstrip()))
 
 
+def _is_parse_error_result(result: str) -> bool:
+    """Whether a tool refused because its argument JSON would not parse.
+
+    Same class of problem as a missing argument -- a malformed call, not a
+    result -- and it needs the same bounded handling. Without a breaker a model
+    that cannot emit a large nested payload correctly re-sends the identical
+    broken shape until the turn limit; a real run lost 8 of 50 turns that way.
+    """
+    return (result or "").lstrip().startswith("Error: could not parse the arguments for ")
+
+
 def _tool_arg_missing_error(name: str, missing: str) -> str:
     """Message for a call whose argument block never arrived at all.
 
@@ -7845,6 +7856,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     missing_args_retries = 0  # times a call arrived without its arguments
+    parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
     plan_mutation_retries = 0
@@ -8215,6 +8227,29 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 if trace is not None:
                     trace.append({"turn": turn, "type": "missing_tool_args",
                                   "tool": name})
+                continue
+            # Unparseable argument JSON is the same class of malformed call as
+            # a missing argument, but escalates immediately rather than
+            # echoing the generic parser message first: a `continue` here
+            # never sets `executed`, and the loop's own "no progress" breaker
+            # (below, forcing/forced_stop) ends the run after just ONE prior
+            # non-executing turn -- there is no real second round-trip in
+            # which a later escalation would ever reach the model, so the
+            # actionable guidance has to be what it sees on this one chance.
+            if _is_parse_error_result(result):
+                parse_error_retries += 1
+                messages.append({"role": "user", "content": (
+                    f"The arguments for '{name}' could not be parsed as JSON. Do "
+                    "not re-send the same payload unchanged. Send a smaller, "
+                    "simpler one instead: drop every optional argument (for CAD "
+                    "project tools, omit 'verification' and 'parameters' entirely "
+                    "— verification can be supplied later at finalize), keep the "
+                    "JSON on a single line, and include only the required "
+                    "arguments."
+                )})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "tool_arg_parse_error",
+                                  "tool": name, "count": parse_error_retries})
                 continue
             executed = True
             tool_outputs.append(result)

@@ -56,17 +56,26 @@ def test_project_create_is_idempotent_but_rejects_spec_drift(tmp_path):
     assert "Created staged CAD project" in created
     assert "Auto-built 1 warehouse part(s) with zero model turns" not in created
     assert "1 custom part(s) still need cad_project_add_component" in created
-    # Resuming with the identical spec returns the checkpoint status, not a
-    # second "Created" message.
-    assert "CAD project: robot" in cad_project.create(
+    # Re-running the identical spec is idempotent: nothing is built twice and
+    # the same guidance comes back.
+    again = cad_project.create(
         manifest, "robot", parts,
         parameters={"clearance": 0.3}, verification={"solid_count": 2}, formats="step,stl",
     )
-    mismatch = cad_project.create(
-        manifest, "robot", parts,
+    assert "1 custom part(s) still need cad_project_add_component" in again
+
+    # Drift on a part that is NOT yet built is allowed now -- that is what makes
+    # a failed part correctable in place instead of forcing a new manifest.
+    # (Drift on a *built* part is still refused: see
+    # test_create_still_refuses_to_change_an_already_built_part.)
+    changed = cad_project.create(
+        manifest, "robot", [_custom_part("Base", "a revised description")],
         parameters={"clearance": 1.0}, verification={"solid_count": 2}, formats="step,stl",
     )
-    assert "different project specification" in mismatch
+    assert "different project specification" not in changed
+    saved = json.loads(manifest.read_text())
+    assert saved["parts"]["Base"]["description"] == "a revised description"
+    assert saved["parameters"] == {"clearance": 1.0}
 
 
 def test_component_build_is_checkpointed_and_exact_retry_is_cached(
@@ -132,6 +141,107 @@ def test_add_component_rejects_undeclared_or_non_custom_name(tmp_path):
         manifest, "Ghost", "def gen_step(): pass", verification={"solid_count": 1}
     )
     assert "was not declared" in undeclared
+
+
+def _warehouse_part(name, kind, params):
+    return {"name": name, "kind": kind, "params": params}
+
+
+def test_failed_warehouse_build_is_recoverable_on_the_same_manifest(tmp_path, monkeypatch):
+    """The deadlock from a real 50-turn run: create() persisted the manifest
+    even when a warehouse part failed, then refused the corrected retry as
+    "a different project specification" while add_component refused the same
+    part as "already built" -- leaving a new filename as the only way out."""
+    manifest = tmp_path / "robot" / "project.cadproject.json"
+    built_calls = []
+
+    def fake_build(output, kind, params):
+        built_calls.append(params.get("name_marker"))
+        if params.get("bad"):
+            return {"ok": False, "error": "invalid param"}
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_bytes(b"STEP")
+        return {"ok": True, "ports": {"bore": {"at": [0, 0, 0], "axis": [0, 0, 1]}}}
+
+    monkeypatch.setattr(cad_project.cad, "build_warehouse_component", fake_build)
+
+    parts = [
+        _warehouse_part("GoodGear", "warehouse.gear", {"name_marker": "good"}),
+        _warehouse_part("BadGear", "warehouse.gear", {"name_marker": "bad", "bad": True}),
+    ]
+    first = cad_project.create(manifest, "robot", parts)
+    assert "could not be built" in first
+    assert "BadGear" in first
+    assert "SAME filename" in first
+
+    # The corrected retry lands on the same manifest instead of being refused.
+    parts[1] = _warehouse_part("BadGear", "warehouse.gear", {"name_marker": "fixed"})
+    built_calls.clear()
+    second = cad_project.create(manifest, "robot", parts)
+    assert "different project specification" not in second
+    assert "Auto-built 1 warehouse part(s)" in second
+    # The already-good part is carried forward, not rebuilt.
+    assert built_calls == ["fixed"]
+    saved = json.loads(manifest.read_text())
+    assert saved["components"]["GoodGear"]["status"] == "built"
+    assert saved["components"]["BadGear"]["status"] == "built"
+
+
+def test_add_component_does_not_claim_an_unbuilt_warehouse_part_was_built(
+    tmp_path, monkeypatch
+):
+    manifest = tmp_path / "robot" / "project.cadproject.json"
+    monkeypatch.setattr(
+        cad_project.cad, "build_warehouse_component",
+        lambda *a, **k: {"ok": False, "error": "invalid param"},
+    )
+    cad_project.create(
+        manifest, "robot", [_warehouse_part("Screw", "warehouse.fastener", {})]
+    )
+
+    result = cad_project.add_component(
+        manifest, "Screw", "def gen_step(): pass", verification={"solid_count": 1}
+    )
+    assert "already built" not in result
+    assert "has not succeeded yet" in result
+    assert "cad_project_create" in result
+
+
+def test_create_still_refuses_to_change_an_already_built_part(tmp_path, monkeypatch):
+    manifest = tmp_path / "robot" / "project.cadproject.json"
+
+    def fake_build(output, kind, params):
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_bytes(b"STEP")
+        return {"ok": True, "ports": {}}
+
+    monkeypatch.setattr(cad_project.cad, "build_warehouse_component", fake_build)
+    parts = [_warehouse_part("Gear", "warehouse.gear", {"module": 1.5})]
+    assert "Auto-built" in cad_project.create(manifest, "robot", parts)
+
+    drifted = [_warehouse_part("Gear", "warehouse.gear", {"module": 99})]
+    result = cad_project.create(manifest, "robot", drifted)
+    assert "already built and verified" in result
+    assert "Gear" in result
+
+
+def test_status_lists_declared_parts_with_kind_and_state(tmp_path, monkeypatch):
+    manifest = tmp_path / "robot" / "project.cadproject.json"
+    monkeypatch.setattr(
+        cad_project.cad, "build_warehouse_component",
+        lambda *a, **k: {"ok": False, "error": "invalid param"},
+    )
+    cad_project.create(manifest, "robot", [
+        _custom_part("Housing"),
+        _warehouse_part("Screw", "warehouse.fastener", {}),
+    ])
+
+    report = cad_project.status(manifest)
+    assert "Parts: 0/2 built" in report
+    assert "Housing [custom]" in report
+    assert "Screw [warehouse.fastener]" in report
+    # A part that was declared but never built must be visible, not omitted.
+    assert "not built" in report
 
 
 def test_add_component_repair_budget_is_bounded(tmp_path, monkeypatch):
@@ -356,3 +466,50 @@ def test_only_one_checkpoint_call_executes_per_model_response(engine, monkeypatc
 
     assert result == "waiting for checkpoint"
     assert executed == ["cad_project_create"]
+
+
+def test_arg_parse_error_gets_actionable_guidance_not_just_the_raw_parser_error(
+    engine, monkeypatch
+):
+    """A real 50-turn run lost 8 turns to a model re-sending the same
+    unparseable payload verbatim after seeing only the generic parser
+    message. The loop's own "no progress" breaker ends a run after just one
+    non-executing turn (verified directly, not assumed), so there is only
+    ever one real chance for the model to see guidance before the run
+    terminates -- the fix therefore has to escalate on that first occurrence,
+    not build up to it over several turns."""
+    seen_final_messages = []
+    broken = "✿FUNCTION✿: cad_project_create ✿ARGS✿: {\"filename\": \"a/b.cadproject.json\", oops"
+
+    def completion(messages, tools, **kwargs):
+        seen_final_messages.append(list(messages))
+        return _response(broken)
+
+    # full-auto so the write escalates straight through and the loop actually
+    # reaches run_tool's parse-error branch, instead of cycling on the
+    # permission-escalation prompt (a different, already-covered path).
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    result = engine.run_agent(
+        [{"role": "user", "content": "make a CAD project"}],
+        max_turns=8,
+        system_prompt="base",
+        tools_def=[],
+        allowed_tools={"cad_project_create"},
+    )
+
+    # The run ends well short of the 8-turn limit (the pre-existing no-progress
+    # breaker, not a new turn-limit error) -- exactly the "burns every turn"
+    # failure mode this change removes.
+    assert "reached the 8-turn limit" not in result
+    # The actionable guidance was appended to the conversation the model saw
+    # on its next (and, structurally, only remaining) completion call.
+    last_round = seen_final_messages[-1]
+    actionable = [
+        m for m in last_round
+        if m.get("role") == "user"
+        and "could not be parsed as JSON" in str(m.get("content", ""))
+    ]
+    assert actionable, "expected actionable parse-error guidance in the next completion call"
+    assert "omit 'verification'" in actionable[0]["content"]
+    assert "Do not re-send the same payload unchanged" in actionable[0]["content"]

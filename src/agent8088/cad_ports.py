@@ -33,6 +33,26 @@ WAREHOUSE_KINDS = ("warehouse.fastener", "warehouse.gear")
 # cad_mates.port_from_axis). Building a Port here would just be discarded.
 
 
+# Required params per kind, surfaced verbatim in error messages and mirrored
+# in tools.txt / SKILL.md. A model that has to discover these one rejection at
+# a time burns a turn per guess -- a real 50-turn run lost five turns to
+# exactly that (tooth_count/pressure_angle, then size/length, then the size
+# *format*, then the exact enum member).
+REQUIRED_PARAMS = {
+    "warehouse.fastener": ("size", "length"),
+    "warehouse.gear": ("module", "tooth_count", "pressure_angle", "thickness"),
+}
+
+
+def _require(kind: str, params: dict[str, Any]) -> None:
+    missing = [key for key in REQUIRED_PARAMS[kind] if params.get(key) is None]
+    if missing:
+        raise ValueError(
+            f"{kind} is missing required param(s): {', '.join(missing)}. "
+            f"{kind} requires exactly: {', '.join(REQUIRED_PARAMS[kind])}"
+        )
+
+
 def _fastener(params: dict[str, Any]):
     from bd_warehouse.fastener import SocketHeadCapScrew
 
@@ -42,11 +62,20 @@ def _fastener(params: dict[str, Any]):
             f"unsupported fastener type {fastener_type!r}; only 'SocketHeadCapScrew' "
             "is wired up so far"
         )
-    size = params.get("size")
-    length = params.get("length")
-    if not size or length is None:
-        raise ValueError("warehouse.fastener requires 'size' and 'length' params")
-    part = SocketHeadCapScrew(size=str(size), length=float(length))
+    _require("warehouse.fastener", params)
+    size = str(params["size"])
+    # Validate against the real enum before bd_warehouse does, so one message
+    # carries both the format rule and the actual accepted values. Read from
+    # the library rather than hardcoded -- a version bump that adds a size
+    # must not make this list quietly wrong.
+    valid = list(SocketHeadCapScrew.sizes("iso4762"))
+    if size not in valid:
+        raise ValueError(
+            f"warehouse.fastener size {size!r} is not valid. Size must include its "
+            f"thread pitch as 'M<diameter>-<pitch>' (e.g. 'M6-1', not 'M6' or "
+            f"'M6-1.0'). Valid sizes: {', '.join(valid)}"
+        )
+    part = SocketHeadCapScrew(size=size, length=float(params["length"]))
     ports = {"bearing_face": {"at": (0.0, 0.0, 0.0), "axis": (0.0, 0.0, 1.0)}}
     return part, ports
 
@@ -54,10 +83,7 @@ def _fastener(params: dict[str, Any]):
 def _gear(params: dict[str, Any]):
     from bd_warehouse.gear import SpurGear
 
-    required = ("module", "tooth_count", "pressure_angle", "thickness")
-    missing = [key for key in required if params.get(key) is None]
-    if missing:
-        raise ValueError(f"warehouse.gear is missing required params: {', '.join(missing)}")
+    _require("warehouse.gear", params)
     part = SpurGear(
         module=float(params["module"]),
         tooth_count=int(params["tooth_count"]),
