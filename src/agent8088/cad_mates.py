@@ -19,13 +19,22 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from build123d import Location, RigidJoint
+from build123d import Location, Plane, RigidJoint
 
 
 class Port(NamedTuple):
     """A named attachment point on a component, in that component's own
     local frame (not yet placed in the assembly)."""
     location: Location
+
+
+def port_from_axis(at: tuple[float, float, float], axis: tuple[float, float, float]) -> Port:
+    """Build a Port from a position plus an outward-facing direction --
+    verified against the real runtime: Plane(origin=at, z_dir=axis).location
+    carries both position and the orientation RigidJoint needs, not just a
+    bare point. `axis` is the port's local +Z, pointing away from its own
+    part's body per the module-level convention."""
+    return Port(location=Plane(origin=at, z_dir=axis).location)
 
 
 MATE_TYPES = ("coaxial", "face_to_face", "press_fit", "gear_mesh")

@@ -2271,10 +2271,50 @@ def build_tools_def(tool_specs: dict) -> list:
                     },
                     "additionalProperties": False,
                 }
+                port_check = {
+                    "type": "object",
+                    "properties": {"at": vector, "axis": vector},
+                    "required": ["at"],
+                    "additionalProperties": False,
+                }
+                part_schema = {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "description": {"type": "string"},
+                        "params": {"type": "object"},
+                    },
+                    "required": ["name", "kind"],
+                    "additionalProperties": False,
+                }
+                mate_schema = {
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["coaxial", "face_to_face", "press_fit", "gear_mesh"],
+                        },
+                        "a": {"type": "string"},
+                        "b": {"type": "string"},
+                        "module": scalar,
+                        "teeth_a": {"type": "integer", "minimum": 1},
+                        "teeth_b": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["type", "a", "b"],
+                    "additionalProperties": False,
+                }
                 if "parameters" in props:
                     props["parameters"] = {"type": "object"}
                 if "verification" in props:
                     props["verification"] = project_verification
+                if name == "cad_project_create":
+                    if "parts" in props:
+                        props["parts"] = {
+                            "type": "array", "minItems": 1, "items": part_schema,
+                        }
+                    if "mates" in props:
+                        props["mates"] = {"type": "array", "items": mate_schema}
                 if name == "cad_project_add_component":
                     props["verification"] = {
                         "type": "object", "minProperties": 1,
@@ -2285,29 +2325,13 @@ def build_tools_def(tool_specs: dict) -> list:
                         },
                         "additionalProperties": False,
                     }
-                if name == "cad_project_finalize":
-                    props["assembly"] = {
-                        "type": "object",
-                        "properties": {
-                            "occurrences": {
-                                "type": "array", "minItems": 1,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": {"type": "string"},
-                                        "component": {"type": "string"},
-                                        "at": vector,
-                                        "rotate": vector,
-                                    },
-                                    "required": ["name", "component"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            "verification": project_verification,
-                        },
-                        "required": ["occurrences", "verification"],
-                        "additionalProperties": False,
-                    }
+                    if "ports" in props:
+                        props["ports"] = {
+                            "type": "object", "additionalProperties": port_check,
+                        }
+                # cad_project_finalize takes no placement argument at all --
+                # positions come from the mates already declared at create(),
+                # so its only refined property is the inherited "verification".
             params = {"type": "object", "properties": props,
                       "required": required_params(spec)}
         result.append({
@@ -5900,6 +5924,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if name == "cad_project_create":
             result = cad_project.create(
                 target, str(args.get("name", "")), content,
+                mates=_structured_text_argument(args.get("mates"), "[]"),
+                parameters=_structured_text_argument(args.get("parameters"), "{}"),
                 verification=_structured_text_argument(args.get("verification"), "{}"),
                 formats=str(args.get("formats", "step,stl")),
             )
@@ -5910,6 +5936,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 target, str(args.get("name", "")), content,
                 parameters=_structured_text_argument(args.get("parameters"), "{}"),
                 verification=_structured_text_argument(args.get("verification"), "{}"),
+                ports=_structured_text_argument(args.get("ports"), "{}"),
                 timeout=timeout,
             )
             _last_write_diff = None
@@ -7697,13 +7724,17 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
     if staged:
         project_routing = (
             "- REQUIRED for every multi-component, movable, robotic, architectural, or "
-            "otherwise complex assembly: use the staged CAD project workflow. First call "
-            "cad_project_create with <project>/project.cadproject.json. Then make exactly "
-            "ONE cad_project_add_component call per response and WAIT for its validation "
-            "result before writing the next component. After all components pass, call "
-            "cad_project_finalize with only occurrence names, component names, placements, "
-            "and final verification. Never put a whole assembly in generate_cad_model. "
-            "If work may already exist, call cad_project_status before rebuilding it.\n"
+            "otherwise complex assembly: use the staged CAD project workflow. Declare the "
+            "WHOLE assembly in one cad_project_create call: every part (kind \"custom\" for "
+            "bespoke geometry, or a warehouse.* kind for a standard fastener/gear -- built "
+            "immediately with zero further calls) plus every mate connecting them. Only "
+            "then call cad_project_add_component, once per remaining \"custom\" part, "
+            "waiting for its validation result before the next one (capped at 3 repair "
+            "attempts per component). Positions are computed from the declared mates, not "
+            "authored by you -- cad_project_finalize takes no placement argument at all, "
+            "only an optional final verification override. Never put a whole assembly in "
+            "generate_cad_model. If work may already exist, call cad_project_status before "
+            "rebuilding it.\n"
         )
     else:
         project_routing = (
@@ -7953,11 +7984,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     f"{warning} Abandon the partial monolithic CAD program. "
                     "Use the checkpointed CAD project workflow now. Call exactly "
                     "ONE tool in this response: cad_project_status if a project "
-                    "manifest already exists, otherwise cad_project_create. Do not "
-                    "emit component source until the create/status result returns. "
-                    "Subsequent responses must add exactly one component at a time "
-                    "with cad_project_add_component and wait for validation before "
-                    "continuing; finish with cad_project_finalize."
+                    "manifest already exists, otherwise cad_project_create declaring "
+                    "the FULL parts+mates specification in one call (warehouse.* parts "
+                    "build immediately, zero further calls). Subsequent responses must "
+                    "add exactly one remaining custom component at a time with "
+                    "cad_project_add_component and wait for validation before "
+                    "continuing; finish with cad_project_finalize, which needs no "
+                    "placement argument -- positions come from the mates already "
+                    "declared."
                 )
             elif content:
                 # A genuinely large answer/tool call was in progress.
