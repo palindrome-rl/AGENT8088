@@ -69,6 +69,14 @@ timeout_seconds=120
 # max_tool_timeout_seconds=600
 # browser_max_steps=500
 # browser_task_timeout_seconds=600
+
+# Actions the browsing model may batch into one step. Wall clock tracks the
+# number of steps, so 1 (the reliable default) makes a multi-field form slow:
+# a 7-field form takes ~9 steps at 1, or ~5 at 4 - measured 149s vs 53s on a
+# local 35B, same correct result. Raise it for form-heavy or extraction runs;
+# keep it at 1 on a site where clicks reshuffle the DOM (some checkouts).
+# Override for one run with AGENT8088_BROWSER_MAX_ACTIONS_PER_STEP.
+# browser_max_actions_per_step=1
 # browse_page runs headless by default. Set this to 0 to watch the browser
 # work in a real window — useful for demos and for debugging a stuck selector.
 # Visibility only: the SSRF proxy and every other guard are unaffected.

@@ -3411,6 +3411,14 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "500"))
 BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "600"))
+# How many actions the browsing model may batch into one step. Measured on a
+# local 35B: prefill is ~1250 tok/s and llama.cpp prefix-caches the fixed
+# system prompt, but generation is only ~68 tok/s - so a step costs about its
+# output tokens, and wall clock tracks the number of steps. One action per step
+# is the reliable default (it prevents the stale-index cascade seen in
+# checkout), but it multiplies the cost of a form: raise it for a form-heavy
+# run, at the price of acting on a DOM that a previous action may have changed.
+BROWSER_MAX_ACTIONS_PER_STEP = int(APP_CONFIG.get("browser_max_actions_per_step", "1"))
 # Headless is the right default for a tool that runs unattended, but it leaves
 # no way to *watch* a run - which is exactly what a demo or a stuck-selector
 # debugging session needs. Opt in with browser_headless=0, or per-run with
@@ -3563,6 +3571,20 @@ def _browser_task_timeout() -> int:
     tool call may never outrun max_tool_timeout_seconds - the documented hard
     ceiling every other tool path clamps to (see run_tool)."""
     return min(max(1, BROWSER_TASK_TIMEOUT_SECONDS), MAX_TOOL_TIMEOUT_SECONDS)
+
+
+def _browser_max_actions_per_step() -> int:
+    """Actions the browsing model may batch per step; env beats config.
+
+    A bad value falls back to the config value instead of raising - this runs
+    mid-task, and a typo must not take out a browsing run.
+    """
+    raw = os.environ.get("AGENT8088_BROWSER_MAX_ACTIONS_PER_STEP", "").strip()
+    try:
+        value = int(raw) if raw else BROWSER_MAX_ACTIONS_PER_STEP
+    except ValueError:
+        value = BROWSER_MAX_ACTIONS_PER_STEP
+    return max(1, value)
 
 
 def _browser_headless() -> bool:
@@ -3758,7 +3780,7 @@ async def _run_browser_agent(url: str, task: str, executable_path: str | None = 
             # A small model often batches actions for the old DOM after the
             # first click navigates. One action per fresh state trades calls for
             # reliability and prevents the stale-index cascade seen in checkout.
-            max_actions_per_step=1,
+            max_actions_per_step=_browser_max_actions_per_step(),
             extend_system_message=(
                 "Reliability rules: use only element indices from the current "
                 "browser state. After navigation, inspect the new state before "

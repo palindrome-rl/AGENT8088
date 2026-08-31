@@ -439,9 +439,58 @@ def test_the_agent_is_built_without_vision_thinking_or_the_judge(fake_browser_us
     assert kwargs["use_vision"] is False
     assert kwargs["use_thinking"] is False
     assert kwargs["llm_timeout"] == A.TIMEOUT_SECONDS
-    assert kwargs["max_actions_per_step"] == 1
+    assert kwargs["max_actions_per_step"] == A.BROWSER_MAX_ACTIONS_PER_STEP
     assert "current browser state" in kwargs["extend_system_message"]
     assert kwargs["use_judge"] is False
+
+
+# --- browser_max_actions_per_step --------------------------------------------
+# Measured on a local 35B: prefill runs ~1250 tok/s and llama.cpp prefix-caches
+# the (fixed, ~30k char) system prompt, but generation runs ~68 tok/s - so a
+# step costs roughly its output tokens, and wall clock scales with the number
+# of steps. Pinning one action per step therefore multiplies the cost of any
+# multi-action task (a 7-field form went ~9 steps). It stays the default for
+# reliability, but has to be tunable for a form-heavy run.
+
+def test_the_batch_size_default_stays_one_for_reliability():
+    assert A.BROWSER_MAX_ACTIONS_PER_STEP == 1
+
+
+def test_config_can_raise_the_batch_size(fake_browser_use, monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_ACTIONS_PER_STEP", 4, raising=False)
+
+    asyncio.run(A._run_browser_agent("https://example.com", "fill the form"))
+
+    assert fake_browser_use.agents[0].kwargs["max_actions_per_step"] == 4
+
+
+def test_env_overrides_the_batch_size(fake_browser_use, monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_ACTIONS_PER_STEP", 1, raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_MAX_ACTIONS_PER_STEP", "5")
+
+    asyncio.run(A._run_browser_agent("https://example.com", "fill the form"))
+
+    assert fake_browser_use.agents[0].kwargs["max_actions_per_step"] == 5
+
+
+def test_a_nonsense_batch_size_falls_back_rather_than_crashing(
+        fake_browser_use, monkeypatch):
+    """A bad value must not take out a browsing run mid-demo."""
+    monkeypatch.setattr(A, "BROWSER_MAX_ACTIONS_PER_STEP", 3, raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_MAX_ACTIONS_PER_STEP", "lots")
+
+    asyncio.run(A._run_browser_agent("https://example.com", "fill the form"))
+
+    assert fake_browser_use.agents[0].kwargs["max_actions_per_step"] == 3
+
+
+def test_the_batch_size_is_never_below_one(fake_browser_use, monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_ACTIONS_PER_STEP", 1, raising=False)
+    monkeypatch.setenv("AGENT8088_BROWSER_MAX_ACTIONS_PER_STEP", "0")
+
+    asyncio.run(A._run_browser_agent("https://example.com", "fill the form"))
+
+    assert fake_browser_use.agents[0].kwargs["max_actions_per_step"] == 1
 
 
 def test_the_llm_is_built_with_the_same_completion_token_ceiling_as_the_main_loop(
