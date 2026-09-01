@@ -32,6 +32,34 @@ def _unfence_json_object(content: str) -> str:
     return content if content.startswith("{") else original
 
 
+def _with_schema_instruction(messages: list, instruction: str) -> list:
+    """Attach a JSON-schema instruction while keeping any system message first.
+
+    The obvious spelling - appending {"role": "system", ...} to the end - is
+    rejected outright by several OpenAI-compatible servers with "System
+    message must be at the beginning" (observed on a llama.cpp/llama-swap box
+    serving Qwen3.8-27B, and on Ollama Cloud serving GLM). Since those are the
+    same providers this whole fallback exists for, the instruction is merged
+    into the leading system message instead - which every provider accepts,
+    and which also avoids introducing two consecutive same-role messages that
+    stricter APIs reject. The caller's list is never mutated.
+    """
+    messages = list(messages)
+    if messages and messages[0].get("role") == "system":
+        head = dict(messages[0])
+        content = head.get("content")
+        if isinstance(content, str):
+            head["content"] = f"{content}\n\n{instruction}"
+        elif isinstance(content, list):
+            # browser-use can serialize content as a list of typed parts.
+            head["content"] = content + [{"type": "text", "text": instruction}]
+        else:
+            return [{"role": "system", "content": instruction}] + messages
+        messages[0] = head
+        return messages
+    return [{"role": "system", "content": instruction}] + messages
+
+
 def _parse_structured_output(output_format, content: str):
     content = _unfence_json_object(content)
     try:
@@ -86,14 +114,10 @@ class Agent8088ChatModel(ChatLiteLLM):
         from litellm import acompletion
 
         schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-        litellm_messages = LiteLLMMessageSerializer.serialize(messages)
-        litellm_messages = litellm_messages + [{
-            "role": "system",
-            "content": (
-                "Respond with ONLY a single JSON object matching this schema, "
-                f"and no other text:\n{schema}"
-            ),
-        }]
+        litellm_messages = _with_schema_instruction(
+            LiteLLMMessageSerializer.serialize(messages),
+            "Respond with ONLY a single JSON object matching this schema, "
+            f"and no other text:\n{schema}")
 
         params: dict = {
             "model": self.model,

@@ -2,6 +2,7 @@
 already-configured provider (no second LLM credential path) and charges
 every call to the caller's existing turn budget, so a browsing task can't
 spend tokens the user's budget ceiling doesn't know about."""
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -282,3 +283,134 @@ async def test_non_structured_calls_are_unaffected_by_the_fallback(monkeypatch):
     result = await model.ainvoke([])
 
     assert result.completion == "done"
+
+
+# --- the schema instruction must not displace the system message -------------
+# The json_object fallback appended its schema instruction as a *trailing*
+# system message. Several OpenAI-compatible servers reject that outright with
+# "System message must be at the beginning" - observed on a llama.cpp/llama-swap
+# box serving Qwen3.8-27B, and on Ollama Cloud serving GLM. Every fallback
+# attempt then failed with a BadRequestError and browser-use retried it 6
+# times, so the fallback was broken for the very provider class it exists for.
+# Keeping any system message at index 0 is accepted everywhere, so that is the
+# invariant these tests pin - not one vendor's wording.
+
+def _fallback_probe(monkeypatch, messages):
+    """Run the json_object fallback and return the messages it sent."""
+    from pydantic import ValidationError
+
+    model = Agent8088ChatModel(model="openai/glm-5.3-flash", budget=None)
+
+    async def fake_super_ainvoke(self, msgs, output_format=None, **kwargs):
+        try:
+            output_format.model_validate_json("not json at all")
+        except ValidationError as exc:
+            raise exc from None
+
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+    monkeypatch.setattr(
+        "agent8088.browser_llm.LiteLLMMessageSerializer.serialize",
+        staticmethod(lambda _m: messages), raising=True)
+
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"thinking": "ok", "answer": "done"}'))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    return model, calls
+
+
+@pytest.mark.asyncio
+async def test_no_system_message_appears_after_the_first_position(monkeypatch):
+    model, calls = _fallback_probe(monkeypatch, [
+        {"role": "system", "content": "You are a browser agent."},
+        {"role": "user", "content": "current state"},
+    ])
+
+    await model.ainvoke([], output_format=_Output)
+
+    sent = calls[0]["messages"]
+    later_roles = [m["role"] for m in sent[1:]]
+    assert "system" not in later_roles, f"system message not at the front: {later_roles}"
+
+
+@pytest.mark.asyncio
+async def test_the_schema_instruction_still_reaches_the_model(monkeypatch):
+    model, calls = _fallback_probe(monkeypatch, [
+        {"role": "system", "content": "You are a browser agent."},
+        {"role": "user", "content": "current state"},
+    ])
+
+    await model.ainvoke([], output_format=_Output)
+
+    blob = json.dumps(calls[0]["messages"])
+    assert "single JSON object" in blob
+    # and the original system text is not thrown away
+    assert "You are a browser agent." in blob
+
+
+@pytest.mark.asyncio
+async def test_a_leading_system_message_is_preserved_not_replaced(monkeypatch):
+    model, calls = _fallback_probe(monkeypatch, [
+        {"role": "system", "content": "ORIGINAL RULES"},
+        {"role": "user", "content": "state"},
+    ])
+
+    await model.ainvoke([], output_format=_Output)
+
+    head = calls[0]["messages"][0]
+    assert head["role"] == "system"
+    assert "ORIGINAL RULES" in json.dumps(head["content"])
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_with_no_system_message_gets_one_at_the_front(monkeypatch):
+    model, calls = _fallback_probe(monkeypatch, [
+        {"role": "user", "content": "state"},
+    ])
+
+    await model.ainvoke([], output_format=_Output)
+
+    sent = calls[0]["messages"]
+    assert sent[0]["role"] == "system"
+    assert "single JSON object" in json.dumps(sent[0]["content"])
+    assert [m["role"] for m in sent[1:]] == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_multimodal_system_content_is_handled_without_crashing(monkeypatch):
+    """browser-use can serialize content as a list of parts, not a bare string."""
+    model, calls = _fallback_probe(monkeypatch, [
+        {"role": "system", "content": [{"type": "text", "text": "RULES"}]},
+        {"role": "user", "content": "state"},
+    ])
+
+    await model.ainvoke([], output_format=_Output)
+
+    sent = calls[0]["messages"]
+    assert [m["role"] for m in sent] == ["system", "user"]
+    blob = json.dumps(sent[0]["content"])
+    assert "RULES" in blob and "single JSON object" in blob
+
+
+@pytest.mark.asyncio
+async def test_the_callers_message_list_is_not_mutated(monkeypatch):
+    original = [
+        {"role": "system", "content": "RULES"},
+        {"role": "user", "content": "state"},
+    ]
+    model, calls = _fallback_probe(monkeypatch, original)
+
+    await model.ainvoke([], output_format=_Output)
+
+    assert original == [
+        {"role": "system", "content": "RULES"},
+        {"role": "user", "content": "state"},
+    ]
