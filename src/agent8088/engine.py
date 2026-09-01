@@ -7455,13 +7455,16 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 
 CLI_ANYTHING_MIN_TURNS = 20
 CLI_ANYTHING_MAX_TURNS = 60
-# Was CAD_PROJECT_MIN_TURNS = 24, sized for the deleted staged
+# Was a bare CAD_PROJECT_MIN_TURNS = 24 constant, sized for the deleted staged
 # cad_project_create/add_component/finalize architecture, where one tool call
 # did a whole build stage. The current architecture drives raw
 # execute_shell/write_file, which costs several turns per build step instead
 # of one -- confirmed live against a 12-solid mechanism that hit the old floor
-# with real repair work still outstanding.
-CAD_GENERATION_MIN_TURNS = 40
+# with real repair work still outstanding. Configurable like
+# cad_scoped_shell_timeout_seconds below, rather than hardcoded, so it can be
+# tuned (or lowered) from config.txt/GUI without a code change; /maxturns still
+# raises it further for the whole session if set higher.
+CAD_GENERATION_MIN_TURNS = int(APP_CONFIG.get("cad_generation_min_turns", "40"))
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
