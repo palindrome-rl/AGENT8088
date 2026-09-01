@@ -1264,9 +1264,18 @@ def _is_cad_scoped_command(command: str) -> bool:
     parts = _shell_parts(command)
     if len(parts) < 2:
         return False
+    # On Windows `_shell_parts` splits with posix=False, which keeps the quotes
+    # on each token. Quoting is not optional here -- the install path routinely
+    # contains spaces -- so without this every real invocation resolved to a
+    # nonsense relative path and the guard rejected it.
+    def _unquote(token: str) -> str:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            return token[1:-1]
+        return token
+
     try:
-        executable = Path(parts[0]).resolve()
-        script = Path(parts[1]).resolve()
+        executable = Path(_unquote(parts[0])).resolve()
+        script = Path(_unquote(parts[1])).resolve()
     except OSError:
         return False
     try:
@@ -1276,11 +1285,17 @@ def _is_cad_scoped_command(command: str) -> bool:
     if executable != cad_python:
         return False
     scripts_dir = _cad_skill_scripts_dir().resolve()
+    if script == scripts_dir:
+        return False
     try:
         script.relative_to(scripts_dir)
     except ValueError:
         return False
-    return script.is_file()
+    # Upstream ships each entry point as a package directory (`scripts/gen/`
+    # with __main__.py), not a module file, and `python <dir>` runs its
+    # __main__. Requiring is_file() here rejected every real invocation, so the
+    # auto-approval never fired and CAD commands fell back to normal prompting.
+    return script.is_file() or (script / "__main__.py").is_file()
 
 
 def _is_fixed_host_tool_command(command: str) -> bool:
