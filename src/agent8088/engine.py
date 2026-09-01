@@ -7562,10 +7562,14 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
             "the user declined visual review, hand generated CAD to the Viewer before the final answer."
         )
     lines.append(
-        "- For a multi-solid assembly, build and validate one named solid at a time "
-        "(write, gen, inspect validate) before combining them -- do not write the whole "
-        "assembly as one file and validate everything at the end. Diagnose and repair a "
-        "failing solid immediately, before moving to the next one."
+        "- For a multi-solid assembly, before writing any generator source use write_file "
+        "to create <name>.plan.md next to it: a checklist of every named solid in build "
+        "order, one line each. Build and validate one named solid at a time (write, gen, "
+        "inspect validate) -- do not write the whole assembly as one file and validate "
+        "everything at the end. After each solid passes validation, use write_file to check "
+        "it off in <name>.plan.md before starting the next one; if a solid fails, repair and "
+        "re-validate it before moving on. Re-read <name>.plan.md with read_text if you are "
+        "unsure which solids remain."
     )
     lines.append(
         "- If a script call fails, read the error and fix the named field/component once. "
