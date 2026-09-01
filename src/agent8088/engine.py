@@ -7455,7 +7455,13 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 
 CLI_ANYTHING_MIN_TURNS = 20
 CLI_ANYTHING_MAX_TURNS = 60
-CAD_PROJECT_MIN_TURNS = 24
+# Was CAD_PROJECT_MIN_TURNS = 24, sized for the deleted staged
+# cad_project_create/add_component/finalize architecture, where one tool call
+# did a whole build stage. The current architecture drives raw
+# execute_shell/write_file, which costs several turns per build step instead
+# of one -- confirmed live against a 12-solid mechanism that hit the old floor
+# with real repair work still outstanding.
+CAD_GENERATION_MIN_TURNS = 40
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
@@ -7556,6 +7562,12 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
             "the user declined visual review, hand generated CAD to the Viewer before the final answer."
         )
     lines.append(
+        "- For a multi-solid assembly, build and validate one named solid at a time "
+        "(write, gen, inspect validate) before combining them -- do not write the whole "
+        "assembly as one file and validate everything at the end. Diagnose and repair a "
+        "failing solid immediately, before moving to the next one."
+    )
+    lines.append(
         "- If a script call fails, read the error and fix the named field/component once. "
         "Do not rewrite the entire design or keep retrying the same broken approach."
     )
@@ -7583,7 +7595,7 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
         if _cli_anything_requested(messages) else max_turns
     )
     if _cad_generation_requested(messages):
-        limit = max(limit, CAD_PROJECT_MIN_TURNS)
+        limit = max(limit, CAD_GENERATION_MIN_TURNS)
     return limit
 
 
