@@ -1,10 +1,23 @@
-# Upstream CAD components
+# Upstream CAD skill
 
-- `build123d` 0.11.1 — https://github.com/gumyr/build123d — Apache-2.0.
-- `cadgen` 0.4.28 and the adapted CAD workflow/snapshot/Viewer assets from
-  `earthtojake/text-to-cad` — https://github.com/earthtojake/text-to-cad — MIT.
+- Source: https://github.com/earthtojake/text-to-cad, `skills/cad/`
+- Pinned commit: `0e94cd1d2b5fa2013d89aa9504ecadcf16ce39f6` (same commit already verified
+  for the vendored `cad-viewer` skill)
+- License: MIT (`LICENSE` in this directory, unmodified)
 
-Agent8088 pins these versions in an isolated runtime. The text-to-cad snapshot
-assets are redistributed with their MIT license in
-`agent8088/cad_snapshot_runtime/TEXT_TO_CAD_LICENSE.txt`; the Viewer installer
-also verifies a pinned upstream commit/archive hash and installs its LICENSE.
+This directory is a verbatim, unmodified copy of upstream's `skills/cad/` at the pinned
+commit -- SKILL.md, references/, scripts/ (including the vendored `scripts/packages/`
+subtree providing `inspect_refs`, a source copy of `cadgen`, and `cadjs`), agents/,
+requirements.txt, and LICENSE. Agent8088 does not maintain a separate hand-ported version
+of this skill; the model drives it via the generic `execute_shell`/`write_file` tools,
+exactly as it would in any other coding agent that installs this skill (Claude Code, Codex,
+Grok Build). Only `open_cad_viewer` (Agent8088's own tool, backed by the separately
+vendored `cad-viewer` skill) is not part of this tree.
+
+`scripts/inspect/__main__.py` prefers its own vendored `scripts/packages/cadgen` over the
+CAD runtime venv's pip-installed `cadgen==0.4.28` when both are present. This vendored copy
+is untouched from upstream and is not asserted to match the pinned pip version exactly --
+`tests/test_cad_skill_scripts.py` covers the actual invocation path used at runtime.
+
+To update: re-run the vendor step against a newer commit, replace this directory wholesale
+(do not hand-edit inside it), and update the pinned commit above.

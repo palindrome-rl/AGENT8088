@@ -22,7 +22,7 @@ def test_windows_installer_pins_both_engines_and_smoke_tests_geometry():
     assert "cad_runtime_requirements.txt" in INSTALLER
     assert '@("python", "install", "3.11")' in INSTALLER
     assert '@("venv", "--python", "3.11"' in INSTALLER
-    assert "cad_worker.py" in INSTALLER
+    assert "skills_installed\\cad\\scripts\\gen" in INSTALLER
     assert "verify_cad_runtime.py" in INSTALLER
     assert "install_cad_viewer.py" in INSTALLER
     assert '"--viewer-root", $viewerRoot' in INSTALLER

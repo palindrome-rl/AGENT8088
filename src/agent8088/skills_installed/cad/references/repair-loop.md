@@ -1,94 +1,91 @@
-# Repair loop (Agent8088 port)
+# Repair loop
 
-Read this file when a `generate_cad_design` / `generate_cad_model` /
-`validate_cad_model` call fails. Ported from earthtojake/text-to-cad's CAD
-skill (MIT); tool names adapted to Agent8088's sandboxed CAD tools. Agent8088
-caps generation attempts per turn (configurable via
-`cad_max_generation_attempts` in config.txt), so each retry must be a genuine
-diagnosis, not a variant shot.
+Read this file when generation, export, inspection, positioning, snapshot review, CAD Viewer setup, or documentation validation fails.
 
 ## Loop
 
-1. Read the failing tool output.
-2. Classify the failure (below).
-3. Make the smallest responsible source or design change — repair only the
-   named field or component; do not rewrite the whole design.
-4. Regenerate.
-5. Rerun the failed validation plus any dependent checks.
+1. Read the failing command output.
+2. Classify the failure.
+3. Make the smallest responsible source or command change.
+4. Rerun the failed command.
+5. Rerun any dependent validation checks.
 6. Report remaining risk or deliberate deviations.
 
 ## Failure classes and fixes
-
-### Schema/declarative design errors (generate_cad_design)
-
-Likely causes:
-
-- unknown parameter referenced in an expression
-- unsupported primitive type (declarative schema: box, cylinder, sphere, cone,
-  tube)
-- non-positive dimension
-- components overlap volumetrically (interference) without an allowed_contact
-  declaration
-- wrong solid count (parts accidentally fused or omitted)
-
-Fix:
-
-- correct only the named schema field or component
-- for interference: separate the solids, fuse the intruding feature into its
-  parent's component, or declare the pair via allowed_contact when the overlap
-  is a genuine intended contact (pin through bore, press-fit)
-- for wrong solid count: check whether parts were accidentally fused or omitted
-
-### Source import or syntax failure (generate_cad_model)
-
-Likely causes:
-
-- invalid Python syntax
-- disallowed import (only build123d, math, dataclasses, typing are permitted)
-- private/dunder or file-capable method usage (rejected by the AST validator)
-- function not named `gen_step()` with no arguments
-- `PARAMS` redefined (it is injected; never redefine it)
-
-Fix:
-
-- correct imports and syntax
-- ensure `gen_step()` returns the STEP-ready shape or labeled compound
-- keep every export in the tool's hands; the generator only constructs geometry
 
 ### Multi-section loft: "Failed to create valid loft" / "Recovery failed"
 
 The message names neither the station nor the cause. Two checks, in this order:
 
 1. **Loft increasing PREFIXES** (`faces[:5]`, `[:10]`, `[:20]`, …) to bracket
-   where it breaks, and watch the reported volume as well as the exception.
+   where it breaks, and watch the reported volume as well as the exception — a
+   loft that "succeeds" with an absurd volume is already failing.
 2. **Loft every ADJACENT PAIR.** If every pair succeeds but the full set fails,
-   the sections disagree on POINT COUNT. Guarantee a fixed sample count per
+   the sections are individually fine and the problem is global — almost always
+   that sections disagree on POINT COUNT. Guarantee a fixed sample count per
    section.
 
 Two silent causes worth ruling out before either:
 
-- **A section that is genuinely disconnected** (two closed regions) produces a
+- **A section that is genuinely disconnected** (two closed regions — e.g. a
+  station cutting two separate nacelles, or crossing an open slot) produces a
   `Face` that raises nothing and reports a plausible area; only `Face.is_valid`
-  is False. End the loft at the last connected station, or bridge the gap in
-  the section and cut it back afterwards. (`Face.is_valid` is a PROPERTY —
-  calling `f.is_valid()` raises `TypeError: 'bool' object is not callable`.)
+  is False. The loft then fails dozens of stations away. End the loft at the last
+  connected station, or bridge the gap in the section and cut it back afterwards.
+  (`Face.is_valid` is a PROPERTY — calling `f.is_valid()` raises
+  `TypeError: 'bool' object is not callable`, which reads like a corrupt object.)
 - **Samples dropped where a component does not exist** make counts vary station
   to station. Carry a value rather than dropping the sample.
 
-### Boolean failure
+### Boolean against a large lofted surface never returns
+
+A subtract against a single large B-spline surface costs a full-surface
+classification PER TOOL and grows superlinearly in tool count — measured on one
+~4,900-control-point skin: 1 tool 24 s, 4 tools 70 s, 41 tools did not finish in
+15 minutes, and a 44-tool build ran over seven hours without completing. Batching
+into one list operand does NOT help; the cost is per tool, not per accumulation.
+
+Confirm rather than guess: the process stays at ~100 % CPU with the progress file
+frozen on its first phase, and a stack sample shows `Extrema_ExtPS::Perform` with
+`BSplSLib_Cache::BuildCache` rebuilding on nearly every evaluation.
+
+Fix by not cutting: shallow cosmetic recesses do not need to be booleans at all.
+At 19 m rendered to 1920 px, 1 px is ~10 mm, so a 4 mm groove is sub-pixel and
+reads only because the edge overlay draws feature edges. Keep booleans for
+openings that change the silhouette, and build the rest additively.
+
+### Source import or syntax failure
 
 Likely causes:
 
-- coincident or coplanar tool/target faces
-- near-tangent surfaces
-- tools overlapping each other in one batch
+- invalid Python syntax
+- missing import
+- wrong build123d symbol
+- function not named `gen_step()`
+- executable code outside the intended function has side effects
 
 Fix:
 
-- enlarge or offset the tool so faces cross instead of touch (extend ~1 mm
-  beyond both faces for through-cuts)
-- pass boolean tools in ONE list operand, not pairwise accumulation
-- split tool families into staged subtracts when a batch returns slivers
+- correct imports and syntax
+- ensure `gen_step()` returns the STEP-ready shape or compound
+- keep output paths in CLI commands, not inside `gen_step()`
+
+### Invalid or missing geometry
+
+Likely causes:
+
+- open sketch
+- subtractive profile outside target
+- zero thickness
+- boolean operation failed
+- construction geometry used as exported geometry
+
+Fix:
+
+- close profiles intended to become faces
+- verify dimensions are positive
+- make subtractive tools pass through when through-cuts are intended
+- simplify the failing feature and rebuild incrementally
 
 ### Fillet or chamfer failure
 
@@ -100,61 +97,43 @@ Likely causes:
 
 Fix:
 
-- reduce radius/length (retry at half radius once, then degrade — see the
-  build123d-modeling reference `safe_fillet` pattern)
+- reduce radius/length
 - filter selected edges more narrowly
 - apply fillets later in the model
 - split edge groups by feature intent
-- do not 3D-chamfer tangent chains or multi-arc outlines; bake the bevel into
-  the section profile instead
-
-### Invalid or missing geometry
-
-Likely causes:
-
-- open sketch
-- subtractive profile outside target
-- zero thickness
-- inverted solid (positive volume check)
-
-Fix:
-
-- close profiles intended to become faces
-- verify dimensions are positive
-- make subtractive tools pass through when through-cuts are intended
-- simplify the failing feature and rebuild incrementally
 
 ### Wrong scale or bounding box
 
 Likely causes:
 
-- units mismatch (declarative schema is millimetres only)
+- units mismatch
 - mistaken diameter/radius
 - extrusion direction or amount wrong
-- centered vs MIN-aligned origin confusion
+- part not centered as assumed
+- direct imported STEP uses unexpected units
 
 Fix:
 
 - check parameter values
-- measure critical extents against the reported bounding box
-- correct source dimensions; never rotate the preview to hide an axis problem
+- inspect facts and planes
+- measure critical extents
+- correct source dimensions or import handling
 
-### Assembly interference failure
+### Missing feature
 
 Likely causes:
 
-- separate solids volumetrically overlapping (ribs/bosses placed as siblings
-  instead of fused into the parent)
-- pins/bolts modeled without clearance inside their bores
-- forgotten clearance between moving parts
+- wrong `Mode.ADD`/`Mode.SUBTRACT`
+- feature profile not inside target
+- blind cut too shallow
+- selector changed after prior operation
 
 Fix:
 
-- fuse ribs/gussets into their parent component so the pair disappears
-- model hole radius = shaft radius + clearance from named parameters
-- if the overlap is a genuine intended contact (pin through bore, press-fit),
-  declare the pair via allowed_contact in the design; every undeclared pair
-  still fails the check
+- confirm feature mode
+- increase cut length for through-cuts
+- inspect topology or planes
+- regenerate and measure/check feature-specific refs
 
 ### Selector fragility
 
@@ -166,27 +145,66 @@ Likely causes:
 
 Fix:
 
-- select by axis, plane, position, normal, or bounding position
-- re-select after every boolean or fillet
+- select by axis, plane, position, normal, or inspected reference
+- use `refs --facts --planes --positioning` to rediscover stable references
 - add construction datums or simplify operations if needed
 
-### Wrong placement
+### Positioning or joint mismatch
 
-Fix the local coordinate frame rather than adding a compensating transform at
-the end. Build at the origin, transform, then place.
+Likely causes: wrong part-local origin or datum, reversed `AssemblyHelper` fixed/moving order, `.connect_to()` moving the wrong part, inverted joint axis, sign errors in symmetric placement, an explicit `Location` not recomputed after a parameter change, or a joint defined in world coordinates when a part-local datum was intended.
+
+Fix:
+
+- inspect `refs --positioning`, then `frame` and `align` on the relevant selectors
+- verify the source-level `AssemblyHelper` target order, joint labels, and `joint_location` definitions
+- apply the smallest source correction from the list in `positioning.md` (Source-level positioning corrections)
+- regenerate the assembly from the Python source and rerun the failed check
+
+### CAD Viewer startup or link failure
+
+Likely causes:
+
+- Node/npm unavailable
+- CAD Viewer app not built or cannot start
+- Viewer URL path is not the project's absolute model directory
+- returned link is missing `?file=`, or its `file=` is not relative to that directory
+
+Fix:
+
+- rebuild each link as `<viewer-origin><absolute-model-directory>?file=<path relative to it>`
+- return one documented Viewer link per requested file
+- if unresolved, report the startup failure and rely on CLI facts/measurements plus snapshots for validation
+
+### CAD `scripts/snapshot` failure
+
+Likely causes:
+
+- target input path is wrong, missing, or not a STEP/STP file or same-stem Python generator
+- adjacent CAD Viewer GLB/topology artifact missing
+- invalid render flags
+
+Fix:
+
+- generate STEP first, then snapshot the primary `.step`/`.stp` artifact
+- retry only with simpler supported snapshot jobs, starting with a single `view` output before wireframe display or `section`
+- choose modes and packet size per `snapshot-review.md`
+
+## Diff after repair
+
+Use `diff` when the fix might have affected unrelated geometry:
+
+```bash
+python scripts/inspect diff path/to/before.step path/to/after.step --planes
+```
 
 ## Reporting failed repairs
 
-If a check cannot be repaired within the turn's attempt budget, report:
+If a check cannot be repaired in the current environment, report:
 
 ```text
 - what failed
 - what was tried
-- which artifact is still usable (STEP, report.json, preview.png are preserved)
+- which artifact is still usable
 - which validation claims cannot be made
 - what the next source-level correction should be
 ```
-
-Never claim success from a Python exit code. The CAD tools reopen the exported
-STEP, validate BREP topology, and render a snapshot; report their actual
-result.

@@ -1165,7 +1165,7 @@ install_cad_runtime() {
         fi
     fi
 
-    # Real worker round trip: build, export, reopen, validate, and render.
+    # Real round trip: gen, validate, reopen, and render via the vendored CAD skill scripts.
     _rc=0
     run_with_timeout 300 "$_py" -I "$_verifier" \
         --viewer-root "$_viewer_root" >/dev/null 2>&1 || _rc=$?

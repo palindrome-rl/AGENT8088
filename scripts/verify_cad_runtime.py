@@ -133,67 +133,46 @@ def main(argv=None) -> int:
     parser.add_argument("--viewer-root", type=Path, required=True)
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
-    worker = root / "src" / "agent8088" / "cad_worker.py"
+    scripts_dir = root / "src" / "agent8088" / "skills_installed" / "cad" / "scripts"
     with tempfile.TemporaryDirectory(prefix="agent8088-cad-smoke-") as raw:
         workspace = Path(raw)
+        source = workspace / "box.step.py"
         output = workspace / "box.step"
-        request = workspace / "request.json"
-        request.write_text(
-            json.dumps({
-                "action": "primitive",
-                "shape": "box",
-                "dimensions": {"length": 2, "width": 3, "height": 5},
-                "output": str(output),
-                "workspace": str(workspace),
-            }),
+        # Same exact invocation shape the model is told to use
+        # (_cad_runtime_instruction in engine.py) -- this is the acceptance
+        # gate for the path the model actually runs, not a parallel one.
+        source.write_text(
+            "from build123d import Box\n\nPARAMS = {}\n\n\ndef gen_step():\n"
+            "    return Box(2, 3, 5)\n",
             encoding="utf-8",
         )
         completed = subprocess.run(
-            [sys.executable, "-I", str(worker), str(request)],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
+            [sys.executable, str(scripts_dir / "gen"), "box.step.py", "--write", "--json"],
+            capture_output=True, text=True, timeout=180, check=False, cwd=str(workspace),
+        )
+        if completed.returncode or not output.is_file():
+            print(completed.stdout, file=sys.stderr)
+            print(completed.stderr, file=sys.stderr)
+            return completed.returncode or 1
+
+        completed = subprocess.run(
+            [sys.executable, str(scripts_dir / "inspect"), "validate", "box.step.py"],
+            capture_output=True, text=True, timeout=180, check=False, cwd=str(workspace),
         )
         if completed.returncode:
             print(completed.stdout, file=sys.stderr)
             print(completed.stderr, file=sys.stderr)
             return completed.returncode
-        report = workspace / "box.report.json"
-        preview = workspace / "box.preview.png"
-        request.write_text(
-            json.dumps({
-                "action": "validate",
-                "input": str(output),
-                "report": str(report),
-                "preview": str(preview),
-                "workspace": str(workspace),
-            }),
-            encoding="utf-8",
-        )
-        completed = subprocess.run(
-            [sys.executable, "-I", str(worker), str(request)],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
-        if completed.returncode:
-            print(completed.stdout, file=sys.stderr)
-            print(completed.stderr, file=sys.stderr)
-            return completed.returncode
+        validity = json.loads(completed.stdout)
+        assert validity["ok"] is True and validity["failureCount"] == 0
 
         from build123d import import_step
 
         reopened = import_step(output)
         assert len(reopened.solids()) == 1
         assert abs(reopened.volume - 30) < 1e-6
-        assert report.stat().st_size > 0
-        assert preview.stat().st_size > 0
-        payload = json.loads(report.read_text(encoding="utf-8"))
-        assert payload["validity"]["ok"] is True
         _viewer_smoke(args.viewer_root, workspace, output)
-        print("CAD runtime worker/export/reopen/render/viewer round trip: OK")
+        print("CAD runtime gen/validate/reopen/viewer round trip: OK")
     return 0
 
 

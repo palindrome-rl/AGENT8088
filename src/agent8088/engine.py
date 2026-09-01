@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cad, cad_project, cli_anything, documents, memory, web_search
+from agent8088 import cad, cli_anything, documents, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -346,6 +346,13 @@ MAX_DOCUMENT_BYTES = int(APP_CONFIG.get("max_document_bytes", str(25 * 1024 * 10
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
 MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "300")))
+# A CAD-scoped script call (scripts/gen on a complex lattice, etc.) can
+# legitimately run longer than the generic shell ceiling -- mirrors the old
+# the old cad_project_finalize/generate_cad_model tool timeouts (600-900s).
+CAD_SCOPED_SHELL_TIMEOUT_SECONDS = max(
+    MAX_TOOL_TIMEOUT_SECONDS,
+    int(APP_CONFIG.get("cad_scoped_shell_timeout_seconds", "900")),
+)
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
@@ -1243,6 +1250,39 @@ def _local_shell_reads_files(command: str) -> bool:
     )
 
 
+def _cad_skill_scripts_dir() -> Path:
+    return SKILLS_DIR / "cad" / "scripts"
+
+
+def _is_cad_scoped_command(command: str) -> bool:
+    """True only for `<cad venv python> <script under the vendored cad skill's
+    scripts/>  [args...]` -- the one shape auto-approved on CAD turns in any
+    permission mode (check_permission) and exempted from the CAD-turn shell
+    block (_run_agent_loop). `_shell_parts` already rejects any command
+    containing shell metacharacters/chaining (`_SHELL_CONTROL_RE`), so a
+    second command cannot be smuggled past this check."""
+    parts = _shell_parts(command)
+    if len(parts) < 2:
+        return False
+    try:
+        executable = Path(parts[0]).resolve()
+        script = Path(parts[1]).resolve()
+    except OSError:
+        return False
+    try:
+        cad_python = Path(cad.cad_runtime_python()).resolve()
+    except Exception:
+        return False
+    if executable != cad_python:
+        return False
+    scripts_dir = _cad_skill_scripts_dir().resolve()
+    try:
+        script.relative_to(scripts_dir)
+    except ValueError:
+        return False
+    return script.is_file()
+
+
 def _is_fixed_host_tool_command(command: str) -> bool:
     """Whether this is verbatim the command of a host tool that takes no arguments.
 
@@ -1272,6 +1312,13 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
+    # A CAD-scoped script invocation is auto-approved in every permission
+    # mode -- upstream's text-to-cad workflow is many small script calls
+    # (gen, inspect, snapshot, ...) and prompting per call would reintroduce
+    # the escalation-turn tax this design exists to avoid. The scope check
+    # itself is the security boundary (_is_cad_scoped_command), not the mode.
+    if mode == "shell" and _is_cad_scoped_command(command):
+        return True
     # Read-only subagents may execute verification commands only when the
     # backend guarantees isolation. Their disposable workspace is prepared by
     # _exec_sandbox_command; host execution never enters this exception.
@@ -2131,207 +2178,6 @@ def build_tools_def(tool_specs: dict) -> list:
             for param in spec["args"]:
                 arg_types = spec.get("arg_types", {})
                 props[param] = {"type": arg_types.get(param, "string")}
-            if name == "generate_cad_design" and "design" in props:
-                # A nested object is materially more reliable than asking the
-                # model to JSON-escape an entire CAD program inside a string.
-                # Keep this schema intentionally bounded to the operations the
-                # reviewed compiler actually implements.
-                scalar = {"oneOf": [{"type": "number"}, {"type": "string"}]}
-                vector = {"type": "array", "items": scalar, "minItems": 3,
-                          "maxItems": 3}
-                primitive = {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string", "enum": [
-                            "box", "cylinder", "sphere", "cone", "tube",
-                        ]},
-                        "size": vector,
-                        "radius": scalar,
-                        "radius1": scalar,
-                        "radius2": scalar,
-                        "outer_radius": scalar,
-                        "inner_radius": scalar,
-                        "height": scalar,
-                        "at": vector,
-                        "rotate": vector,
-                        "placements": {"type": "array", "items": vector},
-                    },
-                    "required": ["type"],
-                    "additionalProperties": False,
-                }
-                bbox_check = {
-                    "type": "object",
-                    "properties": {
-                        "size": vector,
-                        "min": vector,
-                        "max": vector,
-                    },
-                    "additionalProperties": False,
-                }
-                component_check = {
-                    "type": "object",
-                    "properties": {
-                        "solid_count": {"type": "integer", "minimum": 1},
-                        "bounding_box": bbox_check,
-                    },
-                    "additionalProperties": False,
-                }
-                props["design"] = {
-                    "type": "object",
-                    "properties": {
-                        "schema_version": {"type": "integer", "enum": [1]},
-                        "name": {"type": "string"},
-                        "units": {"type": "string", "enum": ["mm"]},
-                        "parameters": {"type": "object", "additionalProperties": scalar},
-                        "components": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "add": {"type": "array", "items": primitive,
-                                            "minItems": 1},
-                                    "cut": {"type": "array", "items": primitive},
-                                },
-                                "required": ["name", "add"],
-                                "additionalProperties": False,
-                            },
-                        },
-                        "verification": {
-                            "type": "object",
-                            "minProperties": 1,
-                            "properties": {
-                                "tolerance": scalar,
-                                "overall_bounding_box": bbox_check,
-                                "solid_count": {"type": "integer", "minimum": 1},
-                                "component_count": {"type": "integer", "minimum": 1},
-                                "components": {
-                                    "type": "object",
-                                    "additionalProperties": component_check,
-                                },
-                            },
-                            "additionalProperties": False,
-                        },
-                    },
-                    "required": ["schema_version", "units", "parameters", "components",
-                                 "verification"],
-                    "additionalProperties": False,
-                }
-            if name == "generate_cad_model" and "verification" in props:
-                scalar = {"oneOf": [{"type": "number"}, {"type": "string"}]}
-                vector = {"type": "array", "items": scalar, "minItems": 3,
-                          "maxItems": 3}
-                props["verification"] = {
-                    "type": "object",
-                    "minProperties": 1,
-                    "properties": {
-                        "tolerance": scalar,
-                        "overall_bounding_box": {
-                            "type": "object",
-                            "properties": {
-                                "size": vector, "min": vector, "max": vector,
-                            },
-                            "additionalProperties": False,
-                        },
-                        "solid_count": {"type": "integer", "minimum": 1},
-                    },
-                    "additionalProperties": False,
-                }
-            if name in {
-                "cad_project_create", "cad_project_add_component", "cad_project_finalize",
-            }:
-                scalar = {"oneOf": [{"type": "number"}, {"type": "string"}]}
-                vector = {
-                    "type": "array", "items": scalar, "minItems": 3, "maxItems": 3,
-                }
-                bbox_check = {
-                    "type": "object",
-                    "properties": {"size": vector, "min": vector, "max": vector},
-                    "additionalProperties": False,
-                }
-                component_check = {
-                    "type": "object",
-                    "properties": {
-                        "solid_count": {"type": "integer", "minimum": 1},
-                        "bounding_box": bbox_check,
-                    },
-                    "additionalProperties": False,
-                }
-                project_verification = {
-                    "type": "object",
-                    "properties": {
-                        "tolerance": scalar,
-                        "overall_bounding_box": bbox_check,
-                        "solid_count": {"type": "integer", "minimum": 1},
-                        "component_count": {"type": "integer", "minimum": 1},
-                        "components": {
-                            "type": "object", "additionalProperties": component_check,
-                        },
-                    },
-                    "additionalProperties": False,
-                }
-                port_check = {
-                    "type": "object",
-                    "properties": {"at": vector, "axis": vector},
-                    "required": ["at"],
-                    "additionalProperties": False,
-                }
-                part_schema = {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "kind": {"type": "string"},
-                        "description": {"type": "string"},
-                        "params": {"type": "object"},
-                    },
-                    "required": ["name", "kind"],
-                    "additionalProperties": False,
-                }
-                mate_schema = {
-                    "type": "object",
-                    "properties": {
-                        "type": {
-                            "type": "string",
-                            "enum": ["coaxial", "face_to_face", "press_fit", "gear_mesh"],
-                        },
-                        "a": {"type": "string"},
-                        "b": {"type": "string"},
-                        "module": scalar,
-                        "teeth_a": {"type": "integer", "minimum": 1},
-                        "teeth_b": {"type": "integer", "minimum": 1},
-                    },
-                    "required": ["type", "a", "b"],
-                    "additionalProperties": False,
-                }
-                if "parameters" in props:
-                    props["parameters"] = {"type": "object"}
-                if "verification" in props:
-                    props["verification"] = project_verification
-                if name == "cad_project_create":
-                    if "parts" in props:
-                        props["parts"] = {
-                            "type": "array", "minItems": 1, "items": part_schema,
-                        }
-                    if "mates" in props:
-                        props["mates"] = {"type": "array", "items": mate_schema}
-                if name == "cad_project_add_component":
-                    props["verification"] = {
-                        "type": "object", "minProperties": 1,
-                        "properties": {
-                            "tolerance": scalar,
-                            "overall_bounding_box": bbox_check,
-                            "solid_count": {"type": "integer", "minimum": 1},
-                        },
-                        "additionalProperties": False,
-                    }
-                    if "ports" in props:
-                        props["ports"] = {
-                            "type": "object", "additionalProperties": port_check,
-                        }
-                # cad_project_finalize takes no placement argument at all --
-                # positions come from the mates already declared at create(),
-                # so its only refined property is the inherited "verification".
             params = {"type": "object", "properties": props,
                       "required": required_params(spec)}
         result.append({
@@ -2634,7 +2480,20 @@ def read_skill_resource(name: str, resource: str) -> str:
         raise ValueError("Skill resource must be a supported text file.")
     if target.stat().st_size > _MAX_SKILL_RESOURCE_BYTES:
         raise ValueError("Skill resource is too large to load.")
-    return target.read_text(encoding="utf-8")
+    text = target.read_text(encoding="utf-8")
+    if skill["name"] == "cad" and relative.upper() == "SKILL.MD":
+        # The vendored SKILL.md is generic upstream text -- it has no idea
+        # what this install's CAD python interpreter or scripts/ directory
+        # actually resolve to. Append the concrete paths here too (not only
+        # via _cad_runtime_instruction, which depends on a message-content
+        # classifier that can miss a request): this fires every time the
+        # model actually asks for the skill, regardless of that classifier.
+        text += (
+            "\n\n---\nThis install's concrete paths (use these exactly):\n"
+            f"- CAD python interpreter: {cad.cad_runtime_python()}\n"
+            f"- CAD skill scripts directory: {_cad_skill_scripts_dir()}\n"
+        )
+    return text
 
 
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
@@ -3190,9 +3049,7 @@ _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 # correct work. Excluded here: convert_document checks output_path.exists() and
 # the byte count itself; there is no model-authored logic to second-guess.
 _NON_AUDITABLE_TOOLS = {
-    "convert_document", "convert_cad", "create_cad_part",
-    "generate_cad_design", "generate_cad_model", "validate_cad_model",
-    "cad_project_create", "cad_project_add_component", "cad_project_finalize",
+    "convert_document",
 }
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
@@ -5472,7 +5329,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return f"Unknown tool: {name}"
 
     mode = (spec.get("mode") or "").lower()
-    timeout = min(max(1, int(spec.get("timeout") or 25)), MAX_TOOL_TIMEOUT_SECONDS)
+    _declared_timeout = int(spec.get("timeout") or 25)
+    _timeout_ceiling = MAX_TOOL_TIMEOUT_SECONDS
+    if mode == "shell" and _is_cad_scoped_command(str(args.get("command") or "")):
+        _declared_timeout = max(_declared_timeout, CAD_SCOPED_SHELL_TIMEOUT_SECONDS)
+        _timeout_ceiling = CAD_SCOPED_SHELL_TIMEOUT_SECONDS
+    timeout = min(max(1, _declared_timeout), _timeout_ceiling)
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
     approval_key = _tool_call_key(name, args)
@@ -5882,8 +5744,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
 
     if mode == "read_text":
-        if name == "cad_project_status":
-            return cad_project.status(read_target)
         if name == "open_cad_viewer":
             open_value = str(args.get("open_browser", "true")).strip().lower()
             return cad.open_cad_viewer(
@@ -5928,89 +5788,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if name == "create_document":
             result = documents.build_document(target, content)
             _last_write_diff = None  # binary output — a text diff would be noise
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "cad_project_create":
-            result = cad_project.create(
-                target, str(args.get("name", "")), content,
-                mates=_structured_text_argument(args.get("mates"), "[]"),
-                parameters=_structured_text_argument(args.get("parameters"), "{}"),
-                verification=_structured_text_argument(args.get("verification"), "{}"),
-                formats=str(args.get("formats", "step,stl")),
-            )
-            _last_write_diff = None
-            return result
-        if name == "cad_project_add_component":
-            result = cad_project.add_component(
-                target, str(args.get("name", "")), content,
-                parameters=_structured_text_argument(args.get("parameters"), "{}"),
-                verification=_structured_text_argument(args.get("verification"), "{}"),
-                ports=_structured_text_argument(args.get("ports"), "{}"),
-                timeout=timeout,
-            )
-            _last_write_diff = None
-            return result
-        if name == "cad_project_finalize":
-            result = cad_project.finalize(
-                target, content, str(args.get("formats", "")), timeout=timeout,
-            )
-            _last_write_diff = None
-            return result
-        if name == "convert_cad":
-            result = cad.convert_cad(
-                target, str(args.get("format", "")), timeout=timeout,
-            )
-            _last_write_diff = None  # binary output — a text diff would be noise
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "create_cad_part":
-            result = cad.create_cad_part(target, str(args.get("shape", "")),
-                                         str(args.get("dimensions", "")),
-                                         timeout=timeout)
-            _last_write_diff = None  # binary output — a text diff would be noise
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "generate_cad_model":
-            result = cad.generate_cad_model(
-                target,
-                content,
-                _structured_text_argument(args.get("parameters"), "{}"),
-                str(args.get("formats", "step,stl")),
-                timeout=timeout,
-                verification=_structured_text_argument(
-                    args.get("verification"), "{}"
-                ),
-            )
-            _last_write_diff = None
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "generate_cad_design":
-            result = cad.generate_cad_design(
-                target,
-                content,
-                str(args.get("formats", "step,stl")),
-                timeout=timeout,
-            )
-            _last_write_diff = None
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "validate_cad_model":
-            render_value = str(args.get("render", "true")).strip().lower()
-            result = cad.validate_cad_model(
-                target, render=render_value not in {"0", "false", "no", "off"},
-                timeout=timeout,
-            )
-            _last_write_diff = None
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path instead.")
@@ -7696,8 +7473,22 @@ def _cad_generation_requested(messages: list[dict]) -> bool:
     """
     turns = _genuine_user_turns(messages)
     text = _message_text(turns[-1]) if turns else ""
+    # Broad on purpose: since the skill's scripts/ location and the CAD venv's
+    # interpreter are only ever told to the model via _cad_runtime_instruction
+    # (gated on this classifier), a missed noun here doesn't just lose a nice-
+    # to-have hint -- the model never learns the absolute paths it needs and
+    # is left blind-guessing shell commands (confirmed: "create a 20mm cube"
+    # missed the old cad|step|stl|... list, cost ~25 wasted shell calls
+    # rediscovering paths, and ended up bypassing the vendored skill's own
+    # scripts/gen entirely). Generic shape/mechanical-part nouns are included
+    # alongside the format-specific ones.
     cad_pattern = re.compile(
-        r"\b(?:cad|build123d|text-to-cad|freecad|step|stl|3mf|brep|iges)\b",
+        r"\b(?:cad|build123d|text-to-cad|freecad|step|stl|3mf|brep|iges|"
+        r"gen_step|part|assembly|component|bracket|enclosure|housing|gear|"
+        r"shaft|pin|bolt|screw|nut|washer|bearing|gripper|chuck|fixture|jig|"
+        r"mount|bracket|panel|plate|tube|pipe|flange|hinge|bushing|"
+        r"box|cube|sphere|cylinder|cone|prism|solid|"
+        r"3d[\s-]?(?:model|part|print|design)|mechanism|prototype)\b",
         re.IGNORECASE,
     )
     action_pattern = re.compile(
@@ -7720,86 +7511,40 @@ def _cad_generation_requested(messages: list[dict]) -> bool:
 
 
 def _cad_runtime_instruction(available: set[str] | None = None) -> str:
-    """Small dynamic routing contract with the actual output location.
-
-    The routing line is built from the tools that survived this round's
-    filter. Naming a tool the model cannot call makes it emit a call that
-    comes back "Unknown tool", so the contract tracks the schema instead of
-    describing the full toolset unconditionally.
+    """Routing contract for the vendored text-to-cad skill: the model drives
+    generation via execute_shell/write_file against the skill's own scripts,
+    same as any other coding agent that installs this skill. Only a shell
+    command that exactly invokes <cad python> <script under the vendored
+    skill's scripts/> is auto-approved without a permission prompt
+    (_is_cad_scoped_command) -- anything else on a CAD turn still goes
+    through normal permission gating, same as any other shell/write call.
     """
     available = available if available is not None else set()
-    project_tools = {
-        "cad_project_create", "cad_project_add_component", "cad_project_finalize",
-    }
-    staged = project_tools <= available
-    if staged:
-        project_routing = (
-            "- REQUIRED for every multi-component, movable, robotic, architectural, or "
-            "otherwise complex assembly: use the staged CAD project workflow. Declare the "
-            "WHOLE assembly in one cad_project_create call: every part (kind \"custom\" for "
-            "bespoke geometry, or a warehouse.* kind for a standard fastener/gear -- built "
-            "immediately with zero further calls) plus every mate connecting them. Only "
-            "then call cad_project_add_component, once per remaining \"custom\" part, "
-            "waiting for its validation result before the next one (capped at 3 repair "
-            "attempts per component). Positions are computed from the declared mates, not "
-            "authored by you -- cad_project_finalize takes no placement argument at all, "
-            "only an optional final verification override. Never put a whole assembly in "
-            "generate_cad_model. If work may already exist, call cad_project_status before "
-            "rebuilding it.\n"
+    cad_python = cad.cad_runtime_python()
+    scripts_dir = _cad_skill_scripts_dir()
+    lines = [
+        "CAD EXECUTION CONTRACT (active for this request) -- follow skills_installed/cad/SKILL.md:",
+        f"- CAD python interpreter: {cad_python}",
+        f"- CAD skill scripts directory: {scripts_dir}",
+        f"- Generated/inspected files live in {ARTIFACTS_ROOT} (execute_shell's cwd).",
+        "- Write a gen_step() Python source file with write_file, then run it via "
+        f'execute_shell as exactly: "{cad_python}" "{scripts_dir}/gen" <target.py> --write --json',
+        f'- Inspect/validate with: "{cad_python}" "{scripts_dir}/inspect" refs <target.step> --facts --json, '
+        "and the other inspect/export/snapshot subcommands documented in SKILL.md. "
+        "These exact invocations (python interpreter above, script inside the path above, no shell "
+        "chaining) are auto-approved without a permission prompt; anything else is gated normally.",
+    ]
+    if "open_cad_viewer" in available:
+        lines.append(
+            "- For an existing artifact or after successful generation, use open_cad_viewer "
+            "for interactive review. Do not start a server or browser through a shell. Unless "
+            "the user declined visual review, hand generated CAD to the Viewer before the final answer."
         )
-    else:
-        project_routing = (
-            "- The staged CAD project tools are NOT available. Do not claim that a "
-            "multi-component assembly can be completed in one source-bearing call.\n"
-        )
-    if "generate_cad_design" not in available and not staged:
-        routing = (
-            "- No CAD generation tool is available for the rest of this request. "
-            "Do not call generate_cad_design or generate_cad_model. Report the last "
-            "specific failure and the artifacts already produced.\n"
-        )
-    elif "generate_cad_model" in available:
-        routing = (
-            "- For a SINGLE part, use create_cad_part for one primitive, "
-            "generate_cad_design for boxes/cylinders/spheres/cones/tubes with cuts, or "
-            "generate_cad_model for one part needing fillets, chamfers, sketches, lofts, "
-            "sweeps, shells, or curved profiles. In advanced source, translate with "
-            "Pos(x, y, z) * shape; never call Location(x, y, z) or Location(z=...). "
-            "Every generation call requires request-derived verification, which must never "
-            "be weakened to make incorrect geometry pass.\n"
-            "- PLAN-THEN-EMIT for complex single parts: before your FIRST generation call "
-            "on a feature-heavy request, reply once in plain text (no tool call) with a "
-            "BUILD PLAN of at most 20 lines: named components, a parameter table, "
-            "allowed_contact pairs, datum/orientation convention, and expected bounding "
-            "box. Then, on the next turn, emit ONE complete generate_cad_model call "
-            "implementing exactly that plan — no further prose. Keep the generator "
-            "compact (helpers, loops, parameters); the plan carries the reasoning so "
-            "the code call stays small.\n"
-        )
-    elif "generate_cad_design" in available:
-        routing = (
-            "- For a SINGLE primitive use create_cad_part. For one declarative part use "
-            "generate_cad_design. generate_cad_model is NOT available. Express holes, "
-            "pockets, and repeated features with cut primitives and placements.\n"
-        )
-    else:
-        routing = ""
-    return (
-        "CAD EXECUTION CONTRACT (active for this request):\n"
-        f"- Generated files belong in {ARTIFACTS_ROOT}. Pass a bare .step filename; "
-        "the tool resolves it there. Never guess C:/artifacts or inspect paths with a shell.\n"
-        + project_routing + routing +
-        "- For an existing artifact or after successful generation, use open_cad_viewer "
-        "for interactive review. Do not start a server or browser through a shell. Unless "
-        "the user declined visual review, hand generated CAD to the Viewer before the final answer.\n"
-        "- Keep each model response bounded. For a staged project, call one project tool "
-        "and stop until its result arrives; never emit several component source programs "
-        "in the same response. Use parameters and loops inside each small component.\n"
-        "- Do not use execute_shell, run_sandboxed, or write_file for CAD generation. "
-        "The CAD tools own generation, export, validation, and preview.\n"
-        "- If generation fails, repair the named field/component once. Do not rewrite "
-        "the entire design or keep retrying variants."
+    lines.append(
+        "- If a script call fails, read the error and fix the named field/component once. "
+        "Do not rewrite the entire design or keep retrying the same broken approach."
     )
+    return "\n".join(lines)
 
 
 def _tool_definition_name(definition: dict) -> str:
@@ -7864,7 +7609,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
     cad_failures = 0
-    cad_generation_stopped = False
     # Plan-then-emit gate: after the model has produced text (its BUILD PLAN)
     # on a CAD turn, the next turn gets one nudge to convert the plan into the
     # single generation call. Never blocks a turn that already calls a tool.
@@ -7896,22 +7640,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         if no_execute_shell:
             round_allowed_tools.discard("execute_shell")
         if cad_generation:
-            # CAD creation has purpose-built, bounded tools. Removing generic
-            # execution/write escape hatches prevents path-discovery shell calls
-            # and raw scripts from competing with the verified workflow.
-            round_allowed_tools.difference_update({
-                "execute_shell", "run_sandboxed", "write_file",
-            })
-        if cad_generation_stopped:
-            round_allowed_tools.difference_update({
-                "generate_cad_design", "generate_cad_model",
-            })
-        if cad_decomposition_required:
-            # Once a CAD response has overflowed, the one-shot tools cannot
-            # recover: more tokens merely encourage another monolithic program.
-            round_allowed_tools.difference_update({
-                "generate_cad_design", "generate_cad_model",
-            })
+            # CAD generation is driven by the vendored text-to-cad skill's own
+            # scripts, invoked via execute_shell/write_file (same shape as any
+            # other coding agent running this skill). Only run_sandboxed
+            # (Docker-style isolation) is unneeded here. A CAD-scoped script
+            # call is auto-approved without a prompt (check_permission /
+            # _is_cad_scoped_command); anything else still goes through normal
+            # permission gating like any other shell/write call.
+            round_allowed_tools.discard("run_sandboxed")
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if cad_generation:
@@ -7988,22 +7724,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             )
             if cad_generation:
                 # The truncated content cannot be executed and may be huge.
-                # Drop it so the retry starts from the compact request and
-                # switches to the persistent component workflow.
+                # Drop it so the retry starts from a smaller request.
                 messages.pop()
                 cad_decomposition_required = True
                 retry_instruction = (
-                    f"{warning} Abandon the partial monolithic CAD program. "
-                    "Use the checkpointed CAD project workflow now. Call exactly "
-                    "ONE tool in this response: cad_project_status if a project "
-                    "manifest already exists, otherwise cad_project_create declaring "
-                    "the FULL parts+mates specification in one call (warehouse.* parts "
-                    "build immediately, zero further calls). Subsequent responses must "
-                    "add exactly one remaining custom component at a time with "
-                    "cad_project_add_component and wait for validation before "
-                    "continuing; finish with cad_project_finalize, which needs no "
-                    "placement argument -- positions come from the mates already "
-                    "declared."
+                    f"{warning} Abandon that generator. Write a substantially smaller, "
+                    "simpler gen_step() source (helpers/loops instead of one long "
+                    "unrolled program) with write_file, then run it via "
+                    f'"{cad.cad_runtime_python()}" "{_cad_skill_scripts_dir()}/gen" '
+                    "<target.py> --write --json. Split a complex assembly into separate "
+                    "component source files if needed."
                 )
             elif content:
                 # A genuinely large answer/tool call was in progress.
@@ -8034,25 +7764,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_answer(answer)
             return answer
         if calls:
-            if cad_generation:
-                project_names = {
-                    "cad_project_create", "cad_project_add_component",
-                    "cad_project_finalize", "cad_project_status",
-                }
-                project_calls = [call for call in calls if call["name"] in project_names]
-                if project_calls and len(calls) > 1:
-                    # A staged project call mutates or reads checkpoint state.
-                    # Later calls in the same model response were authored
-                    # without seeing that result, so executing them would make
-                    # component order and repairs nondeterministic.
-                    skipped = len(calls) - 1
-                    calls = [project_calls[0]]
-                    if on_result:
-                        on_result(
-                            "error",
-                            f"Deferred {skipped} CAD tool call(s); staged CAD executes "
-                            "exactly one checkpoint operation per model response.",
-                        )
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
         else:
@@ -8106,13 +7817,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # the user. Bounded: one injection, then the answer flows normally.
             if (cad_generation and not cad_plan_pending and not cad_decomposition_required
                     and answer and len(answer.splitlines()) >= 3
-                    and round_allowed_tools & {"generate_cad_design",
-                                               "generate_cad_model"}):
+                    and "write_file" in round_allowed_tools):
                 cad_plan_pending = True
                 messages.append({"role": "user", "content":
-                    "Plan received — now emit the single generation call "
-                    "(generate_cad_model or generate_cad_design) implementing it. "
-                    "No more prose: one tool call, complete code, no narration."
+                    "Plan received — now write the gen_step() source implementing it "
+                    "with write_file, then run it via the CAD skill's scripts/gen. "
+                    "No more prose: proceed directly, complete code, no narration."
                 })
                 if trace is not None:
                     trace.append({"turn": turn, "type": "cad_plan_ack"})
@@ -8253,18 +7963,21 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 continue
             executed = True
             tool_outputs.append(result)
-            if name in {"generate_cad_design", "generate_cad_model",
-                        "cad_project_add_component"}:
-                if result.startswith(("CAD generation failed", "CAD design generation failed")):
+            if (name == "execute_shell"
+                    and _is_cad_scoped_command(str(args.get("command") or ""))):
+                # Upstream's scripts print a traceback or a JSON {"error": ...}
+                # object on failure rather than a fixed sentinel string (there's
+                # no bespoke "CAD generation failed" wrapper anymore) -- sniff
+                # for either.
+                if "Traceback (most recent call last)" in result or '"error"' in result:
                     cad_failures += 1
                     if (CAD_MAX_GENERATION_ATTEMPTS > 0
                             and cad_failures >= CAD_MAX_GENERATION_ATTEMPTS):
-                        cad_generation_stopped = True
                         result += (
                             f"\nCAD retry budget exhausted after {cad_failures} failed "
-                            "generation attempts. Do not call another generation tool in "
-                            "this turn; report the latest specific failure and preserved "
-                            "artifacts."
+                            "script calls. Do not retry the same approach again this "
+                            "turn; report the latest specific failure and preserved "
+                            "artifacts, or try a substantially simpler generator."
                         )
                 else:
                     cad_failures = 0

@@ -876,7 +876,7 @@ function Install-CadRuntime {
     $runtimeVenv = Join-Path $runtimeRoot "venv"
     $runtimePy = Join-Path $runtimeVenv "Scripts\python.exe"
     $requirements = Join-Path $InstallDir "src\agent8088\cad_runtime_requirements.txt"
-    $worker = Join-Path $InstallDir "src\agent8088\cad_worker.py"
+    $skillGen = Join-Path $InstallDir "src\agent8088\skills_installed\cad\scripts\gen"
     $verifier = Join-Path $InstallDir "scripts\verify_cad_runtime.py"
     $viewerInstaller = Join-Path $InstallDir "scripts\install_cad_viewer.py"
     $viewerRoot = Join-Path $runtimeRoot "viewer"
@@ -895,7 +895,7 @@ function Install-CadRuntime {
     }
 
     if (-not (Test-Path -LiteralPath $requirements) -or
-        -not (Test-Path -LiteralPath $worker) -or
+        -not (Test-Path -LiteralPath $skillGen) -or
         -not (Test-Path -LiteralPath $verifier) -or
         -not (Test-Path -LiteralPath $viewerInstaller)) {
         Register-SkippedStage -Label "Advanced CAD runtime" `

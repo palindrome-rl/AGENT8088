@@ -1,299 +1,121 @@
 ---
 name: cad
-description: Create, inspect, validate, render, and convert mechanical CAD with build123d and text-to-cad's STEP-first workflow — from single primitives to full multi-part mechanisms.
+description: Create, modify, inspect, and validate STEP-first parametric CAD parts and assemblies. Use for natural-language CAD specs, reference images, 2D technical drawings, STEP/STP generation or direct inspection, Python CAD source, source-level joints, selector references, geometry facts, measurements, mating deltas, snapshots, and secondary STL/3MF/native GLB outputs from CAD geometry.
 ---
 
-# CAD
+# CAD generation, inspection, and validation
 
-Agent8088 uses **build123d** as its geometry engine and **text-to-cad/cadgen**
-for STEP-first generation, named assemblies, topology validation, inspection,
-and snapshot review. Do not write FreeCAD Python and do not run CAD source with
-`execute_shell`.
+Provenance: maintained in [earthtojake/text-to-cad](https://github.com/earthtojake/text-to-cad).
+Use the installed local skill files as the runtime source of truth; the
+repository link is only for provenance and release review.
 
-## Tool choice — decision tree
+## Purpose
 
-1. One box, cylinder, sphere, cone, or tube → `create_cad_part`.
-2. Convert an existing supported artifact → `convert_cad`.
-3. Validate or render an existing STEP → `validate_cad_model`.
-4. Open an existing or generated artifact for interactive review →
-   `open_cad_viewer`.
-5. Any part or assembly expressible with boxes, cylinders, spheres, cones,
-   tubes, placements, fusions and cuts (no fillets, chamfers, mirrors, or
-   sketches) → `generate_cad_design` (preferred; type-checked, no
-   model-authored Python).
-6. Every multi-component, movable, robotic, architectural, or otherwise
-   complex assembly → the staged `cad_project_*` workflow (see "Staged
-   assembly workflow" below). Required — never put a whole assembly in one
-   `generate_cad_model` call.
-7. Everything else (a single part) → `generate_cad_model` (full build123d
-   Python via one `gen_step()` function). Route here whenever the brief names
-   fillets, chamfers, mirrors, serrations, ribs, lofts, sweeps, sketches,
-   selectors, gears, threads — or any feature the five declarative primitives
-   cannot express. **When in doubt, use `generate_cad_model`**: it is the
-   universal single-part path and is always available for CAD requests.
+Create or modify parametric CAD models from natural-language requirements, generate validated STEP/STP artifacts, inspect geometry references, and return checked outputs. Treat STEP as the primary CAD artifact. Treat STL, 3MF, and native GLB as secondary export workflows that branch from a STEP-first process. For assemblies, prefer `cadgen.assembly.AssemblyHelper` with source-level build123d joints, named mating datums, and native labels when the parts have functional assembly relationships.
 
-Both complex-model tools generate STEP, export requested secondary formats,
-reopen and validate every solid independently, check bounded assembly
-interference (honoring any declared allowed_contact pairs), and render an
-isometric preview before reporting success. After successful generation, call
-`open_cad_viewer` with the canonical STEP unless the user explicitly declines
-interactive review.
+There are two ways into the STEP workflow: generate from build123d Python source (the default when designing from scratch or modifying a generated model), or import an existing STEP/STP file directly (when no generator exists or the user explicitly targets the STEP file). Both produce the same inspectable artifacts.
 
-## CAD brief before source
+## Use this skill when
 
-Before calling a tool, establish internally (see
-`references/cad-brief.md` for the full template and clarification policy):
+Use this skill when the user asks for CAD files, STEP/STP files, build123d source, selector refs such as `#o1.2.f1`, mechanical parts, assemblies, enclosures, brackets, fixtures, holes, counterbores, countersinks, slots, pockets, bosses, standoffs, ribs, fillets, chamfers, shells, source-level joints, mating, or measurements. Also use it when the user supplies reference images or 2D technical drawings of a part to reproduce or take design intent from.
 
-1. Units (millimetres unless explicitly stated otherwise).
-2. Primary axes, origin, and the functional datum.
-3. Named components and expected solid count — one labeled solid per
-   requested component.
-4. Exposed parameters and derived dimensions.
-5. Fits, clearances, wall thicknesses, tolerances. **Clearance is a named
-   parameter**: `bore_radius = pin_radius + pin_clearance`, never an eyeballed
-   gap.
-6. Intended contacts (pin through bore, press-fit, rib fused into parent) to
-   declare via `allowed_contact`.
-7. Expected overall bounding-box range.
-8. Required formats.
+Also use it when the user asks for STL, 3MF, or native GLB output from CAD geometry. Keep those workflows secondary and load `supported-exports.md` for details. For 2D DXF drawings, use the `$dxf` skill; when a DXF projects from a 3D part, this skill owns the STEP geometry and `$dxf` owns the drawing.
 
-Do not ask a question when the user explicitly asked you to make reasonable
-engineering assumptions. Record those assumptions in the final response.
+Do not use this skill for render-only concept art, CAM toolpaths, engineering certification, FEA conclusions, architectural BIM, or freehand illustration unless the user also needs CAD geometry.
 
-## Declarative design contract (generate_cad_design)
+## Default assumptions
 
-Use a bare filename such as `house.step`; Agent8088 resolves it to its
-artifacts directory. Never guess `C:/artifacts`, call a shell to discover the
-current directory, or write a separate script.
+Use these defaults unless the user specifies otherwise. These are first-pass modeling defaults, not manufacturability, tolerance, or certification claims:
 
-The schema has millimetre units, editable parameters, uniquely named
-components, and arithmetic expressions referencing parameters. Every primitive
-supports `at`, `rotate`, and a compact `placements` array.
+- Units: millimeters.
+- Origin: per the part-type defaults in `references/positioning.md`; center of the main part or assembly when nothing better applies.
+- Base plane: XY.
+- Up/extrusion axis: positive Z.
+- Output geometry: closed, positive-volume solids unless the user requests surfaces or construction geometry.
+- STEP structure: one valid solid, a compound of solids, or a labeled assembly compound.
+- Assembly structure: fixed root part, part-local frames, named mating datums, `AssemblyHelper` relationships backed by build123d joints where applicable, explicit generated placements, and verbose native labels.
+- Small plastic enclosure wall: 2.0-3.0 mm when unspecified.
+- Cosmetic fillet: 1.0-3.0 mm when safe for local geometry.
+- M3/M4/M5 normal clearance holes: 3.4/4.5/5.5 mm unless another standard is requested.
 
-```json
-{
-  "schema_version": 1,
-  "name": "bracket",
-  "units": "mm",
-  "parameters": {"length": 80, "width": 50, "height": 8, "hole_r": 3.4},
-  "components": [{
-    "name": "plate",
-    "add": [{"type": "box", "size": ["length", "width", "height"]}],
-    "cut": [{
-      "type": "cylinder", "radius": "hole_r", "height": "height + 2",
-      "at": [15, 15, -1], "placements": [[0, 0, 0], [50, 0, 0]]
-    }]
-  }],
-  "allowed_contact": [["PivotPins", "LeftPivotSupport"]]
-}
+Ask one focused clarification question only when missing information makes the model impossible, fit-critical, safety-critical, or compliance-bound. Otherwise proceed with explicit assumptions.
+
+## Tools and paths
+
+From the CAD skill directory, the launcher shape is:
+
+```bash
+python scripts/gen ...       # render GLB/topology packages from gen_step() Python sources
+python scripts/export ...    # STL/3MF/GLB mesh files from Python sources or imported STEP
+python scripts/inspect ...   # refs, measure, align, frame, diff
+python scripts/snapshot ...  # PNG/GIF visual review packets
+python scripts/artifact ...  # debug one on-demand render-package build (imported STEP)
 ```
 
-Primitive-specific fields: box `size`; cylinder `radius,height`; sphere
-`radius`; cone `radius1,radius2,height`; tube `outer_radius,inner_radius,
-height`. Use separate named components when the user wants separate solids.
-Avoid overlapping solids; exact touching faces are valid mating contact and
-are not interference. The declarative schema cannot express fillets,
-chamfers, mirrored pairs, or sketch-driven geometry — for those, use
-`generate_cad_model`.
+Use the active project Python interpreter; treat `python` in examples as an interpreter placeholder. Use `python scripts/<tool> --help` for the complete current command interface; reference docs show recommended workflows, not every flag.
 
-## Python source contract (generate_cad_model — universal path)
+**Snapshot inputs.** This skill's snapshot renders `.step`/`.step.py`, `.stp`, `.3mf`, `.glb` and `.stl`. Implicit models and robot descriptions are rendered by the `implicit-cad` and `urdf`/`srdf`/`sdf` skills; the CLI refuses them rather than rendering something it should not.
 
-Pass a `.step` filename, a JSON parameter object, and Python source defining
-exactly one entry point:
+**Theme and display.** Theme settings live under one `--theme`, display settings under one `--display` — the viewer's two tabs, one option each. The default theme is `snapshot`: Workbench Light with the ground grid and origin axis removed, because in a still image those read as geometry rather than as orientation. Pass `--theme workbench-light` for the viewer's own look. Projection is a theme trait honoured by every format, so a snapshot frames the same way the viewport does.
 
-```python
-from build123d import *
+**Streams.** stdout carries the result; stderr carries progress, timing, and failures. Every tool answers on stdout — `gen` prints `<outcome> <package path>` per target — so `2>/dev/null` leaves something parseable and `>/dev/null` leaves a readable log. JSON on stdout is always compact; pipe through `jq .` to read it. The two never interleave, so `2>/dev/null` leaves a clean parseable result and `>/dev/null` leaves a readable log. For machine-readable output: `gen`, `export`, and `snapshot` take `--json`; `inspect` already emits JSON and takes `--format text` for prose. `--verbose` adds stage timing (and full tracebacks) on stderr. Output volume does not grow with model size — a 600-occurrence assembly logs the same dozen lines a single part does.
 
-def gen_step():
-    body = Box(PARAMS["length"], PARAMS["width"], PARAMS["height"])
-    body.label = "body"
-    return body
+**Failures** print the exception and the frames *in your own generator*, not the runtime's:
+
+```text
+[scripts/gen] FAILED: ValueError: bad radius
+[scripts/gen]   models/step/parts/widget.step.py:9 in gen_step
+[scripts/gen]       return _profile(radius)
+[scripts/gen] re-run with --verbose for the full traceback
 ```
 
-The tool injects `PARAMS` from the provided JSON. Never redefine it. `gen_step`
-takes no arguments and returns a build123d `Shape` or a labeled `Compound`
-with one labeled child per requested component.
+**A build waits for a concurrent build of the same model** rather than racing it, and says so on stderr (`waiting for another run to finish building ...`), repeating while it waits. Pass `--lock-timeout SECONDS` to give up instead and report `{"ok":true,"contended":true}`. With `--json`, each target's `outcome` is `built`, `current`, `skipped-peer` (the peer finished and its package is current), or `contended` (the peer is still building and this run declined to wait).
 
-Keep the generator compact. Use small helper functions and loops for repeated
-features instead of emitting nearly identical statements per instance. Make
-one complete `generate_cad_model` call; do not narrate the source before
-calling.
+Target paths resolve from the command's current working directory, not from the skill directory. Run commands from the workspace that owns the artifacts and pass cwd-relative target paths so project CAD files never resolve accidentally under the skill directory. Keep a STEP output and its Python generator in the same directory with the same basename unless the user explicitly requests otherwise.
 
-Allowed imports are build123d, math, dataclasses, and typing. File IO,
-network access, process execution, dynamic imports, private/dunder access, and
-calls such as `open`, `eval`, or `exec` are rejected. The tool owns every
-export; the generator only constructs and returns geometry.
+CAD references are `#...` selector tokens local to a target, for example `#o1.2` or `#o1.2.f1`. Pass the STEP/CAD file as a separate target argument when using CAD CLIs.
 
-**Read `references/build123d-modeling.md` before writing non-trivial
-source.** It carries the hard-won traps: fillet ladders that degrade silently,
-`Plane.rotated()` composing in world axes, `.located()` discarding rotations,
-align datums, multi-tool boolean batching, inverted solids passing validity.
+## Required workflow
 
-## Staged assembly workflow (cad_project_*)
+Scale depth to the task: a simple part needs a short brief and few spec-driven checks; assemblies and fit-critical work need full positioning and alignment validation.
 
-Declare the whole assembly in **one** `cad_project_create` call — every part
-and every connection between them — instead of discovering it one component
-at a time:
+1. **Classify the task.** New part, new assembly, source modification, direct STEP/STP inspection, reference selection, measurement/alignment check, snapshot review, or secondary output request.
+2. **Load only the needed references.** Use the triggers below instead of reading the whole reference set.
+3. **Write a natural-language CAD brief.** Extract dimensions, units, coordinate convention, feature intent, output paths, assumptions, and validation targets from all provided inputs — prose, reference images, technical drawings. Use `references/cad-brief.md`.
+4. **Check named purchasable components.** When an assembly includes named off-the-shelf actuators, servos, motors, electronics boards, connectors, or other purchasable components, search `$step-parts` before creating simplified placeholder geometry. If no exact match is found, record the miss and then use a documented envelope.
+5. **Plan before coding.** Define parameters, intent labels, source paths, expected bounding boxes, and any mating/positioning datums before editing.
+6. **Edit source, not generated artifacts.** Author build123d Python with `gen_step()`, naming a buildable entry generator `<name>.step.py` (helper/library modules stay `<name>.py`; see `references/step-generation.md`). When a Python generator exists, run `scripts/gen` on the generator, never on its exported STEP. Imported STEP/STP files (no generator) need no build step: inspect, snapshot, and the CAD Viewer generate their render artifacts on demand, and `scripts/export` accepts them directly.
+7. **Generate explicit targets.** Run `scripts/gen` on explicit generator targets only; do not run directory-wide generation. Add `--write` when the user needs the `.step` file itself, and use `scripts/export` when they need STL/3MF/GLB mesh files.
+8. **Validate geometrically.** Run `scripts/inspect refs <step-or-cad-target> --facts --planes --positioning` as the baseline, then verify the dimensions and relationships the user's spec calls out with targeted `measure`, `align`, `frame`, or `diff` checks. Run `scripts/inspect validate <step-or-cad-target>` for geometry soundness: `refs --facts` reports counts and bounds, and its `ok` field covers ref resolution only — an open shell and an inverted solid both pass it.
+9. **Snapshot the primary STEP — snapshot validation is mandatory.** After creating or visibly updating a primary STEP/STP part or assembly, ALWAYS run CAD `scripts/snapshot` against it and review the output; deterministic checks passing is not a reason to skip. The only skip cases are documented in `references/snapshot-review.md` (no visible geometry changed, or no valid artifact exists); report the reason when skipping.
+10. **Repair and rerun.** If a check fails, change the smallest responsible source section, regenerate, and rerun the failed validation.
 
-- **`parts`**: array of `{name, kind, ...}`. `kind: "custom"` needs a
-  `description` and a later `cad_project_add_component` call with real
-  build123d source. A warehouse kind needs a `params` object instead and is
-  built immediately, deterministically, with **zero further model turns** — do
-  not write source for these; `create` already built them by the time it
-  returns. Exact param contracts:
+## Handoff
 
-  | kind | required `params` |
-  |---|---|
-  | `warehouse.gear` | `module`, `tooth_count`, `pressure_angle`, `thickness` — all four |
-  | `warehouse.fastener` | `size`, `length` |
+After completing CAD work that creates or modifies `.step`, `.stp`, `.stl`, `.3mf`, or native `.glb` artifacts, you must ALWAYS hand the explicit file path(s) to `$cad-viewer` when that skill is installed. `$cad-viewer` must start CAD Viewer if it is not already running and return link(s) to the relevant created or updated file(s); include those live viewer link(s) in the final response. If `$cad-viewer` is unavailable or startup fails, report that and rely on CLI inspection plus snapshots instead of silently omitting the handoff. This rule applies to every workflow in this skill, including secondary STL/3MF/GLB outputs.
 
-  A fastener `size` **must carry its thread pitch**: `"M6-1"`, not `"M6"` and
-  not `"M6-1.0"`. Valid values are a fixed set: `M1.6-0.35, M2-0.4, M2.5-0.45,
-  M3-0.5, M4-0.7, M5-0.8, M6-1, M8-1.25, M10-1.5, M12-1.75, M14-2, M16-2,
-  M20-2.5, M24-3, M30-3.5, M36-4, M42-4.5, M48-5, M56-5.5, M64-6`.
+When verification snapshots are generated, include the saved PNG/GIF snapshot(s) in the final response. If no snapshot applies, or if snapshot generation fails, say why and report the deterministic validation that still ran.
 
-- **Correcting a mistake**: call `cad_project_create` again with the **same
-  manifest filename**. Parts that already built are kept and never rebuilt;
-  only the ones you fixed get built. Never start a new project file to work
-  around a failed part. `cad_project_status` shows every declared part with its
-  kind and whether it is built.
-- **Keep the create call small.** `verification` and `parameters` are optional —
-  omit them unless they are actually needed (verification can be supplied at
-  `cad_project_finalize` instead). A large deeply-nested payload is the single
-  most common cause of an unparseable tool call.
-- **`mates`**: array of `{type, a, b}` connecting `"PartName.port_name"`
-  pairs. `type` is one of `coaxial` (align two axes — a pin in a bore),
-  `face_to_face` (coincident faces), `press_fit` (like coaxial, plus
-  auto-exempted from interference — this *replaces* `allowed_contact` for the
-  assembly workflow: a declared press_fit or gear_mesh mate already says the
-  pair is expected to touch), or `gear_mesh` (needs `module`, `teeth_a`,
-  `teeth_b` too; positions two gears at their pitch-circle center distance).
-- Positions are **never** authored by you. `cad_project_finalize` takes no
-  placement argument at all — it computes every part's location from the
-  mates you already declared. If a part needs to mate with something, give it
-  a named port in `cad_project_add_component`'s `ports` field: `{port_name:
-  {at: [x,y,z], axis: [x,y,z]}}`, where `axis` points away from that part's
-  own body, toward whatever it will mate with.
-- `cad_project_add_component` is bounded to 3 real repair attempts per
-  component name. A 4th call after 3 failures is refused — rework the
-  approach for that component rather than retrying the same broken one.
-- A part connecting to two other parts simultaneously (e.g. a shared housing
-  with jaws mating on one side and a scroll mechanism on the other) is fine —
-  the assembly only needs to be one valid *static* configuration, not a
-  proof that the mechanism can move through its full range.
+## Non-negotiables
 
-## Mechanism playbook (moving assemblies)
+- Keep STEP as the primary validated CAD artifact. Generated STEP/STP, STL, 3MF, GLB/topology outputs, and render sidecars are derived artifacts; STL/3MF are secondary unless the user explicitly says otherwise.
+- Use named parameters, closed solids, verbose native build123d labels, and source-controlled geometry intent.
+- Author assembly positioning in source. `references/positioning.md` is authoritative for `AssemblyHelper`, build123d joints, explicit `Location` transforms, and alignment validation.
+- Do not use `git status`, `git diff`, or file-size churn as CAD comparison for large exported STEP/STP, GLB/topology, STL, or 3MF artifacts. Compare source changes, `scripts/inspect` summaries, snapshots, or generated topology output instead; use path-limited git status only for bookkeeping.
+- Report only checks that actually ran or are directly supported by tool output.
 
-This is about geometry *within* one `generate_cad_model` call or one
-`cad_project_add_component`'s custom part — placing features inside a single
-component's own `gen_step()`. Positioning *between* separate parts in a
-staged project uses the mates in "Staged assembly workflow" above, not `Pos`/
-`Rot` on a whole component.
+## Progressive references
 
-For grippers, linkages, hinges, and any assembly with pins/pivots (full
-detail in `references/positioning.md`):
+Load these files only when their trigger applies:
 
-- Model each moving part at the origin with its pivot axis on a coordinate
-  axis; place with `Pos`/`Rot` afterward.
-- Derive every position from parameters — pivot positions, link lengths,
-  angles — never hand-tuned constants.
-- Mirrored left/right parts: one builder function called twice with a sign
-  flip, or `mirror()` about the symmetry plane. Keep both as separate labeled
-  solids.
-- Through-holes sharing an axis (finger pivot, support bore, link eye) are
-  built from the SAME parameter.
-- Fuse ribs/gussets into their parent solid; do not leave overlapping
-  siblings.
-- Declare intended contacts (pins through bores, link-on-pin) via
-  `allowed_contact` pairs; everything undeclared still fails the interference
-  check.
-- Fillets and chamfers last, each wrapped in a try/except that degrades
-  gracefully (retry at half radius, then skip) instead of failing the build.
+- `references/cad-brief.md` — converting prose, reference images, and technical drawings into a CAD brief.
+- `references/build123d-modeling.md` — build123d modeling patterns, topology, selectors, features, labels.
+- `references/step-generation.md` — STEP generation from Python source, direct STEP/STP imports, and post-generation steps.
+- `references/inspection-and-validation.md` — validation sequence, selector refs, facts, planes, measurements, alignment, diff, frame, and validation reporting.
+- `references/snapshot-review.md` — mandatory snapshot policy, packet sizing, targeted views, and converting visual findings into geometry checks.
+- `references/positioning.md` — part-local datums and origins, assembly transforms, build123d joints, CLI alignment validation, and positioning reports.
+- `references/parameters.md` — parameterizing or animating a STEP model: source parameters, JS parameter/animation sidecars declared via gen_step params, viewer controls, and animation design.
+- `references/supported-exports.md` — STL/3MF/native GLB mesh export workflows via `scripts/export`.
+- `references/repair-loop.md` — diagnosis and repair procedures.
 
-## Modeling order
-
-1. Base solids.
-2. Major additions and fusions.
-3. Major subtractions and holes.
-4. Shells and wall thickness.
-5. Repeated features.
-6. Fillets and chamfers last.
-7. Component placement and labeled compound assembly.
-
-Apply realistic slip-fit clearance explicitly rather than relying on coincident
-surfaces. Avoid tangential booleans; extend cutting tools beyond the target.
-Remember that build123d primitives are centered on some axes by default. Set
-`align=(Align.MIN, Align.MIN, Align.MIN)` when dimensions and positions are
-specified from a lower-corner datum.
-
-## Validation and repair
-
-Success requires all requested files plus a report and preview. Pay attention
-to the returned bounding box, solid count, volume, and validity findings.
-
-Generation attempts are bounded per turn (configurable via
-`cad_max_generation_attempts` in config.txt). Each retry must repair the
-NAMED failure — a variant shot wastes the budget. Follow
-`references/repair-loop.md` to classify the failure and apply the smallest
-responsible fix:
-
-- Invalid design/expression: correct only the named schema field.
-- Boolean failure: enlarge or offset the tool so faces cross instead of touch.
-- Fillet failure: reduce the radius or filter the exact intended edges
-  (safe_fillet ladder in the modeling reference).
-- Loft failure: use compatible profiles and consistent orientation.
-- Wrong placement: correct the local coordinate frame rather than adding a
-  compensating transform at the end.
-- Wrong solid count: inspect whether parts were accidentally fused or omitted.
-- Wrong axis: repair the source; do not merely rotate the preview.
-- Interference failure: separate the solids, fuse intruding features into
-  their parent, or declare the pair via allowed_contact when genuinely
-  intended.
-
-Never claim success from a Python exit code. The CAD tools make disk
-artifacts, reopen them, validate BREP topology, and render a snapshot; report
-their actual result.
-
-## Interactive visual verification
-
-Use the managed Viewer only through `open_cad_viewer`; never start its Python
-server, Node tooling, or a browser from generated code. It binds to loopback
-and opens only the authorized artifact directory. For STEP, verify labels and
-part structure in the assembly tree, hide/show major components, inspect an
-exploded layout, and use clipping where internal clearances matter. Mesh
-measurements are vertex-based approximations; use STEP geometry/report values
-for authoritative dimensions. If the Viewer cannot start, preserve and report
-the verified STEP, JSON report, and PNG rather than regenerating otherwise
-valid geometry.
-
-## Outputs
-
-STEP is the canonical portable CAD artifact. Supported secondary outputs are
-STL, 3MF, GLB, and BREP. Native `.FCStd` feature-tree output is not provided
-by this backend. If requested, explain that the validated STEP can be opened
-in FreeCAD but is not a native PartDesign history.
-
-The normal advanced-model bundle contains:
-
-- `<name>.design.json` — retained declarative design (preferred workflow), or
-  `<name>.step.py` — retained parametric build123d source (advanced workflow).
-- `<name>.params.json` — exposed parameters.
-- `<name>.step` — canonical BREP model.
-- `<name>.preview.png` — deterministic isometric review image.
-- `<name>.report.json` — dimensions and validity evidence.
-- Requested secondary exports.
-
-## References (lazy-load per trigger)
-
-- `references/cad-brief.md` — converting prose/images/drawings into a brief.
-- `references/build123d-modeling.md` — build123d patterns, traps, labels,
-  safe fillets, boolean batching. Read before non-trivial Python source.
-- `references/repair-loop.md` — failure classification and smallest fixes.
-- `references/positioning.md` — mechanisms, pins, clearance, mirrored parts,
-  assembly structure.
-
-## Upstream basis
-
-The workflow is adapted from earthtojake/text-to-cad's CAD skill and the
-pinned cadgen runtime (both MIT). Geometry is produced by gumyr/build123d.
-Their license and version notices ship with Agent8088's CAD runtime assets.
+Final responses should include generated files, returned `$cad-viewer` viewer links, verification snapshots, validation actually run, assumptions, and caveats. Use `references/inspection-and-validation.md` for report structure.
