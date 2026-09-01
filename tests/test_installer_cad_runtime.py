@@ -58,15 +58,17 @@ def test_linux_installer_has_the_same_optional_runtime_contract():
     assert "sudo -v" not in section
 
 
-def test_packaging_contains_worker_requirements_renderer_and_license():
+def test_packaging_contains_runtime_requirements():
     project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    for name in (
-        "cad_runtime_requirements.txt",
-        "cad_snapshot_runtime/render.html",
-        "cad_snapshot_runtime/snapshot-render.js",
-        "cad_snapshot_runtime/TEXT_TO_CAD_LICENSE.txt",
-    ):
-        assert name in project
+    assert "cad_runtime_requirements.txt" in project
+    # The renderer and its licence now ship inside the vendored skill rather than
+    # as a hand-copied cad_snapshot_runtime/, so they need no force-include: they
+    # live under src/agent8088, which `packages` takes whole. Assert they are
+    # actually there -- dropping the force-include entries must not silently drop
+    # the MIT licence we are obliged to distribute with upstream's code.
+    skill = ROOT / "src/agent8088/skills_installed/cad"
+    assert (skill / "LICENSE").is_file()
+    assert (skill / "scripts/snapshot/runtime/snapshot-render.js").is_file()
 
 
 def test_viewer_installer_is_commit_and_checksum_pinned():

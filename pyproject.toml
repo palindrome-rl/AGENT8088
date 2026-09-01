@@ -80,6 +80,3 @@ packages = ["src/agent8088"]
 "src/agent8088/gateway/platforms/whatsapp_bridge/package.json" = "agent8088/gateway/platforms/whatsapp_bridge/package.json"
 "src/agent8088/gateway/platforms/whatsapp_bridge/package-lock.json" = "agent8088/gateway/platforms/whatsapp_bridge/package-lock.json"
 "src/agent8088/cad_runtime_requirements.txt" = "agent8088/cad_runtime_requirements.txt"
-"src/agent8088/cad_snapshot_runtime/render.html" = "agent8088/cad_snapshot_runtime/render.html"
-"src/agent8088/cad_snapshot_runtime/snapshot-render.js" = "agent8088/cad_snapshot_runtime/snapshot-render.js"
-"src/agent8088/cad_snapshot_runtime/TEXT_TO_CAD_LICENSE.txt" = "agent8088/cad_snapshot_runtime/TEXT_TO_CAD_LICENSE.txt"
