@@ -149,6 +149,7 @@ def _parse_structured_output(output_format, content: str):
 @dataclass
 class Agent8088ChatModel(ChatLiteLLM):
     budget: Optional[Any] = None  # duck-typed engine._TurnBudget: .exceeded() / .add_tokens()
+    extra_body: Optional[dict] = None
 
     async def ainvoke(self, messages, output_format=None, **kwargs):
         if self.budget is not None:
@@ -156,7 +157,9 @@ class Agent8088ChatModel(ChatLiteLLM):
             if over:
                 raise RuntimeError(over)
         try:
-            result = await super().ainvoke(messages, output_format, **kwargs)
+            result = (await self._ainvoke_with_extra_body(messages, output_format)
+                      if self.extra_body else
+                      await super().ainvoke(messages, output_format, **kwargs))
         except ModelProviderError as exc:
             # Same recovery as the ValidationError case below, for the other
             # shape the same providers produce: a reasoning model that spends
@@ -188,6 +191,56 @@ class Agent8088ChatModel(ChatLiteLLM):
             self.budget.add_tokens(result.usage.prompt_tokens, result.usage.completion_tokens)
         return result
 
+    async def _ainvoke_with_extra_body(self, messages, output_format):
+        """Run ChatLiteLLM's request with an OpenAI-compatible extra body."""
+        from litellm import acompletion
+
+        params: dict = {
+            "model": self.model,
+            "messages": LiteLLMMessageSerializer.serialize(messages),
+            "num_retries": self.max_retries,
+            "extra_body": self.extra_body,
+        }
+        if self.temperature is not None:
+            params["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            params["max_tokens"] = self.max_tokens
+        if self.api_key:
+            params["api_key"] = self.api_key
+        if self.api_base:
+            params["api_base"] = self.api_base
+        if self.metadata:
+            params["metadata"] = self.metadata
+        if output_format is not None:
+            schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+            params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "agent_output", "strict": True, "schema": schema},
+            }
+
+        try:
+            response = await acompletion(**params)
+        except Exception as exc:  # browser-use normalizes provider failures here
+            raise ModelProviderError(message=str(exc), model=self.name) from exc
+        if not response.choices:
+            raise ModelProviderError(
+                message="Empty response: no choices returned by the model",
+                status_code=502, model=self.name)
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        if output_format is not None:
+            if not content:
+                raise ModelProviderError(
+                    message="Model returned empty content for structured output request",
+                    status_code=500, model=self.name)
+            content = output_format.model_validate_json(content)
+        return ChatInvokeCompletion(
+            completion=content,
+            thinking=str(getattr(choice.message, "reasoning_content", "") or "") or None,
+            usage=self._parse_usage(response),
+            stop_reason=choice.finish_reason,
+        )
+
     async def _ainvoke_json_object_fallback(self, messages, output_format, **kwargs):
         from litellm import acompletion
 
@@ -211,6 +264,8 @@ class Agent8088ChatModel(ChatLiteLLM):
             params["api_key"] = self.api_key
         if self.api_base:
             params["api_base"] = self.api_base
+        if self.extra_body:
+            params["extra_body"] = self.extra_body
 
         response = await acompletion(**params)
         content = response.choices[0].message.content or ""
@@ -222,7 +277,8 @@ class Agent8088ChatModel(ChatLiteLLM):
 
 
 def build_browser_chat_model(
-    client, model_name: str, budget=None, max_tokens: Optional[int] = None
+    client, model_name: str, budget=None, max_tokens: Optional[int] = None,
+    extra_body: Optional[dict] = None,
 ) -> Agent8088ChatModel:
     """Build a browser-use chat model that targets the exact same
     provider/model engine.py's main loop is already configured for.
@@ -242,7 +298,7 @@ def build_browser_chat_model(
     before writing the actual action can get cut off mid-response, which
     browser-use reports as "Model returned empty action" and retries the
     whole step - a silent, avoidable source of wasted round-trips."""
-    kwargs = {"budget": budget}
+    kwargs = {"budget": budget, "extra_body": extra_body}
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
     if isinstance(client, dict) and client.get("api_mode") == "litellm":

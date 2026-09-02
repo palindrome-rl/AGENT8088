@@ -182,6 +182,7 @@ never does — and a recalled memory can never authorise a tool call.
 | `browser_max_steps` | Max steps `browse_page`'s browsing agent takes on one task (default `25`). Override once with `AGENT8088_BROWSER_MAX_STEPS`. |
 | `browser_task_timeout_seconds` | Overall wall-clock limit for one `browse_page` call (default `600`). Clamped to `max_tool_timeout_seconds`; override once with `AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS`. |
 | `browser_screenshots` | Enable browser screenshots for a vision-capable model (default `0`); override once with `AGENT8088_BROWSER_SCREENSHOTS=1`. |
+| `browser_llm_extra_body` | JSON fields sent only to browser-use model calls; use `{"chat_template_kwargs":{"enable_thinking":false}}` for Qwen served by vLLM. |
 
 ### Turn budget
 

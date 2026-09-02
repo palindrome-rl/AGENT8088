@@ -204,9 +204,11 @@ def fake_browser_use(monkeypatch):
         profiles.append(kwargs)
         return types.SimpleNamespace(**kwargs)
 
-    def fake_build_browser_chat_model(client, model_name, budget=None, max_tokens=None):
+    def fake_build_browser_chat_model(client, model_name, budget=None, max_tokens=None,
+                                      extra_body=None):
         llm_calls.append({"client": client, "model_name": model_name,
-                          "budget": budget, "max_tokens": max_tokens})
+                          "budget": budget, "max_tokens": max_tokens,
+                          "extra_body": extra_body})
         return object()
 
     monkeypatch.setattr(browser_use, "Agent", _FakeAgent)
@@ -230,6 +232,18 @@ def test_telemetry_and_cloud_sync_are_disabled_before_the_agent_runs(
 
     assert os.environ["ANONYMIZED_TELEMETRY"] == "false"
     assert os.environ["BROWSER_USE_CLOUD_SYNC"] == "false"
+
+
+def test_browser_llm_extra_body_is_parsed_and_passed_to_the_adapter(
+        fake_browser_use, monkeypatch):
+    monkeypatch.setitem(
+        A.APP_CONFIG, "browser_llm_extra_body",
+        '{"chat_template_kwargs":{"enable_thinking":false}}')
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    assert fake_browser_use.llm_calls[0]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}}
 
 
 def test_an_explicit_telemetry_opt_in_is_respected(fake_browser_use, monkeypatch):

@@ -51,6 +51,21 @@ def test_configure_logging_writes_jsonl_to_log_dir(log_dir):
     datetime.fromisoformat(e["ts"])  # raises if not ISO
 
 
+def test_configure_logging_keeps_agent_records_off_root_console(log_dir, capsys):
+    root = logging.getLogger()
+    handler = logging.StreamHandler(sys.stderr)
+    root.addHandler(handler)
+    old_level = root.level
+    root.setLevel(logging.INFO)
+    try:
+        L.configure_logging()
+        logging.getLogger("agent8088.engine").info("browser_visit hosts=example.com")
+        assert capsys.readouterr().err == ""
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
+
+
 def test_subsystem_name_strips_agent8088_prefix(log_dir):
     L.configure_logging()
     logging.getLogger("agent8088.gateway.platforms.slack").warning("connect")
