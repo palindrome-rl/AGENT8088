@@ -17,7 +17,7 @@ BUILTIN_PROVIDERS = {
     "moonshot":     {"label": "Moonshot (Kimi)", "base_url": "https://api.moonshot.ai/v1", "api_key_env": "MOONSHOT_API_KEY", "default_model": "kimi-k2.6"},
     "qwen":         {"label": "Qwen (DashScope)", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key_env": "DASHSCOPE_API_KEY", "default_model": "qwen-plus"},
     "ollama-cloud": {"label": "Ollama Cloud", "base_url": "https://ollama.com/v1", "api_key_env": "OLLAMA_API_KEY", "default_model": "gpt-oss:120b"},
-    "copilot":      {"label": "GitHub Copilot", "base_url": "https://api.githubcopilot.com", "api_key_env": "GH_TOKEN", "default_model": "gpt-4o-mini"},
+    "anthropic":    {"label": "Anthropic (Claude)", "base_url": "https://api.anthropic.com/v1/", "api_key_env": "ANTHROPIC_API_KEY", "default_model": "claude-sonnet-4-6"},
 }
 for _name, _provider in BUILTIN_PROVIDERS.items():
     _provider["native_tools"] = _name != "ollama"
@@ -36,8 +36,47 @@ FALLBACK_MODELS = {
     "moonshot":     ["kimi-k2.6", "moonshot-v1-8k", "moonshot-v1-32k"],
     "qwen":         ["qwen-plus", "qwen-max", "qwen-turbo"],
     "ollama-cloud": ["gpt-oss:120b", "qwen3:14b", "llama3.3"],
-    "copilot":      ["gpt-4o-mini", "gpt-4o", "claude-sonnet-4"],
+    "anthropic":    ["claude-sonnet-4-6", "claude-opus-5", "claude-haiku-3.5"],
 }
+
+
+def resolve_subagent_model(raw: str, provider: str, client=None) -> tuple[str, str]:
+    """Return (model_id, warning). Empty model_id means "use the session model".
+
+    Subagents run on the active provider only. A model must be one the provider
+    actually offers; anything else falls back to the session model with a warning.
+    """
+    raw = (raw or "").strip()
+    if not raw or raw.lower() == "inherit":
+        return "", ""
+    if ":" in raw and raw.split(":", 1)[0] in BUILTIN_PROVIDERS:
+        return "", (f"cross-provider model '{raw}' is no longer supported; "
+                    f"using the session model")
+    available = list_models(provider, client=client, fallback=False)
+    if available and raw not in available:
+        return "", (f"model '{raw}' is not available on {provider}; "
+                    f"using the session model")
+    return raw, ""
+
+
+# OpenAI-compatible /v1/models responses normally expose only an id, owner and
+# creation time. Context and output limits are NOT standardized there. Instead,
+# probe_model_context_window queries the provider's native model-info endpoint
+# (Ollama's /api/show for ollama/ollama-cloud, /v1/models for others) and reads
+# whatever context-length field the endpoint publishes. Provider-specific config
+# values (provider.<name>.context_window) remain the escape hatch for private
+# endpoints and take precedence over the probe in engine._active_model_token_limits().
+
+
+def model_token_limits(provider_name, model_id):
+    """Return reviewed limits for one exact provider/model pairing.
+
+    No hardcoded catalog — limits are probed from the endpoint at runtime via
+    probe_model_context_window. This function is kept as a stable import target
+    for engine._active_model_token_limits but always returns empty: the probe
+    writes session-only values into PROVIDERS[name] directly.
+    """
+    return {}
 
 import csv, hashlib, json, os, stat, subprocess, sys, tempfile, time
 from pathlib import Path, PureWindowsPath
@@ -144,3 +183,111 @@ def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, 
         return models
     except Exception:
         return list(FALLBACK_MODELS.get(provider_name, [])) if fallback else []
+
+
+def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL_LIST_TIMEOUT_SECONDS):
+    """Best-effort: ask the endpoint for the model's context window and output limit.
+
+    Returns (context_window, max_completion_tokens) or (None, None) on miss.
+    Never raises — the caller treats None as "use fallback".
+
+    Strategies tried in order, by provider:
+    1. Ollama native /api/show — ollama/ollama-cloud publish model_info with
+       "<arch>.context_length". The reliable path for Ollama providers.
+    2. Google native /v1beta/models/{id} — gemini publishes inputTokenLimit
+       and outputTokenLimit that the OpenAI-compatible layer doesn't expose.
+    3. OpenAI-compatible /v1/models — OpenRouter, Groq, and others add
+       non-standard fields (context_length, context_window, top_provider).
+       Most OpenAI endpoints don't publish anything here.
+    """
+    base_url = str(getattr(client, "base_url", "")).rstrip("/")
+    api_key = str(getattr(client, "api_key", ""))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    # Strategy 1: Ollama /api/show
+    if provider_name in ("ollama", "ollama-cloud") or "ollama" in base_url:
+        try:
+            import httpx
+            show_url = base_url.replace("/v1", "") + "/api/show"
+            r = httpx.post(show_url, json={"model": model_id},
+                           headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                info = r.json().get("model_info", {})
+                ctx = None
+                for key, value in info.items():
+                    if key.endswith("context_length") and isinstance(value, int):
+                        ctx = value
+                        break
+                if ctx:
+                    return ctx, None
+        except Exception:
+            pass
+
+    # Strategy 2: Google native API (gemini)
+    if provider_name == "gemini" or "googleapis" in base_url:
+        try:
+            import httpx
+            model_clean = model_id.replace("models/", "")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_clean}"
+            r = httpx.get(url, headers={"x-goog-api-key": api_key}, timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                ctx = data.get("inputTokenLimit")
+                out = data.get("outputTokenLimit")
+                if ctx:
+                    return int(ctx), int(out) if out else None
+        except Exception:
+            pass
+
+    # Strategy 2b: Anthropic Models API (returns max_input_tokens + max_tokens)
+    if provider_name == "anthropic" or "anthropic.com" in base_url:
+        try:
+            import httpx
+            r = httpx.get(f"{base_url}/models", headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }, timeout=timeout)
+            if r.status_code == 200:
+                for m in r.json().get("data", []):
+                    if m.get("id") == model_id:
+                        ctx = m.get("max_input_tokens")
+                        out = m.get("max_tokens")
+                        if ctx:
+                            return int(ctx), int(out) if out else None
+        except Exception:
+            pass
+
+    # Strategy 3: OpenAI-compatible /v1/models
+    try:
+        fetch_client = (client.with_options(timeout=timeout)
+                        if hasattr(client, "with_options") else client)
+        resp = fetch_client.models.list()
+        norm = _normalize_model_id("", model_id)
+        for m in resp.data:
+            if _normalize_model_id("", str(getattr(m, "id", ""))) == norm:
+                ctx = None
+                for attr in ("context_length", "context_window",
+                             "max_context_length", "max_input_tokens"):
+                    v = getattr(m, attr, None)
+                    if v:
+                        try:
+                            ctx = int(v)
+                        except (TypeError, ValueError):
+                            pass
+                    if ctx:
+                        break
+                # OpenRouter puts max_completion_tokens inside top_provider
+                out = None
+                tp = getattr(m, "top_provider", None)
+                if isinstance(tp, dict):
+                    out = tp.get("max_completion_tokens")
+                    if out:
+                        try:
+                            out = int(out)
+                        except (TypeError, ValueError):
+                            out = None
+                if ctx:
+                    return ctx, out
+    except Exception:
+        pass
+    return None, None

@@ -199,6 +199,7 @@ class _SubStatusLine:
 # Load the real Agent8088 engine
 # ---------------------------------------------------------------------------
 from agent8088 import engine as A
+from agent8088 import fusion
 from agent8088 import searxng_provision
 from agent8088.logging_setup import configure_logging
 
@@ -1970,12 +1971,14 @@ def cmd_help(_):
         ("/tools", "List every tool with its args, mode, and description"),
         ("/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails"),
         ("/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)"),
-        ("/agents", "List available sub-agent profiles"),
+        ("/agents [new|edit|delete|models]", "List, create, edit, or delete sub-agent profiles"),
         ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
         ("/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session"),
         ("/cli-anything [task]", "Use CLI-Anything to find, run, build, refine, test, or validate an application CLI"),
         ("/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs"),
         ("/audit [on|off]", "Verify each step against the real files after it runs"),
+        ("/fusion setup", "Pick a default fusion panel and judge once, interactively"),
+        ("/fusion <query>", "Ask the panel in parallel; a blind judge picks the best answer"),
         ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
         ("/paste [q]", "Analyze an image from the OS clipboard (Windows/macOS)"),
         ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
@@ -2278,19 +2281,142 @@ def cmd_agent(rest):
     _run_subagent(name, task)
 
 
-def cmd_agents(_):
+def _cmd_agents_list():
     t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
-              caption="run one with  /agent  (arrow-key picker)  or  /agent <name> <task>",
+              caption="run one with  /agent  (arrow-key picker)  or  /agent <name> <task>  ·  "
+                      "manage with  /agents new|edit|delete|models",
               caption_style="dim")
     t.add_column("Name", style="#237dd7")
+    t.add_column("Source", style="#237dd7")
     t.add_column("Max turns", style="#237dd7")
+    t.add_column("Model", style="#237dd7")
     t.add_column("Tools", style="#237dd7")
     t.add_column("Description", style="#237dd7")
     for name in sorted(A.SUBAGENT_SPECS):
         p = A.SUBAGENT_SPECS[name]
         tools = ", ".join(t_ for t_ in p["tools"] if t_ in A.TOOL_NAMES) or "—"
-        t.add_row(name, str(p["max_turns"]), tools, p["description"])
+        source = "built-in" if p.get("builtin") else "custom"
+        model = p.get("model") or "inherit"
+        t.add_row(name, source, str(p["max_turns"]), model, tools, p["description"])
     console.print(t)
+
+    provider = _active_provider_name()
+    models = _fetch_models_for_provider(provider)
+    if models:
+        shown = ", ".join(models[:10])
+        more = f", and {len(models) - 10} more" if len(models) > 10 else ""
+        console.print(f"[dim]{provider} offers {len(models)} models — {shown}{more}.  "
+                      f"/agents models for the full list.[/dim]")
+    else:
+        console.print(f"[dim]{provider}: could not fetch the model list right now.[/dim]")
+
+
+def _cmd_agents_models():
+    provider = _active_provider_name()
+    models = _fetch_models_for_provider(provider)
+    if not models:
+        console.print(f"[dim]{provider}: could not fetch the model list right now.[/dim]")
+        return
+    t = Table(title=f"{provider} models ({len(models)})", box=box.SIMPLE, title_style="bold #00edff")
+    t.add_column("Model", style="#237dd7")
+    for m in models:
+        t.add_row(m)
+    console.print(t)
+
+
+def _cmd_agents_new(rest):
+    name = rest.strip() or _custom_prompt("Name (lowercase, e.g. my-agent):")
+    name = name.strip().lower()
+    description = _custom_prompt("Description:")
+    tools = _custom_prompt("Tools (comma-separated, blank = read_text, execute_shell):")
+    max_turns = _custom_prompt("Max turns:", default="8")
+    provider = _active_provider_name()
+    models = ["inherit (use session model)"] + _fetch_models_for_provider(provider)
+    model_choice = _choice_prompt("Model:", models, models[0])
+    model = "" if model_choice.startswith("inherit") else model_choice
+    console.print("[dim]Enter the sub-agent's system prompt. End with an empty line.[/dim]")
+    prompt_lines = []
+    while True:
+        try:
+            line = console.input()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line:
+            break
+        prompt_lines.append(line)
+    prompt = "\n".join(prompt_lines)
+    result = A._exec_create_subagent({
+        "name": name,
+        "description": description,
+        "tools": tools,
+        "max_turns": max_turns,
+        "model": model,
+        "prompt": prompt,
+    })
+    console.print(result)
+
+
+def _cmd_agents_edit(name):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /agents edit <name>")
+        return
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    profile = A.SUBAGENT_SPECS.get(name)
+    if profile is None:
+        console.print(f"[red]unknown agent:[/red] {name}")
+        return
+    if profile.get("builtin"):
+        console.print(f"[red]'{name}' is built-in and cannot be edited.[/red] "
+                      f"Use [#237dd7]/agents new {name}[/#237dd7] to shadow it with a custom version.")
+        return
+    path = A.USER_AGENTS_DIR / f"{name}.md"
+    editor = os.environ.get("EDITOR") or ("notepad" if sys.platform == "win32" else "vi")
+    subprocess.run([editor, str(path)])
+
+
+def _cmd_agents_delete(name):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /agents delete <name>")
+        return
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    profile = A.SUBAGENT_SPECS.get(name)
+    if profile is None:
+        console.print(f"[red]unknown agent:[/red] {name}")
+        return
+    if profile.get("builtin"):
+        console.print(f"[red]'{name}' is built-in and cannot be deleted.[/red]")
+        return
+    path = A.USER_AGENTS_DIR / f"{name}.md"
+    try:
+        if not _confirm_destructive(f"Delete sub-agent '{name}'", str(path)):
+            console.print("[dim]cancelled[/dim]")
+            return
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim]cancelled[/dim]")
+        return
+    path.unlink(missing_ok=True)
+    console.print(f"[#237dd7]deleted[/#237dd7] {path}")
+
+
+def cmd_agents(rest):
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    parts = (rest or "").strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    if not sub:
+        _cmd_agents_list()
+    elif sub == "models":
+        _cmd_agents_models()
+    elif sub == "new":
+        _cmd_agents_new(arg)
+    elif sub == "edit":
+        _cmd_agents_edit(arg)
+    elif sub == "delete":
+        _cmd_agents_delete(arg)
+    else:
+        console.print("[red]usage:[/red] /agents [new [name]|edit <name>|delete <name>|models]")
 
 
 def cmd_tool(rest):
@@ -2573,6 +2699,8 @@ def cmd_model(rest):
         return
     active = _active_provider_name()
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
+    _ctx, _out = A._active_model_token_limits()
+    console.print(f"[dim]  context: {_ctx:,} · max output: {_out:,}[/dim]")
     banner()
 
 
@@ -2636,7 +2764,7 @@ def save_model_profile(path, name, api_mode, model, base_url="", api_key_env="")
 
 def configure_model_profile():
     """Configure a model profile from inside the running REPL."""
-    _run_setup(config_path=A.CONFIG_PATH, include_workspace=False, activate_runtime=True, heading="Model setup")
+    _run_setup(config_path=_resolve_config_path(), include_workspace=False, activate_runtime=True, heading="Model setup")
 
 
 def cmd_config(_):
@@ -2743,6 +2871,8 @@ def cmd_doctor(rest):
     t.add_column("Check", style="#00edff", no_wrap=True)
     t.add_column("Result", style="#237dd7")
     t.add_row("Model", f"{active}:{A.MODEL_NAME}")
+    model_context, model_output = A._active_model_token_limits()
+    t.add_row("Model token limits", f"{model_context:,} context / {model_output:,} output")
     t.add_row("Endpoint", str(endpoint or "provider-managed"))
     t.add_row("Reachability", _endpoint_probe(endpoint) if endpoint else "provider-managed")
     t.add_row("Authentication", auth)
@@ -2755,6 +2885,13 @@ def cmd_doctor(rest):
     cli_label = (f"ready (CLI-Hub {cli_state['version']})" if cli_state["available"]
                  else "available on demand")
     t.add_row("CLI-Anything", cli_label)
+    cad_state = A.cad.cad_runtime_status()
+    cad_label = (
+        f"ready (build123d {cad_state['build123d']}, cadgen {cad_state['cadgen']})"
+        if cad_state["available"]
+        else f"unavailable ({cad_state.get('reason', 'runtime probe failed')})"
+    )
+    t.add_row("Advanced CAD", cad_label)
     console.print(t)
 
     if fix:
@@ -2787,6 +2924,7 @@ def cmd_dump(_rest):
     provider = A.PROVIDERS.get(active, {})
     sandbox = A.sandbox_status()
     cli_state = A.cli_anything.status(A.CONFIG_PATH)
+    cad_state = A.cad.cad_runtime_status()
 
     lines = [
         f"Agent8088 diagnostic dump — {__version__}",
@@ -2812,6 +2950,13 @@ def cmd_dump(_rest):
         f"Version: {cli_state['version'] or 'not installed'}",
         f"Expected version: {cli_state['expected_version']}",
         f"Runtime path: {cli_state['root']}",
+        "",
+        "## Advanced CAD",
+        f"Available: {cad_state['available']}",
+        f"build123d expected: {cad_state['build123d']}",
+        f"cadgen expected: {cad_state['cadgen']}",
+        f"Runtime path: {cad_state['root']}",
+        f"Detail: {cad_state.get('reason', 'verified')}",
         "",
         "## Configuration",
         f"Config path: {A.CONFIG_PATH} (exists={A.CONFIG_PATH.exists()})",
@@ -2906,6 +3051,11 @@ def _search_provider_rows():
         schema = provider.setup_schema()
         try:
             available = provider.is_available(ctx)
+            # A configured loopback URL does not mean the SearXNG service is
+            # running. Use the same short health probe as startup so the
+            # status table does not call a stopped container "ready".
+            if provider.name == "searxng" and available:
+                available = A.web_search.probe_searxng(ctx)
         except Exception:  # noqa: BLE001 — /search status must list every backend regardless
             available = False
         keys = ", ".join(v["key"] for v in schema.get("env_vars") or [])
@@ -3134,6 +3284,211 @@ def cmd_audit(rest):
     if not saved:
         console.print(f"[yellow]applies to this session only — could not write to "
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
+
+
+def _fusion_panel_table(results):
+    t = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Provider", style="#237dd7")
+    t.add_column("Model", style="#237dd7")
+    t.add_column("Status")
+    for r in results:
+        status = "[green]ok[/green]" if r.error is None else f"[red]{r.error}[/red]"
+        t.add_row(r.member.provider, r.member.model, status)
+    return t
+
+
+def _parse_fusion_flags(rest):
+    """Pull optional leading `--panel <spec>` / `--judge <spec>` flags off a
+    /fusion command line. Either flag may appear, in either order, before the
+    question text. Returns (panel_specs_or_None, judge_spec_or_None, query)."""
+    panel_specs = None
+    judge_spec = None
+    while True:
+        stripped = rest.lstrip()
+        if stripped.startswith("--panel "):
+            value, _, rest = stripped[len("--panel "):].partition(" ")
+            panel_specs = [s for s in value.split(",") if s.strip()]
+        elif stripped.startswith("--judge "):
+            value, _, rest = stripped[len("--judge "):].partition(" ")
+            judge_spec = value
+        else:
+            rest = stripped
+            break
+    return panel_specs, judge_spec, rest.strip()
+
+
+def _fusion_available_providers():
+    """Provider names with a working API key, for the setup picker."""
+    return sorted(name for name, info in A.PROVIDERS.items() if A._provider_api_key(info))
+
+
+def _cmd_fusion_setup(_rest):
+    """Interactive one-time configuration: pick the fusion panel and judge
+    once, save to config.txt, and every plain `/fusion <question>` afterward
+    uses them — no flags needed."""
+    available = _fusion_available_providers()
+    if not available:
+        console.print("[red]no providers with a working API key are configured — "
+                       "set one up with /model first.[/red]")
+        return
+
+    current_max = str(A.APP_CONFIG.get("fusion_max_panel", "6"))
+    max_panel_input = _custom_prompt("Max panel size:", default=current_max)
+    try:
+        max_panel = max(1, int(max_panel_input))
+    except ValueError:
+        console.print(f"[yellow]'{max_panel_input}' isn't a number — keeping {current_max}.[/yellow]")
+        max_panel = max(1, int(current_max) if current_max.isdigit() else 6)
+
+    console.print(f"[dim]Providers with a working key: {', '.join(available)}[/dim]")
+    chosen = _multi_choice_prompt(
+        "Panel providers (check none to keep auto-discovering, up to the max above):",
+        available)
+    if len(chosen) > max_panel:
+        console.print(f"[yellow]picked {len(chosen)}, keeping only the first {max_panel} "
+                       f"(max panel size) — {', '.join(chosen[max_panel:])} dropped.[/yellow]")
+        chosen = chosen[:max_panel]
+
+    panel_specs = []
+    for provider in chosen:
+        models = _fetch_models_for_provider(provider)
+        default_model = A.PROVIDERS[provider].get("model", "")
+        if models:
+            choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
+            choice = _choice_prompt(f"Model for {provider}:", choices, choices[0])
+            model = default_model if choice.startswith("(default)") else choice
+        else:
+            model = _custom_prompt(f"Model for {provider}:", default=default_model)
+        panel_specs.append(f"{provider}:{model}" if model else provider)
+
+    judge_choices = ["(auto) session's current model"] + available
+    judge_choice = _choice_prompt("Judge:", judge_choices, judge_choices[0])
+    if judge_choice.startswith("(auto)"):
+        judge_provider, judge_model = "", ""
+    else:
+        judge_provider = judge_choice
+        models = _fetch_models_for_provider(judge_provider)
+        default_model = A.PROVIDERS[judge_provider].get("model", "")
+        if models:
+            choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
+            choice = _choice_prompt(f"Model for judge ({judge_provider}):", choices, choices[0])
+            judge_model = "" if choice.startswith("(default)") else choice
+        else:
+            judge_model = ""
+
+    values = {
+        "fusion_panel": ",".join(panel_specs),
+        "fusion_judge_provider": judge_provider,
+        "fusion_judge_model": judge_model,
+        "fusion_max_panel": max_panel,
+    }
+    A.update_simple_config(A.CONFIG_PATH, values)
+    A.APP_CONFIG.update({k: str(v) for k, v in values.items()})
+
+    if panel_specs:
+        console.print(f"[#237dd7]fusion panel set:[/#237dd7] {', '.join(panel_specs)}")
+    else:
+        console.print(f"[#237dd7]fusion panel:[/#237dd7] auto-discover, up to {max_panel} providers")
+    console.print(f"[#237dd7]fusion judge:[/#237dd7] "
+                   f"{judge_provider + ':' + judge_model if judge_provider else 'auto (session model)'}")
+    console.print("[dim]Saved. Plain /fusion <question> will use this now — "
+                   "no restart needed.[/dim]")
+
+
+def cmd_fusion(rest):
+    """Send one query to every model on the panel in parallel, then have a
+    blind judge pick the best answer. Read-only — makes no writes, so no
+    confirmation gate.
+
+    Run `/fusion setup` once to pick a default panel and judge interactively —
+    after that, plain `/fusion <question>` just uses them, no flags needed.
+    Optional flags before the question override the saved config for one call:
+      /fusion --panel gemini:gemini-3-pro,ollama-cloud:kimi-k3 --judge anthropic:claude-sonnet-4-6 <question>
+    """
+    if rest.strip().lower() == "setup":
+        _cmd_fusion_setup(rest)
+        return
+
+    panel_specs, judge_spec, query = _parse_fusion_flags(rest)
+    if not query:
+        console.print("[red]usage:[/red] /fusion <question>")
+        console.print("[dim]no panel set up yet? run [/dim][#237dd7]/fusion setup[/#237dd7]")
+        return
+
+    max_panel = int(A.APP_CONFIG.get("fusion_max_panel", "6"))
+    member_timeout_s = float(A.APP_CONFIG.get("fusion_member_timeout_s", "60.0"))
+    max_workers = int(A.APP_CONFIG.get("fusion_max_workers", "8"))
+    panel_max_tokens = int(A.APP_CONFIG.get("fusion_panel_max_tokens", "1200"))
+    judge_max_tokens = int(A.APP_CONFIG.get("fusion_judge_max_tokens", "500"))
+    judge_provider = str(A.APP_CONFIG.get("fusion_judge_provider", "")).strip() or None
+    judge_model = str(A.APP_CONFIG.get("fusion_judge_model", "")).strip() or None
+
+    if judge_spec:
+        judge_provider, _, judge_model = judge_spec.partition(":")
+        judge_provider = judge_provider.strip() or None
+        judge_model = judge_model.strip() or None
+
+    if not panel_specs:
+        configured_panel = str(A.APP_CONFIG.get("fusion_panel", "")).strip()
+        if configured_panel:
+            panel_specs = [s for s in configured_panel.split(",") if s.strip()]
+
+    if panel_specs:
+        try:
+            panel = fusion.build_explicit_panel(panel_specs)
+        except ValueError as exc:
+            console.print(f"[red]--panel error:[/red] {exc}")
+            return
+    else:
+        panel = fusion.discover_panel(max_panel_size=max_panel)
+
+    if not panel:
+        console.print("[red]no providers with a working API key are configured[/red]")
+        return
+
+    console.print(f"[dim]asking {len(panel)} models "
+                  f"({', '.join(f'{m.provider}:{m.model}' for m in panel)})...[/dim]")
+
+    with status_cm("running fusion..."):
+        result = fusion.run_fusion(
+            query,
+            panel=panel,
+            judge_provider=judge_provider,
+            judge_model=judge_model,
+            max_panel_size=max_panel,
+            member_timeout_s=member_timeout_s,
+            max_workers=max_workers,
+            max_tokens=panel_max_tokens,
+            judge_max_tokens=judge_max_tokens,
+        )
+
+    if result.winner_index is None:
+        console.print(f"[red]fusion failed:[/red] {result.judge_error}")
+        if result.results:
+            console.print(_fusion_panel_table(result.results))
+        return
+
+    console.print(_fusion_panel_table(result.results))
+
+    if not result.judge_parsed and result.judge_raw:
+        winner = result.results[result.winner_index]
+        console.print(f"[yellow]judge output could not be parsed — showing "
+                      f"{winner.member.provider}:{winner.member.model}'s answer instead[/yellow]")
+
+    console.print(Panel(Text(result.winner_answer), title="Fusion Answer",
+                         box=box.ROUNDED, border_style="#00C8FF"))
+
+    if result.judge_parsed or not result.judge_raw:
+        console.print(f"[dim]Verdict: {result.verdict}[/dim]")
+    else:
+        raw = result.judge_raw.strip()[:300]
+        console.print(f"[dim]judge output (unparsed): {raw}[/dim]")
+
+    footer = f"[dim]tokens: {result.total_input_tokens}/{result.total_output_tokens} in/out"
+    if result.total_cost_usd is not None:
+        footer += f" · est. cost: ${result.total_cost_usd:.4f}"
+    footer += "[/dim]"
+    console.print(footer)
 
 
 def _print_line(line, args):
@@ -3538,8 +3893,27 @@ def _show_limits():
     for name in sorted(A.SUBAGENT_SPECS):
         st.add_row(name, str(A.SUBAGENT_SPECS[name]["max_turns"]))
     console.print(st)
+
+    _provider_rows = [
+        (name, A.PROVIDERS[name].get("context_window"),
+         A.PROVIDERS[name].get("max_completion_tokens"))
+        for name in sorted(A.PROVIDERS)
+        if A.PROVIDERS[name].get("context_window")
+        or A.PROVIDERS[name].get("max_completion_tokens")
+    ]
+    if _provider_rows:
+        pt = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
+        pt.add_column("Provider", style="#237dd7")
+        pt.add_column("Context", style="#237dd7")
+        pt.add_column("Max output", style="#237dd7")
+        for name, ctx, comp in _provider_rows:
+            pt.add_row(name, str(ctx or "—"), str(comp or "—"))
+        console.print(pt)
+
+    active_ctx, active_out = A._active_model_token_limits()
+    console.print(f"[dim]Active model: {active_ctx:,} context / {active_out:,} output[/dim]")
     console.print("[dim]/limits <key> <value> · /limits subagent <name> <turns> · "
-                  "/limits tool <name> <seconds>[/dim]")
+                  "/limits tool <name> <seconds> · /limits provider <name> <key> <value>[/dim]")
 
 
 def _memory_set_enabled(want: bool) -> None:
@@ -3827,6 +4201,16 @@ def cmd_limits(rest):
                 return
             _report_limit_change(A.set_tool_timeout(parts[1], parts[2]))
             return
+        if parts[0] == "provider":
+            if len(parts) != 4:
+                console.print("[red]usage:[/red] /limits provider <name> <key> <value>")
+                return
+            _, name, pkey, pvalue = parts
+            try:
+                _report_limit_change(A.set_provider_limit(name, pkey, pvalue))
+            except (KeyError, ValueError) as e:
+                console.print(f"[red]error:[/red] {e}")
+            return
         if len(parts) != 2:
             console.print("[red]usage:[/red] /limits <key> <value>")
             return
@@ -3945,6 +4329,31 @@ def _choice_prompt(message, choices, default=""):
             print("Invalid choice.")
 
 
+def _multi_choice_prompt(message, choices, checked=()):
+    """Checkbox picker — space to toggle, enter to confirm. Falls back to a
+    numbered comma-separated prompt on a non-interactive terminal."""
+    try:
+        from InquirerPy import inquirer
+        from InquirerPy.base.control import Choice
+        options = [Choice(c, enabled=c in checked) for c in choices]
+        return inquirer.checkbox(message=message, choices=options,
+                                  instruction="(space to toggle, enter to confirm)").execute()
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        print(message)
+        for index, choice in enumerate(choices, 1):
+            marker = " (default)" if choice in checked else ""
+            print(f"  {index}. {choice}{marker}")
+        value = input("Numbers, comma-separated (blank = none): ").strip()
+        if not value:
+            return []
+        picked = []
+        for part in value.split(","):
+            part = part.strip()
+            if part.isdigit() and 1 <= int(part) <= len(choices):
+                picked.append(choices[int(part) - 1])
+        return picked
+
+
 def _configure_custom_models_endpoint():
     try:
         endpoint = _custom_prompt("OpenAI-compatible URL:")
@@ -3973,7 +4382,7 @@ COMMANDS = {
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,
-    "audit": cmd_audit,
+    "audit": cmd_audit, "fusion": cmd_fusion,
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
     "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
@@ -3992,9 +4401,10 @@ _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 # Main REPL
 # ---------------------------------------------------------------------------
 def _estimate_context_pct():
-    """Rough ~4-chars-per-token estimate against CONTEXT_WINDOW — good enough for a
-    progress hint, not meant to be exact. Image parts count as a flat allowance
-    rather than their (huge) base64 length, which would peg the meter at 100%."""
+    """Rough ~4-chars-per-token estimate against the active model's context
+    window — good enough for a progress hint, not meant to be exact. Image
+    parts count as a flat allowance rather than their (huge) base64 length,
+    which would peg the meter at 100%."""
     chars = len(A.SYSTEM_PROMPT)
     for m in S.messages:
         content = m.get("content")
@@ -4006,9 +4416,10 @@ def _estimate_context_pct():
                     chars += 3000  # flat per-image allowance
         else:
             chars += len(content or "")
-    if not A.CONTEXT_WINDOW:
+    ctx_window, _ = A._active_model_token_limits()
+    if not ctx_window:
         return 0
-    return min(100, int(100 * (chars // 4) / A.CONTEXT_WINDOW))
+    return min(100, int(100 * (chars // 4) / ctx_window))
 
 
 def _prompt_label():
@@ -4031,11 +4442,14 @@ def _status_bar_fragments():
     pct = _estimate_context_pct()
     filled = min(10, max(0, pct // 10))
     last = S.last_usage or {}
+    ctx_window, ctx_output = A._active_model_token_limits()
+    ctx_label = f"{ctx_window // 1024}K" if ctx_window >= 1024 else str(ctx_window)
     return [
         ("fg:#00edff bold", " ◆ 8088 "),
         ("fg:#237dd7 bold", f"· {_active_provider_name()}:{A.MODEL_NAME}"[:28]),
         ("", " │ "),
         ("fg:#237dd7", f"{'█' * filled}{'░' * (10 - filled)} {pct}% ctx"),
+        ("fg:#0077B6", f" {ctx_label}"),
         ("", " │ "),
         ("fg:#237dd7", A.PERMISSION_MODE),
         ("", " │ "),
@@ -4288,6 +4702,21 @@ def _agent8088_home():
     if os.name == "nt":
         return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "agent8088"
     return Path.home() / ".agent8088"
+
+
+def _resolve_config_path():
+    """Resolve the active config.txt path, matching engine.py's precedence.
+
+    AGENT8088_CONFIG env > CWD ./config.txt > ~/.agent8088/config.txt >
+    %LOCALAPPDATA%/agent8088/config.txt. A CWD ./config.txt is exclusive
+    — setup writes go there, not the global install.
+    """
+    if os.environ.get("AGENT8088_CONFIG"):
+        return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+    cwd_config = Path.cwd() / "config.txt"
+    if cwd_config.exists():
+        return cwd_config
+    return Path(_agent8088_home() / "config.txt")
 
 
 def _agent8088_link_dir():
@@ -5491,8 +5920,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
     from agent8088 import providers as provider_registry
-    home = _agent8088_home()
-    config_path = Path(config_path or os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    config_path = Path(config_path) if config_path else _resolve_config_path()
     if not config_path.exists():
         # Seed from the packaged template so the wizard has defaults to edit.
         # The old behaviour — refusing to run and telling the user to "run the
@@ -5734,8 +6162,7 @@ def _run_gateway_setup():
     import subprocess
     import shutil
 
-    home = _agent8088_home()
-    config_path = Path(os.environ.get("AGENT8088_CONFIG", str(home / "config.txt")))
+    config_path = _resolve_config_path()
     if not config_path.exists():
         # Seed from the packaged template — same fix as _run_setup. The old
         # "run --setup first" message was a dead end when --setup itself

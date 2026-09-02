@@ -12,7 +12,7 @@
 param(
     [switch]$SkipSetup,
     [switch]$TerminalBootstrap,
-    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "main" }),
+    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = "",
     [string]$InstallerSourceUrl = ""
@@ -201,6 +201,7 @@ $ChromiumInstalled = $false
 $NodeInstalled = $false
 $WhatsAppBridgeReady = $false
 $SandboxInstalled = $false
+$CadRuntimeInstalled = $false
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -248,6 +249,7 @@ $TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
 $TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
 $TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
 $TLibreOffice = 1800 * $TimeoutScale  # ~350 MB MSI plus dependency resolution/install
+$TCadRuntime  = 1800 * $TimeoutScale  # OpenCascade/VTK wheels plus runtime smoke test
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
 # premature cut fails the install outright -- but it is still the largest
@@ -861,6 +863,124 @@ function Install-LibreOffice {
         -Reason "WinGet install failed ($wingetReason)" `
         -Fix "install LibreOffice manually from https://www.libreoffice.org/download/, then rerun"
     return $false
+}
+
+# ----------------------------------------------------------------------------
+# Isolated build123d + text-to-cad runtime. This replaces the desktop FreeCAD
+# dependency. It is deliberately outside the core venv: cadgen's OpenCascade,
+# VTK and scientific wheels are large and must not destabilize chat, search or
+# document dependencies. A failed optional CAD stage never blocks Agent8088.
+# ----------------------------------------------------------------------------
+function Install-CadRuntime {
+    $runtimeRoot = Join-Path $Agent8088Home "integrations\cad"
+    $runtimeVenv = Join-Path $runtimeRoot "venv"
+    $runtimePy = Join-Path $runtimeVenv "Scripts\python.exe"
+    $requirements = Join-Path $InstallDir "src\agent8088\cad_runtime_requirements.txt"
+    $skillGen = Join-Path $InstallDir "src\agent8088\skills_installed\cad\scripts\gen"
+    $verifier = Join-Path $InstallDir "scripts\verify_cad_runtime.py"
+    $viewerInstaller = Join-Path $InstallDir "scripts\install_cad_viewer.py"
+    $viewerRoot = Join-Path $runtimeRoot "viewer"
+    $probe = "from importlib.metadata import version; import build123d,cadgen; assert version('build123d')=='0.11.1'; assert version('cadgen')=='0.4.28'"
+    $dependenciesReady = $false
+
+    if (Test-Path -LiteralPath $runtimePy) {
+        $ready = Invoke-WithTimeout -FilePath $runtimePy `
+            -Arguments @("-I", "-c", $probe) -TimeoutSec 30 -Activity "Checking advanced CAD runtime"
+        if (-not $ready.TimedOut -and $ready.ExitCode -eq 0) {
+            $dependenciesReady = $true
+            Write-Info "build123d + text-to-cad CAD dependencies already installed"
+        } else {
+            Write-Warn "Existing CAD runtime is incomplete - rebuilding it"
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $requirements) -or
+        -not (Test-Path -LiteralPath $skillGen) -or
+        -not (Test-Path -LiteralPath $verifier) -or
+        -not (Test-Path -LiteralPath $viewerInstaller)) {
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "packaged runtime files are missing" `
+            -Fix "rerun the Agent8088 installer from a complete checkout"
+        return $false
+    }
+
+    New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+    if (-not $dependenciesReady) {
+        Write-Info "Installing isolated build123d + text-to-cad CAD runtime..."
+        # cadgen 0.4.28 requires Python 3.11+, while Agent8088 core intentionally
+        # still supports 3.10. Keep that requirement inside this isolated runtime.
+        $cadPython = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("python", "install", "3.11") -TimeoutSec $TVenv `
+            -Activity "Installing managed Python 3.11 for advanced CAD"
+        if ($cadPython.TimedOut -or $cadPython.ExitCode -ne 0) {
+            $why = if ($cadPython.TimedOut) { "timed out" } else { "uv exit $($cadPython.ExitCode)" }
+            Register-SkippedStage -Label "Advanced CAD runtime" `
+                -Reason "managed Python 3.11 install failed ($why)" `
+                -Fix "rerun the installer; the core agent works without advanced CAD"
+            return $false
+        }
+        $venvResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("venv", "--python", "3.11", "--clear", $runtimeVenv) `
+            -TimeoutSec $TVenv -Activity "Creating isolated CAD environment"
+        if ($venvResult.TimedOut -or $venvResult.ExitCode -ne 0 -or -not (Test-Path $runtimePy)) {
+            $why = if ($venvResult.TimedOut) { "timed out" } else { "uv exit $($venvResult.ExitCode)" }
+            Register-SkippedStage -Label "Advanced CAD runtime" -Reason "venv creation failed ($why)" `
+                -Fix "rerun the installer; the core agent works without advanced CAD"
+            return $false
+        }
+
+        $installResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+            -Arguments @("pip", "install", "--python", $runtimePy, "--requirement", $requirements) `
+            -TimeoutSec $TCadRuntime -Activity "Installing build123d and text-to-cad"
+        if ($installResult.TimedOut -or $installResult.ExitCode -ne 0) {
+            $why = if ($installResult.TimedOut) { "timed out after $([int]($TCadRuntime / 60))m" } else { "uv exit $($installResult.ExitCode)" }
+            Register-SkippedStage -Label "Advanced CAD runtime" -Reason "dependency install failed ($why)" `
+                -Fix "rerun the installer; set AGENT8088_TIMEOUT_SCALE=3 on a slow link"
+            return $false
+        }
+    }
+
+    $viewerInstall = Invoke-WithTimeout -FilePath $runtimePy `
+        -Arguments @("-I", $viewerInstaller, "--target", $viewerRoot) `
+        -TimeoutSec $TCadRuntime -Activity "Installing text-to-cad CAD Viewer"
+    if ($viewerInstall.TimedOut -or $viewerInstall.ExitCode -ne 0) {
+        $why = if ($viewerInstall.TimedOut) { "timed out" } else { "viewer installer exit $($viewerInstall.ExitCode)" }
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "CAD Viewer install failed ($why)" `
+            -Fix "rerun the installer; the download is checksum-pinned and safe to retry"
+        return $false
+    }
+
+    # The preview renderer is part of the CAD runtime contract. Install the
+    # browser revision matching the pinned Playwright package, even if the core
+    # agent currently happens to use the same revision.
+    $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $Agent8088Home "playwright-browsers"
+    $browser = Invoke-WithTimeout -FilePath $runtimePy `
+        -Arguments @("-m", "playwright", "install", "chromium") `
+        -TimeoutSec $TChromium -Activity "Installing advanced CAD preview browser"
+    if ($browser.TimedOut -or $browser.ExitCode -ne 0) {
+        $why = if ($browser.TimedOut) { "timed out" } else { "Playwright exit $($browser.ExitCode)" }
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "preview browser install failed ($why)" `
+            -Fix "rerun the installer; set AGENT8088_TIMEOUT_SCALE=3 on a slow link"
+        return $false
+    }
+
+    # A real round trip catches missing native wheels, invalid OpenCascade
+    # output, and a browser that installs but cannot render a CAD preview.
+    $smoke = Invoke-WithTimeout -FilePath $runtimePy `
+        -Arguments @("-I", $verifier, "--viewer-root", $viewerRoot) `
+        -TimeoutSec 300 -Activity "Verifying CAD generation, preview, and Viewer"
+    if ($smoke.TimedOut -or $smoke.ExitCode -ne 0) {
+        Register-SkippedStage -Label "Advanced CAD runtime" `
+            -Reason "installed packages failed the STEP, preview, and Viewer round-trip smoke test" `
+            -Fix "rerun the installer; inspect antivirus blocks if OpenCascade or Chromium cannot start"
+        return $false
+    }
+
+    $script:CadRuntimeInstalled = $true
+    Write-Success "build123d + text-to-cad CAD runtime and Viewer installed and verified"
+    return $true
 }
 
 function ConvertTo-PowerShellLiteral {
@@ -2393,6 +2513,11 @@ function Verify-Install {
     } else {
         Write-Host "  Browser:  Chromium missing (browse_page will show install instructions)"
     }
+    if ($script:CadRuntimeInstalled) {
+        Write-Host "  CAD:      build123d + text-to-cad runtime and Viewer installed and verified"
+    } else {
+        Write-Host "  CAD:      advanced CAD runtime unavailable (core agent still works)"
+    }
     if ($script:WhatsAppBridgeReady) {
         Write-Host "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"
     } elseif ($script:NodeInstalled) {
@@ -2537,6 +2662,7 @@ try {
     Install-Gateway-Extras
     Install-Node-Bridge
     Install-LibreOffice
+    Install-CadRuntime
     Install-Embedding-Model
     Install-Native-Sandbox
     if (-not (Setup-Path)) {
