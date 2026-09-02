@@ -4192,7 +4192,10 @@ def cmd_limits(rest):
                 return
             _, name, pkey, pvalue = parts
             try:
-                _report_limit_change(A.set_provider_limit(name, pkey, pvalue))
+                if pvalue.strip().lower() == "default":
+                    _report_limit_change(A.reset_provider_limit(name, pkey))
+                else:
+                    _report_limit_change(A.set_provider_limit(name, pkey, pvalue))
             except (KeyError, ValueError) as e:
                 console.print(f"[red]error:[/red] {e}")
             return

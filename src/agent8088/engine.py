@@ -116,6 +116,20 @@ def update_simple_config(path: Path, values: dict) -> None:
     _write_private_text(path, content)
 
 
+def remove_simple_config_keys(path: Path, keys) -> None:
+    """Delete key=value lines entirely, so callers fall back through to
+    probed/default values instead of an explicit override. Sibling to
+    update_simple_config, which can only set a value, never clear one."""
+    path = Path(path)
+    if not path.exists():
+        return
+    content = path.read_text(encoding="utf-8")
+    for key in keys:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+            raise ValueError(f"Invalid config key {key!r}")
+        content = re.sub(rf"^{re.escape(key)}=.*\n?", "", content, flags=re.MULTILINE)
+    _write_private_text(path, content)
+
 
 # --- .env key store ---
 
@@ -329,7 +343,7 @@ MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
 MAX_COMPLETION_TOKENS = max(
-    1, min(int(APP_CONFIG.get("max_completion_tokens", "8192")), CONTEXT_WINDOW)
+    1, min(int(APP_CONFIG.get("max_completion_tokens", "65000")), CONTEXT_WINDOW)
 )
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
 # A sub-agent exists to keep work *out* of the parent's context, so an unbounded
@@ -528,6 +542,28 @@ def set_provider_limit(provider: str, key: str, value: str) -> dict:
     config_key = f"provider.{provider}.{key}"
     APP_CONFIG[config_key] = str(new)
     update_simple_config(CONFIG_PATH, {config_key: new})
+    return {"key": config_key, "old": old, "new": new, "provider": provider,
+            "direction": "looser" if new > old else "tighter" if new < old else "same",
+            "over_ceiling": False, "ceiling": None}
+
+
+def reset_provider_limit(provider: str, key: str) -> dict:
+    """Clear a provider.<name>.<key> override so _active_model_token_limits
+    falls through to global config, then probed model metadata, then the
+    hardcoded default -- the same chain it already uses when no override was
+    ever set. The counterpart to set_provider_limit for undoing one."""
+    if provider not in PROVIDERS:
+        raise KeyError(provider)
+    if key not in _PROVIDER_LIMIT_KEYS:
+        raise ValueError(f"unknown provider limit: {key}")
+    old_raw = PROVIDERS[provider].get(key)
+    old = _positive_int(old_raw, 0)
+    PROVIDERS[provider].pop(key, None)
+    config_key = f"provider.{provider}.{key}"
+    APP_CONFIG.pop(config_key, None)
+    remove_simple_config_keys(CONFIG_PATH, [config_key])
+    new_context, new_completion = _active_model_token_limits(provider)
+    new = new_context if key == "context_window" else new_completion
     return {"key": config_key, "old": old, "new": new, "provider": provider,
             "direction": "looser" if new > old else "tighter" if new < old else "same",
             "over_ceiling": False, "ceiling": None}
