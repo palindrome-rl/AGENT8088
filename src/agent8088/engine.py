@@ -8404,7 +8404,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
     """
     if _plan_approved:
         return False
-    if name in {"browse_page", "get_page_title"}:
+    if name == "get_page_title":
         return not (_user_supplied_url(messages, args.get("url"))
                     or _user_requested_tool(messages, name))
     if name == "execute_shell":
@@ -8603,7 +8603,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
     plan_mutation_retries = 0
-    searched = False     # prevents speculative page browsing after search results
+    searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
     user_turns = _genuine_user_turns(messages)

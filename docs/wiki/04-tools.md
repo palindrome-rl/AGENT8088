@@ -390,7 +390,7 @@ training and an old page reads as current.
 | Date-qualified queries | A query meaning "as of now" with no year of its own gets the current year appended — or the month, for "today"/"this week". Controlled by `search_date_augmentation` |
 | Result dating | Results are stamped with their retrieval date so the model can spot a stale one |
 | Repeat searches | A reworded or reordered repeat is answered from the first search's results instead of re-running. A failed or empty search stays retryable |
-| Follow-up fetches | After a search succeeds, an *unsolicited* `browse_page`, `curl`-style shell command, or fetch-shaped MCP call is refused |
+| Follow-up fetches | After a search succeeds, an *unsolicited* `get_page_title`, `curl`-style shell command, or fetch-shaped MCP call is refused. `browse_page` may read a result when snippets lack a requested detail. |
 
 An **approved plan** lifts the follow-up gate for the rest of that turn. A
 plan-mode turn researches with a search and then carries out the approved steps in
