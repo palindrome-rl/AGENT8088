@@ -44,7 +44,7 @@ def test_a_malformed_browser_knob_falls_back_instead_of_killing_the_import(
 
     assert result.returncode == 0, f"import died on {key}={value!r}:\n{result.stderr[-1500:]}"
     steps, timeout = result.stdout.strip().split()[-2:]
-    assert (steps, timeout) == ("500", "600")
+    assert (steps, timeout) == ("25", "600")
 
 
 def test_a_valid_browser_knob_is_still_honoured(tmp_path):

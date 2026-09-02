@@ -3426,7 +3426,7 @@ def _int_config(key: str, default: int) -> int:
         return default
 
 
-BROWSER_MAX_STEPS = _int_config("browser_max_steps", 500)
+BROWSER_MAX_STEPS = _int_config("browser_max_steps", 25)
 BROWSER_TASK_TIMEOUT_SECONDS = _int_config("browser_task_timeout_seconds", 600)
 # How many actions the browsing model may batch into one step. Measured on a
 # local 35B: prefill is ~1250 tok/s and llama.cpp prefix-caches the fixed
@@ -3447,6 +3447,70 @@ BROWSER_HEADLESS = APP_CONFIG.get("browser_headless", "1").strip().lower() in (
 # per browse_page call so dragging it never sticks. "W,H" and "X,Y".
 BROWSER_WINDOW_SIZE = APP_CONFIG.get("browser_window_size", "").strip()
 BROWSER_WINDOW_POSITION = APP_CONFIG.get("browser_window_position", "").strip()
+# Screenshots (browser-use "vision") are off by default: a screenshot sent with
+# every step hard-errors against a text-only model, which is a large share of
+# the providers agent8088 targets. Turn it on only for a model that accepts
+# image input. Config-only on purpose - it's a property of the configured model,
+# not something to flip per run.
+BROWSER_SCREENSHOTS = APP_CONFIG.get("browser_screenshots", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
+# Where a browse has gone, captured from the SSRF proxy's on_visit hook. The
+# proxy is the one place that sees every request a browse makes (browser-use has
+# no per-request hook), so this is both the audit record of "what did it visit?"
+# and the source for the subtle live "visiting <host>" line the CLI shows under
+# the spinner. Written from the proxy's own threads, so guard the list; the
+# single-string current host is fine to read unlocked (an atomic rebind).
+_browse_visit_lock = threading.Lock()
+_browse_current_host = None   # host the browse is contacting now, or None
+_browse_visited_hosts = []    # ordered distinct hosts contacted this run
+
+
+def browser_status():
+    """The host browse_page is contacting right now, or None when idle.
+
+    The CLI reads this at spinner-render time to show a subtle 'visiting <host>'
+    line while a browse runs - a browse can otherwise sit for minutes with no
+    sign of life. None for every other tool, so the line only appears mid-browse.
+    """
+    return _browse_current_host
+
+
+def _reset_browse_visits() -> None:
+    global _browse_current_host
+    with _browse_visit_lock:
+        _browse_current_host = None
+        _browse_visited_hosts.clear()
+
+
+def _end_browse_visits() -> list:
+    """Clear the live "visiting" host and return the distinct hosts visited.
+
+    One call so the global rebind stays in a function that declares it global,
+    and the audit sees the list before the next run resets it."""
+    global _browse_current_host
+    with _browse_visit_lock:
+        visited = list(_browse_visited_hosts)
+        _browse_current_host = None
+    return visited
+
+
+def _record_browse_visit(url: str) -> None:
+    """Proxy on_visit callback: one approved request the browser just made.
+
+    Runs on the proxy's own threads, so it must never raise. Tracks the current
+    host (for the live line) and the ordered set of distinct hosts (for the
+    audit trail written when the browse ends)."""
+    global _browse_current_host
+    try:
+        import urllib.parse
+        host = urllib.parse.urlsplit(url).hostname or url
+    except Exception:  # noqa: BLE001 - a visit record must never fail a request
+        host = url
+    with _browse_visit_lock:
+        _browse_current_host = host
+        if host not in _browse_visited_hosts:
+            _browse_visited_hosts.append(host)
 
 # Mirrors cli.py's S.show_reasoning (toggled by /reasoning, aliased /think) -
 # see cmd_reasoning and Session.__init__. Kept as a plain engine.py global
@@ -3478,6 +3542,9 @@ class _QuietBrowserUseNoiseFilter(logging.Filter):
         # that itself via history.is_done() - so all it does is make a run
         # that returned the correct answer look like it crashed.
         "Result failed",
+        "Page readiness timeout",
+        "Empty DOM detected after navigation",
+        "Received duplicate response for request",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -3518,7 +3585,7 @@ def _set_browser_use_log_verbosity(verbose: bool) -> None:
     to it - only a Handler's own filter sees every record that reaches it,
     regardless of which logger originated it."""
     level = logging.INFO if verbose else logging.WARNING
-    for logger_name in ("browser_use", "bubus", "LiteLLM"):
+    for logger_name in ("browser_use", "bubus", "LiteLLM", "cdp_use", "cdp_use.client"):
         logging.getLogger(logger_name).setLevel(level)
 
     # browser-use's own cleanup of a Playwright session's low-level
@@ -3535,12 +3602,13 @@ def _set_browser_use_log_verbosity(verbose: bool) -> None:
     # surface through here.
     logging.getLogger("asyncio").setLevel(logging.WARNING if verbose else logging.CRITICAL)
 
-    for handler in logging.getLogger("browser_use").handlers:
-        has_filter = _browser_use_noise_filter in handler.filters
-        if verbose and has_filter:
-            handler.removeFilter(_browser_use_noise_filter)
-        elif not verbose and not has_filter:
-            handler.addFilter(_browser_use_noise_filter)
+    for logger_name in ("browser_use", "cdp_use", "cdp_use.client"):
+        for handler in logging.getLogger(logger_name).handlers:
+            has_filter = _browser_use_noise_filter in handler.filters
+            if verbose and has_filter:
+                handler.removeFilter(_browser_use_noise_filter)
+            elif not verbose and not has_filter:
+                handler.addFilter(_browser_use_noise_filter)
 
     try:
         import litellm
@@ -3587,13 +3655,53 @@ _BROWSER_PROHIBITED_HOST_PATTERNS = (
 )
 
 
+def _browser_max_steps() -> int:
+    """AI-call ceiling for one browse; env beats config so a demo or a test can
+    cap it without editing config.txt (the batch-size and headless knobs already
+    work this way). A bad value falls back rather than crashing a run mid-task.
+
+    Only a ceiling: browse_page still stops as soon as the task is done, and the
+    wall-clock timeout still applies on top - this just bounds how many steps a
+    task that never finishes may burn."""
+    raw = os.environ.get("AGENT8088_BROWSER_MAX_STEPS", "").strip()
+    try:
+        value = int(raw) if raw else BROWSER_MAX_STEPS
+    except ValueError:
+        value = BROWSER_MAX_STEPS
+    return max(1, value)
+
+
 def _browser_task_timeout() -> int:
     """The real wall-clock bound on one browse_page call.
 
     browser_task_timeout_seconds is the browser-specific budget, but a single
     tool call may never outrun max_tool_timeout_seconds - the documented hard
-    ceiling every other tool path clamps to (see run_tool)."""
-    return min(max(1, BROWSER_TASK_TIMEOUT_SECONDS), MAX_TOOL_TIMEOUT_SECONDS)
+    ceiling every other tool path clamps to (see run_tool).
+
+    Env beats config (AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS) so one run can be
+    shortened for a test or a demo without editing config.txt; a bad value falls
+    back to the configured budget rather than crashing."""
+    raw = os.environ.get("AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS", "").strip()
+    try:
+        seconds = int(raw) if raw else BROWSER_TASK_TIMEOUT_SECONDS
+    except ValueError:
+        seconds = BROWSER_TASK_TIMEOUT_SECONDS
+    return min(max(1, seconds), MAX_TOOL_TIMEOUT_SECONDS)
+
+
+def _browser_screenshots() -> bool:
+    """Whether this browse sends screenshots to the model (browser-use vision).
+
+    Off by default (see BROWSER_SCREENSHOTS): a screenshot every step hard-errors
+    against a text-only model, which is a large share of the providers agent8088
+    targets. Enable browser_screenshots=1, or set
+    AGENT8088_BROWSER_SCREENSHOTS=1 for one vision-capable run."""
+    override = os.environ.get("AGENT8088_BROWSER_SCREENSHOTS", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return BROWSER_SCREENSHOTS
 
 
 def _browser_max_actions_per_step() -> int:
@@ -3843,8 +3951,9 @@ def _browser_use_available() -> bool:
         return False
 
 
-async def _run_browser_agent(url: str, task: str, executable_path: str | None = None) -> str:
-    """Drive one browser-use Agent run and return its final result text.
+async def _run_browser_agent(url: str, task: str,
+                             executable_path: str | None = None) -> tuple[str, str]:
+    """Drive one browser-use Agent run, returning web content and local notes.
 
     Every request the browser makes passes through a fresh local SSRF-
     filtering proxy (browser_proxy.py) that runs the same _egress_check/
@@ -3868,9 +3977,11 @@ async def _run_browser_agent(url: str, task: str, executable_path: str | None = 
     from agent8088.browser_llm import build_browser_chat_model
     from agent8088.browser_proxy import start_ssrf_filtering_proxy
 
+    _reset_browse_visits()
     proxy_url, stop_proxy = start_ssrf_filtering_proxy(
         lambda target_url: _egress_check(target_url) or _ssrf_check(target_url),
-        check_address=_browser_address_check)
+        check_address=_browser_address_check,
+        on_visit=_record_browse_visit)
     # Left unset, BrowserProfile's own field validator silently mkdtemp()s a
     # user-data-dir under the OS temp dir - and browser-use's cleanup code
     # only recognizes a different temp-dir prefix, so that directory is never
@@ -3899,14 +4010,14 @@ async def _run_browser_agent(url: str, task: str, executable_path: str | None = 
             # every step) and errors out entirely against a model that
             # doesn't accept image input - which is exactly the situation for
             # a large share of the providers/models agent8088 supports (local
-            # or text-only). Since this adapter is required to work with
-            # "whatever provider the user already has configured," not just
-            # vision-capable ones, screenshots must be off unconditionally.
-            # use_vision="auto" was considered and rejected: it still exposes
-            # a "screenshot" action the model can choose to call on its own,
-            # which would hit the same failure - only False fully disables
-            # both the automatic per-step screenshot and that action.
-            use_vision=False,
+            # or text-only). Since this adapter must work with "whatever
+            # provider the user already has configured," the default is off -
+            # but a vision-capable model can turn it back on with
+            # browser_screenshots=1 (see _browser_screenshots). It is a plain
+            # bool, not "auto": "auto" still exposes a "screenshot" action the
+            # model can call on its own and hit the same failure, so the choice
+            # stays explicit - fully off, or fully on for a model that can see.
+            use_vision=_browser_screenshots(),
             # A free-form thinking field can consume a small model's entire
             # output budget before it emits a browser action.
             use_thinking=False,
@@ -3940,7 +4051,7 @@ async def _run_browser_agent(url: str, task: str, executable_path: str | None = 
             use_judge=False,
         )
         history = await asyncio.wait_for(
-            agent.run(max_steps=BROWSER_MAX_STEPS),
+            agent.run(max_steps=_browser_max_steps()),
             timeout=_browser_task_timeout(),
         )
     finally:
@@ -3956,18 +4067,29 @@ async def _run_browser_agent(url: str, task: str, executable_path: str | None = 
                     "browse_page: agent.close() did not finish cleanly: %s", e)
         stop_proxy()
         shutil.rmtree(user_data_dir, ignore_errors=True)
+        # Record where the browse actually went, and drop the live "visiting"
+        # line. The proxy saw every host; without this line there is no answer
+        # to "what did it visit?" - browse_page only ever logged the start URL.
+        visited = _end_browse_visits()
+        if visited:
+            _log.info("browser_visit start=%s hosts=%s", url, ", ".join(visited))
+            _audit("browser_visit", start_url=url, hosts=", ".join(visited))
 
-    result = history.final_result() or "(The task did not produce a final result.)"
+    content = history.final_result() or "(The task did not produce a final result.)"
+    # Advisory notes are kept apart from the page content: _exec_browser wraps
+    # only the content in the untrusted-content frame, so these agent8088-owned
+    # notes are not mislabelled as something the website said.
+    notes = []
     if not history.is_done():
-        result += "\n\n(Note: the browsing task hit its step or time limit before finishing.)"
+        notes.append("Note: the browsing task hit its step or time limit before finishing.")
     # A budget stop raises inside Agent8088ChatModel.ainvoke, but browser-use
     # catches per-step exceptions and keeps going until max_steps, so the real
     # reason would otherwise never reach the user - only the generic
     # "hit its step or time limit" note above.
     over_budget = _active_budget.exceeded() if _active_budget is not None else None
     if over_budget:
-        result += f"\n\n(The browsing task stopped early: {over_budget})"
-    return result
+        notes.append(f"The browsing task stopped early: {over_budget}")
+    return content, "\n".join(notes)
 
 
 def _exec_browser(args: dict) -> str:
@@ -4021,13 +4143,12 @@ def _exec_browser(args: dict) -> str:
 
     saved_role, _active_role = _active_role, "subagent:browser"
     try:
-        result = asyncio.run(_run_browser_agent(url, task, executable_path))
+        browser_result = asyncio.run(_run_browser_agent(url, task, executable_path))
     except asyncio.TimeoutError:
-        knob = ("max_tool_timeout_seconds"
-                if BROWSER_TASK_TIMEOUT_SECONDS > MAX_TOOL_TIMEOUT_SECONDS
-                else "browser_task_timeout_seconds")
-        result = (f"Browser error: task exceeded the {_browser_task_timeout()}s "
-                  f"time limit (raise {knob} in config.txt).")
+        return (f"Browser error: task exceeded the {_browser_task_timeout()}s "
+                f"time limit (raise AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS for this "
+                "run, or browser_task_timeout_seconds in config.txt; "
+                "max_tool_timeout_seconds remains the hard cap).")
     except KeyboardInterrupt:
         # Ctrl+C ends agent8088 outright (cli.py's main loop catches this one
         # level up and exits) - re-raise so that still happens. What this
@@ -4045,12 +4166,27 @@ def _exec_browser(args: dict) -> str:
         logging.getLogger("asyncio").setLevel(logging.CRITICAL)
         raise
     except Exception as e:
-        result = f"Browser error: {e}"
+        return f"Browser error: {e}"
     finally:
         _active_role = saved_role
 
-    result = re.sub(r'\n{3,}', '\n\n', (result or "").strip())
-    return _wrap_untrusted(_strip_special_tokens(result[:5000]), url)
+    # Tests and third-party callers have historically stubbed this helper with
+    # a plain string. Keep that small compatibility path while real runs return
+    # separate local notes so Agent8088's own messages are never labelled as web
+    # content.
+    if isinstance(browser_result, tuple):
+        content, note = browser_result
+    else:
+        content, note = browser_result, ""
+    content = re.sub(r'\n{3,}', '\n\n', (content or "").strip())
+    content = _strip_special_tokens(content)
+    if len(content) > 5000:
+        omitted = len(content) - 5000
+        content = content[:5000].rstrip()
+        note = "\n".join(part for part in (
+            note, f"Browser result truncated: {omitted} characters omitted.") if part)
+    result = _wrap_untrusted(content, url)
+    return f"{result}\n\n{note}" if note else result
 
 
 # ---------------------------------------------------------------------------

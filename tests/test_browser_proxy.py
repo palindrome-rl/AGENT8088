@@ -24,7 +24,9 @@ def _connect_raw(port, target):
 
 
 def test_connect_to_blocked_target_is_refused():
-    proxy_url, stop = start_ssrf_filtering_proxy(lambda url: "Blocked: test policy.")
+    visited = []
+    proxy_url, stop = start_ssrf_filtering_proxy(
+        lambda url: "Blocked: test policy.", on_visit=visited.append)
     port = int(proxy_url.rsplit(":", 1)[1])
     try:
         code, reason = _connect_raw(port, "10.0.0.5:443")
@@ -32,6 +34,7 @@ def test_connect_to_blocked_target_is_refused():
         assert "Blocked" in reason
     finally:
         stop()
+    assert not visited
 
 
 def test_connect_to_allowed_target_establishes_tunnel_and_relays_data():
@@ -60,6 +63,27 @@ def test_connect_to_allowed_target_establishes_tunnel_and_relays_data():
     finally:
         stop()
         upstream.close()
+
+
+def test_allowed_requests_are_reported_to_the_visit_hook():
+    visited = []
+    proxy_url, stop = start_ssrf_filtering_proxy(lambda url: None, on_visit=visited.append)
+    port = int(proxy_url.rsplit(":", 1)[1])
+    upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    upstream.bind(("127.0.0.1", 0))
+    upstream.listen(1)
+    upstream_port = upstream.getsockname()[1]
+    try:
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        client.sendall(f"CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        conn, _ = upstream.accept()
+        assert client.recv(4096).startswith(b"HTTP/1.1 200")
+        client.close()
+        conn.close()
+    finally:
+        stop()
+        upstream.close()
+    assert visited == [f"https://127.0.0.1:{upstream_port}/"]
 
 
 def test_check_target_receives_a_url_shaped_string_for_connect():

@@ -101,6 +101,7 @@ def test_active_role_restored_even_when_the_run_raises(monkeypatch, tmp_path):
     result = A._exec_browser({"url": "https://example.com", "task": "read the heading"})
 
     assert "Browser error" in result
+    assert "EXTERNAL_UNTRUSTED_CONTENT" not in result
     assert A._active_role == "main"
 
 
@@ -594,4 +595,66 @@ def test_a_budget_stop_is_reported_in_the_result(fake_browser_use, monkeypatch):
 
     result = asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
 
-    assert "Turn budget exceeded" in result
+    assert "Turn budget exceeded" in result[1]
+
+
+def test_env_overrides_step_timeout_and_screenshots(fake_browser_use, monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 25)
+    monkeypatch.setattr(A, "BROWSER_TASK_TIMEOUT_SECONDS", 600)
+    monkeypatch.setattr(A, "BROWSER_SCREENSHOTS", False)
+    monkeypatch.setenv("AGENT8088_BROWSER_MAX_STEPS", "3")
+    monkeypatch.setenv("AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS", "7")
+    monkeypatch.setenv("AGENT8088_BROWSER_SCREENSHOTS", "1")
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+
+    assert fake_browser_use.agents[0].max_steps == 3
+    assert fake_browser_use.agents[0].kwargs["use_vision"] is True
+    assert A._browser_task_timeout() == 7
+
+
+def test_browser_output_marks_truncation_and_keeps_its_own_note_outside_web_content(
+        monkeypatch, tmp_path):
+    _install_present_chromium(monkeypatch, tmp_path)
+
+    async def fake_run_browser_agent(url, task, executable_path=None):
+        return "x" * 5001, "Note: task stopped early."
+
+    monkeypatch.setattr(A, "_run_browser_agent", fake_run_browser_agent)
+    result = A._exec_browser({"url": "https://example.com", "task": "read it"})
+
+    assert "Browser result truncated: 1 characters omitted." in result
+    assert result.index("<<<END_UNTRUSTED_CONTENT>>>") < result.index("Note: task stopped early.")
+
+
+@pytest.mark.parametrize("message", [
+    "⚠️ Page readiness timeout (8.0s, 8843ms) for https://huggingface.co/papers",
+    "⚠️ Empty DOM detected after navigation to https://arxiv.org/search/, "
+    "waiting 3s and rechecking...",
+    "Received duplicate response for request 93 - ignoring",
+])
+def test_noise_filter_drops_the_transient_page_load_notices(message):
+    """Three warnings that browser-use and cdp-use print per navigation while
+    recovering on their own. All observed in a run that returned the correct
+    answer: a readiness probe that timed out and was retried, a DOM that was
+    empty for a moment after navigation and was rechecked, and a duplicate
+    CDP response whose own text says it is being ignored. None of them
+    changes whether the task succeeded, which browse_page reports through
+    history.is_done()."""
+    filt = A._QuietBrowserUseNoiseFilter()
+    assert filt.filter(_log_record(message)) is False
+
+
+def test_the_noise_filter_reaches_the_cdp_use_logger():
+    """cdp_use.client keeps its own handler and does not propagate, so a
+    filter attached only to browser_use's handler never sees its records -
+    which is why the duplicate-response warnings kept printing."""
+    import logging
+
+    A._set_browser_use_log_verbosity(False)
+    for name in ("cdp_use", "cdp_use.client"):
+        handlers = logging.getLogger(name).handlers
+        if not handlers:
+            continue
+        assert any(A._browser_use_noise_filter in h.filters for h in handlers), (
+            f"{name} handlers carry no noise filter")

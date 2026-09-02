@@ -175,6 +175,10 @@ class _StatusLine:
             bits.append("esc to interrupt")
         grid = Table.grid(padding=(0, 1))
         grid.add_row(self.spinner, Text(f"{self.msg} ({' · '.join(bits)})", style="dim"))
+        if self.msg == "running browse_page...":
+            host = A.browser_status()
+            if host:
+                grid.add_row(Text(""), Text(f"visiting {host}", style="dim"))
         yield grid
 
 
@@ -1017,6 +1021,16 @@ def on_result(name, result):
     if S.verbose == "off":
         return
     mode = A.TOOL_SPECS.get(name, {}).get("mode")
+
+    if result.lstrip().startswith("ESCALATION_REQUEST\x1f"):
+        fields = result.strip().split("\x1f", 4)
+        change = fields[2] if len(fields) > 2 else "this action"
+        reason = fields[4] if len(fields) > 4 else ""
+        message = reason or f"Approval required for {change}."
+        if change:
+            message = f"{change}: {message}"
+        console.print(Text(f"  ⎿  {message}", style="dim"))
+        return
 
     if name == "web_search":
         # The raw result carries a "[Retrieved ...]" date stamp and an

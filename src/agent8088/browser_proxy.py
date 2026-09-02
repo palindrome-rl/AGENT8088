@@ -61,7 +61,8 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self):
         host, _, port_str = self.path.partition(":")
         port = int(port_str or 443)
-        blocked = self.server.check_target(f"https://{host}:{port}/")
+        target = f"https://{host}:{port}/"
+        blocked = self.server.check_target(target)
         if blocked:
             self.send_error(403, blocked)
             return
@@ -69,6 +70,7 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
         if upstream is None:
             self.send_error(status, message)
             return
+        self.server.record_visit(target)
         self.send_response(200, "Connection Established")
         self.end_headers()
         self._relay(self.connection, upstream)
@@ -89,6 +91,7 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
         if upstream is None:
             self.send_error(status, message)
             return
+        self.server.record_visit(self.path)
         target = urllib.parse.urlunparse(
             ("", "", parsed.path or "/", parsed.params, parsed.query, ""))
         upstream.sendall(f"{method} {target} HTTP/1.1\r\n".encode())
@@ -154,10 +157,26 @@ class _SSRFFilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPSer
     allow_reuse_address = True
 
     def __init__(self, check_target: Callable[[str], Optional[str]],
-                 check_address: Callable[[str, int, str], Optional[str]]):
+                 check_address: Callable[[str, int, str], Optional[str]],
+                 on_visit: Callable[[str], None]):
         super().__init__(("127.0.0.1", 0), _SSRFFilteringHandler)
         self.check_target = check_target
         self.check_address = check_address
+        self.on_visit = on_visit
+
+    def record_visit(self, url: str) -> None:
+        """Report one approved request to the caller's visit hook.
+
+        Called for every request that passed check_target - the initial
+        navigation and every redirect, clicked link, form post and background
+        fetch after it. browser-use has no per-request hook of its own, so this
+        proxy is the one place that sees the full set of hosts a browse touches;
+        the hook is what lets a caller record or display them. Never allowed to
+        break a request: a raising hook must not fail the browse."""
+        try:
+            self.on_visit(url)
+        except Exception:  # noqa: BLE001 - a visit record must never fail a request
+            pass
 
     def handle_error(self, request, client_address):
         # Chromium routinely opens and abandons connections (speculative
@@ -177,6 +196,7 @@ class _SSRFFilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPSer
 def start_ssrf_filtering_proxy(
     check_target: Callable[[str], Optional[str]],
     check_address: Optional[Callable[[str, int, str], Optional[str]]] = None,
+    on_visit: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, Callable[[], None]]:
     """Start a loopback-only proxy that runs `check_target(url)` (returning
     None if allowed, else an error string - the same contract as
@@ -191,9 +211,15 @@ def start_ssrf_filtering_proxy(
     "127.0.0.1" for the connection. Defaults to refusing nothing, which is
     only appropriate when the caller has no address policy at all.
 
+    `on_visit(url)` is called once for every request the proxy forwards after
+    it passes check_target - the caller uses it to record or surface where a
+    browse actually went (browser-use exposes no per-request hook of its own).
+    Defaults to doing nothing.
+
     Returns (proxy_url, stop_fn). Call stop_fn() to shut the proxy down."""
     server = _SSRFFilteringProxyServer(
-        check_target, check_address or (lambda host, port, ip: None))
+        check_target, check_address or (lambda host, port, ip: None),
+        on_visit or (lambda url: None))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     port = server.server_address[1]
