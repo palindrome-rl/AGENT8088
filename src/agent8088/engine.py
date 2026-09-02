@@ -342,9 +342,15 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
-MAX_COMPLETION_TOKENS = max(
-    1, min(int(APP_CONFIG.get("max_completion_tokens", "65000")), CONTEXT_WINDOW)
-)
+# Not clamped to CONTEXT_WINDOW here -- that constant is only the *global*
+# fallback context, not the active model's real one. _active_model_token_limits
+# already does min(completion, context) against each call's actual resolved
+# context; pre-clamping here against the wrong (global, usually smaller) value
+# silently capped every model's completion fallback at CONTEXT_WINDOW regardless
+# of its real context window -- e.g. a 1M-context model still showed 32,768
+# output because this line clamped the fallback down before the real context
+# was ever consulted.
+MAX_COMPLETION_TOKENS = max(1, int(APP_CONFIG.get("max_completion_tokens", "65000")))
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
 # A sub-agent exists to keep work *out* of the parent's context, so an unbounded
 # answer defeats the delegation it was spawned for. 0 disables the cap.
