@@ -18,7 +18,7 @@ is what the permission layer gates on — see
 | `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails. |
 | `web_search` | `search` | `query` | prompt by default | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
-| `browse_page` | `browser` | `url` | prompt | Headless browser — renders JS that curl can't. |
+| `browse_page` | `browser` | `url`, `task` | prompt | Headless browser — click, fill forms, navigate, and extract via natural-language instructions, not just read static text. |
 | `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
 | `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. |
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |

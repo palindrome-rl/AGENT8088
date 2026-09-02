@@ -74,3 +74,7 @@ artifacts/*
 
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/
+
+# Subagent-driven-development scratch workspace (ledgers, briefs, reports) —
+# per-plan working state, not part of the shipped change
+.superpowers/

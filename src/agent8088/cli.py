@@ -175,6 +175,10 @@ class _StatusLine:
             bits.append("esc to interrupt")
         grid = Table.grid(padding=(0, 1))
         grid.add_row(self.spinner, Text(f"{self.msg} ({' · '.join(bits)})", style="dim"))
+        if self.msg == "running browse_page...":
+            host = A.browser_status()
+            if host:
+                grid.add_row(Text(""), Text(f"visiting {host}", style="dim"))
         yield grid
 
 
@@ -221,6 +225,7 @@ class Session:
             self.max_turns = 10
         self.show_trace = config.get("show_trace", "0").lower() in {"1", "true", "on", "yes"}
         self.show_reasoning = config.get("show_reasoning", "0").lower() in {"1", "true", "on", "yes"}
+        A.SHOW_REASONING = self.show_reasoning
         self.last_trace = None
         self.conversation_trace = []
         self.trace_path = ""
@@ -1017,6 +1022,16 @@ def on_result(name, result):
     if S.verbose == "off":
         return
     mode = A.TOOL_SPECS.get(name, {}).get("mode")
+
+    if result.lstrip().startswith("ESCALATION_REQUEST\x1f"):
+        fields = result.strip().split("\x1f", 4)
+        change = fields[2] if len(fields) > 2 else "this action"
+        reason = fields[4] if len(fields) > 4 else ""
+        message = reason or f"Approval required for {change}."
+        if change:
+            message = f"{change}: {message}"
+        console.print(Text(f"  ⎿  {message}", style="dim"))
+        return
 
     if name == "web_search":
         # The raw result carries a "[Retrieved ...]" date stamp and an
@@ -2175,6 +2190,109 @@ def cmd_cli_anything(rest):
         "first, preserve Agent8088's permissions and sandbox boundaries, and "
         f"complete or clearly report blockers: {task}"
     )
+
+
+def cmd_task(rest):
+    """Start, resume, or inspect a restart-safe model task."""
+    from agent8088.task_runtime import TaskStore, run_task, store_path
+    store = TaskStore(A.APP_CONFIG.get("task_db_path") or store_path(A.CONFIG_PATH))
+    parts = (rest or "").strip().split(None, 1)
+    action = parts[0].lower() if parts else "list"
+    if action in {"list", "status"}:
+        rows = store.list()
+        if not rows:
+            console.print("[dim]No durable tasks.[/dim]")
+        for row in rows:
+            console.print(f"{row['id'][:12]}  {row['state']:<10}  {row['goal'][:100]}")
+        store.close()
+        return
+    if action not in {"start", "resume", "end", "output"}:
+        console.print("[dim]usage: /task start <goal> | /task resume <id> | /task end <id> | /task output <id> | /task list[/dim]")
+        store.close()
+        return
+    task_ref = parts[1].strip() if action in {"resume", "end", "output"} and len(parts) > 1 else ""
+    goal = parts[1].strip() if action == "start" and len(parts) > 1 else ""
+    if action == "start" and not goal:
+        console.print("[red]A task goal is required.[/red]")
+        store.close()
+        return
+    if action in {"resume", "end", "output"} and not task_ref:
+        console.print(f"[red]A task id is required for /task {action}.[/red]")
+        store.close()
+        return
+    if action in {"resume", "end", "output"}:
+        try:
+            task = store.resolve(task_ref)
+        except KeyError:
+            console.print(f"[red]No unique task matches[/red] '{task_ref}'.")
+            store.close()
+            return
+    else:
+        task = None
+    if action == "end":
+        row = store.cancel(task["id"])
+        console.print(f"[bold]task {row['id']}[/bold] → {row['state']}")
+        store.close()
+        return
+    if action == "output":
+        console.print(f"[bold]task {task['id']}[/bold] → {task['state']} (slice {task['slice_no']})")
+        console.print(Panel(Text(task["last_answer"] or "(no answer yet)"),
+                            title="[#237dd7]latest answer[/#237dd7]", box=box.ROUNDED,
+                            border_style="#0077B6"))
+        for op in store.recent_operations(task["id"]):
+            preview = str(op["result"]).strip().replace("\n", " ")
+            line = Text("  ⎿ ", style="dim")
+            line.append(op["tool"], style="bold")
+            line.append(f" · {op['state']}", style="dim")
+            if preview:
+                line.append(f" · {preview[:160]}" + ("…" if len(preview) > 160 else ""), style="dim")
+            console.print(line)
+        store.close()
+        return
+
+    def task_calls(calls):
+        for call in calls:
+            line = Text("⏺ ", style="#237dd7")
+            line.append(call["name"], style="bold")
+            summary = _tool_summary(call["name"], call.get("arguments"))
+            if summary:
+                line.append(" · ", style="dim")
+                line.append(summary, style="dim")
+            console.print(line)
+
+    def task_result(name, result):
+        if str(result).startswith("ESCALATION_REQUEST\x1f"):
+            return
+        preview = str(result).strip().replace("\n", " ")
+        line = Text("  ⎿ ", style="dim")
+        line.append(preview[:160] + ("…" if len(preview) > 160 else ""), style="dim")
+        console.print(line)
+
+    def task_slice(task, event):
+        label = f"task {task['id'][:8]} · slice {task['slice_no']} · {event}"
+        console.print(Text(f"◐ {label}", style="#237dd7"))
+
+    def task_escalation(_name, result):
+        return _handle_escalation(result)
+
+    def agent(messages, **kwargs):
+        return A.run_agent(
+            messages, temperature=S.temperature,
+            memory_capture=False,
+            system_prompt=_session_system_prompt,
+            tools_def=lambda: A.build_tools_def(_active_tool_specs()),
+            allowed_tools=lambda: set(_active_tool_specs()),
+            spin=status_cm, on_calls=task_calls, on_result=task_result,
+            on_escalation=task_escalation, **kwargs,
+        )
+
+    row = run_task(goal, agent, store=store, workspace=A.PROJECT_ROOT,
+                   task_id=task["id"] if task else None, max_slices=8, slice_turns=max(4, S.max_turns),
+                   on_slice=task_slice)
+    console.print(f"[bold]task {row['id']}[/bold] → {row['state']} (slice {row['slice_no']})")
+    if row["last_answer"]:
+        console.print(row["last_answer"])
+    store.close()
 
 
 def _read_key(fd):
@@ -3644,6 +3762,7 @@ def cmd_resume(rest):
     S.max_turns = int(data.get("max_turns", 10))
     S.show_trace = bool(data.get("show_trace", False))
     S.show_reasoning = bool(data.get("show_reasoning", False))
+    A.SHOW_REASONING = S.show_reasoning
     S.disabled_skills = set(data.get("disabled_skills", [])) & set(A.SKILL_PACKAGES)
     S.verbose = data.get("verbose", "on") if data.get("verbose") in {"on", "off", "full"} else "on"
     S.usage_mode = data.get("usage_mode", "tokens") if data.get("usage_mode") in {"off", "tokens", "full"} else "tokens"
@@ -3787,6 +3906,7 @@ def cmd_reasoning(rest):
         S.show_reasoning = False
     else:
         S.show_reasoning = not S.show_reasoning
+    A.SHOW_REASONING = S.show_reasoning
     state = "on" if S.show_reasoning else "off"
     note = "  [dim](secrets & system text are masked even when shown)[/dim]" if S.show_reasoning else ""
     console.print(f"reasoning display: [{'green' if S.show_reasoning else 'red'}]{state}[/]{note}")
@@ -4393,6 +4513,7 @@ COMMANDS = {
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
     "memory": cmd_memory,
+    "task": cmd_task,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 

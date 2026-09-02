@@ -160,6 +160,23 @@ def test_probe_result_is_used_when_no_config_override(monkeypatch, engine):
     assert completion == 32768
 
 
+def test_two_cutoffs_get_a_concise_last_recovery_attempt(monkeypatch, engine):
+    calls = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        calls.append({"messages": list(messages), "max_tokens": max_tokens})
+        if len(calls) < 3:
+            return _length_response("<think>too long</think>")
+        return _stop_response("recovered")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    result = engine.run_agent([{"role": "user", "content": "use a tool"}], max_turns=5)
+
+    assert result == "recovered"
+    assert calls[2]["max_tokens"] == min(1024, engine.MAX_COMPLETION_TOKENS)
+    assert "within 200 tokens" in calls[2]["messages"][-1]["content"]
+
+
 def test_turn_limit_reports_error_and_latest_tool_result(monkeypatch, engine):
     responses = iter((
         '✿FUNCTION✿: read_text ✿ARGS✿: {"filename": "first"}',

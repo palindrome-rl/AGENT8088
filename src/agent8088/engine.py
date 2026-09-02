@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
+import ast, asyncio, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -345,7 +345,7 @@ READ_PAGE_LINES = int(APP_CONFIG.get("read_page_lines", "200"))
 MAX_DOCUMENT_BYTES = int(APP_CONFIG.get("max_document_bytes", str(25 * 1024 * 1024)))
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
-MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "300")))
+MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "600")))
 # A CAD-scoped script call (scripts/gen on a complex lattice, etc.) can
 # legitimately run longer than the generic shell ceiling -- mirrors the old
 # the old cad_project_finalize/generate_cad_model tool timeouts (600-900s).
@@ -2017,9 +2017,19 @@ def _native_tool_text(message) -> str:
             continue
         arguments = getattr(function, "arguments", None) or "{}"
         try:
-            arguments = json.dumps(json.loads(arguments))
-        except (TypeError, json.JSONDecodeError):
-            arguments = "{}"
+            # The tolerant loader, not plain json.loads: a provider that sends
+            # a literal newline inside an argument value (common when the value
+            # is code or a long task description) is emitting technically
+            # invalid JSON that is still perfectly recoverable.
+            arguments = json.dumps(_loads_tool_args(arguments))
+        except Exception:
+            # Pass the raw blob through rather than substituting "{}". Both
+            # ✿ARGS✿ paths in find_tool_calls turn unparseable arguments into
+            # an explicit __parse_error__, whereas "{}" would look like the
+            # model sent no arguments at all — making the tool report a
+            # required field as missing and blame the model for an omission
+            # that never happened.
+            arguments = str(arguments)
         lines.append(f"✿FUNCTION✿: {function.name} ✿ARGS✿: {arguments}")
     return "\n".join(lines)
 
@@ -2341,6 +2351,8 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- A direct request to run a command MUST call execute_shell.")
     if "web_search" in specs:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
+    if "browse_page" in specs:
+        lines.append("- A multi-step website workflow MUST use one browse_page call whose task contains the entire end-to-end workflow. Do not split login, cart, checkout, or navigation across browse_page calls: each call starts a fresh browser session.")
     if "convert_document" in specs:
         lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
     if "create_document" in specs:
@@ -3832,7 +3844,526 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 # Browser — real page rendering via Playwright (optional dependency)
 # ---------------------------------------------------------------------------
-BROWSER_TIMEOUT_MS = int(APP_CONFIG.get("browser_timeout_ms", "20000"))
+def _int_config(key: str, default: int) -> int:
+    """Parse an integer setting, falling back to `default` on anything else.
+
+    These knobs are read while `import agent8088.engine` is still running, so
+    a bare int() turns one typo in config.txt - a trailing "# comment", an
+    emptied-out value - into a ValueError traceback that kills the CLI, the
+    gateway and the MCP server before any of them start, naming no setting.
+    No browsing knob is worth a dead process: mirror what
+    _browser_max_actions_per_step already does for its own value and fall
+    back to the documented default.
+    """
+    try:
+        return int(str(APP_CONFIG.get(key, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+BROWSER_MAX_STEPS = _int_config("browser_max_steps", 25)
+BROWSER_TASK_TIMEOUT_SECONDS = _int_config("browser_task_timeout_seconds", 600)
+# How many actions the browsing model may batch into one step. Measured on a
+# local 35B: prefill is ~1250 tok/s and llama.cpp prefix-caches the fixed
+# system prompt, but generation is only ~68 tok/s - so a step costs about its
+# output tokens, and wall clock tracks the number of steps. One action per step
+# is the reliable default (it prevents the stale-index cascade seen in
+# checkout), but it multiplies the cost of a form: raise it for a form-heavy
+# run, at the price of acting on a DOM that a previous action may have changed.
+BROWSER_MAX_ACTIONS_PER_STEP = int(APP_CONFIG.get("browser_max_actions_per_step", "1"))
+# Headless is the right default for a tool that runs unattended, but it leaves
+# no way to *watch* a run - which is exactly what a demo or a stuck-selector
+# debugging session needs. Opt in with browser_headless=0, or per-run with
+# AGENT8088_BROWSER_HEADLESS=0. Visibility only; every other guard is unchanged.
+BROWSER_HEADLESS = APP_CONFIG.get("browser_headless", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+# Only meaningful when the window is visible: a browsing window that lands on
+# top of the terminal defeats the point of watching, and the window is rebuilt
+# per browse_page call so dragging it never sticks. "W,H" and "X,Y".
+BROWSER_WINDOW_SIZE = APP_CONFIG.get("browser_window_size", "").strip()
+BROWSER_WINDOW_POSITION = APP_CONFIG.get("browser_window_position", "").strip()
+# Screenshots (browser-use "vision") are off by default: a screenshot sent with
+# every step hard-errors against a text-only model, which is a large share of
+# the providers agent8088 targets. Turn it on only for a model that accepts
+# image input. Config-only on purpose - it's a property of the configured model,
+# not something to flip per run.
+BROWSER_SCREENSHOTS = APP_CONFIG.get("browser_screenshots", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
+# Where a browse has gone, captured from the SSRF proxy's on_visit hook. The
+# proxy is the one place that sees every request a browse makes (browser-use has
+# no per-request hook), so this is both the audit record of "what did it visit?"
+# and the source for the subtle live "visiting <host>" line the CLI shows under
+# the spinner. Written from the proxy's own threads, so guard the list; the
+# single-string current host is fine to read unlocked (an atomic rebind).
+_browse_visit_lock = threading.Lock()
+_browse_current_host = None   # host the browse is contacting now, or None
+_browse_visited_hosts = []    # ordered distinct hosts contacted this run
+
+
+def browser_status():
+    """The host browse_page is contacting right now, or None when idle.
+
+    The CLI reads this at spinner-render time to show a subtle 'visiting <host>'
+    line while a browse runs - a browse can otherwise sit for minutes with no
+    sign of life. None for every other tool, so the line only appears mid-browse.
+    """
+    return _browse_current_host
+
+
+def _reset_browse_visits() -> None:
+    global _browse_current_host
+    with _browse_visit_lock:
+        _browse_current_host = None
+        _browse_visited_hosts.clear()
+
+
+def _end_browse_visits() -> list:
+    """Clear the live "visiting" host and return the distinct hosts visited.
+
+    One call so the global rebind stays in a function that declares it global,
+    and the audit sees the list before the next run resets it."""
+    global _browse_current_host
+    with _browse_visit_lock:
+        visited = list(_browse_visited_hosts)
+        _browse_current_host = None
+    return visited
+
+
+def _record_browse_visit(url: str) -> None:
+    """Proxy on_visit callback: one approved request the browser just made.
+
+    Runs on the proxy's own threads, so it must never raise. Tracks the current
+    host (for the live line) and the ordered set of distinct hosts (for the
+    audit trail written when the browse ends)."""
+    global _browse_current_host
+    try:
+        import urllib.parse
+        host = urllib.parse.urlsplit(url).hostname or url
+    except Exception:  # noqa: BLE001 - a visit record must never fail a request
+        host = url
+    with _browse_visit_lock:
+        _browse_current_host = host
+        if host not in _browse_visited_hosts:
+            _browse_visited_hosts.append(host)
+
+# Mirrors cli.py's S.show_reasoning (toggled by /reasoning, aliased /think) -
+# see cmd_reasoning and Session.__init__. Kept as a plain engine.py global
+# rather than imported from cli.py so this module has no dependency on the
+# CLI (it must also work under --mcp-serve/--gateway, which don't use cli.py).
+SHOW_REASONING = False
+
+
+class _QuietBrowserUseNoiseFilter(logging.Filter):
+    """Drops specific browser-use WARNING-level messages that carry no
+    actionable information for the end user, while leaving every other
+    WARNING - including the security watchdog's own "Blocking navigation to
+    disallowed URL"/"non-allowed URL detected" messages - fully visible.
+    Those matter (they're the SSRF deny-list actually doing its job); these
+    don't: a one-time, permanent notice about our own deny-list using glob
+    patterns (it always does, by design - see
+    _BROWSER_PROHIBITED_HOST_PATTERNS), and the per-step "model returned an
+    empty action, retrying" notice, which doesn't change whether the task
+    ultimately succeeds (that's already reflected in browse_page's own
+    returned text via history.is_done())."""
+
+    _NOISY_SUBSTRINGS = (
+        "Using glob patterns in allowed_domains",
+        "Model returned empty action",
+        "Model still returned empty after retry",
+        # One per failed step, printed with a red cross straight to the
+        # console. Same reasoning as the empty-action notice: a retried step
+        # says nothing about whether the task succeeded - browse_page reports
+        # that itself via history.is_done() - so all it does is make a run
+        # that returned the correct answer look like it crashed.
+        "Result failed",
+        "Page readiness timeout",
+        "Empty DOM detected after navigation",
+        "Received duplicate response for request",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(s in message for s in self._NOISY_SUBSTRINGS)
+
+
+_browser_use_noise_filter = _QuietBrowserUseNoiseFilter()
+
+
+def _set_browser_use_log_verbosity(verbose: bool) -> None:
+    """browser-use's own step-by-step log (Eval/Memory/Next goal/...) and
+    litellm's "completion() model=..." lines print straight to the console,
+    bypassing agent8088's own tool-result display entirely - the actual
+    answer already reaches the user through _run_browser_agent's return
+    value, shown properly in the browse_page result. Quiet by default, same
+    as the main loop's own chain-of-thought; /reasoning on (or /think on)
+    restores it.
+
+    Sets logger *levels* directly rather than calling browser-use's own
+    setup_logging(): its "result" mode does not actually quiet everything -
+    it explicitly special-cases the "bubus" event-bus logger (what the
+    Agent's step narration is dispatched through) to stay at INFO regardless
+    (see browser_use/logging_config.py, "Configure bubus logger to allow
+    INFO level logs") - so relying on it alone leaves the exact noise this
+    exists to hide. It would also stack a duplicate handler onto these
+    loggers every time this function runs (its handler-clearing only
+    touches the root logger, not "browser_use"/"bubus" themselves),
+    printing each line more times the longer a session runs. A plain
+    `import browser_use` already configures a handler once, at package
+    import - all that is needed on top of that is the level.
+
+    Dropping specific WARNING-level messages needs a Filter, and it has to
+    go on the *handler*, not the logger: the noisy messages are logged by
+    child loggers (e.g. browser_use.browser.watchdogs.security_watchdog),
+    and a Filter attached to a logger is only consulted for records logged
+    directly on that exact logger instance, not ones a child propagates up
+    to it - only a Handler's own filter sees every record that reaches it,
+    regardless of which logger originated it."""
+    level = logging.INFO if verbose else logging.WARNING
+    for logger_name in ("browser_use", "bubus", "LiteLLM", "cdp_use", "cdp_use.client"):
+        logging.getLogger(logger_name).setLevel(level)
+
+    # browser-use's own cleanup of a Playwright session's low-level
+    # connection task doesn't always finish before the coroutine driving it
+    # returns - not only when interrupted, but sometimes even on a normal,
+    # successful completion. The interpreter's later garbage collection of
+    # that lingering task then logs "Task was destroyed but it is
+    # pending!"/"Future exception was never retrieved" through the standard
+    # "asyncio" logger, at ERROR level - reading as a crash in the middle of
+    # an otherwise-correct answer. This codebase has no other asyncio usage
+    # anywhere, so silencing this logger by default is safe: there is
+    # nothing else it could be hiding. /reasoning on restores it, same as
+    # the others, since a real asyncio bug elsewhere would also want to
+    # surface through here.
+    logging.getLogger("asyncio").setLevel(logging.WARNING if verbose else logging.CRITICAL)
+
+    for logger_name in ("browser_use", "cdp_use", "cdp_use.client"):
+        for handler in logging.getLogger(logger_name).handlers:
+            has_filter = _browser_use_noise_filter in handler.filters
+            if verbose and has_filter:
+                handler.removeFilter(_browser_use_noise_filter)
+            elif not verbose and not has_filter:
+                handler.addFilter(_browser_use_noise_filter)
+
+    try:
+        import litellm
+        litellm.suppress_debug_info = not verbose
+    except Exception:
+        pass
+
+# Host patterns the browsing agent is forbidden from navigating to, enforced by
+# browser-use's own security watchdog *before* Chromium issues the request.
+#
+# This is a second, independent layer behind the SSRF-filtering proxy, and it
+# exists because Chromium refuses to send some targets through a proxy at all:
+# loopback and link-local hosts are covered by an implicit proxy-bypass rule,
+# so a request to 127.0.0.1 or 169.254.169.254 would never reach the proxy and
+# therefore never be seen by _egress_check/_ssrf_check. ProxySettings(bypass=
+# "<-loopback>") closes the link-local half of that gap, but the loopback half
+# survives it (the proxy itself is bound to 127.0.0.1, so Chromium keeps
+# exempting loopback unconditionally) - hence this list.
+#
+# Patterns are matched against the hostname with fnmatch by browser-use's
+# SecurityWatchdog (browser_use/browser/watchdogs/security_watchdog.py,
+# _is_url_match), so ranges are spelled as globs rather than CIDRs. They cover
+# the same address space _ssrf_check rejects: loopback, link-local, RFC1918,
+# CGNAT, IPv6 ULA/link-local, and the reserved/multicast ranges. Keep the list
+# under 100 entries - at 100 browser-use silently converts it to a set and
+# drops pattern matching entirely (DOMAIN_OPTIMIZATION_THRESHOLD).
+_BROWSER_PROHIBITED_HOST_PATTERNS = (
+    # Loopback and the unspecified address.
+    "localhost", "*.localhost", "127.*", "0.0.0.0", "0", "::1", "::",
+    # Link-local, including the 169.254.169.254 cloud-metadata endpoint.
+    "169.254.*", "fe8*:*", "fe9*:*", "fea*:*", "feb*:*",
+    # RFC1918 private ranges.
+    "10.*", "192.168.*", "172.1[6-9].*", "172.2[0-9].*", "172.3[01].*",
+    # CGNAT 100.64.0.0/10.
+    "100.6[4-9].*", "100.[7-9][0-9].*", "100.1[01][0-9].*", "100.12[0-7].*",
+    # IPv6 unique-local (fc00::/7). The ":" keeps these from matching ordinary
+    # hostnames that merely start with "fc"/"fd" (e.g. fcbarcelona.com).
+    "fc*:*", "fd*:*",
+    # Other special-use / reserved / multicast ranges.
+    "192.0.0.*", "192.0.2.*", "198.18.*", "198.19.*", "198.51.100.*",
+    "203.0.113.*", "22[4-9].*", "23[0-9].*", "24[0-9].*", "25[0-5].*",
+    # Internal naming conventions that resolve inside a private network.
+    "*.local", "*.internal",
+)
+
+
+def _browser_max_steps() -> int:
+    """AI-call ceiling for one browse; env beats config so a demo or a test can
+    cap it without editing config.txt (the batch-size and headless knobs already
+    work this way). A bad value falls back rather than crashing a run mid-task.
+
+    Only a ceiling: browse_page still stops as soon as the task is done, and the
+    wall-clock timeout still applies on top - this just bounds how many steps a
+    task that never finishes may burn."""
+    raw = os.environ.get("AGENT8088_BROWSER_MAX_STEPS", "").strip()
+    try:
+        value = int(raw) if raw else BROWSER_MAX_STEPS
+    except ValueError:
+        value = BROWSER_MAX_STEPS
+    return max(1, value)
+
+
+def _browser_task_timeout() -> int:
+    """The real wall-clock bound on one browse_page call.
+
+    browser_task_timeout_seconds is the browser-specific budget, but a single
+    tool call may never outrun max_tool_timeout_seconds - the documented hard
+    ceiling every other tool path clamps to (see run_tool).
+
+    Env beats config (AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS) so one run can be
+    shortened for a test or a demo without editing config.txt; a bad value falls
+    back to the configured budget rather than crashing."""
+    raw = os.environ.get("AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS", "").strip()
+    try:
+        seconds = int(raw) if raw else BROWSER_TASK_TIMEOUT_SECONDS
+    except ValueError:
+        seconds = BROWSER_TASK_TIMEOUT_SECONDS
+    return min(max(1, seconds), MAX_TOOL_TIMEOUT_SECONDS)
+
+
+def _browser_screenshots() -> bool:
+    """Whether this browse sends screenshots to the model (browser-use vision).
+
+    Off by default (see BROWSER_SCREENSHOTS): a screenshot every step hard-errors
+    against a text-only model, which is a large share of the providers agent8088
+    targets. Enable browser_screenshots=1, or set
+    AGENT8088_BROWSER_SCREENSHOTS=1 for one vision-capable run."""
+    override = os.environ.get("AGENT8088_BROWSER_SCREENSHOTS", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return BROWSER_SCREENSHOTS
+
+
+def _browser_max_actions_per_step() -> int:
+    """Actions the browsing model may batch per step; env beats config.
+
+    A bad value falls back to the config value instead of raising - this runs
+    mid-task, and a typo must not take out a browsing run.
+    """
+    raw = os.environ.get("AGENT8088_BROWSER_MAX_ACTIONS_PER_STEP", "").strip()
+    try:
+        value = int(raw) if raw else BROWSER_MAX_ACTIONS_PER_STEP
+    except ValueError:
+        value = BROWSER_MAX_ACTIONS_PER_STEP
+    return max(1, value)
+
+
+def _browser_headless() -> bool:
+    """Whether this browsing session hides its window.
+
+    Env beats config so a single run can be watched without editing config.txt.
+    Anything unrecognised falls back to the config value rather than guessing.
+    """
+    override = os.environ.get("AGENT8088_BROWSER_HEADLESS", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return BROWSER_HEADLESS
+
+
+def _browser_window_pair(value: str) -> dict:
+    """Parse a "W,H"/"X,Y" setting into BrowserProfile's ViewportSize shape.
+
+    Returned as a dict rather than Chromium flags on purpose: browser-use
+    computes its own --window-size/--window-position and its values win, so a
+    raw arg is silently discarded. Anything not exactly two integers is dropped.
+
+    Callers pass the env override ahead of the config value, so a demo can be
+    placed from the command line without editing config.txt at all.
+    """
+    parts = [part.strip() for part in str(value or "").split(",")]
+    if len(parts) != 2 or not all(re.fullmatch(r"-?\d{1,5}", part) for part in parts):
+        return {}
+    return {"width": int(parts[0]), "height": int(parts[1])}
+
+
+def _browser_profile_kwargs(proxy_url: str) -> dict:
+    """Build the BrowserProfile(...) kwargs for one browsing session.
+
+    Split out from _run_browser_agent so the security-critical parts (proxy
+    routing, headless, the navigation deny-list) can be asserted by a fast unit
+    test without launching a browser - see tests/test_browser_profile_args.py.
+    """
+    from browser_use.browser import ProxySettings
+
+    kwargs = {
+        # Everything goes through the local SSRF-filtering proxy. "<-loopback>"
+        # *removes* Chromium's implicit loopback/link-local bypass rule, so
+        # targets like 169.254.169.254 are proxied (and checked) rather than
+        # dialed directly. See _BROWSER_PROHIBITED_HOST_PATTERNS for the part
+        # of that gap this flag cannot close.
+        "proxy": ProxySettings(server=proxy_url, bypass="<-loopback>"),
+        # browser-use defaults headless to "headful if a display exists", which
+        # pops a real visible window on any desktop. browse_page is documented
+        # as a headless tool and runs unattended, so pin it - unless the
+        # operator explicitly asked to watch (see BROWSER_HEADLESS).
+        "headless": _browser_headless(),
+        # browser-use downloads three CRX extensions from clients2.google.com
+        # on first launch and injects them into every page. Those downloads are
+        # made by browser-use itself, not through the proxy, so they bypass
+        # _egress_check/_ssrf_check and the audit log entirely.
+        "enable_default_extensions": False,
+    }
+    if sys.platform == "darwin":
+        # Chrome otherwise asks macOS for the login keychain password even
+        # with a fresh automation profile. This disposable browser never
+        # needs the user's stored credentials.
+        kwargs["args"] = ["--use-mock-keychain"]
+    if not kwargs["headless"]:
+        # Placement only matters for a window someone is actually watching.
+        for field, setting in (
+                ("window_size", os.environ.get("AGENT8088_BROWSER_WINDOW_SIZE")
+                 or BROWSER_WINDOW_SIZE),
+                ("window_position", os.environ.get("AGENT8088_BROWSER_WINDOW_POSITION")
+                 or BROWSER_WINDOW_POSITION)):
+            pair = _browser_window_pair(setting)
+            if pair:
+                kwargs[field] = pair
+    if SSRF_ALLOW_PRIVATE:
+        # The operator has explicitly opted every private range back in; the
+        # proxy's own check is a no-op in this mode too.
+        return kwargs
+
+    import fnmatch
+
+    allowed_hosts = set()
+    for entry in SSRF_ALLOW_HOSTS:
+        # Entries are "host" or "host:port" (_ssrf_host_allowlisted matches
+        # both). Only the host half can be expressed as a domain pattern.
+        if entry.startswith("[") and "]" in entry:      # [::1] / [::1]:8080
+            allowed_hosts.add(entry[1:entry.index("]")])
+            continue
+        host, sep, port = entry.rpartition(":")
+        # A bare IPv6 literal ("::1") also ends in ":<digits>" - the remaining
+        # colon in the host half is what tells the two apart.
+        allowed_hosts.add(host if sep and port.isdigit() and ":" not in host
+                          else entry)
+    # A host the operator allowlisted through ssrf_allow_hosts must stay
+    # reachable, and a deny-list of patterns cannot express an exception - so
+    # drop any pattern that would cover an allowlisted host.
+    kwargs["prohibited_domains"] = [
+        pattern for pattern in _BROWSER_PROHIBITED_HOST_PATTERNS
+        if not any(fnmatch.fnmatchcase(host, pattern) or host == pattern
+                   for host in allowed_hosts)
+    ]
+    # Catches IP literals a hostname pattern cannot - decimal/hex/octal/
+    # short-form encodings of the same private addresses (http://2130706433/
+    # is 127.0.0.1). Can't be used alongside an allowlist: it refuses every
+    # IP-literal URL, including an allowlisted one.
+    kwargs["block_ip_addresses"] = not SSRF_ALLOW_HOSTS
+    return kwargs
+
+
+_BROWSER_PROFILE_PREFIX = "agent8088-browser-profile-"
+# Well beyond any single browsing call: browser_task_timeout_seconds is itself
+# clamped to max_tool_timeout_seconds (600s by default), so an hour cannot
+# overlap a session that is still legitimately running.
+_BROWSER_PROFILE_MAX_AGE_SECONDS = 3600
+
+
+def _running_browser_processes():
+    """[(pid, ppid, command_line)] for processes on this machine, or [].
+
+    Deliberately a plain `ps` read with no third-party dependency - macOS and
+    Linux both expose the full argument list, including the --user-data-dir
+    that identifies one of our profiles. Windows is not covered (its own
+    uninstall path already walks process trees); the sweep there degrades to
+    removing directories that nothing holds.
+    """
+    if sys.platform == "win32":
+        return []
+    result = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="],
+                            capture_output=True, text=True, timeout=15)
+    processes = []
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+            processes.append((int(fields[0]), int(fields[1]), fields[2]))
+    return processes
+
+
+def _sweep_stale_browser_profiles(root=None, max_age_seconds=None, now=None,
+                                  list_processes=None, terminate=None) -> None:
+    """Reap browser profiles - and browsers - that outlived their session.
+
+    _run_browser_agent removes its own profile in a `finally`, which covers a
+    normal return and a timeout alike, but nothing runs on SIGKILL or a hard
+    crash. What survives is a profile directory plus a Chromium reparented to
+    init that runs until the machine reboots. Found on a real machine: an
+    orphan alive for two days, and nine more from a job killed mid-run, with
+    no code path that would ever look for them.
+
+    What identifies an abandoned browser is **orphanhood, not age**. An
+    orphan keeps writing to its profile, so the directory's mtime is
+    refreshed continuously and never gets old - the first cut of this sweep
+    keyed on mtime and would have skipped every live orphan forever. This
+    code always outlives the browser it launches, so ppid == 1 means the
+    launching process is gone and the browser is abandoned by definition.
+
+    Directory age is still the rule for *directories*, where it is the right
+    question: an old directory that no live process holds is pure litter.
+    A directory that is still held is left alone however old it is, so a
+    long-running session is never sabotaged.
+
+    Only paths carrying our own mkdtemp prefix are ever considered, so an
+    ordinary Chrome the user is browsing with cannot match. The process seams
+    are injected so tests exercise the matching rules without enumerating or
+    signalling anything real.
+    """
+    root = Path(root) if root is not None else Path(tempfile.gettempdir())
+    max_age = (_BROWSER_PROFILE_MAX_AGE_SECONDS if max_age_seconds is None
+               else max_age_seconds)
+    now = time.time() if now is None else now
+    list_processes = list_processes or _running_browser_processes
+    terminate = terminate or (lambda pid: os.kill(pid, signal.SIGTERM))
+    log = logging.getLogger(__name__)
+
+    try:
+        profiles = [path for path in root.glob(f"{_BROWSER_PROFILE_PREFIX}*")
+                    if path.is_dir()]
+    except OSError as e:
+        log.debug("browse_page: could not scan for stale profiles: %s", e)
+        return
+    if not profiles:
+        return
+
+    try:
+        processes = list(list_processes())
+    except Exception as e:  # noqa: BLE001 - cleanup must never fail a task
+        log.debug("browse_page: could not enumerate processes: %s", e)
+        processes = []
+
+    abandoned = set()
+    held = set()
+    for pid, ppid, command in processes:
+        for path in profiles:
+            if str(path) not in command:
+                continue
+            if ppid == 1:
+                abandoned.add(path)
+                try:
+                    terminate(pid)
+                    log.debug("browse_page: reaped orphaned browser pid %s", pid)
+                except Exception as e:  # noqa: BLE001 - already gone, or not ours
+                    log.debug("browse_page: could not signal pid %s: %s", pid, e)
+            else:
+                held.add(path)
+
+    for path in profiles:
+        if path in held:
+            continue
+        try:
+            expired = now - path.stat().st_mtime > max_age
+        except OSError:
+            continue
+        if path in abandoned or expired:
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _playwright_available() -> bool:
@@ -3843,25 +4374,187 @@ def _playwright_available() -> bool:
         return False
 
 
+def _browser_use_available() -> bool:
+    """browser-use requires Python >= 3.11 while this project supports 3.10,
+    so it is declared with an environment marker and is genuinely absent on a
+    3.10 install (see pyproject.toml). Checked explicitly so that case reports
+    itself instead of surfacing as a bare ImportError."""
+    try:
+        import browser_use  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+async def _run_browser_agent(url: str, task: str,
+                             executable_path: str | None = None) -> tuple[str, str]:
+    """Drive one browser-use Agent run, returning web content and local notes.
+
+    Every request the browser makes passes through a fresh local SSRF-
+    filtering proxy (browser_proxy.py) that runs the same _egress_check/
+    _ssrf_check the old single-shot tool ran on every request, not just the
+    first navigation - see the design spec, section 4. The Agent's own LLM
+    calls are charged to the caller's active turn budget via
+    Agent8088ChatModel (browser_llm.py), so a multi-step task can't spend
+    tokens outside the user's existing budget ceiling.
+    """
+    # browser-use ships anonymized telemetry ON by default and posts the task
+    # text, visited URLs, extracted content and model name to a third-party
+    # analytics endpoint on every run - traffic this codebase's own egress
+    # guard and audit log never see, because browser-use makes it directly.
+    # setdefault, not a plain assignment: an operator who deliberately opted
+    # in through the environment keeps their setting.
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
+    os.environ.setdefault("BROWSER_USE_CLOUD_SYNC", "false")
+    _set_browser_use_log_verbosity(SHOW_REASONING)
+
+    from browser_use import Agent, BrowserProfile
+    from agent8088.browser_llm import build_browser_chat_model
+    from agent8088.browser_proxy import start_ssrf_filtering_proxy
+
+    _reset_browse_visits()
+    proxy_url, stop_proxy = start_ssrf_filtering_proxy(
+        lambda target_url: _egress_check(target_url) or _ssrf_check(target_url),
+        check_address=_browser_address_check,
+        on_visit=_record_browse_visit)
+    # Left unset, BrowserProfile's own field validator silently mkdtemp()s a
+    # user-data-dir under the OS temp dir - and browser-use's cleanup code
+    # only recognizes a different temp-dir prefix, so that directory is never
+    # removed. Owning the path here means it can actually be deleted below.
+    # Before adding one more profile, clear out any left behind by a session
+    # that was killed outright - along with the browser still holding it.
+    try:
+        _sweep_stale_browser_profiles()
+    except Exception as e:  # noqa: BLE001 - never let cleanup fail the task
+        logging.getLogger(__name__).debug(
+            "browse_page: stale-profile sweep skipped: %s", e)
+    user_data_dir = tempfile.mkdtemp(prefix=_BROWSER_PROFILE_PREFIX)
+    agent = None
+    try:
+        llm = build_browser_chat_model(
+            client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS)
+        profile = BrowserProfile(
+            user_data_dir=user_data_dir, executable_path=executable_path,
+            **_browser_profile_kwargs(proxy_url))
+        agent = Agent(
+            task=task,
+            llm=llm,
+            browser_profile=profile,
+            initial_actions=[{"navigate": {"url": url, "new_tab": False}}],
+            # browser-use defaults to use_vision=True (sends a screenshot with
+            # every step) and errors out entirely against a model that
+            # doesn't accept image input - which is exactly the situation for
+            # a large share of the providers/models agent8088 supports (local
+            # or text-only). Since this adapter must work with "whatever
+            # provider the user already has configured," the default is off -
+            # but a vision-capable model can turn it back on with
+            # browser_screenshots=1 (see _browser_screenshots). It is a plain
+            # bool, not "auto": "auto" still exposes a "screenshot" action the
+            # model can call on its own and hit the same failure, so the choice
+            # stays explicit - fully off, or fully on for a model that can see.
+            use_vision=_browser_screenshots(),
+            # A free-form thinking field can consume a small model's entire
+            # output budget before it emits a browser action.
+            use_thinking=False,
+            # Browser Use otherwise guesses 75s for an unknown model name. Use
+            # Agent8088's provider timeout so a slow local completion is not
+            # discarded and retried just before it arrives.
+            llm_timeout=TIMEOUT_SECONDS,
+            # A small model often batches actions for the old DOM after the
+            # first click navigates. One action per fresh state trades calls for
+            # reliability and prevents the stale-index cascade seen in checkout.
+            max_actions_per_step=_browser_max_actions_per_step(),
+            extend_system_message=(
+                "Reliability rules: use only element indices from the current "
+                "browser state. After navigation, inspect the new state before "
+                "acting. After an input action reports success, submit the form "
+                "once even if a later DOM summary omits the value. Retry typing "
+                "only when the site displays a validation error."
+            ),
+            # browser-use defaults use_judge=True: after every completed task
+            # it runs one more full LLM call to self-critique the result. Its
+            # own verdict doesn't retry or change what's returned - it's
+            # advisory-only logging - so it's pure extra latency and token
+            # cost for no behavioral benefit. Worse, its rubric leans on
+            # screenshot evidence, which use_vision=False above deliberately
+            # never produces - so with vision off it tends to report a
+            # confident, correct answer as failed for lacking screenshots
+            # that were never going to exist. Off, for the same reason vision
+            # is off: this adapter has to work the same way regardless of
+            # which model/provider is configured, not assume one judge_llm
+            # call will reliably agree with itself.
+            use_judge=False,
+        )
+        history = await asyncio.wait_for(
+            agent.run(max_steps=_browser_max_steps()),
+            timeout=_browser_task_timeout(),
+        )
+    finally:
+        # agent.run() closes its own session on a normal return, but on a
+        # timeout (or any other exception) it is cancelled mid-step and the
+        # Chromium process it launched would be orphaned. close() kills the
+        # session; it is safe to call on an already-closed one.
+        if agent is not None:
+            try:
+                await asyncio.wait_for(agent.close(), timeout=30)
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "browse_page: agent.close() did not finish cleanly: %s", e)
+        stop_proxy()
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+        # Record where the browse actually went, and drop the live "visiting"
+        # line. The proxy saw every host; without this line there is no answer
+        # to "what did it visit?" - browse_page only ever logged the start URL.
+        visited = _end_browse_visits()
+        if visited:
+            _log.info("browser_visit start=%s hosts=%s", url, ", ".join(visited))
+            _audit("browser_visit", start_url=url, hosts=", ".join(visited))
+
+    content = history.final_result() or "(The task did not produce a final result.)"
+    # Advisory notes are kept apart from the page content: _exec_browser wraps
+    # only the content in the untrusted-content frame, so these agent8088-owned
+    # notes are not mislabelled as something the website said.
+    notes = []
+    if not history.is_done():
+        notes.append("Note: the browsing task hit its step or time limit before finishing.")
+    # A budget stop raises inside Agent8088ChatModel.ainvoke, but browser-use
+    # catches per-step exceptions and keeps going until max_steps, so the real
+    # reason would otherwise never reach the user - only the generic
+    # "hit its step or time limit" note above.
+    over_budget = _active_budget.exceeded() if _active_budget is not None else None
+    if over_budget:
+        notes.append(f"The browsing task stopped early: {over_budget}")
+    return content, "\n".join(notes)
+
+
 def _exec_browser(args: dict) -> str:
-    """Load a page in a headless browser and return its text, optionally scoped to
-    a CSS selector. Handles JS-rendered pages that curl cannot. SSRF-guarded.
-    Degrades with install instructions when Playwright isn't present.
+    """Load a page and complete a task on it in a real headless browser --
+    click, fill forms, navigate, and extract information via natural-
+    language instructions. SSRF-guarded on every request the session makes,
+    not just the first navigation. Degrades with install instructions when
+    Playwright isn't present.
 
     `playwright` the Python package is a core dependency (always installed),
     but the Chromium *browser binary* is a separate ~280 MB download the
     installer fetches afterward and can fail or be skipped independently
     (network blip, disk space, antivirus). `_playwright_available` alone
-    cannot see that gap - it would report available and let the missing-binary
-    case fall through to playwright's own multi-paragraph "Executable doesn't
-    exist" error, which reads as a crash rather than an install step. Checking
-    the resolved executable_path up front, inside the same driver session
-    launch() would use, catches that case with the same clear message as a
-    fully-missing install.
+    cannot see that gap - it would report available and let the missing-
+    binary case fall through to a multi-paragraph "Executable doesn't
+    exist" error. Checking the resolved executable_path up front, with the
+    same Playwright session browser-use itself will use, catches that case
+    with a clear message instead.
     """
+    global _active_role
+
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: browser tool requires 'url'."
+    # Validated with the other arguments, before the environment pre-flight
+    # below: a missing 'task' is a caller error, and reporting it as "Chromium
+    # is not installed" would send the caller off fixing the wrong thing.
+    task = str(args.get("task") or "").strip()
+    if not task:
+        return "Error: browser tool requires 'task'."
     blocked = _egress_check(url) or _ssrf_check(url)
     if blocked:
         return blocked
@@ -3869,55 +4562,66 @@ def _exec_browser(args: dict) -> str:
         return ("Playwright is not installed. Install it with:\n"
                 "  pip install playwright && playwright install chromium\n"
                 "Until then, use web_search or get_page_title instead.")
-    # Keep Chromium's ~280MB download inside $AGENT8088_HOME rather than the
-    # OS-default shared cache (~/.cache/ms-playwright etc.) - that shared
-    # cache can belong to other Playwright-using projects on the same
-    # machine, so `agent8088 --uninstall` cannot safely delete it. Installing
-    # into our own subdirectory means the existing home-directory wipe
-    # already covers it, with no separate cleanup logic needed.
-    os.environ.setdefault(
-        "PLAYWRIGHT_BROWSERS_PATH", str(_agent_data_dir() / "playwright-browsers")
-    )
-    selector = str(args.get("selector") or "").strip()
+    if not _browser_use_available():
+        return ("Interactive browsing is unavailable: the browser-use package "
+                "is not installed. It requires Python 3.11 or newer, so it is "
+                "skipped on a Python 3.10 install. Reinstall Agent8088 on "
+                "Python 3.11+, or use web_search or get_page_title instead.")
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            if not os.path.exists(p.chromium.executable_path):
-                return ("Playwright's Chromium browser is not installed. Install it with:\n"
-                        "  playwright install chromium\n"
-                        "Until then, use web_search or get_page_title instead.")
-            browser = p.chromium.launch(headless=True)
-            try:
-                page = browser.new_page()
-                blocked_requests = []
-
-                def guard_request(route):
-                    request_url = route.request.url
-                    if request_url.startswith(("data:", "blob:", "about:")):
-                        route.continue_()
-                        return
-                    reason = _egress_check(request_url) or _ssrf_check(request_url)
-                    if reason:
-                        blocked_requests.append(reason)
-                        route.abort()
-                    else:
-                        route.continue_()
-
-                page.route("**/*", guard_request)
-                page.goto(url, timeout=BROWSER_TIMEOUT_MS, wait_until="domcontentloaded")
-                if blocked_requests:
-                    return blocked_requests[0]
-                if selector:
-                    text = "\n".join(el.inner_text() for el in page.query_selector_all(selector))
-                else:
-                    text = page.inner_text("body")
-                title = page.title()
-            finally:
-                browser.close()
+        executable_path = _playwright_chromium_executable()
     except Exception as e:
         return f"Browser error: {e}"
-    text = re.sub(r'\n{3,}', '\n\n', (text or "").strip())
-    return _wrap_untrusted(_strip_special_tokens(f"Title: {title}\n\n{text[:5000]}"), url)
+    if executable_path is None:
+        return ("Playwright's Chromium browser is not installed. Install it with:\n"
+                "  playwright install chromium\n"
+                "Until then, use web_search or get_page_title instead.")
+
+    saved_role, _active_role = _active_role, "subagent:browser"
+    try:
+        browser_result = asyncio.run(_run_browser_agent(url, task, executable_path))
+    except asyncio.TimeoutError:
+        return (f"Browser error: task exceeded the {_browser_task_timeout()}s "
+                f"time limit (raise AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS for this "
+                "run, or browser_task_timeout_seconds in config.txt; "
+                "max_tool_timeout_seconds remains the hard cap).")
+    except KeyboardInterrupt:
+        # Ctrl+C ends agent8088 outright (cli.py's main loop catches this one
+        # level up and exits) - re-raise so that still happens. What this
+        # catches here is purely cosmetic: asyncio.run()'s own best-effort
+        # task cancellation can't always finish gracefully mid-Playwright-
+        # session, since its connection-management task needs a round of
+        # network I/O to close that a hard interrupt doesn't leave time for.
+        # The interpreter's later garbage collection of that abandoned task
+        # then prints "Task was destroyed but it is pending!"/"Future
+        # exception was never retrieved" through the standard "asyncio"
+        # logger - after the CLI has already said goodbye, reading as a
+        # crash on the way out of a process that already exited cleanly. The
+        # process is on its way down either way, so silence that logger for
+        # its remaining lifetime rather than leave that artifact visible.
+        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+        raise
+    except Exception as e:
+        return f"Browser error: {e}"
+    finally:
+        _active_role = saved_role
+
+    # Tests and third-party callers have historically stubbed this helper with
+    # a plain string. Keep that small compatibility path while real runs return
+    # separate local notes so Agent8088's own messages are never labelled as web
+    # content.
+    if isinstance(browser_result, tuple):
+        content, note = browser_result
+    else:
+        content, note = browser_result, ""
+    content = re.sub(r'\n{3,}', '\n\n', (content or "").strip())
+    content = _strip_special_tokens(content)
+    if len(content) > 5000:
+        omitted = len(content) - 5000
+        content = content[:5000].rstrip()
+        note = "\n".join(part for part in (
+            note, f"Browser result truncated: {omitted} characters omitted.") if part)
+    result = _wrap_untrusted(content, url)
+    return f"{result}\n\n{note}" if note else result
 
 
 # ---------------------------------------------------------------------------
@@ -3962,6 +4666,55 @@ def _which_executable(name: str) -> str | None:
             if executable:
                 return executable
     return shutil.which(name)
+
+
+def _playwright_chromium_executable() -> str | None:
+    """Locate Playwright's Chromium, or None when it is not installed.
+
+    Sets PLAYWRIGHT_BROWSERS_PATH to whichever candidate directory actually
+    holds the build this Playwright wants, so the launch below and Playwright
+    itself agree on one location.
+
+    Order matters. agent8088's own directory comes first: `--uninstall` can
+    only honestly delete a ~280MB download it owns, and the OS-shared
+    ms-playwright cache may belong to other Playwright projects on the machine.
+    But it must not be *forced*, which is what this used to do - on a machine
+    that already had a valid, version-matching Chromium in the shared cache,
+    browse_page reported "Chromium browser is not installed" and stayed dead
+    until the user either re-downloaded 280MB or discovered the env var. So
+    the private directory wins only when it has a usable browser; otherwise
+    fall back to Playwright's own default, which is exactly where a plain
+    `playwright install chromium` puts it - making the message above true.
+
+    An explicit PLAYWRIGHT_BROWSERS_PATH always wins: that is the operator
+    telling us where their browsers live.
+    """
+    from playwright.sync_api import sync_playwright
+
+    explicit = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    private = str(_agent_data_dir() / "playwright-browsers")
+    # None means "leave the variable unset and let Playwright use its default".
+    candidates = [explicit] if explicit else [private, None]
+
+    for root in candidates:
+        if root is None:
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        else:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = root
+        with sync_playwright() as p:
+            candidate = p.chromium.executable_path
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    # Nothing found. Restore the variable to however we found it, so this stays
+    # idempotent: leaving our own last candidate behind would look like an
+    # explicit operator choice on the next call, and a retry after the user
+    # actually installs Chromium would then never re-check the other location.
+    if explicit:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = explicit
+    else:
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+    return None
 
 
 _DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
@@ -5897,6 +6650,14 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
         args = json.loads(arguments)
     except Exception:
         return "Invalid JSON"
+    # Durable task runs record intent before a side effect and its result after it.
+    # Import lazily so ordinary interactive turns keep the existing dependency graph.
+    try:
+        from agent8088.task_runtime import current_runtime
+        runtime = current_runtime()
+    except Exception:
+        runtime = None
+    operation_id = runtime.before_tool(name, args) if runtime else None
 
     # Taken before the call runs: once it has written, the previous state is the
     # one thing that cannot be reconstructed.
@@ -5924,6 +6685,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
 
     # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
     result = _redact_secrets(result)
+    if runtime and operation_id:
+        runtime.after_tool(operation_id, result)
 
     if (TOOL_SPECS.get(name, {}).get("mode") or "").lower() != "last_output":
         _last_tool_output, _last_tool_name = result, name
@@ -6061,8 +6824,48 @@ def _normalize_tool_markers(text: str) -> str:
     )
 
 
+# Only whitespace and an opening code fence may sit between a bare ✿FUNCTION✿
+# line and the argument object it belongs to. Deliberately strict: scanning
+# past arbitrary prose would let an unrelated JSON object elsewhere in the
+# reply be adopted as this call's arguments, which is a worse failure than
+# reporting the arguments missing.
+_ARGS_AFTER_FUNCTION_RE = re.compile(r"\s*(?:`{3,}[^\n]*\n\s*)?\{")
+
+
+def _args_after_function_marker(text: str, name: str):
+    """Recover the argument object for a ✿FUNCTION✿ line that has no ✿ARGS✿.
+
+    Models routinely put the arguments in a following ```json fence instead of
+    after an ✿ARGS✿ marker (observed live from glm-5.2 via Ollama Cloud), and
+    find_tool_calls works on fence-stripped text so a documentation example
+    cannot execute itself — which discarded exactly those arguments and left a
+    bare tool name. The tool then reported its required argument as missing,
+    blaming the model for omitting what it had in fact supplied, on every
+    retry. `text` here is the ORIGINAL reply with fences intact; this is only
+    ever reached once a ✿FUNCTION✿ marker was already found OUTSIDE a fence,
+    so a fully fenced example still never becomes a call.
+    """
+    marker = re.search(r"✿FUNCTION✿\s*:\s*" + re.escape(name), text)
+    if not marker:
+        return {}
+    opener = _ARGS_AFTER_FUNCTION_RE.match(text, marker.end())
+    if not opener:
+        return {}  # genuinely no arguments — the tool's own error is honest
+    raw_args = _scan_json_object(text, opener.end() - 1)
+    try:
+        return _loads_tool_args(raw_args)
+    except Exception:
+        # An argument object was clearly intended but is broken. Same reason
+        # as the ✿ARGS✿ path: flag the parse failure rather than let it look
+        # like the model passed nothing.
+        return {"__parse_error__": raw_args[:400]}
+
+
 def find_tool_calls(text: str, allowed: set = None) -> list:
     allowed = allowed if allowed is not None else TOOL_NAMES
+    # Kept with fences intact for _args_after_function_marker: arguments the
+    # model put in a ```json fence are invisible in the stripped text below.
+    unstripped = _normalize_tool_markers(text)
     text = _normalize_tool_markers(_outside_fenced_code(text))
     calls = []
     # 1) ✿{"name": "...", "arguments": {...}}✿
@@ -6113,20 +6916,35 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 if resolved in allowed:
                     calls.append({"name": resolved,
                                   "arguments": {"__parse_error__": loose.group(2).strip()[:400]}})
-        if not calls and "✿ARGS✿" not in text:  # loose ✿FUNCTION✿ line, genuinely no args
+        # A loose ✿FUNCTION✿ line with no ✿ARGS✿ marker. "No marker" is NOT
+        # proof the model passed no arguments — it may have put them in a
+        # following fence or on the next line bare, so look for the object
+        # before concluding they are missing (see _args_after_function_marker).
+        if not calls and "✿ARGS✿" not in text:
             m2 = re.search(r'✿FUNCTION✿\s*:\s*(\w+)', text)
             if m2:
                 resolved = _resolve_tool_name(m2.group(1))
                 if resolved in allowed:
-                    calls.append({"name": resolved, "arguments": {}})
+                    calls.append({
+                        "name": resolved,
+                        "arguments": _args_after_function_marker(unstripped, m2.group(1)),
+                    })
     # 3) bare JSON {"name": "...", "arguments": {...}}
+    # The arguments object's extent is found by counting braces, for the same
+    # reason the ✿ARGS✿ branch above does it: a non-greedy `(\{.*?\})` stops at
+    # the first '}' and truncates any nested object, which made the whole call
+    # unparseable and silently dropped it. MCP tools declare their own
+    # parameter schemas and can legitimately take nested objects.
     if not calls:
-        for m in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
+        for m in re.finditer(
+                r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(?=\{)', text, re.DOTALL):
+            resolved = _resolve_tool_name(m.group(1))
+            if resolved not in allowed:
+                continue
             try:
-                resolved = _resolve_tool_name(m.group(1))
-                if resolved in allowed:
-                    calls.append({"name": resolved, "arguments": json.loads(m.group(2))})
-                    break
+                calls.append({"name": resolved,
+                              "arguments": _loads_tool_args(_scan_json_object(text, m.end()))})
+                break
             except Exception:
                 pass
     # 4) tool name followed by an inline {"command": "..."}
@@ -6669,6 +7487,58 @@ SSRF_ALLOW_HOSTS = {h.strip().lower()
                     for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
                     if h.strip()}
 
+
+def _local_search_allowance(base_url: str) -> set:
+    """{"host:port"} for a self-hosted search endpoint on loopback, else {}.
+
+    web_search's SearXNG backend runs on 127.0.0.1 (searxng_provision
+    publishes the container to loopback only), so _ssrf_check would refuse it
+    like any other internal address. config.txt used to solve that by
+    shipping `ssrf_allow_hosts=127.0.0.1,localhost` - which handed *every*
+    tool a pass to *every* service on the user's machine: a local dev server,
+    an admin panel, the Ollama API on 11434. It also disabled
+    block_ip_addresses for the browsing profile, since browser-use refuses to
+    combine that flag with an allowlist.
+
+    Scoping the pass to the exact host:port the operator's own
+    search_base_url names keeps web_search working - `/search setup` writes
+    that key, so a non-default searxng_host_port is followed automatically -
+    while leaving every other loopback port refused.
+
+    Only loopback is granted automatically. A SearXNG on the LAN
+    (192.168.x.y) is a real network hop and still needs an explicit
+    ssrf_allow_hosts entry, exactly as it did before.
+    """
+    import ipaddress
+    import socket
+    import urllib.parse
+
+    raw = str(base_url or "").strip()
+    if not raw:
+        return set()
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        host, port = (parsed.hostname or "").lower(), parsed.port
+    except Exception:
+        return set()
+    # A port is required: the pass has to be narrower than "this whole host".
+    if not host or not port:
+        return set()
+    try:
+        addresses = socket.getaddrinfo(host, port)
+    except Exception:
+        return set()
+    try:
+        if not all(ipaddress.ip_address(info[4][0]).is_loopback
+                   for info in addresses):
+            return set()
+    except Exception:
+        return set()
+    return {f"{host}:{port}"}
+
+
+_SEARCH_ALLOW_HOSTS = _local_search_allowance(APP_CONFIG.get("search_base_url", ""))
+
 # --- Egress domain policy ---
 # _ssrf_check blocks INTERNAL addresses; this bounds which PUBLIC hosts the
 # agent may reach. Empty allowlist = allow all (unchanged default). The
@@ -6722,18 +7592,69 @@ def _ssrf_check(url: str):
             ip = ipaddress.ip_address(info[4][0])
         except Exception:
             return "Blocked: unresolvable address."
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return (f"Blocked: '{host}' resolves to internal address {ip}. "
-                    "Requests to private/loopback/link-local networks are not allowed.")
+        if _ip_is_internal(ip):
+            return _internal_address_refusal(host, ip)
+    return None
+
+
+def _ip_is_internal(ip) -> bool:
+    """True for an address the agent must never be steered into reaching.
+
+    Shared by _ssrf_check (which resolves a hostname) and
+    _browser_address_check (which validates one already-resolved address), so
+    the two can never drift into disagreeing about what counts as internal.
+    """
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _internal_address_refusal(host: str, ip) -> str:
+    return (f"Blocked: '{host}' resolves to internal address {ip}. "
+            "Requests to private/loopback/link-local networks are not allowed.")
+
+
+def _browser_address_check(host: str, port: int, ip: str):
+    """Vet the exact address the browsing proxy is about to connect to.
+
+    _ssrf_check answers "is this hostname safe" by resolving it; this answers
+    "is this specific address safe", so the proxy can connect to the very
+    address that was approved instead of resolving the name a second time.
+    Without that pairing there is a DNS-rebinding window: a short-TTL record
+    under an attacker's control answers with a public IP for the check and
+    with 127.0.0.1 for the connection, and the body of a private service
+    comes back to the browsing agent. Same return contract as _ssrf_check -
+    None to allow, else the refusal string.
+    """
+    import ipaddress
+
+    if SSRF_ALLOW_PRIVATE:
+        return None
+    if _ssrf_host_allowlisted(host, port):
+        return None
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return f"Blocked: '{host}' resolved to an unusable address."
+    if _ip_is_internal(address):
+        return _internal_address_refusal(host, address)
     return None
 
 
 def _ssrf_host_allowlisted(host: str, port: int | None = None) -> bool:
-    """Match the narrow SSRF allowlist without performing DNS."""
+    """Match the narrow SSRF allowlist without performing DNS.
+
+    Two sources, deliberately kept apart: the operator's own
+    ssrf_allow_hosts, and the loopback search endpoint derived from
+    search_base_url (see _local_search_allowance). Only the operator's list
+    relaxes the *browsing* deny-list in _browser_profile_kwargs - the search
+    endpoint is for web_search, and browse_page has no business reaching it.
+    """
     host = (host or "").lower()
-    return bool(host and (host in SSRF_ALLOW_HOSTS or
-                          (port and f"{host}:{port}" in SSRF_ALLOW_HOSTS)))
+    if not host:
+        return False
+    if host in SSRF_ALLOW_HOSTS or (port and f"{host}:{port}" in SSRF_ALLOW_HOSTS):
+        return True
+    return bool(port) and f"{host}:{port}" in _SEARCH_ALLOW_HOSTS
 
 
 def _host_matches(host: str, domain: str) -> bool:
@@ -7302,7 +8223,7 @@ class _TurnBudget:
 # Shared agent loop (used by both interactive and one-shot modes)
 # ---------------------------------------------------------------------------
 def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
-              memory_background=False, **kwargs):
+              memory_background=False, memory_capture=True, **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
 
@@ -7352,9 +8273,10 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             _last_audit_share = budget.audit_share() if budget is not None else 0.0
             # After the answer, never in front of it. An interrupted or failed
             # turn leaves `answer` None and teaches nothing.
-            _capture_turn_memory(messages, answer, identity=memory_identity,
-                                 run_id=memory_run_id,
-                                 in_background=memory_background)
+            if memory_capture:
+                _capture_turn_memory(messages, answer, identity=memory_identity,
+                                     run_id=memory_run_id,
+                                     in_background=memory_background)
         _active_budget = previous
 
 
@@ -7657,6 +8579,17 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     searched = False     # prevents speculative page browsing after search results
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
+    user_turns = _genuine_user_turns(messages)
+    durable_browser_goal = next((str(message.get("content") or "")
+                                 for message in user_turns
+                                 if str(message.get("content") or "").startswith(
+                                     "This is a durable task.")), "")
+    browser_goal = ((durable_browser_goal.split("\n\n", 1)[-1]
+                     if durable_browser_goal else "")
+                    or (str(user_turns[-1].get("content") or "")
+                        if user_turns else ""))
+    durable_start = (re.search(r"https?://[^\s<>\]\)]+", durable_browser_goal)
+                     if durable_browser_goal else None)
     cad_failures = 0
     # Plan-then-emit gate: after the model has produced text (its BUILD PLAN)
     # on a CAD turn, the next turn gets one nudge to convert the plan into the
@@ -7719,16 +8652,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
-        # After a length cutoff, the one retry gets a bigger budget (capped by
-        # the model's context window) — the same fixed budget would just
-        # reproduce the same cutoff if the model reasons a similar amount again.
+        # After a length cutoff, first allow a larger retry, then force one
+        # short answer/tool-call attempt for models with a low output ceiling.
+        # The limits are the active model's, not the module constants, so a
+        # per-provider override or endpoint probe is what the ladder scales.
         loop_client = client
         loop_provider = provider_name
         loop_model = model_name
         turn_context_window, turn_completion_limit = _active_model_token_limits(loop_provider, loop_model)
         turn_max_tokens = (
-            min(turn_completion_limit * 2, turn_context_window)
-            if length_retries and not cad_generation else turn_completion_limit
+            turn_completion_limit if not length_retries or cad_generation else
+            min(turn_completion_limit * 2, turn_context_window) if length_retries == 1 else
+            min(1024, turn_completion_limit)
         )
         try:
             with spin("thinking..."):
@@ -7765,6 +8700,21 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
+        for call in calls:
+            if call["name"] == "browse_page" and browser_goal:
+                call["arguments"] = dict(call.get("arguments") or {})
+                if durable_start:
+                    call["arguments"]["url"] = durable_start.group(0).rstrip(".,")
+                call["arguments"]["task"] = (
+                    "Complete the entire original user request in this same browser "
+                    "session. In stateful flows, move between pages by clicking the "
+                    "site's visible links or buttons; do not navigate directly to a "
+                    "later URL after login or a state change, because a full reload "
+                    "may discard in-memory state. After an input action reports success, "
+                    "submit the form once even if the next page summary omits the field "
+                    "value; retry typing only if the site shows a validation error. "
+                    f"Original user request:\n{browser_goal}"
+                )
         finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
             warning = (
@@ -7804,9 +8754,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
-            if length_retries < 1:
+            if length_retries < 2:
                 length_retries += 1
-                messages.append({"role": "user", "content": retry_instruction})
+                messages.append({"role": "user", "content": (
+                    retry_instruction if length_retries == 1 else
+                    "Your last two responses reached the output limit. Reply within 200 tokens "
+                    "with exactly one complete tool call or a final answer. Do not include analysis "
+                    "or thinking."
+                )})
                 continue
             answer = _guard_answer(warning)
             if on_answer:

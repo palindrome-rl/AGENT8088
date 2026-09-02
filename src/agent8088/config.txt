@@ -27,12 +27,19 @@ allowed_paths=.
 
 # --- SSRF protection ---
 # Requests to private/internal addresses are blocked unless the host appears
-# here. Loopback only by default — nothing on your LAN is assumed reachable.
+# here. Empty by default: nothing internal is assumed reachable, not even
+# your own machine.
+#
+# A locally provisioned SearXNG needs no entry — the exact host:port of your
+# search_base_url is allowed automatically when it is on loopback, so
+# web_search reaches it while the rest of localhost (dev servers, admin
+# panels, the Ollama API) stays refused to every tool, browse_page included.
 #
 # To reach a SearXNG on another machine on your network, add its host:port:
-#   ssrf_allow_hosts=127.0.0.1,localhost,192.168.1.10:8888
-# `/search` adds the entry itself when it provisions a local instance.
-ssrf_allow_hosts=127.0.0.1,localhost
+#   ssrf_allow_hosts=192.168.1.10:8888
+# Prefer host:port over a bare host — a bare host opens every port on it, and
+# it also relaxes the browsing agent's own navigation deny-list.
+# ssrf_allow_hosts=
 
 # --- Permission Layer 3: Path-based write restrictions ---
 # Writes to these paths run without a prompt (auto-approved):
@@ -73,7 +80,33 @@ default_provider=ollama
 # provider.<name>.max_completion_tokens=32768
 
 timeout_seconds=120
-# max_tool_timeout_seconds=300
+# max_tool_timeout_seconds=600
+# browser_max_steps=25
+# browser_task_timeout_seconds=600
+# Override either for one run with AGENT8088_BROWSER_MAX_STEPS or
+# AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS.
+
+# Actions the browsing model may batch into one step. Wall clock tracks the
+# number of steps, so 1 (the reliable default) makes a multi-field form slow:
+# a 7-field form takes ~9 steps at 1, or ~5 at 4 - measured 149s vs 53s on a
+# local 35B, same correct result. Raise it for form-heavy or extraction runs;
+# keep it at 1 on a site where clicks reshuffle the DOM (some checkouts).
+# Override for one run with AGENT8088_BROWSER_MAX_ACTIONS_PER_STEP.
+# browser_max_actions_per_step=1
+# browse_page runs headless by default. Set this to 0 to watch the browser
+# work in a real window — useful for demos and for debugging a stuck selector.
+# Visibility only: the SSRF proxy and every other guard are unaffected.
+# Override for one run with AGENT8088_BROWSER_HEADLESS=0.
+# browser_headless=1
+# Where the visible window opens, as "W,H" and "X,Y". Ignored when headless.
+# Handy for a side-by-side screen recording: keep the terminal on the left and
+# put the browser on the right.
+# browser_window_size=1280,900
+# browser_window_position=680,0
+# Both also accept AGENT8088_BROWSER_WINDOW_SIZE / _POSITION for one run.
+# Screenshots stay off for text-only models. Enable this, or set
+# AGENT8088_BROWSER_SCREENSHOTS=1 for one run, only with a vision-capable model.
+# browser_screenshots=0
 
 # Global fallbacks when no per-provider value is set:
 # context_window=32768
