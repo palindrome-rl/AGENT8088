@@ -699,14 +699,19 @@ ALLOWED_PATHS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Permission layer ÔÇö readonly by default, escalates to edit on user approval
+# Permission layer -- full-auto by default (configurable), escalates only when
+# dropped to a tighter mode (readonly/plan-only/edit) via config.txt, --mode,
+# or the env var below.
 # ---------------------------------------------------------------------------
 # plan-only is refused here for the same reason `/mode` and `--mode` refuse it: a
 # plan session must be entered through enter_plan_mode(), which records the mode to
 # come back to. Starting in plan-only skips that, so finish_plan_session() has
 # nothing to restore and the session is stranded in plan mode. Fall back to the
-# safe default instead of honouring it; `/plan` is the only door.
-_env_permission_mode = os.environ.get("AGENT8088_PERMISSION", "readonly")
+# safe readonly mode instead of honouring it, regardless of the configured
+# default above; `/plan` is the only door.
+_env_permission_mode = os.environ.get(
+    "AGENT8088_PERMISSION", APP_CONFIG.get("default_permission_mode", "full-auto")
+)
 PERMISSION_MODE = "readonly" if _env_permission_mode == "plan-only" else _env_permission_mode
 # Set of pending one-shot approval keys, not a single slot -- a turn that
 # blocks on two writes at once (e.g. a CAD turn's plan.md + generator script)
