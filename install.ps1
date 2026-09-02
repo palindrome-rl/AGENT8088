@@ -863,73 +863,6 @@ function Install-LibreOffice {
     return $false
 }
 
-# ----------------------------------------------------------------------------
-# FreeCAD (headless freecadcmd) - CAD inspection, format conversion, and
-# parametric part generation. Used by the cad tools and skill; nothing in
-# engine.py requires it to exist.
-#
-# Same contract as Install-LibreOffice above: detect first, install via WinGet,
-# and on failure register a skipped stage rather than aborting setup. FreeCAD
-# is ~1GB, so a slow or interrupted download must not take the whole install
-# down with it.
-#
-# AGENT8088_FREECAD lets someone point at a portable extraction instead --
-# FreeCAD publishes a no-install .7z, which avoids the elevation an MSI-style
-# install needs. Detection honours that variable, so this step failing is
-# recoverable without admin rights.
-# ----------------------------------------------------------------------------
-function Install-FreeCAD {
-    $freecadNames = @("freecadcmd.exe", "FreeCADCmd.exe")
-    # The official installer defaults to a per-user, no-elevation install
-    # under %LOCALAPPDATA%\Programs, not Program Files -- confirmed on a real
-    # install; this was a guess when first written (see cad.py's own note).
-    $freecadDirs = @(
-        "$env:ProgramFiles\FreeCAD 1.1\bin",
-        "$env:ProgramFiles\FreeCAD\bin",
-        "${env:ProgramFiles(x86)}\FreeCAD 1.1\bin",
-        "${env:ProgramFiles(x86)}\FreeCAD\bin",
-        "$env:LOCALAPPDATA\Programs\FreeCAD 1.1\bin",
-        "$env:LOCALAPPDATA\Programs\FreeCAD\bin"
-    )
-    $candidates = foreach ($dir in $freecadDirs) {
-        foreach ($name in $freecadNames) { Join-Path $dir $name }
-    }
-    if ($env:AGENT8088_FREECAD) { $candidates = @($env:AGENT8088_FREECAD) + $candidates }
-
-    $existing = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($existing) {
-        Write-Success "FreeCAD found at $existing"
-        return $true
-    }
-
-    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $winget) {
-        Write-Warn "WinGet not found - cannot install FreeCAD automatically."
-        Register-SkippedStage -Label "FreeCAD" `
-            -Reason "no WinGet available" `
-            -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
-        return $false
-    }
-
-    Write-Info "Installing FreeCAD (needed for CAD inspection, conversion, and part generation; ~1GB) ..."
-    & $winget.Source install --id FreeCAD.FreeCAD --exact --source winget `
-        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
-    $wingetExit = $LASTEXITCODE
-
-    $installed = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($installed) {
-        Write-Success "FreeCAD installed at $installed"
-        return $true
-    }
-
-    Write-Warn "FreeCAD install did not complete (WinGet exit $wingetExit)."
-    Register-SkippedStage -Label "FreeCAD" `
-        -Reason "WinGet install failed (exit $wingetExit)" `
-        -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
-    return $false
-}
-
 function ConvertTo-PowerShellLiteral {
     param([AllowNull()][string]$Value)
     return "'" + ([string]$Value).Replace("'", "''") + "'"
@@ -2604,7 +2537,6 @@ try {
     Install-Gateway-Extras
     Install-Node-Bridge
     Install-LibreOffice
-    Install-FreeCAD
     Install-Embedding-Model
     Install-Native-Sandbox
     if (-not (Setup-Path)) {
