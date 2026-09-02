@@ -60,9 +60,46 @@ This is why the auditor's read-only-ness is a property of the engine rather than
 of its prompt. `check_permission()` refuses the write; the model is not being
 asked to behave.
 
+### Which model a sub-agent runs on
+
+A sub-agent runs on the **same provider as the session** — it never opens a
+second provider connection, and it cannot mutate the session's active provider
+or model.
+
+Its profile may name a `model:` in frontmatter. That name is checked against the
+live model list the active provider actually publishes:
+
+| `model:` value | Result |
+|---|---|
+| omitted, empty, or `inherit` | Runs on the session's current model. |
+| a model the provider offers | Runs on that model. |
+| a model the provider does not offer | Falls back to the session model, with a warning on the report. |
+| `provider:model` (cross-provider) | Rejected. Falls back to the session model with a warning. |
+
+The fallback is deliberate. A profile pinned to `kimi-k2.6` keeps working after
+you `/model` over to a provider that has never heard of it — you get a warning,
+not a dead sub-agent. Creation is stricter than running: `create_subagent`
+refuses an unavailable model up front (and lists real ones), because at that
+moment the provider is known, whereas at spawn time it may have changed since.
+
+Model discovery is the provider's own `/v1/models`, cached for an hour. If that
+fetch fails, validation is skipped rather than failing closed — a network blip
+must not invalidate a model that is genuinely there.
+
 ### Defining your own
 
-Markdown with YAML frontmatter in `agents_dir`:
+Two directories are merged into the available set:
+
+| Directory | Setting | Contents |
+|---|---|---|
+| package `agents/` | `agents_dir` | The bundled profiles. Read-only; replaced on upgrade. |
+| `%LOCALAPPDATA%\agent8088\agents` (POSIX: `~/.agent8088/agents`) | `user_agents_dir` | Your custom profiles. Survives upgrades. |
+
+A user profile **overrides** a bundled one of the same name, so you can shadow
+`coder` without editing the package. The set is re-read on every delegation, so
+a profile written mid-session is usable immediately — no restart.
+
+Markdown with YAML frontmatter:
 
 ```markdown
 ---
@@ -70,6 +107,7 @@ name: reviewer
 description: Reviews a diff for correctness and flags risky changes.
 tools: read_text, execute_shell, last_output
 max_turns: 8
+model: inherit
 ---
 
 You are a code reviewer. Read the diff, then report only defects you can
@@ -78,21 +116,40 @@ point at with a file and line. Do not restate what the code does.
 
 The body becomes the sub-agent's system prompt.
 
+You can also just ask for one in conversation — the agent calls
+`create_subagent`, which validates the name, tools, turn budget and model, and
+writes the profile to `user_agents_dir` for you. It is a normal write: in
+readonly mode it escalates for approval like any other.
+
 ### Guardrails
 
 - **Depth-limited** — `subagent_max_depth` prevents a sub-agent spawning an
-  infinite chain of sub-agents.
+  infinite chain of sub-agents. `spawn_subagent` is also stripped from every
+  sub-agent's tool set outright, so the limit is not the only thing holding.
 - **Permission layer still applies** — a sub-agent's `write_file` escalates to
   the same approval prompt as the parent's would.
 - **Unknown profile falls back** to `default_subagent` rather than erroring.
 - **Tool set is intersected** — a profile can only narrow the available tools,
   never grant something the parent didn't have.
+- **Bundled names are reserved** — `create_subagent` refuses to overwrite a
+  bundled profile; shadow it with a `user_agents_dir` file instead if you mean to.
+- **Profile fields are sanitized on write** — a `description` cannot contain a
+  line break, so it cannot close the frontmatter block early and smuggle extra
+  instructions into the prompt body or widen the declared tool set.
 
 ### From the REPL
 
+`/agent` runs one; `/agents` manages them.
+
 ```
-/agents                 # list profiles
-/agent explore <task>   # run one directly
+/agent explore <task>    # run one directly (no args opens a picker)
+
+/agents                  # list profiles — source, model, tools, and a
+                         #   one-line summary of the provider's models
+/agents models           # every model the active provider offers
+/agents new [name]       # create one interactively
+/agents edit <name>      # open a custom profile in $EDITOR
+/agents delete <name>    # remove a custom profile (bundled ones are refused)
 ```
 
 ---

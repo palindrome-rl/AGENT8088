@@ -39,9 +39,25 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.api_key_env` | Name of the env var / `.env` entry holding the key. **Preferred.** |
 | `provider.<name>.api_key` | Literal key. Legacy — migrated to `.env` on first run. |
 | `provider.<name>.api_mode` | `openai` (default) or `litellm`. |
+| `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
+| `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `fallback_models` | Comma-separated `provider:model` chain, tried on 429/503/connection errors. |
 | `context_window` | Token budget for history trimming. |
+| `max_completion_tokens` | Global output-token ceiling when the active model has no reviewed limit or provider override. |
 | `timeout_seconds` | Per-request timeout (default `120`). |
+
+### Fusion
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fusion_panel` | `""` | `provider:model,provider:model,...`; empty = auto-discover every provider with a working key. Overridden per-call by `/fusion --panel ...` |
+| `fusion_judge_provider` | `""` | Provider to use as judge; empty = the currently active provider |
+| `fusion_judge_model` | `""` | Model to use as judge; empty = the session's current model |
+| `fusion_max_panel` | `6` | Maximum number of models in the panel |
+| `fusion_member_timeout_s` | `60` | Per-panel-member timeout in seconds |
+| `fusion_max_workers` | `8` | Thread pool size for parallel panel calls |
+| `fusion_panel_max_tokens` | `1200` | Max completion tokens per panel member |
+| `fusion_judge_max_tokens` | `500` | Max completion tokens for the judge |
 
 Sampling: `frequency_penalty`, `presence_penalty` (temperature is a runtime
 setting — `/temp`). Details in [Model Providers](05-model-providers.md).
@@ -215,7 +231,8 @@ cannot hand itself a fresh write budget.
 | `tools_file` | Path to `tools.txt` (the tool registry). |
 | `system_file` | Path to `system.md` (base prompt). |
 | `user_file` | Path to `USER.md` (persona). |
-| `skills_dir` / `agents_dir` | Skill packages and sub-agent profiles. |
+| `skills_dir` / `agents_dir` | Skill packages and bundled sub-agent profiles. |
+| `user_agents_dir` | Your own sub-agent profiles, merged over `agents_dir`. Defaults to `%LOCALAPPDATA%\agent8088\agents` (POSIX: `~/.agent8088/agents`) so they survive an upgrade. |
 | `subagent_max_depth` | Recursion limit for `spawn_subagent`. |
 | `default_subagent` | Profile used when none is named. |
 | `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
@@ -232,6 +249,8 @@ process and this file so the change survives a restart:
 /limits max_turn_seconds 60
 /limits subagent explore 12
 /limits tool browse_page 90
+/limits provider glm context_window 1048576
+/limits provider custom max_completion_tokens 32768
 ```
 
 Raising a limit is allowed and reported as such, with a further warning past a

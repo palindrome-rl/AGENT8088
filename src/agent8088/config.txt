@@ -65,8 +65,19 @@ default_provider=ollama
 # provider.openrouter.model=anthropic/claude-sonnet-4
 # provider.openrouter.api_key=sk-or-...
 
+# Per-provider token limits — auto-applied on /model switch. Override the
+# global context_window / max_completion_tokens for one provider without
+# affecting the rest. Unknown models fall back to the global defaults below,
+# or a best-effort endpoint probe if the endpoint reports context info.
+# provider.<name>.context_window=1048576
+# provider.<name>.max_completion_tokens=32768
+
 timeout_seconds=120
 # max_tool_timeout_seconds=300
+
+# Global fallbacks when no per-provider value is set:
+# context_window=32768
+# max_completion_tokens=8192
 
 # --- display ---
 # Pygments theme for the code the agent reads and writes: file listings, diffs

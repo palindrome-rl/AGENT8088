@@ -1,5 +1,8 @@
 import asyncio
 import logging
+import sys
+
+log = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -16,12 +19,21 @@ def main() -> None:
     from agent8088.gateway.runner import build_runner
     runner = build_runner()
     if not runner.adapters:
-        logging.error("No messaging platforms enabled. Set one of slack_enabled, whatsapp_enabled, discord_enabled, email_enabled, or telegram_enabled to 1 in config.txt (or run: agent8088 --gateway-setup).")
-        return
+        message = ("No messaging platforms enabled. Set one of slack_enabled, "
+                   "whatsapp_enabled, discord_enabled, email_enabled, or "
+                   "telegram_enabled to 1 in config.txt (or run: "
+                   "agent8088 --gateway-setup).")
+        log.error(message)
+        # The file logger may be the only configured handler. A failed service
+        # start must still explain itself to an operator or process supervisor.
+        print(message, file=sys.stderr)
+        # Service managers and CI must be able to detect that no gateway
+        # actually started; an error log paired with exit code 0 looked healthy.
+        raise SystemExit(1)
     try:
         asyncio.run(runner.run())
     except KeyboardInterrupt:
-        logging.info("Gateway stopped.")
+        log.info("Gateway stopped.")
 
 
 if __name__ == "__main__":
