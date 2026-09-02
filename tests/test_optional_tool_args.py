@@ -44,3 +44,22 @@ def test_optional_naming_an_undeclared_arg_is_ignored(engine):
 def test_schedule_task_no_longer_demands_schedule_and_task(engine):
     """action=list needs neither; requiring them forced the model to invent values."""
     assert engine.TOOL_REQUIRED_PARAMS["schedule_task"] == ["action"]
+
+
+def test_schedule_list_reports_an_unavailable_crontab(engine, monkeypatch):
+    def unavailable(*_args, **_kwargs):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(engine.subprocess, "run", unavailable)
+    assert engine._exec_cron({"action": "list"}).startswith("Cron unavailable:")
+
+
+def test_schedule_add_reports_an_unavailable_crontab_write(engine, monkeypatch):
+    def crontab(command, **_kwargs):
+        if command == ["crontab", "-l"]:
+            return type("Result", (), {"returncode": 0, "stdout": ""})()
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(engine.subprocess, "run", crontab)
+    result = engine._exec_cron({"action": "add", "schedule": "0 9 * * *", "task": "report"})
+    assert result.startswith("Cron unavailable:")
