@@ -708,7 +708,15 @@ ALLOWED_PATHS = [
 # safe default instead of honouring it; `/plan` is the only door.
 _env_permission_mode = os.environ.get("AGENT8088_PERMISSION", "readonly")
 PERMISSION_MODE = "readonly" if _env_permission_mode == "plan-only" else _env_permission_mode
-_one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
+# Set of pending one-shot approval keys, not a single slot -- a turn that
+# blocks on two writes at once (e.g. a CAD turn's plan.md + generator script)
+# needs both grants alive simultaneously. A single scalar meant the second
+# grant silently overwrote the first before it was ever spent, and the two
+# blocked calls ping-ponged forever, each stealing the other's grant every
+# retry. _ANY_GRANT_KEY is the "True" case: a grant not tied to a specific
+# pending call (set_permission_mode etc. still clear the whole set).
+_ANY_GRANT_KEY = "\x00any\x00"
+_one_shot_grants: set = set()
 _pending_approval_key = ""
 _local_fallback_grant = False
 _remote_git_grant = False
@@ -749,9 +757,9 @@ def set_permission_mode(mode: str) -> None:
     """The one place PERMISSION_MODE changes, so every grant tied to the old mode
     is dropped with it. A grant that outlives its mode is a hole: an approval the
     user gave for a plan step must not still be spendable after the mode moved on."""
-    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant, _pending_approval_key
+    global PERMISSION_MODE, _plan_execution_grant, _pending_approval_key
     PERMISSION_MODE = mode
-    _one_shot_grant = False
+    _one_shot_grants.clear()
     _plan_execution_grant = False
     _pending_approval_key = ""
 
@@ -818,18 +826,21 @@ def reset_approval_state() -> None:
 
 def reset_turn_approval_state() -> None:
     """Drop unspent grants before a new agent turn can use them."""
-    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
-    _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
+    global _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    _one_shot_grants.clear()
+    _local_fallback_grant = _remote_git_grant = False
     _pending_approval_key = ""
 
 
 def _take_search_fallback_grant(approval_key: str) -> bool:
     """Spend the exact approval that permits a local search to use DDGS."""
-    global _one_shot_grant
-    if _one_shot_grant != approval_key:
-        return False
-    _one_shot_grant = False
-    return True
+    if approval_key in _one_shot_grants:
+        _one_shot_grants.discard(approval_key)
+        return True
+    if _ANY_GRANT_KEY in _one_shot_grants:
+        _one_shot_grants.discard(_ANY_GRANT_KEY)
+        return True
+    return False
 
 
 def _tool_call_key(name: str, args: dict) -> str:
@@ -1392,7 +1403,6 @@ def _is_fixed_host_tool_command(command: str) -> bool:
 def check_permission(mode: str, command: str = "", path_zone: str = "default",
                      host: bool = False, approval_key: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
-    global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
     # A CAD-scoped script invocation is auto-approved in every permission
@@ -1441,9 +1451,16 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
                 and not _is_fixed_host_tool_command(command)):
             return False
         return True
-    # One-shot grant: allow one blocked tool through, then revert
-    if _one_shot_grant is True or _one_shot_grant == approval_key:
-        _one_shot_grant = False
+    # One-shot grant: allow one blocked tool through, then revert. Checked
+    # against the set of currently pending grants (plural -- see
+    # _one_shot_grants above) rather than a single slot, so a turn that
+    # blocked on two writes at once doesn't have the second grant clobber
+    # the first before either is spent.
+    if _ANY_GRANT_KEY in _one_shot_grants:
+        _one_shot_grants.discard(_ANY_GRANT_KEY)
+        return True
+    if approval_key and approval_key in _one_shot_grants:
+        _one_shot_grants.discard(approval_key)
         return True
     return False
 
@@ -1461,15 +1478,19 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
 
 def grant_escalation(change_type: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
-    The user is prompted for every write/mutation - no session-wide grants."""
-    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    The user is prompted for every write/mutation - no session-wide grants.
+
+    Adds to the set of pending one-shot grants rather than replacing a single
+    slot -- a turn can have more than one blocked call needing its own grant
+    (e.g. a CAD turn's plan.md write and its generator write, escalated
+    together), and each grant is spent independently by check_permission."""
+    global _local_fallback_grant, _remote_git_grant, _pending_approval_key
     if change_type == "git_remote_write":
         _remote_git_grant = True
-        _one_shot_grant = False
         _local_fallback_grant = False
         _pending_approval_key = ""
         return
-    _one_shot_grant = _pending_approval_key or True
+    _one_shot_grants.add(_pending_approval_key or _ANY_GRANT_KEY)
     _pending_approval_key = ""
     _local_fallback_grant = False
     _remote_git_grant = False
@@ -3662,7 +3683,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
-    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
+    global PERMISSION_MODE, _plan_execution_grant
     global _local_fallback_grant, _remote_git_grant, _active_role
     global _sandbox_readonly, SUBAGENT_SPECS
 
@@ -3724,12 +3745,14 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     global _permission_floor_readonly
     floor = profile.get("permission", "")
     saved_permission = None
+    saved_grants = None
     if floor == "readonly":
-        saved_permission = (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+        saved_permission = (PERMISSION_MODE, _plan_execution_grant,
                             _local_fallback_grant, _remote_git_grant,
                             _permission_floor_readonly, _sandbox_readonly)
+        saved_grants = set(_one_shot_grants)  # copy -- the live set gets cleared below
         PERMISSION_MODE = "readonly"
-        _one_shot_grant = False
+        _one_shot_grants.clear()
         _plan_execution_grant = False
         _local_fallback_grant = False
         _remote_git_grant = False
@@ -3761,9 +3784,11 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         _last_tool_output, _last_tool_name, _last_write_diff = saved
         _active_role = saved_role
         if saved_permission is not None:
-            (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+            (PERMISSION_MODE, _plan_execution_grant,
              _local_fallback_grant, _remote_git_grant,
              _permission_floor_readonly, _sandbox_readonly) = saved_permission
+            _one_shot_grants.clear()
+            _one_shot_grants.update(saved_grants)
 
     answer = _cap_subagent_answer(answer)
     if model_warning:
