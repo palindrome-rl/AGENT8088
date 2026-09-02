@@ -350,8 +350,3 @@ web_search_no_prompt=1
 # blocked_paths first. Sensitive files and shell startup files (.zshrc etc.)
 # are refused regardless of this setting.
 # mcp_server_allow_writes=0
-
-# --- screen-recording setup (active) ---
-browser_headless=0
-browser_window_size=1280,900
-browser_window_position=680,0
