@@ -2436,7 +2436,7 @@ def _detect_pasted_file(line: str):
     must resolve to a file that genuinely exists on disk.
     """
     stripped = line.strip()
-    if not stripped or stripped.startswith("/"):
+    if not stripped:
         return None
 
     # Quoted spans first (a Windows drag-drop path containing a space is
@@ -4978,8 +4978,9 @@ def _windows_processes_in_tree(target):
     higher integrity level, so a file a security scanner has mapped stays
     invisible here.
     """
+    prefix = str(target).rstrip("\\/") + "\\*"
     listing = _run_powershell_capture(
-        "$prefix = " + _powershell_literal(Path(str(target)) / "*") + "\n"
+        "$prefix = " + _powershell_literal(prefix) + "\n"
         f"$selfPid = {os.getpid()}\n"
         # One CIM query for the definitive case, then module lists for the few
         # runtimes that could be hosting install code from outside the tree.
