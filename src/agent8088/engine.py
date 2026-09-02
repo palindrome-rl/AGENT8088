@@ -548,10 +548,18 @@ def set_provider_limit(provider: str, key: str, value: str) -> dict:
 
 
 def reset_provider_limit(provider: str, key: str) -> dict:
-    """Clear a provider.<name>.<key> override so _active_model_token_limits
-    falls through to global config, then probed model metadata, then the
-    hardcoded default -- the same chain it already uses when no override was
-    ever set. The counterpart to set_provider_limit for undoing one."""
+    """Clear a provider.<name>.<key> override and recover the real probed
+    value, not the hardcoded module default.
+
+    model_token_limits() (the "known" table _active_model_token_limits falls
+    back to) always returns {} -- probed values live nowhere but
+    PROVIDERS[name] itself, so popping the override without restoring one
+    would silently replace a real per-model number (e.g. Ollama Cloud's
+    65,536-token output ceiling, only ever discovered via probing) with the
+    generic 32768/65000 fallback. Try the session probe cache first (no
+    network), then re-probe live, before giving up and letting it fall to
+    the hardcoded default -- same as a provider that was never overridden.
+    """
     if provider not in PROVIDERS:
         raise KeyError(provider)
     if key not in _PROVIDER_LIMIT_KEYS:
@@ -562,6 +570,24 @@ def reset_provider_limit(provider: str, key: str) -> dict:
     config_key = f"provider.{provider}.{key}"
     APP_CONFIG.pop(config_key, None)
     remove_simple_config_keys(CONFIG_PATH, [config_key])
+
+    model = MODEL_NAME
+    cache_key = (provider, model)
+    probed_ctx, probed_out = _PROBED_LIMITS.get(cache_key, (None, None))
+    if probed_ctx is None and probed_out is None:
+        try:
+            from agent8088.providers import probe_model_context_window
+            probe_client, _ = get_client(provider)
+            probed_ctx, probed_out = probe_model_context_window(
+                probe_client, model, provider_name=provider)
+            _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
+        except Exception:
+            probed_ctx, probed_out = None, None
+    if key == "context_window" and probed_ctx:
+        PROVIDERS[provider]["context_window"] = str(probed_ctx)
+    elif key == "max_completion_tokens" and probed_out:
+        PROVIDERS[provider]["max_completion_tokens"] = str(probed_out)
+
     new_context, new_completion = _active_model_token_limits(provider)
     new = new_context if key == "context_window" else new_completion
     return {"key": config_key, "old": old, "new": new, "provider": provider,
