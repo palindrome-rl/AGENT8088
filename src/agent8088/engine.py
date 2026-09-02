@@ -3873,24 +3873,14 @@ def _exec_browser(args: dict) -> str:
                 "is not installed. It requires Python 3.11 or newer, so it is "
                 "skipped on a Python 3.10 install. Reinstall Agent8088 on "
                 "Python 3.11+, or use web_search or get_page_title instead.")
-    # Keep Chromium's ~280MB download inside $AGENT8088_HOME rather than the
-    # OS-default shared cache (~/.cache/ms-playwright etc.) - that shared
-    # cache can belong to other Playwright-using projects on the same
-    # machine, so `agent8088 --uninstall` cannot safely delete it.
-    os.environ.setdefault(
-        "PLAYWRIGHT_BROWSERS_PATH", str(_agent_data_dir() / "playwright-browsers")
-    )
-    executable_path = None
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            executable_path = p.chromium.executable_path
-            if not os.path.exists(executable_path):
-                return ("Playwright's Chromium browser is not installed. Install it with:\n"
-                        "  playwright install chromium\n"
-                        "Until then, use web_search or get_page_title instead.")
+        executable_path = _playwright_chromium_executable()
     except Exception as e:
         return f"Browser error: {e}"
+    if executable_path is None:
+        return ("Playwright's Chromium browser is not installed. Install it with:\n"
+                "  playwright install chromium\n"
+                "Until then, use web_search or get_page_title instead.")
 
     saved_role, _active_role = _active_role, "subagent:browser"
     try:
@@ -3968,6 +3958,55 @@ def _which_executable(name: str) -> str | None:
             if executable:
                 return executable
     return shutil.which(name)
+
+
+def _playwright_chromium_executable() -> str | None:
+    """Locate Playwright's Chromium, or None when it is not installed.
+
+    Sets PLAYWRIGHT_BROWSERS_PATH to whichever candidate directory actually
+    holds the build this Playwright wants, so the launch below and Playwright
+    itself agree on one location.
+
+    Order matters. agent8088's own directory comes first: `--uninstall` can
+    only honestly delete a ~280MB download it owns, and the OS-shared
+    ms-playwright cache may belong to other Playwright projects on the machine.
+    But it must not be *forced*, which is what this used to do - on a machine
+    that already had a valid, version-matching Chromium in the shared cache,
+    browse_page reported "Chromium browser is not installed" and stayed dead
+    until the user either re-downloaded 280MB or discovered the env var. So
+    the private directory wins only when it has a usable browser; otherwise
+    fall back to Playwright's own default, which is exactly where a plain
+    `playwright install chromium` puts it - making the message above true.
+
+    An explicit PLAYWRIGHT_BROWSERS_PATH always wins: that is the operator
+    telling us where their browsers live.
+    """
+    from playwright.sync_api import sync_playwright
+
+    explicit = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    private = str(_agent_data_dir() / "playwright-browsers")
+    # None means "leave the variable unset and let Playwright use its default".
+    candidates = [explicit] if explicit else [private, None]
+
+    for root in candidates:
+        if root is None:
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        else:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = root
+        with sync_playwright() as p:
+            candidate = p.chromium.executable_path
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    # Nothing found. Restore the variable to however we found it, so this stays
+    # idempotent: leaving our own last candidate behind would look like an
+    # explicit operator choice on the next call, and a retry after the user
+    # actually installs Chromium would then never re-check the other location.
+    if explicit:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = explicit
+    else:
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+    return None
 
 
 def _agent_data_dir() -> Path:
