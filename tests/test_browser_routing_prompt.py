@@ -43,6 +43,38 @@ def test_browser_receives_the_complete_user_goal(engine, monkeypatch):
     assert "retry typing only if the site shows a validation error" in executed[0][1]
 
 
+def test_browser_can_fill_details_missing_from_search_results(engine, monkeypatch):
+    responses = iter((
+        '✿FUNCTION✿: web_search ✿ARGS✿: '
+        '{"query":"central London barbers prices contact details"}',
+        '✿FUNCTION✿: browse_page ✿ARGS✿: '
+        '{"url":"https://example.com/prices","task":"Extract haircut prices and phone number."}',
+        "done",
+    ))
+    executed = []
+
+    def completion(*_args, **_kwargs):
+        message = type("Message", (), {"content": next(responses)})()
+        choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+        return type("Response", (), {"choices": [choice]})()
+
+    def exec_tool(name, raw_args, **_kwargs):
+        executed.append((name, json.loads(raw_args)))
+        return "Search results" if name == "web_search" else "Haircut: £30; phone: 020 0000 0000"
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    monkeypatch.setattr(engine, "exec_tool", exec_tool)
+
+    assert engine.run_agent(
+        [{"role": "user", "content": (
+            "List central London barbershops with haircut prices and contact info."
+        )}],
+        max_turns=3, system_prompt="", tools_def=[],
+        allowed_tools={"web_search", "browse_page"},
+    ) == "done"
+    assert [name for name, _args in executed] == ["web_search", "browse_page"]
+
+
 def test_resumed_browser_task_keeps_its_original_goal(engine, monkeypatch):
     response = '✿FUNCTION✿: browse_page ✿ARGS✿: {"url":"https://example.com/later"}'
     message = type("Message", (), {"content": response})()
