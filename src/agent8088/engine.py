@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, asyncio, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
+import ast, asyncio, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings  # readline enables input history
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -22,6 +22,18 @@ APP_DIR = Path(__file__).resolve().parent
 
 import logging
 _log = logging.getLogger("agent8088.engine")
+
+def _quiet_fastapi_422_deprecation_warning() -> None:
+    """Hide FastAPI's browser-use import-time compatibility notice."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated\\.",
+        category=DeprecationWarning,
+        module=r"fastapi\\.applications",
+    )
+
+
+_quiet_fastapi_422_deprecation_warning()
 
 
 # ---------------------------------------------------------------------------
@@ -4153,6 +4165,19 @@ def _browser_max_actions_per_step() -> int:
     return max(1, value)
 
 
+def _browser_llm_extra_body() -> dict | None:
+    """Optional OpenAI-compatible request fields for browser-use only."""
+    raw = str(APP_CONFIG.get("browser_llm_extra_body", "")).strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        logging.getLogger(__name__).warning("Ignoring invalid browser_llm_extra_body JSON.")
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _browser_headless() -> bool:
     """Whether this browsing session hides its window.
 
@@ -4380,6 +4405,7 @@ def _browser_use_available() -> bool:
     3.10 install (see pyproject.toml). Checked explicitly so that case reports
     itself instead of surfacing as a bare ImportError."""
     try:
+        _quiet_fastapi_422_deprecation_warning()
         import browser_use  # noqa: F401
         return True
     except Exception:
@@ -4432,7 +4458,8 @@ async def _run_browser_agent(url: str, task: str,
     agent = None
     try:
         llm = build_browser_chat_model(
-            client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS)
+            client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS,
+            extra_body=_browser_llm_extra_body())
         profile = BrowserProfile(
             user_data_dir=user_data_dir, executable_path=executable_path,
             **_browser_profile_kwargs(proxy_url))

@@ -76,6 +76,28 @@ def test_max_tokens_is_threaded_through_for_both_client_shapes():
 
 
 @pytest.mark.asyncio
+async def test_extra_body_is_sent_on_structured_browser_calls(monkeypatch):
+    model = Agent8088ChatModel(
+        model="openai/qwen", extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"thinking": "", "answer": "ok"}'),
+                                     finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    result = await model.ainvoke([], output_format=_Output)
+
+    assert result.completion.answer == "ok"
+    assert calls[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+@pytest.mark.asyncio
 async def test_ainvoke_charges_the_budget_on_success(monkeypatch):
     budget = _FakeBudget()
     model = Agent8088ChatModel(model="openai/gpt-4o", budget=budget)
