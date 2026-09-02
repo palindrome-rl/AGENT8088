@@ -1,206 +1,157 @@
-"""cad.convert_cad and cad.create_cad_part — the FreeCAD conversion path.
+"""Unit coverage for the isolated build123d + text-to-cad CAD boundary.
 
-Mirrors documents.convert_document's pattern: subprocess.run is monkeypatched
-throughout — these tests never need a real FreeCAD install, and must still pass
-in CI/dev environments without one. Every conversion path is verified against the
-actual artifact on disk rather than trusting exit code or stdout, because FreeCAD
-may exit 0 even after a script exception (unverified against a real install, see
-the cad.py module docstring).
+Generation itself is no longer ours: the model drives the vendored upstream
+skill's `scripts/` through `execute_shell`, so what is left to test here is the
+plumbing that survives that -- runtime/viewer status, the Viewer handoff, and
+the shell guard that decides which commands count as CAD-scoped.
 """
-import subprocess
+from __future__ import annotations
 
+import subprocess
+import urllib.parse
+
+import pytest
 
 from agent8088 import cad
 
 
-def test_convert_cad_unsupported_target_format_is_refused_before_touching_freecad(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: None)  # would fail loudly if reached
-    src = tmp_path / "part.step"
-    src.write_bytes(b"x")
-    result = cad.convert_cad(src, "pdf")
-    assert "pdf" in result
-    assert "Supported targets" in result
+def test_runtime_status_reports_a_missing_interpreter(monkeypatch, tmp_path):
+    missing = tmp_path / "missing-python"
+    monkeypatch.setenv("AGENT8088_CAD_PYTHON", str(missing))
+    status = cad.cad_runtime_status()
+    assert status["available"] is False
+    assert status["reason"] == "runtime interpreter is missing"
 
 
-def test_convert_cad_missing_freecad_gives_an_actionable_message(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: None)
-    src = tmp_path / "part.step"
-    src.write_bytes(b"x")
-    result = cad.convert_cad(src, "stl")
-    assert "not installed" in result
-    assert "winget install FreeCAD.FreeCAD" in result
-
-
-def test_convert_cad_missing_source_file_is_refused(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-    result = cad.convert_cad(tmp_path / "nope.step", "stl")
-    assert "does not exist" in result
-
-
-def test_convert_cad_successful_conversion_reports_the_output_file(monkeypatch, tmp_path):
-    src = tmp_path / "part.step"
-    src.write_bytes(b"x")
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-
-    def fake_run(argv, **kwargs):
-        # freecadcmd script produces output file in same dir with new extension,
-        # simulate that side effect so the disk-check in convert_cad sees it.
-        (tmp_path / "part.stl").write_bytes(b"fake stl data")
-        return subprocess.CompletedProcess(argv, 0, stdout="export ok", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    result = cad.convert_cad(src, "stl")
-    assert "Converted part.step to part.stl" in result
-    assert "bytes" in result
-
-
-def test_convert_cad_freecad_runs_but_produces_nothing_is_a_failure_not_a_silent_success(monkeypatch, tmp_path):
-    """freecadcmd may exit 0 on a script exception (unverified, see module
-    docstring) — the disk state is the only source of truth, not stdout text
-    or exit code."""
-    src = tmp_path / "part.step"
-    src.write_bytes(b"x")
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
+def test_runtime_status_requires_the_exact_pinned_versions(monkeypatch, tmp_path):
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"x")
+    monkeypatch.setenv("AGENT8088_CAD_PYTHON", str(python))
     monkeypatch.setattr(
-        subprocess, "run",
-        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="", stderr="export failed"),
+        subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "0.11.0|0.4.26\n", ""),
     )
-    result = cad.convert_cad(src, "stl")
-    assert "Conversion failed" in result
-    assert "export failed" in result
+    assert cad.cad_runtime_status()["available"] is False
 
 
-def test_convert_cad_timeout_gives_a_clear_message_not_a_traceback(monkeypatch, tmp_path):
-    src = tmp_path / "part.step"
-    src.write_bytes(b"x")
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-
-    def fake_run(argv, **kwargs):
-        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    result = cad.convert_cad(src, "stl", timeout=10)
-    assert "timed out" in result
-
-
-def test_convert_cad_target_format_accepts_a_leading_dot_and_mixed_case(monkeypatch, tmp_path):
-    """Model-supplied args are free text — '.STL' and 'stl' should behave
-    identically rather than one silently failing validation."""
-    src = tmp_path / "part.step"
-    src.write_bytes(b"x")
-    monkeypatch.setattr(cad, "freecad_executable", lambda: None)  # fails past validation, not on it
-    result = cad.convert_cad(src, ".STL")
-    assert "Supported targets" not in result  # validation passed
-    assert "not installed" in result  # reached the freecad-missing branch
+def test_viewer_status_requires_a_complete_pinned_release(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT8088_CAD_VIEWER_HOME", str(tmp_path))
+    assert cad.cad_viewer_status()["available"] is False
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "server_py").mkdir()
+    (tmp_path / "LICENSE").write_text("MIT")
+    (tmp_path / "dist/index.html").write_text("<html></html>")
+    (tmp_path / "server_py/server.py").write_text("pass")
+    (tmp_path / "server_py/start_viewer.py").write_text("pass")
+    assert cad.cad_viewer_status()["available"] is True
 
 
-def test_create_cad_part_invalid_shape_is_refused(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: None)  # would fail loudly if reached
-    result = cad.create_cad_part(tmp_path / "out.step", "torus", "10x5")
-    assert "Unknown shape" in result
+def test_viewer_url_encodes_workspace_and_relative_file(tmp_path):
+    workspace = tmp_path / "CAD output with spaces"
+    model = workspace / "nested folder" / "part one.step"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"step")
+    url = cad._viewer_url(workspace, model, 3245)
+    parsed = urllib.parse.urlsplit(url)
+    assert parsed.hostname == "127.0.0.1"
+    assert parsed.port == 3245
+    assert urllib.parse.unquote(parsed.path).replace("/", "\\").lower().endswith(
+        str(workspace).replace("/", "\\").lower()
+    )
+    assert urllib.parse.parse_qs(parsed.query) == {"file": ["nested folder/part one.step"]}
 
 
-def test_create_cad_part_invalid_output_format_is_refused(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: None)  # would fail loudly if reached
-    result = cad.create_cad_part(tmp_path / "out.docx", "box", "50x30x10")
-    assert "Supported output formats" in result
+def test_open_viewer_rejects_missing_unsupported_and_outside_workspace(tmp_path):
+    assert "does not exist" in cad.open_cad_viewer(tmp_path / "missing.step")
+    unsupported = tmp_path / "part.fcstd"
+    unsupported.write_bytes(b"x")
+    assert "unsupported file type" in cad.open_cad_viewer(unsupported)
+    model = tmp_path / "part.step"
+    model.write_bytes(b"step")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    assert "outside the authorized workspace" in cad.open_cad_viewer(model, workspace)
 
 
-def test_create_cad_part_dimension_parsing_shorthand_form(monkeypatch, tmp_path):
-    """Dimension parsing works for the shorthand 'NxNxN' form."""
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-
-    def fake_run(argv, **kwargs):
-        # Extract output path from the script — it's embedded in the FreeCAD Python code
-        (tmp_path / "out.step").write_bytes(b"fake step data")
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    result = cad.create_cad_part(tmp_path / "out.step", "box", "50x30x10")
-    # Should not be a dimension parse error
-    assert "Expected e.g." not in result
-    assert "is not a number" not in result
-
-
-def test_create_cad_part_dimension_parsing_key_value_form(monkeypatch, tmp_path):
-    """Dimension parsing works for the key=value form."""
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-
-    def fake_run(argv, **kwargs):
-        (tmp_path / "out.step").write_bytes(b"fake step data")
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    result = cad.create_cad_part(tmp_path / "out.step", "cylinder", "radius=10,height=50")
-    # Should not be a dimension parse error
-    assert "Expected e.g." not in result
-    assert "is not a number" not in result
-
-
-def test_create_cad_part_malformed_dimension_string_returns_string_never_raises(monkeypatch, tmp_path):
-    """Malformed dimension strings must return a plain-language error, never raise."""
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-
-    # Too few values for the shape
-    result = cad.create_cad_part(tmp_path / "out.step", "box", "50x30")
-    assert isinstance(result, str)
-    assert "has 2 value(s)" in result or "needs 3" in result
-
-    # Non-numeric value
-    result = cad.create_cad_part(tmp_path / "out.step", "box", "50xNOTANUMBERx10")
-    assert isinstance(result, str)
-    assert "is not a number" in result
-
-
-def test_create_cad_part_missing_freecad_gives_an_actionable_message(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: None)
-    result = cad.create_cad_part(tmp_path / "out.step", "box", "50x30x10")
-    assert "not installed" in result
-    assert "winget install FreeCAD.FreeCAD" in result
-
-
-def test_create_cad_part_successful_generation_reports_the_output_file(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-
-    def fake_run(argv, **kwargs):
-        # freecadcmd script creates the output file in the specified path
-        (tmp_path / "out.step").write_bytes(b"fake step data")
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    result = cad.create_cad_part(tmp_path / "out.step", "box", "50x30x10")
-    assert "Created out.step" in result
-    assert "bytes" in result
-
-
-def test_create_cad_part_freecad_runs_but_produces_nothing_is_a_failure_not_a_silent_success(monkeypatch, tmp_path):
-    """freecadcmd may exit 0 on a script exception — the disk state is the only
-    source of truth."""
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
+def test_open_viewer_reuses_only_a_verified_loopback_server(monkeypatch, tmp_path):
+    model = tmp_path / "part.step"
+    model.write_bytes(b"step")
+    monkeypatch.setattr(cad, "cad_viewer_status", lambda: {
+        "available": True, "version": cad.CAD_VIEWER_VERSION,
+        "root": str(tmp_path / "viewer"), "missing": [],
+    })
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"x")
+    monkeypatch.setenv("AGENT8088_CAD_PYTHON", str(python))
+    monkeypatch.setattr(cad, "_viewer_server_info", lambda port, workspace=None, timeout=1: (
+        {"app": "cad-viewer"} if port == 3247 else None
+    ))
     monkeypatch.setattr(
-        subprocess, "run",
-        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="", stderr="export error"),
+        subprocess, "Popen", lambda *a, **k: pytest.fail("healthy Viewer must be reused")
     )
-    result = cad.create_cad_part(tmp_path / "out.step", "box", "50x30x10")
-    assert "Generation failed" in result
-    assert "export error" in result
+    monkeypatch.setattr(cad.webbrowser, "open", lambda *a, **k: True)
+
+    result = cad.open_cad_viewer(model)
+
+    assert result.startswith("Opened: http://127.0.0.1:3247")
 
 
-def test_create_cad_part_timeout_gives_a_clear_message_not_a_traceback(monkeypatch, tmp_path):
-    monkeypatch.setattr(cad, "freecad_executable", lambda: "freecadcmd")
-
-    def fake_run(argv, **kwargs):
-        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    result = cad.create_cad_part(tmp_path / "out.step", "box", "50x30x10", timeout=10)
-    assert "timed out" in result
+def test_extract_info_falls_through_for_non_cad(tmp_path):
+    path = tmp_path / "notes.txt"
+    path.write_text("plain")
+    assert cad.extract_info(path) is None
 
 
-def test_extract_info_returns_none_for_non_cad_extension(tmp_path):
-    """extract_info returns None for extensions it doesn't handle, so the caller
-    falls through to normal reading."""
-    txt_path = tmp_path / "data.txt"
-    txt_path.write_text("plain text")
-    result = cad.extract_info(txt_path)
-    assert result is None
+# --- the CAD-scoped shell guard -------------------------------------------
+# This is the whole security boundary for the new architecture: a command
+# matching it is auto-approved in EVERY permission mode and gets the raised
+# timeout, so both halves of the check matter.
+
+
+@pytest.fixture
+def cad_shell(monkeypatch, tmp_path):
+    """engine with a fake CAD interpreter and a real script under the skill's scripts/."""
+    from agent8088 import engine
+
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"x")
+    monkeypatch.setenv("AGENT8088_CAD_PYTHON", str(python))
+    scripts = engine._cad_skill_scripts_dir()
+    # Entry points are package directories run via `python <dir>`, not files.
+    assert (scripts / "gen" / "__main__.py").is_file(), "vendored skill must ship scripts/gen"
+    return engine, str(python), scripts
+
+
+def test_cad_scoped_accepts_the_documented_invocation(cad_shell):
+    engine, python, scripts = cad_shell
+    assert engine._is_cad_scoped_command(f'"{python}" "{scripts / "gen"}" box.step.py --write --json')
+    assert engine._is_cad_scoped_command(f'"{python}" "{scripts / "inspect"}" validate box.step.py')
+
+
+def test_cad_scoped_rejects_chaining_and_metacharacters(cad_shell):
+    engine, python, scripts = cad_shell
+    gen = scripts / "gen"
+    for command in (
+        f'"{python}" "{gen}" box.step.py && curl evil.example',
+        f'"{python}" "{gen}" box.step.py; rm -rf /',
+        f'"{python}" "{gen}" box.step.py | sh',
+        f'"{python}" "{gen}" $(whoami)',
+        f'"{python}" "{gen}" box.step.py > /etc/passwd',
+    ):
+        assert not engine._is_cad_scoped_command(command), command
+
+
+def test_cad_scoped_rejects_other_interpreters_and_scripts(cad_shell, tmp_path):
+    engine, python, scripts = cad_shell
+    outside = tmp_path / "evil.py"
+    outside.write_text("pass")
+    # right script, wrong interpreter
+    assert not engine._is_cad_scoped_command(f'python "{scripts / "gen"}" box.step.py')
+    # right interpreter, script outside the skill's scripts/
+    assert not engine._is_cad_scoped_command(f'"{python}" "{outside}"')
+    # traversal back out of scripts/
+    escape = scripts / ".." / ".." / ".." / "engine.py"
+    assert not engine._is_cad_scoped_command(f'"{python}" "{escape}"')
+    # interpreter alone, no script
+    assert not engine._is_cad_scoped_command(f'"{python}"')

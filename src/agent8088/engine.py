@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, asyncio, math, operator, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
+import ast, asyncio, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit  # readline enables input history
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -52,7 +52,11 @@ def _protect_private_file(path: Path) -> None:
     if identity.returncode or not re.fullmatch(r"S-\d(?:-\d+)+", sid):
         raise OSError("Could not determine the current Windows user SID.")
     for acl_args in (
-        ["/grant:r", f"*{sid}:(R,W)"],
+        # Modify (not R,W): os.replace() renames the temp file over the target,
+        # and a rename needs DELETE on the source. Folders without
+        # FILE_DELETE_CHILD on the parent (e.g. OneDrive-synced dirs) then fail
+        # with WinError 5. M keeps the file private to the SID but allows delete.
+        ["/grant:r", f"*{sid}:(M)"],
         ["/inheritance:r"],
     ):
         result = subprocess.run(
@@ -229,11 +233,19 @@ def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
     return migrated
 
 
-# Config path: AGENT8088_CONFIG env var > ~/.agent8088/config.txt > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
+# Config path: AGENT8088_CONFIG env var > CWD ./config.txt > ~/.agent8088/config.txt
+#             > %LOCALAPPDATA%/agent8088/config.txt > APP_DIR/config.txt
+# A CWD ./config.txt is exclusive — the two files never interact (no merge,
+# no global read). This lets a project directory own its full config (provider,
+# keys, token limits) without polluting the global install, and /limits
+# provider writes stay local when CWD config is active.
+_cwd_config = Path.cwd() / "config.txt"
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
 if os.environ.get("AGENT8088_CONFIG"):
     CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+elif _cwd_config.exists():
+    CONFIG_PATH = _cwd_config
 elif _user_config.exists():
     CONFIG_PATH = _user_config
 elif _win_config.exists():
@@ -334,6 +346,13 @@ MAX_DOCUMENT_BYTES = int(APP_CONFIG.get("max_document_bytes", str(25 * 1024 * 10
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
 MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "600")))
+# A CAD-scoped script call (scripts/gen on a complex lattice, etc.) can
+# legitimately run longer than the generic shell ceiling -- mirrors the old
+# the old cad_project_finalize/generate_cad_model tool timeouts (600-900s).
+CAD_SCOPED_SHELL_TIMEOUT_SECONDS = max(
+    MAX_TOOL_TIMEOUT_SECONDS,
+    int(APP_CONFIG.get("cad_scoped_shell_timeout_seconds", "900")),
+)
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
@@ -346,6 +365,14 @@ MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
 MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
 COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
 COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
+
+# --- Retry before failover ---
+# Retries the same provider this many times (with exponential backoff) before
+# falling through the fallback_models chain. 0 = immediate failover.
+API_MAX_RETRIES = max(0, int(APP_CONFIG.get("api_max_retries", "3")))
+API_RETRY_INITIAL_DELAY_MS = max(0, int(APP_CONFIG.get("api_retry_initial_delay_ms", "500")))
+API_RETRY_MAX_DELAY_MS = max(1, int(APP_CONFIG.get("api_retry_max_delay_ms", "10000")))
+API_RETRY_JITTER_RATIO = max(0.0, min(1.0, float(APP_CONFIG.get("api_retry_jitter_ratio", "0.1"))))
 
 # --- Write blast radius: bounds how much damage one turn can do ---
 # The permission layer decides WHETHER a write is allowed; these bound HOW MANY
@@ -477,6 +504,35 @@ def set_tool_timeout(tool: str, seconds: int) -> dict:
             "direction": "looser" if seconds > old else "tighter" if seconds < old else "same",
             "over_ceiling": False, "ceiling": None}
 
+
+_PROVIDER_LIMIT_KEYS = ("context_window", "max_completion_tokens")
+
+
+def set_provider_limit(provider: str, key: str, value: str) -> dict:
+    """Change one provider's token limit. Persisted as provider.<name>.<key>.
+
+    Mirrors set_subagent_turns: mutates the live PROVIDERS dict, APP_CONFIG,
+    and config.txt so the change survives a restart. _active_model_token_limits
+    reads PROVIDERS[name] first, so the next turn picks up the new value.
+    """
+    if provider not in PROVIDERS:
+        raise KeyError(provider)
+    if key not in _PROVIDER_LIMIT_KEYS:
+        raise ValueError(f"unknown provider limit: {key}")
+    new = int(value)
+    if new < 1:
+        raise ValueError("must be >= 1")
+    old_raw = PROVIDERS[provider].get(key)
+    old = _positive_int(old_raw, 0)
+    PROVIDERS[provider][key] = str(new)
+    config_key = f"provider.{provider}.{key}"
+    APP_CONFIG[config_key] = str(new)
+    update_simple_config(CONFIG_PATH, {config_key: new})
+    return {"key": config_key, "old": old, "new": new, "provider": provider,
+            "direction": "looser" if new > old else "tighter" if new < old else "same",
+            "over_ceiling": False, "ceiling": None}
+
+
 # --- Approval policy ---
 # There is deliberately no separate "approval mode" axis: PERMISSION_MODE already
 # decides what is gated, and a second setting that could also wave a gate through
@@ -487,6 +543,12 @@ def set_tool_timeout(tool: str, seconds: int) -> dict:
 # stop and report instead of retrying the same blocked action until max_turns.
 # 0 disables. A single approval resets the count.
 DENIAL_BREAKER_THRESHOLD = int(APP_CONFIG.get("denial_breaker_threshold", "3"))
+
+# Failed CAD generation attempts tolerated in one turn before the generation
+# tools are withdrawn and the model must report. Complex assemblies need more
+# diagnosis-repair cycles than simple parts; the old hardcoded 2 stopped
+# legitimate work. 0 disables the cap (turn/max_turns still bound the run).
+CAD_MAX_GENERATION_ATTEMPTS = int(APP_CONFIG.get("cad_max_generation_attempts", "4"))
 
 # Unattended runs (cron / scheduled) have no operator to answer a prompt.
 #   deny     refuse the gated action and tell the model why (fail closed)
@@ -1188,6 +1250,54 @@ def _local_shell_reads_files(command: str) -> bool:
     )
 
 
+def _cad_skill_scripts_dir() -> Path:
+    return SKILLS_DIR / "cad" / "scripts"
+
+
+def _is_cad_scoped_command(command: str) -> bool:
+    """True only for `<cad venv python> <script under the vendored cad skill's
+    scripts/>  [args...]` -- the one shape auto-approved on CAD turns in any
+    permission mode (check_permission) and exempted from the CAD-turn shell
+    block (_run_agent_loop). `_shell_parts` already rejects any command
+    containing shell metacharacters/chaining (`_SHELL_CONTROL_RE`), so a
+    second command cannot be smuggled past this check."""
+    parts = _shell_parts(command)
+    if len(parts) < 2:
+        return False
+    # On Windows `_shell_parts` splits with posix=False, which keeps the quotes
+    # on each token. Quoting is not optional here -- the install path routinely
+    # contains spaces -- so without this every real invocation resolved to a
+    # nonsense relative path and the guard rejected it.
+    def _unquote(token: str) -> str:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            return token[1:-1]
+        return token
+
+    try:
+        executable = Path(_unquote(parts[0])).resolve()
+        script = Path(_unquote(parts[1])).resolve()
+    except OSError:
+        return False
+    try:
+        cad_python = Path(cad.cad_runtime_python()).resolve()
+    except Exception:
+        return False
+    if executable != cad_python:
+        return False
+    scripts_dir = _cad_skill_scripts_dir().resolve()
+    if script == scripts_dir:
+        return False
+    try:
+        script.relative_to(scripts_dir)
+    except ValueError:
+        return False
+    # Upstream ships each entry point as a package directory (`scripts/gen/`
+    # with __main__.py), not a module file, and `python <dir>` runs its
+    # __main__. Requiring is_file() here rejected every real invocation, so the
+    # auto-approval never fired and CAD commands fell back to normal prompting.
+    return script.is_file() or (script / "__main__.py").is_file()
+
+
 def _is_fixed_host_tool_command(command: str) -> bool:
     """Whether this is verbatim the command of a host tool that takes no arguments.
 
@@ -1217,6 +1327,13 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
+    # A CAD-scoped script invocation is auto-approved in every permission
+    # mode -- upstream's text-to-cad workflow is many small script calls
+    # (gen, inspect, snapshot, ...) and prompting per call would reintroduce
+    # the escalation-turn tax this design exists to avoid. The scope check
+    # itself is the security boundary (_is_cad_scoped_command), not the mode.
+    if mode == "shell" and _is_cad_scoped_command(command):
+        return True
     # Read-only subagents may execute verification commands only when the
     # backend guarantees isolation. Their disposable workspace is prepared by
     # _exec_sandbox_command; host execution never enters this exception.
@@ -1422,6 +1539,47 @@ ACTIVE_PROVIDER = (_initial_provider if _initial_provider in PROVIDERS
                    else DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else "")
 
 
+def _positive_int(value, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _active_model_token_limits(provider_name: str = "", model_name: str = "") -> tuple[int, int]:
+    """Return (context window, completion ceiling) for the active model.
+
+    Most OpenAI-compatible model-list endpoints do not publish either value.
+    Resolution is therefore explicit and deterministic: a provider profile
+    override wins, then a global config override, then reviewed model metadata,
+    and finally the conservative legacy defaults.
+    """
+    from agent8088.providers import model_token_limits
+
+    active_provider = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    active_model = model_name or MODEL_NAME
+    profile = PROVIDERS.get(active_provider, {})
+    known = model_token_limits(active_provider, active_model)
+    context_value = profile.get("context_window")
+    if context_value in (None, ""):
+        context_value = (
+            APP_CONFIG.get("context_window")
+            if "context_window" in APP_CONFIG
+            else known.get("context_window")
+        )
+    completion_value = profile.get("max_completion_tokens")
+    if completion_value in (None, ""):
+        completion_value = (
+            APP_CONFIG.get("max_completion_tokens")
+            if "max_completion_tokens" in APP_CONFIG
+            else known.get("max_completion_tokens")
+        )
+    context = _positive_int(context_value, CONTEXT_WINDOW)
+    completion = _positive_int(completion_value, MAX_COMPLETION_TOKENS)
+    return context, min(completion, context)
+
+
 def activate_model(provider: str = "", model: str = ""):
     """Select and persist a configured provider and optional model."""
     global client, MODEL_NAME, ACTIVE_PROVIDER, DEFAULT_PROVIDER
@@ -1454,7 +1612,53 @@ def activate_model(provider: str = "", model: str = ""):
         update_simple_config(CONFIG_PATH, {"model_name": selected_model})
         APP_CONFIG["model_name"] = selected_model
         MODEL_NAME = selected_model
+    _maybe_probe_context_window()
     return client, MODEL_NAME
+
+
+_PROBED_LIMITS = {}
+
+
+def _maybe_probe_context_window():
+    """Best-effort: if the active model has no context_window set, probe
+    the endpoint. Cached per (provider, model) so switching models on the same
+    provider re-probes. Stored session-only (not persisted — the user can
+    /limits provider to make it stick). Never blocks or raises."""
+    try:
+        from agent8088.providers import probe_model_context_window
+    except ImportError:
+        return
+    name = ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    if not name or name not in PROVIDERS:
+        return
+    model = MODEL_NAME
+    cache_key = (name, model)
+    if cache_key in _PROBED_LIMITS:
+        ctx, out = _PROBED_LIMITS[cache_key]
+        if ctx:
+            PROVIDERS[name]["context_window"] = str(ctx)
+        if out:
+            PROVIDERS[name]["max_completion_tokens"] = str(out)
+        return
+    if PROVIDERS[name].get("context_window"):
+        return  # explicit config override — no probe needed
+    if "context_window" in APP_CONFIG:
+        return  # global override exists — no probe needed
+    try:
+        probed_ctx, probed_out = probe_model_context_window(client, model, provider_name=name)
+    except Exception:
+        probed_ctx, probed_out = None, None
+    _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
+    if probed_ctx and probed_ctx > 0:
+        PROVIDERS[name]["context_window"] = str(probed_ctx)
+    if probed_out and probed_out > 0 and not PROVIDERS[name].get("max_completion_tokens"):
+        PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
+
+
+# Probe once at import: without this, a fresh launch shows the conservative
+# 32k/8k defaults in /doctor until the user reconfigures via /model setup,
+# because activate_model is the only other caller.
+_maybe_probe_context_window()
 
 
 def _native_tools_enabled(tools, provider_name: str = "") -> bool:
@@ -1532,6 +1736,20 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
     return response
 
 
+def _is_unknown_param_error(exc: Exception) -> bool:
+    """Whether an API rejection looks like an unrecognized-request-field 400."""
+    text = str(exc)
+    status = getattr(exc, "status_code", None)
+    if status is not None and int(status) != 400:
+        return False
+    lowered = text.lower()
+    return ("unknown" in lowered or "unexpected" in lowered
+            or "unrecognized" in lowered or "unsupported" in lowered) and (
+        "reasoning_effort" in lowered or "extra_body" in lowered
+        or "argument" in lowered or "parameter" in lowered or "field" in lowered
+    )
+
+
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = ""):
@@ -1590,11 +1808,33 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     )
     if _native_tools_enabled(tools, provider_name):
         request_options["tools"] = tools
+    # Optional per-provider reasoning dial (provider.<name>.reasoning_effort).
+    # Some OpenAI-compatible layers accept reasoning_effort, others 400 on the
+    # unknown field — retry clean once on that specific rejection.
+    effort = ""
+    if provider_name:
+        effort = str((PROVIDERS.get(provider_name) or {}).get("reasoning_effort") or "").strip()
+    if effort:
+        request_options["extra_body"] = {"reasoning_effort": effort}
     _raise_if_interrupted(interrupt_check)
     if on_token is None:
-        return client.chat.completions.create(**request_options)
+        try:
+            return client.chat.completions.create(**request_options)
+        except Exception as exc:
+            if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
+                return client.chat.completions.create(**request_options)
+            raise
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
-    stream = client.chat.completions.create(**request_options, stream=True)
+    try:
+        stream = client.chat.completions.create(**request_options, stream=True)
+    except Exception as exc:
+        if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
+            return _create_completion(
+                client, messages, tools, max_tokens=max_tokens,
+                system_prompt=system_prompt, temperature=temperature,
+                on_token=on_token, interrupt_check=interrupt_check,
+                model_name=model_name, provider_name=provider_name)
+        raise
     collected, tool_chunks, finish_reason = [], {}, None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
     try:
@@ -1642,11 +1882,44 @@ def _retryable_model_error(error: Exception) -> bool:
     return any(marker in name or marker in text for marker in retryable)
 
 
+def _extract_retry_after(error):
+    """Parse Retry-After header (seconds or HTTP-date) from an OpenAI SDK error."""
+    resp = getattr(error, "response", None)
+    if not resp or not hasattr(resp, "headers"):
+        return None
+    raw = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw) * 1000)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        return max(0, int((dt.timestamp() - time.time()) * 1000))
+    except Exception:
+        return None
+
+
+def _retry_delay(retry_attempt, retry_after_ms=None):
+    if retry_after_ms and retry_after_ms <= API_RETRY_MAX_DELAY_MS:
+        return retry_after_ms / 1000.0
+    exponent = min(retry_attempt - 1, 1024)
+    delay = min(API_RETRY_INITIAL_DELAY_MS * 2 ** exponent, API_RETRY_MAX_DELAY_MS)
+    jitter = 1 - API_RETRY_JITTER_RATIO + 2 * API_RETRY_JITTER_RATIO * random.random()
+    return (delay * jitter) / 1000.0
+
+
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
                                      on_token, interrupt_check, trace, turn,
-                                     max_tokens=None):
+                                     max_tokens=None, client_override=None,
+                                     provider_override=None, model_override=None):
+    active_client = client_override if client_override is not None else client
+    active_provider = provider_override or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    active_model = model_override or MODEL_NAME
     emitted = False
-    max_tokens = max_tokens if max_tokens is not None else MAX_COMPLETION_TOKENS
+    max_tokens = max_tokens if max_tokens is not None else _active_model_token_limits(active_provider, active_model)[1]
 
     def tracked_token(kind, delta):
         nonlocal emitted
@@ -1655,24 +1928,32 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             on_token(kind, delta)
 
     token_handler = tracked_token if on_token else None
-    try:
-        return create_completion(
-            client, messages, tools, temperature=temperature,
-            max_tokens=max_tokens,
-            system_prompt=system_prompt, on_token=token_handler,
-            interrupt_check=interrupt_check,
-            provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
-            telemetry_attempt="primary",
-        )
-    except AgentInterrupted:
-        raise
-    except Exception as primary_error:
-        if emitted or not _retryable_model_error(primary_error):
+    last_error = None
+    for attempt in range(1, API_MAX_RETRIES + 2):  # 1 initial try + API_MAX_RETRIES retries
+        try:
+            return create_completion(
+                active_client, messages, tools, temperature=temperature,
+                max_tokens=max_tokens,
+                system_prompt=system_prompt, on_token=token_handler,
+                interrupt_check=interrupt_check,
+                model_name=active_model,
+                provider_name=active_provider,
+                telemetry_attempt="primary",
+            )
+        except AgentInterrupted:
             raise
-        last_error = primary_error
+        except Exception as primary_error:
+            if emitted or not _retryable_model_error(primary_error):
+                raise
+            last_error = primary_error
+            retry_after_ms = _extract_retry_after(primary_error)
+            if retry_after_ms is not None and retry_after_ms > API_RETRY_MAX_DELAY_MS:
+                break  # skip remaining retries, fall through to fallback chain
+            if attempt <= API_MAX_RETRIES:
+                time.sleep(_retry_delay(attempt, retry_after_ms))
 
     for provider_name, model_name in _fallback_targets():
-        if provider_name == (ACTIVE_PROVIDER or DEFAULT_PROVIDER) and model_name == MODEL_NAME:
+        if provider_name == active_provider and model_name == active_model:
             continue
         try:
             fallback_client, _ = get_client(provider_name)
@@ -1977,6 +2258,15 @@ def _resolve_tool_name(name):
     return TOOL_ALIASES.get(name, name)
 
 
+def _structured_text_argument(value, default="") -> str:
+    """Serialize structured built-in tool arguments without Python repr syntax."""
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
 RUNTIME_CONTEXT_HEADING = "\n\n## Runtime Context\n"
 
 
@@ -2070,6 +2360,10 @@ def render_tool_docs(specs: dict) -> str:
     for name, s in specs.items():
         args = ", ".join(s["args"]) or "no args"
         lines.append(f"- {name}({args}): {s['description']}")
+        if name == "spawn_subagent":
+            agent_types = sorted(globals().get("SUBAGENT_SPECS") or {})
+            if agent_types:
+                lines.append(f"  Available agent_type values: {', '.join(agent_types)}.")
     return "\n".join(lines)
 
 
@@ -2213,7 +2507,20 @@ def read_skill_resource(name: str, resource: str) -> str:
         raise ValueError("Skill resource must be a supported text file.")
     if target.stat().st_size > _MAX_SKILL_RESOURCE_BYTES:
         raise ValueError("Skill resource is too large to load.")
-    return target.read_text(encoding="utf-8")
+    text = target.read_text(encoding="utf-8")
+    if skill["name"] == "cad" and relative.upper() == "SKILL.MD":
+        # The vendored SKILL.md is generic upstream text -- it has no idea
+        # what this install's CAD python interpreter or scripts/ directory
+        # actually resolve to. Append the concrete paths here too (not only
+        # via _cad_runtime_instruction, which depends on a message-content
+        # classifier that can miss a request): this fires every time the
+        # model actually asks for the skill, regardless of that classifier.
+        text += (
+            "\n\n---\nThis install's concrete paths (use these exactly):\n"
+            f"- CAD python interpreter: {cad.cad_runtime_python()}\n"
+            f"- CAD skill scripts directory: {_cad_skill_scripts_dir()}\n"
+        )
+    return text
 
 
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
@@ -2236,7 +2543,17 @@ _last_write_diff = []
 # ---------------------------------------------------------------------------
 # Subagents — profiles loaded from agents/*.md (frontmatter + body prompt)
 # ---------------------------------------------------------------------------
+def _agent_data_dir() -> Path:
+    if os.environ.get("AGENT8088_HOME"):
+        return Path(os.environ["AGENT8088_HOME"]).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088"
+    return Path.home() / ".agent8088"
+
+
 AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expanduser()
+USER_AGENTS_DIR = Path(APP_CONFIG.get("user_agents_dir",
+                                      str(_agent_data_dir() / "agents"))).expanduser()
 DEFAULT_SUBAGENT = APP_CONFIG.get("default_subagent", "general-purpose")
 SUBAGENT_MAX_DEPTH = int(APP_CONFIG.get("subagent_max_depth", "1"))
 
@@ -2246,6 +2563,8 @@ _DEFAULT_SUBAGENT_PROFILE = {
     "tools": sorted(n for n in TOOL_NAMES if n != "spawn_subagent"),
     "max_turns": 8,
     "permission": "",
+    "model": "inherit",
+    "builtin": True,
     "system_prompt": (
         "You are a focused sub-agent spawned to complete ONE delegated task with a "
         "fresh context. Use your tools actively. When done, reply with a concise final "
@@ -2254,10 +2573,12 @@ _DEFAULT_SUBAGENT_PROFILE = {
 }
 
 
-def load_subagent_specs(agents_dir: Path) -> dict:
+def load_subagent_specs(agents_dir: Path, user_agents_dir: Path = None) -> dict:
     specs = {}
-    if agents_dir.exists() and agents_dir.is_dir():
-        for path in sorted(agents_dir.glob("*.md")):
+    for source_dir, is_builtin in ((agents_dir, True), (user_agents_dir, False)):
+        if not source_dir or not source_dir.exists() or not source_dir.is_dir():
+            continue
+        for path in sorted(source_dir.glob("*.md")):
             meta, body = _parse_frontmatter_md(path.read_text())
             name = meta.get("name") or path.stem
             specs[name] = {
@@ -2273,14 +2594,18 @@ def load_subagent_specs(agents_dir: Path) -> dict:
                 # honoured: a profile may restrict itself below the caller's mode,
                 # never widen past it.
                 "permission": meta.get("permission", "").strip().lower(),
+                # Subagent model configuration (Claude Code style frontmatter)
+                "model": meta.get("model", "").strip(),
                 "system_prompt": body.strip() or _DEFAULT_SUBAGENT_PROFILE["system_prompt"],
+                # Provenance so the CLI can refuse to delete a built-in profile.
+                "builtin": is_builtin,
             }
     if DEFAULT_SUBAGENT not in specs:
         specs[DEFAULT_SUBAGENT] = dict(_DEFAULT_SUBAGENT_PROFILE, name=DEFAULT_SUBAGENT)
     return specs
 
 
-SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR)
+SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 
 # UI hook: a presentation layer (e.g. the Rich CLI) may set this to a factory
 #   subagent_ui(agent_type, task, depth) -> dict of run_agent hooks
@@ -2750,7 +3075,9 @@ _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 # noise that costs a model call and tokens, and on a `fail` verdict can revert
 # correct work. Excluded here: convert_document checks output_path.exists() and
 # the byte count itself; there is no model-authored logic to second-guess.
-_NON_AUDITABLE_TOOLS = {"convert_document", "convert_cad", "create_cad_part"}
+_NON_AUDITABLE_TOOLS = {
+    "convert_document",
+}
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
 
@@ -3185,13 +3512,107 @@ def _cap_subagent_answer(answer: str) -> str:
               "Ask it a narrower question if you need the rest.]")
 
 
+_VALID_SUBAGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _exec_create_subagent(args: dict) -> str:
+    """Write a new custom sub-agent profile to USER_AGENTS_DIR/<name>.md.
+
+    Bypasses resolve_write_path on purpose: this tool has no path_arg (see
+    tools.txt), the destination is always derived from `name` under the
+    fixed user agents directory, never from a caller-supplied path.
+    """
+    name = str(args.get("name") or "").strip().lower()
+    if not name or not _VALID_SUBAGENT_NAME.match(name) or ".." in name or "/" in name or "\\" in name:
+        return ("Error: 'name' must match [a-z0-9][a-z0-9_-]* (lowercase, no path "
+                "separators, no '..'). Got: {!r}".format(args.get("name", "")))
+
+    builtins = load_subagent_specs(AGENTS_DIR)
+    if name in builtins:
+        return (f"Error: '{name}' is a built-in agent profile and cannot be "
+                f"overwritten. Choose a different name.")
+
+    raw_tools = str(args.get("tools") or "").strip()
+    if raw_tools:
+        tools = [t for t in (s.strip() for s in raw_tools.split(",")) if t]
+        invalid = [t for t in tools if t not in TOOL_NAMES]
+        if invalid:
+            return (f"Error: unknown tool(s): {', '.join(invalid)}. "
+                    f"Valid tools: {', '.join(sorted(TOOL_NAMES))}")
+    else:
+        tools = ["read_text", "execute_shell"]
+    tools = [t for t in tools if t != "spawn_subagent"]
+
+    try:
+        max_turns = int(str(args.get("max_turns") or 8).strip())
+    except ValueError:
+        max_turns = 8
+    max_turns = max(1, min(20, max_turns))
+
+    raw_model = str(args.get("model") or "").strip()
+    model = "inherit"
+    if raw_model and raw_model.lower() != "inherit":
+        from agent8088.providers import resolve_subagent_model, list_models
+        provider = ACTIVE_PROVIDER or DEFAULT_PROVIDER
+        resolved, warning = resolve_subagent_model(raw_model, provider, client)
+        if warning:
+            available = list_models(provider, client=client, fallback=True) or []
+            shown = ", ".join(available[:15])
+            more = f" and {len(available) - 15} more" if len(available) > 15 else ""
+            return (f"Error: {warning}. Available models on {provider}: "
+                    f"{shown}{more}.")
+        model = resolved or "inherit"
+
+    # Collapse newlines out of anything that lands inside the '---' block.
+    # description is free text from the caller; without this, an embedded
+    # "\n---\n" prematurely closes the frontmatter block early, pushing the
+    # real tools/max_turns/model lines (and the real prompt) into what
+    # _parse_frontmatter_md treats as the body -- silently widening the
+    # sub-agent to its default tool set and smuggling attacker-authored
+    # instructions into its system prompt, invisible from the short
+    # description /agents displays. model is normalized too, defensively,
+    # since it comes from a provider's own model-list response.
+    def _sanitize_frontmatter_value(v: str) -> str:
+        return " ".join(str(v).split())
+
+    description = (_sanitize_frontmatter_value(args.get("description") or "")
+                    or f"Custom sub-agent: {name}.")
+    model = _sanitize_frontmatter_value(model)
+
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return "Error: 'prompt' (the sub-agent's system prompt / body) is required."
+
+    frontmatter = (
+        "---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        f"tools: {', '.join(tools)}\n"
+        f"max_turns: {max_turns}\n"
+        f"model: {model}\n"
+        "---\n"
+        "\n"
+        f"{prompt}\n"
+    )
+    target = USER_AGENTS_DIR / f"{name}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(frontmatter, encoding="utf-8", newline="")
+
+    return (f"Created sub-agent profile '{name}' at {target}. "
+            f"Use it via spawn_subagent with agent_type='{name}'.")
+
+
 def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
     global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
     global _local_fallback_grant, _remote_git_grant, _active_role
-    global _sandbox_readonly
+    global _sandbox_readonly, SUBAGENT_SPECS
+
+    # Dynamically reload subagent specifications so on-the-fly markdown
+    # changes and newly created subagents are immediately accessible.
+    SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 
     if depth >= SUBAGENT_MAX_DEPTH:
         return (f"Error: subagent recursion depth limit ({SUBAGENT_MAX_DEPTH}) reached. "
@@ -3206,6 +3627,15 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     if profile is None:
         available = ", ".join(sorted(SUBAGENT_SPECS)) or "(none)"
         return f"Error: unknown agent_type '{type_name}'. Available: {available}."
+
+    # Model resolution for subagent: active provider only, no cross-provider routing.
+    from agent8088.providers import resolve_subagent_model
+    raw_model = (args.get("model") or profile.get("model") or "").strip()
+    sub_model, model_warning = resolve_subagent_model(
+        raw_model, ACTIVE_PROVIDER or DEFAULT_PROVIDER, client)
+    target_model = sub_model or MODEL_NAME
+    if model_warning:
+        _log.warning("spawn_subagent: %s", model_warning)
 
     # Restrict to the profile's tools that actually exist; sub-agents never get
     # spawn_subagent (bounds recursion in addition to the depth guard).
@@ -3265,6 +3695,9 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             # Share the parent's ceiling. A fresh budget here would be a free
             # bypass: delegate to a subagent and the limit starts over.
             budget=_active_budget,
+            client=client,
+            provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+            model_name=target_model,
         )
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
@@ -3277,6 +3710,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
              _permission_floor_readonly, _sandbox_readonly) = saved_permission
 
     answer = _cap_subagent_answer(answer)
+    if model_warning:
+        answer = f"[note: {model_warning}]\n\n{answer}"
     if ui.get("done"):
         ui["done"](answer)
     return f"[subagent:{type_name}] {answer}"
@@ -4282,14 +4717,6 @@ def _playwright_chromium_executable() -> str | None:
     return None
 
 
-def _agent_data_dir() -> Path:
-    if os.environ.get("AGENT8088_HOME"):
-        return Path(os.environ["AGENT8088_HOME"]).expanduser()
-    if sys.platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088"
-    return Path.home() / ".agent8088"
-
-
 _DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
 
 
@@ -5229,6 +5656,17 @@ def _is_missing_argument_error(result: str) -> bool:
     return bool(_MISSING_ARG_RE.match((result or "").lstrip()))
 
 
+def _is_parse_error_result(result: str) -> bool:
+    """Whether a tool refused because its argument JSON would not parse.
+
+    Same class of problem as a missing argument -- a malformed call, not a
+    result -- and it needs the same bounded handling. Without a breaker a model
+    that cannot emit a large nested payload correctly re-sends the identical
+    broken shape until the turn limit; a real run lost 8 of 50 turns that way.
+    """
+    return (result or "").lstrip().startswith("Error: could not parse the arguments for ")
+
+
 def _tool_arg_missing_error(name: str, missing: str) -> str:
     """Message for a call whose argument block never arrived at all.
 
@@ -5485,12 +5923,25 @@ def _exec_cron(args: dict) -> str:
         return _exec_windows_cron(action, schedule, task, fields)
 
     def read_crontab():
-        result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True, timeout=20)
-        return "" if result.returncode else result.stdout
+        try:
+            result = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, f"Cron unavailable: {exc}"
+        return ("" if result.returncode else result.stdout), None
+
+    def write_crontab(payload):
+        try:
+            return subprocess.run(
+                ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20), None
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, f"Cron unavailable: {exc}"
 
     if action == "list":
-        entries = [line for line in read_crontab().splitlines() if _CRON_MARKER in line]
+        current, error = read_crontab()
+        if error:
+            return error
+        entries = [line for line in current.splitlines() if _CRON_MARKER in line]
         return "\n".join(entries) or "No scheduled tasks."
 
     if action == "add":
@@ -5501,22 +5952,29 @@ def _exec_cron(args: dict) -> str:
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
                  f"AGENT8088_UNATTENDED=1 "
                  f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
-        current = read_crontab()
+        current, error = read_crontab()
+        if error:
+            return error
         payload = current + ("" if not current or current.endswith("\n") else "\n") + entry + "\n"
-        result = subprocess.run(
-            ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20)
+        result, error = write_crontab(payload)
+        if error:
+            return error
         return f"Scheduled: {schedule}" if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     if action == "remove":
         quoted_task = shlex.quote(task)
+        current, error = read_crontab()
+        if error:
+            return error
         payload = "\n".join(
-            line for line in read_crontab().splitlines()
+            line for line in current.splitlines()
             if not (_CRON_MARKER in line and quoted_task in line)
         )
         if payload:
             payload += "\n"
-        result = subprocess.run(
-            ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20)
+        result, error = write_crontab(payload)
+        if error:
+            return error
         return "Removed." if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     raise AssertionError(f"Unhandled cron action: {action}")
@@ -5659,7 +6117,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return f"Unknown tool: {name}"
 
     mode = (spec.get("mode") or "").lower()
-    timeout = min(max(1, int(spec.get("timeout") or 25)), MAX_TOOL_TIMEOUT_SECONDS)
+    _declared_timeout = int(spec.get("timeout") or 25)
+    _timeout_ceiling = MAX_TOOL_TIMEOUT_SECONDS
+    if mode == "shell" and _is_cad_scoped_command(str(args.get("command") or "")):
+        _declared_timeout = max(_declared_timeout, CAD_SCOPED_SHELL_TIMEOUT_SECONDS)
+        _timeout_ceiling = CAD_SCOPED_SHELL_TIMEOUT_SECONDS
+    timeout = min(max(1, _declared_timeout), _timeout_ceiling)
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
     approval_key = _tool_call_key(name, args)
@@ -5683,6 +6146,28 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                           and not _ddgs_only_chain())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
+
+    if name == "create_subagent":
+        # Handled outside the write_text path machinery: this tool has no
+        # path_arg (see tools.txt) — the destination is always derived from
+        # `name` under USER_AGENTS_DIR, never a caller-supplied path, so
+        # resolve_write_path has nothing to resolve. It still writes to disk,
+        # so it takes the same permission gate every other write does; placing
+        # it after the plan-only check above keeps both gates in force.
+        target = str(USER_AGENTS_DIR / f"{str(args.get('name') or '').strip().lower()}.md")
+        if not check_permission("write_text", target, approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="write_text",
+                   decision="blocked", detail=target, change_type="new_file")
+            return request_escalation(
+                target_mode="edit",
+                paths=[target],
+                change_type="new_file",
+                reason=f"Tool '{name}' requires write_text access, which is "
+                       f"blocked in {PERMISSION_MODE} mode.",
+            )
+        _audit("tool_call", tool=name, mode="write_text", decision="allowed",
+               detail=target)
+        return _exec_create_subagent(args)
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
@@ -5868,7 +6353,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return (f"Error: this turn has already written {_turn_writes} files, "
                     f"the max_writes_per_turn limit. Stop writing and report what "
                     f"you have done, or raise max_writes_per_turn in config.txt.")
-        write_size = len(str(args.get(spec.get("content_arg") or "content", "")))
+        write_size = len(_structured_text_argument(
+            args.get(spec.get("content_arg") or "content", "")
+        ).encode("utf-8"))
         if MAX_WRITE_BYTES and write_size > MAX_WRITE_BYTES:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="max_write_bytes")
@@ -6045,6 +6532,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
 
     if mode == "read_text":
+        if name == "open_cad_viewer":
+            open_value = str(args.get("open_browser", "true")).strip().lower()
+            return cad.open_cad_viewer(
+                read_target,
+                workspace=read_target.parent,
+                launch_browser=open_value not in {"0", "false", "no", "off"},
+                timeout=timeout,
+            )
         # Documents are extracted to text first. Deliberately handled inside the
         # existing read mode rather than as a new tool: this way a .docx read
         # goes through the same sensitive-file floor, read path zones and
@@ -6053,19 +6548,14 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # auditor's larger result allowance, which _tool_result_for_model keys
         # on the literal name "read_text".
         text = documents.extract_text(read_target, MAX_DOCUMENT_BYTES)
-        if text is None:
-            # CAD files get the same treatment and for the same reason: reading
-            # one here inherits the whole chain above rather than needing a
-            # read_cad tool that would have to re-implement it.
-            text = cad.extract_info(read_target)
-        if text is None:  # neither — read it as ordinary text
+        if text is None:  # not a document — read it as ordinary text
             text = _read_text_limited(read_target)
         return _strip_special_tokens(_paginate_read(text, args, read_target))
 
     if mode == "write_text":
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
-        content = str(args.get(content_arg, ""))
+        content = _structured_text_argument(args.get(content_arg, ""))
         _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -6080,21 +6570,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # means it cannot skip any of them; only the bytes-on-disk step differs.
         if name == "create_document":
             result = documents.build_document(target, content)
-            _last_write_diff = None  # binary output — a text diff would be noise
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "convert_cad":
-            result = cad.convert_cad(target, str(args.get("format", "")))
-            _last_write_diff = None  # binary output — a text diff would be noise
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "create_cad_part":
-            result = cad.create_cad_part(target, str(args.get("shape", "")),
-                                         str(args.get("dimensions", "")))
             _last_write_diff = None  # binary output — a text diff would be noise
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
@@ -7573,7 +8048,9 @@ def describe_capabilities() -> str:
     """
     lines = ["# Agent8088 capabilities", ""]
 
+    model_context, model_output = _active_model_token_limits()
     lines += [f"Model: {MODEL_NAME}",
+              f"Model token limits: {model_context:,} context / {model_output:,} output",
               f"Permission mode: {PERMISSION_MODE}",
               f"Sandbox backend: {_resolve_sandbox_backend()}",
               f"Max turns per request: {APP_CONFIG.get('max_turns', '10')}",
@@ -7915,6 +8392,16 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 
 CLI_ANYTHING_MIN_TURNS = 20
 CLI_ANYTHING_MAX_TURNS = 60
+# Was a bare CAD_PROJECT_MIN_TURNS = 24 constant, sized for the deleted staged
+# cad_project_create/add_component/finalize architecture, where one tool call
+# did a whole build stage. The current architecture drives raw
+# execute_shell/write_file, which costs several turns per build step instead
+# of one -- confirmed live against a 12-solid mechanism that hit the old floor
+# with real repair work still outstanding. Configurable like
+# cad_scoped_shell_timeout_seconds below, rather than hardcoded, so it can be
+# tuned (or lowered) from config.txt/GUI without a code change; /maxturns still
+# raises it further for the whole session if set higher.
+CAD_GENERATION_MIN_TURNS = int(APP_CONFIG.get("cad_generation_min_turns", "40"))
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
@@ -7936,10 +8423,124 @@ def _execute_shell_forbidden(messages: list[dict]) -> bool:
     )
 
 
+def _cad_generation_requested(messages: list[dict]) -> bool:
+    """True for an explicit CAD request or an unambiguous CAD continuation.
+
+    Looking only at the last message made ``retry it`` and ``export it to STL``
+    lose the bounded CAD toolset. Inheriting every old CAD turn is equally
+    unsafe because ``now tell me a joke`` must restore the normal tools. Only a
+    deliberately small set of continuation verbs inherits the most recent CAD
+    request.
+    """
+    turns = _genuine_user_turns(messages)
+    text = _message_text(turns[-1]) if turns else ""
+    # Broad on purpose: since the skill's scripts/ location and the CAD venv's
+    # interpreter are only ever told to the model via _cad_runtime_instruction
+    # (gated on this classifier), a missed noun here doesn't just lose a nice-
+    # to-have hint -- the model never learns the absolute paths it needs and
+    # is left blind-guessing shell commands (confirmed: "create a 20mm cube"
+    # missed the old cad|step|stl|... list, cost ~25 wasted shell calls
+    # rediscovering paths, and ended up bypassing the vendored skill's own
+    # scripts/gen entirely). Generic shape/mechanical-part nouns are included
+    # alongside the format-specific ones.
+    cad_pattern = re.compile(
+        r"\b(?:cad|build123d|text-to-cad|freecad|step|stl|3mf|brep|iges|"
+        r"gen_step|part|assembly|component|bracket|enclosure|housing|gear|"
+        r"shaft|pin|bolt|screw|nut|washer|bearing|gripper|chuck|fixture|jig|"
+        r"mount|bracket|panel|plate|tube|pipe|flange|hinge|bushing|"
+        r"box|cube|sphere|cylinder|cone|prism|solid|"
+        r"3d[\s-]?(?:model|part|print|design)|mechanism|prototype)\b",
+        re.IGNORECASE,
+    )
+    action_pattern = re.compile(
+        r"\b(?:build|create|generate|model|design|convert|export|modify|edit|render|preview)\b",
+        re.IGNORECASE,
+    )
+    if cad_pattern.search(text) and action_pattern.search(text):
+        return True
+    continuation = re.search(
+        r"\b(?:try|retry|continue|resume|fix|repair|redo|regenerate|adjust|change|"
+        r"modify|edit|export|convert|render|preview)\b",
+        text, re.IGNORECASE,
+    )
+    if not continuation:
+        return False
+    if len(turns) < 2:
+        return False
+    previous = _message_text(turns[-2])
+    return bool(cad_pattern.search(previous) and action_pattern.search(previous))
+
+
+def _cad_runtime_instruction(available: set[str] | None = None) -> str:
+    """Routing contract for the vendored text-to-cad skill: the model drives
+    generation via execute_shell/write_file against the skill's own scripts,
+    same as any other coding agent that installs this skill. Only a shell
+    command that exactly invokes <cad python> <script under the vendored
+    skill's scripts/> is auto-approved without a permission prompt
+    (_is_cad_scoped_command) -- anything else on a CAD turn still goes
+    through normal permission gating, same as any other shell/write call.
+    """
+    available = available if available is not None else set()
+    cad_python = cad.cad_runtime_python()
+    scripts_dir = _cad_skill_scripts_dir()
+    lines = [
+        "CAD EXECUTION CONTRACT (active for this request) -- follow skills_installed/cad/SKILL.md:",
+        f"- CAD python interpreter: {cad_python}",
+        f"- CAD skill scripts directory: {scripts_dir}",
+        f"- Generated/inspected files live in {ARTIFACTS_ROOT} (execute_shell's cwd).",
+        "- Write a gen_step() Python source file with write_file, then run it via "
+        f'execute_shell as exactly: "{cad_python}" "{scripts_dir}/gen" <target.py> --write --json',
+        f'- Inspect/validate with: "{cad_python}" "{scripts_dir}/inspect" refs <target.step> --facts --json, '
+        "and the other inspect/export/snapshot subcommands documented in SKILL.md. "
+        "These exact invocations (python interpreter above, script inside the path above, no shell "
+        "chaining) are auto-approved without a permission prompt; anything else is gated normally.",
+    ]
+    if "open_cad_viewer" in available:
+        lines.append(
+            "- For an existing artifact or after successful generation, use open_cad_viewer "
+            "for interactive review. Do not start a server or browser through a shell. Unless "
+            "the user declined visual review, hand generated CAD to the Viewer before the final answer."
+        )
+    lines.append(
+        "- Before writing any generator source, use write_file to create <name>.plan.md "
+        "next to it: a checklist of every named solid this request needs, in build order, "
+        "one line each -- even a single-solid part gets a one-line plan.md. Build and "
+        "validate one named solid at a time (write, gen, inspect validate) -- do not write "
+        "everything as one file and validate it all at the end. After each solid passes "
+        "validation, use write_file to check it off in <name>.plan.md before starting the "
+        "next one; if a solid fails, repair and re-validate it before moving on. Re-read "
+        "<name>.plan.md with read_text if you are unsure which solids remain."
+    )
+    lines.append(
+        "- If a script call fails, read the error and fix the named field/component once. "
+        "Do not rewrite the entire design or keep retrying the same broken approach."
+    )
+    return "\n".join(lines)
+
+
+def _tool_definition_name(definition: dict) -> str:
+    function = definition.get("function") if isinstance(definition, dict) else None
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return str(definition.get("name") or "") if isinstance(definition, dict) else ""
+
+
+def _filter_tool_definitions(definitions, allowed: set[str]):
+    """Keep the model-visible tool schema synchronized with runnable names."""
+    if not isinstance(definitions, list):
+        return definitions
+    return [item for item in definitions if _tool_definition_name(item) in allowed]
+
+
 def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
-    """Give an explicit CLI-Anything task room for its install-and-run workflow."""
-    return (max(max_turns, CLI_ANYTHING_MIN_TURNS)
-            if _cli_anything_requested(messages) else max_turns)
+    """Give stateful integrations enough bounded rounds to finish their lifecycle."""
+    limit = (
+        max(max_turns, CLI_ANYTHING_MIN_TURNS)
+        if _cli_anything_requested(messages) else max_turns
+    )
+    if _cad_generation_requested(messages):
+        limit = max(limit, CAD_GENERATION_MIN_TURNS)
+    return limit
 
 
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
@@ -7947,7 +8548,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_escalation=None,
                     on_token=None, interrupt_check=None, trace=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
-                    depth=0, budget=None):
+                    depth=0, budget=None, client=None, provider_name=None,
+                    model_name=None):
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -7970,6 +8572,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     missing_args_retries = 0  # times a call arrived without its arguments
+    parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
     plan_mutation_retries = 0
@@ -7987,6 +8590,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         if user_turns else ""))
     durable_start = (re.search(r"https?://[^\s<>\]\)]+", durable_browser_goal)
                      if durable_browser_goal else None)
+    cad_failures = 0
+    # Plan-then-emit gate: after the model has produced text (its BUILD PLAN)
+    # on a CAD turn, the next turn gets one nudge to convert the plan into the
+    # single generation call. Never blocks a turn that already calls a tool.
+    cad_plan_pending = False
+    cad_decomposition_required = False
 
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
@@ -8001,6 +8610,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     turn_limit = _turn_limit_for_messages(messages, max_turns)
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
+    cad_generation = _cad_generation_requested(messages)
     hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
@@ -8011,7 +8621,22 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         )
         if no_execute_shell:
             round_allowed_tools.discard("execute_shell")
+        if cad_generation:
+            # CAD generation is driven by the vendored text-to-cad skill's own
+            # scripts, invoked via execute_shell/write_file (same shape as any
+            # other coding agent running this skill). Only run_sandboxed
+            # (Docker-style isolation) is unneeded here. A CAD-scoped script
+            # call is auto-approved without a prompt (check_permission /
+            # _is_cad_scoped_command); anything else still goes through normal
+            # permission gating like any other shell/write call.
+            round_allowed_tools.discard("run_sandboxed")
+        round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
+        if cad_generation:
+            round_system_prompt = (
+                (round_system_prompt or current_system_prompt())
+                + "\n\n" + _cad_runtime_instruction(round_allowed_tools)
+            )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         # Resource ceiling. Checked before the model call so an exhausted budget
@@ -8028,11 +8653,17 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
         # After a length cutoff, first allow a larger retry, then force one
-        # short answer/tool-call attempt for models with an 8k output ceiling.
+        # short answer/tool-call attempt for models with a low output ceiling.
+        # The limits are the active model's, not the module constants, so a
+        # per-provider override or endpoint probe is what the ladder scales.
+        loop_client = client
+        loop_provider = provider_name
+        loop_model = model_name
+        turn_context_window, turn_completion_limit = _active_model_token_limits(loop_provider, loop_model)
         turn_max_tokens = (
-            MAX_COMPLETION_TOKENS if not length_retries else
-            min(MAX_COMPLETION_TOKENS * 2, CONTEXT_WINDOW) if length_retries == 1 else
-            min(1024, MAX_COMPLETION_TOKENS)
+            turn_completion_limit if not length_retries or cad_generation else
+            min(turn_completion_limit * 2, turn_context_window) if length_retries == 1 else
+            min(1024, turn_completion_limit)
         )
         try:
             with spin("thinking..."):
@@ -8041,6 +8672,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     system_prompt=round_system_prompt, on_token=on_token,
                     interrupt_check=interrupt_check, trace=trace, turn=turn,
                     max_tokens=turn_max_tokens,
+                    client_override=loop_client,
+                    provider_override=loop_provider,
+                    model_override=loop_model,
                 )
         except AgentInterrupted:
             raise
@@ -8087,7 +8721,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 f"Model output reached its {turn_max_tokens}-token limit. "
                 "The partial response was not executed."
             )
-            if content:
+            if cad_generation:
+                # The truncated content cannot be executed and may be huge.
+                # Drop it so the retry starts from a smaller request.
+                messages.pop()
+                cad_decomposition_required = True
+                retry_instruction = (
+                    f"{warning} Abandon that generator. Write a substantially smaller, "
+                    "simpler gen_step() source (helpers/loops instead of one long "
+                    "unrolled program) with write_file, then run it via "
+                    f'"{cad.cad_runtime_python()}" "{_cad_skill_scripts_dir()}/gen" '
+                    "<target.py> --write --json. Split a complex assembly into separate "
+                    "component source files if needed."
+                )
+            elif content:
                 # A genuinely large answer/tool call was in progress.
                 retry_instruction = (
                     f"{warning} Retry with one complete, concise tool call; "
@@ -8168,8 +8815,24 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             answer = strip_tool_json(content)
 
+            # Plan-then-emit gate: on a CAD turn the model was asked for a BUILD
+            # PLAN first. When its text-only reply IS that plan, nudge once to
+            # emit the single generation call instead of returning the plan to
+            # the user. Bounded: one injection, then the answer flows normally.
+            if (cad_generation and not cad_plan_pending and not cad_decomposition_required
+                    and answer and len(answer.splitlines()) >= 3
+                    and "write_file" in round_allowed_tools):
+                cad_plan_pending = True
+                messages.append({"role": "user", "content":
+                    "Plan received — now write the gen_step() source implementing it "
+                    "with write_file, then run it via the CAD skill's scripts/gen. "
+                    "No more prose: proceed directly, complete code, no narration."
+                })
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "cad_plan_ack"})
+                continue
+
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
-            # returning nothing (some models emit only chain-of-thought and stall).
             if not answer and empty_retries < 1 and not forcing and not unknown:
                 empty_retries += 1
                 if on_result:
@@ -8279,8 +8942,50 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     trace.append({"turn": turn, "type": "missing_tool_args",
                                   "tool": name})
                 continue
+            # Unparseable argument JSON is the same class of malformed call as
+            # a missing argument, but escalates immediately rather than
+            # echoing the generic parser message first: a `continue` here
+            # never sets `executed`, and the loop's own "no progress" breaker
+            # (below, forcing/forced_stop) ends the run after just ONE prior
+            # non-executing turn -- there is no real second round-trip in
+            # which a later escalation would ever reach the model, so the
+            # actionable guidance has to be what it sees on this one chance.
+            if _is_parse_error_result(result):
+                parse_error_retries += 1
+                messages.append({"role": "user", "content": (
+                    f"The arguments for '{name}' could not be parsed as JSON. Do "
+                    "not re-send the same payload unchanged. Send a smaller, "
+                    "simpler one instead: drop every optional argument (for CAD "
+                    "project tools, omit 'verification' and 'parameters' entirely "
+                    "— verification can be supplied later at finalize), keep the "
+                    "JSON on a single line, and include only the required "
+                    "arguments."
+                )})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "tool_arg_parse_error",
+                                  "tool": name, "count": parse_error_retries})
+                continue
             executed = True
             tool_outputs.append(result)
+            if (name == "execute_shell"
+                    and _is_cad_scoped_command(str(args.get("command") or ""))):
+                # Upstream's scripts print a traceback or a JSON {"error": ...}
+                # object on failure rather than a fixed sentinel string (there's
+                # no bespoke "CAD generation failed" wrapper anymore) -- sniff
+                # for either.
+                if "Traceback (most recent call last)" in result or '"error"' in result:
+                    cad_failures += 1
+                    if (CAD_MAX_GENERATION_ATTEMPTS > 0
+                            and cad_failures >= CAD_MAX_GENERATION_ATTEMPTS):
+                        result += (
+                            f"\nCAD retry budget exhausted after {cad_failures} failed "
+                            "script calls. Do not retry the same approach again this "
+                            "turn; report the latest specific failure and preserved "
+                            "artifacts, or try a substantially simpler generator."
+                        )
+                else:
+                    cad_failures = 0
+                    cad_plan_pending = False
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
                 # answered from it. An escalation is not a result — recording it

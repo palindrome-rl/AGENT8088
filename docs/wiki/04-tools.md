@@ -24,6 +24,7 @@ is what the permission layer gates on — see
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
 | `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
+| `create_subagent` | `write_text` | `name`, `description`, `tools`, `max_turns`, `model`, `prompt` | escalates | Create a custom sub-agent profile in `user_agents_dir`. |
 | `present_plan` | `plan` | `plan` | ✅ | Show a plan as markdown and ask the user to approve it (plan mode's exit point). |
 | `execute_plan` | `plan` | `steps` | ✅ | Run an already-decided sequence of tool calls, verified step by step. |
 | `git_status` | `shell` | — | depends | `git status`. |
@@ -44,8 +45,7 @@ is what the permission layer gates on — see
 | `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
 | `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
 | `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
-| `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert an existing CAD file between STEP/IGES/STL/OBJ/BREP/FCStd/DXF via FreeCAD. |
-| `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
+| `open_cad_viewer` | `read_text` | `filename`, `open_browser` | ✅ | Open a supported artifact in the managed loopback CAD Viewer. |
 
 `*` optional argument.
 
@@ -75,32 +75,20 @@ of them instead of needing a parallel set that could drift.
 
 ## CAD
 
-Reading is automatic: point `read_text` at a `.step`, `.stp`, `.iges`, `.igs`,
-`.stl`, `.obj`, `.brep`, `.dxf` or `.fcstd` and it comes back as a text summary —
-object tree, bounding box, volume, surface area.
+The bundled `cad` skill drives Build123d and text-to-cad through its versioned
+scripts under `skills_installed/cad/scripts/`; it is not a second set of
+registered CAD tools. The normal workflow writes a `gen_step()` source file,
+then uses the skill's `gen`, `inspect`, `export`, and `snapshot` scripts to
+create and validate STEP-first artifacts.
 
-`convert_cad` converts between those formats. `create_cad_part` builds a
-primitive (box, cylinder, sphere, cone, tube) from a dimension string like
-`50x30x10` or `r10x50`, with the output format taken from the filename
-extension — no code generation, which is the point: it is the deterministic
-floor for when writing FreeCAD Python defeats the model.
+`read_text` automatically inspects supported STEP/STP files through the
+isolated CAD runtime. `open_cad_viewer` is the only built-in CAD-specific tool:
+it opens STEP/STP, STL, 3MF, GLB, or DXF artifacts in a managed Viewer bound
+only to `127.0.0.1`.
 
-All of it needs **FreeCAD** installed. The Windows installer attempts it via
-WinGet, and `AGENT8088_FREECAD` can point at a portable extraction's
-`freecadcmd.exe` instead — FreeCAD publishes a no-install `.7z` that avoids
-elevation. When it is absent, every CAD path says so and names the install
-command rather than failing obscurely.
-
-PDF is deliberately **not** a `convert_cad` target. Exporting a 3D model to PDF
-means generating a TechDraw drawing — template, projection direction, scale —
-not a format conversion, and the naive page-and-view export that resembles one
-produces an empty sheet.
-
-Both CAD write tools share `mode=write_text` for the same reason
-`create_document` does, and both are excluded from the plan auditor: they verify
-their own output on disk, while the auditor runs in a disposable sandbox copy
-that cannot see the real file, so auditing them yields verdicts from the
-auditor's own blindness.
+The optional Build123d/text-to-cad runtime and Viewer run in a dedicated Python
+3.11 environment. Installation is best effort, so failure never blocks the
+core agent; `/doctor` reports whether the exact runtime is ready.
 
 > `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
 > without a prompt under the native sandbox, escalated under `local`, because

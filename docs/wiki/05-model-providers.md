@@ -134,3 +134,44 @@ recover, bounded to avoid infinite retries.
 
 This is why a small local model still works: correctness doesn't depend on the
 provider implementing tool-calling perfectly.
+
+## Fusion — cross-provider panel + judge
+
+`/fusion <query>` is a one-shot consultation command that runs a blind panel
+comparison across multiple providers. It sends the same query to one model from
+each provider that has a working API key, collects their answers, then a judge
+model picks the best one. This is **not** part of the normal agent loop — no
+tools are given to panel members, and the exchange does not become part of
+conversation history.
+
+**Panel selection is automatic.** The command walks your configured providers,
+picks one model from each that has a valid API key (that provider's default
+model unless overridden), and queries them in parallel. Each panel member sees
+only a minimal system prompt instructing it to answer directly; no special
+context, no tool availability. This keeps the comparison fair and the answers
+short.
+
+**Judging is blind.** The judge model (configurable; defaults to your current
+session model) sees the candidate answers labeled anonymously as "Answer A",
+"Answer B", and so on in randomized order. The judge is never told which model
+produced which answer. This prevents bias toward recognizable names or the
+judge's own output. The judge picks a winner and explains the choice in a short
+verdict paragraph.
+
+**Output includes the winning answer verbatim, the judge's verdict, a table of
+which panel members succeeded, timed out, or errored, and a token/cost footer.**
+If a panel member errors or times out it's dropped; one slow or bad provider
+does not sink the entire run. If everything fails, you're told plainly. If only
+one model answers, fusion skips the judge entirely since there's nothing to
+compare. If the judge gives an unparseable response, fusion falls back to the
+first surviving answer and says so explicitly rather than silently guessing.
+
+**Fusion is expensive.** It makes N panel calls plus one judge call, roughly
+4–5× the cost of a single-model query. There is no confirmation prompt because
+fusion makes no destructive changes, but the tool prints which models it is
+about to call before making any request, so cost is visible up front.
+
+**Configuration** is controlled via `config.txt`. Reference `fusion_max_panel`,
+`fusion_member_timeout_s`, `fusion_judge_provider`, and `fusion_judge_model`,
+and the remaining keys for parallelism and token limits. See the
+[Configuration](02-configuration.md) doc for the complete list and defaults.

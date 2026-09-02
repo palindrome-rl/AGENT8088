@@ -32,7 +32,15 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="GNU timeout process-group behavior requires a real POSIX host",
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BASH = shutil.which("bash") or "/bin/bash"
@@ -85,7 +93,7 @@ def _run(fake_bin: Path, log_path: Path, extra_script: str) -> subprocess.Comple
         + extra_script
     )
     return subprocess.run([BASH, "-c", script], env=env,
-                           capture_output=True, text=True, timeout=10)
+                          capture_output=True, text=True, timeout=10, check=False)
 
 
 def test_foreground_variant_asks_timeout_for_foreground(tmp_path):

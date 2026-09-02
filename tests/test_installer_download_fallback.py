@@ -43,7 +43,15 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX PATH isolation must run under a real POSIX shell, not Windows bash.exe",
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BASH = shutil.which("bash") or "/bin/bash"
@@ -88,7 +96,7 @@ def _run(fake_bin: Path, extra_script: str) -> subprocess.CompletedProcess:
         + extra_script
     )
     return subprocess.run([BASH, "-c", script], env=env,
-                           capture_output=True, text=True, timeout=10)
+                          capture_output=True, text=True, timeout=10, check=False)
 
 
 def test_uses_curl_when_present(tmp_path):

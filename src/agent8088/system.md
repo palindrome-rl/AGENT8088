@@ -229,6 +229,8 @@ When the permission mode is plan-only, the user has asked for a plan, not for wo
   inline. This keeps your main context clean; the sub-agent returns only a concise summary.
 - Write the `task` as a complete, standalone instruction — the sub-agent has NO access to
   this conversation. Include everything it needs and state exactly what to return.
-- Pick `agent_type`: use `explore` for read-only search/reading, `general-purpose` otherwise.
+- Pick `agent_type` from the list in the `spawn_subagent` description — prefer `explore` for
+  read-only search and reading, `general-purpose` otherwise. When the user asks for a sub-agent
+  that does not exist yet, create it with `create_subagent`, then spawn it.
 - Do NOT delegate trivial single-tool actions (one shell command, one file read) — just do them.
 - A sub-agent cannot spawn its own sub-agents; do the final synthesis yourself.

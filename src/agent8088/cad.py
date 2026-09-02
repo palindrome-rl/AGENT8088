@@ -1,587 +1,360 @@
-"""CAD inspection, conversion, and generation via FreeCAD headless.
+"""CAD runtime plumbing: the isolated build123d/cadgen venv, the Viewer, and
+the generic .step/.stp read fallback.
 
-This is the CAD analog of `documents.py` and deliberately mirrors its
-conventions: `extract_info` returns None for extensions it doesn't handle (so
-the caller falls through to normal reading), the write-side functions never
-raise and instead return a plain-language string a tool caller can hand back
-directly, and every subprocess result is verified against the real artifact
-on disk rather than trusted from exit code or stdout.
+Generation itself is no longer a bespoke tool surface here -- the model
+drives the vendored earthtojake/text-to-cad skill (skills_installed/cad/)
+directly via execute_shell/write_file, the same way any coding agent that
+installs that skill would. This module only keeps what still has to be
+engine-internal, trusted code:
 
-Unlike `documents.py`, there is no dependency-free path: STEP/IGES require
-OpenCascade, which only FreeCAD's own Python environment (bundled with
-`freecadcmd`) provides. Every operation here shells out to it.
+* build123d/cadgen runtime + Viewer install/health/launch (general plumbing,
+  independent of how generation is driven);
+* extract_info(), the read_text fallback for .step/.stp files -- it shells
+  out to the vendored skill's own scripts/inspect, the same command the
+  model would run, so this is not a second implementation to keep in sync.
 
-FreeCAD's exact install layout and its exit-code behaviour on a script
-exception could not be verified while writing this (see
-`docs/superpowers/specs/2026-08-24-cad-freecad-design.md`, "Open items") —
-FreeCAD's wiki was behind bot protection. Treat `freecadcmd` as an untrusted
-black box: never believe it succeeded without checking the artifact it was
-supposed to produce.
+The main Agent8088 environment never imports build123d/cadgen directly.
 """
 from __future__ import annotations
 
 import json
-import re
+import os
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
 from pathlib import Path
+from typing import Any
 
 from .documents import _readable_or_reason
 
-# CAD files run much larger than office documents (a STEP assembly can be
-# hundreds of MB), so the guard here is far more generous than
-# MAX_DOCUMENT_BYTES in documents.py.
 MAX_CAD_BYTES = 200 * 1024 * 1024
 
+CADGEN_VERSION = "0.4.28"
+BUILD123D_VERSION = "0.11.1"
+CAD_VIEWER_VERSION = "0.4.28"
+CAD_VIEWER_COMMIT = "0e94cd1d2b5fa2013d89aa9504ecadcf16ce39f6"
+CAD_VIEWER_SHA256 = "8a349d4287407c79392e736c9d2e2d9c52e0427a58d168a4f325f926dfd7b7d1"
+
 CAD_EXTENSIONS = (
-    ".fcstd", ".step", ".stp", ".iges", ".igs", ".stl", ".obj", ".brep", ".dxf",
+    ".step", ".stp", ".stl", ".3mf", ".glb", ".brep",
 )
 
-# PDF is deliberately absent. Exporting a 3D model to PDF means generating a
-# TechDraw drawing — template, projection direction, scale — not a format
-# conversion, and the naive page+view export that looks like one produces an
-# empty or broken sheet. Claiming a target that probably fails is worse than
-# not claiming it; add it only once it can be verified against a real install.
-CONVERTIBLE_CAD_TARGETS = ("step", "stl", "iges", "obj", "brep", "dxf")
 
-CAD_PRIMITIVES = ("box", "cylinder", "sphere", "cone", "tube")
-
-# The exe name and portable/installer layout were unverified when this was
-# written (see module docstring) — confirmed on a real install afterward:
-# freecadcmd.exe (lowercase) at %LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\. The
-# official installer defaults to that per-user, no-elevation location, not
-# Program Files — install.ps1's WinGet path was never actually exercised, so
-# both roots are checked rather than trusting either guess alone. Both
-# casings are kept for a WinGet/portable layout that may still land in
-# Program Files. AGENT8088_FREECAD lets a user who extracted a portable 7z
-# anywhere point straight at it without editing code.
-def _freecad_candidates():
-    import os
-    names = ("freecadcmd.exe", "FreeCADCmd.exe")
-    dirs = [
-        r"C:\Program Files\FreeCAD 1.1\bin",
-        r"C:\Program Files\FreeCAD\bin",
-    ]
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        dirs += [
-            str(Path(local_app_data) / "Programs" / "FreeCAD 1.1" / "bin"),
-            str(Path(local_app_data) / "Programs" / "FreeCAD" / "bin"),
-        ]
-    return tuple(str(Path(d) / n) for d in dirs for n in names)
+def _agent_home() -> Path:
+    configured = os.environ.get("AGENT8088_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+        return Path(base) / "agent8088"
+    return Path.home() / ".agent8088"
 
 
-FREECAD_INSTALL_PATHS = _freecad_candidates()
+def cad_runtime_root() -> Path:
+    override = os.environ.get("AGENT8088_CAD_HOME", "").strip()
+    if override:
+        return Path(override).expanduser().resolve(strict=False)
+    return _agent_home() / "integrations" / "cad"
 
 
-def freecad_executable() -> str | None:
-    """Find freecadcmd, or None. Checked fresh every call — mirrors
-    `documents._soffice_executable()`: install is best-effort and can have
-    failed, been skipped, or (for FreeCAD) never been attempted by the
-    installer at all yet."""
-    import os
-    import shutil
+def cad_runtime_python() -> Path:
+    override = os.environ.get("AGENT8088_CAD_PYTHON", "").strip()
+    if override:
+        return Path(override).expanduser().resolve(strict=False)
+    root = cad_runtime_root() / "venv"
+    return root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
-    override = os.environ.get("AGENT8088_FREECAD")
-    if override and Path(override).exists():
-        return override
 
-    for name in ("freecadcmd", "FreeCADCmd"):
-        found = shutil.which(name)
-        if found:
-            return found
+def cad_viewer_root() -> Path:
+    """Resolve the checksum-pinned text-to-cad Viewer release."""
+    override = os.environ.get("AGENT8088_CAD_VIEWER_HOME", "").strip()
+    if override:
+        return Path(override).expanduser().resolve(strict=False)
+    manifest = cad_runtime_root() / "viewer" / "current.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        root = Path(str(payload.get("root") or "")).resolve(strict=False)
+        releases = (manifest.parent / "releases").resolve(strict=False)
+        root.relative_to(releases)
+        if (
+            str(payload.get("version")) == CAD_VIEWER_VERSION
+            and str(payload.get("commit")) == CAD_VIEWER_COMMIT
+            and str(payload.get("sha256")) == CAD_VIEWER_SHA256
+            and root.name == CAD_VIEWER_COMMIT
+        ):
+            return root
+    except (OSError, ValueError, TypeError):
+        pass
+    return cad_runtime_root() / "viewer" / "missing"
 
-    for candidate in FREECAD_INSTALL_PATHS:
-        if Path(candidate).exists():
-            return candidate
-    return None
+
+def cad_viewer_status() -> dict[str, Any]:
+    root = cad_viewer_root()
+    required = (
+        root / "LICENSE",
+        root / "dist" / "index.html",
+        root / "server_py" / "server.py",
+        root / "server_py" / "start_viewer.py",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    return {
+        "available": not missing,
+        "version": CAD_VIEWER_VERSION,
+        "root": str(root),
+        "missing": missing,
+    }
+
+
+def cad_runtime_status(timeout: int = 45) -> dict[str, Any]:
+    """Return a real import probe for the isolated CAD runtime."""
+    python = cad_runtime_python()
+    result: dict[str, Any] = {
+        "available": False,
+        "python": str(python),
+        "root": str(cad_runtime_root()),
+        "cadgen": CADGEN_VERSION,
+        "build123d": BUILD123D_VERSION,
+        "viewer": cad_viewer_status(),
+    }
+    if not python.is_file():
+        result["reason"] = "runtime interpreter is missing"
+        return result
+    code = (
+        "from importlib.metadata import version; "
+        "import build123d, cadgen; "
+        "print(version('build123d') + '|' + version('cadgen'))"
+    )
+    try:
+        done = subprocess.run(
+            [str(python), "-I", "-c", code], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=max(1, int(timeout)),
+            shell=False, env=_worker_env(), check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result["reason"] = f"runtime probe failed: {exc}"
+        return result
+    versions = (done.stdout or "").strip().split("|")
+    if done.returncode == 0 and versions == [BUILD123D_VERSION, CADGEN_VERSION]:
+        result["available"] = bool(result["viewer"]["available"])
+        result["installed_versions"] = versions
+        if not result["available"]:
+            result["reason"] = "CAD Viewer runtime is missing or incomplete"
+    else:
+        detail = (done.stderr or done.stdout or f"exit {done.returncode}").strip()
+        result["reason"] = detail[:500]
+    return result
 
 
 _NOT_INSTALLED_MESSAGE = (
-    "FreeCAD is not installed, so CAD support is unavailable. Install it with: "
-    "winget install FreeCAD.FreeCAD (or rerun the Agent8088 installer), or set "
-    "AGENT8088_FREECAD to the full path of freecadcmd.exe if it's already "
-    "installed in a non-standard location, then try again."
+    "Agent8088's advanced CAD runtime is not installed, so this CAD operation "
+    "cannot run. Re-run the Agent8088 installer to install the pinned build123d "
+    f"{BUILD123D_VERSION} + text-to-cad cadgen {CADGEN_VERSION} runtime."
 )
 
-# Dispatches how a FreeCAD script should open each source extension. .fcstd is
-# a native document; everything else is imported into a fresh document via the
-# module that understands that format. Guessed from FreeCAD's documented
-# Python API surface, not verified against a real install (see module
-# docstring) — a wrong import call here fails safely, because every caller
-# checks the resulting artifact on disk/stdout rather than trusting this ran.
-def _py_literal(value) -> str:
-    """A path as a safe Python string literal for the generated script.
 
-    json.dumps, not an f-string with manually escaped backslashes: the path
-    reaches here from a model-supplied filename, and escaping backslashes
-    alone leaves a quote or a newline free to close the literal and append
-    arbitrary code to a script that then runs unsandboxed. JSON's string
-    grammar escapes quotes, backslashes and control characters, and the
-    result is a valid Python literal.
-    """
-    return json.dumps(str(value))
+def _worker_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_agent_home() / "playwright-browsers"))
+    return env
 
 
-def _open_script_lines(src: Path) -> list[str]:
-    ext = src.suffix.lower()
-    src_literal = _py_literal(src)
-    if ext == ".fcstd":
-        return [f"doc = FreeCAD.openDocument({src_literal})"]
-    if ext in (".stl", ".obj"):
-        return [
-            'doc = FreeCAD.newDocument("agent8088_cad")',
-            "import Mesh",
-            f"Mesh.insert({src_literal}, doc.Name)",
-        ]
-    if ext == ".dxf":
-        return [
-            'doc = FreeCAD.newDocument("agent8088_cad")',
-            "import importDXF",
-            f"importDXF.insert({src_literal}, doc.Name)",
-        ]
-    # .step/.stp/.iges/.igs/.brep — all OpenCascade formats Part.insert reads.
-    return [
-        'doc = FreeCAD.newDocument("agent8088_cad")',
-        "import Part",
-        f"Part.insert({src_literal}, doc.Name)",
-    ]
-
-
-def _run_freecad_script(freecad: str, script: str, timeout: int):
-    """Write `script` to a temp file, run it under freecadcmd, clean up.
-    Inline `-c` code is not used: quoting a multi-line script through a shell
-    is fragile, a temp file is not."""
-    import subprocess
-    import tempfile
-    import os
-
-    fd, script_path = tempfile.mkstemp(suffix=".py")
+def _viewer_server_info(port: int, workspace: Path | None = None,
+                        timeout: float = 1.0) -> dict[str, Any] | None:
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(script)
-        return subprocess.run(
-            [freecad, script_path],
-            capture_output=True, text=True, timeout=timeout,
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{int(port)}/__cad/server",
+            headers={"User-Agent": "Agent8088-CAD-Viewer/1"},
         )
-    finally:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("app") == "cad-viewer":
+            if workspace is not None:
+                served = Path(str(payload.get("rootDir") or "")).resolve(strict=False)
+                if os.path.normcase(str(served)) != os.path.normcase(str(workspace.resolve())):
+                    return None
+            return payload
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    return None
+
+
+def _port_is_bindable(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def _viewer_url(workspace: Path, path: Path, port: int) -> str:
+    directory = workspace.as_posix()
+    if os.name == "nt" and not directory.startswith("/"):
+        directory = "/" + directory
+    url_path = urllib.parse.quote(directory, safe="/:")
+    relative = path.relative_to(workspace).as_posix()
+    return f"http://127.0.0.1:{port}{url_path}?" + urllib.parse.urlencode({"file": relative})
+
+
+def open_cad_viewer(path, workspace=None, launch_browser: bool = True,
+                    timeout: int = 45) -> str:
+    """Start or reuse the managed loopback Viewer and open one CAD artifact."""
+    path = Path(path).expanduser().resolve(strict=False)
+    if not path.is_file():
+        return f"Cannot open CAD Viewer: {path} does not exist."
+    supported = {".step", ".stp", ".stl", ".3mf", ".glb", ".dxf"}
+    if path.suffix.lower() not in supported:
+        return "Cannot open CAD Viewer: unsupported file type " + path.suffix.lower()
+    root = Path(workspace).expanduser().resolve(strict=False) if workspace else path.parent
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return "Cannot open CAD Viewer: the artifact is outside the authorized workspace."
+    viewer = cad_viewer_status()
+    if not viewer["available"]:
+        return (
+            "CAD Viewer is not installed. Re-run the Agent8088 installer to install "
+            f"the pinned text-to-cad Viewer {CAD_VIEWER_VERSION} runtime."
+        )
+    python = cad_runtime_python()
+    if not python.is_file():
+        return _NOT_INSTALLED_MESSAGE
+
+    selected_port = next(
+        (port for port in range(3245, 3256) if _viewer_server_info(port, root)),
+        None,
+    )
+    # Only look for a new port after checking the whole managed range for an
+    # existing verified Viewer. This avoids spawning duplicate servers merely
+    # because an earlier port happens to be free.
+    if selected_port is None:
+        selected_port = next(
+            (port for port in range(3245, 3256) if _port_is_bindable(port)),
+            None,
+        )
+    if selected_port is None:
+        return "Could not start CAD Viewer: ports 3245-3255 are unavailable."
+
+    if _viewer_server_info(selected_port, root) is None:
+        viewer_root = Path(viewer["root"])
+        state_root = cad_runtime_root() / "viewer" / "state"
+        state_root.mkdir(parents=True, exist_ok=True)
+        log_path = state_root / f"viewer-{selected_port}.log"
+        env = _worker_env()
+        env["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(viewer_root), env.get("PYTHONPATH", "")) if item
+        )
+        command = [
+            str(python), "-m", "server_py.server", "--host", "127.0.0.1",
+            "--port", str(selected_port),
+        ]
+        process_options: dict[str, Any]
+        if os.name == "nt":
+            process_options = {
+                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            }
+        else:
+            process_options = {"start_new_session": True}
         try:
-            os.unlink(script_path)
-        except OSError:
-            pass
+            with log_path.open("ab", buffering=0) as log:
+                subprocess.Popen(
+                    command, cwd=str(root), env=env, stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=subprocess.STDOUT, close_fds=True,
+                    **process_options,
+                )
+        except OSError as exc:
+            return f"Could not start CAD Viewer: {exc}"
+
+        deadline = time.monotonic() + max(3, int(timeout))
+        while time.monotonic() < deadline:
+            if _viewer_server_info(selected_port, root):
+                break
+            time.sleep(0.2)
+        else:
+            try:
+                detail = log_path.read_text(encoding="utf-8", errors="replace")[-1000:].strip()
+            except OSError:
+                detail = ""
+            return "CAD Viewer did not become ready." + (f" Log: {detail}" if detail else "")
+
+    url = _viewer_url(root, path, selected_port)
+    opened = False
+    if launch_browser:
+        try:
+            opened = bool(webbrowser.open(url, new=2))
+        except webbrowser.Error:
+            opened = False
+    action = "Opened" if opened else "CAD Viewer ready"
+    return f"{action}: {url}"
+
+
+def _cad_skill_scripts_dir() -> Path:
+    # Mirrors engine.py's own _cad_skill_scripts_dir() default (skills_dir
+    # config defaults to this same path); a reconfigured skills_dir only
+    # affects this read-fallback probe, not the CAD-scoped shell auto-approval
+    # gate, which is the actual security boundary.
+    return Path(__file__).with_name("skills_installed") / "cad" / "scripts"
 
 
 def extract_info(path, max_bytes: int = MAX_CAD_BYTES):
-    """Return a text summary of a CAD file, or None if `path`'s extension
-    isn't CAD, so the caller falls through to normal reading. Same contract
-    as `documents.extract_text`."""
+    """Return a deterministic geometry summary, or None for a non-CAD file.
+
+    Shells out to the vendored text-to-cad skill's own scripts/inspect --
+    the same command the model runs -- rather than a second implementation.
+    """
     path = Path(path)
-    ext = path.suffix.lower()
-    if ext not in CAD_EXTENSIONS:
+    if path.suffix.lower() not in CAD_EXTENSIONS:
         return None
-
-    size = path.stat().st_size
-    if size > max_bytes:
-        raise ValueError(
-            f"CAD file is too large to inspect (limit: {max_bytes} bytes): {path}"
-        )
-
-    unreadable = _readable_or_reason(path)
-    if unreadable:
-        return unreadable
-
-    freecad = freecad_executable()
-    if not freecad:
-        return _NOT_INSTALLED_MESSAGE
-
     if not path.exists():
         return f"Cannot inspect: {path} does not exist."
-
-    script = "\n".join([
-        "import FreeCAD, json",
-        *_open_script_lines(path),
-        "objects = []",
-        "bbox = None",
-        "total_volume = 0.0",
-        "total_area = 0.0",
-        "for obj in doc.Objects:",
-        "    objects.append({'name': obj.Name, 'label': getattr(obj, 'Label', obj.Name), 'type': obj.TypeId})",
-        "    shape = getattr(obj, 'Shape', None)",
-        "    if shape is not None and not shape.isNull():",
-        "        try:",
-        "            total_volume += shape.Volume",
-        "            total_area += shape.Area",
-        "        except Exception:",
-        "            pass",
-        "        try:",
-        "            bb = shape.BoundBox",
-        "            bbox = bb if bbox is None else (bbox.add(bb) or bbox)",
-        "        except Exception:",
-        "            pass",
-        "result = {'objects': objects, 'volume': total_volume, 'area': total_area}",
-        "if bbox is not None:",
-        "    result['bounding_box'] = {'length': bbox.XLength, 'width': bbox.YLength, 'height': bbox.ZLength}",
-        "print('AGENT8088_CAD_JSON_START')",
-        "print(json.dumps(result))",
-        "print('AGENT8088_CAD_JSON_END')",
-    ])
-
-    try:
-        result = _run_freecad_script(freecad, script, timeout=120)
-    except Exception as exc:  # subprocess.TimeoutExpired and friends
-        import subprocess
-        if isinstance(exc, subprocess.TimeoutExpired):
-            return f"FreeCAD timed out after 120s inspecting {path.name}."
-        return f"Could not run FreeCAD: {exc}"
-
-    # freecadcmd may exit 0 even after a script exception (unverified, see
-    # module docstring) — the only trustworthy signal is whether the expected
-    # JSON actually appears on stdout, not the exit code.
-    stdout = result.stdout or ""
-    if "AGENT8088_CAD_JSON_START" not in stdout:
-        detail = (result.stderr or stdout or "no output from freecadcmd").strip()
-        return f"Could not inspect {path.name}: FreeCAD said: {detail[:500]}"
-
-    import json
-    payload = stdout.split("AGENT8088_CAD_JSON_START", 1)[1]
-    payload = payload.split("AGENT8088_CAD_JSON_END", 1)[0].strip()
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        return f"Could not parse FreeCAD output for {path.name}: {exc}"
-
-    lines = [f"CAD file: {path.name}", f"Objects: {len(data.get('objects', []))}"]
-    for obj in data.get("objects", []):
-        lines.append(f"  - {obj.get('label', obj.get('name'))} ({obj.get('type')})")
-    bbox = data.get("bounding_box")
-    if bbox:
-        lines.append(
-            f"Bounding box: {bbox.get('length'):.3f} x {bbox.get('width'):.3f} "
-            f"x {bbox.get('height'):.3f} mm (L x W x H)"
-        )
-    if data.get("volume"):
-        lines.append(f"Volume: {data['volume']:.3f} mm^3")
-    if data.get("area"):
-        lines.append(f"Surface area: {data['area']:.3f} mm^2")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Conversion
-# ---------------------------------------------------------------------------
-def _export_script_lines(target: str, output: Path) -> list[str]:
-    """Build the export half of a conversion script for `target`. Export API
-    guessed from FreeCAD's documented module layout (Part.export for
-    OpenCascade formats, Mesh.export for STL/OBJ) — unverified, see module
-    docstring. A wrong guess here fails safely: convert_cad only reports
-    success once the output file actually exists on disk."""
-    out_literal = _py_literal(output)
-    objs = "[o for o in doc.Objects if hasattr(o, 'Shape') and o.Shape and not o.Shape.isNull()]"
-    if target in ("step", "iges", "brep"):
-        return [
-            "import Part",
-            f"shapes = {objs}",
-            "if not shapes:",
-            "    raise RuntimeError('no exportable shapes in document')",
-            f"Part.export(shapes, {out_literal})",
-        ]
-    if target in ("stl", "obj"):
-        return [
-            "import Mesh, MeshPart",
-            f"shapes = {objs}",
-            "mesh_objs = [o for o in doc.Objects if o.TypeId.startswith('Mesh::')]",
-            "if shapes:",
-            "    meshes = [MeshPart.meshFromShape(Shape=s.Shape, LinearDeflection=0.1) for s in shapes]",
-            "    combined = meshes[0]",
-            "    for m in meshes[1:]:",
-            "        combined.addMesh(m)",
-            f"    combined.write({out_literal})",
-            "elif mesh_objs:",
-            f"    Mesh.export(mesh_objs, {out_literal})",
-            "else:",
-            "    raise RuntimeError('no exportable geometry in document')",
-        ]
-    if target == "dxf":
-        return [
-            "import importDXF",
-            f"shapes = {objs}",
-            "if not shapes:",
-            "    raise RuntimeError('no exportable shapes in document')",
-            f"importDXF.export(shapes, {out_literal})",
-        ]
-    # Every target in CONVERTIBLE_CAD_TARGETS is handled above; the format was
-    # validated by convert_cad before reaching here.
-    raise ValueError(f"no exporter for target format: {target}")
-
-
-def convert_cad(path, target_format: str, timeout: int = 180) -> str:
-    """Convert `path` to `target_format` via freecadcmd, in place (same
-    directory, same basename, new extension). Returns a summary or a
-    plain-language reason it didn't happen — never raises, so a tool caller
-    can return this string directly."""
-    path = Path(path)
-    target_format = (target_format or "").strip().lower().lstrip(".")
-    if target_format not in CONVERTIBLE_CAD_TARGETS:
-        return (f"Cannot convert to '{target_format}'. Supported targets: "
-                 f"{', '.join(CONVERTIBLE_CAD_TARGETS)}.")
-
-    freecad = freecad_executable()
-    if not freecad:
-        return _NOT_INSTALLED_MESSAGE
-
-    if not path.exists():
-        return f"Cannot convert: {path} does not exist."
-
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"CAD file is too large to inspect (limit: {max_bytes} bytes): {path}")
     unreadable = _readable_or_reason(path)
     if unreadable:
         return unreadable
-
-    output_path = path.with_suffix("." + target_format)
-    script = "\n".join([
-        "import FreeCAD",
-        *_open_script_lines(path),
-        *_export_script_lines(target_format, output_path),
-    ])
-
-    import subprocess
-    try:
-        result = _run_freecad_script(freecad, script, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return (f"FreeCAD timed out after {timeout}s converting {path.name}. "
-                 "Cold-start can be slow — try again, or raise the timeout.")
-
-    # As with extract_info: freecadcmd may exit 0 on a script exception, so
-    # success is only ever established by checking the artifact on disk.
-    if not output_path.exists():
-        detail = (result.stderr or result.stdout or "no output from freecadcmd").strip()
-        return (f"Conversion failed: {path.name} was not converted to "
-                 f"{target_format}. FreeCAD said: {detail[:500]}")
-
-    return f"Converted {path.name} to {output_path.name} ({output_path.stat().st_size} bytes)."
-
-
-# ---------------------------------------------------------------------------
-# Primitive generation
-# ---------------------------------------------------------------------------
-# One deliberately simple, documented dimension format per shape, since a
-# model will send free text and this has to parse it defensively rather than
-# assume it's well-formed:
-#   box:      "LxWxH"                    e.g. "50x30x10"
-#   cylinder: "rRxH"                     e.g. "r10x50"
-#   sphere:   "rR"                       e.g. "r10"
-#   cone:     "rR1xR2xH"                 e.g. "r10x5x20"  (R1=base, R2=top)
-#   tube:     "rOUTERxINNERxH"           e.g. "r10x5x20"  (outer, inner, height)
-# Also accepts explicit "key=value,key=value" for anyone who wants to be
-# unambiguous about which number is which.
-_DIM_KEYS = {
-    "box": ("length", "width", "height"),
-    "cylinder": ("radius", "height"),
-    "sphere": ("radius",),
-    "cone": ("radius1", "radius2", "height"),
-    "tube": ("outer_radius", "inner_radius", "height"),
-}
-_KEY_ALIASES = {
-    "l": "length", "w": "width", "h": "height", "height": "height",
-    "r": "radius", "radius": "radius",
-    "r1": "radius1", "radius1": "radius1",
-    "r2": "radius2", "radius2": "radius2",
-    "outer": "outer_radius", "outer_radius": "outer_radius",
-    "inner": "inner_radius", "inner_radius": "inner_radius",
-    "length": "length", "width": "width",
-}
-
-
-def _parse_dimensions(shape: str, dimensions: str) -> dict:
-    """Parse a dimensions string for `shape`. Raises ValueError with a
-    human-readable reason on anything malformed — caught by the caller,
-    never surfaced as a traceback."""
-    keys = _DIM_KEYS[shape]
-    dimensions = (dimensions or "").strip()
-    if not dimensions:
-        raise ValueError(
-            f"No dimensions given for '{shape}'. Expected e.g. "
-            f"{'x'.join('N' for _ in keys)} (fields: {', '.join(keys)})."
-        )
-
-    if "=" in dimensions:
-        values = {}
-        for part in dimensions.split(","):
-            if "=" not in part:
-                continue
-            k, v = part.split("=", 1)
-            key = _KEY_ALIASES.get(k.strip().lower())
-            if key is None or key not in keys:
-                continue
-            try:
-                values[key] = float(v.strip())
-            except ValueError:
-                raise ValueError(f"'{v.strip()}' in '{dimensions}' is not a number.")
-        missing = [k for k in keys if k not in values]
-        if missing:
-            raise ValueError(
-                f"Missing {', '.join(missing)} for '{shape}' in '{dimensions}'."
-            )
-        return values
-
-    tokens = re.split(r"[xX]", dimensions)
-    tokens = [t.strip().lower().lstrip("r") for t in tokens]  # "r10" -> "10"
-    if len(tokens) != len(keys):
-        raise ValueError(
-            f"'{dimensions}' has {len(tokens)} value(s), '{shape}' needs "
-            f"{len(keys)}: {'x'.join('N' for _ in keys)} (fields: {', '.join(keys)})."
-        )
-    values = {}
-    for key, token in zip(keys, tokens):
-        try:
-            values[key] = float(token)
-        except ValueError:
-            raise ValueError(f"'{token}' in '{dimensions}' is not a number.")
-    return values
-
-
-def _primitive_script_lines(shape: str, dims: dict) -> list[str]:
-    if shape == "box":
-        return [
-            "import Part",
-            f"part = Part.makeBox({dims['length']}, {dims['width']}, {dims['height']})",
-        ]
-    if shape == "cylinder":
-        return [
-            "import Part",
-            f"part = Part.makeCylinder({dims['radius']}, {dims['height']})",
-        ]
-    if shape == "sphere":
-        return [
-            "import Part",
-            f"part = Part.makeSphere({dims['radius']})",
-        ]
-    if shape == "cone":
-        return [
-            "import Part",
-            f"part = Part.makeCone({dims['radius1']}, {dims['radius2']}, {dims['height']})",
-        ]
-    # tube: outer cylinder with inner cylinder cut out
-    return [
-        "import Part",
-        f"outer = Part.makeCylinder({dims['outer_radius']}, {dims['height']})",
-        f"inner = Part.makeCylinder({dims['inner_radius']}, {dims['height']})",
-        "part = outer.cut(inner)",
-    ]
-
-
-def create_cad_part(path, shape: str, dimensions: str, timeout: int = 180) -> str:
-    """Generate a primitive CAD part (parameters, never freeform code) and
-    save it to `path`. Output format is inferred from `path`'s extension and
-    must be one of CONVERTIBLE_CAD_TARGETS. Never raises."""
-    path = Path(path)
-    shape = (shape or "").strip().lower()
-    if shape not in CAD_PRIMITIVES:
-        return f"Unknown shape '{shape}'. Supported: {', '.join(CAD_PRIMITIVES)}."
-
-    target_format = path.suffix.lower().lstrip(".")
-    if target_format not in CONVERTIBLE_CAD_TARGETS:
-        return (f"Cannot save as '{path.suffix}'. Supported output formats: "
-                 f"{', '.join(CONVERTIBLE_CAD_TARGETS)}.")
-
-    try:
-        dims = _parse_dimensions(shape, dimensions)
-    except ValueError as exc:
-        return str(exc)
-
-    freecad = freecad_executable()
-    if not freecad:
+    python = cad_runtime_python()
+    inspect_script = _cad_skill_scripts_dir() / "inspect"
+    if not python.is_file() or not inspect_script.is_file():
         return _NOT_INSTALLED_MESSAGE
-
-    script = "\n".join([
-        "import FreeCAD",
-        'doc = FreeCAD.newDocument("agent8088_cad")',
-        *_primitive_script_lines(shape, dims),
-        'obj = doc.addObject("Part::Feature", "Part")',
-        "obj.Shape = part",
-        "doc.recompute()",
-        *_export_script_lines(target_format, path),
-    ])
-
-    import subprocess
+    # Upstream's inspect CLI resolves its target relative to cwd -- run it
+    # from the file's own directory with a bare filename, as documented.
     try:
-        result = _run_freecad_script(freecad, script, timeout=timeout)
+        done = subprocess.run(
+            [str(python), str(inspect_script), "refs", path.name, "--facts"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=180, shell=False, cwd=str(path.parent), env=_worker_env(),
+            check=False,
+        )
     except subprocess.TimeoutExpired:
-        return f"FreeCAD timed out after {timeout}s generating {path.name}."
-
-    if not path.exists():
-        detail = (result.stderr or result.stdout or "no output from freecadcmd").strip()
-        return (f"Generation failed: {path.name} was not created. "
-                 f"FreeCAD said: {detail[:500]}")
-
-    return f"Created {path.name} ({path.stat().st_size} bytes) — {shape} {dimensions}."
-
-
-if __name__ == "__main__":
-    # Self-check that runs WITHOUT FreeCAD installed: exercises every failure
-    # path that doesn't require the real binary. Run with:
-    #   python -m agent8088.cad
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-
-        # unknown extension -> None
-        txt_path = tmp / "t.txt"
-        txt_path.write_text("plain")
-        assert extract_info(txt_path) is None
-
-        # size guard
-        big_path = tmp / "big.step"
-        big_path.write_bytes(b"0" * 100)
-        try:
-            extract_info(big_path, max_bytes=10)
-            raise AssertionError("expected ValueError")
-        except ValueError:
-            pass
-
-        # unsupported conversion target
-        step_path = tmp / "part.step"
-        step_path.write_text("not real step data")
-        result = convert_cad(step_path, "docx")
-        assert "Supported targets" in result, result
-
-        # source does not exist
-        result = convert_cad(tmp / "missing.step", "stl")
-        assert "does not exist" in result or "FreeCAD is not installed" in result, result
-
-        # bad shape
-        result = create_cad_part(tmp / "out.step", "torus", "10x5")
-        assert "Unknown shape" in result, result
-
-        # bad output extension
-        result = create_cad_part(tmp / "out.docx", "box", "50x30x10")
-        assert "Supported output formats" in result, result
-
-        # dimension parsing: shorthand and key=value, valid and invalid
-        assert _parse_dimensions("box", "50x30x10") == {
-            "length": 50.0, "width": 30.0, "height": 10.0,
-        }
-        assert _parse_dimensions("cylinder", "r10x50") == {
-            "radius": 10.0, "height": 50.0,
-        }
-        assert _parse_dimensions("cylinder", "radius=10,height=50") == {
-            "radius": 10.0, "height": 50.0,
-        }
-        try:
-            _parse_dimensions("box", "50x30")
-            raise AssertionError("expected ValueError for wrong field count")
-        except ValueError:
-            pass
-        try:
-            _parse_dimensions("box", "50xNOTANUMBERx10")
-            raise AssertionError("expected ValueError for non-numeric field")
-        except ValueError:
-            pass
-
-        # If FreeCAD genuinely isn't installed on this machine (true in this
-        # dev environment), every operation reports that honestly rather than
-        # a traceback — the one path that stays fully exercisable here.
-        if freecad_executable() is None:
-            assert "not installed" in extract_info(step_path) or "Could not read" in extract_info(step_path)
-            assert "not installed" in convert_cad(step_path, "stl")
-            assert "not installed" in create_cad_part(tmp / "out.step", "box", "50x30x10")
-
-    print("cad.py self-check passed")
+        return f"Could not inspect {path.name}: inspect timed out after 180s."
+    except OSError as exc:
+        return f"Could not inspect {path.name}: {exc}"
+    try:
+        payload = json.loads(done.stdout or "{}")
+    except json.JSONDecodeError:
+        detail = (done.stderr or done.stdout or f"exited {done.returncode}").strip()
+        return f"Could not inspect {path.name}: {detail[:500]}"
+    tokens = payload.get("tokens") or []
+    if not payload.get("ok") or not tokens:
+        errors = payload.get("errors") or []
+        detail = errors[0].get("message") if errors else "unknown CAD error"
+        return f"Could not inspect {path.name}: {detail}"
+    summary = tokens[0].get("summary") or {}
+    lines = [f"CAD file: {path.name}"]
+    for key in ("kind", "occurrenceCount", "leafOccurrenceCount", "shapeCount",
+                "faceCount", "edgeCount", "vertexCount"):
+        if key in summary:
+            lines.append(f"{key}: {summary[key]}")
+    bounds = summary.get("bounds") or {}
+    if bounds:
+        lines.append(f"bounds: min={bounds.get('min')} max={bounds.get('max')}")
+    return "\n".join(lines)

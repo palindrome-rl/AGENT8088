@@ -1,187 +1,121 @@
 ---
 name: cad
-description: Write FreeCAD Python for CAD work create_cad_part and convert_cad can't do — booleans, holes, edits to an existing model, assemblies.
-version: 1.0.0
-category: software-development
+description: Create, modify, inspect, and validate STEP-first parametric CAD parts and assemblies. Use for natural-language CAD specs, reference images, 2D technical drawings, STEP/STP generation or direct inspection, Python CAD source, source-level joints, selector references, geometry facts, measurements, mating deltas, snapshots, and secondary STL/3MF/native GLB outputs from CAD geometry.
 ---
 
-`create_cad_part` builds one primitive (box/cylinder/sphere/cone/tube) from
-a dimension string. `convert_cad` converts an existing file between formats.
-Neither writes code. **This skill is for everything past that**: booleans,
-holes, multiple shapes in one file, editing a file that already exists.
+# CAD generation, inspection, and validation
 
-Check `create_cad_part`/`convert_cad` first — most requests fit one of them
-without any code at all. Reach for this skill only when they genuinely can't
-do the job.
+Provenance: maintained in [earthtojake/text-to-cad](https://github.com/earthtojake/text-to-cad).
+Use the installed local skill files as the runtime source of truth; the
+repository link is only for provenance and release review.
 
-## Find FreeCAD first, and call it by full path
+## Purpose
 
-```
-execute_shell: if exist "%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\freecadcmd.exe" (echo FOUND) else (echo MISSING)
-```
+Create or modify parametric CAD models from natural-language requirements, generate validated STEP/STP artifacts, inspect geometry references, and return checked outputs. Treat STEP as the primary CAD artifact. Treat STL, 3MF, and native GLB as secondary export workflows that branch from a STEP-first process. For assemblies, prefer `cadgen.assembly.AssemblyHelper` with source-level build123d joints, named mating datums, and native labels when the parts have functional assembly relationships.
 
-**Use `%LOCALAPPDATA%`, never `C:\Users\%USERNAME%\AppData\Local`.** Verified
-failure: under the native sandbox those two do not agree — `%USERNAME%`
-expands to the sandbox's own restricted account while the real profile
-directory belongs to the signed-in user, so the hand-built path points at a
-profile that does not exist and the check reports MISSING against a working
-install. `%LOCALAPPDATA%` resolves correctly in both places. The same trap
-applies to `%APPDATA%` and `%USERPROFILE%`: use the variable that names the
-directory you want, never rebuild it out of `%USERNAME%`.
+There are two ways into the STEP workflow: generate from build123d Python source (the default when designing from scratch or modifying a generated model), or import an existing STEP/STP file directly (when no generator exists or the user explicitly targets the STEP file). Both produce the same inspectable artifacts.
 
-The official installer puts FreeCAD at
-`%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\freecadcmd.exe` — a per-user
-location, not `Program Files`, and not on `PATH`. Also check
-`C:\Program Files\FreeCAD 1.1\bin\freecadcmd.exe` (a WinGet or portable
-install may land there instead). If neither exists, tell the user FreeCAD
-isn't installed rather than guessing or claiming success — and never invent
-a reason for a failure that has nothing to do with FreeCAD being missing.
+## Use this skill when
 
-Harmless noise to expect on every sandboxed run: `unable to open file
-...FreeCAD/v1-1/system.cfg` / `user.cfg`. FreeCAD cannot write its config
-under the sandbox's restricted profile. It still executes correctly — judge
-the run by its output and by whether the file landed on disk, not by these
-lines.
+Use this skill when the user asks for CAD files, STEP/STP files, build123d source, selector refs such as `#o1.2.f1`, mechanical parts, assemblies, enclosures, brackets, fixtures, holes, counterbores, countersinks, slots, pockets, bosses, standoffs, ribs, fillets, chamfers, shells, source-level joints, mating, or measurements. Also use it when the user supplies reference images or 2D technical drawings of a part to reproduce or take design intent from.
 
-**On Windows, `execute_shell` runs `cmd.exe`, not bash.** `dir` not `ls`,
-double quotes not single. Same rule as the `documents` skill, repeated here
-because it bites every shell-based skill the same way.
+Also use it when the user asks for STL, 3MF, or native GLB output from CAD geometry. Keep those workflows secondary and load `supported-exports.md` for details. For 2D DXF drawings, use the `$dxf` skill; when a DXF projects from a 3D part, this skill owns the STEP geometry and `$dxf` owns the drawing.
 
-## Write the script into the project, not a temp directory
+Do not use this skill for render-only concept art, CAM toolpaths, engineering certification, FEA conclusions, architectural BIM, or freehand illustration unless the user also needs CAD geometry.
 
-```
-write_file: artifacts\make_part.py
-execute_shell: "%LOCALAPPDATA%\Programs\FreeCAD 1.1\bin\freecadcmd.exe" "<absolute path to artifacts\make_part.py>"
-```
+## Default assumptions
 
-**Put the script under the project (`artifacts\`), never in the system temp
-directory.** Verified failure: under the native sandbox a script written to
-`%TEMP%` cannot be read back at all — even `type file.py` returns
-`Access is denied`, and `freecadcmd` given such a path dies with
-`Application unexpectedly terminated` and exit 1. That message names nothing
-useful; the real cause is the sandbox denying access to temp. Writing to
-`artifacts\` avoids it entirely.
+Use these defaults unless the user specifies otherwise. These are first-pass modeling defaults, not manufacturability, tolerance, or certification claims:
 
-If a run fails that way, check whether the script is somewhere the sandbox
-can actually read before assuming FreeCAD or the script is at fault.
+- Units: millimeters.
+- Origin: per the part-type defaults in `references/positioning.md`; center of the main part or assembly when nothing better applies.
+- Base plane: XY.
+- Up/extrusion axis: positive Z.
+- Output geometry: closed, positive-volume solids unless the user requests surfaces or construction geometry.
+- STEP structure: one valid solid, a compound of solids, or a labeled assembly compound.
+- Assembly structure: fixed root part, part-local frames, named mating datums, `AssemblyHelper` relationships backed by build123d joints where applicable, explicit generated placements, and verbose native labels.
+- Small plastic enclosure wall: 2.0-3.0 mm when unspecified.
+- Cosmetic fillet: 1.0-3.0 mm when safe for local geometry.
+- M3/M4/M5 normal clearance holes: 3.4/4.5/5.5 mm unless another standard is requested.
 
-Then confirm the output file actually exists and re-read it with `read_text`
-(which already extracts CAD summaries) before saying anything succeeded.
-`freecadcmd` can print a success-looking trace and still not write the file —
-disk state is the only thing worth trusting, never the console output.
+Ask one focused clarification question only when missing information makes the model impossible, fit-critical, safety-critical, or compliance-bound. Otherwise proceed with explicit assumptions.
 
-## Use full Windows paths inside the script, always
+## Tools and paths
 
-**Verified failure**: a Unix-style path (`/tmp/out.step`) inside a FreeCAD
-Python script silently fails to export — `freecadcmd` is a native Windows
-binary and does not understand it, even though the same path might resolve
-in a bash shell. Every path inside the script must be a real Windows path:
-`r"C:\Users\...\out.step"` (raw string, or escaped backslashes) — never a
-forward-slash Unix-style path, never a bare relative name.
+From the CAD skill directory, the launcher shape is:
 
-## Reading a format not already in `read_text`
-
-The read side already covers `.fcstd`, `.step`/`.stp`, `.iges`/`.igs`,
-`.stl`, `.obj`, `.brep`, `.dxf` — just call `read_text` on those, no script
-needed. For anything else, open it the same way a conversion script would
-(see below) and print what you need.
-
-## The primitives (verified against a real install)
-
-```python
-import FreeCAD, Part
-doc = FreeCAD.newDocument("work")
-
-box = Part.makeBox(50, 30, 20)                          # length, width, height
-cyl = Part.makeCylinder(10, 50)                          # radius, height
-cyl2 = Part.makeCylinder(5, 30,
-    FreeCAD.Vector(25, 15, -5), FreeCAD.Vector(0, 0, 1))  # radius, height, base point, direction
-sph = Part.makeSphere(25)                                # radius
+```bash
+python scripts/gen ...       # render GLB/topology packages from gen_step() Python sources
+python scripts/export ...    # STL/3MF/GLB mesh files from Python sources or imported STEP
+python scripts/inspect ...   # refs, measure, align, frame, diff
+python scripts/snapshot ...  # PNG/GIF visual review packets
+python scripts/artifact ...  # debug one on-demand render-package build (imported STEP)
 ```
 
-## Booleans — a hole through a plate
+Use the active project Python interpreter; treat `python` in examples as an interpreter placeholder. Use `python scripts/<tool> --help` for the complete current command interface; reference docs show recommended workflows, not every flag.
 
-```python
-import FreeCAD, Part
+**Snapshot inputs.** This skill's snapshot renders `.step`/`.step.py`, `.stp`, `.3mf`, `.glb` and `.stl`. Implicit models and robot descriptions are rendered by the `implicit-cad` and `urdf`/`srdf`/`sdf` skills; the CLI refuses them rather than rendering something it should not.
 
-doc = FreeCAD.newDocument("work")
-plate = Part.makeBox(50, 30, 20)
-hole = Part.makeCylinder(5, 30, FreeCAD.Vector(25, 15, -5), FreeCAD.Vector(0, 0, 1))
-result = plate.cut(hole)   # boolean subtract. .fuse() unions, .common() intersects.
+**Theme and display.** Theme settings live under one `--theme`, display settings under one `--display` — the viewer's two tabs, one option each. The default theme is `snapshot`: Workbench Light with the ground grid and origin axis removed, because in a still image those read as geometry rather than as orientation. Pass `--theme workbench-light` for the viewer's own look. Projection is a theme trait honoured by every format, so a snapshot frames the same way the viewport does.
 
-obj = doc.addObject("Part::Feature", "plate")
-obj.Shape = result
-doc.recompute()
-Part.export([obj], r"C:\path\to\output.step")
+**Streams.** stdout carries the result; stderr carries progress, timing, and failures. Every tool answers on stdout — `gen` prints `<outcome> <package path>` per target — so `2>/dev/null` leaves something parseable and `>/dev/null` leaves a readable log. JSON on stdout is always compact; pipe through `jq .` to read it. The two never interleave, so `2>/dev/null` leaves a clean parseable result and `>/dev/null` leaves a readable log. For machine-readable output: `gen`, `export`, and `snapshot` take `--json`; `inspect` already emits JSON and takes `--format text` for prose. `--verbose` adds stage timing (and full tracebacks) on stderr. Output volume does not grow with model size — a 600-occurrence assembly logs the same dozen lines a single part does.
+
+**Failures** print the exception and the frames *in your own generator*, not the runtime's:
+
+```text
+[scripts/gen] FAILED: ValueError: bad radius
+[scripts/gen]   models/step/parts/widget.step.py:9 in gen_step
+[scripts/gen]       return _profile(radius)
+[scripts/gen] re-run with --verbose for the full traceback
 ```
 
-Make the hole's cylinder taller than the plate and offset its base below the
-plate's bottom face (as above: base z = -5 for a 20mm-tall box starting at
-z=0), so it cuts all the way through — a cylinder exactly the plate's height
-can leave a sliver of material at one face from floating-point tolerance.
+**A build waits for a concurrent build of the same model** rather than racing it, and says so on stderr (`waiting for another run to finish building ...`), repeating while it waits. Pass `--lock-timeout SECONDS` to give up instead and report `{"ok":true,"contended":true}`. With `--json`, each target's `outcome` is `built`, `current`, `skipped-peer` (the peer finished and its package is current), or `contended` (the peer is still building and this run declined to wait).
 
-## Editing a file that already exists — open, add, export all
+Target paths resolve from the command's current working directory, not from the skill directory. Run commands from the workspace that owns the artifacts and pass cwd-relative target paths so project CAD files never resolve accidentally under the skill directory. Keep a STEP output and its Python generator in the same directory with the same basename unless the user explicitly requests otherwise.
 
-**Verified**: this is how to add a shape to an existing model without
-regenerating what's already there. `Part.insert` loads the existing
-geometry into the document as real objects — it does not need touching to
-survive; only export the full object list at the end.
+CAD references are `#...` selector tokens local to a target, for example `#o1.2` or `#o1.2.f1`. Pass the STEP/CAD file as a separate target argument when using CAD CLIs.
 
-```python
-import FreeCAD, Part
+## Required workflow
 
-doc = FreeCAD.newDocument("edit")
-Part.insert(r"C:\path\to\existing.step", doc.Name)   # existing shapes are now real objects
+Scale depth to the task: a simple part needs a short brief and few spec-driven checks; assemblies and fit-critical work need full positioning and alignment validation.
 
-new_box = Part.makeBox(10, 10, 10, FreeCAD.Vector(60, 0, 0))
-obj = doc.addObject("Part::Feature", "added")
-obj.Shape = new_box
+1. **Classify the task.** New part, new assembly, source modification, direct STEP/STP inspection, reference selection, measurement/alignment check, snapshot review, or secondary output request.
+2. **Load only the needed references.** Use the triggers below instead of reading the whole reference set.
+3. **Write a natural-language CAD brief.** Extract dimensions, units, coordinate convention, feature intent, output paths, assumptions, and validation targets from all provided inputs — prose, reference images, technical drawings. Use `references/cad-brief.md`.
+4. **Check named purchasable components.** When an assembly includes named off-the-shelf actuators, servos, motors, electronics boards, connectors, or other purchasable components, search `$step-parts` before creating simplified placeholder geometry. If no exact match is found, record the miss and then use a documented envelope.
+5. **Plan before coding.** Define parameters, intent labels, source paths, expected bounding boxes, and any mating/positioning datums before editing.
+6. **Edit source, not generated artifacts.** Author build123d Python with `gen_step()`, naming a buildable entry generator `<name>.step.py` (helper/library modules stay `<name>.py`; see `references/step-generation.md`). When a Python generator exists, run `scripts/gen` on the generator, never on its exported STEP. Imported STEP/STP files (no generator) need no build step: inspect, snapshot, and the CAD Viewer generate their render artifacts on demand, and `scripts/export` accepts them directly.
+7. **Generate explicit targets.** Run `scripts/gen` on explicit generator targets only; do not run directory-wide generation. Add `--write` when the user needs the `.step` file itself, and use `scripts/export` when they need STL/3MF/GLB mesh files.
+8. **Validate geometrically.** Run `scripts/inspect refs <step-or-cad-target> --facts --planes --positioning` as the baseline, then verify the dimensions and relationships the user's spec calls out with targeted `measure`, `align`, `frame`, or `diff` checks. Run `scripts/inspect validate <step-or-cad-target>` for geometry soundness: `refs --facts` reports counts and bounds, and its `ok` field covers ref resolution only — an open shell and an inverted solid both pass it.
+9. **Snapshot the primary STEP — snapshot validation is mandatory.** After creating or visibly updating a primary STEP/STP part or assembly, ALWAYS run CAD `scripts/snapshot` against it and review the output; deterministic checks passing is not a reason to skip. The only skip cases are documented in `references/snapshot-review.md` (no visible geometry changed, or no valid artifact exists); report the reason when skipping.
+10. **Repair and rerun.** If a check fails, change the smallest responsible source section, regenerate, and rerun the failed validation.
 
-doc.recompute()
-all_shapes = [o for o in doc.Objects if hasattr(o, "Shape")]
-Part.export(all_shapes, r"C:\path\to\existing.step")   # every object, not just the new one
-```
+## Handoff
 
-**"Add to this file" means the real existing geometry stays in the output.**
-Building a fresh box with similar dimensions and calling it done is not the
-same task — the original shape is gone. This is the exact failure mode this
-agent has hit twice already with documents: asked to modify something real,
-it wrote a fresh replacement instead. `Part.insert` then exporting the full
-object list is what makes "add to" actually mean add to.
+After completing CAD work that creates or modifies `.step`, `.stp`, `.stl`, `.3mf`, or native `.glb` artifacts, you must ALWAYS hand the explicit file path(s) to `$cad-viewer` when that skill is installed. `$cad-viewer` must start CAD Viewer if it is not already running and return link(s) to the relevant created or updated file(s); include those live viewer link(s) in the final response. If `$cad-viewer` is unavailable or startup fails, report that and rely on CLI inspection plus snapshots instead of silently omitting the handoff. This rule applies to every workflow in this skill, including secondary STL/3MF/GLB outputs.
 
-## Assemblies (multiple positioned parts, one file)
+When verification snapshots are generated, include the saved PNG/GIF snapshot(s) in the final response. If no snapshot applies, or if snapshot generation fails, say why and report the deterministic validation that still ran.
 
-There is no dedicated Assembly API verified here — build it as several
-`Part::Feature` objects in one document, each given a `Placement` to
-position it, and export the full list together:
+## Non-negotiables
 
-```python
-import FreeCAD, Part
+- Keep STEP as the primary validated CAD artifact. Generated STEP/STP, STL, 3MF, GLB/topology outputs, and render sidecars are derived artifacts; STL/3MF are secondary unless the user explicitly says otherwise.
+- Use named parameters, closed solids, verbose native build123d labels, and source-controlled geometry intent.
+- Author assembly positioning in source. `references/positioning.md` is authoritative for `AssemblyHelper`, build123d joints, explicit `Location` transforms, and alignment validation.
+- Do not use `git status`, `git diff`, or file-size churn as CAD comparison for large exported STEP/STP, GLB/topology, STL, or 3MF artifacts. Compare source changes, `scripts/inspect` summaries, snapshots, or generated topology output instead; use path-limited git status only for bookkeeping.
+- Report only checks that actually ran or are directly supported by tool output.
 
-doc = FreeCAD.newDocument("assembly")
+## Progressive references
 
-base = doc.addObject("Part::Feature", "base")
-base.Shape = Part.makeBox(100, 60, 10)
+Load these files only when their trigger applies:
 
-post = doc.addObject("Part::Feature", "post")
-post.Shape = Part.makeCylinder(8, 40)
-post.Placement = FreeCAD.Placement(FreeCAD.Vector(20, 30, 10), FreeCAD.Rotation())
+- `references/cad-brief.md` — converting prose, reference images, and technical drawings into a CAD brief.
+- `references/build123d-modeling.md` — build123d modeling patterns, topology, selectors, features, labels.
+- `references/step-generation.md` — STEP generation from Python source, direct STEP/STP imports, and post-generation steps.
+- `references/inspection-and-validation.md` — validation sequence, selector refs, facts, planes, measurements, alignment, diff, frame, and validation reporting.
+- `references/snapshot-review.md` — mandatory snapshot policy, packet sizing, targeted views, and converting visual findings into geometry checks.
+- `references/positioning.md` — part-local datums and origins, assembly transforms, build123d joints, CLI alignment validation, and positioning reports.
+- `references/parameters.md` — parameterizing or animating a STEP model: source parameters, JS parameter/animation sidecars declared via gen_step params, viewer controls, and animation design.
+- `references/supported-exports.md` — STL/3MF/native GLB mesh export workflows via `scripts/export`.
+- `references/repair-loop.md` — diagnosis and repair procedures.
 
-doc.recompute()
-all_shapes = [o for o in doc.Objects if hasattr(o, "Shape")]
-Part.export(all_shapes, r"C:\path\to\assembly.step")
-```
-
-`FreeCAD.Placement(position_vector, rotation)` moves an object without
-mutating its base shape — build each part at the origin, then place it,
-rather than baking an offset into the geometry itself.
-
-## What's genuinely unverified past this point
-
-Sketches with constraints, TechDraw drawings (deliberately not part of
-`convert_cad` — see its own refusal message), FEM, and real kinematic
-assemblies (the `Assembly` workbench proper, not just positioned parts) were
-not exercised against a real install when this skill was written. Try the
-straightforward FreeCAD API call, verify the output file exists and looks
-sane via `read_text`, and say plainly if it didn't work rather than
-asserting success on an unread file.
+Final responses should include generated files, returned `$cad-viewer` viewer links, verification snapshots, validation actually run, assumptions, and caveats. Use `references/inspection-and-validation.md` for report structure.
