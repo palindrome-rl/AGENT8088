@@ -2,7 +2,7 @@
 
 [← Wiki index](README.md)
 
-32 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+36 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
 is what the permission layer gates on — see
 [Permissions & Security](03-permissions-and-security.md).
 
@@ -20,6 +20,32 @@ is what the permission layer gates on — see
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url` | prompt | Headless browser — renders JS that curl can't. |
 | `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
+| `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. |
+| `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
+| `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
+| `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
+| `present_plan` | `plan` | `plan` | ✅ | Show a plan as markdown and ask the user to approve it (plan mode's exit point). |
+| `execute_plan` | `plan` | `steps` | ✅ | Run an already-decided sequence of tool calls, verified step by step. |
+| `git_status` | `shell` | — | depends | `git status`. |
+| `git_diff` | `shell` | — | depends | `git diff`. |
+| `git_log` | `shell` | — | depends | `git log`. |
+| `git_clone` | `shell` | `url`, `directory` | prompt | Clone a repo. |
+| `git_commit` | `shell` | `message` | prompt | Commit staged changes. |
+| `git_push` | `shell` | — | **blocked** | Refused at the always-on floor. |
+| `git_create_pr` | `shell` | `title`, `body` | prompt | Open a PR via `gh`. |
+| `view_skill` | `skill` | `name`, `resource` | ✅ | Load one path-confined text resource from an enabled progressive skill. |
+| `cli_anything_status` | `cli_anything` | — | ✅ | Report the isolated CLI-Anything runtime state. |
+| `cli_anything_setup` | `cli_anything` | — | prompt | Install pinned CLI-Hub into its isolated environment. |
+| `cli_anything_list` | `cli_anything` | — | prompt | List the official catalog as JSON. |
+| `cli_anything_search` | `cli_anything` | `query` | prompt | Search the official CLI-Anything catalog. |
+| `cli_anything_info` | `cli_anything` | `name` | prompt | Inspect one catalog entry. |
+| `cli_anything_install` | `cli_anything` | `name` | prompt | Install one approved Python harness at the pinned upstream revision. |
+| `cli_anything_update` | `cli_anything` | `name` | prompt | Reinstall one managed harness at the pinned upstream revision. |
+| `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
+| `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
+| `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
+| `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert an existing CAD file between STEP/IGES/STL/OBJ/BREP/FCStd/DXF via FreeCAD. |
+| `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
 
 `*` optional argument.
 
@@ -46,29 +72,35 @@ only creates new `.docx`/`.xlsx`/`.pptx`.
 key on that mode — the sensitive-file floor, write path zones, plan-only
 blocking, plan-audit revert. Sharing the mode means the tool inherits every one
 of them instead of needing a parallel set that could drift.
-| `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
-| `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
-| `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
-| `present_plan` | `plan` | `plan` | ✅ | Show a plan as markdown and ask the user to approve it (plan mode's exit point). |
-| `execute_plan` | `plan` | `steps` | ✅ | Run an already-decided sequence of tool calls, verified step by step. |
-| `git_status` | `shell` | — | depends | `git status`. |
-| `git_diff` | `shell` | — | depends | `git diff`. |
-| `git_log` | `shell` | — | depends | `git log`. |
-| `git_clone` | `shell` | `url`, `directory` | prompt | Clone a repo. |
-| `git_commit` | `shell` | `message` | prompt | Commit staged changes. |
-| `git_push` | `shell` | — | **blocked** | Refused at the always-on floor. |
-| `git_create_pr` | `shell` | `title`, `body` | prompt | Open a PR via `gh`. |
-| `view_skill` | `skill` | `name`, `resource` | ✅ | Load one path-confined text resource from an enabled progressive skill. |
-| `cli_anything_status` | `cli_anything` | — | ✅ | Report the isolated CLI-Anything runtime state. |
-| `cli_anything_setup` | `cli_anything` | — | prompt | Install pinned CLI-Hub into its isolated environment. |
-| `cli_anything_list` | `cli_anything` | — | prompt | List the official catalog as JSON. |
-| `cli_anything_search` | `cli_anything` | `query` | prompt | Search the official CLI-Anything catalog. |
-| `cli_anything_info` | `cli_anything` | `name` | prompt | Inspect one catalog entry. |
-| `cli_anything_install` | `cli_anything` | `name` | prompt | Install one approved Python harness at the pinned upstream revision. |
-| `cli_anything_update` | `cli_anything` | `name` | prompt | Reinstall one managed harness at the pinned upstream revision. |
-| `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
-| `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
-| `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
+
+## CAD
+
+Reading is automatic: point `read_text` at a `.step`, `.stp`, `.iges`, `.igs`,
+`.stl`, `.obj`, `.brep`, `.dxf` or `.fcstd` and it comes back as a text summary —
+object tree, bounding box, volume, surface area.
+
+`convert_cad` converts between those formats. `create_cad_part` builds a
+primitive (box, cylinder, sphere, cone, tube) from a dimension string like
+`50x30x10` or `r10x50`, with the output format taken from the filename
+extension — no code generation, which is the point: it is the deterministic
+floor for when writing FreeCAD Python defeats the model.
+
+All of it needs **FreeCAD** installed. The Windows installer attempts it via
+WinGet, and `AGENT8088_FREECAD` can point at a portable extraction's
+`freecadcmd.exe` instead — FreeCAD publishes a no-install `.7z` that avoids
+elevation. When it is absent, every CAD path says so and names the install
+command rather than failing obscurely.
+
+PDF is deliberately **not** a `convert_cad` target. Exporting a 3D model to PDF
+means generating a TechDraw drawing — template, projection direction, scale —
+not a format conversion, and the naive page-and-view export that resembles one
+produces an empty sheet.
+
+Both CAD write tools share `mode=write_text` for the same reason
+`create_document` does, and both are excluded from the plan auditor: they verify
+their own output on disk, while the auditor runs in a disposable sandbox copy
+that cannot see the real file, so auditing them yields verdicts from the
+auditor's own blindness.
 
 > `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
 > without a prompt under the native sandbox, escalated under `local`, because
