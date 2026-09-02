@@ -239,6 +239,7 @@ class Session:
         if self.memory_notifications not in {"off", "on", "verbose"}:
             self.memory_notifications = "on"
         self.last_usage = None
+        self.turns_this_run = 0  # reset per run in do_chat; incremented once per model turn by on_calls
 
 
 S = Session()
@@ -692,6 +693,10 @@ def _remember_call_path(call):
 
 
 def on_calls(calls):
+    # Called once per model turn (once per round-trip to the model, regardless
+    # of how many tool calls that turn makes) -- the exact thing "how many turns
+    # did that take" is asking about, distinct from tool-call count.
+    S.turns_this_run += 1
     for call in calls:
         _remember_call_path(call)
     if S.verbose == "off":
@@ -1812,6 +1817,7 @@ def do_chat(query):
     # Filled by the capture thread via the engine hook; read back on this thread.
     memory_stored = []
     A.memory_on_capture = memory_stored.extend
+    S.turns_this_run = 0
     trace = [] if S.show_trace else None
     reasoning_parts = []
     stream = _StreamFilter()
@@ -1927,12 +1933,15 @@ def do_chat(query):
         return
 
     render_answer(answer)
-    S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "context": _estimate_context_pct()}
+    S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "turns": S.turns_this_run,
+                    "context": _estimate_context_pct()}
     if S.usage_mode == "tokens":
-        console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens[/dim]")
+        console.print(f"[dim]{elapsed:.1f}s · {S.turns_this_run} turn{'s' if S.turns_this_run != 1 else ''} · "
+                      f"↑{tokens_ref[0]} tokens[/dim]")
     elif S.usage_mode == "full":
         active = _active_provider_name()
-        console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens · "
+        console.print(f"[dim]{elapsed:.1f}s · {S.turns_this_run} turn{'s' if S.turns_this_run != 1 else ''} · "
+                      f"↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
     _await_memory_capture(memory_stored)
     if trace is not None:

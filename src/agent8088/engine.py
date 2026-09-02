@@ -7563,6 +7563,14 @@ CLI_ANYTHING_MAX_TURNS = 60
 # tuned (or lowered) from config.txt/GUI without a code change; /maxturns still
 # raises it further for the whole session if set higher.
 CAD_GENERATION_MIN_TURNS = int(APP_CONFIG.get("cad_generation_min_turns", "40"))
+# Same dynamic-extension pattern as CLI_ANYTHING_MIN/MAX/EXTENSION_TURNS below,
+# applied to CAD: a run still making real progress at its current limit (last
+# tool call succeeded, per _plan_step_failed) gets more room automatically,
+# rather than dying at CAD_GENERATION_MIN_TURNS the way the three-jaw chuck did
+# mid-build with real repair work outstanding. Harness-decided, not something
+# the model has to ask for -- see the near-limit check in _run_agent_loop.
+CAD_GENERATION_MAX_TURNS = int(APP_CONFIG.get("cad_generation_max_turns", "100"))
+CAD_GENERATION_EXTENSION_TURNS = int(APP_CONFIG.get("cad_generation_extension_turns", "10"))
 CLI_ANYTHING_EXTENSION_TURNS = 5
 # Auto-compact once the estimated context usage crosses this percentage of the
 # active model's context window, checked each turn against that turn's real
@@ -7729,6 +7737,12 @@ def _cad_runtime_instruction(available: set[str] | None = None) -> str:
         "- If a script call fails, read the error and fix the named field/component once. "
         "Do not rewrite the entire design or keep retrying the same broken approach."
     )
+    lines.append(
+        "- Your current turn budget is not a hard stop: if you are still making real "
+        "progress (each call succeeding) when you approach it, more turns are granted "
+        "automatically, up to a higher ceiling. Do not rush validation, skip solids, or "
+        "cut corners to fit an artificial limit -- keep building and validating properly."
+    )
     return "\n".join(lines)
 
 
@@ -7814,7 +7828,13 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
     cad_generation = _cad_generation_requested(messages)
-    hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
+    # Composed rather than if/elif: a turn is never both, but written this way so
+    # a future third dynamic-extension case doesn't have to become a chain.
+    hard_turn_limit = turn_limit
+    if dynamic_cli:
+        hard_turn_limit = max(hard_turn_limit, CLI_ANYTHING_MAX_TURNS)
+    if cad_generation:
+        hard_turn_limit = max(hard_turn_limit, CAD_GENERATION_MAX_TURNS)
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
             break
@@ -8270,11 +8290,15 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed:
             forcing = False
-            if (dynamic_cli and turn + 1 == turn_limit
-                    and turn_limit < hard_turn_limit
-                    and tool_outputs and not _plan_step_failed(tool_outputs[-1])):
+            near_limit = (turn + 1 == turn_limit and turn_limit < hard_turn_limit
+                          and tool_outputs and not _plan_step_failed(tool_outputs[-1]))
+            if dynamic_cli and near_limit:
                 turn_limit = min(
                     turn_limit + CLI_ANYTHING_EXTENSION_TURNS, hard_turn_limit
+                )
+            elif cad_generation and near_limit:
+                turn_limit = min(
+                    turn_limit + CAD_GENERATION_EXTENSION_TURNS, hard_turn_limit
                 )
         elif forcing:
             forced_stop = True
