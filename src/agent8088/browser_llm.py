@@ -13,6 +13,7 @@ import json
 from typing import Any, Optional
 
 from pydantic import ValidationError
+from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.litellm import ChatLiteLLM
 from browser_use.llm.litellm.serializer import LiteLLMMessageSerializer
 from browser_use.llm.schema import SchemaOptimizer
@@ -30,6 +31,60 @@ def _unfence_json_object(content: str) -> str:
     if content[:4].lower() == "json":
         content = content[4:].lstrip()
     return content if content.startswith("{") else original
+
+
+def _first_json_object(content: str) -> str:
+    """Return the first balanced top-level JSON object found in `content`.
+
+    A reasoning model routinely narrates around the object it was asked for:
+    a sentence of preamble before it, a second object after it, or a fence
+    opened mid-message where _unfence_json_object's start-anchored check
+    cannot see it. All three were captured verbatim from Ollama Cloud serving
+    glm-5.2 during real browse_page runs, and each cost a whole retried step
+    because json.loads() rejects the surrounding prose.
+
+    Scanning for the first balanced {...} recovers every one of those shapes.
+    JSON string quoting is honoured so a '}' inside a value does not end the
+    object early. When there is no object at all the input is returned
+    unchanged, so a provider that genuinely answered in prose still raises
+    rather than having a value invented for it.
+    """
+    start = content.find("{")
+    if start < 0:
+        return content
+    depth = 0
+    in_string = escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start:index + 1]
+    return content
+
+
+def _is_empty_structured_content(exc) -> bool:
+    """True for ChatLiteLLM's "provider returned no content" error only.
+
+    ModelProviderError is browser-use's catch-all for provider failures -
+    rate limits, connection resets, HTTP errors - and retrying those through
+    the json_object path would turn one real network failure into two. Only
+    the empty-content case is a formatting problem the fallback can actually
+    fix, so the match stays deliberately narrow.
+    """
+    return "empty content" in str(getattr(exc, "message", exc) or "").lower()
 
 
 def _with_schema_instruction(messages: list, instruction: str) -> list:
@@ -61,22 +116,34 @@ def _with_schema_instruction(messages: list, instruction: str) -> list:
 
 
 def _parse_structured_output(output_format, content: str):
-    content = _unfence_json_object(content)
-    try:
-        return output_format.model_validate_json(content)
-    except ValidationError:
+    # Salvage is strictly a fallback, never a pre-filter: reaching for the
+    # first balanced {...} up front would reduce a valid top-level array to
+    # just its first element. Try what the provider actually sent first.
+    unfenced = _unfence_json_object(content)
+    candidates = [unfenced]
+    salvaged = _first_json_object(unfenced)
+    if salvaged != unfenced:
+        candidates.append(salvaged)
+
+    invalid = None
+    for candidate in candidates:
         try:
-            value = json.loads(content)
-        except json.JSONDecodeError:
-            raise
-        if "action" not in getattr(output_format, "model_fields", {}) or not isinstance(value, dict):
-            raise
-        actions = value.get("action")
-        if actions is not None and (not isinstance(actions, list)
-                                    or any(action for action in actions)):
-            raise
-        value["action"] = []
-        return output_format.model_validate(value)
+            return output_format.model_validate_json(candidate)
+        except ValidationError as exc:
+            invalid = exc
+
+    try:
+        value = json.loads(candidates[-1])
+    except json.JSONDecodeError:
+        raise
+    if "action" not in getattr(output_format, "model_fields", {}) or not isinstance(value, dict):
+        raise invalid
+    actions = value.get("action")
+    if actions is not None and (not isinstance(actions, list)
+                                or any(action for action in actions)):
+        raise invalid
+    value["action"] = []
+    return output_format.model_validate(value)
 
 
 @dataclass
@@ -90,6 +157,17 @@ class Agent8088ChatModel(ChatLiteLLM):
                 raise RuntimeError(over)
         try:
             result = await super().ainvoke(messages, output_format, **kwargs)
+        except ModelProviderError as exc:
+            # Same recovery as the ValidationError case below, for the other
+            # shape the same providers produce: a reasoning model that spends
+            # its whole completion budget on reasoning_content and returns
+            # content="". ChatLiteLLM reports that as ModelProviderError, not
+            # ValidationError, so it used to bypass this fallback entirely and
+            # fail the step - then get retried identically.
+            if output_format is None or not _is_empty_structured_content(exc):
+                raise
+            result = await self._ainvoke_json_object_fallback(
+                messages, output_format, **kwargs)
         except ValidationError:
             # Some OpenAI-compatible providers (observed: Ollama Cloud
             # serving glm-5.2) accept response_format=json_schema without

@@ -25,6 +25,39 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 - stdlib signature
         pass  # silence default request logging to stderr
 
+    def _connect_upstream(self, host, port):
+        """Open the upstream socket to an address the guard has approved.
+
+        Handing a *hostname* to socket.create_connection would resolve it a
+        second time, independently of the resolution the SSRF check just
+        validated - a DNS-rebinding window in which an attacker-controlled
+        record answers "public" for the check and "127.0.0.1" for the
+        connection. So resolve once here and check that exact address before
+        connecting to it.
+
+        Returns (socket, status, message): status is None on success, 403 for
+        an address the guard refused, 502 for a real connectivity failure.
+        """
+        try:
+            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            return None, 502, f"Could not resolve {host}: {exc}"
+
+        last_error = None
+        for family, socktype, proto, _canonname, sockaddr in addresses:
+            blocked = self.server.check_address(host, port, sockaddr[0])
+            if blocked:
+                return None, 403, blocked
+            upstream = socket.socket(family, socktype, proto)
+            try:
+                upstream.settimeout(10)
+                upstream.connect(sockaddr)
+                return upstream, None, ""
+            except OSError as exc:
+                last_error = exc
+                upstream.close()
+        return None, 502, f"Could not connect to {host}:{port}: {last_error}"
+
     def do_CONNECT(self):
         host, _, port_str = self.path.partition(":")
         port = int(port_str or 443)
@@ -32,10 +65,9 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
         if blocked:
             self.send_error(403, blocked)
             return
-        try:
-            upstream = socket.create_connection((host, port), timeout=10)
-        except OSError as exc:
-            self.send_error(502, f"Could not connect to {host}:{port}: {exc}")
+        upstream, status, message = self._connect_upstream(host, port)
+        if upstream is None:
+            self.send_error(status, message)
             return
         self.send_response(200, "Connection Established")
         self.end_headers()
@@ -53,10 +85,9 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
         if not host:
             self.send_error(400, "Malformed request target")
             return
-        try:
-            upstream = socket.create_connection((host, port), timeout=10)
-        except OSError as exc:
-            self.send_error(502, f"Could not connect to {host}:{port}: {exc}")
+        upstream, status, message = self._connect_upstream(host, port)
+        if upstream is None:
+            self.send_error(status, message)
             return
         target = urllib.parse.urlunparse(
             ("", "", parsed.path or "/", parsed.params, parsed.query, ""))
@@ -122,9 +153,11 @@ class _SSRFFilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPSer
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, check_target: Callable[[str], Optional[str]]):
+    def __init__(self, check_target: Callable[[str], Optional[str]],
+                 check_address: Callable[[str, int, str], Optional[str]]):
         super().__init__(("127.0.0.1", 0), _SSRFFilteringHandler)
         self.check_target = check_target
+        self.check_address = check_address
 
     def handle_error(self, request, client_address):
         # Chromium routinely opens and abandons connections (speculative
@@ -143,13 +176,24 @@ class _SSRFFilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPSer
 
 def start_ssrf_filtering_proxy(
     check_target: Callable[[str], Optional[str]],
+    check_address: Optional[Callable[[str, int, str], Optional[str]]] = None,
 ) -> Tuple[str, Callable[[], None]]:
     """Start a loopback-only proxy that runs `check_target(url)` (returning
     None if allowed, else an error string - the same contract as
     _egress_check/_ssrf_check) before forwarding every request.
 
+    `check_address(host, port, ip)` is the second half of that guarantee, and
+    follows the same return contract. The proxy resolves each target once and
+    passes the resolved IP through it before connecting to that exact
+    address, so the check and the connection can never disagree - without it,
+    a hostname was resolved a second time at connect and an attacker-
+    controlled short-TTL record could answer "public" for the check and
+    "127.0.0.1" for the connection. Defaults to refusing nothing, which is
+    only appropriate when the caller has no address policy at all.
+
     Returns (proxy_url, stop_fn). Call stop_fn() to shut the proxy down."""
-    server = _SSRFFilteringProxyServer(check_target)
+    server = _SSRFFilteringProxyServer(
+        check_target, check_address or (lambda host, port, ip: None))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     port = server.server_address[1]

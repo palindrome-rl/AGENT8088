@@ -27,12 +27,19 @@ allowed_paths=.
 
 # --- SSRF protection ---
 # Requests to private/internal addresses are blocked unless the host appears
-# here. Loopback only by default — nothing on your LAN is assumed reachable.
+# here. Empty by default: nothing internal is assumed reachable, not even
+# your own machine.
+#
+# A locally provisioned SearXNG needs no entry — the exact host:port of your
+# search_base_url is allowed automatically when it is on loopback, so
+# web_search reaches it while the rest of localhost (dev servers, admin
+# panels, the Ollama API) stays refused to every tool, browse_page included.
 #
 # To reach a SearXNG on another machine on your network, add its host:port:
-#   ssrf_allow_hosts=127.0.0.1,localhost,192.168.1.10:8888
-# `/search` adds the entry itself when it provisions a local instance.
-ssrf_allow_hosts=127.0.0.1,localhost
+#   ssrf_allow_hosts=192.168.1.10:8888
+# Prefer host:port over a bare host — a bare host opens every port on it, and
+# it also relaxes the browsing agent's own navigation deny-list.
+# ssrf_allow_hosts=
 
 # --- Permission Layer 3: Path-based write restrictions ---
 # Writes to these paths run without a prompt (auto-approved):

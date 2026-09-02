@@ -414,3 +414,114 @@ async def test_the_callers_message_list_is_not_mutated(monkeypatch):
         {"role": "system", "content": "RULES"},
         {"role": "user", "content": "state"},
     ]
+
+
+# ---------------------------------------------------------------------------
+# Salvaging a JSON object out of a reasoning model's prose
+# ---------------------------------------------------------------------------
+# Captured verbatim from Ollama Cloud serving glm-5.2 during a real browse_page
+# run: the model obeys "reply with JSON" but prefixes a sentence of narration,
+# or wraps the object in a fence *after* that narration, or emits a second
+# object after the first. json.loads() rejects all three with the errors seen
+# in the live logs ("Expecting value: line 1 column 1 (char 0)" and "Extra
+# data: line 1 column 27"). browser-use's Agent counts each as a failed step
+# and retries the identical request up to 6 times - so one unparsed byte costs
+# a whole step's worth of latency and tokens. Measured on four live runs:
+# 2-8 wasted LLM round trips per browse_page call.
+
+_PROSE_THEN_OBJECT = (
+    "I have all the information needed from the browser state.\n\n"
+    '{"thinking": "ok", "answer": "The sky is blue."}'
+)
+_PROSE_THEN_FENCED_OBJECT = (
+    "I can see the first three books listed on the page.\n\n"
+    "I have all the information needed to complete the task.```json\n"
+    '{"thinking": "ok", "answer": "The sky is blue."}\n```'
+)
+_OBJECT_THEN_EXTRA_DATA = (
+    '{"thinking": "ok", "answer": "The sky is blue."}'
+    '{"thinking": "again", "answer": "duplicate"}'
+)
+
+
+@pytest.mark.parametrize("content", [
+    _PROSE_THEN_OBJECT,
+    _PROSE_THEN_FENCED_OBJECT,
+    _OBJECT_THEN_EXTRA_DATA,
+])
+def test_a_json_object_buried_in_prose_is_recovered_not_rejected(content):
+    from agent8088.browser_llm import _parse_structured_output
+
+    assert _parse_structured_output(_Output, content) == _Output(
+        thinking="ok", answer="The sky is blue.")
+
+
+def test_prose_with_no_json_object_at_all_still_raises():
+    """Salvage must not paper over a provider that returned no object: that is
+    a genuine failure the caller has to see, not something to invent a value
+    for."""
+    from agent8088.browser_llm import _parse_structured_output
+
+    with pytest.raises(Exception):
+        _parse_structured_output(_Output, "I cannot help with that request.")
+
+
+def test_a_brace_inside_a_string_does_not_end_the_object_early():
+    """The scan has to respect JSON string quoting - a '}' inside a value is
+    not the end of the object."""
+    from agent8088.browser_llm import _parse_structured_output
+
+    content = ('Here you go:\n'
+               '{"thinking": "a } brace and a \\" quote", "answer": "done"}')
+    assert _parse_structured_output(_Output, content) == _Output(
+        thinking='a } brace and a " quote', answer="done")
+
+
+@pytest.mark.asyncio
+async def test_empty_content_for_a_structured_request_also_falls_back(monkeypatch):
+    """A reasoning model can spend its whole completion budget on
+    reasoning_content and return content="". browser-use's ChatLiteLLM raises
+    ModelProviderError (not ValidationError) for that case, so the
+    json_object fallback never fired - the step failed and was retried
+    identically, exactly the pathology the fallback exists to prevent."""
+    from browser_use.llm.exceptions import ModelProviderError
+
+    model = Agent8088ChatModel(model="openai/glm-5.2", budget=None)
+
+    async def fake_super_ainvoke(self, messages, output_format=None, **kwargs):
+        raise ModelProviderError(
+            message="Model returned empty content for structured output request",
+            status_code=500, model="openai/glm-5.2")
+
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fake_super_ainvoke, raising=True)
+
+    async def fake_acompletion(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"thinking": "ok", "answer": "recovered"}'))],
+            usage=SimpleNamespace(prompt_tokens=4, completion_tokens=2),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    result = await model.ainvoke([], output_format=_Output)
+
+    assert result.completion == _Output(thinking="ok", answer="recovered")
+
+
+def test_a_valid_top_level_json_array_is_not_reduced_to_its_first_object():
+    """Salvage must be a fallback, never a pre-filter. Scanning for the first
+    balanced {...} before attempting a straight parse would silently turn a
+    perfectly valid top-level array into just its first element - a
+    correctness regression introduced by the recovery path itself."""
+    from pydantic import RootModel
+
+    from agent8088.browser_llm import _parse_structured_output
+
+    class _Items(RootModel[list[dict]]):
+        pass
+
+    parsed = _parse_structured_output(_Items, '[{"a": 1}, {"b": 2}]')
+
+    assert parsed.root == [{"a": 1}, {"b": 2}]

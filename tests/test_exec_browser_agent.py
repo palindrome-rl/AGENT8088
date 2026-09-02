@@ -352,6 +352,20 @@ def test_noise_filter_drops_the_empty_action_retry_notice():
     assert filt.filter(_log_record("Model still returned empty after retry. Inserting safe noop action.")) is False
 
 
+def test_noise_filter_drops_the_per_step_result_retry_notice():
+    """browser-use logs one of these per failed step, straight to the console,
+    with a red cross - observed 2-8 times in a single successful browse_page
+    run against Ollama Cloud/glm-5.2 while the task still completed and
+    returned the correct answer. Like the empty-action notice above it does
+    not change the outcome, which browse_page already reports through
+    history.is_done(); it just makes a working run look broken."""
+    filt = A._QuietBrowserUseNoiseFilter()
+    assert filt.filter(_log_record(
+        "❌ Result failed 1/6 times: Expecting value: line 1 column 1 (char 0)")) is False
+    assert filt.filter(_log_record(
+        "❌ Result failed 3/6 times: Extra data: line 1 column 27 (char 26)")) is False
+
+
 def test_noise_filter_keeps_security_blocking_warnings():
     """The exact scenario this must never hide: the SSRF deny-list's second
     layer (see the Critical fix) actually refusing a navigation. Losing

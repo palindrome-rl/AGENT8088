@@ -18,6 +18,31 @@ from agent8088 import engine as A
 pytest.importorskip("browser_use")
 
 
+@pytest.fixture(autouse=True)
+def _default_ssrf_posture(monkeypatch):
+    """Pin the SSRF settings these tests reason about, instead of inheriting
+    whatever config.txt the machine running them happens to have.
+
+    _browser_profile_kwargs reads SSRF_ALLOW_HOSTS / SSRF_ALLOW_PRIVATE as
+    module globals baked at import, so without this the security assertions
+    below silently describe the developer's own config rather than the default
+    posture - and six of them failed outright under the config.txt this repo
+    ships. A security test whose verdict depends on ambient configuration
+    cannot be trusted to catch a regression. Tests that specifically exercise
+    an allowlist still monkeypatch these afterwards, which wins over this
+    fixture.
+    """
+    monkeypatch.setattr(A, "SSRF_ALLOW_HOSTS", set(), raising=False)
+    monkeypatch.setattr(A, "SSRF_ALLOW_PRIVATE", False, raising=False)
+    # Same problem, different setting: browser_headless=0 is exactly what a
+    # demo or debugging config sets, and it made the "a real window never
+    # opens" assertions fail on the developer's own machine while passing in
+    # CI. The tests that are *about* the visible-window opt-in set these
+    # themselves after this fixture runs.
+    monkeypatch.setattr(A, "BROWSER_HEADLESS", True, raising=False)
+    monkeypatch.delenv("AGENT8088_BROWSER_HEADLESS", raising=False)
+
+
 def _profile(tmp_path, **overrides):
     """Build a real BrowserProfile from production kwargs and return it.
 

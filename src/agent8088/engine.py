@@ -3409,8 +3409,25 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 # Browser — real page rendering via Playwright (optional dependency)
 # ---------------------------------------------------------------------------
-BROWSER_MAX_STEPS = int(APP_CONFIG.get("browser_max_steps", "500"))
-BROWSER_TASK_TIMEOUT_SECONDS = int(APP_CONFIG.get("browser_task_timeout_seconds", "600"))
+def _int_config(key: str, default: int) -> int:
+    """Parse an integer setting, falling back to `default` on anything else.
+
+    These knobs are read while `import agent8088.engine` is still running, so
+    a bare int() turns one typo in config.txt - a trailing "# comment", an
+    emptied-out value - into a ValueError traceback that kills the CLI, the
+    gateway and the MCP server before any of them start, naming no setting.
+    No browsing knob is worth a dead process: mirror what
+    _browser_max_actions_per_step already does for its own value and fall
+    back to the documented default.
+    """
+    try:
+        return int(str(APP_CONFIG.get(key, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+BROWSER_MAX_STEPS = _int_config("browser_max_steps", 500)
+BROWSER_TASK_TIMEOUT_SECONDS = _int_config("browser_task_timeout_seconds", 600)
 # How many actions the browsing model may batch into one step. Measured on a
 # local 35B: prefill is ~1250 tok/s and llama.cpp prefix-caches the fixed
 # system prompt, but generation is only ~68 tok/s - so a step costs about its
@@ -3455,6 +3472,12 @@ class _QuietBrowserUseNoiseFilter(logging.Filter):
         "Using glob patterns in allowed_domains",
         "Model returned empty action",
         "Model still returned empty after retry",
+        # One per failed step, printed with a red cross straight to the
+        # console. Same reasoning as the empty-action notice: a retried step
+        # says nothing about whether the task succeeded - browse_page reports
+        # that itself via history.is_done() - so all it does is make a run
+        # that returned the correct answer look like it crashed.
+        "Result failed",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -3694,6 +3717,112 @@ def _browser_profile_kwargs(proxy_url: str) -> dict:
     return kwargs
 
 
+_BROWSER_PROFILE_PREFIX = "agent8088-browser-profile-"
+# Well beyond any single browsing call: browser_task_timeout_seconds is itself
+# clamped to max_tool_timeout_seconds (600s by default), so an hour cannot
+# overlap a session that is still legitimately running.
+_BROWSER_PROFILE_MAX_AGE_SECONDS = 3600
+
+
+def _running_browser_processes():
+    """[(pid, ppid, command_line)] for processes on this machine, or [].
+
+    Deliberately a plain `ps` read with no third-party dependency - macOS and
+    Linux both expose the full argument list, including the --user-data-dir
+    that identifies one of our profiles. Windows is not covered (its own
+    uninstall path already walks process trees); the sweep there degrades to
+    removing directories that nothing holds.
+    """
+    if sys.platform == "win32":
+        return []
+    result = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="],
+                            capture_output=True, text=True, timeout=15)
+    processes = []
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+            processes.append((int(fields[0]), int(fields[1]), fields[2]))
+    return processes
+
+
+def _sweep_stale_browser_profiles(root=None, max_age_seconds=None, now=None,
+                                  list_processes=None, terminate=None) -> None:
+    """Reap browser profiles - and browsers - that outlived their session.
+
+    _run_browser_agent removes its own profile in a `finally`, which covers a
+    normal return and a timeout alike, but nothing runs on SIGKILL or a hard
+    crash. What survives is a profile directory plus a Chromium reparented to
+    init that runs until the machine reboots. Found on a real machine: an
+    orphan alive for two days, and nine more from a job killed mid-run, with
+    no code path that would ever look for them.
+
+    What identifies an abandoned browser is **orphanhood, not age**. An
+    orphan keeps writing to its profile, so the directory's mtime is
+    refreshed continuously and never gets old - the first cut of this sweep
+    keyed on mtime and would have skipped every live orphan forever. This
+    code always outlives the browser it launches, so ppid == 1 means the
+    launching process is gone and the browser is abandoned by definition.
+
+    Directory age is still the rule for *directories*, where it is the right
+    question: an old directory that no live process holds is pure litter.
+    A directory that is still held is left alone however old it is, so a
+    long-running session is never sabotaged.
+
+    Only paths carrying our own mkdtemp prefix are ever considered, so an
+    ordinary Chrome the user is browsing with cannot match. The process seams
+    are injected so tests exercise the matching rules without enumerating or
+    signalling anything real.
+    """
+    root = Path(root) if root is not None else Path(tempfile.gettempdir())
+    max_age = (_BROWSER_PROFILE_MAX_AGE_SECONDS if max_age_seconds is None
+               else max_age_seconds)
+    now = time.time() if now is None else now
+    list_processes = list_processes or _running_browser_processes
+    terminate = terminate or (lambda pid: os.kill(pid, signal.SIGTERM))
+    log = logging.getLogger(__name__)
+
+    try:
+        profiles = [path for path in root.glob(f"{_BROWSER_PROFILE_PREFIX}*")
+                    if path.is_dir()]
+    except OSError as e:
+        log.debug("browse_page: could not scan for stale profiles: %s", e)
+        return
+    if not profiles:
+        return
+
+    try:
+        processes = list(list_processes())
+    except Exception as e:  # noqa: BLE001 - cleanup must never fail a task
+        log.debug("browse_page: could not enumerate processes: %s", e)
+        processes = []
+
+    abandoned = set()
+    held = set()
+    for pid, ppid, command in processes:
+        for path in profiles:
+            if str(path) not in command:
+                continue
+            if ppid == 1:
+                abandoned.add(path)
+                try:
+                    terminate(pid)
+                    log.debug("browse_page: reaped orphaned browser pid %s", pid)
+                except Exception as e:  # noqa: BLE001 - already gone, or not ours
+                    log.debug("browse_page: could not signal pid %s: %s", pid, e)
+            else:
+                held.add(path)
+
+    for path in profiles:
+        if path in held:
+            continue
+        try:
+            expired = now - path.stat().st_mtime > max_age
+        except OSError:
+            continue
+        if path in abandoned or expired:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def _playwright_available() -> bool:
     try:
         import playwright.sync_api  # noqa: F401
@@ -3740,12 +3869,20 @@ async def _run_browser_agent(url: str, task: str, executable_path: str | None = 
     from agent8088.browser_proxy import start_ssrf_filtering_proxy
 
     proxy_url, stop_proxy = start_ssrf_filtering_proxy(
-        lambda target_url: _egress_check(target_url) or _ssrf_check(target_url))
+        lambda target_url: _egress_check(target_url) or _ssrf_check(target_url),
+        check_address=_browser_address_check)
     # Left unset, BrowserProfile's own field validator silently mkdtemp()s a
     # user-data-dir under the OS temp dir - and browser-use's cleanup code
     # only recognizes a different temp-dir prefix, so that directory is never
     # removed. Owning the path here means it can actually be deleted below.
-    user_data_dir = tempfile.mkdtemp(prefix="agent8088-browser-profile-")
+    # Before adding one more profile, clear out any left behind by a session
+    # that was killed outright - along with the browser still holding it.
+    try:
+        _sweep_stale_browser_profiles()
+    except Exception as e:  # noqa: BLE001 - never let cleanup fail the task
+        logging.getLogger(__name__).debug(
+            "browse_page: stale-profile sweep skipped: %s", e)
+    user_data_dir = tempfile.mkdtemp(prefix=_BROWSER_PROFILE_PREFIX)
     agent = None
     try:
         llm = build_browser_chat_model(
@@ -6739,6 +6876,58 @@ SSRF_ALLOW_HOSTS = {h.strip().lower()
                     for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
                     if h.strip()}
 
+
+def _local_search_allowance(base_url: str) -> set:
+    """{"host:port"} for a self-hosted search endpoint on loopback, else {}.
+
+    web_search's SearXNG backend runs on 127.0.0.1 (searxng_provision
+    publishes the container to loopback only), so _ssrf_check would refuse it
+    like any other internal address. config.txt used to solve that by
+    shipping `ssrf_allow_hosts=127.0.0.1,localhost` - which handed *every*
+    tool a pass to *every* service on the user's machine: a local dev server,
+    an admin panel, the Ollama API on 11434. It also disabled
+    block_ip_addresses for the browsing profile, since browser-use refuses to
+    combine that flag with an allowlist.
+
+    Scoping the pass to the exact host:port the operator's own
+    search_base_url names keeps web_search working - `/search setup` writes
+    that key, so a non-default searxng_host_port is followed automatically -
+    while leaving every other loopback port refused.
+
+    Only loopback is granted automatically. A SearXNG on the LAN
+    (192.168.x.y) is a real network hop and still needs an explicit
+    ssrf_allow_hosts entry, exactly as it did before.
+    """
+    import ipaddress
+    import socket
+    import urllib.parse
+
+    raw = str(base_url or "").strip()
+    if not raw:
+        return set()
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        host, port = (parsed.hostname or "").lower(), parsed.port
+    except Exception:
+        return set()
+    # A port is required: the pass has to be narrower than "this whole host".
+    if not host or not port:
+        return set()
+    try:
+        addresses = socket.getaddrinfo(host, port)
+    except Exception:
+        return set()
+    try:
+        if not all(ipaddress.ip_address(info[4][0]).is_loopback
+                   for info in addresses):
+            return set()
+    except Exception:
+        return set()
+    return {f"{host}:{port}"}
+
+
+_SEARCH_ALLOW_HOSTS = _local_search_allowance(APP_CONFIG.get("search_base_url", ""))
+
 # --- Egress domain policy ---
 # _ssrf_check blocks INTERNAL addresses; this bounds which PUBLIC hosts the
 # agent may reach. Empty allowlist = allow all (unchanged default). The
@@ -6792,18 +6981,69 @@ def _ssrf_check(url: str):
             ip = ipaddress.ip_address(info[4][0])
         except Exception:
             return "Blocked: unresolvable address."
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return (f"Blocked: '{host}' resolves to internal address {ip}. "
-                    "Requests to private/loopback/link-local networks are not allowed.")
+        if _ip_is_internal(ip):
+            return _internal_address_refusal(host, ip)
+    return None
+
+
+def _ip_is_internal(ip) -> bool:
+    """True for an address the agent must never be steered into reaching.
+
+    Shared by _ssrf_check (which resolves a hostname) and
+    _browser_address_check (which validates one already-resolved address), so
+    the two can never drift into disagreeing about what counts as internal.
+    """
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _internal_address_refusal(host: str, ip) -> str:
+    return (f"Blocked: '{host}' resolves to internal address {ip}. "
+            "Requests to private/loopback/link-local networks are not allowed.")
+
+
+def _browser_address_check(host: str, port: int, ip: str):
+    """Vet the exact address the browsing proxy is about to connect to.
+
+    _ssrf_check answers "is this hostname safe" by resolving it; this answers
+    "is this specific address safe", so the proxy can connect to the very
+    address that was approved instead of resolving the name a second time.
+    Without that pairing there is a DNS-rebinding window: a short-TTL record
+    under an attacker's control answers with a public IP for the check and
+    with 127.0.0.1 for the connection, and the body of a private service
+    comes back to the browsing agent. Same return contract as _ssrf_check -
+    None to allow, else the refusal string.
+    """
+    import ipaddress
+
+    if SSRF_ALLOW_PRIVATE:
+        return None
+    if _ssrf_host_allowlisted(host, port):
+        return None
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return f"Blocked: '{host}' resolved to an unusable address."
+    if _ip_is_internal(address):
+        return _internal_address_refusal(host, address)
     return None
 
 
 def _ssrf_host_allowlisted(host: str, port: int | None = None) -> bool:
-    """Match the narrow SSRF allowlist without performing DNS."""
+    """Match the narrow SSRF allowlist without performing DNS.
+
+    Two sources, deliberately kept apart: the operator's own
+    ssrf_allow_hosts, and the loopback search endpoint derived from
+    search_base_url (see _local_search_allowance). Only the operator's list
+    relaxes the *browsing* deny-list in _browser_profile_kwargs - the search
+    endpoint is for web_search, and browse_page has no business reaching it.
+    """
     host = (host or "").lower()
-    return bool(host and (host in SSRF_ALLOW_HOSTS or
-                          (port and f"{host}:{port}" in SSRF_ALLOW_HOSTS)))
+    if not host:
+        return False
+    if host in SSRF_ALLOW_HOSTS or (port and f"{host}:{port}" in SSRF_ALLOW_HOSTS):
+        return True
+    return bool(port) and f"{host}:{port}" in _SEARCH_ALLOW_HOSTS
 
 
 def _host_matches(host: str, domain: str) -> bool:

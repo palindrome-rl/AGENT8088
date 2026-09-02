@@ -129,3 +129,106 @@ def test_plain_http_delete_patch_options_are_forwarded_not_rejected_as_unsupport
         assert resp.status == 403
     finally:
         stop()
+
+
+# ---------------------------------------------------------------------------
+# DNS rebinding
+# ---------------------------------------------------------------------------
+def test_a_host_that_rebinds_to_loopback_after_the_check_is_refused():
+    """The check and the connection must agree on one address.
+
+    _ssrf_check resolves the hostname to decide whether it is internal, and
+    the proxy then opened its upstream socket by *hostname* - a second,
+    independent resolution. A short-TTL attacker record can answer "public"
+    for the check and "127.0.0.1" a moment later for the connection, which
+    handed the browsing agent the body of a private service. Verified as a
+    working bypass before this test existed, against a real local server.
+    """
+    import http.server
+    import socket
+    import threading
+    import urllib.request
+
+    from agent8088 import engine as A
+
+    class _Secret(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"INTERNAL SECRET"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    victim = http.server.HTTPServer(("127.0.0.1", 0), _Secret)
+    threading.Thread(target=victim.serve_forever, daemon=True).start()
+    victim_port = victim.server_address[1]
+
+    rebind_host = "rebind.attacker.invalid"
+    real_getaddrinfo = socket.getaddrinfo
+    resolutions = []
+
+    def rebinding_getaddrinfo(host, port, *args, **kwargs):
+        if host != rebind_host:
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        resolutions.append(host)
+        # First answer public, every later one loopback.
+        ip = "93.184.216.34" if len(resolutions) == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 80))]
+
+    socket.getaddrinfo = rebinding_getaddrinfo
+    proxy_url, stop = start_ssrf_filtering_proxy(
+        lambda url: A._egress_check(url) or A._ssrf_check(url),
+        check_address=A._browser_address_check,
+    )
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url}))
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            opener.open(f"http://{rebind_host}:{victim_port}/", timeout=10)
+        assert excinfo.value.code == 403
+        assert "INTERNAL SECRET" not in excinfo.value.read().decode(errors="replace")
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+        stop()
+        victim.shutdown()
+
+
+def test_an_ordinary_public_host_is_still_connected_to_the_address_checked():
+    """Pinning must not break the normal path: a public hostname still
+    resolves, passes, and connects."""
+    import socket
+    import threading
+
+    from agent8088 import engine as A
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    seen = []
+
+    def accept_once():
+        conn, _ = server.accept()
+        seen.append(conn.recv(1024))
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+        conn.close()
+
+    threading.Thread(target=accept_once, daemon=True).start()
+
+    # Allowlist this loopback endpoint the way an operator would, so the
+    # public-path logic is exercised without leaving the machine.
+    proxy_url, stop = start_ssrf_filtering_proxy(
+        lambda url: None, check_address=lambda host, prt, ip: None)
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url}))
+        response = opener.open(f"http://127.0.0.1:{port}/", timeout=10)
+        assert response.read() == b"hi"
+        assert seen and b"GET /" in seen[0]
+    finally:
+        stop()
+        server.close()
