@@ -44,8 +44,6 @@ is what the permission layer gates on — see
 | `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
 | `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
 | `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
-| `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert an existing CAD file between STEP/IGES/STL/OBJ/BREP/FCStd/DXF via FreeCAD. |
-| `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
 
 `*` optional argument.
 
@@ -72,35 +70,6 @@ only creates new `.docx`/`.xlsx`/`.pptx`.
 key on that mode — the sensitive-file floor, write path zones, plan-only
 blocking, plan-audit revert. Sharing the mode means the tool inherits every one
 of them instead of needing a parallel set that could drift.
-
-## CAD
-
-Reading is automatic: point `read_text` at a `.step`, `.stp`, `.iges`, `.igs`,
-`.stl`, `.obj`, `.brep`, `.dxf` or `.fcstd` and it comes back as a text summary —
-object tree, bounding box, volume, surface area.
-
-`convert_cad` converts between those formats. `create_cad_part` builds a
-primitive (box, cylinder, sphere, cone, tube) from a dimension string like
-`50x30x10` or `r10x50`, with the output format taken from the filename
-extension — no code generation, which is the point: it is the deterministic
-floor for when writing FreeCAD Python defeats the model.
-
-All of it needs **FreeCAD** installed. The Windows installer attempts it via
-WinGet, and `AGENT8088_FREECAD` can point at a portable extraction's
-`freecadcmd.exe` instead — FreeCAD publishes a no-install `.7z` that avoids
-elevation. When it is absent, every CAD path says so and names the install
-command rather than failing obscurely.
-
-PDF is deliberately **not** a `convert_cad` target. Exporting a 3D model to PDF
-means generating a TechDraw drawing — template, projection direction, scale —
-not a format conversion, and the naive page-and-view export that resembles one
-produces an empty sheet.
-
-Both CAD write tools share `mode=write_text` for the same reason
-`create_document` does, and both are excluded from the plan auditor: they verify
-their own output on disk, while the auditor runs in a disposable sandbox copy
-that cannot see the real file, so auditing them yields verdicts from the
-auditor's own blindness.
 
 > `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
 > without a prompt under the native sandbox, escalated under `local`, because

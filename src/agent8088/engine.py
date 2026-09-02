@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cad, cli_anything, documents, memory, web_search
+from agent8088 import cli_anything, documents, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -2738,7 +2738,7 @@ _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 # noise that costs a model call and tokens, and on a `fail` verdict can revert
 # correct work. Excluded here: convert_document checks output_path.exists() and
 # the byte count itself; there is no model-authored logic to second-guess.
-_NON_AUDITABLE_TOOLS = {"convert_document", "convert_cad", "create_cad_part"}
+_NON_AUDITABLE_TOOLS = {"convert_document"}
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
 
 
@@ -5320,12 +5320,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # auditor's larger result allowance, which _tool_result_for_model keys
         # on the literal name "read_text".
         text = documents.extract_text(read_target, MAX_DOCUMENT_BYTES)
-        if text is None:
-            # CAD files get the same treatment and for the same reason: reading
-            # one here inherits the whole chain above rather than needing a
-            # read_cad tool that would have to re-implement it.
-            text = cad.extract_info(read_target)
-        if text is None:  # neither — read it as ordinary text
+        if text is None:  # not a document — read it as ordinary text
             text = _read_text_limited(read_target)
         return _strip_special_tokens(_paginate_read(text, args, read_target))
 
@@ -5347,21 +5342,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # means it cannot skip any of them; only the bytes-on-disk step differs.
         if name == "create_document":
             result = documents.build_document(target, content)
-            _last_write_diff = None  # binary output — a text diff would be noise
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "convert_cad":
-            result = cad.convert_cad(target, str(args.get("format", "")))
-            _last_write_diff = None  # binary output — a text diff would be noise
-            if shadowed is not None:
-                result += (f" — NOT {shadowed}. A bare filename is stored in "
-                           f"artifacts/; pass that absolute path instead.")
-            return result
-        if name == "create_cad_part":
-            result = cad.create_cad_part(target, str(args.get("shape", "")),
-                                         str(args.get("dimensions", "")))
             _last_write_diff = None  # binary output — a text diff would be noise
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
