@@ -175,7 +175,6 @@ that get merged into the agent's context.
 | `spike` | workflow |
 | `humanizer` | creative |
 | `simplify-code` | software-development |
-| `cad` | software-development |
 
 Loaded skills appear in the system prompt under `## Installed skills`, and in
 `/status`.

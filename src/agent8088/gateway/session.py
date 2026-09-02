@@ -22,7 +22,8 @@ class SessionStore:
     """Per-chat JSON session files."""
 
     def __init__(self, base_dir: str = None):
-        self.dir = Path(base_dir or "~/.agent8088/gateway-sessions").expanduser()
+        home = Path(os.environ.get("AGENT8088_HOME", "~/.agent8088")).expanduser()
+        self.dir = Path(base_dir).expanduser() if base_dir else home / "gateway-sessions"
         self.dir.mkdir(parents=True, exist_ok=True)
         if os.name != "nt":
             os.chmod(self.dir, 0o700)

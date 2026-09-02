@@ -5268,12 +5268,25 @@ def _exec_cron(args: dict) -> str:
         return _exec_windows_cron(action, schedule, task, fields)
 
     def read_crontab():
-        result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True, timeout=20)
-        return "" if result.returncode else result.stdout
+        try:
+            result = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, f"Cron unavailable: {exc}"
+        return ("" if result.returncode else result.stdout), None
+
+    def write_crontab(payload):
+        try:
+            return subprocess.run(
+                ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20), None
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, f"Cron unavailable: {exc}"
 
     if action == "list":
-        entries = [line for line in read_crontab().splitlines() if _CRON_MARKER in line]
+        current, error = read_crontab()
+        if error:
+            return error
+        entries = [line for line in current.splitlines() if _CRON_MARKER in line]
         return "\n".join(entries) or "No scheduled tasks."
 
     if action == "add":
@@ -5284,22 +5297,29 @@ def _exec_cron(args: dict) -> str:
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
                  f"AGENT8088_UNATTENDED=1 "
                  f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
-        current = read_crontab()
+        current, error = read_crontab()
+        if error:
+            return error
         payload = current + ("" if not current or current.endswith("\n") else "\n") + entry + "\n"
-        result = subprocess.run(
-            ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20)
+        result, error = write_crontab(payload)
+        if error:
+            return error
         return f"Scheduled: {schedule}" if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     if action == "remove":
         quoted_task = shlex.quote(task)
+        current, error = read_crontab()
+        if error:
+            return error
         payload = "\n".join(
-            line for line in read_crontab().splitlines()
+            line for line in current.splitlines()
             if not (_CRON_MARKER in line and quoted_task in line)
         )
         if payload:
             payload += "\n"
-        result = subprocess.run(
-            ["crontab", "-"], input=payload, capture_output=True, text=True, timeout=20)
+        result, error = write_crontab(payload)
+        if error:
+            return error
         return "Removed." if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     raise AssertionError(f"Unhandled cron action: {action}")
@@ -5873,12 +5893,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # auditor's larger result allowance, which _tool_result_for_model keys
         # on the literal name "read_text".
         text = documents.extract_text(read_target, MAX_DOCUMENT_BYTES)
-        if text is None:
-            # CAD files get the same treatment and for the same reason: reading
-            # one here inherits the whole chain above rather than needing a
-            # read_cad tool that would have to re-implement it.
-            text = cad.extract_info(read_target)
-        if text is None:  # neither — read it as ordinary text
+        if text is None:  # not a document — read it as ordinary text
             text = _read_text_limited(read_target)
         return _strip_special_tokens(_paginate_read(text, args, read_target))
 

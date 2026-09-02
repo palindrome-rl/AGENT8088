@@ -45,16 +45,7 @@ is what the permission layer gates on — see
 | `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
 | `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
 | `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
-| `convert_cad` | `write_text` | `filename`, `format` | prompt | Convert a supported solid CAD file through the isolated build123d runtime. |
-| `create_cad_part` | `write_text` | `filename`, `shape`, `dimensions` | prompt | Build a box/cylinder/sphere/cone/tube from dimensions. No code needed. |
-| `generate_cad_design` | `write_text` | `filename`, `design`, `formats` | prompt | Compile bounded declarative JSON to a validated STEP-first model and preview. |
-| `generate_cad_model` | `write_text` | `filename`, `source`, `parameters`, `formats` | prompt | Generate a parameterized STEP-first model, validate it, and render a preview. |
-| `cad_project_create` | `write_text` | `filename`, `name`, `parameters`, `verification`, `formats` | prompt | Start or safely resume a checkpointed complex-assembly project. |
-| `cad_project_add_component` | `write_text` | `filename`, `name`, `source`, `parameters`, `verification` | prompt | Generate, reopen, validate, and checkpoint exactly one component. |
-| `cad_project_finalize` | `write_text` | `filename`, `assembly`, `formats` | prompt | Assemble validated components from bounded placements and verify the result. |
-| `cad_project_status` | `read_text` | `filename` | ✅ | Read compact project progress without loading component source. |
-| `validate_cad_model` | `write_text` | `filename`, `render` | prompt | Reopen and validate a STEP model and optionally render an isometric preview. |
-| `open_cad_viewer` | `read_text` | `filename`, `open_browser` | âœ… | Open a supported artifact in the managed loopback text-to-cad Viewer. |
+| `open_cad_viewer` | `read_text` | `filename`, `open_browser` | ✅ | Open a supported artifact in the managed loopback CAD Viewer. |
 
 `*` optional argument.
 
@@ -84,68 +75,20 @@ of them instead of needing a parallel set that could drift.
 
 ## CAD
 
-Reading is automatic for STEP, BREP, and STL. The isolated CAD worker reopens
-the artifact and reports its bounding box, solid count, volume, and topology
-validity rather than interpreting it as text.
+The bundled `cad` skill drives Build123d and text-to-cad through its versioned
+scripts under `skills_installed/cad/scripts/`; it is not a second set of
+registered CAD tools. The normal workflow writes a `gen_step()` source file,
+then uses the skill's `gen`, `inspect`, `export`, and `snapshot` scripts to
+create and validate STEP-first artifacts.
 
-`create_cad_part` is the structured, no-code path for one box, cylinder, sphere,
-cone, or tube. `generate_cad_design` is preferred for individual parts: it
-receives a native structured object and compiles a bounded,
-type-checked schema with parameters, named components, placements, fusions,
-cuts, and request-derived dimensional checks. `generate_cad_model` remains the
-single-part Python escape hatch for build123d operations outside that exact schema.
-Multi-component, robotic, architectural, movable, and otherwise complex
-assemblies use `cad_project_create`, then exactly one
-`cad_project_add_component` per model response, followed by
-`cad_project_finalize`. Component STEP files and validation reports are
-checkpointed, so an output cutoff or failed part repairs only that part instead
-of discarding the whole design. Finalization accepts placements rather than
-generated source, reloads every verified component, and independently checks
-the completed assembly. `cad_project_status` makes interrupted work resumable.
-text-to-cad/cadgen supplies STEP-first generation/export, per-solid topology
-validation, and preview rendering in both workflows. Volumetric assembly
-overlap is rejected independently, while touching mating faces remain valid and
-are not mislabeled as a self-intersecting body. Secondary exports are withheld
-when the STEP misses a declared dimension/count or has interference. The tools
-retain design/source, parameters, STEP, report, preview, and verified
-STL/3MF/GLB/BREP exports. `validate_cad_model`
-can repeat the reopen, topology, interference, and render checks later.
+`read_text` automatically inspects supported STEP/STP files through the
+isolated CAD runtime. `open_cad_viewer` is the only built-in CAD-specific tool:
+it opens STEP/STP, STL, 3MF, GLB, or DXF artifacts in a managed Viewer bound
+only to `127.0.0.1`.
 
-During a CAD-generation turn, generic shell and file-writing tools are removed
-from the model-visible tool set. The agent receives the real artifacts location,
-uses a bare output filename, and executes only one project checkpoint operation
-per model response. If a response reaches the provider's output ceiling, its
-unusable partial source is discarded and the retry is routed to the staged
-project workflow without pretending the model supports a larger limit. This
-avoids shell path guessing, repeated approval loops, and unbounded source
-rewrites consuming the model's time or token budget.
-
-`open_cad_viewer` complements deterministic validation with interactive review
-of STEP/STP, STL, 3MF, GLB, and DXF artifacts. The managed text-to-cad Viewer
-provides an assembly tree, part visibility/focus, display and clipping modes,
-exploded layouts, annotations, screenshots, and interactive measurements. Its
-server binds only to `127.0.0.1`, receives only the artifact directory, and is
-started through the guarded tool rather than shell-generated commands. The
-prebuilt Viewer is installed from a commit- and checksum-pinned upstream
-archive; development/npm sources are not executed. STEP remains authoritative
-because measurements on triangulated formats snap to mesh vertices.
-
-Both upstream engines are pinned in a dedicated Python 3.11
-`integrations/cad/venv` environment installed on a best-effort basis by both
-platform installers. The same stage installs and smoke-tests the pinned Viewer. A
-CAD-stage failure never blocks the core agent, and `/doctor` reports whether
-the exact runtime versions are ready. Native `.FCStd` feature trees are not
-created; validated STEP is the canonical editable interchange artifact.
-
-PDF is deliberately **not** a `convert_cad` target. A useful 3D-to-PDF result
-requires a drawing definition (template, projection, dimensions, and scale),
-not a format conversion.
-
-All CAD write tools share `mode=write_text` for the same reason
-`create_document` does, and all are excluded from the plan auditor: they verify
-their own output on disk, while the auditor runs in a disposable sandbox copy
-that cannot see the real file, so auditing them yields verdicts from the
-auditor's own blindness.
+The optional Build123d/text-to-cad runtime and Viewer run in a dedicated Python
+3.11 environment. Installation is best effort, so failure never blocks the
+core agent; `/doctor` reports whether the exact runtime is ready.
 
 > `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
 > without a prompt under the native sandbox, escalated under `local`, because

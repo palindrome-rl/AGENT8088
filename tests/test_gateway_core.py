@@ -22,6 +22,11 @@ def test_gateway_session_round_trip_handles_windows_unsafe_key(tmp_path):
     assert store.load(key) == []
 
 
+def test_gateway_sessions_honor_agent_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    assert SessionStore().dir == tmp_path / "gateway-sessions"
+
+
 def test_gateway_allowlist_keeps_platform_identities_scoped():
     allowlist = Allowlist.from_config({
         "slack_allowed_users": "U123",
