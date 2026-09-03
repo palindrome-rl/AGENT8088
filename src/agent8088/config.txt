@@ -113,6 +113,9 @@ timeout_seconds=120
 # Global fallbacks when no per-provider value is set:
 # context_window=32768
 # max_completion_tokens=8192
+# Automatically summarize older conversation messages when estimated context
+# usage crosses this percentage. Set to 0 to disable.
+# compaction_threshold_pct=75
 
 # --- display ---
 # Pygments theme for the code the agent reads and writes: file listings, diffs
