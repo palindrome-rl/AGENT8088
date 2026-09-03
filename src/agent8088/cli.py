@@ -3453,15 +3453,16 @@ def _cmd_fusion_setup(_rest):
         max_panel = max(1, int(current_max) if current_max.isdigit() else 6)
 
     console.print(f"[dim]Providers with a working key: {', '.join(available)}[/dim]")
-    chosen = _multi_choice_prompt(
-        "Panel providers (check none to keep auto-discovering, up to the max above):",
-        available)
+    # Count per provider, picked inline in one list: a provider left at 0 is
+    # simply not on the panel, and `ollama-cloud(2)` fills two slots with the
+    # same model. The cap is enforced during selection (max_total) so the count
+    # can't be pushed past it, rather than silently truncating afterwards.
+    counted = _counted_choice_prompt(
+        "Panel providers (leave all at 0 to keep auto-discovering):",
+        available, max_total=max_panel)
 
-    # A provider can contribute more than one panel slot (same model, counted
-    # more than once for extra votes), so the max-panel-size cap has to be
-    # enforced on the flattened spec list below, not on the provider count here.
     panel_specs = []
-    for provider in chosen:
+    for provider, count in counted:
         models = _fetch_models_for_provider(provider)
         default_model = A.PROVIDERS[provider].get("model", "")
         if models:
@@ -3470,7 +3471,6 @@ def _cmd_fusion_setup(_rest):
             model = default_model if choice.startswith("(default)") else choice
         else:
             model = _custom_prompt(f"Model for {provider}:", default=default_model)
-        count = _count_prompt(f"Panel slots for {provider} (same model, extra votes):", default=1)
         spec = f"{provider}:{model}" if model else provider
         panel_specs.extend([spec] * count)
 
@@ -4463,39 +4463,90 @@ def _multi_choice_prompt(message, choices, checked=()):
         return picked
 
 
-def _count_prompt(message, default=1, min_allowed=1):
-    """Numeric spinner — left/right (and up/down) arrows adjust the value,
-    enter confirms. Falls back to a plain numeric text prompt on a
-    non-interactive terminal, same convention as _choice_prompt/_multi_choice_prompt."""
+def _counted_choice_prompt(message, choices, max_total=None):
+    """One list where each row carries its own count: up/down moves between
+    rows, LEFT increases that row's count, RIGHT decreases it, enter confirms.
+    A row at 0 is simply not selected, so this replaces a checkbox instead of
+    sitting next to one -- `ollama-cloud(2)` means that provider fills two
+    panel slots.
+
+    InquirerPy has no widget for this (its checkbox is a boolean toggle and its
+    number prompt is a standalone single field), so this is a small
+    prompt_toolkit Application. Returns [(choice, count), ...] for count >= 1,
+    in list order.
+    """
+    counts = {c: 0 for c in choices}
     try:
-        from InquirerPy import inquirer
-        # InquirerPy's number prompt binds left/right to CURSOR MOVEMENT within
-        # the digit field, not increment/decrement -- only up/down change the
-        # value out of the box. Confirmed live with simulated keypresses (not
-        # assumed): left/right alone left the value unchanged. Remapping left
-        # onto the "up" (increment) action and right onto "down" (decrement),
-        # and clearing the original left/right entries so the physical key
-        # isn't claimed by two actions at once -- verified with real simulated
-        # arrow presses that this produces exactly the left=increase,
-        # right=decrease behavior asked for, while up/down still work too.
-        return int(inquirer.number(
-            message=message, default=default, min_allowed=min_allowed,
-            max_allowed=None, float_allowed=False,
-            keybindings={
-                "up": [{"key": "up"}, {"key": "left"}],
-                "down": [{"key": "down"}, {"key": "right"}],
-                "left": [],
-                "right": [],
-            },
-        ).execute())
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout, HSplit, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+
+        state = {"cursor": 0}
+
+        def render():
+            total = sum(counts.values())
+            head = f"? {message}"
+            if max_total:
+                head += f"  [{total}/{max_total}]"
+            lines = [("bold", head + "\n"),
+                     ("", "  (↑↓ move  ← more  → fewer  enter confirm)\n")]
+            for index, choice in enumerate(choices):
+                count = counts[choice]
+                pointer = "❯ " if index == state["cursor"] else "  "
+                label = f"{choice}({count})" if count else choice
+                style = "class:sel" if index == state["cursor"] else ("bold" if count else "")
+                lines.append((style, f"{pointer}{label}\n"))
+            return lines
+
+        kb = KeyBindings()
+
+        @kb.add("up")
+        def _(event):
+            state["cursor"] = (state["cursor"] - 1) % len(choices)
+
+        @kb.add("down")
+        def _(event):
+            state["cursor"] = (state["cursor"] + 1) % len(choices)
+
+        @kb.add("left")
+        def _(event):
+            choice = choices[state["cursor"]]
+            if max_total and sum(counts.values()) >= max_total:
+                return
+            counts[choice] += 1
+
+        @kb.add("right")
+        def _(event):
+            choice = choices[state["cursor"]]
+            if counts[choice] > 0:
+                counts[choice] -= 1
+
+        @kb.add("enter")
+        def _(event):
+            event.app.exit()
+
+        @kb.add("c-c")
+        def _(event):
+            event.app.exit(exception=KeyboardInterrupt)
+
+        Application(
+            layout=Layout(HSplit([Window(FormattedTextControl(render), always_hide_cursor=True)])),
+            key_bindings=kb, full_screen=False,
+        ).run()
+        return [(c, counts[c]) for c in choices if counts[c] > 0]
     except (ImportError, EOFError, OSError, KeyboardInterrupt):
-        value = input(f"{message} [{default}]: ").strip()
+        print(message)
+        for index, choice in enumerate(choices, 1):
+            print(f"  {index}. {choice}")
+        value = input("Numbers, comma-separated (repeat for extra slots, blank = none): ").strip()
         if not value:
-            return default
-        try:
-            return max(min_allowed, int(value))
-        except ValueError:
-            return default
+            return []
+        for part in value.split(","):
+            part = part.strip()
+            if part.isdigit() and 1 <= int(part) <= len(choices):
+                counts[choices[int(part) - 1]] += 1
+        return [(c, counts[c]) for c in choices if counts[c] > 0]
 
 
 def _configure_custom_models_endpoint():
