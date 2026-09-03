@@ -27,8 +27,8 @@ def test_cli_anything_skill_reaches_the_model_without_ordinary_tool_truncation(e
 
 
 def test_cli_anything_read_can_repeat_after_a_state_change(monkeypatch, engine):
-    info = {"name": "freecad", "arguments": ["part", "info", "0"], "cwd": "."}
-    mutate = {"name": "freecad", "arguments": ["part", "boolean", "cut", "0", "1"], "cwd": "."}
+    info = {"name": "gimp", "arguments": ["part", "info", "0"], "cwd": "."}
+    mutate = {"name": "gimp", "arguments": ["part", "boolean", "cut", "0", "1"], "cwd": "."}
     responses = [
         f"✿FUNCTION✿: cli_anything_run ✿ARGS✿: {json.dumps(info)}",
         f"✿FUNCTION✿: cli_anything_run ✿ARGS✿: {json.dumps(mutate)}",
@@ -63,10 +63,10 @@ def test_cli_anything_read_can_repeat_after_a_state_change(monkeypatch, engine):
 
 def test_cli_anything_hybrid_argument_markup_keeps_export_arguments(engine):
     expected = {
-        "name": "freecad",
+        "name": "gimp",
         "arguments": [
-            "--json", "-p", "cadtest/proj.json", "export", "render",
-            "cadtest/plate.step", "--preset", "step",
+            "--json", "-p", "images/project.xcf", "export", "render",
+            "images/plate.png", "--preset", "png",
         ],
         "cwd": "artifacts",
     }
@@ -81,7 +81,7 @@ def test_cli_anything_hybrid_argument_markup_keeps_export_arguments(engine):
 
 
 def test_cli_anything_keycap_argument_markup_keeps_arguments(engine):
-    expected = {"name": "freecad", "arguments": ["--json", "part", "list"], "cwd": "."}
+    expected = {"name": "gimp", "arguments": ["--json", "part", "list"], "cwd": "."}
     text = f"✿FUNCTION✿: cli_anything_run ✿ARGS⃣: {json.dumps(expected)}"
 
     assert engine.find_tool_calls(text, {"cli_anything_run"}) == [
@@ -90,7 +90,7 @@ def test_cli_anything_keycap_argument_markup_keeps_arguments(engine):
 
 
 def test_cli_anything_cross_mark_tool_markup_keeps_arguments(engine):
-    expected = {"name": "freecad", "arguments": ["--json", "export", "presets"], "cwd": "."}
+    expected = {"name": "gimp", "arguments": ["--json", "export", "presets"], "cwd": "."}
     text = f"✿FUNCTION✗: cli_anything_run ✿ARGS✗: {json.dumps(expected)}"
 
     assert engine.find_tool_calls(text, {"cli_anything_run"}) == [
@@ -227,7 +227,7 @@ def test_catalog_list_uses_json_output(monkeypatch, tmp_path):
 
 def test_cli_anything_task_receives_an_extended_turn_budget(engine):
     assert engine._turn_limit_for_messages(
-        [{"role": "user", "content": "Use CLI-Anything with FreeCAD."}], 10
+        [{"role": "user", "content": "Use CLI-Anything with GIMP."}], 10
     ) == 20
     assert engine._turn_limit_for_messages(
         [{"role": "user", "content": "Summarize this text."}], 10
@@ -239,8 +239,8 @@ def test_cli_anything_turn_budget_grows_while_tools_make_progress(monkeypatch, e
     monkeypatch.setattr(engine, "CLI_ANYTHING_MAX_TURNS", 4)
     monkeypatch.setattr(engine, "CLI_ANYTHING_EXTENSION_TURNS", 1)
     responses = [
-        '✿FUNCTION✿: cli_anything_run ✿ARGS✿: {"name":"freecad","arguments":["one"],"cwd":"."}',
-        '✿FUNCTION✿: cli_anything_run ✿ARGS✿: {"name":"freecad","arguments":["two"],"cwd":"."}',
+        '✿FUNCTION✿: cli_anything_run ✿ARGS✿: {"name":"gimp","arguments":["one"],"cwd":"."}',
+        '✿FUNCTION✿: cli_anything_run ✿ARGS✿: {"name":"gimp","arguments":["two"],"cwd":"."}',
         "done",
     ]
 
@@ -253,7 +253,7 @@ def test_cli_anything_turn_budget_grows_while_tools_make_progress(monkeypatch, e
     monkeypatch.setattr(engine, "exec_tool", lambda *_a, **_kw: '{"ok": true}')
 
     assert engine.run_agent(
-        [{"role": "user", "content": "Use CLI-Anything with FreeCAD."}],
+        [{"role": "user", "content": "Use CLI-Anything with GIMP."}],
         max_turns=1, system_prompt="", tools_def=[],
         allowed_tools={"cli_anything_run"},
     ) == "done"
@@ -323,16 +323,16 @@ def test_safe_arguments_requires_json_array_and_rejects_newlines():
         cli_anything._safe_arguments(["safe", "bad\nargument"])
 
 
-@pytest.mark.parametrize("value", ["freecad", '"freecad"', "`freecad`", "cli-anything-freecad"])
+@pytest.mark.parametrize("value", ["gimp", '"gimp"', "`gimp`", "cli-anything-gimp"])
 def test_safe_name_normalizes_common_model_forms(value):
-    assert cli_anything._safe_name(value) == "freecad"
+    assert cli_anything._safe_name(value) == "gimp"
 
 
 def test_safe_name_rejects_non_string_and_shell_syntax():
     with pytest.raises(TypeError, match="string"):
-        cli_anything._safe_name(["freecad"])
+        cli_anything._safe_name(["gimp"])
     with pytest.raises(ValueError, match="letters"):
-        cli_anything._safe_name("freecad; whoami")
+        cli_anything._safe_name("gimp; whoami")
 
 
 def test_subprocess_runner_never_uses_a_shell(monkeypatch, tmp_path):
@@ -369,7 +369,7 @@ def test_subprocess_runner_prefixes_a_harness_path(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     monkeypatch.setattr(cli_anything.subprocess, "run", fake_run)
-    prefix = tmp_path / "FreeCAD/bin"
+    prefix = tmp_path / "GIMP/bin"
     cli_anything._run(["program"], root=tmp_path, timeout=5,
                        managed_home=False, path_prefix=prefix)
     assert seen["path"].startswith(str(prefix) + os.pathsep)
@@ -462,54 +462,6 @@ def test_installed_skill_is_resolved_inside_managed_venv(monkeypatch, tmp_path):
     assert cli_anything.installed_skill(config, "demo") == "# Demo harness skill"
 
 
-def test_freecad_skill_explains_boolean_operand_visibility(monkeypatch, tmp_path):
-    config = tmp_path / "config.txt"
-    root = cli_anything.integration_root(config)
-    skill = cli_anything.venv_dir(root) / "lib/python/site-packages/cli_anything/freecad/skills/SKILL.md"
-    skill.parent.mkdir(parents=True)
-    skill.write_text("# FreeCAD", encoding="utf-8")
-    cli_anything._save_ledger(root, {
-        "freecad": {"entry_point": "cli-anything-freecad", "dist_name": "cli-anything-freecad"}
-    })
-    monkeypatch.setattr(
-        cli_anything, "_require_hub",
-        lambda *_a, **_kw: (root, cli_anything.hub_executable(root)),
-    )
-    monkeypatch.setattr(
-        cli_anything, "_run",
-        lambda argv, **kwargs: subprocess.CompletedProcess(
-            argv, 0, stdout=str(skill) + "\n", stderr=""
-        ),
-    )
-
-    assert "Never remove the operands" in cli_anything.installed_skill(config, "freecad")
-
-
-def test_freecad_harness_patch_materializes_booleans_and_skips_hidden_parts(tmp_path):
-    root = tmp_path / "runtime"
-    generator = (
-        cli_anything.venv_dir(root)
-        / "lib/python3.13/site-packages/cli_anything/freecad/utils/freecad_macro_gen.py"
-    )
-    generator.parent.mkdir(parents=True)
-    generator.write_text('''def booleans(project):
-    boolean_ops = project.get("boolean_ops", [])
-
-def export(project):
-    lines.append("# Collect all shape objects for export")
-    lines.append("export_objects = []")
-    lines.append("for obj in doc.Objects:")
-    lines.append("    if hasattr(obj, 'Shape') and obj.Shape.isValid():")
-    lines.append("        export_objects.append(obj)")
-''', encoding="utf-8")
-
-    cli_anything._patch_freecad_harness(root)
-    patched = generator.read_text(encoding="utf-8")
-
-    assert "materialize stored boolean parts" in patched
-    assert "obj.Name not in hidden_objects" in patched
-
-
 def test_installed_skill_refuses_path_outside_managed_venv(monkeypatch, tmp_path):
     config = tmp_path / "config.txt"
     root = cli_anything.integration_root(config)
@@ -563,145 +515,3 @@ def test_run_uses_ledger_entry_and_structured_argv(monkeypatch, tmp_path):
     ]
     assert seen["cwd"] == tmp_path.resolve()
     assert seen["managed_home"] is False
-
-
-def test_freecad_run_uses_the_macos_application_cli(monkeypatch, tmp_path):
-    config = tmp_path / "config.txt"
-    root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / (
-        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
-    )
-    executable.parent.mkdir(parents=True)
-    executable.write_text("placeholder", encoding="utf-8")
-    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
-    app_bin = tmp_path / "FreeCAD.app/Contents/Resources/bin"
-    seen = {}
-    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
-    monkeypatch.setattr(cli_anything, "_freecad_macos_bin", lambda: app_bin)
-
-    def fake_run(argv, **kwargs):
-        seen["argv"] = argv
-        seen["path_prefix"] = kwargs["path_prefix"]
-        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(cli_anything, "_run", fake_run)
-    assert cli_anything.run(
-        config, "freecad",
-        ["--json", "-p", "plate.FCStd", "export", "render", "plate.stl", "--overwrite"],
-        tmp_path,
-    ) == "{}"
-    assert seen["argv"][-2:] == ["--preset", "stl"]
-    assert seen["path_prefix"] == app_bin
-
-
-def test_freecad_step_inspection_counts_exported_solids(monkeypatch, tmp_path):
-    config = tmp_path / "config.txt"
-    root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / (
-        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
-    )
-    executable.parent.mkdir(parents=True)
-    executable.write_text("placeholder", encoding="utf-8")
-    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
-    (tmp_path / "assembly.step").write_text(
-        "#1=MANIFOLD_SOLID_BREP('Box',#2);\n#3=MANIFOLD_SOLID_BREP('Cylinder',#4);\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
-    monkeypatch.setattr(cli_anything, "_freecad_macos_bin", lambda: None)
-    monkeypatch.setattr(
-        cli_anything, "_run",
-        lambda argv, **kwargs: subprocess.CompletedProcess(
-            argv, 0, stdout='{"estimated_objects": 1}', stderr=""
-        ),
-    )
-
-    result = cli_anything.run(
-        config, "freecad", ["--json", "import", "info", "assembly.step"], tmp_path
-    )
-
-    assert json.loads(result)["estimated_objects"] == 2
-
-
-def test_freecad_resolves_deferred_boolean_measurement(monkeypatch, tmp_path):
-    config = tmp_path / "config.txt"
-    root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / (
-        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
-    )
-    executable.parent.mkdir(parents=True)
-    executable.write_text("placeholder", encoding="utf-8")
-    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
-    (tmp_path / "project.json").write_text(json.dumps({"parts": [
-        {"name": "Final Cut", "type": "cut"},
-    ]}), encoding="utf-8")
-    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
-    monkeypatch.setattr(cli_anything, "_freecad_macos_bin", lambda: None)
-
-    def fake_run(argv, **kwargs):
-        if argv[0] == str(executable):
-            return subprocess.CompletedProcess(
-                argv, 0, stdout=json.dumps({
-                    "kind": "bounding_box", "part_index": 0, "deferred": True,
-                    "min": None, "max": None, "size": None,
-                }), stderr="",
-            )
-        backend = {"returncode": 0, "stdout": (
-            'AGENT8088_METRICS={"area": 84.0, "volume": 42.0, '
-            '"center_of_mass": [5, 11, 17], "min": {"x": 0, "y": 1, "z": 2}, '
-            '"max": {"x": 10, "y": 21, "z": 32}, '
-            '"size": {"x": 10, "y": 20, "z": 30}, '
-            '"inertia": {"Ixx": 1, "Iyy": 2, "Izz": 3}, "valid": true}'
-        )}
-        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(backend), stderr="")
-
-    monkeypatch.setattr(cli_anything, "_run", fake_run)
-    result = cli_anything.run(
-        config, "freecad",
-        ["--json", "-p", "project.json", "measure", "bounding-box", "0"], tmp_path,
-    )
-
-    assert json.loads(result) == {
-        "kind": "bounding_box", "part_index": 0, "deferred": False,
-        "min": {"x": 0, "y": 1, "z": 2},
-        "max": {"x": 10, "y": 21, "z": 32},
-        "size": {"x": 10, "y": 20, "z": 30},
-    }
-
-
-def test_freecad_part_result_exposes_zero_based_index():
-    result = cli_anything._freecad_expose_part_index(
-        '{"id": 9, "name": "FuseBaseUpright", "type": "fuse"}',
-        ["--json", "part", "boolean", "fuse", "0", "1"],
-    )
-
-    assert json.loads(result)["index"] == 8
-
-
-def test_freecad_refuses_removing_a_referenced_boolean_operand(monkeypatch, tmp_path):
-    config = tmp_path / "config.txt"
-    root = cli_anything.integration_root(config)
-    executable = cli_anything.hub_executable(root).parent / (
-        "cli-anything-freecad.exe" if os.name == "nt" else "cli-anything-freecad"
-    )
-    executable.parent.mkdir(parents=True)
-    executable.write_text("placeholder", encoding="utf-8")
-    cli_anything._save_ledger(root, {"freecad": {"entry_point": "cli-anything-freecad"}})
-    (tmp_path / "project.json").write_text(json.dumps({"parts": [
-        {"id": 1, "name": "Outer", "type": "cylinder", "visible": False},
-        {"id": 2, "name": "Inner", "type": "cylinder", "visible": False},
-        {"id": 3, "name": "Barrel", "type": "cut",
-         "params": {"base_id": 1, "tool_id": 2}, "visible": True},
-    ]}), encoding="utf-8")
-    monkeypatch.setattr(cli_anything, "status", lambda *_a, **_kw: {"available": True})
-    monkeypatch.setattr(
-        cli_anything, "_run",
-        lambda *_a, **_kw: pytest.fail("referenced operand removal must not execute"),
-    )
-
-    result = cli_anything.run(
-        config, "freecad",
-        ["--json", "-p", "project.json", "part", "remove", "1"], tmp_path,
-    )
-
-    assert "already hidden and excluded from export" in result

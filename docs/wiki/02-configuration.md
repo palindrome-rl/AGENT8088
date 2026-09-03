@@ -177,9 +177,12 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_read_bytes` | Cap on a single file read. |
 | `max_http_bytes` | Cap on an HTTP response. |
 | `max_tool_output_bytes` | Cap on tool output fed back to the model. |
-| `max_tool_timeout_seconds` | Hard ceiling for one tool call (default `300`). |
+| `max_tool_timeout_seconds` | Hard ceiling for one tool call (default `600`). |
 | `max_image_bytes` | Cap on an image attachment. |
-| `browser_timeout_ms` | `browse_page` timeout. |
+| `browser_max_steps` | Max steps `browse_page`'s browsing agent takes on one task (default `25`). Override once with `AGENT8088_BROWSER_MAX_STEPS`. |
+| `browser_task_timeout_seconds` | Overall wall-clock limit for one `browse_page` call (default `600`). Clamped to `max_tool_timeout_seconds`; override once with `AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS`. |
+| `browser_screenshots` | Enable browser screenshots for a vision-capable model (default `0`); override once with `AGENT8088_BROWSER_SCREENSHOTS=1`. |
+| `browser_llm_extra_body` | JSON fields sent only to browser-use model calls; use `{"chat_template_kwargs":{"enable_thinking":false}}` for Qwen served by vLLM. |
 
 ### Turn budget
 

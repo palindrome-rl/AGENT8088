@@ -97,6 +97,9 @@ def configure_logging() -> None:
         base_dir = A._agent_data_dir() / "logs"
         base_dir.mkdir(parents=True, exist_ok=True)
         parent = logging.getLogger("agent8088")
+        # browser-use configures a console handler on the root logger. Keep
+        # agent8088 records in the JSONL sink instead of duplicating them there.
+        parent.propagate = False
         # Idempotent: don't attach a second DailyJsonlHandler on repeat calls.
         if any(isinstance(h, DailyJsonlHandler) for h in parent.handlers):
             return

@@ -184,14 +184,26 @@ else:
 
 # --------------------------------------------------------------- 4. BROWSER
 section("4. BROWSER TOOL")
-if A._playwright_available():
-    res = A._exec_browser({"url": "https://example.com"})
-    check("REAL browser loads a live page", "Example Domain" in res, res[:45].replace("\n", " "))
-    sel = A._exec_browser({"url": "https://example.com", "selector": "h1"})
-    check("REAL browser honors a CSS selector", "Example Domain" in sel)
+# browse_page now drives an interactive browser-use agent: one call launches a
+# real Chromium *and* spends real tokens against the configured provider. That
+# is too expensive and too dependent on a working LLM config to run by default
+# in a verification script, so the live check is opt-in behind the same env var
+# the browser integration tests use.
+if not A._playwright_available():
+    skip("REAL browser task run", "playwright not installed")
+elif not os.environ.get("AGENT8088_RUN_BROWSER_INTEGRATION"):
+    skip("REAL browser task run",
+         "set AGENT8088_RUN_BROWSER_INTEGRATION=1 (launches a browser, calls the LLM)")
 else:
-    skip("REAL browser page load", "playwright not installed")
+    res = A._exec_browser({
+        "url": "https://example.com",
+        "task": "Report the exact text of the h1 heading on this page.",
+    })
+    check("REAL browser completes a task on a live page",
+          "Example Domain" in res, res[:45].replace("\n", " "))
 check("browser requires a url", "requires 'url'" in A._exec_browser({}))
+check("browser requires a task",
+      "requires 'task'" in A._exec_browser({"url": "https://example.com"}))
 
 # ------------------------------------------------------------------ 5. SSRF
 section("5. SSRF PROTECTION")
@@ -210,7 +222,8 @@ for url, label in [("http://127.0.0.1/admin", "loopback"),
     check(f"blocks {label}", A._ssrf_check(url) is not None)
 check("allows a public URL", A._ssrf_check("https://example.com") is None)
 # browser + image paths enforce it too
-check("browser enforces SSRF", "Blocked" in A._exec_browser({"url": "http://127.0.0.1/"}))
+check("browser enforces SSRF",
+      "Blocked" in A._exec_browser({"url": "http://127.0.0.1/", "task": "read the page"}))
 try:
     A.build_image_message("x", ["http://169.254.169.254/a.png"])
     check("image URLs enforce SSRF", False, "not blocked!")

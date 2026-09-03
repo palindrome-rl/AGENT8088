@@ -50,7 +50,33 @@ def test_error_still_shows_raw_preview(monkeypatch):
     assert "Blocked" in text
 
 
-def test_escalation_pending_still_shows_raw_preview(monkeypatch):
+def test_escalation_pending_renders_readably_not_as_raw_sentinel(monkeypatch):
+    """An escalation payload is not a result set, so it must not be summarised
+    as one - but dumping it raw is just as wrong. Its fields are separated by
+    \x1f, which the terminal renders as nothing at all, so the sentinel, the
+    target mode, the change type, the paths and the reason all ran together
+    into one unreadable string:
+
+        ESCALATION_REQUESTeditnetwork_requestshttps://x.comTool 'browse_page'...
+
+    Show the reason, which is the only part addressed to a human.
+    """
     raw = "ESCALATION_REQUEST\x1fplan-only\x1fweb_search\x1f\x1fneeds approval"
     text = _rendered(monkeypatch, raw)
-    assert "ESCALATION_REQUEST" in text
+
+    assert "ESCALATION_REQUEST" not in text
+    assert "\x1f" not in text
+    assert "needs approval" in text
+
+
+def test_the_browse_page_escalation_from_readonly_mode_is_legible(monkeypatch):
+    """The exact payload seen in a real session."""
+    raw = ("ESCALATION_REQUEST\x1fedit\x1fnetwork_requests"
+           "\x1fhttps://huggingface.co/papers"
+           "\x1fTool 'browse_page' requires browser access, "
+           "which is blocked in readonly mode.")
+    text = _rendered(monkeypatch, raw)
+
+    assert "ESCALATION_REQUESTedit" not in text
+    assert "network_requests" in text
+    assert "blocked in readonly mode" in text
