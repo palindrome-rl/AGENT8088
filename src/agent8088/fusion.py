@@ -17,14 +17,154 @@ from agent8088 import engine as A
 
 PANEL_SYSTEM_PROMPT = (
     "You are one participant in a blind panel answering a single question. "
-    "Answer directly and completely from your own knowledge. You have no "
-    "tools and cannot ask follow-up questions — this is a one-shot answer."
+    "Answer directly and completely. You have one tool, web_search — call it "
+    "for anything current, time-sensitive, or factual that could have changed "
+    "since your training (events, releases, prices, winners, news). You may "
+    "skip it only for pure reasoning, math, opinions, or knowledge that never "
+    "changes. This is a one-shot consultation: budget at most a couple of "
+    "searches, then give your final answer."
 )
+
+# Loop bound: enough rounds for a search, a refined search, and the final
+# answer. ponytail: fixed 4, raise fusion_max_tool_turns if a member needs
+# more follow-ups in practice.
+MAX_TOOL_TURNS = 4
+
+_ALLOWED_TOOLS = {"web_search"}
+_ESCALATION_PREFIX = "ESCALATION_REQUEST"
+
+
+def _run_tool_once(args: dict) -> str:
+    """One web_search through the engine's own gated path — sensitive-query,
+    secret-leak, SSRF and backend-chain guards all apply, same as the main
+    loop. depth=1 keeps sub-delegation off."""
+    return A.run_tool("web_search", args, allow_plan=False, depth=1)
+
+
+def _member_tool_loop(
+    client,
+    query: str,
+    *,
+    model: str,
+    provider: str,
+    max_tokens: int,
+    completion_fn: CompletionFn,
+) -> tuple:
+    """Mini agent loop for one panel member: model may emit web_search calls
+    (the ✿FUNCTION✿ content-channel protocol, parsed by find_tool_calls),
+    results are appended as user messages, loop ends when it answers in plain
+    text or the turn budget runs out.
+
+    Returns (final_text, input_tokens, output_tokens). Escalation requests
+    (permission prompts) are surfaced as a refusal to the model rather than
+    answered — nobody is watching a panel member to approve it.
+    """
+    tool_docs = A.render_tool_docs(
+        {name: A.TOOL_SPECS[name] for name in ("web_search",) if name in A.TOOL_SPECS}
+    )
+    # Same runtime context the main loop injects, most importantly today's
+    # date: without it a model whose training predates an event is confident
+    # the event hasn't happened, so the "search when time-sensitive" rule
+    # never fires. Reuse the engine's block rather than a second date line.
+    system_prompt = (PANEL_SYSTEM_PROMPT + "\n\n"
+                      + A.render_runtime_context() + "\n" + tool_docs)
+    messages = [{"role": "user", "content": query}]
+    total_input = 0
+    total_output = 0
+
+    for _turn in range(MAX_TOOL_TURNS):
+        response = completion_fn(
+            client,
+            messages,
+            [],
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            temperature=0.3,
+            on_token=None,
+            interrupt_check=None,
+            model_name=model,
+            provider_name=provider,
+            telemetry_attempt="fusion_panel",
+        )
+        text = A._strip_reasoning(response.choices[0].message.content or "")
+        usage, _source = A._model_usage(response)
+        total_input += usage.get("input_tokens") or 0
+        total_output += usage.get("output_tokens") or 0
+
+        calls = A.find_tool_calls(text, allowed=_ALLOWED_TOOLS)
+        if not calls:
+            # No runnable call. Two distinct causes, both must correct the
+            # model rather than return leftover text as its "answer" — a live
+            # run handed the judge raw ✿FUNCTION✿ protocol and half-sentences
+            # as candidate answers.
+            attempted = sorted(set(A._attempted_tool_names(text)) - _ALLOWED_TOOLS)
+            cleaned = A.strip_tool_json(text)
+            if attempted:
+                # It tried a tool it doesn't have; find_tool_calls dropped it
+                # silently. Say so, or the model believes the call ran.
+                messages.append({"role": "user", "content":
+                    f"Tools {', '.join(attempted)} are not available to you. "
+                    "web_search is your only tool — use it, or answer in "
+                    "plain text from what you already have."})
+                continue
+            if cleaned.strip():
+                return cleaned, total_input, total_output
+            messages.append({"role": "user", "content":
+                "That tool call could not be executed (malformed or unsupported). "
+                "Do not emit tool-call markup. Answer in plain text now, from "
+                "what you have."})
+            continue
+
+        outcome_lines = []
+        for call in calls:
+            result = _run_tool_once(call.get("arguments") or {})
+            if result.startswith(_ESCALATION_PREFIX):
+                result = (
+                    "Error: this search requires permission that nobody can "
+                    "approve here. Do not retry it — answer from your own "
+                    "knowledge or the results you already have."
+                )
+            outcome_lines.append(f"Result of web_search:\n{result}")
+        messages.append({"role": "user", "content": "\n\n".join(outcome_lines)})
+
+    # Budget exhausted: one last forced answer with no tools offered.
+    messages.append({
+        "role": "user",
+        "content": "Search budget used up. Give your final answer now, in "
+                   "plain text, with no further tool calls.",
+    })
+    response = completion_fn(
+        client,
+        messages,
+        [],
+        max_tokens=max_tokens,
+        # No tool docs on the forced answer, but keep the date context:
+        # an answer about a dated event is wrong by a year without it.
+        system_prompt=PANEL_SYSTEM_PROMPT + "\n\n" + A.render_runtime_context(),
+        temperature=0.3,
+        on_token=None,
+        interrupt_check=None,
+        model_name=model,
+        provider_name=provider,
+        telemetry_attempt="fusion_panel",
+    )
+    text = A.strip_tool_json(A._strip_reasoning(
+        response.choices[0].message.content or ""))
+    usage, _source = A._model_usage(response)
+    total_input += usage.get("input_tokens") or 0
+    total_output += usage.get("output_tokens") or 0
+    if not text.strip():
+        text = "(no answer produced)"
+    return text, total_input, total_output
 
 JUDGE_SYSTEM_PROMPT = (
     "You are an impartial judge. You will see several answers to the same "
     "question, labeled anonymously. Pick the single best answer and justify "
-    "your choice."
+    "your choice. You MUST always pick a winner — never refuse, never say "
+    "you cannot decide, and never leave the WINNER line out. If the answers "
+    "are similar or you are uncertain, pick the one you would trust most and "
+    "say so in the verdict. Keep any thinking short: your output must start "
+    "with the required format, not reasoning."
 )
 
 CompletionFn = Callable[..., object]
@@ -135,8 +275,12 @@ def run_panel(
     member_timeout_s: float = 60.0,
     max_workers: int = 8,
     completion_fn: CompletionFn = None,
+    use_tools: bool = False,
 ) -> list:
-    """Fan out one create_completion call per panel member in parallel."""
+    """Fan out one create_completion call per panel member in parallel.
+
+    use_tools=True gives each member a mini tool loop with web_search —
+    follow-up searches included — instead of a single no-tools answer."""
     if completion_fn is None:
         completion_fn = A.create_completion
 
@@ -148,6 +292,22 @@ def run_panel(
     def _call(member: PanelMember) -> PanelResult:
         start = time.monotonic()
         try:
+            if use_tools:
+                text, input_tokens, output_tokens = _member_tool_loop(
+                    member.client,
+                    query,
+                    model=member.model,
+                    provider=member.provider,
+                    max_tokens=max_tokens,
+                    completion_fn=completion_fn,
+                )
+                return PanelResult(
+                    member=member,
+                    text=text,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    elapsed_s=time.monotonic() - start,
+                )
             response = completion_fn(
                 member.client,
                 messages,
@@ -161,7 +321,8 @@ def run_panel(
                 provider_name=member.provider,
                 telemetry_attempt="fusion_panel",
             )
-            text = A._strip_reasoning(response.choices[0].message.content or "")
+            text = A.strip_tool_json(A._strip_reasoning(
+                response.choices[0].message.content or ""))
             usage, _source = A._model_usage(response)
             return PanelResult(
                 member=member,
@@ -231,9 +392,11 @@ def judge(
     """Blind the survivors, ask the judge model to pick a winner.
 
     A judge whose max_tokens budget cuts it off before it emits its WINNER
-    marker (reasoning models spend the budget thinking) is retried once at
-    double the token budget. Reasoning tokens count against max_tokens, so
-    a thoughtful judge can be starved of the room it needs to answer."""
+    marker (reasoning models spend the budget thinking) is retried at 2x and
+    then 4x the token budget. Reasoning tokens count against max_tokens, so
+    a thoughtful judge can be starved of the room it needs to answer; the
+    4x run observed live (glm-5.3, 500-token default) exhausted both prior
+    attempts on thinking alone."""
     if completion_fn is None:
         completion_fn = A.create_completion
 
@@ -254,14 +417,18 @@ def judge(
 
     prompt = (
         f"Question:\n{query}\n\n{candidate_block}\n\n"
-        "Pick the single best answer. Respond in exactly this format, nothing else:\n"
+        "Pick the single best answer — one of the labeled letters. There is "
+        "always a winner, even if the answers are close or all flawed; when "
+        "uncertain, choose the most accurate, complete, and honest one. "
+        "Respond in exactly this format, nothing else, with no preamble or "
+        "reasoning before it:\n"
         "WINNER: <letter>\nVERDICT: <2-4 sentences explaining why this answer is best>"
     )
 
-    def _call_judge(judge_max_tokens: int):
+    def _call_judge(judge_max_tokens: int, urgency: str = ""):
         return completion_fn(
             judge_client,
-            [{"role": "user", "content": prompt}],
+            [{"role": "user", "content": prompt + urgency}],
             [],
             max_tokens=judge_max_tokens,
             system_prompt=JUDGE_SYSTEM_PROMPT,
@@ -276,12 +443,16 @@ def judge(
     total_input = 0
     total_output = 0
     raw = ""
-    # One retry at 2x tokens: a reasoning judge can burn the entire budget
-    # thinking and never reach WINNER:/VERDICT:. ponytail: fixed 2 attempts,
-    # a configurable ladder is not warranted until a case needs three.
-    for attempt_index, budget in enumerate((max_tokens, max_tokens * 2)):
+    # Ladder: original budget, 2x, then 4x with a no-reasoning demand. A
+    # reasoning judge can burn every prior budget thinking and never reach
+    # WINNER:/VERDICT:. ponytail: fixed 3 attempts; not configurable until
+    # a real case needs a fourth.
+    urgencies = ("", "", "\n\nYou already have all the information you need. "
+                       "Do NOT reason or deliberate. Your first characters "
+                       "must be 'WINNER:'.")
+    for budget, urgency in zip((max_tokens, max_tokens * 2, max_tokens * 4), urgencies):
         try:
-            response = _call_judge(budget)
+            response = _call_judge(budget, urgency)
         except Exception as exc:
             result.judge_error = f"{type(exc).__name__}: {exc}"
             return result
@@ -289,11 +460,8 @@ def judge(
         total_input += usage.get("input_tokens") or 0
         total_output += usage.get("output_tokens") or 0
         raw = A._strip_reasoning(response.choices[0].message.content or "")
-        _winner, verdict_text = _parse_verdict(raw)
         if _WINNER_RE.search(raw):
             break
-        if attempt_index == 0:
-            continue
 
     result.judge_raw = raw
     result.total_input_tokens += total_input
@@ -325,11 +493,13 @@ def run_fusion(
     max_tokens: int = 1200,
     judge_max_tokens: int = 500,
     completion_fn: CompletionFn = None,
+    use_tools: bool = False,
 ) -> FusionResult:
     """Single entry point: discover panel, fan out, blind-judge, return.
 
     Pass `panel` (e.g. from build_explicit_panel) to skip auto-discovery and
-    use exactly those members instead."""
+    use exactly those members instead. use_tools=True gives every member a
+    mini tool loop with web_search."""
     if completion_fn is None:
         completion_fn = A.create_completion
 
@@ -349,6 +519,7 @@ def run_fusion(
         member_timeout_s=member_timeout_s,
         max_workers=max_workers,
         completion_fn=completion_fn,
+        use_tools=use_tools,
     )
 
     survivors = [r for r in results if r.error is None]

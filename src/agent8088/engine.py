@@ -128,6 +128,20 @@ def update_simple_config(path: Path, values: dict) -> None:
     _write_private_text(path, content)
 
 
+def remove_simple_config_keys(path: Path, keys) -> None:
+    """Delete key=value lines entirely, so callers fall back through to
+    probed/default values instead of an explicit override. Sibling to
+    update_simple_config, which can only set a value, never clear one."""
+    path = Path(path)
+    if not path.exists():
+        return
+    content = path.read_text(encoding="utf-8")
+    for key in keys:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+            raise ValueError(f"Invalid config key {key!r}")
+        content = re.sub(rf"^{re.escape(key)}=.*\n?", "", content, flags=re.MULTILINE)
+    _write_private_text(path, content)
+
 
 # --- .env key store ---
 
@@ -340,9 +354,15 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
-MAX_COMPLETION_TOKENS = max(
-    1, min(int(APP_CONFIG.get("max_completion_tokens", "8192")), CONTEXT_WINDOW)
-)
+# Not clamped to CONTEXT_WINDOW here -- that constant is only the *global*
+# fallback context, not the active model's real one. _active_model_token_limits
+# already does min(completion, context) against each call's actual resolved
+# context; pre-clamping here against the wrong (global, usually smaller) value
+# silently capped every model's completion fallback at CONTEXT_WINDOW regardless
+# of its real context window -- e.g. a 1M-context model still showed 32,768
+# output because this line clamped the fallback down before the real context
+# was ever consulted.
+MAX_COMPLETION_TOKENS = max(1, int(APP_CONFIG.get("max_completion_tokens", "65000")))
 MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
 # A sub-agent exists to keep work *out* of the parent's context, so an unbounded
 # answer defeats the delegation it was spawned for. 0 disables the cap.
@@ -538,6 +558,54 @@ def set_provider_limit(provider: str, key: str, value: str) -> dict:
             "over_ceiling": False, "ceiling": None}
 
 
+def reset_provider_limit(provider: str, key: str) -> dict:
+    """Clear a provider.<name>.<key> override and recover the real probed
+    value, not the hardcoded module default.
+
+    model_token_limits() (the "known" table _active_model_token_limits falls
+    back to) always returns {} -- probed values live nowhere but
+    PROVIDERS[name] itself, so popping the override without restoring one
+    would silently replace a real per-model number (e.g. Ollama Cloud's
+    65,536-token output ceiling, only ever discovered via probing) with the
+    generic 32768/65000 fallback. Try the session probe cache first (no
+    network), then re-probe live, before giving up and letting it fall to
+    the hardcoded default -- same as a provider that was never overridden.
+    """
+    if provider not in PROVIDERS:
+        raise KeyError(provider)
+    if key not in _PROVIDER_LIMIT_KEYS:
+        raise ValueError(f"unknown provider limit: {key}")
+    old_raw = PROVIDERS[provider].get(key)
+    old = _positive_int(old_raw, 0)
+    PROVIDERS[provider].pop(key, None)
+    config_key = f"provider.{provider}.{key}"
+    APP_CONFIG.pop(config_key, None)
+    remove_simple_config_keys(CONFIG_PATH, [config_key])
+
+    model = MODEL_NAME
+    cache_key = (provider, model)
+    probed_ctx, probed_out = _PROBED_LIMITS.get(cache_key, (None, None))
+    if probed_ctx is None and probed_out is None:
+        try:
+            from agent8088.providers import probe_model_context_window
+            probe_client, _ = get_client(provider)
+            probed_ctx, probed_out = probe_model_context_window(
+                probe_client, model, provider_name=provider)
+            _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
+        except Exception:
+            probed_ctx, probed_out = None, None
+    if key == "context_window" and probed_ctx:
+        PROVIDERS[provider]["context_window"] = str(probed_ctx)
+    elif key == "max_completion_tokens" and probed_out:
+        PROVIDERS[provider]["max_completion_tokens"] = str(probed_out)
+
+    new_context, new_completion = _active_model_token_limits(provider)
+    new = new_context if key == "context_window" else new_completion
+    return {"key": config_key, "old": old, "new": new, "provider": provider,
+            "direction": "looser" if new > old else "tighter" if new < old else "same",
+            "over_ceiling": False, "ceiling": None}
+
+
 # --- Approval policy ---
 # There is deliberately no separate "approval mode" axis: PERMISSION_MODE already
 # decides what is gated, and a second setting that could also wave a gate through
@@ -630,16 +698,29 @@ ALLOWED_PATHS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Permission layer ÔÇö readonly by default, escalates to edit on user approval
+# Permission layer -- full-auto by default (configurable), escalates only when
+# dropped to a tighter mode (readonly/plan-only/edit) via config.txt, --mode,
+# or the env var below.
 # ---------------------------------------------------------------------------
 # plan-only is refused here for the same reason `/mode` and `--mode` refuse it: a
 # plan session must be entered through enter_plan_mode(), which records the mode to
 # come back to. Starting in plan-only skips that, so finish_plan_session() has
 # nothing to restore and the session is stranded in plan mode. Fall back to the
-# safe default instead of honouring it; `/plan` is the only door.
-_env_permission_mode = os.environ.get("AGENT8088_PERMISSION", "readonly")
+# safe readonly mode instead of honouring it, regardless of the configured
+# default above; `/plan` is the only door.
+_env_permission_mode = os.environ.get(
+    "AGENT8088_PERMISSION", APP_CONFIG.get("default_permission_mode", "full-auto")
+)
 PERMISSION_MODE = "readonly" if _env_permission_mode == "plan-only" else _env_permission_mode
-_one_shot_grant = False  # exact tool-call key, or True for direct embedding grants
+# Set of pending one-shot approval keys, not a single slot -- a turn that
+# blocks on two writes at once (e.g. a CAD turn's plan.md + generator script)
+# needs both grants alive simultaneously. A single scalar meant the second
+# grant silently overwrote the first before it was ever spent, and the two
+# blocked calls ping-ponged forever, each stealing the other's grant every
+# retry. _ANY_GRANT_KEY is the "True" case: a grant not tied to a specific
+# pending call (set_permission_mode etc. still clear the whole set).
+_ANY_GRANT_KEY = "\x00any\x00"
+_one_shot_grants: set = set()
 _pending_approval_key = ""
 _local_fallback_grant = False
 _remote_git_grant = False
@@ -680,9 +761,9 @@ def set_permission_mode(mode: str) -> None:
     """The one place PERMISSION_MODE changes, so every grant tied to the old mode
     is dropped with it. A grant that outlives its mode is a hole: an approval the
     user gave for a plan step must not still be spendable after the mode moved on."""
-    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant, _pending_approval_key
+    global PERMISSION_MODE, _plan_execution_grant, _pending_approval_key
     PERMISSION_MODE = mode
-    _one_shot_grant = False
+    _one_shot_grants.clear()
     _plan_execution_grant = False
     _pending_approval_key = ""
 
@@ -749,18 +830,21 @@ def reset_approval_state() -> None:
 
 def reset_turn_approval_state() -> None:
     """Drop unspent grants before a new agent turn can use them."""
-    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
-    _one_shot_grant = _local_fallback_grant = _remote_git_grant = False
+    global _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    _one_shot_grants.clear()
+    _local_fallback_grant = _remote_git_grant = False
     _pending_approval_key = ""
 
 
 def _take_search_fallback_grant(approval_key: str) -> bool:
     """Spend the exact approval that permits a local search to use DDGS."""
-    global _one_shot_grant
-    if _one_shot_grant != approval_key:
-        return False
-    _one_shot_grant = False
-    return True
+    if approval_key in _one_shot_grants:
+        _one_shot_grants.discard(approval_key)
+        return True
+    if _ANY_GRANT_KEY in _one_shot_grants:
+        _one_shot_grants.discard(_ANY_GRANT_KEY)
+        return True
+    return False
 
 
 def _tool_call_key(name: str, args: dict) -> str:
@@ -1275,7 +1359,6 @@ def _is_fixed_host_tool_command(command: str) -> bool:
 def check_permission(mode: str, command: str = "", path_zone: str = "default",
                      host: bool = False, approval_key: str = "") -> bool:
     """Return True if the tool mode is allowed in the current permission mode."""
-    global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
     # Read-only subagents may execute verification commands only when the
@@ -1317,9 +1400,16 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
                 and not _is_fixed_host_tool_command(command)):
             return False
         return True
-    # One-shot grant: allow one blocked tool through, then revert
-    if _one_shot_grant is True or _one_shot_grant == approval_key:
-        _one_shot_grant = False
+    # One-shot grant: allow one blocked tool through, then revert. Checked
+    # against the set of currently pending grants (plural -- see
+    # _one_shot_grants above) rather than a single slot, so a turn that
+    # blocked on two writes at once doesn't have the second grant clobber
+    # the first before either is spent.
+    if _ANY_GRANT_KEY in _one_shot_grants:
+        _one_shot_grants.discard(_ANY_GRANT_KEY)
+        return True
+    if approval_key and approval_key in _one_shot_grants:
+        _one_shot_grants.discard(approval_key)
         return True
     return False
 
@@ -1337,15 +1427,19 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
 
 def grant_escalation(change_type: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
-    The user is prompted for every write/mutation - no session-wide grants."""
-    global _one_shot_grant, _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    The user is prompted for every write/mutation - no session-wide grants.
+
+    Adds to the set of pending one-shot grants rather than replacing a single
+    slot -- a turn can have more than one blocked call needing its own grant
+    (e.g. a CAD turn's plan.md write and its generator write, escalated
+    together), and each grant is spent independently by check_permission."""
+    global _local_fallback_grant, _remote_git_grant, _pending_approval_key
     if change_type == "git_remote_write":
         _remote_git_grant = True
-        _one_shot_grant = False
         _local_fallback_grant = False
         _pending_approval_key = ""
         return
-    _one_shot_grant = _pending_approval_key or True
+    _one_shot_grants.add(_pending_approval_key or _ANY_GRANT_KEY)
     _pending_approval_key = ""
     _local_fallback_grant = False
     _remote_git_grant = False
@@ -3537,7 +3631,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
-    global PERMISSION_MODE, _one_shot_grant, _plan_execution_grant
+    global PERMISSION_MODE, _plan_execution_grant
     global _local_fallback_grant, _remote_git_grant, _active_role
     global _sandbox_readonly, SUBAGENT_SPECS
 
@@ -3599,12 +3693,14 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     global _permission_floor_readonly
     floor = profile.get("permission", "")
     saved_permission = None
+    saved_grants = None
     if floor == "readonly":
-        saved_permission = (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+        saved_permission = (PERMISSION_MODE, _plan_execution_grant,
                             _local_fallback_grant, _remote_git_grant,
                             _permission_floor_readonly, _sandbox_readonly)
+        saved_grants = set(_one_shot_grants)  # copy -- the live set gets cleared below
         PERMISSION_MODE = "readonly"
-        _one_shot_grant = False
+        _one_shot_grants.clear()
         _plan_execution_grant = False
         _local_fallback_grant = False
         _remote_git_grant = False
@@ -3636,9 +3732,11 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
         _last_tool_output, _last_tool_name, _last_write_diff = saved
         _active_role = saved_role
         if saved_permission is not None:
-            (PERMISSION_MODE, _one_shot_grant, _plan_execution_grant,
+            (PERMISSION_MODE, _plan_execution_grant,
              _local_fallback_grant, _remote_git_grant,
              _permission_floor_readonly, _sandbox_readonly) = saved_permission
+            _one_shot_grants.clear()
+            _one_shot_grants.update(saved_grants)
 
     answer = _cap_subagent_answer(answer)
     if model_warning:
@@ -8902,9 +9000,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed:
             forcing = False
-            if (dynamic_cli and turn + 1 == turn_limit
-                    and turn_limit < hard_turn_limit
-                    and tool_outputs and not _plan_step_failed(tool_outputs[-1])):
+            near_limit = (turn + 1 == turn_limit and turn_limit < hard_turn_limit
+                          and tool_outputs and not _plan_step_failed(tool_outputs[-1]))
+            if dynamic_cli and near_limit:
                 turn_limit = min(
                     turn_limit + CLI_ANYTHING_EXTENSION_TURNS, hard_turn_limit
                 )

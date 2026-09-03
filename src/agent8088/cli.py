@@ -244,6 +244,7 @@ class Session:
         if self.memory_notifications not in {"off", "on", "verbose"}:
             self.memory_notifications = "on"
         self.last_usage = None
+        self.turns_this_run = 0  # reset per run in do_chat; incremented once per model turn by on_calls
 
 
 S = Session()
@@ -697,6 +698,10 @@ def _remember_call_path(call):
 
 
 def on_calls(calls):
+    # Called once per model turn (once per round-trip to the model, regardless
+    # of how many tool calls that turn makes) -- the exact thing "how many turns
+    # did that take" is asking about, distinct from tool-call count.
+    S.turns_this_run += 1
     for call in calls:
         _remember_call_path(call)
     if S.verbose == "off":
@@ -1827,6 +1832,7 @@ def do_chat(query):
     # Filled by the capture thread via the engine hook; read back on this thread.
     memory_stored = []
     A.memory_on_capture = memory_stored.extend
+    S.turns_this_run = 0
     trace = [] if S.show_trace else None
     reasoning_parts = []
     stream = _StreamFilter()
@@ -1942,12 +1948,15 @@ def do_chat(query):
         return
 
     render_answer(answer)
-    S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "context": _estimate_context_pct()}
+    S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "turns": S.turns_this_run,
+                    "context": _estimate_context_pct()}
     if S.usage_mode == "tokens":
-        console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens[/dim]")
+        console.print(f"[dim]{elapsed:.1f}s · {S.turns_this_run} turn{'s' if S.turns_this_run != 1 else ''} · "
+                      f"↑{tokens_ref[0]} tokens[/dim]")
     elif S.usage_mode == "full":
         active = _active_provider_name()
-        console.print(f"[dim]{elapsed:.1f}s · ↑{tokens_ref[0]} tokens · "
+        console.print(f"[dim]{elapsed:.1f}s · {S.turns_this_run} turn{'s' if S.turns_this_run != 1 else ''} · "
+                      f"↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
     _await_memory_capture(memory_stored)
     if trace is not None:
@@ -3444,25 +3453,36 @@ def _cmd_fusion_setup(_rest):
         max_panel = max(1, int(current_max) if current_max.isdigit() else 6)
 
     console.print(f"[dim]Providers with a working key: {', '.join(available)}[/dim]")
-    chosen = _multi_choice_prompt(
-        "Panel providers (check none to keep auto-discovering, up to the max above):",
-        available)
-    if len(chosen) > max_panel:
-        console.print(f"[yellow]picked {len(chosen)}, keeping only the first {max_panel} "
-                       f"(max panel size) — {', '.join(chosen[max_panel:])} dropped.[/yellow]")
-        chosen = chosen[:max_panel]
+    # Count per provider, picked inline in one list: a provider left at 0 is
+    # simply not on the panel, and `ollama-cloud(2)` fills two slots with the
+    # same model. The cap is enforced during selection (max_total) so the count
+    # can't be pushed past it, rather than silently truncating afterwards.
+    counted = _counted_choice_prompt(
+        "Panel providers (leave all at 0 to keep auto-discovering):",
+        available, max_total=max_panel)
 
     panel_specs = []
-    for provider in chosen:
+    for provider, count in counted:
         models = _fetch_models_for_provider(provider)
         default_model = A.PROVIDERS[provider].get("model", "")
-        if models:
-            choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
-            choice = _choice_prompt(f"Model for {provider}:", choices, choices[0])
-            model = default_model if choice.startswith("(default)") else choice
-        else:
-            model = _custom_prompt(f"Model for {provider}:", default=default_model)
-        panel_specs.append(f"{provider}:{model}" if model else provider)
+        for seat in range(1, count + 1):
+            label = f"Model for {provider}"
+            if count > 1:
+                label += f" (seat {seat}/{count})"
+            if models:
+                choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
+                choice = _choice_prompt(label + ":", choices, choices[0])
+                model = default_model if choice.startswith("(default)") else choice
+            else:
+                model = _custom_prompt(label + ":", default=default_model)
+            spec = f"{provider}:{model}" if model else provider
+            panel_specs.append(spec)
+
+    if len(panel_specs) > max_panel:
+        console.print(f"[yellow]picked {len(panel_specs)} panel member(s), keeping only the "
+                       f"first {max_panel} (max panel size) — "
+                       f"{', '.join(panel_specs[max_panel:])} dropped.[/yellow]")
+        panel_specs = panel_specs[:max_panel]
 
     judge_choices = ["(auto) session's current model"] + available
     judge_choice = _choice_prompt("Judge:", judge_choices, judge_choices[0])
@@ -3507,6 +3527,8 @@ def cmd_fusion(rest):
     after that, plain `/fusion <question>` just uses them, no flags needed.
     Optional flags before the question override the saved config for one call:
       /fusion --panel gemini:gemini-3-pro,ollama-cloud:kimi-k3 --judge anthropic:claude-sonnet-4-6 <question>
+    Each panel member can call web_search on its own when it needs fresh
+    facts — it decides, no flag needed.
     """
     if rest.strip().lower() == "setup":
         _cmd_fusion_setup(rest)
@@ -3563,6 +3585,7 @@ def cmd_fusion(rest):
             max_workers=max_workers,
             max_tokens=panel_max_tokens,
             judge_max_tokens=judge_max_tokens,
+            use_tools=True,
         )
 
     if result.winner_index is None:
@@ -3573,10 +3596,17 @@ def cmd_fusion(rest):
 
     console.print(_fusion_panel_table(result.results))
 
-    if not result.judge_parsed and result.judge_raw:
+    if not result.judge_parsed:
         winner = result.results[result.winner_index]
-        console.print(f"[yellow]judge output could not be parsed — showing "
-                      f"{winner.member.provider}:{winner.member.model}'s answer instead[/yellow]")
+        if result.judge_raw:
+            console.print(f"[yellow]judge output could not be parsed — showing "
+                          f"{winner.member.provider}:{winner.member.model}'s answer instead[/yellow]")
+        else:
+            reason = result.judge_error or "judge produced no usable output"
+            console.print(f"[yellow]judge failed ({reason}) — showing "
+                          f"{winner.member.provider}:{winner.member.model}'s answer instead; "
+                          "try /fusion setup with a non-reasoning judge or raise "
+                          "fusion_judge_max_tokens.[/yellow]")
 
     console.print(Panel(Text(result.winner_answer), title="Fusion Answer",
                          box=box.ROUNDED, border_style="#00C8FF"))
@@ -4297,7 +4327,10 @@ def cmd_limits(rest):
                 return
             _, name, pkey, pvalue = parts
             try:
-                _report_limit_change(A.set_provider_limit(name, pkey, pvalue))
+                if pvalue.strip().lower() == "default":
+                    _report_limit_change(A.reset_provider_limit(name, pkey))
+                else:
+                    _report_limit_change(A.set_provider_limit(name, pkey, pvalue))
             except (KeyError, ValueError) as e:
                 console.print(f"[red]error:[/red] {e}")
             return
@@ -4442,6 +4475,92 @@ def _multi_choice_prompt(message, choices, checked=()):
             if part.isdigit() and 1 <= int(part) <= len(choices):
                 picked.append(choices[int(part) - 1])
         return picked
+
+
+def _counted_choice_prompt(message, choices, max_total=None):
+    """One list where each row carries its own count: up/down moves between
+    rows, RIGHT increases that row's count, LEFT decreases it, enter confirms.
+    A row at 0 is simply not selected, so this replaces a checkbox instead of
+    sitting next to one -- `ollama-cloud(2)` means that provider fills two
+    panel slots.
+
+    InquirerPy has no widget for this (its checkbox is a boolean toggle and its
+    number prompt is a standalone single field), so this is a small
+    prompt_toolkit Application. Returns [(choice, count), ...] for count >= 1,
+    in list order.
+    """
+    counts = {c: 0 for c in choices}
+    try:
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout, HSplit, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+
+        state = {"cursor": 0}
+
+        def render():
+            total = sum(counts.values())
+            head = f"? {message}"
+            if max_total:
+                head += f"  [{total}/{max_total}]"
+            lines = [("bold", head + "\n"),
+                     ("", "  (↑↓ move  → more  ← fewer  enter confirm)\n")]
+            for index, choice in enumerate(choices):
+                count = counts[choice]
+                pointer = "❯ " if index == state["cursor"] else "  "
+                label = f"{choice}({count})" if count else choice
+                style = "class:sel" if index == state["cursor"] else ("bold" if count else "")
+                lines.append((style, f"{pointer}{label}\n"))
+            return lines
+
+        kb = KeyBindings()
+
+        @kb.add("up")
+        def _(event):
+            state["cursor"] = (state["cursor"] - 1) % len(choices)
+
+        @kb.add("down")
+        def _(event):
+            state["cursor"] = (state["cursor"] + 1) % len(choices)
+
+        @kb.add("right")
+        def _(event):
+            choice = choices[state["cursor"]]
+            if max_total and sum(counts.values()) >= max_total:
+                return
+            counts[choice] += 1
+
+        @kb.add("left")
+        def _(event):
+            choice = choices[state["cursor"]]
+            if counts[choice] > 0:
+                counts[choice] -= 1
+
+        @kb.add("enter")
+        def _(event):
+            event.app.exit()
+
+        @kb.add("c-c")
+        def _(event):
+            event.app.exit(exception=KeyboardInterrupt)
+
+        Application(
+            layout=Layout(HSplit([Window(FormattedTextControl(render), always_hide_cursor=True)])),
+            key_bindings=kb, full_screen=False,
+        ).run()
+        return [(c, counts[c]) for c in choices if counts[c] > 0]
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        print(message)
+        for index, choice in enumerate(choices, 1):
+            print(f"  {index}. {choice}")
+        value = input("Numbers, comma-separated (repeat for extra slots, blank = none): ").strip()
+        if not value:
+            return []
+        for part in value.split(","):
+            part = part.strip()
+            if part.isdigit() and 1 <= int(part) <= len(choices):
+                counts[choices[int(part) - 1]] += 1
+        return [(c, counts[c]) for c in choices if counts[c] > 0]
 
 
 def _configure_custom_models_endpoint():
