@@ -3457,26 +3457,22 @@ def _cmd_fusion_setup(_rest):
         "Panel providers (check none to keep auto-discovering, up to the max above):",
         available)
 
-    # A provider can contribute more than one panel slot (multiple models), so
-    # the max-panel-size cap has to be enforced on the flattened spec list
-    # below, not on the provider count here.
+    # A provider can contribute more than one panel slot (same model, counted
+    # more than once for extra votes), so the max-panel-size cap has to be
+    # enforced on the flattened spec list below, not on the provider count here.
     panel_specs = []
     for provider in chosen:
         models = _fetch_models_for_provider(provider)
         default_model = A.PROVIDERS[provider].get("model", "")
         if models:
             choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
-            picked = _multi_choice_prompt(
-                f"Model(s) for {provider} (space to toggle, enter to confirm):",
-                choices, checked=[choices[0]])
-            picked_models = [
-                default_model if choice.startswith("(default)") else choice
-                for choice in picked
-            ] or [default_model]
+            choice = _choice_prompt(f"Model for {provider}:", choices, choices[0])
+            model = default_model if choice.startswith("(default)") else choice
         else:
-            picked_models = [_custom_prompt(f"Model for {provider}:", default=default_model)]
-        for model in picked_models:
-            panel_specs.append(f"{provider}:{model}" if model else provider)
+            model = _custom_prompt(f"Model for {provider}:", default=default_model)
+        count = _count_prompt(f"Panel slots for {provider} (same model, extra votes):", default=1)
+        spec = f"{provider}:{model}" if model else provider
+        panel_specs.extend([spec] * count)
 
     if len(panel_specs) > max_panel:
         console.print(f"[yellow]picked {len(panel_specs)} panel member(s), keeping only the "
@@ -4465,6 +4461,26 @@ def _multi_choice_prompt(message, choices, checked=()):
             if part.isdigit() and 1 <= int(part) <= len(choices):
                 picked.append(choices[int(part) - 1])
         return picked
+
+
+def _count_prompt(message, default=1, min_allowed=1):
+    """Numeric spinner — left/right (and up/down) arrows adjust the value,
+    enter confirms. Falls back to a plain numeric text prompt on a
+    non-interactive terminal, same convention as _choice_prompt/_multi_choice_prompt."""
+    try:
+        from InquirerPy import inquirer
+        return int(inquirer.number(
+            message=message, default=default, min_allowed=min_allowed,
+            max_allowed=None, float_allowed=False,
+        ).execute())
+    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+        value = input(f"{message} [{default}]: ").strip()
+        if not value:
+            return default
+        try:
+            return max(min_allowed, int(value))
+        except ValueError:
+            return default
 
 
 def _configure_custom_models_endpoint():
