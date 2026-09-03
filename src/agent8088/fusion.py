@@ -17,9 +17,114 @@ from agent8088 import engine as A
 
 PANEL_SYSTEM_PROMPT = (
     "You are one participant in a blind panel answering a single question. "
-    "Answer directly and completely from your own knowledge. You have no "
-    "tools and cannot ask follow-up questions — this is a one-shot answer."
+    "Answer directly and completely. You have one tool, web_search — use it "
+    "whenever the question needs fresh or factual information you are not "
+    "certain of, and skip it when your own knowledge clearly suffices. This "
+    "is a one-shot consultation: budget at most a couple of searches, then "
+    "give your final answer."
 )
+
+# Loop bound: enough rounds for a search, a refined search, and the final
+# answer. ponytail: fixed 4, raise fusion_max_tool_turns if a member needs
+# more follow-ups in practice.
+MAX_TOOL_TURNS = 4
+
+_ALLOWED_TOOLS = {"web_search"}
+_ESCALATION_PREFIX = "ESCALATION_REQUEST"
+
+
+def _run_tool_once(args: dict) -> str:
+    """One web_search through the engine's own gated path — sensitive-query,
+    secret-leak, SSRF and backend-chain guards all apply, same as the main
+    loop. depth=1 keeps sub-delegation off."""
+    return A.run_tool("web_search", args, allow_plan=False, depth=1)
+
+
+def _member_tool_loop(
+    client,
+    query: str,
+    *,
+    model: str,
+    provider: str,
+    max_tokens: int,
+    completion_fn: CompletionFn,
+) -> tuple:
+    """Mini agent loop for one panel member: model may emit web_search calls
+    (the ✿FUNCTION✿ content-channel protocol, parsed by find_tool_calls),
+    results are appended as user messages, loop ends when it answers in plain
+    text or the turn budget runs out.
+
+    Returns (final_text, input_tokens, output_tokens). Escalation requests
+    (permission prompts) are surfaced as a refusal to the model rather than
+    answered — nobody is watching a panel member to approve it.
+    """
+    tool_docs = A.render_tool_docs(
+        {name: A.TOOL_SPECS[name] for name in ("web_search",) if name in A.TOOL_SPECS}
+    )
+    system_prompt = PANEL_SYSTEM_PROMPT + "\n\n" + tool_docs
+    messages = [{"role": "user", "content": query}]
+    total_input = 0
+    total_output = 0
+
+    for _turn in range(MAX_TOOL_TURNS):
+        response = completion_fn(
+            client,
+            messages,
+            [],
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            temperature=0.3,
+            on_token=None,
+            interrupt_check=None,
+            model_name=model,
+            provider_name=provider,
+            telemetry_attempt="fusion_panel",
+        )
+        text = A._strip_reasoning(response.choices[0].message.content or "")
+        usage, _source = A._model_usage(response)
+        total_input += usage.get("input_tokens") or 0
+        total_output += usage.get("output_tokens") or 0
+
+        calls = A.find_tool_calls(text, allowed=_ALLOWED_TOOLS)
+        if not calls:
+            return text, total_input, total_output
+
+        outcome_lines = []
+        for call in calls:
+            result = _run_tool_once(call.get("arguments") or {})
+            if result.startswith(_ESCALATION_PREFIX):
+                result = (
+                    "Error: this search requires permission that nobody can "
+                    "approve here. Do not retry it — answer from your own "
+                    "knowledge or the results you already have."
+                )
+            outcome_lines.append(f"Result of web_search:\n{result}")
+        messages.append({"role": "user", "content": "\n\n".join(outcome_lines)})
+
+    # Budget exhausted: one last forced answer with no tools offered.
+    messages.append({
+        "role": "user",
+        "content": "Search budget used up. Give your final answer now, in "
+                   "plain text, with no further tool calls.",
+    })
+    response = completion_fn(
+        client,
+        messages,
+        [],
+        max_tokens=max_tokens,
+        system_prompt=PANEL_SYSTEM_PROMPT,
+        temperature=0.3,
+        on_token=None,
+        interrupt_check=None,
+        model_name=model,
+        provider_name=provider,
+        telemetry_attempt="fusion_panel",
+    )
+    text = A._strip_reasoning(response.choices[0].message.content or "")
+    usage, _source = A._model_usage(response)
+    total_input += usage.get("input_tokens") or 0
+    total_output += usage.get("output_tokens") or 0
+    return text, total_input, total_output
 
 JUDGE_SYSTEM_PROMPT = (
     "You are an impartial judge. You will see several answers to the same "
@@ -135,8 +240,12 @@ def run_panel(
     member_timeout_s: float = 60.0,
     max_workers: int = 8,
     completion_fn: CompletionFn = None,
+    use_tools: bool = False,
 ) -> list:
-    """Fan out one create_completion call per panel member in parallel."""
+    """Fan out one create_completion call per panel member in parallel.
+
+    use_tools=True gives each member a mini tool loop with web_search —
+    follow-up searches included — instead of a single no-tools answer."""
     if completion_fn is None:
         completion_fn = A.create_completion
 
@@ -148,6 +257,22 @@ def run_panel(
     def _call(member: PanelMember) -> PanelResult:
         start = time.monotonic()
         try:
+            if use_tools:
+                text, input_tokens, output_tokens = _member_tool_loop(
+                    member.client,
+                    query,
+                    model=member.model,
+                    provider=member.provider,
+                    max_tokens=max_tokens,
+                    completion_fn=completion_fn,
+                )
+                return PanelResult(
+                    member=member,
+                    text=text,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    elapsed_s=time.monotonic() - start,
+                )
             response = completion_fn(
                 member.client,
                 messages,
@@ -325,11 +450,13 @@ def run_fusion(
     max_tokens: int = 1200,
     judge_max_tokens: int = 500,
     completion_fn: CompletionFn = None,
+    use_tools: bool = False,
 ) -> FusionResult:
     """Single entry point: discover panel, fan out, blind-judge, return.
 
     Pass `panel` (e.g. from build_explicit_panel) to skip auto-discovery and
-    use exactly those members instead."""
+    use exactly those members instead. use_tools=True gives every member a
+    mini tool loop with web_search."""
     if completion_fn is None:
         completion_fn = A.create_completion
 
@@ -349,6 +476,7 @@ def run_fusion(
         member_timeout_s=member_timeout_s,
         max_workers=max_workers,
         completion_fn=completion_fn,
+        use_tools=use_tools,
     )
 
     survivors = [r for r in results if r.error is None]

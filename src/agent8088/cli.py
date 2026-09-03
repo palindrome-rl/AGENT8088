@@ -3527,6 +3527,8 @@ def cmd_fusion(rest):
     after that, plain `/fusion <question>` just uses them, no flags needed.
     Optional flags before the question override the saved config for one call:
       /fusion --panel gemini:gemini-3-pro,ollama-cloud:kimi-k3 --judge anthropic:claude-sonnet-4-6 <question>
+    Each panel member can call web_search on its own when it needs fresh
+    facts — it decides, no flag needed.
     """
     if rest.strip().lower() == "setup":
         _cmd_fusion_setup(rest)
@@ -3583,6 +3585,7 @@ def cmd_fusion(rest):
             max_workers=max_workers,
             max_tokens=panel_max_tokens,
             judge_max_tokens=judge_max_tokens,
+            use_tools=True,
         )
 
     if result.winner_index is None:
