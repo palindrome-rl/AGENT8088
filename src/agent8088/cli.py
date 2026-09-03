@@ -3398,7 +3398,8 @@ def cmd_audit(rest):
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
 
 
-def _fusion_panel_table(results, judge_provider=None, judge_model=None):
+def _fusion_panel_table(results, judge_provider=None, judge_model=None,
+                        judge_parsed=None, judge_error=None):
     t = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Provider", style="#237dd7")
     t.add_column("Model", style="#237dd7")
@@ -3407,9 +3408,14 @@ def _fusion_panel_table(results, judge_provider=None, judge_model=None):
         status = "[green]ok[/green]" if r.error is None else f"[red]{r.error}[/red]"
         t.add_row(f"[dim]panel[/dim] {r.member.provider}", r.member.model, status)
     if judge_provider:
+        if judge_parsed:
+            judge_status = "[green]ok[/green]"
+        elif judge_error:
+            judge_status = f"[red]no verdict: {judge_error}[/red]"
+        else:
+            judge_status = "[dim]—[/dim]"
         t.add_row(f"[bold]judge[/bold] {judge_provider}",
-                  judge_model or "(session model)",
-                  "[dim]picks the winner[/dim]")
+                  judge_model or "(session model)", judge_status)
     return t
 
 
@@ -3600,12 +3606,14 @@ def cmd_fusion(rest):
     if result.winner_index is None:
         console.print(f"[red]fusion failed:[/red] {result.judge_error}")
         if result.results:
-            console.print(_fusion_panel_table(result.results,
-                                              shown_judge_provider, shown_judge_model))
+            console.print(_fusion_panel_table(
+                result.results, shown_judge_provider, shown_judge_model,
+                judge_parsed=result.judge_parsed, judge_error=result.judge_error))
         return
 
-    console.print(_fusion_panel_table(result.results,
-                                      shown_judge_provider, shown_judge_model))
+    console.print(_fusion_panel_table(
+        result.results, shown_judge_provider, shown_judge_model,
+        judge_parsed=result.judge_parsed, judge_error=result.judge_error))
 
     if not result.judge_parsed:
         winner = result.results[result.winner_index]
