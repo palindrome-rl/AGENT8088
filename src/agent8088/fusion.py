@@ -93,7 +93,27 @@ def _member_tool_loop(
 
         calls = A.find_tool_calls(text, allowed=_ALLOWED_TOOLS)
         if not calls:
-            return text, total_input, total_output
+            # No runnable call. Two distinct causes, both must correct the
+            # model rather than return leftover text as its "answer" — a live
+            # run handed the judge raw ✿FUNCTION✿ protocol and half-sentences
+            # as candidate answers.
+            attempted = sorted(set(A._attempted_tool_names(text)) - _ALLOWED_TOOLS)
+            cleaned = A.strip_tool_json(text)
+            if attempted:
+                # It tried a tool it doesn't have; find_tool_calls dropped it
+                # silently. Say so, or the model believes the call ran.
+                messages.append({"role": "user", "content":
+                    f"Tools {', '.join(attempted)} are not available to you. "
+                    "web_search is your only tool — use it, or answer in "
+                    "plain text from what you already have."})
+                continue
+            if cleaned.strip():
+                return cleaned, total_input, total_output
+            messages.append({"role": "user", "content":
+                "That tool call could not be executed (malformed or unsupported). "
+                "Do not emit tool-call markup. Answer in plain text now, from "
+                "what you have."})
+            continue
 
         outcome_lines = []
         for call in calls:
@@ -128,10 +148,13 @@ def _member_tool_loop(
         provider_name=provider,
         telemetry_attempt="fusion_panel",
     )
-    text = A._strip_reasoning(response.choices[0].message.content or "")
+    text = A.strip_tool_json(A._strip_reasoning(
+        response.choices[0].message.content or ""))
     usage, _source = A._model_usage(response)
     total_input += usage.get("input_tokens") or 0
     total_output += usage.get("output_tokens") or 0
+    if not text.strip():
+        text = "(no answer produced)"
     return text, total_input, total_output
 
 JUDGE_SYSTEM_PROMPT = (
@@ -298,7 +321,8 @@ def run_panel(
                 provider_name=member.provider,
                 telemetry_attempt="fusion_panel",
             )
-            text = A._strip_reasoning(response.choices[0].message.content or "")
+            text = A.strip_tool_json(A._strip_reasoning(
+                response.choices[0].message.content or ""))
             usage, _source = A._model_usage(response)
             return PanelResult(
                 member=member,
