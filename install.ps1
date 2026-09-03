@@ -2593,7 +2593,10 @@ try {
     Install-Deps
     Install-Gateway-Extras
     Install-Node-Bridge
-    Install-LibreOffice
+    # Alone among the bare-called optional stages, this one returns $true/$false
+    # (the tests assert on it), so an unassigned call prints True/False into the
+    # install log. Discard it here rather than dropping the return value.
+    [void](Install-LibreOffice)
     Install-Embedding-Model
     Install-Native-Sandbox
     if (-not (Setup-Path)) {
