@@ -12,6 +12,8 @@
 param(
     [switch]$SkipSetup,
     [switch]$TerminalBootstrap,
+    [switch]$WithLibreOffice,
+    [switch]$SkipLibreOffice,
     [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = "",
@@ -811,7 +813,43 @@ function Install-WindowsTerminal {
 # Modeled directly on Install-WindowsTerminal above: same non-interactive
 # invocation, same "warn and register a skipped stage, never abort the whole
 # installer" contract as every other optional component here.
+#
+# Unlike the others it asks first. ~350 MB installed per-machine by WinGet is
+# the slowest stage in this installer by a wide margin, and the three
+# capabilities it unlocks are ones plenty of users never touch.
 # ----------------------------------------------------------------------------
+# Consent for the one stage nobody should be made to wait on unasked. Kept out
+# of Install-LibreOffice so the tests can stub the console read.
+#
+# The $NonInteractive guard is not a policy choice: on a headless host Read-Host
+# returns empty immediately, so the explicit-answer loop below would spin
+# forever.
+function Read-LibreOfficeConsent {
+    if ($WithLibreOffice -and $SkipLibreOffice) {
+        throw "-WithLibreOffice and -SkipLibreOffice cannot be used together."
+    }
+    if ($WithLibreOffice) { return $true }
+    if ($SkipLibreOffice) { return $false }
+    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(1|y|yes|true)$') { return $true }
+    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(0|n|no|false)$') { return $false }
+    $runningInCI = $env:CI -match '^(1|y|yes|true)$'
+    if ($NonInteractive -or $runningInCI) {
+        Write-Info "Non-interactive - skipping the optional LibreOffice install."
+        return $false
+    }
+
+    Write-Host ""
+    Write-Warn "LibreOffice is optional (~350 MB) and can take several minutes to download and install."
+    Write-Host "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading,"
+    Write-Host "    and Excel formula recalculation. Skipping is safe."
+    Write-Host "    Add it later with: winget install TheDocumentFoundation.LibreOffice"
+    do {
+        $rawAnswer = Read-Host "Install LibreOffice now? [yes/no]"
+        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
+    } while ($answer -notin @("yes", "no"))
+    return ($answer -eq "yes")
+}
+
 function Install-LibreOffice {
     $sofficePaths = @(
         "$env:ProgramFiles\LibreOffice\program\soffice.exe",
@@ -833,7 +871,17 @@ function Install-LibreOffice {
         return $false
     }
 
-    Write-Info "Installing LibreOffice (needed for .docx/.pptx to PDF conversion and legacy .doc/.ppt/.xls) ..."
+    # Asked only once both cheap preconditions hold: nothing installed already,
+    # and a WinGet that could actually carry the answer out.
+    if (-not (Read-LibreOfficeConsent)) {
+        Write-Info "Skipping LibreOffice."
+        Register-SkippedStage -Label "LibreOffice" `
+            -Reason "not selected (optional, slow to install)" `
+            -Fix "winget install TheDocumentFoundation.LibreOffice"
+        return $false
+    }
+
+    Write-Info "Installing LibreOffice; this can take several minutes (needed for .docx/.pptx to PDF conversion and legacy .doc/.ppt/.xls) ..."
     $wingetResult = Invoke-WithTimeout -FilePath $winget.Source `
         -Arguments @(
             "install", "--id", "TheDocumentFoundation.LibreOffice", "--exact",
@@ -884,6 +932,10 @@ function Get-InstallerInvocation {
     $installLiteral = ConvertTo-PowerShellLiteral $InstallDir
     $skipSetupLiteral = if ($SkipSetup) { '$true' } else { '$false' }
     $arguments = "-Branch $branchLiteral -Agent8088Home $homeLiteral -InstallDir $installLiteral -SkipSetup`:$skipSetupLiteral"
+    # Not forwarded = silently re-asked (or re-decided) in the relaunched window.
+    # An env var needs no plumbing here; Start-Process inherits the environment.
+    if ($WithLibreOffice) { $arguments += " -WithLibreOffice" }
+    if ($SkipLibreOffice) { $arguments += " -SkipLibreOffice" }
     if ($ForTerminalBootstrap) { $arguments += " -TerminalBootstrap" }
 
     if ($PreferLocalScript -and -not $InstallerSourceUrl -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
@@ -2485,6 +2537,11 @@ function Start-InitialAgent {
 # ----------------------------------------------------------------------------
 Write-Banner
 Set-InstallerExitStatus -ExitCode 0
+if ($WithLibreOffice -and $SkipLibreOffice) {
+    Write-Err "-WithLibreOffice and -SkipLibreOffice cannot be used together."
+    Set-InstallerExitStatus -ExitCode 1
+    return
+}
 if (-not (Test-DiskSpace)) {
     Write-Info "Installation stopped. Free the required disk space, then run the installer again."
     Set-InstallerExitStatus -ExitCode 1

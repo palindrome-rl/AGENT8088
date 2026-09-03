@@ -9,27 +9,38 @@
   OpenAI-compatible API key
 - Optional: Node.js 20.11+ for the native sandbox and the WhatsApp bridge
 - Optional (Windows): LibreOffice, for `.docx`/`.pptx`/`.xlsx`→PDF conversion,
-  legacy `.doc`/`.ppt`/`.xls` reading, and Excel formula recalculation. The
-  installer tries to install it via WinGet; if that fails (no WinGet, offline
-  machine) it's skipped with a warning rather than blocking setup — those
-  three capabilities are simply unavailable until it's installed manually.
+  legacy `.doc`/`.ppt`/`.xls` reading, and Excel formula recalculation. It is
+  ~350 MB and by far the slowest stage in the installer, so the installer
+  **asks before installing it** rather than assuming. Answer `no` and setup
+  carries on — those three capabilities are simply unavailable until you run
+  `winget install TheDocumentFoundation.LibreOffice`, which the end-of-install
+  summary reminds you of.
+
+  To answer in advance, or on a machine that cannot be prompted:
+
+  ```powershell
+  $env:AGENT8088_INSTALL_LIBREOFFICE = 'yes'   # or 'no' to skip
+  $env:AGENT8088_BRANCH = 'development'
+  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+  ```
 
 No admin rights are needed for the base install. WinGet may prompt for
-elevation when installing LibreOffice specifically, since it's a per-machine
-install — that's WinGet's own prompt, not something this installer requests.
+elevation if you accept LibreOffice, since it's a per-machine install — that's
+WinGet's own prompt, not something this installer requests.
 
 ## Install
 
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.sh | bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-iex (irm https://raw.githubusercontent.com/tayyabimam1/AGENT8088/main/install.ps1)
+$env:AGENT8088_BRANCH = 'development'
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
 ```
 
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the
