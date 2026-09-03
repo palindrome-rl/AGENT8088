@@ -3456,22 +3456,33 @@ def _cmd_fusion_setup(_rest):
     chosen = _multi_choice_prompt(
         "Panel providers (check none to keep auto-discovering, up to the max above):",
         available)
-    if len(chosen) > max_panel:
-        console.print(f"[yellow]picked {len(chosen)}, keeping only the first {max_panel} "
-                       f"(max panel size) — {', '.join(chosen[max_panel:])} dropped.[/yellow]")
-        chosen = chosen[:max_panel]
 
+    # A provider can contribute more than one panel slot (multiple models), so
+    # the max-panel-size cap has to be enforced on the flattened spec list
+    # below, not on the provider count here.
     panel_specs = []
     for provider in chosen:
         models = _fetch_models_for_provider(provider)
         default_model = A.PROVIDERS[provider].get("model", "")
         if models:
             choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
-            choice = _choice_prompt(f"Model for {provider}:", choices, choices[0])
-            model = default_model if choice.startswith("(default)") else choice
+            picked = _multi_choice_prompt(
+                f"Model(s) for {provider} (space to toggle, enter to confirm):",
+                choices, checked=[choices[0]])
+            picked_models = [
+                default_model if choice.startswith("(default)") else choice
+                for choice in picked
+            ] or [default_model]
         else:
-            model = _custom_prompt(f"Model for {provider}:", default=default_model)
-        panel_specs.append(f"{provider}:{model}" if model else provider)
+            picked_models = [_custom_prompt(f"Model for {provider}:", default=default_model)]
+        for model in picked_models:
+            panel_specs.append(f"{provider}:{model}" if model else provider)
+
+    if len(panel_specs) > max_panel:
+        console.print(f"[yellow]picked {len(panel_specs)} panel member(s), keeping only the "
+                       f"first {max_panel} (max panel size) — "
+                       f"{', '.join(panel_specs[max_panel:])} dropped.[/yellow]")
+        panel_specs = panel_specs[:max_panel]
 
     judge_choices = ["(auto) session's current model"] + available
     judge_choice = _choice_prompt("Judge:", judge_choices, judge_choices[0])
