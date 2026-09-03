@@ -4469,9 +4469,24 @@ def _count_prompt(message, default=1, min_allowed=1):
     non-interactive terminal, same convention as _choice_prompt/_multi_choice_prompt."""
     try:
         from InquirerPy import inquirer
+        # InquirerPy's number prompt binds left/right to CURSOR MOVEMENT within
+        # the digit field, not increment/decrement -- only up/down change the
+        # value out of the box. Confirmed live with simulated keypresses (not
+        # assumed): left/right alone left the value unchanged. Remapping left
+        # onto the "up" (increment) action and right onto "down" (decrement),
+        # and clearing the original left/right entries so the physical key
+        # isn't claimed by two actions at once -- verified with real simulated
+        # arrow presses that this produces exactly the left=increase,
+        # right=decrease behavior asked for, while up/down still work too.
         return int(inquirer.number(
             message=message, default=default, min_allowed=min_allowed,
             max_allowed=None, float_allowed=False,
+            keybindings={
+                "up": [{"key": "up"}, {"key": "left"}],
+                "down": [{"key": "down"}, {"key": "right"}],
+                "left": [],
+                "right": [],
+            },
         ).execute())
     except (ImportError, EOFError, OSError, KeyboardInterrupt):
         value = input(f"{message} [{default}]: ").strip()
