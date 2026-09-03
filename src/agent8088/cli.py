@@ -3465,14 +3465,18 @@ def _cmd_fusion_setup(_rest):
     for provider, count in counted:
         models = _fetch_models_for_provider(provider)
         default_model = A.PROVIDERS[provider].get("model", "")
-        if models:
-            choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
-            choice = _choice_prompt(f"Model for {provider}:", choices, choices[0])
-            model = default_model if choice.startswith("(default)") else choice
-        else:
-            model = _custom_prompt(f"Model for {provider}:", default=default_model)
-        spec = f"{provider}:{model}" if model else provider
-        panel_specs.extend([spec] * count)
+        for seat in range(1, count + 1):
+            label = f"Model for {provider}"
+            if count > 1:
+                label += f" (seat {seat}/{count})"
+            if models:
+                choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
+                choice = _choice_prompt(label + ":", choices, choices[0])
+                model = default_model if choice.startswith("(default)") else choice
+            else:
+                model = _custom_prompt(label + ":", default=default_model)
+            spec = f"{provider}:{model}" if model else provider
+            panel_specs.append(spec)
 
     if len(panel_specs) > max_panel:
         console.print(f"[yellow]picked {len(panel_specs)} panel member(s), keeping only the "
@@ -4465,7 +4469,7 @@ def _multi_choice_prompt(message, choices, checked=()):
 
 def _counted_choice_prompt(message, choices, max_total=None):
     """One list where each row carries its own count: up/down moves between
-    rows, LEFT increases that row's count, RIGHT decreases it, enter confirms.
+    rows, RIGHT increases that row's count, LEFT decreases it, enter confirms.
     A row at 0 is simply not selected, so this replaces a checkbox instead of
     sitting next to one -- `ollama-cloud(2)` means that provider fills two
     panel slots.
@@ -4490,7 +4494,7 @@ def _counted_choice_prompt(message, choices, max_total=None):
             if max_total:
                 head += f"  [{total}/{max_total}]"
             lines = [("bold", head + "\n"),
-                     ("", "  (↑↓ move  ← more  → fewer  enter confirm)\n")]
+                     ("", "  (↑↓ move  → more  ← fewer  enter confirm)\n")]
             for index, choice in enumerate(choices):
                 count = counts[choice]
                 pointer = "❯ " if index == state["cursor"] else "  "
@@ -4509,14 +4513,14 @@ def _counted_choice_prompt(message, choices, max_total=None):
         def _(event):
             state["cursor"] = (state["cursor"] + 1) % len(choices)
 
-        @kb.add("left")
+        @kb.add("right")
         def _(event):
             choice = choices[state["cursor"]]
             if max_total and sum(counts.values()) >= max_total:
                 return
             counts[choice] += 1
 
-        @kb.add("right")
+        @kb.add("left")
         def _(event):
             choice = choices[state["cursor"]]
             if counts[choice] > 0:
