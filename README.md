@@ -97,6 +97,29 @@ The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`
 
 > **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account + WFP egress filter. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
 
+### Use the web UI
+
+See the [Web UI CLI reference](docs/wiki/10-cli-reference.md#web-ui) for details.
+
+```sh
+# Production
+cd web && npm install && npm run build
+cd ..
+agent8088 --web
+```
+
+```sh
+# Development — Terminal 1
+PYTHONPATH=src python -m agent8088.cli --web --web-dev
+
+# Development — Terminal 2
+cd web && npm run dev
+```
+
+Production: http://127.0.0.1:8180  ·  Development: http://127.0.0.1:5180
+
+Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
+
 ### A few useful commands
 
 | Command | Purpose |

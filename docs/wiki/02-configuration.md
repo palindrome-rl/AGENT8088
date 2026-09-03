@@ -178,6 +178,7 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_http_bytes` | Cap on an HTTP response. |
 | `max_tool_output_bytes` | Cap on tool output fed back to the model. |
 | `max_tool_timeout_seconds` | Hard ceiling for one tool call (default `600`). |
+| `compaction_threshold_pct` | Automatically summarize older messages at this estimated context usage (default `75`; `0` disables). |
 | `max_image_bytes` | Cap on an image attachment. |
 | `browser_max_steps` | Max steps `browse_page`'s browsing agent takes on one task (default `25`). Override once with `AGENT8088_BROWSER_MAX_STEPS`. |
 | `browser_task_timeout_seconds` | Overall wall-clock limit for one `browse_page` call (default `600`). Clamped to `max_tool_timeout_seconds`; override once with `AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS`. |
