@@ -17,11 +17,12 @@ from agent8088 import engine as A
 
 PANEL_SYSTEM_PROMPT = (
     "You are one participant in a blind panel answering a single question. "
-    "Answer directly and completely. You have one tool, web_search — use it "
-    "whenever the question needs fresh or factual information you are not "
-    "certain of, and skip it when your own knowledge clearly suffices. This "
-    "is a one-shot consultation: budget at most a couple of searches, then "
-    "give your final answer."
+    "Answer directly and completely. You have one tool, web_search — call it "
+    "for anything current, time-sensitive, or factual that could have changed "
+    "since your training (events, releases, prices, winners, news). You may "
+    "skip it only for pure reasoning, math, opinions, or knowledge that never "
+    "changes. This is a one-shot consultation: budget at most a couple of "
+    "searches, then give your final answer."
 )
 
 # Loop bound: enough rounds for a search, a refined search, and the final
@@ -61,7 +62,12 @@ def _member_tool_loop(
     tool_docs = A.render_tool_docs(
         {name: A.TOOL_SPECS[name] for name in ("web_search",) if name in A.TOOL_SPECS}
     )
-    system_prompt = PANEL_SYSTEM_PROMPT + "\n\n" + tool_docs
+    # Same runtime context the main loop injects, most importantly today's
+    # date: without it a model whose training predates an event is confident
+    # the event hasn't happened, so the "search when time-sensitive" rule
+    # never fires. Reuse the engine's block rather than a second date line.
+    system_prompt = (PANEL_SYSTEM_PROMPT + "\n\n"
+                      + A.render_runtime_context() + "\n" + tool_docs)
     messages = [{"role": "user", "content": query}]
     total_input = 0
     total_output = 0
@@ -112,7 +118,9 @@ def _member_tool_loop(
         messages,
         [],
         max_tokens=max_tokens,
-        system_prompt=PANEL_SYSTEM_PROMPT,
+        # No tool docs on the forced answer, but keep the date context:
+        # an answer about a dated event is wrong by a year without it.
+        system_prompt=PANEL_SYSTEM_PROMPT + "\n\n" + A.render_runtime_context(),
         temperature=0.3,
         on_token=None,
         interrupt_check=None,
@@ -129,7 +137,11 @@ def _member_tool_loop(
 JUDGE_SYSTEM_PROMPT = (
     "You are an impartial judge. You will see several answers to the same "
     "question, labeled anonymously. Pick the single best answer and justify "
-    "your choice."
+    "your choice. You MUST always pick a winner — never refuse, never say "
+    "you cannot decide, and never leave the WINNER line out. If the answers "
+    "are similar or you are uncertain, pick the one you would trust most and "
+    "say so in the verdict. Keep any thinking short: your output must start "
+    "with the required format, not reasoning."
 )
 
 CompletionFn = Callable[..., object]
@@ -356,9 +368,11 @@ def judge(
     """Blind the survivors, ask the judge model to pick a winner.
 
     A judge whose max_tokens budget cuts it off before it emits its WINNER
-    marker (reasoning models spend the budget thinking) is retried once at
-    double the token budget. Reasoning tokens count against max_tokens, so
-    a thoughtful judge can be starved of the room it needs to answer."""
+    marker (reasoning models spend the budget thinking) is retried at 2x and
+    then 4x the token budget. Reasoning tokens count against max_tokens, so
+    a thoughtful judge can be starved of the room it needs to answer; the
+    4x run observed live (glm-5.3, 500-token default) exhausted both prior
+    attempts on thinking alone."""
     if completion_fn is None:
         completion_fn = A.create_completion
 
@@ -379,14 +393,18 @@ def judge(
 
     prompt = (
         f"Question:\n{query}\n\n{candidate_block}\n\n"
-        "Pick the single best answer. Respond in exactly this format, nothing else:\n"
+        "Pick the single best answer — one of the labeled letters. There is "
+        "always a winner, even if the answers are close or all flawed; when "
+        "uncertain, choose the most accurate, complete, and honest one. "
+        "Respond in exactly this format, nothing else, with no preamble or "
+        "reasoning before it:\n"
         "WINNER: <letter>\nVERDICT: <2-4 sentences explaining why this answer is best>"
     )
 
-    def _call_judge(judge_max_tokens: int):
+    def _call_judge(judge_max_tokens: int, urgency: str = ""):
         return completion_fn(
             judge_client,
-            [{"role": "user", "content": prompt}],
+            [{"role": "user", "content": prompt + urgency}],
             [],
             max_tokens=judge_max_tokens,
             system_prompt=JUDGE_SYSTEM_PROMPT,
@@ -401,12 +419,16 @@ def judge(
     total_input = 0
     total_output = 0
     raw = ""
-    # One retry at 2x tokens: a reasoning judge can burn the entire budget
-    # thinking and never reach WINNER:/VERDICT:. ponytail: fixed 2 attempts,
-    # a configurable ladder is not warranted until a case needs three.
-    for attempt_index, budget in enumerate((max_tokens, max_tokens * 2)):
+    # Ladder: original budget, 2x, then 4x with a no-reasoning demand. A
+    # reasoning judge can burn every prior budget thinking and never reach
+    # WINNER:/VERDICT:. ponytail: fixed 3 attempts; not configurable until
+    # a real case needs a fourth.
+    urgencies = ("", "", "\n\nYou already have all the information you need. "
+                       "Do NOT reason or deliberate. Your first characters "
+                       "must be 'WINNER:'.")
+    for budget, urgency in zip((max_tokens, max_tokens * 2, max_tokens * 4), urgencies):
         try:
-            response = _call_judge(budget)
+            response = _call_judge(budget, urgency)
         except Exception as exc:
             result.judge_error = f"{type(exc).__name__}: {exc}"
             return result
@@ -414,11 +436,8 @@ def judge(
         total_input += usage.get("input_tokens") or 0
         total_output += usage.get("output_tokens") or 0
         raw = A._strip_reasoning(response.choices[0].message.content or "")
-        _winner, verdict_text = _parse_verdict(raw)
         if _WINNER_RE.search(raw):
             break
-        if attempt_index == 0:
-            continue
 
     result.judge_raw = raw
     result.total_input_tokens += total_input

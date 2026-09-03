@@ -333,13 +333,13 @@ def test_run_fusion_judge_truncation_retry_still_unparseable_falls_back(monkeypa
         provider = kw["provider_name"]
         calls.append(provider)
         if provider == "judge":
-            # truncated both times: no WINNER marker ever
+            # truncated every time: no WINNER marker ever
             return _fake_response("rambling reasoning cut off here", output_tokens=0)
         return _fake_response(f"answer from {provider}")
 
     result = fusion.run_fusion("q", judge_provider="judge", completion_fn=fake_completion)
 
-    assert calls.count("judge") == 2, "give up after one retry"
+    assert calls.count("judge") == 3, "3-rung ladder: original, 2x, 4x with urgency"
     assert result.judge_parsed is False
     assert result.winner_answer == "answer from p1"  # first-survivor fallback still works
 

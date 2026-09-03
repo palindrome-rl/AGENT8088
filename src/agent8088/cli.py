@@ -3596,10 +3596,17 @@ def cmd_fusion(rest):
 
     console.print(_fusion_panel_table(result.results))
 
-    if not result.judge_parsed and result.judge_raw:
+    if not result.judge_parsed:
         winner = result.results[result.winner_index]
-        console.print(f"[yellow]judge output could not be parsed — showing "
-                      f"{winner.member.provider}:{winner.member.model}'s answer instead[/yellow]")
+        if result.judge_raw:
+            console.print(f"[yellow]judge output could not be parsed — showing "
+                          f"{winner.member.provider}:{winner.member.model}'s answer instead[/yellow]")
+        else:
+            reason = result.judge_error or "judge produced no usable output"
+            console.print(f"[yellow]judge failed ({reason}) — showing "
+                          f"{winner.member.provider}:{winner.member.model}'s answer instead; "
+                          "try /fusion setup with a non-reasoning judge or raise "
+                          "fusion_judge_max_tokens.[/yellow]")
 
     console.print(Panel(Text(result.winner_answer), title="Fusion Answer",
                          box=box.ROUNDED, border_style="#00C8FF"))
