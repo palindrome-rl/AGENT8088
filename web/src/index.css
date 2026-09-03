@@ -1,0 +1,204 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --brand-primary: #237dd7;
+  --brand-cyan: #00edff;
+  --brand-border: #0077B6;
+}
+
+/* Dark mode (default) */
+html.dark {
+  color-scheme: dark;
+}
+html.dark body {
+  background: #0a0a0b;
+  color: #e4e4e7;
+}
+
+/* Light mode */
+html:not(.dark) {
+  color-scheme: light;
+}
+html:not(.dark) body {
+  background: #fafafa;
+  color: #18181b;
+}
+
+body {
+  font-family: 'Inter', system-ui, ui-sans-serif, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Beautiful UI — pixel-grid loader */
+.pixel-grid-loader {
+  background-image:
+    linear-gradient(rgba(35, 125, 215, 0.1) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(35, 125, 215, 0.1) 1px, transparent 1px);
+  background-size: 8px 8px;
+  animation: pixel-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pixel-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.8; }
+}
+
+/* Beautiful UI — streaming text cursor */
+.stream-cursor::after {
+  content: '▊';
+  animation: blink 1s step-end infinite;
+  color: var(--brand-cyan);
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* Beautiful UI — shimmer for loading states */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
+  animation: shimmer 1.8s infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Smooth sidebar transition — Beautiful UI easing */
+.sidebar-transition {
+  transition: width 280ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Fluid message entrance */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.msg-enter {
+  animation: msg-in 0.25s ease-out;
+}
+
+/* User message slide-in from right */
+@keyframes user-msg-in {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.user-msg-enter {
+  animation: user-msg-in 0.2s ease-out;
+}
+
+/* Beautiful UI — pixel-grid loader keyframes */
+@keyframes pixel-on {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 1; }
+}
+
+@keyframes shimmer-text {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Beautiful UI — fade-in for settled text */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Beautiful UI — fade-up for trace rows */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Beautiful UI — spinner for active step */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Beautiful UI — word reveal for streaming text */
+@keyframes word-reveal {
+  from { opacity: 0; filter: blur(4px); }
+  to { opacity: 1; filter: blur(0); }
+}
+
+/* Beautiful UI — pop-in for menus */
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96) translateY(4px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Beautiful UI — equalizer bounce for dictation */
+@keyframes eq-bounce {
+  0%, 100% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1); }
+}
+
+/* Beautiful UI — primitive card padding & footer */
+.primitive-card-pad {
+  padding: 14px 16px 12px;
+}
+.primitive-card-footer {
+  padding: 10px 14px;
+  border-top: 1px solid var(--line, rgba(39, 39, 42, 0.5));
+}
+.primitive-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  padding: 4px;
+  transition: background-color 100ms ease, color 100ms ease;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+/* Focus ring — subtle */
+*:focus-visible {
+  outline: 2px solid rgba(35, 125, 215, 0.4);
+  outline-offset: 1px;
+}
+
+/* Legacy pages predate the dark: variants used by the newer shell. Keep their
+   existing class names usable when the theme is switched to light. */
+html:not(.dark) .bg-zinc-950 { background-color: #ffffff !important; }
+html:not(.dark) .bg-zinc-900 { background-color: #ffffff !important; }
+html:not(.dark) .bg-zinc-800 { background-color: #f4f4f5 !important; }
+html:not(.dark) .bg-zinc-700 { background-color: #e4e4e7 !important; }
+html:not(.dark) .text-zinc-100 { color: #18181b !important; }
+html:not(.dark) .text-zinc-200 { color: #27272a !important; }
+html:not(.dark) .text-zinc-300 { color: #3f3f46 !important; }
+html:not(.dark) .text-zinc-400 { color: #71717a !important; }
+html:not(.dark) .text-zinc-500 { color: #71717a !important; }
+html:not(.dark) .text-zinc-600 { color: #52525b !important; }
+html:not(.dark) .text-brand-cyan { color: #0077b6 !important; }
+html:not(.dark) .border-zinc-800 { border-color: #e4e4e7 !important; }
+html:not(.dark) .border-zinc-700 { border-color: #d4d4d8 !important; }
+html:not(.dark) [class~="bg-zinc-950/50"],
+html:not(.dark) [class~="bg-zinc-950/30"],
+html:not(.dark) [class~="bg-zinc-950/20"],
+html:not(.dark) [class~="bg-zinc-900/50"],
+html:not(.dark) [class~="bg-zinc-900/40"],
+html:not(.dark) [class~="bg-zinc-900/30"],
+html:not(.dark) [class~="bg-zinc-800/60"],
+html:not(.dark) [class~="bg-zinc-800/50"],
+html:not(.dark) [class~="bg-zinc-800/40"],
+html:not(.dark) [class~="bg-zinc-800/20"] { background-color: rgb(244 244 245 / 0.72) !important; }
+html:not(.dark) [class~="border-zinc-800/60"],
+html:not(.dark) [class~="border-zinc-800/70"],
+html:not(.dark) [class~="border-zinc-800/50"] { border-color: rgb(228 228 231 / 0.85) !important; }
+html:not(.dark) [class~="placeholder:text-zinc-600"]::placeholder { color: #a1a1aa !important; }
+html:not(.dark) [class~="bg-zinc-900"][class~="text-white"] { background-color: #18181b !important; }
