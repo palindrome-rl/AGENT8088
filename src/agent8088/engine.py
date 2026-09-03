@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cad, cli_anything, documents, memory, web_search
+from agent8088 import cli_anything, documents, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -358,13 +358,6 @@ MAX_DOCUMENT_BYTES = int(APP_CONFIG.get("max_document_bytes", str(25 * 1024 * 10
 MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
 MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
 MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "600")))
-# A CAD-scoped script call (scripts/gen on a complex lattice, etc.) can
-# legitimately run longer than the generic shell ceiling -- mirrors the old
-# the old cad_project_finalize/generate_cad_model tool timeouts (600-900s).
-CAD_SCOPED_SHELL_TIMEOUT_SECONDS = max(
-    MAX_TOOL_TIMEOUT_SECONDS,
-    int(APP_CONFIG.get("cad_scoped_shell_timeout_seconds", "900")),
-)
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
@@ -555,12 +548,6 @@ def set_provider_limit(provider: str, key: str, value: str) -> dict:
 # stop and report instead of retrying the same blocked action until max_turns.
 # 0 disables. A single approval resets the count.
 DENIAL_BREAKER_THRESHOLD = int(APP_CONFIG.get("denial_breaker_threshold", "3"))
-
-# Failed CAD generation attempts tolerated in one turn before the generation
-# tools are withdrawn and the model must report. Complex assemblies need more
-# diagnosis-repair cycles than simple parts; the old hardcoded 2 stopped
-# legitimate work. 0 disables the cap (turn/max_turns still bound the run).
-CAD_MAX_GENERATION_ATTEMPTS = int(APP_CONFIG.get("cad_max_generation_attempts", "4"))
 
 # Unattended runs (cron / scheduled) have no operator to answer a prompt.
 #   deny     refuse the gated action and tell the model why (fail closed)
@@ -1262,54 +1249,6 @@ def _local_shell_reads_files(command: str) -> bool:
     )
 
 
-def _cad_skill_scripts_dir() -> Path:
-    return SKILLS_DIR / "cad" / "scripts"
-
-
-def _is_cad_scoped_command(command: str) -> bool:
-    """True only for `<cad venv python> <script under the vendored cad skill's
-    scripts/>  [args...]` -- the one shape auto-approved on CAD turns in any
-    permission mode (check_permission) and exempted from the CAD-turn shell
-    block (_run_agent_loop). `_shell_parts` already rejects any command
-    containing shell metacharacters/chaining (`_SHELL_CONTROL_RE`), so a
-    second command cannot be smuggled past this check."""
-    parts = _shell_parts(command)
-    if len(parts) < 2:
-        return False
-    # On Windows `_shell_parts` splits with posix=False, which keeps the quotes
-    # on each token. Quoting is not optional here -- the install path routinely
-    # contains spaces -- so without this every real invocation resolved to a
-    # nonsense relative path and the guard rejected it.
-    def _unquote(token: str) -> str:
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
-            return token[1:-1]
-        return token
-
-    try:
-        executable = Path(_unquote(parts[0])).resolve()
-        script = Path(_unquote(parts[1])).resolve()
-    except OSError:
-        return False
-    try:
-        cad_python = Path(cad.cad_runtime_python()).resolve()
-    except Exception:
-        return False
-    if executable != cad_python:
-        return False
-    scripts_dir = _cad_skill_scripts_dir().resolve()
-    if script == scripts_dir:
-        return False
-    try:
-        script.relative_to(scripts_dir)
-    except ValueError:
-        return False
-    # Upstream ships each entry point as a package directory (`scripts/gen/`
-    # with __main__.py), not a module file, and `python <dir>` runs its
-    # __main__. Requiring is_file() here rejected every real invocation, so the
-    # auto-approval never fired and CAD commands fell back to normal prompting.
-    return script.is_file() or (script / "__main__.py").is_file()
-
-
 def _is_fixed_host_tool_command(command: str) -> bool:
     """Whether this is verbatim the command of a host tool that takes no arguments.
 
@@ -1339,13 +1278,6 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     global _one_shot_grant
     if mode == "shell" and _hard_blocked_shell(command):
         return False
-    # A CAD-scoped script invocation is auto-approved in every permission
-    # mode -- upstream's text-to-cad workflow is many small script calls
-    # (gen, inspect, snapshot, ...) and prompting per call would reintroduce
-    # the escalation-turn tax this design exists to avoid. The scope check
-    # itself is the security boundary (_is_cad_scoped_command), not the mode.
-    if mode == "shell" and _is_cad_scoped_command(command):
-        return True
     # Read-only subagents may execute verification commands only when the
     # backend guarantees isolation. Their disposable workspace is prepared by
     # _exec_sandbox_command; host execution never enters this exception.
@@ -2519,20 +2451,7 @@ def read_skill_resource(name: str, resource: str) -> str:
         raise ValueError("Skill resource must be a supported text file.")
     if target.stat().st_size > _MAX_SKILL_RESOURCE_BYTES:
         raise ValueError("Skill resource is too large to load.")
-    text = target.read_text(encoding="utf-8")
-    if skill["name"] == "cad" and relative.upper() == "SKILL.MD":
-        # The vendored SKILL.md is generic upstream text -- it has no idea
-        # what this install's CAD python interpreter or scripts/ directory
-        # actually resolve to. Append the concrete paths here too (not only
-        # via _cad_runtime_instruction, which depends on a message-content
-        # classifier that can miss a request): this fires every time the
-        # model actually asks for the skill, regardless of that classifier.
-        text += (
-            "\n\n---\nThis install's concrete paths (use these exactly):\n"
-            f"- CAD python interpreter: {cad.cad_runtime_python()}\n"
-            f"- CAD skill scripts directory: {_cad_skill_scripts_dir()}\n"
-        )
-    return text
+    return target.read_text(encoding="utf-8")
 
 
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
@@ -6145,11 +6064,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     mode = (spec.get("mode") or "").lower()
     _declared_timeout = int(spec.get("timeout") or 25)
-    _timeout_ceiling = MAX_TOOL_TIMEOUT_SECONDS
-    if mode == "shell" and _is_cad_scoped_command(str(args.get("command") or "")):
-        _declared_timeout = max(_declared_timeout, CAD_SCOPED_SHELL_TIMEOUT_SECONDS)
-        _timeout_ceiling = CAD_SCOPED_SHELL_TIMEOUT_SECONDS
-    timeout = min(max(1, _declared_timeout), _timeout_ceiling)
+    timeout = min(max(1, _declared_timeout), MAX_TOOL_TIMEOUT_SECONDS)
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
     approval_key = _tool_call_key(name, args)
@@ -6559,14 +6474,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
 
     if mode == "read_text":
-        if name == "open_cad_viewer":
-            open_value = str(args.get("open_browser", "true")).strip().lower()
-            return cad.open_cad_viewer(
-                read_target,
-                workspace=read_target.parent,
-                launch_browser=open_value not in {"0", "false", "no", "off"},
-                timeout=timeout,
-            )
         # Documents are extracted to text first. Deliberately handled inside the
         # existing read mode rather than as a new tool: this way a .docx read
         # goes through the same sensitive-file floor, read path zones and
@@ -8419,16 +8326,6 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
 
 CLI_ANYTHING_MIN_TURNS = 20
 CLI_ANYTHING_MAX_TURNS = 60
-# Was a bare CAD_PROJECT_MIN_TURNS = 24 constant, sized for the deleted staged
-# cad_project_create/add_component/finalize architecture, where one tool call
-# did a whole build stage. The current architecture drives raw
-# execute_shell/write_file, which costs several turns per build step instead
-# of one -- confirmed live against a 12-solid mechanism that hit the old floor
-# with real repair work still outstanding. Configurable like
-# cad_scoped_shell_timeout_seconds below, rather than hardcoded, so it can be
-# tuned (or lowered) from config.txt/GUI without a code change; /maxturns still
-# raises it further for the whole session if set higher.
-CAD_GENERATION_MIN_TURNS = int(APP_CONFIG.get("cad_generation_min_turns", "40"))
 CLI_ANYTHING_EXTENSION_TURNS = 5
 
 
@@ -8448,101 +8345,6 @@ def _execute_shell_forbidden(messages: list[dict]) -> bool:
         if message.get("role") == "user"
         and not str(message.get("content") or "").startswith(_TOOL_RESULT_PREFIX)
     )
-
-
-def _cad_generation_requested(messages: list[dict]) -> bool:
-    """True for an explicit CAD request or an unambiguous CAD continuation.
-
-    Looking only at the last message made ``retry it`` and ``export it to STL``
-    lose the bounded CAD toolset. Inheriting every old CAD turn is equally
-    unsafe because ``now tell me a joke`` must restore the normal tools. Only a
-    deliberately small set of continuation verbs inherits the most recent CAD
-    request.
-    """
-    turns = _genuine_user_turns(messages)
-    text = _message_text(turns[-1]) if turns else ""
-    # Broad on purpose: since the skill's scripts/ location and the CAD venv's
-    # interpreter are only ever told to the model via _cad_runtime_instruction
-    # (gated on this classifier), a missed noun here doesn't just lose a nice-
-    # to-have hint -- the model never learns the absolute paths it needs and
-    # is left blind-guessing shell commands (confirmed: "create a 20mm cube"
-    # missed the old cad|step|stl|... list, cost ~25 wasted shell calls
-    # rediscovering paths, and ended up bypassing the vendored skill's own
-    # scripts/gen entirely). Generic shape/mechanical-part nouns are included
-    # alongside the format-specific ones.
-    cad_pattern = re.compile(
-        r"\b(?:cad|build123d|text-to-cad|freecad|step|stl|3mf|brep|iges|"
-        r"gen_step|part|assembly|component|bracket|enclosure|housing|gear|"
-        r"shaft|pin|bolt|screw|nut|washer|bearing|gripper|chuck|fixture|jig|"
-        r"mount|bracket|panel|plate|tube|pipe|flange|hinge|bushing|"
-        r"box|cube|sphere|cylinder|cone|prism|solid|"
-        r"3d[\s-]?(?:model|part|print|design)|mechanism|prototype)\b",
-        re.IGNORECASE,
-    )
-    action_pattern = re.compile(
-        r"\b(?:build|create|generate|model|design|convert|export|modify|edit|render|preview)\b",
-        re.IGNORECASE,
-    )
-    if cad_pattern.search(text) and action_pattern.search(text):
-        return True
-    continuation = re.search(
-        r"\b(?:try|retry|continue|resume|fix|repair|redo|regenerate|adjust|change|"
-        r"modify|edit|export|convert|render|preview)\b",
-        text, re.IGNORECASE,
-    )
-    if not continuation:
-        return False
-    if len(turns) < 2:
-        return False
-    previous = _message_text(turns[-2])
-    return bool(cad_pattern.search(previous) and action_pattern.search(previous))
-
-
-def _cad_runtime_instruction(available: set[str] | None = None) -> str:
-    """Routing contract for the vendored text-to-cad skill: the model drives
-    generation via execute_shell/write_file against the skill's own scripts,
-    same as any other coding agent that installs this skill. Only a shell
-    command that exactly invokes <cad python> <script under the vendored
-    skill's scripts/> is auto-approved without a permission prompt
-    (_is_cad_scoped_command) -- anything else on a CAD turn still goes
-    through normal permission gating, same as any other shell/write call.
-    """
-    available = available if available is not None else set()
-    cad_python = cad.cad_runtime_python()
-    scripts_dir = _cad_skill_scripts_dir()
-    lines = [
-        "CAD EXECUTION CONTRACT (active for this request) -- follow skills_installed/cad/SKILL.md:",
-        f"- CAD python interpreter: {cad_python}",
-        f"- CAD skill scripts directory: {scripts_dir}",
-        f"- Generated/inspected files live in {ARTIFACTS_ROOT} (execute_shell's cwd).",
-        "- Write a gen_step() Python source file with write_file, then run it via "
-        f'execute_shell as exactly: "{cad_python}" "{scripts_dir}/gen" <target.py> --write --json',
-        f'- Inspect/validate with: "{cad_python}" "{scripts_dir}/inspect" refs <target.step> --facts --json, '
-        "and the other inspect/export/snapshot subcommands documented in SKILL.md. "
-        "These exact invocations (python interpreter above, script inside the path above, no shell "
-        "chaining) are auto-approved without a permission prompt; anything else is gated normally.",
-    ]
-    if "open_cad_viewer" in available:
-        lines.append(
-            "- For an existing artifact or after successful generation, use open_cad_viewer "
-            "for interactive review. Do not start a server or browser through a shell. Unless "
-            "the user declined visual review, hand generated CAD to the Viewer before the final answer."
-        )
-    lines.append(
-        "- Before writing any generator source, use write_file to create <name>.plan.md "
-        "next to it: a checklist of every named solid this request needs, in build order, "
-        "one line each -- even a single-solid part gets a one-line plan.md. Build and "
-        "validate one named solid at a time (write, gen, inspect validate) -- do not write "
-        "everything as one file and validate it all at the end. After each solid passes "
-        "validation, use write_file to check it off in <name>.plan.md before starting the "
-        "next one; if a solid fails, repair and re-validate it before moving on. Re-read "
-        "<name>.plan.md with read_text if you are unsure which solids remain."
-    )
-    lines.append(
-        "- If a script call fails, read the error and fix the named field/component once. "
-        "Do not rewrite the entire design or keep retrying the same broken approach."
-    )
-    return "\n".join(lines)
 
 
 def _tool_definition_name(definition: dict) -> str:
@@ -8565,8 +8367,6 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
         max(max_turns, CLI_ANYTHING_MIN_TURNS)
         if _cli_anything_requested(messages) else max_turns
     )
-    if _cad_generation_requested(messages):
-        limit = max(limit, CAD_GENERATION_MIN_TURNS)
     return limit
 
 
@@ -8617,13 +8417,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         if user_turns else ""))
     durable_start = (re.search(r"https?://[^\s<>\]\)]+", durable_browser_goal)
                      if durable_browser_goal else None)
-    cad_failures = 0
-    # Plan-then-emit gate: after the model has produced text (its BUILD PLAN)
-    # on a CAD turn, the next turn gets one nudge to convert the plan into the
-    # single generation call. Never blocks a turn that already calls a tool.
-    cad_plan_pending = False
-    cad_decomposition_required = False
-
     # Fast path: a request for internal instructions/config is a policy refusal —
     # answer it immediately instead of burning turns and tokens to reach the same "no".
     refusal = _preflight_refusal(messages)
@@ -8637,7 +8430,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     turn_limit = _turn_limit_for_messages(messages, max_turns)
     dynamic_cli = _cli_anything_requested(messages)
     no_execute_shell = _execute_shell_forbidden(messages)
-    cad_generation = _cad_generation_requested(messages)
     hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
     for turn in range(hard_turn_limit):
         if turn >= turn_limit:
@@ -8648,22 +8440,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         )
         if no_execute_shell:
             round_allowed_tools.discard("execute_shell")
-        if cad_generation:
-            # CAD generation is driven by the vendored text-to-cad skill's own
-            # scripts, invoked via execute_shell/write_file (same shape as any
-            # other coding agent running this skill). Only run_sandboxed
-            # (Docker-style isolation) is unneeded here. A CAD-scoped script
-            # call is auto-approved without a prompt (check_permission /
-            # _is_cad_scoped_command); anything else still goes through normal
-            # permission gating like any other shell/write call.
-            round_allowed_tools.discard("run_sandboxed")
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
-        if cad_generation:
-            round_system_prompt = (
-                (round_system_prompt or current_system_prompt())
-                + "\n\n" + _cad_runtime_instruction(round_allowed_tools)
-            )
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         # Resource ceiling. Checked before the model call so an exhausted budget
@@ -8688,7 +8466,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         loop_model = model_name
         turn_context_window, turn_completion_limit = _active_model_token_limits(loop_provider, loop_model)
         turn_max_tokens = (
-            turn_completion_limit if not length_retries or cad_generation else
+            turn_completion_limit if not length_retries else
             min(turn_completion_limit * 2, turn_context_window) if length_retries == 1 else
             min(1024, turn_completion_limit)
         )
@@ -8748,20 +8526,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 f"Model output reached its {turn_max_tokens}-token limit. "
                 "The partial response was not executed."
             )
-            if cad_generation:
-                # The truncated content cannot be executed and may be huge.
-                # Drop it so the retry starts from a smaller request.
-                messages.pop()
-                cad_decomposition_required = True
-                retry_instruction = (
-                    f"{warning} Abandon that generator. Write a substantially smaller, "
-                    "simpler gen_step() source (helpers/loops instead of one long "
-                    "unrolled program) with write_file, then run it via "
-                    f'"{cad.cad_runtime_python()}" "{_cad_skill_scripts_dir()}/gen" '
-                    "<target.py> --write --json. Split a complex assembly into separate "
-                    "component source files if needed."
-                )
-            elif content:
+            if content:
                 # A genuinely large answer/tool call was in progress.
                 retry_instruction = (
                     f"{warning} Retry with one complete, concise tool call; "
@@ -8841,23 +8606,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 continue
 
             answer = strip_tool_json(content)
-
-            # Plan-then-emit gate: on a CAD turn the model was asked for a BUILD
-            # PLAN first. When its text-only reply IS that plan, nudge once to
-            # emit the single generation call instead of returning the plan to
-            # the user. Bounded: one injection, then the answer flows normally.
-            if (cad_generation and not cad_plan_pending and not cad_decomposition_required
-                    and answer and len(answer.splitlines()) >= 3
-                    and "write_file" in round_allowed_tools):
-                cad_plan_pending = True
-                messages.append({"role": "user", "content":
-                    "Plan received — now write the gen_step() source implementing it "
-                    "with write_file, then run it via the CAD skill's scripts/gen. "
-                    "No more prose: proceed directly, complete code, no narration."
-                })
-                if trace is not None:
-                    trace.append({"turn": turn, "type": "cad_plan_ack"})
-                continue
 
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
             if not answer and empty_retries < 1 and not forcing and not unknown:
@@ -8982,11 +8730,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 messages.append({"role": "user", "content": (
                     f"The arguments for '{name}' could not be parsed as JSON. Do "
                     "not re-send the same payload unchanged. Send a smaller, "
-                    "simpler one instead: drop every optional argument (for CAD "
-                    "project tools, omit 'verification' and 'parameters' entirely "
-                    "— verification can be supplied later at finalize), keep the "
-                    "JSON on a single line, and include only the required "
-                    "arguments."
+                    "simpler one instead: drop every optional argument, keep the "
+                    "JSON on a single line, and include only the required arguments."
                 )})
                 if trace is not None:
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",
@@ -8994,25 +8739,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 continue
             executed = True
             tool_outputs.append(result)
-            if (name == "execute_shell"
-                    and _is_cad_scoped_command(str(args.get("command") or ""))):
-                # Upstream's scripts print a traceback or a JSON {"error": ...}
-                # object on failure rather than a fixed sentinel string (there's
-                # no bespoke "CAD generation failed" wrapper anymore) -- sniff
-                # for either.
-                if "Traceback (most recent call last)" in result or '"error"' in result:
-                    cad_failures += 1
-                    if (CAD_MAX_GENERATION_ATTEMPTS > 0
-                            and cad_failures >= CAD_MAX_GENERATION_ATTEMPTS):
-                        result += (
-                            f"\nCAD retry budget exhausted after {cad_failures} failed "
-                            "script calls. Do not retry the same approach again this "
-                            "turn; report the latest specific failure and preserved "
-                            "artifacts, or try a substantially simpler generator."
-                        )
-                else:
-                    cad_failures = 0
-                    cad_plan_pending = False
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
                 # answered from it. An escalation is not a result — recording it

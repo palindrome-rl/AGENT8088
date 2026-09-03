@@ -45,7 +45,6 @@ is what the permission layer gates on — see
 | `cli_anything_uninstall` | `cli_anything` | `name` | prompt | Remove one managed harness. |
 | `cli_anything_skill` | `cli_anything` | `name` | ✅ | Load an installed harness's packaged task guidance. |
 | `cli_anything_run` | `cli_anything` | `name`, `arguments`, `cwd` | prompt | Run an installed harness with structured argv and no shell interpolation. |
-| `open_cad_viewer` | `read_text` | `filename`, `open_browser` | ✅ | Open a supported artifact in the managed loopback CAD Viewer. |
 
 `*` optional argument.
 
@@ -72,23 +71,6 @@ only creates new `.docx`/`.xlsx`/`.pptx`.
 key on that mode — the sensitive-file floor, write path zones, plan-only
 blocking, plan-audit revert. Sharing the mode means the tool inherits every one
 of them instead of needing a parallel set that could drift.
-
-## CAD
-
-The bundled `cad` skill drives Build123d and text-to-cad through its versioned
-scripts under `skills_installed/cad/scripts/`; it is not a second set of
-registered CAD tools. The normal workflow writes a `gen_step()` source file,
-then uses the skill's `gen`, `inspect`, `export`, and `snapshot` scripts to
-create and validate STEP-first artifacts.
-
-`read_text` automatically inspects supported STEP/STP files through the
-isolated CAD runtime. `open_cad_viewer` is the only built-in CAD-specific tool:
-it opens STEP/STP, STL, 3MF, GLB, or DXF artifacts in a managed Viewer bound
-only to `127.0.0.1`.
-
-The optional Build123d/text-to-cad runtime and Viewer run in a dedicated Python
-3.11 environment. Installation is best effort, so failure never blocks the
-core agent; `/doctor` reports whether the exact runtime is ready.
 
 > `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
 > without a prompt under the native sandbox, escalated under `local`, because

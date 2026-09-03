@@ -11,7 +11,7 @@ def test_memory_store_hybrid_lifecycle(tmp_path):
             categories=["preference"],
         )
         second = store.add(
-            "User works on CAD generation",
+            "User works on software generation",
             user_id="audit",
             embedding=[0.0, 1.0, 0.0],
             embed_model="audit-v1",

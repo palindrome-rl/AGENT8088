@@ -95,4 +95,3 @@ packages = ["src/agent8088"]
 "src/agent8088/gateway/platforms/whatsapp_bridge/bridge.js" = "agent8088/gateway/platforms/whatsapp_bridge/bridge.js"
 "src/agent8088/gateway/platforms/whatsapp_bridge/package.json" = "agent8088/gateway/platforms/whatsapp_bridge/package.json"
 "src/agent8088/gateway/platforms/whatsapp_bridge/package-lock.json" = "agent8088/gateway/platforms/whatsapp_bridge/package-lock.json"
-"src/agent8088/cad_runtime_requirements.txt" = "agent8088/cad_runtime_requirements.txt"

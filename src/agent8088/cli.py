@@ -3003,13 +3003,6 @@ def cmd_doctor(rest):
     cli_label = (f"ready (CLI-Hub {cli_state['version']})" if cli_state["available"]
                  else "available on demand")
     t.add_row("CLI-Anything", cli_label)
-    cad_state = A.cad.cad_runtime_status()
-    cad_label = (
-        f"ready (build123d {cad_state['build123d']}, cadgen {cad_state['cadgen']})"
-        if cad_state["available"]
-        else f"unavailable ({cad_state.get('reason', 'runtime probe failed')})"
-    )
-    t.add_row("Advanced CAD", cad_label)
     console.print(t)
 
     if fix:
@@ -3042,7 +3035,6 @@ def cmd_dump(_rest):
     provider = A.PROVIDERS.get(active, {})
     sandbox = A.sandbox_status()
     cli_state = A.cli_anything.status(A.CONFIG_PATH)
-    cad_state = A.cad.cad_runtime_status()
 
     lines = [
         f"Agent8088 diagnostic dump — {__version__}",
@@ -3068,13 +3060,6 @@ def cmd_dump(_rest):
         f"Version: {cli_state['version'] or 'not installed'}",
         f"Expected version: {cli_state['expected_version']}",
         f"Runtime path: {cli_state['root']}",
-        "",
-        "## Advanced CAD",
-        f"Available: {cad_state['available']}",
-        f"build123d expected: {cad_state['build123d']}",
-        f"cadgen expected: {cad_state['cadgen']}",
-        f"Runtime path: {cad_state['root']}",
-        f"Detail: {cad_state.get('reason', 'verified')}",
         "",
         "## Configuration",
         f"Config path: {A.CONFIG_PATH} (exists={A.CONFIG_PATH.exists()})",

@@ -38,7 +38,6 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 | **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
-| **Generate and inspect verified CAD** | Build parameterized mechanical parts and assemblies with build123d, use text-to-cad for STEP-first validation and rendered checks, then review the result in its managed interactive CAD Viewer. |
 
 ---
 
@@ -69,7 +68,6 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
 | Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
-| Advanced CAD runtime + interactive Viewer (build123d + text-to-cad) | yes (isolated, optional) | yes (isolated, optional) |
 
 ### Supported platforms
 
@@ -148,43 +146,6 @@ Python harness entries; public npm, uv, bundled, and generic shell installers
 remain visible for manual review. After installing a harness, Agent8088 loads
 its packaged `SKILL.md` before execution so application-specific prerequisites
 and command guidance remain available without eagerly expanding the prompt.
-
-### Verified CAD generation *(experimental)*
-
-Agent8088's built-in CAD path uses [build123d](https://github.com/gumyr/build123d)
-for OpenCascade geometry and the pinned
-[text-to-cad](https://github.com/earthtojake/text-to-cad) `cadgen` workflow for
-STEP-first generation, topology validation, and isometric preview rendering.
-The dependencies live in a dedicated environment under
-`integrations/cad/venv`, with a managed Python 3.11 interpreter, so they cannot
-change the core agent's Python packages or its supported Python version.
-
-Simple boxes, cylinders, spheres, cones, and tubes use a structured primitive
-tool. Individual parts use a bounded, natively structured design object that
-build123d compiles deterministically; advanced build123d Python remains a
-single-part escape hatch for fillets, chamfers, sketches, lofts, sweeps, shells,
-and other geometry outside that exact schema. Complex assemblies use a
-checkpointed project workflow: one component is generated and validated per
-model response, successful parts persist across retries, and a source-free
-placement specification produces the final assembly. This avoids requiring one
-model output to contain an entire robot, building, or mechanism. The worker validates each solid
-independently, rejects volumetric assembly overlap, and compares request-derived
-bounding-box, part-count, and named-component checks before reporting success.
-It requires a STEP model, report, and text-to-cad preview, bounds source and
-iteration complexity, and stops repeated failed generation attempts. STL, 3MF,
-GLB, and BREP are emitted only after the canonical STEP passes validation. This
-backend intentionally does not create native `.FCStd` feature trees; STEP is its
-canonical editable interchange format.
-
-The same isolated installation includes text-to-cad's browser Viewer. Agent8088
-can open validated STEP/STP, STL, 3MF, GLB, and DXF artifacts for assembly-tree
-inspection, part visibility/focus, display and clipping modes, exploded layouts,
-annotations, screenshots, and interactive measurement. The server is started
-through a dedicated tool, binds only to `127.0.0.1`, and is restricted to the
-artifact directory. Its reviewed prebuilt runtime is pinned to one upstream
-commit and checksum; npm dependencies are neither installed nor executed.
-
----
 
 ## CLI and messaging quick reference
 
