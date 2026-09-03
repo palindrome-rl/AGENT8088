@@ -3398,14 +3398,18 @@ def cmd_audit(rest):
                       f"{A.CONFIG_PATH}: {reason}[/yellow]")
 
 
-def _fusion_panel_table(results):
+def _fusion_panel_table(results, judge_provider=None, judge_model=None):
     t = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Provider", style="#237dd7")
     t.add_column("Model", style="#237dd7")
     t.add_column("Status")
     for r in results:
         status = "[green]ok[/green]" if r.error is None else f"[red]{r.error}[/red]"
-        t.add_row(r.member.provider, r.member.model, status)
+        t.add_row(f"[dim]panel[/dim] {r.member.provider}", r.member.model, status)
+    if judge_provider:
+        t.add_row(f"[bold]judge[/bold] {judge_provider}",
+                  judge_model or "(session model)",
+                  "[dim]picks the winner[/dim]")
     return t
 
 
@@ -3588,13 +3592,20 @@ def cmd_fusion(rest):
             use_tools=True,
         )
 
+    # Show the judge row even when auto-resolved: the display resolution
+    # mirrors run_fusion's own (session provider/model when none configured).
+    shown_judge_provider = judge_provider or A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER
+    shown_judge_model = judge_model or A.MODEL_NAME
+
     if result.winner_index is None:
         console.print(f"[red]fusion failed:[/red] {result.judge_error}")
         if result.results:
-            console.print(_fusion_panel_table(result.results))
+            console.print(_fusion_panel_table(result.results,
+                                              shown_judge_provider, shown_judge_model))
         return
 
-    console.print(_fusion_panel_table(result.results))
+    console.print(_fusion_panel_table(result.results,
+                                      shown_judge_provider, shown_judge_model))
 
     if not result.judge_parsed:
         winner = result.results[result.winner_index]
