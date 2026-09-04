@@ -3043,7 +3043,47 @@ def _cmd_local_check():
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Error probing hardware:[/red] {exc}")
         return
-    console.print(A.local_models.format_hardware_report(hw))
+
+    sys_t = Table(title="System", box=box.SIMPLE, title_style="bold #00edff",
+                  header_style="bold #00edff", border_style="#0077B6", show_header=False)
+    sys_t.add_column("Field", style="#00edff", no_wrap=True)
+    sys_t.add_column("Value", style="#237dd7")
+    cpu_val = hw.cpu_brand or "unknown"
+    if hw.cpu_cores_physical:
+        cpu_val += f" ({hw.cpu_cores_physical} cores"
+        if hw.cpu_cores_logical and hw.cpu_cores_logical != hw.cpu_cores_physical:
+            cpu_val += f" / {hw.cpu_cores_logical} threads"
+        if hw.cpu_speed_ghz:
+            cpu_val += f", {hw.cpu_speed_ghz} GHz"
+        cpu_val += ")"
+    sys_t.add_row("CPU", cpu_val)
+    sys_t.add_row("Architecture", hw.architecture or "unknown")
+    ram_color = "green" if hw.ram_total_gb >= 32 else "yellow" if hw.ram_total_gb >= 16 else "red"
+    sys_t.add_row("RAM", f"[{ram_color}]{hw.ram_free_gb:.1f} GB free / {hw.ram_total_gb:.1f} GB total[/{ram_color}]")
+    if hw.gpu_name:
+        sys_t.add_row("GPU", f"[green]{hw.gpu_name} (dedicated)[/green]")
+        sys_t.add_row("VRAM", f"{hw.vram_free_gb:.1f} GB free / {hw.vram_total_gb:.1f} GB total")
+    else:
+        sys_t.add_row("GPU", "[yellow]none detected (NVIDIA only, via nvidia-smi)[/yellow]")
+        sys_t.add_row("VRAM", "n/a -- local models run on CPU")
+    console.print(sys_t)
+    if hw.gpu_name and hw.caveat:
+        console.print(f"[dim]Note: {hw.caveat}[/dim]")
+
+    scores = A.local_models.score_models(hw)
+    mt = Table(title="Model Compatibility", box=box.SIMPLE, title_style="bold #00edff",
+               header_style="bold #00edff", border_style="#0077B6")
+    mt.add_column("Model", style="#00edff")
+    mt.add_column("Params", justify="right")
+    mt.add_column("Size", justify="right")
+    mt.add_column("Score", justify="right")
+    mt.add_column("Category")
+    cat_color = {"Compatible": "green", "Marginal": "yellow", "Poor": "red"}
+    for m in scores:
+        color = cat_color[m.category]
+        mt.add_row(m.name, f"{m.params_b}B", f"{m.size_gb:.1f} GB",
+                   f"[{color}]{m.score}/100[/{color}]", f"[{color}]{m.category}[/{color}]")
+    console.print(mt)
 
 
 def _cmd_local_list():

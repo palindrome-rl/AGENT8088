@@ -12,9 +12,11 @@ for pull/list/remove.
 from __future__ import annotations
 
 import json
+import platform
 import re
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -36,7 +38,51 @@ class HardwareBudget:
     vram_total_gb: float | None
     vram_free_gb: float | None
     source: str  # "nvidia-smi" or "ram-only"
+    cpu_brand: str = ""
+    cpu_cores_physical: int = 0
+    cpu_cores_logical: int = 0
+    cpu_speed_ghz: float | None = None
+    architecture: str = ""
     caveat: str = ""
+
+
+def _windows_cpu_name() -> str | None:
+    """platform.processor() on Windows returns the raw identifier string
+    ("Intel64 Family 6 Model 142...") not the marketing name -- ask WMI for
+    the friendly one instead. Best-effort: any failure just falls through
+    to the raw string."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Processor).Name"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        return out or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _probe_cpu() -> tuple[str, int, int, float | None, str]:
+    """Best-effort CPU identification. platform.processor() is often blank on
+    Linux (returns the raw architecture string instead of a brand string) or,
+    on Windows, a raw identifier rather than the marketing name -- _windows_cpu_name
+    gets the friendly one there."""
+    brand = None
+    if sys.platform == "win32":
+        brand = _windows_cpu_name()
+    brand = brand or platform.processor() or platform.machine() or "unknown"
+    arch = platform.machine() or "unknown"
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False) or 0
+        logical = psutil.cpu_count(logical=True) or 0
+        freq = psutil.cpu_freq()
+        speed_ghz = round(freq.max / 1000, 2) if freq and freq.max else None
+    except Exception:  # noqa: BLE001
+        physical = logical = 0
+        speed_ghz = None
+    return brand, physical, logical, speed_ghz, arch
 
 
 def _probe_gpu() -> tuple[str | None, float | None, float | None, str]:
@@ -74,6 +120,7 @@ def probe_hardware() -> HardwareBudget:
 
     vm = psutil.virtual_memory()
     gpu_name, vram_total, vram_free, caveat = _probe_gpu()
+    cpu_brand, cpu_physical, cpu_logical, cpu_speed, arch = _probe_cpu()
     return HardwareBudget(
         ram_total_gb=round(vm.total / _GIB, 1),
         ram_free_gb=round(vm.available / _GIB, 1),
@@ -81,6 +128,11 @@ def probe_hardware() -> HardwareBudget:
         vram_total_gb=round(vram_total, 1) if vram_total is not None else None,
         vram_free_gb=round(vram_free, 1) if vram_free is not None else None,
         source="nvidia-smi" if gpu_name else "ram-only",
+        cpu_brand=cpu_brand,
+        cpu_cores_physical=cpu_physical,
+        cpu_cores_logical=cpu_logical,
+        cpu_speed_ghz=cpu_speed,
+        architecture=arch,
         caveat=caveat,
     )
 
@@ -105,47 +157,103 @@ _MODEL_CATALOG = [
 # size before a model is comfortable, not just loadable.
 _HEADROOM_FACTOR = 1.3
 
+# Score bands, matching the Compatible/Marginal/Poor split used by hardware
+# fit checkers like llm-checker (github.com/signerless/llm-checker).
+COMPATIBLE_THRESHOLD = 75
+MARGINAL_THRESHOLD = 60
 
-def recommend_models(hw: HardwareBudget) -> list[str]:
-    """Rank _MODEL_CATALOG against the probed budget. A GPU budgets from
-    VRAM (fast); no GPU falls back to free RAM (CPU inference -- works, but
-    slow)."""
+
+@dataclass
+class ModelScore:
+    name: str
+    params_b: int
+    size_gb: float
+    score: int  # 0-100
+    category: str  # "Compatible", "Marginal", "Poor"
+
+
+def _category(score: int) -> str:
+    if score >= COMPATIBLE_THRESHOLD:
+        return "Compatible"
+    if score >= MARGINAL_THRESHOLD:
+        return "Marginal"
+    return "Poor"
+
+
+def score_models(hw: HardwareBudget) -> list[ModelScore]:
+    """0-100 fit score per model in _MODEL_CATALOG, sorted best-first.
+
+    A GPU budgets from VRAM (fast, so the memory-fit ratio IS the score).
+    No GPU falls back to free RAM and additionally caps the score by core
+    count -- CPU inference throughput tracks cores/memory-bandwidth, not
+    just whether the weights fit in RAM at all, so an 8+ physical-core
+    machine keeps the full memory-fit score while a 2-core one is capped
+    near 60% of it even for a model that technically fits."""
     if hw.vram_total_gb:
         budget_gb = hw.vram_total_gb
-        mode = "GPU"
+        cpu_cap = 1.0
     else:
         budget_gb = hw.ram_free_gb
-        mode = "CPU, no GPU detected -- will be slow"
-    lines = []
+        cores = hw.cpu_cores_physical or 0
+        cpu_cap = 0.6 + 0.4 * min(1.0, cores / 8)
+
+    scores = []
     for name, params_b, size_gb in _MODEL_CATALOG:
-        if size_gb * _HEADROOM_FACTOR <= budget_gb:
-            lines.append(f"{name} ({params_b}B, ~{size_gb:.1f} GB) -- fits comfortably [{mode}]")
-        elif size_gb <= budget_gb:
-            lines.append(f"{name} ({params_b}B, ~{size_gb:.1f} GB) -- fits tightly, little headroom [{mode}]")
+        fit_ratio = budget_gb / (size_gb * _HEADROOM_FACTOR)
+        raw = min(100.0, 100.0 * fit_ratio) * cpu_cap
+        score = max(0, round(raw))
+        scores.append(ModelScore(name, params_b, size_gb, score, _category(score)))
+    scores.sort(key=lambda m: m.score, reverse=True)
+    return scores
+
+
+def recommend_models(hw: HardwareBudget) -> list[str]:
+    """Back-compat plain-text summary of score_models(), Compatible/Marginal only."""
+    mode = "GPU" if hw.vram_total_gb else "CPU, no GPU detected -- will be slow"
+    lines = [
+        f"{m.name} ({m.params_b}B, ~{m.size_gb:.1f} GB) -- score {m.score}/100, "
+        f"{m.category} [{mode}]"
+        for m in score_models(hw) if m.category != "Poor"
+    ]
     if not lines:
-        smallest = _MODEL_CATALOG[0]
+        best = score_models(hw)[0]
         lines.append(
-            f"Even {smallest[0]} (~{smallest[2]:.1f} GB) may not fit comfortably -- "
-            f"only ~{budget_gb:.1f} GB available."
+            f"Even {best.name} (~{best.size_gb:.1f} GB) scores only {best.score}/100 -- "
+            f"nothing in the catalog fits comfortably on this machine."
         )
     return lines
 
 
 def format_hardware_report(hw: HardwareBudget) -> str:
-    lines = [f"RAM: {hw.ram_free_gb:.1f} GB free / {hw.ram_total_gb:.1f} GB total"]
+    lines = ["=== System ==="]
+    cpu_line = f"CPU: {hw.cpu_brand or 'unknown'}"
+    if hw.cpu_cores_physical:
+        cpu_line += f" ({hw.cpu_cores_physical} cores"
+        if hw.cpu_cores_logical and hw.cpu_cores_logical != hw.cpu_cores_physical:
+            cpu_line += f" / {hw.cpu_cores_logical} threads"
+        if hw.cpu_speed_ghz:
+            cpu_line += f", {hw.cpu_speed_ghz} GHz"
+        cpu_line += ")"
+    lines.append(cpu_line)
+    lines.append(f"Architecture: {hw.architecture or 'unknown'}")
+    lines.append(f"RAM: {hw.ram_free_gb:.1f} GB free / {hw.ram_total_gb:.1f} GB total")
     if hw.gpu_name:
+        lines.append(f"GPU: {hw.gpu_name} (dedicated)")
         lines.append(
-            f"GPU: {hw.gpu_name} -- {hw.vram_free_gb:.1f} GB free / "
-            f"{hw.vram_total_gb:.1f} GB total VRAM"
+            f"VRAM: {hw.vram_free_gb:.1f} GB free / {hw.vram_total_gb:.1f} GB total"
         )
         if hw.caveat:
             lines.append(f"Note: {hw.caveat}")
     else:
-        lines.append("GPU: none detected (NVIDIA only, via nvidia-smi) -- local models run on CPU")
+        lines.append("GPU: none detected (NVIDIA only, via nvidia-smi)")
+        lines.append("VRAM: n/a -- local models run on CPU")
     lines.append("")
-    lines.append("Recommended models for this machine:")
-    for rec in recommend_models(hw):
-        lines.append(f"  - {rec}")
+    lines.append("=== Model Compatibility ===")
+    lines.append(f"{'Model':<22} {'Params':>7} {'Size':>9} {'Score':>7}  Category")
+    for m in score_models(hw):
+        lines.append(
+            f"{m.name:<22} {m.params_b:>5}B {m.size_gb:>7.1f}GB {m.score:>5}/100  {m.category}"
+        )
     return "\n".join(lines)
 
 
