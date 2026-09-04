@@ -172,6 +172,12 @@ body {
   outline-offset: 1px;
 }
 
+/* The composer owns focus feedback as one control; its text area must not
+   receive a second, nested browser-style focus box. */
+.prompt-textarea:focus-visible {
+  outline: none;
+}
+
 /* Legacy pages predate the dark: variants used by the newer shell. Keep their
    existing class names usable when the theme is switched to light. */
 html:not(.dark) .bg-zinc-950 { background-color: #ffffff !important; }

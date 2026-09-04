@@ -351,7 +351,7 @@ export function PromptBar() {
               placeholder={listening ? 'Listening…' : 'Send a message…'}
               aria-label="Prompt"
               className={cn(
-                'min-w-0 flex-1 resize-none bg-transparent text-[14px] text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:outline-none',
+                'prompt-textarea min-w-0 flex-1 resize-none bg-transparent text-[14px] text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:outline-none',
                 expanded ? 'w-full px-1 py-1' : 'px-1 py-1.5',
                 '[overflow-wrap:anywhere]',
               )}
