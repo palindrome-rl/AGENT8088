@@ -7,6 +7,8 @@ import {
 } from 'lucide-react'
 import { useUIStore } from '@/stores/ui'
 import { useWebSocket } from '@/hooks/useWebSocket'
+import { useCommandCatalog } from '@/lib/commands'
+import type { CommandInfo } from '@/types/api'
 import { cn } from '@/lib/utils'
 
 /* ─────────────────────────────────────────────────────────
@@ -23,12 +25,6 @@ interface NavItem {
   keywords: string
 }
 
-interface CmdItem {
-  label: string
-  command: string
-  description: string
-}
-
 const NAV_ITEMS: NavItem[] = [
   { label: 'Chat', path: '/', icon: MessageSquare, keywords: 'chat message conversation' },
   { label: 'Artifacts', path: '/artifacts', icon: FolderOpen, keywords: 'artifacts files browse outputs' },
@@ -42,55 +38,15 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Doctor', path: '/doctor', icon: Stethoscope, keywords: 'doctor health check diagnostics' },
 ]
 
-const COMMANDS: CmdItem[] = [
-  { label: '/help', command: 'help', description: 'Show the command list' },
-  { label: '/capabilities', command: 'capabilities', description: 'Full self-report: tools, MCP, skills, limits' },
-  { label: '/plan', command: 'plan', description: 'Enter plan mode — propose, approve, then run' },
-  { label: '/audit on', command: 'audit', description: 'Verify each step against real files' },
-  { label: '/raw', command: 'raw', description: 'One raw model call — content, reasoning, tool_calls' },
-  { label: '/image', command: 'image', description: 'Analyze a screenshot/diagram with vision' },
-  { label: '/paste', command: 'paste', description: 'Analyze an image from the clipboard' },
-  { label: '/cli-anything', command: 'cli-anything', description: 'Find, run, build, refine, test CLI apps' },
-  { label: '/model', command: 'model', description: 'Show/switch providers or add one' },
-  { label: '/models', command: 'models', description: 'Pick provider/model or connect custom endpoint' },
-  { label: '/mcp', command: 'mcp', description: 'List MCP servers, connection state, tools' },
-  { label: '/sandbox', command: 'sandbox', description: 'Show/configure command isolation' },
-  { label: '/mode', command: 'mode', description: 'Show or set permission mode' },
-  { label: '/new', command: 'new', description: 'Create a named persistent session' },
-  { label: '/sessions', command: 'sessions', description: 'List named sessions' },
-  { label: '/resume', command: 'resume', description: 'Load a named session' },
-  { label: '/reset', command: 'reset', description: 'Clear active session, keep its name' },
-  { label: '/compact', command: 'compact', description: 'Summarize older turns, retain newest' },
-  { label: '/save', command: 'save', description: 'Save conversation + last trace to JSON' },
-  { label: '/clear', command: 'clear', description: 'Clear conversation context' },
-  { label: '/history', command: 'history', description: 'Show current conversation' },
-  { label: '/trace on', command: 'trace', description: 'Toggle step-by-step JSON trace' },
-  { label: '/reasoning on', command: 'reasoning', description: 'Show/hide model thinking' },
-  { label: '/verbose on', command: 'verbose', description: 'Control tool activity detail' },
-  { label: '/usage tokens', command: 'usage', description: 'Control post-turn usage summaries' },
-  { label: '/temp', command: 'temp', description: 'Set sampling temperature' },
-  { label: '/maxturns', command: 'maxturns', description: 'Set max agent turns' },
-  { label: '/limits', command: 'limits', description: 'Show/change turn, budget, tool limits' },
-  { label: '/dump', command: 'dump', description: 'Write a redacted diagnostic bundle' },
-  { label: '/memory search', command: 'memory', description: 'Persistent memory: search, add, forget, toggle' },
-  { label: '/status', command: 'status', description: 'Model, context, tool, skill, session status' },
-  { label: '/doctor', command: 'doctor', description: 'Check endpoint, auth, tools, skills' },
-  { label: '/config', command: 'config', description: 'Show active configuration' },
-  { label: '/tools', command: 'tools', description: 'List every tool with args, mode, description' },
-  { label: '/tool', command: 'tool', description: 'Invoke ONE tool directly' },
-  { label: '/skills', command: 'skills', description: 'Browse a skill or enable/disable' },
-  { label: '/agents', command: 'agents', description: 'List available sub-agent profiles' },
-  { label: '/agent', command: 'agent', description: 'Run a sub-agent' },
-]
-
 type ResultEntry =
   | { kind: 'nav'; item: NavItem }
-  | { kind: 'cmd'; item: CmdItem }
+  | { kind: 'cmd'; item: CommandInfo }
 
 export function CommandPalette() {
   const { commandPaletteOpen, setCommandPaletteOpen } = useUIStore()
   const navigate = useNavigate()
-  const { send } = useWebSocket()
+  useWebSocket()
+  const { data: commands = [] } = useCommandCatalog()
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -111,7 +67,7 @@ export function CommandPalette() {
     if (!q) {
       return [
         ...NAV_ITEMS.map(item => ({ kind: 'nav' as const, item })),
-        ...COMMANDS.slice(0, 8).map(item => ({ kind: 'cmd' as const, item })),
+        ...commands.filter(item => item.name).slice(0, 8).map(item => ({ kind: 'cmd' as const, item })),
       ]
     }
 
@@ -121,13 +77,15 @@ export function CommandPalette() {
       item.path.toLowerCase().includes(q),
     ).map(item => ({ kind: 'nav' as const, item }))
 
-    const cmdMatches = COMMANDS.filter(item =>
-      item.label.toLowerCase().includes(q) ||
+    const cmdMatches = commands.filter(item =>
+      item.name.toLowerCase().includes(q) ||
+      item.aliases.some(alias => alias.toLowerCase().includes(q)) ||
+      item.usage.toLowerCase().includes(q) ||
       item.description.toLowerCase().includes(q),
     ).map(item => ({ kind: 'cmd' as const, item }))
 
     return [...navMatches, ...cmdMatches]
-  }, [query])
+  }, [commands, query])
 
   // Clamp selected index
   useEffect(() => {
@@ -162,7 +120,10 @@ export function CommandPalette() {
     if (entry.kind === 'nav') {
       navigate(entry.item.path)
     } else {
-      send({ type: 'command', command: entry.item.command, args: '' })
+      navigate('/')
+      window.dispatchEvent(new CustomEvent('agent8088:insert-command', {
+        detail: `/${entry.item.name} `,
+      }))
     }
     setCommandPaletteOpen(false)
   }
@@ -248,7 +209,7 @@ export function CommandPalette() {
                 const item = entry.item
                 return (
                   <button
-                    key={`cmd-${item.command}`}
+                    key={`cmd-${item.name}`}
                     data-idx={idx}
                     onClick={() => selectResult(entry)}
                     className={cn(
@@ -260,7 +221,7 @@ export function CommandPalette() {
                   >
                     <Terminal className="h-4 w-4 shrink-0 text-zinc-400 dark:text-zinc-500" />
                     <div className="min-w-0 flex-1">
-                      <span className="font-mono text-sm text-brand-cyan">{item.label}</span>
+                      <span className="font-mono text-sm text-brand-cyan">{item.usage}</span>
                       <span className="ml-2 text-xs text-zinc-500 dark:text-zinc-500">{item.description}</span>
                     </div>
                     {idx === selected && <CornerDownLeft className="h-3.5 w-3.5 text-zinc-400" />}

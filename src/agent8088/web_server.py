@@ -235,6 +235,12 @@ async def get_status():
     }
 
 
+@app.get("/api/commands")
+async def get_commands():
+    """The CLI command catalog that drives web autocomplete and help."""
+    return _cl().command_catalog()
+
+
 @app.get("/api/tools")
 async def get_tools():
     """Full tool registry: all 32 tools with args, mode, description."""
@@ -1206,8 +1212,25 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
 
 async def _handle_command(ws: WebSocket, msg: dict, C):
     """Execute a slash command and return the result."""
-    command = msg.get("command", "")
+    command = str(msg.get("command", "")).strip().lstrip("/")
     args = msg.get("args", "")
+    if command.lower() in {"exit", "quit"}:
+        await ws.send_json({"type": "command_result", "command": command,
+                            "result": "Web session closed. Reload this page to start a new one."})
+        await ws.close()
+        return
+    if command.lower() == "agent" and not str(args).strip():
+        await ws.send_json({"type": "command_result", "command": command,
+                            "result": "cancelled — try /agent <name> <task>, or /agents to list them"})
+        return
+    model_arg = str(args).strip().lower()
+    if ((command.lower() == "models" and (not model_arg or model_arg in C.A.PROVIDERS or
+                                             model_arg in {"custom", "selfhosted", "self-hosted"})) or
+            (command.lower() == "model" and model_arg == "setup")):
+        await ws.send_json({"type": "command_result", "command": command,
+                            "result": "Use Settings → Config → Model Switcher for interactive model selection and setup. "
+                                      "You can still switch directly with /model <provider>[:model]."})
+        return
     handler = C.COMMANDS.get(command.lower())
     if not handler:
         await ws.send_json({"type": "command_result", "command": command,

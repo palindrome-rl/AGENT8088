@@ -189,6 +189,13 @@ export interface Capabilities {
   guardrails: string[]
 }
 
+export interface CommandInfo {
+  name: string
+  usage: string
+  description: string
+  aliases: string[]
+}
+
 // --- WebSocket protocol ---
 
 export type WSClientMessage =

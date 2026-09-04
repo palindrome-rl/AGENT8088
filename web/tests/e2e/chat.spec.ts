@@ -42,6 +42,39 @@ test('prompt bar accepts text and slash commands', async ({ page }) => {
   await expect(textarea).toHaveValue('/help')
 })
 
+test('slash autocomplete and palette use the CLI command catalog', async ({ page }) => {
+  await page.goto('/')
+  const textarea = page.locator('textarea')
+
+  await textarea.fill('/sea')
+  await expect(page.getByText('/search', { exact: true })).toBeVisible()
+
+  await textarea.press('Control+k')
+  const palette = page.getByPlaceholder('Search pages and commands…')
+  await palette.fill('think')
+  await expect(page.getByText('/think [on|off]', { exact: true })).toBeVisible()
+
+  await palette.fill('audit')
+  await page.getByText('/audit [on|off]', { exact: true }).click()
+  await expect(textarea).toHaveValue('/audit ')
+})
+
+test('an exact slash command submits with Enter', async ({ page }) => {
+  await page.goto('/')
+  const textarea = page.locator('textarea')
+  await textarea.fill('/help')
+  await textarea.press('Enter')
+  await expect(page.getByText('Commands', { exact: true })).toBeVisible()
+})
+
+test('an exact command wins over a longer autocomplete match', async ({ page }) => {
+  await page.goto('/')
+  const textarea = page.locator('textarea')
+  await textarea.fill('/agent')
+  await textarea.press('Enter')
+  await expect(page.getByText('cancelled — try /agent <name> <task>, or /agents to list them')).toBeVisible()
+})
+
 test('tools page loads', async ({ page }) => {
   await page.goto('/tools')
   await page.waitForTimeout(3000)

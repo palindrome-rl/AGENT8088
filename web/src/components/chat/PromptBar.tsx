@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect } from 'react'
+import { useMemo, useState, useRef, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
+import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
 import { ImageUpload } from './ImageUpload'
@@ -12,19 +13,6 @@ import { ImageUpload } from './ImageUpload'
  * Composer with @ sources, / commands, model picker,
  * dictation, and send. Pop-in menus, gliding highlight.
  * ───────────────────────────────────────────────────────── */
-
-/* Mirrors backend COMMANDS (cli.py) — interactive-only commands (exit/quit/
- * stop/approve/deny) are excluded: they either terminate the REPL or expect
- * stdin the web UI doesn't have. 'search' is excluded — it's not a real CLI
- * command (web search is a tool, not a slash command). */
-const COMMANDS = [
-  'help', 'tools', 'tool', 'capabilities', 'agents', 'agent', 'plan', 'image',
-  'paste', 'audit', 'skills', 'cli-anything', 'raw', 'model', 'models', 'mcp',
-  'config', 'status', 'doctor', 'dump', 'sandbox', 'mode',
-  'new', 'sessions', 'resume', 'reset', 'compact',
-  'history', 'trace', 'reasoning', 'think', 'verbose', 'usage', 'temp',
-  'maxturns', 'limits', 'save', 'clear', 'memory',
-]
 
 function generatedSessionName() {
   return `chat-${Date.now()}`
@@ -52,18 +40,30 @@ export function PromptBar() {
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const measureRef = useRef<HTMLSpanElement>(null)
   const controlsRef = useRef<HTMLDivElement>(null)
-  const { isStreaming, sessionName, addMessage, setSessionName } = useSessionStore()
+  const { isStreaming, sessionName, addMessage, setSessionName, setRawLoading, setRawResult } = useSessionStore()
   const { send: wsSend } = useWebSocket()
-  const { rawPanelOpen, toggleRawPanel } = useUIStore()
+  const { data: commands = [] } = useCommandCatalog()
+  const { rawPanelOpen, toggleRawPanel, setRawPanelOpen } = useUIStore()
   const queryClient = useQueryClient()
 
   const token = dismissed ? null : parseToken(text)
   const menu = plusOpen ? 'at' : token?.kind ?? null
   const query = plusOpen ? '' : token?.query ?? ''
 
-  const rows = menu === 'slash'
-    ? COMMANDS.filter(c => c.startsWith(query)).slice(0, 8)
-    : []
+  const rows = useMemo(() => menu === 'slash'
+    ? commands.flatMap(command => [command.name, ...command.aliases])
+      .filter(command => command && command.startsWith(query)).slice(0, 8)
+    : [], [commands, menu, query])
+
+  useEffect(() => {
+    const insertCommand = (event: Event) => {
+      setText((event as CustomEvent<string>).detail)
+      setDismissed(true)
+      requestAnimationFrame(() => inputRef.current?.focus())
+    }
+    window.addEventListener('agent8088:insert-command', insertCommand)
+    return () => window.removeEventListener('agent8088:insert-command', insertCommand)
+  }, [])
 
   // Auto-grow textarea
   useEffect(() => {
@@ -122,6 +122,11 @@ export function PromptBar() {
     setSessionError('')
     if (trimmed.startsWith('/')) {
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
+      if (cmd.toLowerCase() === 'raw') {
+        setRawResult(null)
+        setRawLoading(true)
+        setRawPanelOpen(true)
+      }
       wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
     } else {
       try {
@@ -146,7 +151,8 @@ export function PromptBar() {
         e.preventDefault()
         return
       }
-      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+      const exactCommand = rows.includes(text.trim().slice(1).toLowerCase())
+      if (((e.key === 'Enter' && !e.shiftKey && !exactCommand) || e.key === 'Tab')) {
         e.preventDefault()
         const cmd = rows[0]
         setText(`/${cmd} `)

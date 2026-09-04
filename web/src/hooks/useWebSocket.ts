@@ -17,6 +17,7 @@ import type { ChatMessage, StatusInfo, WSClientMessage, WSEvent } from '@/types/
 
 let sharedWs: WebSocket | null = null
 let disposed = false
+let sessionClosed = false
 let consumers = 0
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -26,7 +27,7 @@ function wireSocket(ws: WebSocket) {
     addToolEvent, updateToolEvent, updatePlanStep,
     resetStreaming, addMessage, setStatus, setSessionName,
   } = useSessionStore.getState()
-  const { setApprovalPending, setPlanApprovalPending } = useUIStore.getState()
+  const { setApprovalPending, setPlanApprovalPending, setRawPanelOpen } = useUIStore.getState()
 
   ws.onmessage = (event) => {
     const data: WSEvent = JSON.parse(event.data)
@@ -112,6 +113,7 @@ function wireSocket(ws: WebSocket) {
           }
           useSessionStore.getState().setRawResult(parsed)
           useSessionStore.getState().setRawLoading(false)
+          setRawPanelOpen(true)
         }
         if (data.result.toLowerCase().startsWith('unknown command')) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
@@ -122,27 +124,23 @@ function wireSocket(ws: WebSocket) {
         // with structured parsing) and session ops (handled with notifications).
         const cmd = data.command.toLowerCase()
         const sessionOps = ['new', 'resume', 'reset', 'compact']
+        if (['exit', 'quit'].includes(cmd)) sessionClosed = true
+        if (sessionOps.includes(cmd)) {
+          void syncSession(true).then(() => {
+            void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
+            if (data.result.trim().length > 0) {
+              addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+            }
+          })
+        } else if (!['exit', 'quit'].includes(cmd)) {
+          void syncSession()
+          void useQueryClientHelper().invalidateQueries({ queryKey: ['commands'] })
+        }
         if (!sessionOps.includes(cmd) &&
             !data.result.toLowerCase().startsWith('unknown command') &&
-            !data.result.toLowerCase().startsWith('error') &&
             cmd !== 'raw' &&
             data.result.trim().length > 0) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
-        }
-        if (sessionOps.includes(cmd)) {
-          void syncSession()
-          void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
-          // Show success notification for session operations (parity with CLI output)
-          if (!data.result.toLowerCase().startsWith('unknown command') &&
-              !data.result.toLowerCase().startsWith('error')) {
-            const notices: Record<string, string> = {
-              new: '✓ New session created',
-              resume: '✓ Session resumed',
-              reset: '✓ Session reset',
-              compact: '✓ Session compacted',
-            }
-            addMessage({ role: 'assistant', content: notices[cmd] ?? scrubMarkup(data.result) })
-          }
         }
         break
     }
@@ -150,14 +148,14 @@ function wireSocket(ws: WebSocket) {
 
   ws.onclose = () => {
     // Reconnect only while the app wants a socket — no zombie loops after unmount.
-    if (!disposed) {
+    if (!disposed && !sessionClosed) {
       reconnectTimer = setTimeout(() => ensureConnection(), 2000)
     }
   }
 }
 
 function ensureConnection() {
-  if (disposed || (sharedWs && sharedWs.readyState <= WebSocket.OPEN)) return
+  if (disposed || sessionClosed || (sharedWs && sharedWs.readyState <= WebSocket.OPEN)) return
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${protocol}//${window.location.host}/ws`
   const ws = new WebSocket(wsUrl)
@@ -165,7 +163,7 @@ function ensureConnection() {
   wireSocket(ws)
 }
 
-async function syncSession() {
+async function syncSession(includeHistory = false) {
   try {
     const statusResponse = await fetch('/api/status')
     if (!statusResponse.ok) return
@@ -173,6 +171,7 @@ async function syncSession() {
     useSessionStore.getState().setStatus(status)
     useSessionStore.getState().setSessionName(status.session_name || '')
 
+    if (!includeHistory) return
     const historyResponse = await fetch('/api/history')
     if (!historyResponse.ok) return
     const history = await historyResponse.json() as { messages?: ChatMessage[] }
