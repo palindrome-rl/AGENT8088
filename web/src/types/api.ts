@@ -24,6 +24,7 @@ export interface ToolSpec {
   content_arg?: string
   timeout: number
   aliases?: string[]
+  category?: string
   enabled: boolean
 }
 
@@ -32,6 +33,7 @@ export interface SkillPackage {
   description: string
   resources: string[]
   enabled: boolean
+  category?: string
 }
 
 export interface SubagentSpec {
@@ -246,7 +248,7 @@ export interface CommandInfo {
 // --- WebSocket protocol ---
 
 export type WSClientMessage =
-  | { type: 'chat'; text: string }
+  | { type: 'chat'; text: string; attachments?: string[] }
   | { type: 'command'; command: string; args?: string }
   | { type: 'interrupt' }
   | { type: 'approval'; approved: boolean; session_scope: boolean; id: string }

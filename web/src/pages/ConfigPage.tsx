@@ -574,6 +574,16 @@ function ProviderCard({ name, info }: { name: string; info: ProviderInfo }) {
   )
 }
 
+function CustomProviderForm({ onSave, saving }: { onSave: (body: Record<string, string>) => void; saving: boolean }) {
+  const [form, setForm] = useState({ name: 'custom', base_url: '', model: '', api_mode: 'openai', api_key_env: '' })
+  return <form onSubmit={(event) => { event.preventDefault(); onSave(form) }} className="space-y-2">
+    <div className="grid gap-2 sm:grid-cols-2">{(['name', 'model', 'base_url', 'api_key_env'] as const).map((key) => <input key={key} value={form[key]} onChange={(event) => setForm({ ...form, [key]: event.target.value })} placeholder={key === 'api_key_env' ? 'API key environment variable (optional)' : key.replace('_', ' ')} required={key === 'model' || key === 'base_url'} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600" />)}</div>
+    <select value={form.api_mode} onChange={(event) => setForm({ ...form, api_mode: event.target.value })} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100"><option value="openai">OpenAI-compatible</option><option value="litellm">LiteLLM</option></select>
+    <button disabled={saving} className="flex items-center gap-2 rounded-lg bg-brand-primary px-3 py-2 text-sm text-white disabled:opacity-40">{saving && <Loader2 className="h-4 w-4 animate-spin" />}Save provider</button>
+    <p className="text-[11px] text-zinc-500">Keys are never entered or stored here; set the named environment variable separately.</p>
+  </form>
+}
+
 // ---- Main Page ----
 
 export default function ConfigPage() {
@@ -605,6 +615,10 @@ export default function ConfigPage() {
       queryClient.invalidateQueries({ queryKey: ['config'] })
       queryClient.invalidateQueries({ queryKey: ['providers'] })
     },
+  })
+  const customProviderMutation = useMutation({
+    mutationFn: (body: Record<string, string>) => postJSON<{ ok?: boolean; error?: string }>('/api/providers/custom', body),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['config'] }); queryClient.invalidateQueries({ queryKey: ['providers'] }) },
   })
 
   // Preferences
@@ -710,6 +724,13 @@ export default function ConfigPage() {
                 switching={switchMutation.isPending}
               />
             )}
+          </Section>
+          <Section icon={Server} title="Custom OpenAI-compatible provider" subtitle="Endpoint and model only; credentials stay outside the browser">
+            <CustomProviderForm onSave={(body) => customProviderMutation.mutate(body)} saving={customProviderMutation.isPending} />
+            {customProviderMutation.data?.error && <p className="mt-2 text-xs text-red-400">{customProviderMutation.data.error}</p>}
+          </Section>
+          <Section icon={Shield} title="Gateway & Admin" subtitle="CLI-only by design">
+            <p className="text-xs leading-relaxed text-zinc-500">Gateway installation, updates, credentials, and process lifecycle controls remain in the CLI so this browser UI never becomes a process or secret-management surface.</p>
           </Section>
 
           {/* Mode Selector */}

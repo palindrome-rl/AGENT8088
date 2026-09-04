@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, asyncio, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings  # readline enables input history
+import ast, asyncio, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.parse  # readline enables input history
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -1505,6 +1505,54 @@ def load_providers(config: dict, include_builtins: bool = False) -> dict:
         n: p for n, p in provs.items()
         if p.get("base_url") or (p.get("api_mode", "").lower() == "litellm" and p.get("model"))
     }
+
+
+_VALID_PROVIDER_PROFILE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_VALID_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+
+
+def configure_provider_profile(name: str, base_url: str, model: str, api_mode: str,
+                               api_key_env: str) -> dict:
+    """Persist a non-secret OpenAI-compatible provider profile.
+
+    Credentials deliberately remain in the environment/.env key store; accepting
+    raw keys here would make the browser a second secret-management surface.
+    """
+    name = str(name or "").strip().lower()
+    model = str(model or "").strip()
+    api_mode = str(api_mode or "openai").strip().lower()
+    api_key_env = str(api_key_env or "").strip()
+    base_url = _normalize_openai_base_url(base_url)
+    if not _VALID_PROVIDER_PROFILE.match(name):
+        raise ValueError("provider name must use lowercase letters, numbers, _ or -")
+    if not model:
+        raise ValueError("a model is required")
+    if api_mode not in {"openai", "litellm"}:
+        raise ValueError("api_mode must be openai or litellm")
+    if api_key_env and not _VALID_ENV_NAME.match(api_key_env):
+        raise ValueError("api_key_env must be an environment-variable name")
+    if api_mode == "openai":
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("base_url must be an http(s) endpoint without credentials")
+    elif base_url:
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("base_url must be an http(s) endpoint without credentials")
+    values = {
+        f"provider.{name}.model": model,
+        f"provider.{name}.api_mode": api_mode,
+        f"provider.{name}.api_key_env": api_key_env,
+    }
+    if base_url:
+        values[f"provider.{name}.base_url"] = base_url
+    update_simple_config(CONFIG_PATH, values)
+    APP_CONFIG.update(values)
+    PROVIDERS[name] = {"model": model, "api_mode": api_mode,
+                       "api_key_env": api_key_env, "base_url": base_url}
+    activate_model(name, model)
+    return {"name": name, "model": model, "api_mode": api_mode,
+            "base_url": base_url, "api_key_env": api_key_env}
 
 
 PROVIDERS = load_providers(APP_CONFIG, include_builtins=True)
@@ -3540,7 +3588,7 @@ def _cap_subagent_answer(answer: str) -> str:
 _VALID_SUBAGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
-def _exec_create_subagent(args: dict) -> str:
+def write_custom_subagent(args: dict, *, allow_existing: bool = False) -> str:
     """Write a new custom sub-agent profile to USER_AGENTS_DIR/<name>.md.
 
     Bypasses resolve_write_path on purpose: this tool has no path_arg (see
@@ -3620,11 +3668,18 @@ def _exec_create_subagent(args: dict) -> str:
         f"{prompt}\n"
     )
     target = USER_AGENTS_DIR / f"{name}.md"
+    if target.exists() and not allow_existing:
+        return f"Error: sub-agent profile '{name}' already exists."
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(frontmatter, encoding="utf-8", newline="")
 
-    return (f"Created sub-agent profile '{name}' at {target}. "
+    return (f"{'Updated' if allow_existing else 'Created'} sub-agent profile '{name}' at {target}. "
             f"Use it via spawn_subagent with agent_type='{name}'.")
+
+
+def _exec_create_subagent(args: dict) -> str:
+    """Write a new custom sub-agent profile to USER_AGENTS_DIR/<name>.md."""
+    return write_custom_subagent(args)
 
 
 def _exec_subagent(args: dict, depth: int = 0) -> str:
@@ -6022,6 +6077,36 @@ def _exec_cron(args: dict) -> str:
         return "Removed." if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     raise AssertionError(f"Unhandled cron action: {action}")
+
+
+def schedule_task(action: str = "list", schedule: str = "", task: str = "") -> dict:
+    """Structured wrapper for the existing schedule_task runtime.
+
+    The CLI retains its text output; callers that need a UI contract get the
+    same validation and platform behavior plus parsed managed entries.
+    """
+    action = str(action or "list").strip().lower()
+    result = _exec_cron({"action": action, "schedule": schedule, "task": task})
+    if action != "list":
+        return {"ok": not result.startswith(("Error:", "Invalid", "Unknown", "Cron unavailable", "Cron error", "Windows scheduler error")),
+                "detail": result, "entries": []}
+    entries = []
+    for line in result.splitlines():
+        if _CRON_MARKER not in line:
+            continue
+        match = re.match(r"^(\S+(?:\s+\S+){4})\s+", line)
+        task_match = re.search(r"printf '%s\\n'\s+(.+?)\s+\|", line)
+        if not match or not task_match:
+            entries.append({"schedule": "", "task": "", "entry": line})
+            continue
+        try:
+            parsed = shlex.split(task_match.group(1))
+            scheduled_task = parsed[0] if len(parsed) == 1 else task_match.group(1)
+        except ValueError:
+            scheduled_task = task_match.group(1)
+        entries.append({"schedule": match.group(1), "task": scheduled_task})
+    return {"ok": not result.startswith(("Cron unavailable", "Windows scheduler error")),
+            "detail": "" if entries else result, "entries": entries}
 
 
 def _tool_path(spec: dict, args: dict) -> str:

@@ -12,6 +12,8 @@ import ConfigPage from '@/pages/ConfigPage'
 import DoctorPage from '@/pages/DoctorPage'
 import FusionPage from '@/pages/FusionPage'
 import TasksPage from '@/pages/TasksPage'
+import SearchPage from '@/pages/SearchPage'
+import SchedulesPage from '@/pages/SchedulesPage'
 
 export default function App() {
   return (
@@ -29,6 +31,8 @@ export default function App() {
         <Route path="/doctor" element={<DoctorPage />} />
         <Route path="/fusion" element={<FusionPage />} />
         <Route path="/tasks" element={<TasksPage />} />
+        <Route path="/search" element={<SearchPage />} />
+        <Route path="/schedules" element={<SchedulesPage />} />
       </Route>
     </Routes>
   )

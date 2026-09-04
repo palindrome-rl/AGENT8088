@@ -16,14 +16,21 @@ async function fetchTools(): Promise<ToolSpec[]> {
   return res.json() as Promise<ToolSpec[]>
 }
 
-async function invokeTool(name: string, args: Record<string, unknown>): Promise<{ name: string; result: unknown }> {
+type ToolRun = { name: string; result: unknown; approval_required?: boolean; approval_id?: string }
+async function invokeTool(name: string, args: Record<string, unknown>): Promise<ToolRun> {
   const res = await fetch(`/api/tool/${encodeURIComponent(name)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(args),
   })
   if (!res.ok) throw new Error(`Invocation failed (${res.status})`)
-  return res.json() as Promise<{ name: string; result: unknown }>
+  return res.json() as Promise<ToolRun>
+}
+
+async function approveTool(id: string, approved: boolean): Promise<ToolRun> {
+  const res = await fetch(`/api/tool/approval/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approved }) })
+  if (!res.ok) throw new Error(`Approval failed (${res.status})`)
+  return res.json() as Promise<ToolRun>
 }
 
 /* ------------------------------------------------------------------ */
@@ -72,6 +79,7 @@ function InvokerModal({ tool, onClose }: InvokerModalProps) {
   const mutation = useMutation({
     mutationFn: (args: Record<string, unknown>) => invokeTool(tool.name, args),
   })
+  const approval = useMutation({ mutationFn: ({ id, approved }: { id: string; approved: boolean }) => approveTool(id, approved) })
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -160,6 +168,8 @@ function InvokerModal({ tool, onClose }: InvokerModalProps) {
   ? mutation.data.result
   : JSON.stringify(mutation.data?.result, null, 2)}
               </pre>
+              {mutation.data?.approval_required && mutation.data.approval_id && <div className="mt-2 flex gap-2"><button type="button" onClick={() => approval.mutate({ id: mutation.data!.approval_id!, approved: true })} className="rounded bg-amber-500/20 px-2 py-1 text-xs text-amber-300">Approve & run</button><button type="button" onClick={() => approval.mutate({ id: mutation.data!.approval_id!, approved: false })} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-400">Cancel</button></div>}
+              {approval.data && <pre className="mt-2 max-h-48 overflow-auto text-[11px] text-zinc-300">{typeof approval.data.result === 'string' ? approval.data.result : JSON.stringify(approval.data.result, null, 2)}</pre>}
             </div>
           )}
 
@@ -204,7 +214,7 @@ export default function ToolsPage() {
   }
 
   const filtered = (tools ?? []).filter((t) =>
-    !filter || t.name.toLowerCase().includes(filter.toLowerCase()) || t.mode.toLowerCase().includes(filter.toLowerCase()),
+    !filter || t.name.toLowerCase().includes(filter.toLowerCase()) || t.mode.toLowerCase().includes(filter.toLowerCase()) || t.category?.toLowerCase().includes(filter.toLowerCase()),
   )
 
   return (
@@ -251,6 +261,7 @@ export default function ToolsPage() {
                 <th className="w-8 px-3 py-2.5" />
                 <th className="px-3 py-2.5 font-medium">Name</th>
                 <th className="px-3 py-2.5 font-medium">Mode</th>
+                <th className="px-3 py-2.5 font-medium">Group</th>
                 <th className="px-3 py-2.5 font-medium">Args</th>
                 <th className="px-3 py-2.5 font-medium">Description</th>
                 <th className="px-3 py-2.5 font-medium">Enabled</th>
@@ -275,6 +286,7 @@ export default function ToolsPage() {
                       </td>
                       <td className="px-3 py-2.5 font-mono text-[13px] text-zinc-100">{tool.name}</td>
                       <td className="px-3 py-2.5"><ModeBadge mode={tool.mode} /></td>
+                      <td className="px-3 py-2.5 text-xs text-zinc-500">{tool.category || 'other'}</td>
                       <td className="px-3 py-2.5 text-xs text-zinc-400">
                         {(tool.args ?? []).length > 0 ? (tool.args ?? []).join(', ') : '—'}
                       </td>
@@ -294,7 +306,7 @@ export default function ToolsPage() {
                     </tr>
                     {isOpen && (
                       <tr className="bg-zinc-950">
-                        <td colSpan={7} className="px-3 py-3">
+                        <td colSpan={8} className="px-3 py-3">
                           <div className="ml-6 space-y-2 border-l-2 border-brand-primary/30 pl-4 text-xs">
                             <div className="flex gap-2">
                               <span className="w-20 shrink-0 text-zinc-500">Timeout</span>

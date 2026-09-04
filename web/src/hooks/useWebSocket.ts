@@ -17,7 +17,6 @@ import type { ChatMessage, StatusInfo, WSClientMessage, WSEvent } from '@/types/
 
 let sharedWs: WebSocket | null = null
 let disposed = false
-let sessionClosed = false
 let consumers = 0
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -124,7 +123,6 @@ function wireSocket(ws: WebSocket) {
         // with structured parsing) and session ops (handled with notifications).
         const cmd = data.command.toLowerCase()
         const sessionOps = ['new', 'resume', 'reset', 'compact']
-        if (['exit', 'quit'].includes(cmd)) sessionClosed = true
         if (sessionOps.includes(cmd)) {
           void syncSession(true).then(() => {
             void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
@@ -132,7 +130,7 @@ function wireSocket(ws: WebSocket) {
               addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
             }
           })
-        } else if (!['exit', 'quit'].includes(cmd)) {
+        } else {
           void syncSession()
           void useQueryClientHelper().invalidateQueries({ queryKey: ['commands'] })
         }
@@ -148,14 +146,14 @@ function wireSocket(ws: WebSocket) {
 
   ws.onclose = () => {
     // Reconnect only while the app wants a socket — no zombie loops after unmount.
-    if (!disposed && !sessionClosed) {
+    if (!disposed) {
       reconnectTimer = setTimeout(() => ensureConnection(), 2000)
     }
   }
 }
 
 function ensureConnection() {
-  if (disposed || sessionClosed || (sharedWs && sharedWs.readyState <= WebSocket.OPEN)) return
+  if (disposed || (sharedWs && sharedWs.readyState <= WebSocket.OPEN)) return
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${protocol}//${window.location.host}/ws`
   const ws = new WebSocket(wsUrl)

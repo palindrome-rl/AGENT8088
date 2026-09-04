@@ -23,6 +23,8 @@ const settingsItems = [
   { to: '/agents', label: 'Sub-Agents', icon: Bot },
   { to: '/fusion', label: 'Fusion', icon: Sparkles },
   { to: '/tasks', label: 'Durable Tasks', icon: ClipboardList },
+  { to: '/search', label: 'Web Search', icon: Search },
+  { to: '/schedules', label: 'Schedules', icon: FolderClock },
   { to: '/mcp', label: 'MCP', icon: Network },
   { to: '/memory', label: 'Memory', icon: Brain },
   { to: '/sessions', label: 'Sessions', icon: FolderClock },

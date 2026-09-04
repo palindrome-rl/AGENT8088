@@ -13,11 +13,12 @@ import logging
 import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -243,7 +244,8 @@ async def get_status():
 @app.get("/api/commands")
 async def get_commands():
     """The CLI command catalog that drives web autocomplete and help."""
-    return _cl().command_catalog()
+    return [item for item in _cl().command_catalog()
+            if item["name"] not in {"exit", "quit"}]
 
 
 @app.get("/api/tools")
@@ -262,6 +264,7 @@ async def get_tools():
             "path_arg": spec.get("path_arg", ""),
             "timeout": spec.get("timeout", 25),
             "aliases": [],
+            "category": str(spec.get("category") or spec.get("mode") or "other"),
             "enabled": name in C._active_tool_specs() if (C := _cl()) else True,
         })
     return tools
@@ -275,7 +278,28 @@ async def invoke_tool(name: str, body: dict = None):
     # run_tool can take minutes (shell, docker, browser) — keep it off the loop.
     result = await asyncio.get_running_loop().run_in_executor(
         None, lambda: A.run_tool(name, args))
+    if str(result).startswith("ESCALATION_REQUEST"):
+        approval_id = uuid.uuid4().hex
+        _pending_direct_tools[approval_id] = {"name": name, "args": args,
+                                              "created": time.time()}
+        return {"name": name, "result": result, "approval_required": True,
+                "approval_id": approval_id}
     return {"name": name, "result": result}
+
+
+@app.post("/api/tool/approval/{approval_id}")
+async def approve_direct_tool(approval_id: str, body: dict = None):
+    """Retry one approval-gated direct tool through the engine permission layer."""
+    entry = _pending_direct_tools.pop(approval_id, None)
+    if entry is None or time.time() - entry["created"] > 300:
+        return {"error": "approval request expired"}
+    if not bool((body or {}).get("approved")):
+        return {"ok": True, "cancelled": True}
+    A = _eng()
+    A.grant_escalation()
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: A.run_tool(entry["name"], entry["args"]))
+    return {"name": entry["name"], "result": result}
 
 
 @app.get("/api/skills")
@@ -290,6 +314,7 @@ async def get_skills():
             "description": pkg.get("description", ""),
             "resources": [r for r in resources],
             "enabled": name not in _cl().S.disabled_skills,
+            "category": str(pkg.get("category") or pkg.get("group") or "General"),
         })
     return skills
 
@@ -327,6 +352,7 @@ async def get_agents():
             "tools": spec.get("tools", []),
             "max_turns": spec.get("max_turns", 8),
             "permission": spec.get("permission", ""),
+            "system_prompt": spec.get("system_prompt", ""),
             "model": spec.get("model", "inherit") or "inherit",
             "builtin": bool(spec.get("builtin")),
         })
@@ -349,6 +375,32 @@ async def create_agent(body: dict = None):
     """Create the same custom markdown profile as `/agents new`."""
     A = _eng()
     result = A._exec_create_subagent(body or {})
+    if result.startswith("Error:"):
+        return {"error": result[6:].strip()}
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    return {"ok": True, "result": result}
+
+
+@app.patch("/api/agents/{name}")
+async def update_agent(name: str, body: dict = None):
+    """Update custom profiles with the same validated writer as the CLI."""
+    A = _eng()
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    profile = A.SUBAGENT_SPECS.get(name)
+    if profile is None:
+        return {"error": f"unknown agent: {name}"}
+    if profile.get("builtin"):
+        return {"error": f"'{name}' is built-in and cannot be edited"}
+    values = dict(body or {})
+    if str(values.get("name", name)).strip().lower() != name:
+        return {"error": "renaming profiles is not supported"}
+    values["name"] = name
+    if isinstance(values.get("tools"), list):
+        values["tools"] = ",".join(str(item) for item in values["tools"])
+    for key in ("description", "tools", "max_turns", "model"):
+        values.setdefault(key, profile.get(key, ""))
+    values.setdefault("prompt", profile.get("system_prompt", ""))
+    result = A.write_custom_subagent(values, allow_existing=True)
     if result.startswith("Error:"):
         return {"error": result[6:].strip()}
     A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
@@ -416,10 +468,10 @@ def _start_durable_task(task_id: str) -> None:
 
 
 @app.get("/api/tasks")
-async def list_tasks():
+async def list_tasks(include_cancelled: bool = False):
     store = _task_store()
     try:
-        return [_task_view(task) for task in store.list()]
+        return [_task_view(task) for task in store.list(include_cancelled=include_cancelled)]
     finally:
         store.close()
 
@@ -634,6 +686,28 @@ async def switch_model(body: ModelSwitchBody):
         return {"ok": True, "provider": body.provider or A.DEFAULT_PROVIDER, "model": model_name}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+class ProviderProfileBody(BaseModel):
+    name: str = "custom"
+    base_url: str = ""
+    model: str
+    api_mode: str = "openai"
+    api_key_env: str = ""
+
+
+@app.post("/api/providers/custom")
+async def configure_custom_provider(body: ProviderProfileBody, request: Request):
+    """Configure an OpenAI-compatible endpoint without receiving a secret."""
+    raw = await request.json()
+    if any(key.lower() in {"api_key", "key", "token", "bearer"} for key in raw):
+        return {"error": "raw API keys are not accepted; set an environment variable instead"}
+    try:
+        profile = _eng().configure_provider_profile(
+            body.name, body.base_url, body.model, body.api_mode, body.api_key_env)
+        return {"ok": True, "provider": profile}
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @app.get("/api/models/{provider}")
@@ -869,10 +943,109 @@ async def get_mcp():
     return servers
 
 
+def _search_status() -> dict:
+    """Structured view of the same registry the /search command uses."""
+    A = _eng()
+    ctx = A._search_context()
+    providers = []
+    for provider in A.WEB_SEARCH_REGISTRY.all():
+        try:
+            available = provider.is_available(ctx)
+            if provider.name == "searxng" and available:
+                available = A.web_search.probe_searxng(ctx)
+        except Exception:
+            available = False
+        schema = provider.setup_schema()
+        providers.append({"name": provider.name, "available": available,
+                          "badge": schema.get("badge", ""), "hint": provider.setup_hint()})
+    from agent8088 import searxng_provision
+    return {"selected": str(A.APP_CONFIG.get("web_search_provider") or A.web_search.AUTO),
+            "active_chain": A._search_chain_summary(), "providers": providers,
+            "searxng": searxng_provision.status(),
+            "docker_available": A._docker_available(),
+            "ssrf_guidance": "Remote SearXNG hosts must pass the existing egress and SSRF allowlists."}
+
+
+@app.get("/api/search")
+async def get_search():
+    return _search_status()
+
+
+@app.post("/api/search/use")
+async def use_search(body: dict = None):
+    A = _eng()
+    provider = str((body or {}).get("provider") or "").strip().lower()
+    known = {A.web_search.AUTO, *(item.name for item in A.WEB_SEARCH_REGISTRY.all())}
+    if provider not in known:
+        return {"error": f"unknown search provider: {provider}"}
+    A.update_simple_config(A.CONFIG_PATH, {"web_search_provider": provider})
+    A.APP_CONFIG["web_search_provider"] = provider
+    return _search_status()
+
+
+@app.post("/api/search/setup")
+async def setup_search(body: dict = None):
+    if not bool((body or {}).get("confirmed")):
+        return {"confirmation_required": True,
+                "message": "Provision a local SearXNG Docker container?"}
+    A = _eng()
+    if not A._docker_available():
+        return {"error": "Docker is unavailable; use the configured fallback or a remote SearXNG URL."}
+    from agent8088 import searxng_provision
+    port = int(A.APP_CONFIG.get("searxng_port", "8080"))
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: searxng_provision.start(A._agent_data_dir(), port=port))
+    if not result.get("ok"):
+        return {"error": result.get("detail", "could not start SearXNG")}
+    ready = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: searxng_provision.wait_ready(port=port))
+    if not ready.get("ok"):
+        return {"error": ready.get("detail", "SearXNG did not become ready")}
+    base_url = result.get("base_url") or searxng_provision.base_url(port)
+    A.update_simple_config(A.CONFIG_PATH, {"search_base_url": base_url,
+                                            "web_search_provider": A.web_search.AUTO})
+    A.APP_CONFIG.update({"search_base_url": base_url, "web_search_provider": A.web_search.AUTO})
+    A.SEARCH_BASE_URL_CONFIGURED = True
+    A.resolve_auto_search_provider()
+    return _search_status()
+
+
+@app.post("/api/search/stop")
+async def stop_search(body: dict = None):
+    if not bool((body or {}).get("confirmed")):
+        return {"confirmation_required": True,
+                "message": "Stop the local SearXNG container?"}
+    from agent8088 import searxng_provision
+    result = await asyncio.get_running_loop().run_in_executor(None, searxng_provision.stop)
+    return _search_status() if result.get("ok") else {"error": result.get("detail", "could not stop SearXNG")}
+
+
+@app.get("/api/schedules")
+async def list_schedules():
+    return _eng().schedule_task()
+
+
+@app.post("/api/schedules")
+async def change_schedule(body: dict = None):
+    body = body or {}
+    action = str(body.get("action") or "").lower()
+    if action not in {"add", "remove"}:
+        return {"error": "action must be add or remove"}
+    if not bool(body.get("confirmed")):
+        return {"confirmation_required": True,
+                "message": f"{action.title()} this unattended scheduled task?"}
+    result = _eng().schedule_task(action, str(body.get("schedule") or ""),
+                                  str(body.get("task") or ""))
+    return result if result["ok"] else {"error": result["detail"]}
+
+
 @app.post("/api/mcp/reload")
-async def mcp_reload():
+async def mcp_reload(body: dict = None):
     """Reconnect MCP servers."""
     A = _eng()
+    if A.MCP_RELOAD_CONFIRM and not bool((body or {}).get("confirmed")):
+        return {"confirmation_required": True,
+                "message": "Reloading drops the MCP tool cache and reconnects servers."}
     A.reload_mcp_tools()
     return {"ok": True}
 
@@ -1009,6 +1182,101 @@ async def get_history():
     return {"messages": C.S.messages, "conversation_trace": C.S.conversation_trace}
 
 
+# Browser uploads are deliberately raw request bodies rather than multipart:
+# FastAPI's optional multipart parser is not part of the Agent8088 runtime.
+_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".pdf", ".docx", ".xlsx", ".pptx",
+                          ".png", ".jpg", ".jpeg", ".gif", ".webp"}
+_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+_ATTACHMENT_MAX_COUNT = 5
+
+
+def _attachment_session(C) -> str:
+    name = str(C.S.name or "web-session")
+    return re.sub(r"[^A-Za-z0-9_-]", "_", name)[:80] or "web-session"
+
+
+def _attachment_index(A, C) -> Path:
+    directory = A.ARTIFACTS_ROOT / ".web-attachments" / _attachment_session(C)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "index.json"
+
+
+def _read_attachments(A, C) -> dict:
+    try:
+        loaded = json.loads(_attachment_index(A, C).read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_attachments(A, C, entries: dict) -> None:
+    _attachment_index(A, C).write_text(json.dumps(entries, separators=(",", ":")), encoding="utf-8")
+
+
+@app.get("/api/attachments")
+async def list_attachments():
+    A, C = _eng(), _cl()
+    return [{"id": key, **value} for key, value in _read_attachments(A, C).items()]
+
+
+@app.post("/api/attachments")
+async def upload_attachment(request: Request):
+    """Store one session-owned upload and return only its opaque reference."""
+    A, C = _eng(), _cl()
+    filename = str(request.headers.get("x-filename") or "").strip()
+    if not filename or filename != Path(filename).name or "\\" in filename or len(filename) > 180:
+        return {"error": "invalid filename"}
+    extension = Path(filename).suffix.lower()
+    if extension not in _ATTACHMENT_EXTENSIONS:
+        return {"error": "unsupported attachment type"}
+    body = await request.body()
+    if not body:
+        return {"error": "attachment is empty"}
+    if len(body) > _ATTACHMENT_MAX_BYTES:
+        return {"error": "attachment exceeds the 25MB limit"}
+    entries = _read_attachments(A, C)
+    if len(entries) >= _ATTACHMENT_MAX_COUNT:
+        return {"error": f"at most {_ATTACHMENT_MAX_COUNT} attachments per session"}
+    attachment_id = uuid.uuid4().hex
+    target = _attachment_index(A, C).parent / f"{attachment_id}{extension}"
+    target.write_bytes(body)
+    entries[attachment_id] = {"name": filename, "size": len(body), "type": extension.lstrip(".")}
+    _save_attachments(A, C, entries)
+    return {"id": attachment_id, **entries[attachment_id]}
+
+
+@app.delete("/api/attachments/{attachment_id}")
+async def delete_attachment(attachment_id: str):
+    A, C = _eng(), _cl()
+    entries = _read_attachments(A, C)
+    metadata = entries.pop(attachment_id, None)
+    if metadata is None:
+        return {"error": "attachment not found"}
+    for candidate in _attachment_index(A, C).parent.glob(f"{attachment_id}.*"):
+        candidate.unlink(missing_ok=True)
+    _save_attachments(A, C, entries)
+    return {"ok": True}
+
+
+def _validated_attachments(ids: Any, A, C) -> list[dict]:
+    if not isinstance(ids, list) or len(ids) > _ATTACHMENT_MAX_COUNT:
+        raise ValueError("invalid attachments")
+    entries = _read_attachments(A, C)
+    resolved = []
+    for attachment_id in ids:
+        if not isinstance(attachment_id, str) or not re.fullmatch(r"[a-f0-9]{32}", attachment_id):
+            raise ValueError("invalid attachment reference")
+        metadata = entries.get(attachment_id)
+        if metadata is None:
+            raise ValueError("attachment does not belong to this session")
+        candidates = list(_attachment_index(A, C).parent.glob(f"{attachment_id}.*"))
+        if len(candidates) != 1 or not candidates[0].is_file():
+            raise ValueError("attachment is no longer available")
+        resolved.append({"id": attachment_id, "name": metadata["name"],
+                         "path": str(candidates[0])})
+    return resolved
+
+
 # === Artifacts browser ===
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
@@ -1130,6 +1398,7 @@ async def set_preferences(body: PrefBody):
 class LimitBody(BaseModel):
     key: str
     value: str
+    target: str = ""
 
 @app.post("/api/limits")
 async def set_limit(body: LimitBody):
@@ -1140,7 +1409,15 @@ async def set_limit(body: LimitBody):
             old, C.S.max_turns = C.S.max_turns, int(body.value)
             C._save_preferences()
             return {"ok": True, "key": "max_turns", "old": old, "new": C.S.max_turns}
-        result = A.set_limit(body.key, body.value)
+        if body.key == "provider":
+            provider, key = body.target.split(":", 1)
+            result = A.set_provider_limit(provider, key, body.value)
+        elif body.key == "tool_timeout":
+            result = A.set_tool_timeout(body.target, body.value)
+        elif body.key == "subagent_turns":
+            result = A.set_subagent_turns(body.target, body.value)
+        else:
+            result = A.set_limit(body.key, body.value)
         return {"ok": True, **result}
     except Exception as exc:
         return {"error": str(exc)}
@@ -1175,6 +1452,8 @@ async def get_limits():
             }
             for name, info in A.PROVIDERS.items()
         },
+        "tools": {name: spec.get("timeout", 25) for name, spec in A.TOOL_SPECS.items()},
+        "agents": {name: spec.get("max_turns", 8) for name, spec in A.SUBAGENT_SPECS.items()},
     }
 
 
@@ -1266,6 +1545,7 @@ async def websocket_endpoint(ws: WebSocket):
 # never read the verdict meant for a different escalation.
 _pending_approvals: dict = {}
 _pending_plan_approvals: dict = {}
+_pending_direct_tools: dict = {}
 _interrupt_event = threading.Event()
 
 
@@ -1286,11 +1566,25 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     text = msg.get("text", "")
     if not text.strip():
         return
+    try:
+        attachments = _validated_attachments(msg.get("attachments", []), A, C)
+    except ValueError as exc:
+        await ws.send_json({"type": "error", "message": str(exc)})
+        return
 
     _interrupt_event.clear()
     S = C.S
 
     # Append user message
+    if attachments:
+        base = A.ARTIFACTS_ROOT.resolve()
+        refs = []
+        for attachment in attachments:
+            # Relative artifact paths are usable by read_text but do not disclose
+            # a host filesystem location in history/export responses.
+            relative = Path(attachment["path"]).resolve().relative_to(base)
+            refs.append(f"- {attachment['name']} (attachment {attachment['id']}): {relative}")
+        text += "\n\nAttached session artifacts (read these files when needed):\n" + "\n".join(refs)
     S.messages.append({"role": "user", "content": text})
 
     trace = [] if S.show_trace else None
@@ -1468,8 +1762,7 @@ async def _handle_command(ws: WebSocket, msg: dict, C):
     args = msg.get("args", "")
     if command.lower() in {"exit", "quit"}:
         await ws.send_json({"type": "command_result", "command": command,
-                            "result": "Web session closed. Reload this page to start a new one."})
-        await ws.close()
+                            "result": f"/{command} is CLI-only and does nothing in the browser."})
         return
     if command.lower() == "agent" and not str(args).strip():
         await ws.send_json({"type": "command_result", "command": command,

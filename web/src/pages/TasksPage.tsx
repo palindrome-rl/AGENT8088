@@ -18,7 +18,7 @@ export default function TasksPage() {
   const [goal, setGoal] = useState('')
   const [selected, setSelected] = useState<string | null>(null)
   const tasks = useQuery({
-    queryKey: ['tasks'], queryFn: () => request<DurableTask[]>('/api/tasks'),
+    queryKey: ['tasks'], queryFn: () => request<DurableTask[]>('/api/tasks?include_cancelled=true'),
     refetchInterval: (query) => query.state.data?.some((task) => task.state === 'running' || task.state === 'queued') ? 1500 : false,
   })
   const detail = useQuery({ queryKey: ['task', selected], queryFn: () => request<DurableTask>(`/api/tasks/${selected}`), enabled: Boolean(selected), refetchInterval: () => tasks.data?.some((task) => task.id === selected && (task.state === 'running' || task.state === 'queued')) ? 1500 : false })
