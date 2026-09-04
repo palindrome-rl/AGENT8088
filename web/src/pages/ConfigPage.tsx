@@ -70,6 +70,8 @@ interface LimitsResponse {
   denial_breaker_threshold: number
   context_window: number
   max_completion_tokens: number
+  active_model?: { provider: string; model: string; context_window: number; max_completion_tokens: number }
+  providers?: Record<string, { context_window: string; max_completion_tokens: string }>
 }
 
 interface SandboxResponse {
@@ -563,6 +565,8 @@ function ProviderCard({ name, info }: { name: string; info: ProviderInfo }) {
       <div className="space-y-1 text-xs text-zinc-500">
         <div className="truncate"><span className="text-zinc-600">url:</span> {info.base_url}</div>
         <div><span className="text-zinc-600">model:</span> {info.model}</div>
+        {info.context_window && <div><span className="text-zinc-600">context:</span> {Number(info.context_window).toLocaleString()}</div>}
+        {info.max_completion_tokens && <div><span className="text-zinc-600">output:</span> {Number(info.max_completion_tokens).toLocaleString()}</div>}
         {info.api_key_env && <div><span className="text-zinc-600">key_env:</span> {info.api_key_env}</div>}
         {info.api_mode && <div><span className="text-zinc-600">mode:</span> {info.api_mode}</div>}
       </div>
@@ -785,6 +789,19 @@ export default function ConfigPage() {
       </div>
 
       {/* Config details */}
+      {configQuery.data && (
+        <Section icon={Activity} title="Runtime Visibility" subtitle="Dynamic model, compaction, and browser state">
+          <div className="grid grid-cols-1 gap-x-8 gap-y-0 sm:grid-cols-2">
+            <InfoRow label="Active model limits" value={limitsQuery.data?.active_model ? `${limitsQuery.data.active_model.context_window.toLocaleString()} context / ${limitsQuery.data.active_model.max_completion_tokens.toLocaleString()} output` : 'Loading…'} mono />
+            <InfoRow label="Auto-compact" value={configQuery.data.auto_compaction ? `${configQuery.data.auto_compaction.threshold_pct}% threshold · keep ${configQuery.data.auto_compaction.keep_messages}` : '—'} />
+            <InfoRow label="Browser progress" value={configQuery.data.browser?.current_host ? `visiting ${configQuery.data.browser.current_host}` : 'idle'} />
+            <InfoRow label="Browser limits" value={configQuery.data.browser ? `${configQuery.data.browser.max_steps} steps · ${configQuery.data.browser.task_timeout_seconds}s` : '—'} />
+            <InfoRow label="Browser actions / step" value={configQuery.data.browser?.max_actions_per_step ?? '—'} />
+            <InfoRow label="Browser visibility" value={configQuery.data.browser ? (configQuery.data.browser.headless ? 'headless' : 'visible') : '—'} />
+          </div>
+        </Section>
+      )}
+
       {configQuery.data && (
         <Section icon={Settings} title="Configuration Details" subtitle="Active config paths & settings">
           <div className="grid grid-cols-1 gap-x-8 gap-y-0 sm:grid-cols-2">

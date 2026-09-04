@@ -1,7 +1,7 @@
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
-  FolderClock, FolderOpen, Settings, Stethoscope,
+  FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
   PanelLeftClose, PanelLeftOpen, Sun, Moon, Search, X, Plus,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
@@ -21,6 +21,8 @@ const settingsItems = [
   { to: '/tools', label: 'Tools', icon: Wrench },
   { to: '/skills', label: 'Skills', icon: BookOpen },
   { to: '/agents', label: 'Sub-Agents', icon: Bot },
+  { to: '/fusion', label: 'Fusion', icon: Sparkles },
+  { to: '/tasks', label: 'Durable Tasks', icon: ClipboardList },
   { to: '/mcp', label: 'MCP', icon: Network },
   { to: '/memory', label: 'Memory', icon: Brain },
   { to: '/sessions', label: 'Sessions', icon: FolderClock },

@@ -232,6 +232,11 @@ async def get_status():
         "temperature": S.temperature,
         "max_turns": S.max_turns,
         "disabled_skills": sorted(S.disabled_skills),
+        "auto_compaction": {
+            "threshold_pct": A.COMPACTION_THRESHOLD_PCT,
+            "keep_messages": A.COMPACTION_KEEP_MESSAGES,
+        },
+        "browser": {"current_host": A.browser_status()},
     }
 
 
@@ -322,6 +327,8 @@ async def get_agents():
             "tools": spec.get("tools", []),
             "max_turns": spec.get("max_turns", 8),
             "permission": spec.get("permission", ""),
+            "model": spec.get("model", "inherit") or "inherit",
+            "builtin": bool(spec.get("builtin")),
         })
     return agents
 
@@ -337,6 +344,224 @@ async def run_agent(name: str, body: dict = None):
     return {"agent": name, "result": result}
 
 
+@app.post("/api/agents")
+async def create_agent(body: dict = None):
+    """Create the same custom markdown profile as `/agents new`."""
+    A = _eng()
+    result = A._exec_create_subagent(body or {})
+    if result.startswith("Error:"):
+        return {"error": result[6:].strip()}
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    return {"ok": True, "result": result}
+
+
+@app.delete("/api/agents/{name}")
+async def delete_agent(name: str):
+    """Delete a custom profile; built-ins stay immutable."""
+    A = _eng()
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    profile = A.SUBAGENT_SPECS.get(name)
+    if profile is None:
+        return {"error": f"unknown agent: {name}"}
+    if profile.get("builtin"):
+        return {"error": f"'{name}' is built-in and cannot be deleted"}
+    path = (A.USER_AGENTS_DIR / f"{name}.md").resolve()
+    if path.parent != A.USER_AGENTS_DIR.resolve():
+        return {"error": "invalid agent name"}
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return {"error": f"profile not found: {name}"}
+    A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
+    return {"ok": True}
+
+
+def _task_store():
+    from agent8088.task_runtime import TaskStore, store_path
+    A = _eng()
+    return TaskStore(A.APP_CONFIG.get("task_db_path") or store_path(A.CONFIG_PATH))
+
+
+def _task_view(task: dict, operations: list[dict] | None = None) -> dict:
+    """Return task state without its checkpointed model messages."""
+    view = {key: value for key, value in task.items() if key != "messages_json"}
+    if operations is not None:
+        view["operations"] = operations
+    return view
+
+
+def _run_durable_task(task_id: str) -> None:
+    """Continue one persisted task outside FastAPI's event loop."""
+    from agent8088.task_runtime import run_task
+    A, C = _eng(), _cl()
+    store = _task_store()
+    try:
+        def agent(messages, **kwargs):
+            return A.run_agent(
+                messages, temperature=C.S.temperature, memory_capture=False,
+                system_prompt=C._session_system_prompt,
+                tools_def=lambda: A.build_tools_def(C._active_tool_specs()),
+                allowed_tools=lambda: set(C._active_tool_specs()), **kwargs,
+            )
+        run_task("", agent, store=store, workspace=A.PROJECT_ROOT, task_id=task_id,
+                 max_slices=8, slice_turns=max(4, C.S.max_turns))
+    except Exception:
+        log.exception("durable task %s failed to start", task_id)
+    finally:
+        store.close()
+
+
+def _start_durable_task(task_id: str) -> None:
+    threading.Thread(target=_run_durable_task, args=(task_id,), daemon=True).start()
+
+
+@app.get("/api/tasks")
+async def list_tasks():
+    store = _task_store()
+    try:
+        return [_task_view(task) for task in store.list()]
+    finally:
+        store.close()
+
+
+@app.get("/api/tasks/{task_id}")
+async def get_task(task_id: str):
+    store = _task_store()
+    try:
+        try:
+            task = store.resolve(task_id)
+        except KeyError:
+            return {"error": f"task not found: {task_id}"}
+        return _task_view(task, store.recent_operations(task["id"]))
+    finally:
+        store.close()
+
+
+@app.post("/api/tasks")
+async def start_task(body: dict = None):
+    goal = str((body or {}).get("goal") or "").strip()
+    if not goal:
+        return {"error": "A task goal is required."}
+    store = _task_store()
+    try:
+        task_id = store.create(goal, _eng().PROJECT_ROOT, [{"role": "user", "content": goal}])
+        task = store.get(task_id)
+    finally:
+        store.close()
+    _start_durable_task(task_id)
+    return _task_view(task)
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def resume_task(task_id: str):
+    store = _task_store()
+    try:
+        try:
+            task = store.resolve(task_id)
+        except KeyError:
+            return {"error": f"task not found: {task_id}"}
+        if task["state"] == "running":
+            return {"error": "task is already running"}
+        if task["state"] in {"completed", "cancelled"}:
+            return {"error": f"task is {task['state']} and cannot resume"}
+    finally:
+        store.close()
+    _start_durable_task(task["id"])
+    return _task_view(task)
+
+
+@app.post("/api/tasks/{task_id}/end")
+async def end_task(task_id: str):
+    store = _task_store()
+    try:
+        try:
+            task = store.resolve(task_id)
+        except KeyError:
+            return {"error": f"task not found: {task_id}"}
+        return _task_view(store.cancel(task["id"]))
+    finally:
+        store.close()
+
+
+@app.get("/api/fusion/config")
+async def get_fusion_config():
+    A = _eng()
+    return {
+        "panel": [item for item in str(A.APP_CONFIG.get("fusion_panel", "")).split(",") if item],
+        "judge_provider": str(A.APP_CONFIG.get("fusion_judge_provider", "")),
+        "judge_model": str(A.APP_CONFIG.get("fusion_judge_model", "")),
+        "max_panel": int(A.APP_CONFIG.get("fusion_max_panel", "6")),
+    }
+
+
+@app.post("/api/fusion/config")
+async def set_fusion_config(body: dict = None):
+    A = _eng()
+    body = body or {}
+    panel = [str(item).strip() for item in body.get("panel", []) if str(item).strip()]
+    try:
+        max_panel = max(1, int(body.get("max_panel", 6)))
+        if len(panel) > max_panel:
+            return {"error": f"panel has {len(panel)} members; maximum is {max_panel}"}
+        values = {
+            "fusion_panel": ",".join(panel),
+            "fusion_judge_provider": str(body.get("judge_provider", "")).strip(),
+            "fusion_judge_model": str(body.get("judge_model", "")).strip(),
+            "fusion_max_panel": max_panel,
+        }
+        A.update_simple_config(A.CONFIG_PATH, values)
+        A.APP_CONFIG.update({key: str(value) for key, value in values.items()})
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+    return await get_fusion_config()
+
+
+@app.post("/api/fusion/run")
+async def run_fusion(body: dict = None):
+    from agent8088 import fusion
+    A = _eng()
+    body = body or {}
+    query = str(body.get("query") or "").strip()
+    if not query:
+        return {"error": "A fusion question is required."}
+    panel_specs = [str(item).strip() for item in body.get("panel", []) if str(item).strip()]
+    try:
+        panel = fusion.build_explicit_panel(panel_specs) if panel_specs else fusion.discover_panel(
+            int(A.APP_CONFIG.get("fusion_max_panel", "6")))
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: fusion.run_fusion(
+                query, panel=panel,
+                judge_provider=str(body.get("judge_provider") or "") or None,
+                judge_model=str(body.get("judge_model") or "") or None,
+                max_panel_size=int(A.APP_CONFIG.get("fusion_max_panel", "6")),
+                member_timeout_s=float(A.APP_CONFIG.get("fusion_member_timeout_s", "60")),
+                max_workers=int(A.APP_CONFIG.get("fusion_max_workers", "8")),
+                max_tokens=int(A.APP_CONFIG.get("fusion_panel_max_tokens", "1200")),
+                judge_max_tokens=int(A.APP_CONFIG.get("fusion_judge_max_tokens", "500")),
+                use_tools=True,
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+    return {
+        "query": result.query,
+        "results": [{
+            "provider": item.member.provider, "model": item.member.model, "text": item.text,
+            "input_tokens": item.input_tokens, "output_tokens": item.output_tokens,
+            "elapsed_s": item.elapsed_s, "error": item.error,
+        } for item in result.results],
+        "winner_index": result.winner_index,
+        "winner_answer": result.winner_answer,
+        "verdict": result.verdict,
+        "judge_error": result.judge_error,
+        "judge_parsed": result.judge_parsed,
+        "total_input_tokens": result.total_input_tokens,
+        "total_output_tokens": result.total_output_tokens,
+        "total_cost_usd": result.total_cost_usd,
+    }
+
+
 @app.get("/api/capabilities")
 async def get_capabilities():
     """Full self-report."""
@@ -347,7 +572,7 @@ async def get_capabilities():
 @app.get("/api/config")
 async def get_config():
     """Active configuration."""
-    A = _eng()
+    A, C = _eng(), _cl()
     return {
         "model_name": A.MODEL_NAME,
         "model_base_url": A.MODEL_BASE_URL,
@@ -355,6 +580,8 @@ async def get_config():
         "active_provider": _cl()._active_provider_name() if _cl() else "",
         "config_path": str(A.CONFIG_PATH),
         "context_window": A.CONTEXT_WINDOW,
+        "max_turns": C.S.max_turns,
+        "temperature": C.S.temperature,
         "tools_file": str(A.TOOLS_FILE),
         "system_file": str(A.SYSTEM_FILE),
         "skills_dir": str(A.SKILLS_DIR),
@@ -364,6 +591,18 @@ async def get_config():
         "shell_cwd": str(A.SHELL_CWD),
         "providers": {k: {kk: vv for kk, vv in v.items() if kk != "api_key"}
                       for k, v in A.PROVIDERS.items()},
+        "auto_compaction": {
+            "threshold_pct": A.COMPACTION_THRESHOLD_PCT,
+            "keep_messages": A.COMPACTION_KEEP_MESSAGES,
+        },
+        "browser": {
+            "max_steps": A.BROWSER_MAX_STEPS,
+            "task_timeout_seconds": A.BROWSER_TASK_TIMEOUT_SECONDS,
+            "max_actions_per_step": A.BROWSER_MAX_ACTIONS_PER_STEP,
+            "headless": A.BROWSER_HEADLESS,
+            "screenshots": A.BROWSER_SCREENSHOTS,
+            "current_host": A.browser_status(),
+        },
     }
 
 
@@ -923,6 +1162,19 @@ async def get_limits():
         "denial_breaker_threshold": getattr(A, "DENIAL_BREAKER_THRESHOLD", 3),
         "context_window": A.CONTEXT_WINDOW,
         "max_completion_tokens": A.MAX_COMPLETION_TOKENS,
+        "active_model": {
+            "provider": A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER,
+            "model": A.MODEL_NAME,
+            "context_window": A._active_model_token_limits()[0],
+            "max_completion_tokens": A._active_model_token_limits()[1],
+        },
+        "providers": {
+            name: {
+                "context_window": info.get("context_window", ""),
+                "max_completion_tokens": info.get("max_completion_tokens", ""),
+            }
+            for name, info in A.PROVIDERS.items()
+        },
     }
 
 
@@ -1222,6 +1474,18 @@ async def _handle_command(ws: WebSocket, msg: dict, C):
     if command.lower() == "agent" and not str(args).strip():
         await ws.send_json({"type": "command_result", "command": command,
                             "result": "cancelled — try /agent <name> <task>, or /agents to list them"})
+        return
+    if command.lower() == "fusion" and str(args).strip().lower() == "setup":
+        await ws.send_json({"type": "command_result", "command": command,
+                            "result": "Use Settings → Fusion to configure the panel and judge in the web UI."})
+        return
+    if command.lower() == "agents" and str(args).strip().lower().split(" ", 1)[0] in {"new", "delete"}:
+        await ws.send_json({"type": "command_result", "command": command,
+                            "result": "Use Settings → Sub-Agents to manage profiles in the web UI."})
+        return
+    if command.lower() == "agents" and str(args).strip().lower().startswith("edit"):
+        await ws.send_json({"type": "command_result", "command": command,
+                            "result": "/agents edit opens a local terminal editor and is not available in the web UI."})
         return
     model_arg = str(args).strip().lower()
     if ((command.lower() == "models" and (not model_arg or model_arg in C.A.PROVIDERS or

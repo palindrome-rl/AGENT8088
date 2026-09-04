@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Search, MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
-  FolderClock, FolderOpen, Settings, Stethoscope,
+  FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
   Terminal, ArrowRight, CornerDownLeft,
 } from 'lucide-react'
 import { useUIStore } from '@/stores/ui'
@@ -31,6 +31,8 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Tools', path: '/tools', icon: Wrench, keywords: 'tools functions invoke' },
   { label: 'Skills', path: '/skills', icon: BookOpen, keywords: 'skills packages knowledge' },
   { label: 'Sub-Agents', path: '/agents', icon: Bot, keywords: 'agents subagents profiles' },
+  { label: 'Fusion', path: '/fusion', icon: Sparkles, keywords: 'fusion panel judge models answers' },
+  { label: 'Durable Tasks', path: '/tasks', icon: ClipboardList, keywords: 'tasks durable resume progress output' },
   { label: 'MCP', path: '/mcp', icon: Network, keywords: 'mcp servers connections' },
   { label: 'Memory', path: '/memory', icon: Brain, keywords: 'memory facts recall persistent' },
   { label: 'Sessions', path: '/sessions', icon: FolderClock, keywords: 'sessions history save resume' },

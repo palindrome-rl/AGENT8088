@@ -9,6 +9,8 @@ export interface ProviderInfo {
   model: string
   native_tools?: boolean
   api_mode?: string
+  context_window?: string
+  max_completion_tokens?: string
 }
 
 export interface ToolSpec {
@@ -39,6 +41,8 @@ export interface SubagentSpec {
   max_turns: number
   permission: string
   system_prompt: string
+  model?: string
+  builtin?: boolean
 }
 
 export interface MemoryFact {
@@ -116,6 +120,8 @@ export interface StatusInfo {
   temperature: number
   max_turns: number
   disabled_skills: string[]
+  auto_compaction?: { threshold_pct: number; keep_messages: number }
+  browser?: { current_host: string | null }
 }
 
 export interface ConfigInfo {
@@ -135,6 +141,47 @@ export interface ConfigInfo {
   artifacts_root: string
   shell_cwd: string
   providers: Record<string, ProviderInfo>
+  auto_compaction?: { threshold_pct: number; keep_messages: number }
+  browser?: {
+    max_steps: number
+    task_timeout_seconds: number
+    max_actions_per_step: number
+    headless: boolean
+    screenshots: boolean
+    current_host: string | null
+  }
+}
+
+export interface DurableTask {
+  id: string
+  goal: string
+  state: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled'
+  slice_no: number
+  last_answer: string
+  error: string
+  created_at: number
+  updated_at: number
+  operations?: Array<{ id: string; tool: string; state: string; result: string; started_at: number; finished_at: number | null }>
+}
+
+export interface FusionConfig {
+  panel: string[]
+  judge_provider: string
+  judge_model: string
+  max_panel: number
+}
+
+export interface FusionResult {
+  query: string
+  results: Array<{ provider: string; model: string; text: string; input_tokens: number; output_tokens: number; elapsed_s: number; error: string | null }>
+  winner_index: number | null
+  winner_answer: string
+  verdict: string
+  judge_error: string | null
+  judge_parsed: boolean
+  total_input_tokens: number
+  total_output_tokens: number
+  total_cost_usd: number | null
 }
 
 export interface DoctorCheck {

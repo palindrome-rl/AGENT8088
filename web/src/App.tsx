@@ -10,6 +10,8 @@ import MemoryPage from '@/pages/MemoryPage'
 import SessionsPage from '@/pages/SessionsPage'
 import ConfigPage from '@/pages/ConfigPage'
 import DoctorPage from '@/pages/DoctorPage'
+import FusionPage from '@/pages/FusionPage'
+import TasksPage from '@/pages/TasksPage'
 
 export default function App() {
   return (
@@ -25,6 +27,8 @@ export default function App() {
         <Route path="/sessions" element={<SessionsPage />} />
         <Route path="/config" element={<ConfigPage />} />
         <Route path="/doctor" element={<DoctorPage />} />
+        <Route path="/fusion" element={<FusionPage />} />
+        <Route path="/tasks" element={<TasksPage />} />
       </Route>
     </Routes>
   )
