@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cli_anything, documents, memory, web_search
+from agent8088 import cli_anything, documents, local_models, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -6051,6 +6051,63 @@ def _plan_mode_block_message() -> str:
             "call normally. Do not claim any of it is done before that happens.")
 
 
+def _run_local_models_tool(name: str, args: dict, timeout: int, approval_key: str) -> str:
+    """Dispatch for the four local_models tools. Hardware probe and listing
+    are read-only, loopback-only calls -- no permission gate, same as
+    CLI-Anything's local_tools/network_tools. Pull/remove touch the local
+    Ollama daemon's disk and go through the same host-shell permission gate
+    CLI-Anything's mutation tools use."""
+    if name == "check_local_hardware":
+        try:
+            hw = local_models.probe_hardware()
+        except Exception as exc:  # noqa: BLE001
+            return f"Error probing hardware: {exc}"
+        return local_models.format_hardware_report(hw)
+
+    if name == "list_local_models":
+        try:
+            installed = local_models.list_installed_models()
+            running = local_models.running_models()
+        except local_models.OllamaError as exc:
+            return str(exc)
+        if not installed:
+            return "No local models installed. Use pull_local_model to install one."
+        running_names = {m.get("name") for m in running}
+        lines = ["Installed local models:"]
+        for m in installed:
+            size_gb = (m.get("size") or 0) / (1024 ** 3)
+            tag = " [running]" if m.get("name") in running_names else ""
+            lines.append(f"  - {m.get('name')} (~{size_gb:.1f} GB){tag}")
+        return "\n".join(lines)
+
+    model_name = str(args.get("name") or "").strip()
+    if not model_name:
+        return "Error: 'name' is required (e.g. 'llama3.3' or 'qwen2.5-coder:32b')."
+    display = f"{name}: {model_name}"
+    if not check_permission("shell", display, host=True, approval_key=approval_key):
+        _audit("escalation_requested", tool=name, mode="shell",
+               decision="blocked", detail=display, change_type="local_execution")
+        return request_escalation(
+            target_mode="edit",
+            paths=[display],
+            change_type="local_execution",
+            reason=("Pull a local model? This downloads several GB and runs "
+                    "against your local Ollama daemon."
+                    if name == "pull_local_model" else
+                    "Remove a local model from disk?"),
+        )
+    _audit("tool_call", tool=name, mode="shell", decision="allowed", detail=display)
+    try:
+        if name == "pull_local_model":
+            status = local_models.pull_model(model_name, timeout=timeout)
+            return f"{model_name}: {status}"
+        if name == "remove_local_model":
+            return local_models.remove_model(model_name)
+        return f"Unknown local_models tool: {name}"
+    except local_models.OllamaError as exc:
+        return f"Error: {exc}"
+
+
 def _run_cli_anything_tool(name: str, args: dict, timeout: int,
                            approval_key: str, allow_plan: bool) -> str:
     """Run the optional CLI-Anything adapter through Agent8088's policy layer."""
@@ -6180,6 +6237,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "cli_anything":
         return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
+
+    if mode == "local_models":
+        missing = next(
+            (param for param in TOOL_REQUIRED_PARAMS.get(name, []) if not args.get(param)),
+            None,
+        )
+        if missing:
+            return _tool_arg_missing_error(name, missing)
+        return _run_local_models_tool(name, args, timeout, approval_key)
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"

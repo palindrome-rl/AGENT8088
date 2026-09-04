@@ -2016,6 +2016,7 @@ def cmd_help(_):
         ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
         ("/status", "Show model, context, tool, skill, and session status"),
         ("/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install"),
+        ("/local [check|list|pull <name>|remove <name>]", "Probe this machine's hardware and recommend local Ollama models, or list/pull/remove installed ones"),
         ("/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report"),
         ("/new <name>", "Create a named persistent session"),
         ("/sessions", "List named sessions"),
@@ -3033,6 +3034,87 @@ def cmd_doctor(rest):
                 console.print(
                     f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
                 )
+
+
+def _cmd_local_check():
+    console.print("[dim]Probing hardware...[/dim]")
+    try:
+        hw = A.local_models.probe_hardware()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Error probing hardware:[/red] {exc}")
+        return
+    console.print(A.local_models.format_hardware_report(hw))
+
+
+def _cmd_local_list():
+    try:
+        installed = A.local_models.list_installed_models()
+        running = A.local_models.running_models()
+    except A.local_models.OllamaError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    if not installed:
+        console.print("[dim]No local models installed. Use /local pull <name>.[/dim]")
+        return
+    running_names = {m.get("name") for m in running}
+    t = Table(title="Local Ollama Models", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Name", style="#00edff")
+    t.add_column("Size", style="#237dd7")
+    t.add_column("Status", style="#237dd7")
+    for m in installed:
+        size_gb = (m.get("size") or 0) / (1024 ** 3)
+        t.add_row(str(m.get("name")), f"{size_gb:.1f} GB",
+                  "running" if m.get("name") in running_names else "")
+    console.print(t)
+
+
+def _cmd_local_pull(name: str):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /local pull <model-name>")
+        return
+    console.print(f"[dim]Pulling {name} from Ollama -- this can take a while...[/dim]")
+    try:
+        status = A.local_models.pull_model(name, timeout=1800)
+        console.print(f"[#237dd7]{name}:[/#237dd7] {status}")
+    except A.local_models.OllamaError as exc:
+        console.print(f"[red]{exc}[/red]")
+
+
+def _cmd_local_remove(name: str):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /local remove <model-name>")
+        return
+    try:
+        if not _confirm_destructive(f"Remove local model '{name}'", name):
+            console.print("[dim]cancelled[/dim]")
+            return
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim]cancelled[/dim]")
+        return
+    try:
+        result = A.local_models.remove_model(name)
+        console.print(f"[#237dd7]{result}[/#237dd7]")
+    except A.local_models.OllamaError as exc:
+        console.print(f"[red]{exc}[/red]")
+
+
+def cmd_local(rest):
+    parts = (rest or "").strip().split(None, 1)
+    sub = parts[0].lower() if parts else "check"
+    arg = parts[1] if len(parts) > 1 else ""
+    if sub in ("check", ""):
+        _cmd_local_check()
+    elif sub == "list":
+        _cmd_local_list()
+    elif sub == "pull":
+        _cmd_local_pull(arg)
+    elif sub in ("remove", "rm", "delete"):
+        _cmd_local_remove(arg)
+    else:
+        console.print("[red]usage:[/red] /local [check|list|pull <name>|remove <name>]")
 
 
 def cmd_dump(_rest):
@@ -4614,6 +4696,7 @@ COMMANDS = {
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
     "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
+    "local": cmd_local,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
