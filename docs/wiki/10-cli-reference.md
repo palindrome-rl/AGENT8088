@@ -157,6 +157,8 @@ sensitive-file floor still applies unconditionally.
 | `/reasoning` | Toggle reasoning display |
 | `/think` | Extended thinking mode |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
+| `/fusion setup` | Interactively pick a default panel and judge (checkbox pickers), saved to `config.txt` |
+| `/fusion <query>` | Ask the panel in parallel; a blind judge picks the best answer. `--panel p:m,...`/`--judge p:m` flags override the saved config for one call |
 
 ### Tools and execution
 
@@ -169,7 +171,11 @@ sensitive-file floor still applies unconditionally.
 | `/audit [on\|off]` | Show or change step verification; no argument reports the current setting and the last turn's cost |
 | `/image <path> [question]` | Analyze an image with a vision-capable model |
 | `/paste [question]` | Analyze an image from the OS clipboard (Windows/macOS; Pillow's `ImageGrab`) |
-| `/agents` | List sub-agent profiles |
+| `/agents` | List sub-agent profiles, with source, model, and the active provider's models |
+| `/agents models` | List every model the active provider offers |
+| `/agents new [name]` | Create a custom sub-agent profile interactively |
+| `/agents edit <name>` | Open a custom profile in `$EDITOR` |
+| `/agents delete <name>` | Delete a custom profile (bundled ones are refused) |
 | `/agent <type> <task>` | Run a sub-agent directly |
 | `/skills` | List skills; `disable`/`enable <name>` |
 | `/cli-anything [task]` | Show integration status, or route a task through the CLI-Anything skill |
@@ -201,6 +207,7 @@ sensitive-file floor still applies unconditionally.
 | `/limits <key> <value>` | Change one — **persists to `config.txt`** |
 | `/limits subagent <name> <turns>` | Per-profile sub-agent round cap |
 | `/limits tool <name> <seconds>` | Per-tool timeout |
+| `/limits provider <name> <key> <value>` | Per-provider token limit (`context_window` or `max_completion_tokens`) |
 | `/config` | Active config + file path |
 | `/capabilities` | What the agent can do and which guardrails are in force |
 | `/doctor [--fix]` | Environment health check; `--fix` repairs a broken web-search install |

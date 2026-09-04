@@ -225,13 +225,16 @@ and edit.
 ## Concurrency
 
 Mostly single-threaded and synchronous — deliberately, since it's an
-interactive tool. Two exceptions:
+interactive tool. Three exceptions:
 
 - **MCP client** runs an asyncio loop on a dedicated background thread, with a
   synchronous facade (`MCPRuntime`) over it, so the rest of the engine stays
   sync.
 - **Gateway** is async end to end (Slack Socket Mode, `discord.py`), calling
   into the sync engine from the adapter layer.
+- **`browse_page`** runs one `asyncio.run()` per call (the browsing library is
+  async-only) alongside a short-lived filtering proxy on its own background
+  thread. Both end with the tool call, so nothing async outlives it.
 
 ## Known architectural gaps
 
@@ -241,5 +244,17 @@ Honest list, for anyone extending this:
   `max_turn_cost_usd` bounds a single turn, but nothing aggregates spend across
   runs. `model_telemetry=1` writes per-call records to a local JSONL file; the
   gap is that nothing reads them back for aggregation.
-- **`browse_page` is read-only.** It renders and extracts text; it can't click
-  or fill forms.
+- **`browse_page`'s reliability depends on the configured model.** It can
+  click, fill forms, navigate, and extract via natural-language
+  instructions, but each step relies on the model returning strict,
+  parseable JSON. Some models/providers occasionally wrap that JSON in
+  markdown code fences or return malformed output; when that happens
+  repeatedly within one task, the browsing agent gives up early rather
+  than completing the task. This is a limitation of the underlying model's
+  instruction-following, not of `browse_page` itself.
+
+  For the same reason, `browse_page` never asks the model for a screenshot:
+  many providers Agent8088 supports are text-only, so vision is off
+  unconditionally rather than assuming one particular model's capabilities.
+  If a task stops early, try it again with a model that follows a strict
+  output format reliably.

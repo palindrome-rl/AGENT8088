@@ -128,7 +128,7 @@ ok("skills loaded",
    {"documentation-writing", "documents", "github-code-review", "plan",
     "systematic-debugging", "test-driven-development",
     "github-pr-workflow", "grounded-citations", "document-to-action-items",
-    "spike", "humanizer", "simplify-code", "cli-anything", "cad"} <= set(E.SKILL_PACKAGES),
+    "spike", "humanizer", "simplify-code", "cli-anything"} <= set(E.SKILL_PACKAGES),
    ", ".join(sorted(E.SKILL_PACKAGES)))
 ok("system.md loaded (not stub)", "Agent8088" in E.BASE_SYSTEM_PROMPT
    and len(E.BASE_SYSTEM_PROMPT) > 500, f"{len(E.BASE_SYSTEM_PROMPT)} chars")
@@ -326,8 +326,6 @@ expected_tools = {
     # mode then applies to it too, with no second gate to keep in sync.
     "create_document": "write_text",
     "convert_document": "write_text",
-    "convert_cad": "write_text",
-    "create_cad_part": "write_text",
 }
 ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
    str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")
@@ -786,7 +784,8 @@ _sh = E.SSRF_ALLOW_HOSTS
 with with_mode("readonly"):
     E.SSRF_ALLOW_HOSTS = set()   # this config allowlists 127.0.0.1 for local SearXNG
     ok("browse_page enforces SSRF",
-       "Blocked" in E.run_tool("browse_page", {"url": "http://127.0.0.1/"}))
+       "Blocked" in E.run_tool("browse_page",
+                               {"url": "http://127.0.0.1/", "task": "read the page"}))
     ok("http tool enforces SSRF",
        "Blocked" in E.run_tool("get_page_title", {"url": "http://169.254.169.254/"}))
 _browser = E._exec_browser
@@ -794,7 +793,8 @@ E.SSRF_ALLOW_HOSTS = {"127.0.0.1"}
 E._exec_browser = lambda _args: "A8088_BROWSER_OK"
 try:
     with with_mode("edit"):
-        browser_result = E.run_tool("browse_page", {"url": "http://127.0.0.1/"})
+        browser_result = E.run_tool("browse_page",
+                                    {"url": "http://127.0.0.1/", "task": "read the page"})
     ok("config allowlist is respected for browse_page",
        browser_result == "A8088_BROWSER_OK", browser_result[:60])
 finally:
@@ -905,20 +905,35 @@ with with_mode("edit"):
 # ============================================================== 13. BROWSER
 section("13. BROWSER")
 ok("browser requires url", "requires 'url'" in E.run_tool("browse_page", {}))
-if E._playwright_available():
-    with with_mode("edit"):
-        r = E.run_tool("browse_page", {"url": "https://example.com"})
-        ok("REAL browser loads a page", "Example Domain" in r, r[:40].replace("\n", " "))
-        r = E.run_tool("browse_page", {"url": "https://example.com", "selector": "h1"})
-        ok("REAL browser honours selector", "Example Domain" in r)
-        r = E.run_tool("browse_page", {"url": "https://this-domain-does-not-exist-8088.invalid"})
-        ok("browser reports navigation failure gracefully",
-           "error" in r.lower() or "Blocked" in r, r[:45])
-    with with_mode("readonly"):
-        r = E.run_tool("browse_page", {"url": "https://example.com"})
-        ok("browser escalates in readonly", "ESCALATION_REQUEST" in r, r[:40])
-else:
+with with_mode("edit"):
+    ok("browser requires task",
+       "requires 'task'" in E.run_tool("browse_page", {"url": "https://example.com"}))
+with with_mode("readonly"):
+    # Escalation happens in run_tool, before _exec_browser is ever called, so
+    # this costs nothing - no browser, no model call.
+    r = E.run_tool("browse_page", {"url": "https://example.com", "task": "read the heading"})
+    ok("browser escalates in readonly", "ESCALATION_REQUEST" in r, r[:40])
+# browse_page now drives an interactive browser-use agent: one call launches a
+# real Chromium *and* spends real tokens against the configured provider, so
+# the live checks are opt-in behind the same env var the browser integration
+# tests use.
+if not E._playwright_available():
     skip("REAL browser", "playwright not installed")
+elif not os.environ.get("AGENT8088_RUN_BROWSER_INTEGRATION"):
+    skip("REAL browser",
+         "set AGENT8088_RUN_BROWSER_INTEGRATION=1 (launches a browser, calls the LLM)")
+else:
+    with with_mode("edit"):
+        r = E.run_tool("browse_page", {
+            "url": "https://example.com",
+            "task": "Report the exact text of the h1 heading on this page."})
+        ok("REAL browser completes a task on a page", "Example Domain" in r,
+           r[:40].replace("\n", " "))
+        r = E.run_tool("browse_page", {
+            "url": "https://this-domain-does-not-exist-8088.invalid",
+            "task": "Report the exact text of the h1 heading on this page."})
+        ok("browser reports navigation failure gracefully",
+           "error" in r.lower() or "Blocked" in r or "not" in r.lower(), r[:45])
 
 # ================================================================ 14. IMAGES
 section("14. IMAGE UNDERSTANDING")

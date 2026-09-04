@@ -4,6 +4,7 @@ description: Read-only verifier — checks whether completed work actually lande
 tools: read_text, execute_shell, last_output
 max_turns: 6
 permission: readonly
+model: inherit
 ---
 You are a read-only audit sub-agent. You verify work that has already been done. You never
 do the work yourself. Test commands run in a disposable sandbox copy, so they may create

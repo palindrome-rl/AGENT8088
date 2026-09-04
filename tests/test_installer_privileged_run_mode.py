@@ -33,7 +33,15 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX privilege detection requires a real POSIX shell and /dev/tty",
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BASH = shutil.which("bash") or "/bin/bash"
@@ -63,7 +71,7 @@ def _run(fake_bin: Path) -> subprocess.CompletedProcess:
     env["PATH"] = str(fake_bin)
     script = _extract("_privileged_run_mode") + "\n_privileged_run_mode"
     return subprocess.run([BASH, "-c", script], env=env,
-                           capture_output=True, text=True, timeout=10)
+                          capture_output=True, text=True, timeout=10, check=False)
 
 
 def test_root_runs_direct_without_touching_sudo(tmp_path):

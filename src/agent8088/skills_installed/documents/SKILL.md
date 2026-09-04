@@ -158,10 +158,11 @@ Editing follows the same open → modify → save pattern:
 
 ## LibreOffice (soffice) — conversion, legacy formats, formula recalc
 
-The Windows installer tries to install LibreOffice via WinGet, but the install
-can fail or be skipped (offline machine, no WinGet). The `convert_document`
-tool checks for soffice itself and tells you plainly if it's missing — you do
-not need to pre-check before calling it.
+The Windows installer asks whether to install LibreOffice — it is optional and
+slow — so plenty of machines will not have it, whether the user declined or the
+install failed (offline machine, no WinGet). The `convert_document` tool checks
+for soffice itself and tells you plainly if it's missing — you do not need to
+pre-check before calling it.
 
 **Converting .docx/.pptx/.xlsx to PDF, or legacy .doc/.ppt/.xls to a modern
 format — use the `convert_document` tool, NOT `execute_shell` with soffice.**

@@ -170,8 +170,6 @@ remain visible for manual review. After installing a harness, Agent8088 loads
 its packaged `SKILL.md` before execution so application-specific prerequisites
 and command guidance remain available without eagerly expanding the prompt.
 
----
-
 ## CLI and messaging quick reference
 
 The CLI and gateway share the same agent loop, session model, tool registry, and permission checks.

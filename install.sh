@@ -170,7 +170,7 @@ fi
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/tayyabimam1/AGENT8088.git"
-REPO_BRANCH="${AGENT8088_BRANCH:-main}"
+REPO_BRANCH="${AGENT8088_BRANCH:-development}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"

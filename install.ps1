@@ -12,7 +12,9 @@
 param(
     [switch]$SkipSetup,
     [switch]$TerminalBootstrap,
-    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "main" }),
+    [switch]$WithLibreOffice,
+    [switch]$SkipLibreOffice,
+    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = "",
     [string]$InstallerSourceUrl = ""
@@ -811,7 +813,43 @@ function Install-WindowsTerminal {
 # Modeled directly on Install-WindowsTerminal above: same non-interactive
 # invocation, same "warn and register a skipped stage, never abort the whole
 # installer" contract as every other optional component here.
+#
+# Unlike the others it asks first. ~350 MB installed per-machine by WinGet is
+# the slowest stage in this installer by a wide margin, and the three
+# capabilities it unlocks are ones plenty of users never touch.
 # ----------------------------------------------------------------------------
+# Consent for the one stage nobody should be made to wait on unasked. Kept out
+# of Install-LibreOffice so the tests can stub the console read.
+#
+# The $NonInteractive guard is not a policy choice: on a headless host Read-Host
+# returns empty immediately, so the explicit-answer loop below would spin
+# forever.
+function Read-LibreOfficeConsent {
+    if ($WithLibreOffice -and $SkipLibreOffice) {
+        throw "-WithLibreOffice and -SkipLibreOffice cannot be used together."
+    }
+    if ($WithLibreOffice) { return $true }
+    if ($SkipLibreOffice) { return $false }
+    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(1|y|yes|true)$') { return $true }
+    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(0|n|no|false)$') { return $false }
+    $runningInCI = $env:CI -match '^(1|y|yes|true)$'
+    if ($NonInteractive -or $runningInCI) {
+        Write-Info "Non-interactive - skipping the optional LibreOffice install."
+        return $false
+    }
+
+    Write-Host ""
+    Write-Warn "LibreOffice is optional (~350 MB) and can take several minutes to download and install."
+    Write-Host "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading,"
+    Write-Host "    and Excel formula recalculation. Skipping is safe."
+    Write-Host "    Add it later with: winget install TheDocumentFoundation.LibreOffice"
+    do {
+        $rawAnswer = Read-Host "Install LibreOffice now? [yes/no]"
+        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
+    } while ($answer -notin @("yes", "no"))
+    return ($answer -eq "yes")
+}
+
 function Install-LibreOffice {
     $sofficePaths = @(
         "$env:ProgramFiles\LibreOffice\program\soffice.exe",
@@ -833,7 +871,17 @@ function Install-LibreOffice {
         return $false
     }
 
-    Write-Info "Installing LibreOffice (needed for .docx/.pptx to PDF conversion and legacy .doc/.ppt/.xls) ..."
+    # Asked only once both cheap preconditions hold: nothing installed already,
+    # and a WinGet that could actually carry the answer out.
+    if (-not (Read-LibreOfficeConsent)) {
+        Write-Info "Skipping LibreOffice."
+        Register-SkippedStage -Label "LibreOffice" `
+            -Reason "not selected (optional, slow to install)" `
+            -Fix "winget install TheDocumentFoundation.LibreOffice"
+        return $false
+    }
+
+    Write-Info "Installing LibreOffice; this can take several minutes (needed for .docx/.pptx to PDF conversion and legacy .doc/.ppt/.xls) ..."
     $wingetResult = Invoke-WithTimeout -FilePath $winget.Source `
         -Arguments @(
             "install", "--id", "TheDocumentFoundation.LibreOffice", "--exact",
@@ -863,73 +911,6 @@ function Install-LibreOffice {
     return $false
 }
 
-# ----------------------------------------------------------------------------
-# FreeCAD (headless freecadcmd) - CAD inspection, format conversion, and
-# parametric part generation. Used by the cad tools and skill; nothing in
-# engine.py requires it to exist.
-#
-# Same contract as Install-LibreOffice above: detect first, install via WinGet,
-# and on failure register a skipped stage rather than aborting setup. FreeCAD
-# is ~1GB, so a slow or interrupted download must not take the whole install
-# down with it.
-#
-# AGENT8088_FREECAD lets someone point at a portable extraction instead --
-# FreeCAD publishes a no-install .7z, which avoids the elevation an MSI-style
-# install needs. Detection honours that variable, so this step failing is
-# recoverable without admin rights.
-# ----------------------------------------------------------------------------
-function Install-FreeCAD {
-    $freecadNames = @("freecadcmd.exe", "FreeCADCmd.exe")
-    # The official installer defaults to a per-user, no-elevation install
-    # under %LOCALAPPDATA%\Programs, not Program Files -- confirmed on a real
-    # install; this was a guess when first written (see cad.py's own note).
-    $freecadDirs = @(
-        "$env:ProgramFiles\FreeCAD 1.1\bin",
-        "$env:ProgramFiles\FreeCAD\bin",
-        "${env:ProgramFiles(x86)}\FreeCAD 1.1\bin",
-        "${env:ProgramFiles(x86)}\FreeCAD\bin",
-        "$env:LOCALAPPDATA\Programs\FreeCAD 1.1\bin",
-        "$env:LOCALAPPDATA\Programs\FreeCAD\bin"
-    )
-    $candidates = foreach ($dir in $freecadDirs) {
-        foreach ($name in $freecadNames) { Join-Path $dir $name }
-    }
-    if ($env:AGENT8088_FREECAD) { $candidates = @($env:AGENT8088_FREECAD) + $candidates }
-
-    $existing = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($existing) {
-        Write-Success "FreeCAD found at $existing"
-        return $true
-    }
-
-    $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $winget) {
-        Write-Warn "WinGet not found - cannot install FreeCAD automatically."
-        Register-SkippedStage -Label "FreeCAD" `
-            -Reason "no WinGet available" `
-            -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
-        return $false
-    }
-
-    Write-Info "Installing FreeCAD (needed for CAD inspection, conversion, and part generation; ~1GB) ..."
-    & $winget.Source install --id FreeCAD.FreeCAD --exact --source winget `
-        --accept-source-agreements --accept-package-agreements --disable-interactivity | Out-Host
-    $wingetExit = $LASTEXITCODE
-
-    $installed = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($installed) {
-        Write-Success "FreeCAD installed at $installed"
-        return $true
-    }
-
-    Write-Warn "FreeCAD install did not complete (WinGet exit $wingetExit)."
-    Register-SkippedStage -Label "FreeCAD" `
-        -Reason "WinGet install failed (exit $wingetExit)" `
-        -Fix "install FreeCAD from https://www.freecad.org/downloads.php, or extract the portable .7z and set AGENT8088_FREECAD to its freecadcmd.exe"
-    return $false
-}
-
 function ConvertTo-PowerShellLiteral {
     param([AllowNull()][string]$Value)
     return "'" + ([string]$Value).Replace("'", "''") + "'"
@@ -951,6 +932,10 @@ function Get-InstallerInvocation {
     $installLiteral = ConvertTo-PowerShellLiteral $InstallDir
     $skipSetupLiteral = if ($SkipSetup) { '$true' } else { '$false' }
     $arguments = "-Branch $branchLiteral -Agent8088Home $homeLiteral -InstallDir $installLiteral -SkipSetup`:$skipSetupLiteral"
+    # Not forwarded = silently re-asked (or re-decided) in the relaunched window.
+    # An env var needs no plumbing here; Start-Process inherits the environment.
+    if ($WithLibreOffice) { $arguments += " -WithLibreOffice" }
+    if ($SkipLibreOffice) { $arguments += " -SkipLibreOffice" }
     if ($ForTerminalBootstrap) { $arguments += " -TerminalBootstrap" }
 
     if ($PreferLocalScript -and -not $InstallerSourceUrl -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
@@ -2552,6 +2537,11 @@ function Start-InitialAgent {
 # ----------------------------------------------------------------------------
 Write-Banner
 Set-InstallerExitStatus -ExitCode 0
+if ($WithLibreOffice -and $SkipLibreOffice) {
+    Write-Err "-WithLibreOffice and -SkipLibreOffice cannot be used together."
+    Set-InstallerExitStatus -ExitCode 1
+    return
+}
 if (-not (Test-DiskSpace)) {
     Write-Info "Installation stopped. Free the required disk space, then run the installer again."
     Set-InstallerExitStatus -ExitCode 1
@@ -2603,8 +2593,10 @@ try {
     Install-Deps
     Install-Gateway-Extras
     Install-Node-Bridge
-    Install-LibreOffice
-    Install-FreeCAD
+    # Alone among the bare-called optional stages, this one returns $true/$false
+    # (the tests assert on it), so an unassigned call prints True/False into the
+    # install log. Discard it here rather than dropping the return value.
+    [void](Install-LibreOffice)
     Install-Embedding-Model
     Install-Native-Sandbox
     if (-not (Setup-Path)) {

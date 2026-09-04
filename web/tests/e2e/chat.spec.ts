@@ -32,7 +32,7 @@ test('settings pages have an explicit back to chat control', async ({ page }) =>
 test('command palette opens with Cmd+K', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('textbox', { name: 'Prompt' }).press('Control+k')
-  await expect(page.locator('text=Search commands')).toBeVisible()
+  await expect(page.getByPlaceholder(/Search pages and commands/)).toBeVisible()
 })
 
 test('prompt bar accepts text and slash commands', async ({ page }) => {

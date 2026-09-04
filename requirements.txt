@@ -12,8 +12,10 @@ openai>=1.0.0,<3
 rich>=13.0.0,<16
 InquirerPy>=0.3.4,<1
 
-# MCP client and server runtime (external servers, and --mcp-serve).
-mcp>=1.27,<2
+# MCP client and server runtime (external servers, and --mcp-serve). The floor
+# is 1.26 rather than 1.27 because browser-use hard-pins mcp==1.26.0; a higher
+# floor makes the two impossible to install together.
+mcp>=1.26,<2
 
 # Terminal logo rendering.
 Pillow>=9,<13
@@ -28,6 +30,12 @@ Pygments>=2.13,<3
 # Headless browser behind browse_page. The Python package only — the browser
 # binary still needs `playwright install chromium`.
 playwright>=1.40,<2
+# Interactive browsing (browse_page's agent) and the LLM adapter behind it.
+# browser-use needs Python >= 3.11 while this project supports 3.10, so the
+# marker keeps a 3.10 install resolvable — without it, pip fails on the whole
+# file rather than dropping one tool.
+browser-use>=0.13,<0.14; python_version >= "3.11"
+litellm>=1,<2
 
 # Keyless web search fallback. web_search must always have a backend needing no
 # Docker, no API key and no setup, so an unreachable SearXNG still returns
@@ -52,8 +60,8 @@ uvicorn[standard]>=0.34.0,<1
 #                                 `playwright install chromium`
 #   pip install -e ".[search]"    alias — ddgs is already a core dep
 #   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
-#   pip install -e ".[dev]"       pytest, ruff, pip-audit
-#   pip install -e ".[litellm]"   litellm, for a provider with api_mode=litellm
+#   pip install -e ".[dev]"       pytest, pytest-asyncio, ruff, pip-audit
+#   pip install -e ".[litellm]"   alias — litellm is already a core dep
 #
 # browser and search are aliases for packages that are already core, kept so the
 # installers' existing steps and any documented command keep working. They were
@@ -65,5 +73,6 @@ uvicorn[standard]>=0.34.0,<1
 # Listed so the whole dependency surface is visible in one place:
 #   gateway: slack-bolt>=1.18.0,<2  slack-sdk>=3.23.0,<4  httpx>=0.24.0,<1
 #            discord.py>=2.3.0,<3   python-telegram-bot>=20,<23
-#   dev:     pytest>=7.0.0,<10      ruff>=0.8,<1          pip-audit>=2.7,<3
+#   dev:     pytest>=7.0.0,<10      pytest-asyncio>=0.23,<2
+#            ruff>=0.8,<1            pip-audit>=2.7,<3
 #   litellm: litellm>=1,<2
