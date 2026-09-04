@@ -37,6 +37,7 @@ def test_cancelled_task_does_not_resume(tmp_path):
     assert store.resolve(task_id[:12])["id"] == task_id
     store.cancel(task_id)
     assert store.list() == []
+    assert [task["id"] for task in store.list(include_cancelled=True)] == [task_id]
     assert store.resolve(task_id[:12])["state"] == "cancelled"
     row = run_task("ignored", lambda *_args, **_kwargs: "should not run",
                    store=store, workspace=tmp_path, task_id=task_id)

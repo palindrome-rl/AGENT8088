@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect } from 'react'
+import { useMemo, useState, useRef, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal } from 'lucide-react'
+import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2 } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
+import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
 import { ImageUpload } from './ImageUpload'
@@ -12,19 +13,6 @@ import { ImageUpload } from './ImageUpload'
  * Composer with @ sources, / commands, model picker,
  * dictation, and send. Pop-in menus, gliding highlight.
  * ───────────────────────────────────────────────────────── */
-
-/* Mirrors backend COMMANDS (cli.py) — interactive-only commands (exit/quit/
- * stop/approve/deny) are excluded: they either terminate the REPL or expect
- * stdin the web UI doesn't have. 'search' is excluded — it's not a real CLI
- * command (web search is a tool, not a slash command). */
-const COMMANDS = [
-  'help', 'tools', 'tool', 'capabilities', 'agents', 'agent', 'plan', 'image',
-  'paste', 'audit', 'skills', 'cli-anything', 'raw', 'model', 'models', 'mcp',
-  'config', 'status', 'doctor', 'dump', 'sandbox', 'mode',
-  'new', 'sessions', 'resume', 'reset', 'compact',
-  'history', 'trace', 'reasoning', 'think', 'verbose', 'usage', 'temp',
-  'maxturns', 'limits', 'save', 'clear', 'memory',
-]
 
 function generatedSessionName() {
   return `chat-${Date.now()}`
@@ -40,6 +28,8 @@ function parseToken(draft: string): { kind: 'at' | 'slash'; query: string; start
   }
 }
 
+type Attachment = { localId: string; file: File; id?: string; state: 'uploading' | 'ready' | 'error'; error?: string }
+
 export function PromptBar() {
   const [text, setText] = useState('')
   const [dismissed, setDismissed] = useState(false)
@@ -49,21 +39,35 @@ export function PromptBar() {
   const [listening, setListening] = useState(false)
   const [expanded, setExpanded] = useState(false)
   const [sessionError, setSessionError] = useState('')
+  const [attachments, setAttachments] = useState<Attachment[]>([])
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const measureRef = useRef<HTMLSpanElement>(null)
   const controlsRef = useRef<HTMLDivElement>(null)
-  const { isStreaming, sessionName, addMessage, setSessionName } = useSessionStore()
+  const { isStreaming, sessionName, addMessage, setSessionName, setRawLoading, setRawResult } = useSessionStore()
   const { send: wsSend } = useWebSocket()
-  const { rawPanelOpen, toggleRawPanel } = useUIStore()
+  const { data: commands = [] } = useCommandCatalog()
+  const { rawPanelOpen, toggleRawPanel, setRawPanelOpen } = useUIStore()
   const queryClient = useQueryClient()
 
   const token = dismissed ? null : parseToken(text)
   const menu = plusOpen ? 'at' : token?.kind ?? null
   const query = plusOpen ? '' : token?.query ?? ''
 
-  const rows = menu === 'slash'
-    ? COMMANDS.filter(c => c.startsWith(query)).slice(0, 8)
-    : []
+  const rows = useMemo(() => menu === 'slash'
+    ? commands.flatMap(command => [command.name, ...command.aliases])
+      .filter(command => command && command.startsWith(query)).slice(0, 8)
+    : [], [commands, menu, query])
+
+  useEffect(() => {
+    const insertCommand = (event: Event) => {
+      setText((event as CustomEvent<string>).detail)
+      setDismissed(true)
+      requestAnimationFrame(() => inputRef.current?.focus())
+    }
+    window.addEventListener('agent8088:insert-command', insertCommand)
+    return () => window.removeEventListener('agent8088:insert-command', insertCommand)
+  }, [])
 
   // Auto-grow textarea
   useEffect(() => {
@@ -116,12 +120,49 @@ export function PromptBar() {
     void queryClient.invalidateQueries({ queryKey: ['sessions'] })
   }
 
+  const uploadAttachment = async (attachment: Attachment) => {
+    try {
+      await ensureSession()
+      const response = await fetch('/api/attachments', {
+        method: 'POST', headers: { 'X-Filename': attachment.file.name }, body: attachment.file,
+      })
+      const result = await response.json() as { id?: string; error?: string }
+      if (!response.ok || !result.id) throw new Error(result.error ?? 'Upload failed')
+      setAttachments((items) => items.map((item) => item.localId === attachment.localId
+        ? { ...item, id: result.id, state: 'ready', error: undefined } : item))
+    } catch (error) {
+      setAttachments((items) => items.map((item) => item.localId === attachment.localId
+        ? { ...item, state: 'error', error: error instanceof Error ? error.message : 'Upload failed' } : item))
+    }
+  }
+
+  const addFiles = (files: FileList | null) => {
+    if (!files) return
+    const selected = Array.from(files).slice(0, Math.max(0, 5 - attachments.length))
+    for (const file of selected) {
+      const attachment = { localId: crypto.randomUUID(), file, state: 'uploading' as const }
+      setAttachments((items) => [...items, attachment])
+      void uploadAttachment(attachment)
+    }
+  }
+
+  const removeAttachment = async (attachment: Attachment) => {
+    setAttachments((items) => items.filter((item) => item.localId !== attachment.localId))
+    if (attachment.id) await fetch(`/api/attachments/${attachment.id}`, { method: 'DELETE' })
+  }
+
   const handleSend = async () => {
     const trimmed = text.trim()
-    if (!trimmed || isStreaming) return
+    const readyAttachments = attachments.filter((attachment) => attachment.state === 'ready' && attachment.id)
+    if ((!trimmed && readyAttachments.length === 0) || isStreaming || attachments.some((attachment) => attachment.state === 'uploading')) return
     setSessionError('')
     if (trimmed.startsWith('/')) {
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
+      if (cmd.toLowerCase() === 'raw') {
+        setRawResult(null)
+        setRawLoading(true)
+        setRawPanelOpen(true)
+      }
       wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
     } else {
       try {
@@ -130,14 +171,16 @@ export function PromptBar() {
         setSessionError(error instanceof Error ? error.message : 'Could not create a session')
         return
       }
-      addMessage({ role: 'user', content: trimmed })
-      wsSend({ type: 'chat', text: trimmed })
+      const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
+      addMessage({ role: 'user', content: message })
+      wsSend({ type: 'chat', text: message, attachments: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []) })
     }
     setText('')
     setDismissed(false)
     setPlusOpen(false)
     setShowImageUpload(false)
     setPasteImage(null)
+    setAttachments((items) => items.filter((attachment) => attachment.state === 'error'))
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -146,7 +189,8 @@ export function PromptBar() {
         e.preventDefault()
         return
       }
-      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+      const exactCommand = rows.includes(text.trim().slice(1).toLowerCase())
+      if (((e.key === 'Enter' && !e.shiftKey && !exactCommand) || e.key === 'Tab')) {
         e.preventDefault()
         const cmd = rows[0]
         setText(`/${cmd} `)
@@ -174,7 +218,7 @@ export function PromptBar() {
     setPlusOpen(false)
   }
 
-  const canSend = text.trim().length > 0
+  const canSend = text.trim().length > 0 || attachments.some((attachment) => attachment.state === 'ready')
 
   return (
     <div
@@ -222,6 +266,7 @@ export function PromptBar() {
             {[
               { label: 'Web search', Icon: Plus, action: () => { setText('/search '); inputRef.current?.focus() } },
               { label: 'Memory recall', Icon: Plus, action: () => { setText('/memory '); inputRef.current?.focus() } },
+              { label: 'Attach files', Icon: Paperclip, action: () => fileInputRef.current?.click() },
               { label: 'Image analysis', Icon: ImagePlus, action: () => { setShowImageUpload(true) } },
             ].map(({ label, Icon, action }, i) => (
               <button
@@ -246,6 +291,7 @@ export function PromptBar() {
 
       {/* ── composer ───────────────────────────────────── */}
       <div className="mx-auto w-full max-w-2xl">
+        <input ref={fileInputRef} type="file" multiple className="hidden" accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.pptx,image/png,image/jpeg,image/gif,image/webp" onChange={(event) => { addFiles(event.target.files); event.currentTarget.value = '' }} />
         {/* ── image upload panel ──────────────────────── */}
         {showImageUpload && (
           <ImageUpload
@@ -253,6 +299,14 @@ export function PromptBar() {
             onClose={() => { setShowImageUpload(false); setPasteImage(null) }}
           />
         )}
+        {attachments.length > 0 && <div className="mb-2 flex flex-wrap gap-1.5 px-1">
+          {attachments.map((attachment) => <div key={attachment.localId} className="flex max-w-full items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-300">
+            {attachment.state === 'uploading' ? <Loader2 className="h-3 w-3 animate-spin text-brand-cyan" /> : attachment.state === 'error' ? <AlertCircle className="h-3 w-3 text-red-400" /> : <Paperclip className="h-3 w-3 text-brand-cyan" />}
+            <span className="max-w-40 truncate">{attachment.file.name}</span>
+            {attachment.state === 'error' && <button type="button" title={attachment.error} onClick={() => void uploadAttachment({ ...attachment, state: 'uploading' })} className="text-red-300 hover:text-red-100">Retry</button>}
+            <button type="button" aria-label={`Remove ${attachment.file.name}`} onClick={() => void removeAttachment(attachment)} className="text-zinc-500 hover:text-zinc-200"><Trash2 className="h-3 w-3" /></button>
+          </div>)}
+        </div>}
         <div
           className={cn(
             'relative flex flex-col overflow-hidden border bg-white dark:bg-zinc-900/50 transition-[border-color] duration-150',

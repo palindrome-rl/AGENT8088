@@ -26,7 +26,7 @@ function wireSocket(ws: WebSocket) {
     addToolEvent, updateToolEvent, updatePlanStep,
     resetStreaming, addMessage, setStatus, setSessionName,
   } = useSessionStore.getState()
-  const { setApprovalPending, setPlanApprovalPending } = useUIStore.getState()
+  const { setApprovalPending, setPlanApprovalPending, setRawPanelOpen } = useUIStore.getState()
 
   ws.onmessage = (event) => {
     const data: WSEvent = JSON.parse(event.data)
@@ -112,6 +112,7 @@ function wireSocket(ws: WebSocket) {
           }
           useSessionStore.getState().setRawResult(parsed)
           useSessionStore.getState().setRawLoading(false)
+          setRawPanelOpen(true)
         }
         if (data.result.toLowerCase().startsWith('unknown command')) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
@@ -122,27 +123,22 @@ function wireSocket(ws: WebSocket) {
         // with structured parsing) and session ops (handled with notifications).
         const cmd = data.command.toLowerCase()
         const sessionOps = ['new', 'resume', 'reset', 'compact']
+        if (sessionOps.includes(cmd)) {
+          void syncSession(true).then(() => {
+            void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
+            if (data.result.trim().length > 0) {
+              addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+            }
+          })
+        } else {
+          void syncSession()
+          void useQueryClientHelper().invalidateQueries({ queryKey: ['commands'] })
+        }
         if (!sessionOps.includes(cmd) &&
             !data.result.toLowerCase().startsWith('unknown command') &&
-            !data.result.toLowerCase().startsWith('error') &&
             cmd !== 'raw' &&
             data.result.trim().length > 0) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
-        }
-        if (sessionOps.includes(cmd)) {
-          void syncSession()
-          void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
-          // Show success notification for session operations (parity with CLI output)
-          if (!data.result.toLowerCase().startsWith('unknown command') &&
-              !data.result.toLowerCase().startsWith('error')) {
-            const notices: Record<string, string> = {
-              new: '✓ New session created',
-              resume: '✓ Session resumed',
-              reset: '✓ Session reset',
-              compact: '✓ Session compacted',
-            }
-            addMessage({ role: 'assistant', content: notices[cmd] ?? scrubMarkup(data.result) })
-          }
         }
         break
     }
@@ -165,7 +161,7 @@ function ensureConnection() {
   wireSocket(ws)
 }
 
-async function syncSession() {
+async function syncSession(includeHistory = false) {
   try {
     const statusResponse = await fetch('/api/status')
     if (!statusResponse.ok) return
@@ -173,6 +169,7 @@ async function syncSession() {
     useSessionStore.getState().setStatus(status)
     useSessionStore.getState().setSessionName(status.session_name || '')
 
+    if (!includeHistory) return
     const historyResponse = await fetch('/api/history')
     if (!historyResponse.ok) return
     const history = await historyResponse.json() as { messages?: ChatMessage[] }
