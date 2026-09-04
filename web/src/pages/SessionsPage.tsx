@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   FolderClock, Plus, Play, RotateCcw, Archive, Loader2,
-  AlertCircle, MessageSquare, CheckCircle2, X,
+  AlertCircle, MessageSquare, CheckCircle2, X, Download, FileText,
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useSessionStore } from '@/stores/session'
@@ -214,6 +214,7 @@ export default function SessionsPage() {
   const [newSessionOpen, setNewSessionOpen] = useState(false)
   const [compactOpen, setCompactOpen] = useState(false)
   const [resumingName, setResumingName] = useState<string | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
 
   // List sessions
   const sessionsQuery = useQuery({
@@ -276,6 +277,16 @@ export default function SessionsPage() {
   })
 
   const activeSession = sessionsQuery.data?.find((s) => s.active)
+  const historyQuery = useQuery({ queryKey: ['history'], queryFn: () => fetchJSON<unknown>('/api/history'), enabled: historyOpen })
+  const exportHistory = async () => {
+    const data = await fetchJSON<unknown>('/api/history')
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${activeSession?.name || 'agent8088-session'}-history.json`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
 
   return (
     <div className="mx-auto max-w-4xl space-y-6 p-6">
@@ -313,6 +324,10 @@ export default function SessionsPage() {
             {compactMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
             Compact
           </button>
+          <button onClick={() => void exportHistory()} className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-300 hover:border-brand-primary/40 hover:text-brand-cyan" title="Export history and trace as JSON">
+            <Download className="h-4 w-4" /> Export
+          </button>
+          <button onClick={() => setHistoryOpen(true)} className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-300 hover:border-brand-primary/40 hover:text-brand-cyan"><FileText className="h-4 w-4" /> Trace</button>
         </div>
       </div>
 
@@ -322,6 +337,7 @@ export default function SessionsPage() {
           <AlertCircle className="h-3.5 w-3.5 shrink-0" /> {newMutation.data.error}
         </div>
       )}
+      {historyOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={() => setHistoryOpen(false)}><div className="w-full max-w-3xl rounded-xl border border-zinc-800 bg-zinc-950 p-4 shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="mb-3 flex items-center justify-between"><h2 className="text-sm font-semibold text-zinc-100">Session history & trace</h2><button onClick={() => setHistoryOpen(false)} className="text-zinc-500 hover:text-zinc-200"><X className="h-4 w-4" /></button></div>{historyQuery.isLoading ? <Loader2 className="h-5 w-5 animate-spin text-brand-cyan" /> : historyQuery.error ? <p className="text-sm text-red-400">{(historyQuery.error as Error).message}</p> : <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap rounded-lg border border-zinc-800 bg-zinc-900/50 p-3 text-[11px] text-zinc-300">{JSON.stringify(historyQuery.data, null, 2)}</pre>}</div></div>}
       {newMutation.isSuccess && !newMutation.data?.error && (
         <div className="flex items-center gap-2 rounded-lg border border-green-900/50 bg-green-950/20 p-3 text-xs text-green-400">
           <CheckCircle2 className="h-3.5 w-3.5 shrink-0" /> Created session "{newMutation.data?.name}"

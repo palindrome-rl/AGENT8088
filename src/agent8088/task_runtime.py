@@ -74,9 +74,13 @@ class TaskStore:
         row = self.db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return dict(row) if row else None
 
-    def list(self) -> list[dict]:
-        return [dict(row) for row in self.db.execute(
-            "SELECT * FROM tasks WHERE state != 'cancelled' ORDER BY updated_at DESC").fetchall()]
+    def list(self, include_cancelled: bool = False) -> list[dict]:
+        """List tasks; keep the CLI's historical cancelled-task default."""
+        query = "SELECT * FROM tasks"
+        if not include_cancelled:
+            query += " WHERE state != 'cancelled'"
+        query += " ORDER BY updated_at DESC"
+        return [dict(row) for row in self.db.execute(query).fetchall()]
 
     def resolve(self, task_ref: str) -> dict:
         """Find one task by its full id or the short id shown by `/task list`."""

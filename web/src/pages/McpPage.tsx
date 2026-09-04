@@ -16,10 +16,16 @@ async function fetchMcp(): Promise<McpServerInfo[]> {
   return res.json() as Promise<McpServerInfo[]>
 }
 
-async function reloadMcp(): Promise<{ ok: boolean }> {
-  const res = await fetch('/api/mcp/reload', { method: 'POST' })
+async function reloadMcp(): Promise<{ ok: boolean; confirmation_required?: boolean; message?: string }> {
+  let res = await fetch('/api/mcp/reload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
   if (!res.ok) throw new Error(`Reload failed (${res.status})`)
-  return res.json() as Promise<{ ok: boolean }>
+  let data = await res.json() as { ok: boolean; confirmation_required?: boolean; message?: string }
+  if (data.confirmation_required) {
+    if (!window.confirm(data.message || 'Reload MCP servers?')) return data
+    res = await fetch('/api/mcp/reload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmed: true }) })
+    data = await res.json() as typeof data
+  }
+  return data
 }
 
 interface McpAddBody {

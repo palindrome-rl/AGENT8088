@@ -1985,62 +1985,70 @@ def parse_tool_args(raw):
     return args
 
 
+COMMAND_SPECS = (
+    ("", "<text>", "Chat — run the full agent loop on your message", ()),
+    ("tools", "/tools", "List every tool with its args, mode, and description", ()),
+    ("capabilities", "/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails", ()),
+    ("tool", "/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)", ()),
+    ("agents", "/agents [new|edit|delete|models]", "Manage sub-agent profiles and model routing", ()),
+    ("agent", "/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker", ()),
+    ("skills", "/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session", ()),
+    ("cli-anything", "/cli-anything [task]", "Use CLI-Anything to find, run, build, refine, test, or validate an application CLI", ()),
+    ("plan", "/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs", ()),
+    ("audit", "/audit [on|off]", "Verify each step against the real files after it runs", ()),
+    ("fusion", "/fusion [setup|--panel provider:model,… --judge provider:model] <query>", "Ask a model panel and have a blind judge select the winner", ()),
+    ("image", "/image <path-or-url> [question]", "Analyze a screenshot/diagram with a vision model", ()),
+    ("paste", "/paste [question]", "Analyze an image from the OS clipboard (Windows/macOS)", ()),
+    ("raw", "/raw <text>", "One raw model call — shows content, reasoning, tool_calls", ()),
+    ("model", "/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider", ()),
+    ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
+    ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
+    ("sandbox", "/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation", ()),
+    ("status", "/status", "Show model, context, tool, skill, and session status", ()),
+    ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
+    ("dump", "/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report", ()),
+    ("search", "/search [status|use|setup|stop]", "Inspect and configure web-search backends", ()),
+    ("mode", "/mode [readonly|full-auto]", "Show or set the permission mode (edit is an alias for full-auto)", ()),
+    ("new", "/new <name>", "Create a named persistent session", ()),
+    ("sessions", "/sessions", "List named sessions", ()),
+    ("resume", "/resume <name>", "Load a named session", ()),
+    ("reset", "/reset", "Clear the active session while retaining its name", ()),
+    ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
+    ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
+    ("memory", "/memory [on|off|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
+    ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
+    ("history", "/history", "Show the current conversation", ()),
+    ("trace", "/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace", ()),
+    ("think", "/think [on|off]", "Alias for /reasoning", ()),
+    ("verbose", "/verbose [on|off|full]", "Control tool activity detail", ()),
+    ("usage", "/usage [off|tokens|full]", "Control post-turn usage summaries", ()),
+    ("reasoning", "/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)", ()),
+    ("temp", "/temp <float>", "Set sampling temperature (current: {temperature})", ()),
+    ("maxturns", "/maxturns <int>", "Set max agent turns (current: {max_turns})", ()),
+    ("save", "/save <file>", "Save conversation + last trace to a JSON file", ()),
+    ("clear", "/clear", "Clear the conversation context", ()),
+    ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
+    ("help", "/help", "Show this list", ()),
+    ("exit", "/exit, /quit", "Leave", ("quit",)),
+)
+
+
+def command_catalog():
+    """Structured command help shared by the CLI and web UI."""
+    return [
+        {"name": name, "usage": usage, "description": description.format(
+            temperature=S.temperature, max_turns=S.max_turns), "aliases": list(aliases)}
+        for name, usage, description, aliases in COMMAND_SPECS
+    ]
+
+
 def cmd_help(_):
     t = Table(title="Commands", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Command", style="#237dd7", no_wrap=True)
     t.add_column("What it does", style="#237dd7")
-    rows = [
-        ("<text>", "Chat — run the full agent loop on your message"),
-        ("/tools", "List every tool with its args, mode, and description"),
-        ("/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails"),
-        ("/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)"),
-        ("/agents [new|edit|delete|models]", "List, create, edit, or delete sub-agent profiles"),
-        ("/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker"),
-        ("/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session"),
-        ("/cli-anything [task]", "Use CLI-Anything to find, run, build, refine, test, or validate an application CLI"),
-        ("/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs"),
-        ("/audit [on|off]", "Verify each step against the real files after it runs"),
-        ("/fusion setup", "Pick a default fusion panel and judge once, interactively"),
-        ("/fusion <query>", "Ask the panel in parallel; a blind judge picks the best answer"),
-        ("/image <path> [q]", "Analyze a screenshot/diagram with a vision model"),
-        ("/paste [q]", "Analyze an image from the OS clipboard (Windows/macOS)"),
-        ("/raw <text>", "One raw model call — shows content, reasoning, tool_calls"),
-        ("/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider"),
-        ("/models [provider|custom]", "Pick a provider/model or connect a custom endpoint"),
-        ("/mcp", "List MCP servers, connection state, errors, and discovered tools"),
-        ("/mcp reload", "Reconnect MCP servers after changing configuration"),
-        ("/mcp add <name> stdio <command> [args...] [--project]", "Add a local MCP server"),
-        ("/mcp add <name> http <url> [--project]", "Add a Streamable HTTP MCP server"),
-        ("/mcp remove <name> [--project]", "Remove an MCP server from the selected scope"),
-        ("/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation"),
-        ("/status", "Show model, context, tool, skill, and session status"),
-        ("/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install"),
-        ("/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report"),
-        ("/new <name>", "Create a named persistent session"),
-        ("/sessions", "List named sessions"),
-        ("/resume <name>", "Load a named session"),
-        ("/reset", "Clear the active session while retaining its name"),
-        ("/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)"),
-        ("/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)"),
-        ("/memory [on|off|search|add|forget|notify|test|clear]",
-         "Persistent memory across sessions — recalls facts each turn, learns from finished turns"),
-        ("/config", "Show the active configuration (model, endpoint, paths)"),
-        ("/history", "Show the current conversation"),
-        ("/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace"),
-        ("/think [on|off]", "Alias for /reasoning"),
-        ("/verbose [on|off|full]", "Control tool activity detail"),
-        ("/usage [off|tokens|full]", "Control post-turn usage summaries"),
-        ("/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)"),
-        ("/temp <float>", "Set sampling temperature (current: %s)" % S.temperature),
-        ("/maxturns <int>", "Set max agent turns (current: %s)" % S.max_turns),
-        ("/save <file>", "Save conversation + last trace to a JSON file"),
-        ("/clear", "Clear the conversation context"),
-        ("/help", "Show this list"),
-        ("/exit, /quit", "Leave"),
-    ]
-    for a, b in rows:
-        t.add_row(a, b)
+    for command in command_catalog():
+        t.add_row(command["usage"], command["description"])
     console.print(t)
 
 

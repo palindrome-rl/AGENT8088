@@ -1,16 +1,16 @@
 import { useState } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Bot, Rocket, X, Loader2, CheckCircle2, XCircle, Cpu, Shield, Terminal,
+  Bot, Rocket, X, Loader2, CheckCircle2, XCircle, Cpu, Shield, Terminal, Plus, Trash2,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { SubagentSpec } from '@/types/api'
 
 /* ------------------------------------------------------------------ */
-/* Types — the /api/agents endpoint omits system_prompt, so we narrow.  */
+/* Types */
 /* ------------------------------------------------------------------ */
 
-type AgentProfile = Omit<SubagentSpec, 'system_prompt'>
+type AgentProfile = SubagentSpec
 
 interface AgentRunResult {
   agent: string
@@ -35,6 +35,23 @@ async function runAgent(name: string, task: string): Promise<AgentRunResult> {
   })
   if (!res.ok) throw new Error(`Agent launch failed (${res.status})`)
   return res.json() as Promise<AgentRunResult>
+}
+
+async function createAgent(body: Record<string, unknown>): Promise<void> {
+  const res = await fetch('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  const data = await res.json() as { error?: string }
+  if (!res.ok || data.error) throw new Error(data.error ?? `Profile creation failed (${res.status})`)
+}
+
+async function deleteAgent(name: string): Promise<void> {
+  const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  const data = await res.json() as { error?: string }
+  if (!res.ok || data.error) throw new Error(data.error ?? `Profile deletion failed (${res.status})`)
+}
+async function updateAgent(name: string, body: Record<string, unknown>): Promise<void> {
+  const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  const data = await res.json() as { error?: string }
+  if (!res.ok || data.error) throw new Error(data.error ?? `Profile update failed (${res.status})`)
 }
 
 /* ------------------------------------------------------------------ */
@@ -192,11 +209,24 @@ function LaunchModal({ agent, onClose }: LaunchModalProps) {
 /* ------------------------------------------------------------------ */
 
 export default function AgentsPage() {
+  const queryClient = useQueryClient()
   const [launchAgent, setLaunchAgent] = useState<AgentProfile | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [profile, setProfile] = useState({ name: '', description: '', model: 'inherit', prompt: '', tools: '', max_turns: 8 })
 
   const { data: agents, isLoading, isError, error } = useQuery({
     queryKey: ['agents'],
     queryFn: fetchAgents,
+  })
+  const createMutation = useMutation({
+    mutationFn: () => createAgent(profile),
+    onSuccess: () => { setProfile({ name: '', description: '', model: 'inherit', prompt: '', tools: '', max_turns: 8 }); setCreating(false); void queryClient.invalidateQueries({ queryKey: ['agents'] }) },
+  })
+  const updateMutation = useMutation({ mutationFn: () => updateAgent(editing!, profile), onSuccess: () => { setEditing(null); setCreating(false); void queryClient.invalidateQueries({ queryKey: ['agents'] }) } })
+  const deleteMutation = useMutation({
+    mutationFn: deleteAgent,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['agents'] }),
   })
 
   return (
@@ -210,7 +240,19 @@ export default function AgentsPage() {
             {agents.length}
           </span>
         )}
+        <button onClick={() => setCreating((open) => !open)} className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-zinc-700 px-2.5 py-1.5 text-xs text-zinc-300 hover:border-brand-primary hover:text-brand-cyan"><Plus className="h-3.5 w-3.5" />New profile</button>
       </div>
+
+      {creating && <form onSubmit={(event) => { event.preventDefault(); if (profile.name && profile.prompt) editing ? updateMutation.mutate() : createMutation.mutate() }} className="mb-5 grid gap-3 rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 sm:grid-cols-2">
+        <input aria-label="Profile name" disabled={Boolean(editing)} value={profile.name} onChange={(event) => setProfile((current) => ({ ...current, name: event.target.value }))} placeholder="profile-name" className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 disabled:opacity-50" />
+        <input aria-label="Profile description" value={profile.description} onChange={(event) => setProfile((current) => ({ ...current, description: event.target.value }))} placeholder="Description" className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600" />
+        <input aria-label="Profile model" value={profile.model} onChange={(event) => setProfile((current) => ({ ...current, model: event.target.value }))} placeholder="inherit" className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-zinc-100 placeholder:text-zinc-600" />
+        <input aria-label="Profile tools" value={profile.tools} onChange={(event) => setProfile((current) => ({ ...current, tools: event.target.value }))} placeholder="tools (comma-separated)" className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-sm text-zinc-100 placeholder:text-zinc-600" />
+        <input aria-label="Profile max turns" type="number" min="1" max="20" value={profile.max_turns} onChange={(event) => setProfile((current) => ({ ...current, max_turns: Number(event.target.value) }))} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100" />
+        <textarea aria-label="Profile prompt" value={profile.prompt} onChange={(event) => setProfile((current) => ({ ...current, prompt: event.target.value }))} placeholder="System prompt" rows={2} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600" />
+        {(createMutation.error || updateMutation.error) && <p className="sm:col-span-2 text-xs text-red-400">{((createMutation.error || updateMutation.error) as Error).message}</p>}
+        <button disabled={!profile.name || !profile.prompt || createMutation.isPending || updateMutation.isPending} className="inline-flex w-fit items-center gap-1.5 rounded-lg bg-brand-primary px-3 py-2 text-xs font-medium text-white disabled:opacity-40">{(createMutation.isPending || updateMutation.isPending) && <Loader2 className="h-3.5 w-3.5 animate-spin" />}{editing ? 'Save profile' : 'Create custom profile'}</button>
+      </form>}
 
       {/* loading */}
       {isLoading && (
@@ -254,6 +296,10 @@ export default function AgentsPage() {
                 <span className="rounded bg-zinc-800/60 px-1.5 py-0.5 text-[10px] text-zinc-500">
                   {agent.tools.length} tools
                 </span>
+                <span className="rounded bg-zinc-800/60 px-1.5 py-0.5 font-mono text-[10px] text-zinc-500" title="Sub-agent model routing">
+                  {agent.model || 'inherit'}
+                </span>
+                {agent.builtin === false && <span className="rounded bg-brand-primary/10 px-1.5 py-0.5 text-[10px] text-brand-cyan">custom</span>}
               </div>
 
               {/* tool chips */}
@@ -278,6 +324,8 @@ export default function AgentsPage() {
                 <Rocket className="h-3.5 w-3.5" />
                 Launch
               </button>
+              {agent.builtin === false && <button onClick={() => { if (window.confirm(`Delete custom profile ${agent.name}?`)) deleteMutation.mutate(agent.name) }} disabled={deleteMutation.isPending} className="mt-2 inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/30 px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" />Delete</button>}
+              {agent.builtin === false && <button onClick={() => { setProfile({ name: agent.name, description: agent.description, model: agent.model || 'inherit', prompt: agent.system_prompt, tools: agent.tools.join(', '), max_turns: agent.max_turns }); setEditing(agent.name); setCreating(true) }} className="mt-2 rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-brand-primary">Edit</button>}
             </div>
           ))}
         </div>

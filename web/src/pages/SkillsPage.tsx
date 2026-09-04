@@ -76,6 +76,7 @@ function SkillCard({ skill }: SkillCardProps) {
           <div className="flex items-center gap-2">
             <BookOpen className="h-3.5 w-3.5 shrink-0 text-brand-cyan/70" />
             <h3 className="truncate font-mono text-sm font-medium text-zinc-100">{skill.name}</h3>
+            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-500">{skill.category || 'General'}</span>
           </div>
           <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-zinc-400">
             {skill.description || 'No description'}
