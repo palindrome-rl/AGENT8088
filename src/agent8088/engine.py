@@ -6108,6 +6108,110 @@ def _run_local_models_tool(name: str, args: dict, timeout: int, approval_key: st
         return f"Error: {exc}"
 
 
+def _run_mcp_manage_tool(name: str, args: dict, approval_key: str) -> str:
+    """Dispatch for MCP server lifecycle tools. list_mcp_servers is read-only
+    (wraps MCP_RUNTIME.statuses); add/remove touch config on disk and connect
+    to a new process, so they go through the same host-shell permission gate
+    pull_local_model/remove_local_model use. The escalation message shows the
+    full command/url about to be configured -- a readonly-mode approval must
+    be informed by what will actually run, not just a server name."""
+    if name == "list_mcp_servers":
+        if not MCP_RUNTIME.statuses:
+            return "No MCP servers configured. Use add_mcp_server to add one."
+        lines = ["Configured MCP servers:"]
+        for server_name, status in sorted(MCP_RUNTIME.statuses.items()):
+            detail = ", ".join(status.get("tools", [])) or status.get("error", "")
+            lines.append(f"  - {server_name}: {status.get('state')}"
+                         + (f" ({detail})" if detail else ""))
+        return "\n".join(lines)
+
+    server_name = str(args.get("name") or "").strip()
+    if not server_name:
+        return "Error: 'name' is required."
+
+    if name == "remove_mcp_server":
+        display = f"remove_mcp_server: {server_name}"
+        if not check_permission("shell", display, host=True, approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="shell",
+                   decision="blocked", detail=display, change_type="local_execution")
+            return request_escalation(
+                target_mode="edit", paths=[display], change_type="local_execution",
+                reason=f"Remove MCP server '{server_name}'?",
+            )
+        _audit("tool_call", tool=name, mode="shell", decision="allowed", detail=display)
+        try:
+            removed = MCP_RUNTIME.remove_server(server_name, project=bool(args.get("project")))
+            reload_mcp_tools()
+        except Exception as exc:  # noqa: BLE001
+            return f"Error removing MCP server: {exc}"
+        return f"Removed {server_name}" if removed else f"'{server_name}' was not configured in that scope."
+
+    if name != "add_mcp_server":
+        return f"Unknown MCP tool: {name}"
+
+    transport = str(args.get("transport") or "").strip().lower()
+    if transport == "stdio":
+        command = str(args.get("command") or "").strip()
+        if not command:
+            return "Error: transport=stdio requires 'command'."
+        raw_args = args.get("args") or []
+        if isinstance(raw_args, str) and raw_args.strip():
+            try:
+                raw_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                raw_args = raw_args.split()
+        elif isinstance(raw_args, str):
+            raw_args = []
+        if not isinstance(raw_args, list):
+            return "Error: 'args' must be a JSON array of strings."
+        config = {"command": command, "args": [str(a) for a in raw_args]}
+        display_cmd = " ".join([command, *config["args"]])
+    elif transport == "http":
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return "Error: transport=http requires 'url'."
+        config = {"url": url}
+        display_cmd = url
+    else:
+        return "Error: 'transport' must be 'stdio' or 'http'."
+
+    raw_env = args.get("env")
+    if raw_env:
+        if isinstance(raw_env, str):
+            try:
+                raw_env = json.loads(raw_env)
+            except json.JSONDecodeError:
+                return "Error: 'env' must be a JSON object string of string->string."
+        if not isinstance(raw_env, dict):
+            return "Error: 'env' must be a JSON object."
+        config["env"] = {str(k): str(v) for k, v in raw_env.items()}
+
+    bearer_env = str(args.get("bearer_token_env") or "").strip()
+    if bearer_env:
+        config["bearer_token_env"] = bearer_env
+
+    display = f"add_mcp_server: {server_name} ({transport}) -> {display_cmd}"
+    if not check_permission("shell", display, host=True, approval_key=approval_key):
+        _audit("escalation_requested", tool=name, mode="shell",
+               decision="blocked", detail=display, change_type="local_execution")
+        return request_escalation(
+            target_mode="edit", paths=[display], change_type="local_execution",
+            reason=(f"Add MCP server '{server_name}'? This configures Agent8088 to "
+                    f"launch/connect: {display_cmd}"),
+        )
+    _audit("tool_call", tool=name, mode="shell", decision="allowed", detail=display)
+    try:
+        MCP_RUNTIME.set_server(server_name, config, project=bool(args.get("project")))
+        reload_mcp_tools()
+    except Exception as exc:  # noqa: BLE001
+        return f"Error adding MCP server: {exc}"
+    status = MCP_RUNTIME.statuses.get(server_name, {})
+    state = status.get("state", "unknown")
+    tools = ", ".join(status.get("tools", [])) or status.get("error", "")
+    return (f"Added '{server_name}' ({transport}). Connection state: {state}"
+            + (f" -- {tools}" if tools else ""))
+
+
 def _run_cli_anything_tool(name: str, args: dict, timeout: int,
                            approval_key: str, allow_plan: bool) -> str:
     """Run the optional CLI-Anything adapter through Agent8088's policy layer."""
@@ -6246,6 +6350,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if missing:
             return _tool_arg_missing_error(name, missing)
         return _run_local_models_tool(name, args, timeout, approval_key)
+
+    if mode == "mcp_manage":
+        missing = next(
+            (param for param in TOOL_REQUIRED_PARAMS.get(name, []) if not args.get(param)),
+            None,
+        )
+        if missing:
+            return _tool_arg_missing_error(name, missing)
+        return _run_mcp_manage_tool(name, args, approval_key)
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"
