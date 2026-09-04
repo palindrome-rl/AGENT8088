@@ -1450,7 +1450,7 @@ DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.m
 def load_text(path: Path, fallback: str) -> str:
     try:
         if path.exists():
-            content = path.read_text().strip()
+            content = path.read_text(encoding="utf-8").strip()
             if content:
                 return content
     except Exception:
@@ -2201,7 +2201,7 @@ def _parse_arg_types(raw: str) -> dict:
 def load_tool_specs(path: Path, config: dict) -> dict:
     specs = {}
     if path.exists():
-        for raw in path.read_text().splitlines():
+        for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -2462,7 +2462,12 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
         meta, body = {}, ""
         skill_md = pkg / "SKILL.md"
         if skill_md.exists():
-            meta, body = _parse_frontmatter_md(skill_md.read_text())
+            # encoding is explicit: read_text() defaults to the locale codec, which
+            # on Windows is cp1252 and cannot decode a SKILL.md containing any
+            # non-ASCII character. That raised UnicodeDecodeError at import time,
+            # before the REPL ever appeared -- one skill file with an em dash in it
+            # took the whole agent down. Same reason as cli.py's banner read.
+            meta, body = _parse_frontmatter_md(skill_md.read_text(encoding="utf-8"))
         tools_file = pkg / "tools.txt"
         tools = load_tool_specs(tools_file, config) if tools_file.exists() else {}
         if not tools and not skill_md.exists():
@@ -2604,7 +2609,7 @@ def load_subagent_specs(agents_dir: Path, user_agents_dir: Path = None) -> dict:
         if not source_dir or not source_dir.exists() or not source_dir.is_dir():
             continue
         for path in sorted(source_dir.glob("*.md")):
-            meta, body = _parse_frontmatter_md(path.read_text())
+            meta, body = _parse_frontmatter_md(path.read_text(encoding="utf-8"))
             name = meta.get("name") or path.stem
             specs[name] = {
                 "name": name,
