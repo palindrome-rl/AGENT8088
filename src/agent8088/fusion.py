@@ -14,6 +14,13 @@ from typing import Callable, Optional
 
 from agent8088 import engine as A
 
+# Hard wall-clock bound on one fusion web_search. The engine's own tool
+# timeout governs individual backend requests, but a slow backend chain
+# (SearXNG down -> retries -> ddgs throttle backoff) can outlive a panel
+# member's own timeout budget. 120s: enough for a throttled ddgs ladder,
+# short enough that a member always answers within member_timeout_s.
+FUSION_SEARCH_TIMEOUT_S = 120.0
+
 
 PANEL_SYSTEM_PROMPT = (
     "You are one participant in a blind panel answering a single question. "
@@ -37,8 +44,29 @@ _ESCALATION_PREFIX = "ESCALATION_REQUEST"
 def _run_tool_once(args: dict) -> str:
     """One web_search through the engine's own gated path — sensitive-query,
     secret-leak, SSRF and backend-chain guards all apply, same as the main
-    loop. depth=1 keeps sub-delegation off."""
-    return A.run_tool("web_search", args, allow_plan=False, depth=1)
+    loop. depth=1 keeps sub-delegation off. Bounded to
+    FUSION_SEARCH_TIMEOUT_S in a worker thread: run_tool's own timeout
+    governs each backend request, not the whole fallback chain, and a panel
+    member must never hang past its own timeout budget on one search."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(A.run_tool, "web_search", args,
+                             allow_plan=False, depth=1)
+        try:
+            return future.result(timeout=FUSION_SEARCH_TIMEOUT_S)
+        except FuturesTimeoutError:
+            future.cancel()
+            return (f"Error: web_search timed out after "
+                    f"{FUSION_SEARCH_TIMEOUT_S:.0f}s. Do not retry it — "
+                    "answer from your own knowledge or the results you "
+                    "already have.")
+    finally:
+        # No wait: a timed-out search must not hold the member hostage while
+        # its worker thread drains. Python threads can't be killed, so the
+        # underlying search may run to completion in the background -- the
+        # member is free either way, and the pool thread exits with the
+        # process.
+        pool.shutdown(wait=False)
 
 
 def _member_tool_loop(
