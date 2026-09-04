@@ -30,6 +30,25 @@ class OllamaError(Exception):
     """Raised when the local Ollama daemon can't be reached or errors out."""
 
 
+def _daemon_unreachable_message(host: str, exc: Exception) -> str:
+    # Explicit "do not try to fix this yourself" instruction: a model that
+    # hits a plain "is ollama serve running?" message will reach for
+    # execute_shell to start the daemon itself, poll it, hit the shell
+    # tool's loopback/SSRF guard on its own curl check, and burn its whole
+    # turn budget on a diagnostic loop that never resolves the turn --
+    # observed live: 10 turns spent trying `start ollama serve`,
+    # `tasklist`, and a blocked `curl localhost` before hitting the turn
+    # limit, even though the daemon was reachable moments later. Starting
+    # a background service the agent doesn't own and can't verify healthy
+    # from inside its own turn budget is also just the wrong tool for this
+    # job -- the user runs `ollama serve` in their own terminal.
+    return (
+        f"Can't reach Ollama at {host} ({exc}). The local Ollama daemon isn't "
+        "running. Do not try to start it yourself with execute_shell -- tell "
+        "the user to run 'ollama serve' in a terminal, then retry."
+    )
+
+
 @dataclass
 class HardwareBudget:
     ram_total_gb: float
@@ -270,9 +289,7 @@ def _ollama_request(path: str, method: str = "GET", body: dict | None = None,
             raw = resp.read()
             return json.loads(raw) if raw else {}
     except urllib.error.URLError as exc:
-        raise OllamaError(
-            f"Can't reach Ollama at {host} -- is 'ollama serve' running? ({exc})"
-        ) from exc
+        raise OllamaError(_daemon_unreachable_message(host, exc)) from exc
     except json.JSONDecodeError as exc:
         raise OllamaError(f"Ollama returned unparseable output: {exc}") from exc
 
@@ -316,9 +333,7 @@ def pull_model(name: str, host: str = DEFAULT_OLLAMA_HOST, timeout: int = 600) -
                     raise OllamaError(evt["error"])
                 last_status = evt.get("status") or last_status
     except urllib.error.URLError as exc:
-        raise OllamaError(
-            f"Can't reach Ollama at {host} -- is 'ollama serve' running? ({exc})"
-        ) from exc
+        raise OllamaError(_daemon_unreachable_message(host, exc)) from exc
     return last_status or "pull finished"
 
 
