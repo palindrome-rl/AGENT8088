@@ -47,12 +47,6 @@ skillopt_data/
 graphify-out/
 .opencode/
 
-# Local agent instructions. Both files stay tracked, so these entries only take
-# effect once a file is untracked with `git rm --cached <file>` — until then git
-# keeps reporting changes to them.
-AGENTS.md
-CLAUDE.md
-
 # Config snapshots (may contain secrets - never commit)
 backup.txt
 opencode.json
