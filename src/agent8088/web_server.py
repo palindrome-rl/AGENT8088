@@ -1464,10 +1464,13 @@ class ModeBody(BaseModel):
 async def set_mode(body: ModeBody):
     """Set permission mode."""
     A = _eng()
+    if body.mode == "plan-only":
+        A.enter_plan_mode()
+        return {"ok": True, "mode": A.PERMISSION_MODE}
     if body.mode in {"readonly", "full-auto"}:
         A.set_permission_mode(body.mode)
         return {"ok": True, "mode": A.PERMISSION_MODE}
-    return {"error": "use /plan to enter plan-only mode"}
+    return {"error": "invalid permission mode"}
 
 
 @app.post("/api/audit")

@@ -19,6 +19,18 @@ class _Engine:
 
     def enter_plan_mode(self):
         self.entered_plan_mode = True
+        self.PERMISSION_MODE = "plan-only"
+
+
+def test_mode_endpoint_enters_plan_mode(monkeypatch):
+    engine = _Engine()
+    engine.PERMISSION_MODE = "readonly"
+    monkeypatch.setattr(web_server, "_eng", lambda: engine)
+
+    result = asyncio.run(web_server.set_mode(web_server.ModeBody(mode="plan-only")))
+
+    assert engine.entered_plan_mode
+    assert result == {"ok": True, "mode": "plan-only"}
 
 
 def test_inline_plan_uses_web_chat_runner(monkeypatch):

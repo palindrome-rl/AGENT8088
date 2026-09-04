@@ -1,6 +1,6 @@
 import { useMemo, useState, useRef, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2 } from 'lucide-react'
+import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2, ChevronDown, Shield } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useCommandCatalog } from '@/lib/commands'
@@ -30,6 +30,12 @@ function parseToken(draft: string): { kind: 'at' | 'slash'; query: string; start
 
 type Attachment = { localId: string; file: File; id?: string; state: 'uploading' | 'ready' | 'error'; error?: string }
 
+const permissionModes = [
+  { value: 'plan-only', label: 'Plan', description: 'Research and propose before running' },
+  { value: 'readonly', label: 'Read-only', description: 'Ask before any change' },
+  { value: 'full-auto', label: 'Full auto', description: 'Run with configured permissions' },
+] as const
+
 export function PromptBar() {
   const [text, setText] = useState('')
   const [dismissed, setDismissed] = useState(false)
@@ -40,11 +46,13 @@ export function PromptBar() {
   const [expanded, setExpanded] = useState(false)
   const [sessionError, setSessionError] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
+  const [modeOpen, setModeOpen] = useState(false)
+  const [modeChanging, setModeChanging] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const measureRef = useRef<HTMLSpanElement>(null)
   const controlsRef = useRef<HTMLDivElement>(null)
-  const { isStreaming, sessionName, addMessage, setSessionName, setRawLoading, setRawResult } = useSessionStore()
+  const { isStreaming, sessionName, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult } = useSessionStore()
   const { send: wsSend } = useWebSocket()
   const { data: commands = [] } = useCommandCatalog()
   const { rawPanelOpen, toggleRawPanel, setRawPanelOpen } = useUIStore()
@@ -85,16 +93,17 @@ export function PromptBar() {
 
   // Close menus on outside click
   useEffect(() => {
-    if (!menu && !plusOpen) return
+    if (!menu && !plusOpen && !modeOpen) return
     const close = (e: PointerEvent) => {
       if (!(e.target as Element)?.closest('[data-promptbar]')) {
         setPlusOpen(false)
+        setModeOpen(false)
         setDismissed(true)
       }
     }
     document.addEventListener('pointerdown', close)
     return () => document.removeEventListener('pointerdown', close)
-  }, [menu, plusOpen])
+  }, [menu, plusOpen, modeOpen])
 
   const ensureSession = async () => {
     if (sessionName) return
@@ -149,6 +158,27 @@ export function PromptBar() {
   const removeAttachment = async (attachment: Attachment) => {
     setAttachments((items) => items.filter((item) => item.localId !== attachment.localId))
     if (attachment.id) await fetch(`/api/attachments/${attachment.id}`, { method: 'DELETE' })
+  }
+
+  const setPermissionMode = async (mode: (typeof permissionModes)[number]['value']) => {
+    setModeOpen(false)
+    if (mode === status?.permission_mode) return
+    setModeChanging(true)
+    setSessionError('')
+    try {
+      const response = await fetch('/api/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      })
+      const result = await response.json() as { mode?: typeof mode; error?: string }
+      if (!response.ok || !result.mode) throw new Error(result.error ?? 'Could not change permission mode')
+      if (status) setStatus({ ...status, permission_mode: result.mode })
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Could not change permission mode')
+    } finally {
+      setModeChanging(false)
+    }
   }
 
   const handleSend = async () => {
@@ -309,7 +339,7 @@ export function PromptBar() {
         </div>}
         <div
           className={cn(
-            'relative flex flex-col overflow-hidden border bg-white dark:bg-zinc-900/50 transition-[border-color] duration-150',
+            'relative flex flex-col overflow-visible border bg-white dark:bg-zinc-900/50 transition-[border-color] duration-150',
             'border-zinc-300 dark:border-zinc-800 focus-within:border-brand-primary/40',
             expanded ? 'rounded-[14px] p-2.5 gap-2' : 'rounded-[14px] p-1.5 gap-1.5',
           )}
@@ -340,6 +370,39 @@ export function PromptBar() {
             >
               <Plus className="h-4 w-4" />
             </button>
+
+            <div className="relative shrink-0">
+              <button
+                type="button"
+                aria-label="Permission mode"
+                aria-expanded={modeOpen}
+                disabled={modeChanging || isStreaming}
+                onClick={() => setModeOpen((open) => !open)}
+                className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-zinc-100"
+              >
+                <Shield className="h-3.5 w-3.5" />
+                <span>{permissionModes.find((mode) => mode.value === status?.permission_mode)?.label ?? 'Mode'}</span>
+                {modeChanging ? <Loader2 className="h-3 w-3 animate-spin" /> : <ChevronDown className="h-3 w-3" />}
+              </button>
+              {modeOpen && (
+                <div className="absolute bottom-full left-0 z-10 mb-2 w-56 overflow-hidden rounded-xl border border-zinc-200 bg-white p-1 shadow-xl shadow-black/10 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-black/40">
+                  {permissionModes.map((mode) => (
+                    <button
+                      key={mode.value}
+                      type="button"
+                      onClick={() => void setPermissionMode(mode.value)}
+                      className={cn(
+                        'block w-full rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50',
+                        status?.permission_mode === mode.value && 'bg-zinc-100 dark:bg-zinc-800/50',
+                      )}
+                    >
+                      <span className="block text-xs font-medium text-zinc-800 dark:text-zinc-100">{mode.label}</span>
+                      <span className="block text-[10px] text-zinc-500 dark:text-zinc-400">{mode.description}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
 
             {/* Textarea */}
             <textarea
