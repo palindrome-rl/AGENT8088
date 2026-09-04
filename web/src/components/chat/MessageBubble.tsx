@@ -22,9 +22,13 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
   // Assistant messages — left-aligned bubble to match user messages
   return (
     <div className="msg-enter mx-auto flex max-w-3xl justify-start px-6 py-2">
-      <div className="w-fit max-w-[85%] rounded-2xl rounded-tl-md border border-zinc-200 bg-zinc-100/90 px-4 py-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/90">
+      <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-zinc-200 bg-zinc-100/90 px-4 py-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/90">
         <div className="mb-1.5 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Agent8088</div>
-        <div className="prose prose-sm max-w-none text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0">
+        {message.format === 'terminal' ? (
+          <pre className="max-h-[60vh] max-w-full overflow-auto whitespace-pre rounded-lg border border-zinc-200 bg-zinc-50 p-3 font-mono text-[12px] leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
+            {scrubMarkup(message.content)}
+          </pre>
+        ) : <div className="min-w-0 max-w-full overflow-hidden prose prose-sm text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0 [&_pre]:max-w-full [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
           {/* Scrub tool-call protocol: history messages are stored raw */}
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
@@ -47,7 +51,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
           >
             {scrubMarkup(message.content)}
           </ReactMarkdown>
-        </div>
+        </div>}
       </div>
     </div>
   )

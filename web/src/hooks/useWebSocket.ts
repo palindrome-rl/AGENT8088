@@ -115,7 +115,7 @@ function wireSocket(ws: WebSocket) {
           setRawPanelOpen(true)
         }
         if (data.result.toLowerCase().startsWith('unknown command')) {
-          addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+          addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
         // Display command output for commands that produce user-visible text
         // (parity with CLI — every /command prints to console; the web UI
@@ -127,7 +127,7 @@ function wireSocket(ws: WebSocket) {
           void syncSession(true).then(() => {
             void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
             if (data.result.trim().length > 0) {
-              addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+              addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
             }
           })
         } else {
@@ -138,7 +138,7 @@ function wireSocket(ws: WebSocket) {
             !data.result.toLowerCase().startsWith('unknown command') &&
             cmd !== 'raw' &&
             data.result.trim().length > 0) {
-          addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+          addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
         break
     }

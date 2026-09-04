@@ -1464,10 +1464,13 @@ class ModeBody(BaseModel):
 async def set_mode(body: ModeBody):
     """Set permission mode."""
     A = _eng()
+    if body.mode == "plan-only":
+        A.enter_plan_mode()
+        return {"ok": True, "mode": A.PERMISSION_MODE}
     if body.mode in {"readonly", "full-auto"}:
         A.set_permission_mode(body.mode)
         return {"ok": True, "mode": A.PERMISSION_MODE}
-    return {"error": "use /plan to enter plan-only mode"}
+    return {"error": "invalid permission mode"}
 
 
 @app.post("/api/audit")
@@ -1513,7 +1516,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "chat":
                 await _handle_chat(ws, msg, A, C)
             elif msg_type == "command":
-                await _handle_command(ws, msg, C)
+                await _handle_command(ws, msg, A, C)
             elif msg_type == "interrupt":
                 # Signal the EscListener — but since we run in async, we
                 # use a threading.Event shared with the agent thread.
@@ -1756,10 +1759,21 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     await loop.run_in_executor(None, thread.join)
 
 
-async def _handle_command(ws: WebSocket, msg: dict, C):
+async def _handle_command(ws: WebSocket, msg: dict, A, C):
     """Execute a slash command and return the result."""
     command = str(msg.get("command", "")).strip().lstrip("/")
     args = msg.get("args", "")
+    if command.lower() == "plan":
+        # cmd_plan() delegates inline tasks to the terminal-only do_chat().
+        # The web runner owns the equivalent streamed path.
+        A.enter_plan_mode()
+        if str(args).strip():
+            await _handle_chat(ws, {"text": str(args)}, A, C)
+        else:
+            await ws.send_json({"type": "command_result", "command": command,
+                                "result": "plan mode — reads only. Agent8088 will research, propose a "
+                                          "plan, and wait for your approval before anything is written or run."})
+        return
     if command.lower() in {"exit", "quit"}:
         await ws.send_json({"type": "command_result", "command": command,
                             "result": f"/{command} is CLI-only and does nothing in the browser."})

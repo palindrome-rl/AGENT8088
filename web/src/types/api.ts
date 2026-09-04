@@ -101,6 +101,8 @@ export interface SessionData {
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
+  /** CLI/Rich output is terminal text, not Markdown. */
+  format?: 'markdown' | 'terminal'
 }
 
 export interface StatusInfo {
