@@ -2,19 +2,19 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   FolderClock, Plus, Play, RotateCcw, Archive, Loader2,
-  AlertCircle, MessageSquare, CheckCircle2, X, Download, FileText,
+  AlertCircle, MessageSquare, CheckCircle2, X, Download, FileText, Pencil, Trash2,
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useSessionStore } from '@/stores/session'
 import type { ChatMessage, SessionInfo } from '@/types/api'
 import { cn } from '@/lib/utils'
+import { apiFetch, handled } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 // ---- API helpers ----
 
 async function fetchJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return apiFetch<T>(url, { action: 'load sessions' })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
@@ -23,8 +23,7 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return handled<T>(res)
 }
 
 interface SessionActionResponse {
@@ -34,6 +33,7 @@ interface SessionActionResponse {
   messages?: number
   summary?: string
   message?: string
+  active?: boolean
   history?: { messages: ChatMessage[] }
 }
 
@@ -161,10 +161,13 @@ function CompactDialog({ open, onClose, onCompact, isCompacting }: {
 
 // ---- Session Row ----
 
-function SessionRow({ session, onResume, isResuming }: {
+function SessionRow({ session, onResume, isResuming, onRename, onDelete, isBusy }: {
   session: SessionInfo
   onResume: (name: string) => void
   isResuming: boolean
+  onRename: (name: string) => void
+  onDelete: (name: string) => void
+  isBusy: boolean
 }) {
   return (
     <tr className="group border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/20 last:border-0">
@@ -186,20 +189,17 @@ function SessionRow({ session, onResume, isResuming }: {
       </td>
       <td className="px-4 py-3 text-sm text-zinc-500">{session.updated}</td>
       <td className="px-4 py-3 text-right">
-        {session.active ? (
-          <span className="inline-flex items-center gap-1 text-xs text-green-400">
-            <CheckCircle2 className="h-3.5 w-3.5" /> active
-          </span>
-        ) : (
-          <button
-            onClick={() => onResume(session.name)}
-            disabled={isResuming}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 opacity-0 transition-all hover:border-brand-primary/40 hover:text-brand-cyan group-hover:opacity-100 disabled:opacity-40"
-          >
-            {isResuming ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-            Resume
-          </button>
-        )}
+        <div className="flex items-center justify-end gap-2">
+          {session.active ? (
+            <span className="inline-flex items-center gap-1 text-xs text-green-400"><CheckCircle2 className="h-3.5 w-3.5" /> active</span>
+          ) : (
+            <button onClick={() => onResume(session.name)} disabled={isBusy} className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 opacity-0 transition-all hover:border-brand-primary/40 hover:text-brand-cyan group-hover:opacity-100 disabled:opacity-40">
+              {isResuming ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} Resume
+            </button>
+          )}
+          <button type="button" aria-label={`Rename session ${session.name}`} onClick={() => onRename(session.name)} disabled={isBusy} className="rounded p-1 text-zinc-500 opacity-0 transition-all hover:text-brand-cyan group-hover:opacity-100 disabled:opacity-40"><Pencil className="h-3.5 w-3.5" /></button>
+          <button type="button" aria-label={`Delete session ${session.name}`} onClick={() => onDelete(session.name)} disabled={isBusy} className="rounded p-1 text-zinc-500 opacity-0 transition-all hover:text-red-400 group-hover:opacity-100 disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" /></button>
+        </div>
       </td>
     </tr>
   )
@@ -215,6 +215,7 @@ export default function SessionsPage() {
   const [compactOpen, setCompactOpen] = useState(false)
   const [resumingName, setResumingName] = useState<string | null>(null)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [renamingName, setRenamingName] = useState<string | null>(null)
 
   // List sessions
   const sessionsQuery = useQuery({
@@ -252,6 +253,34 @@ export default function SessionsPage() {
       setSessionName(data.name || name)
       void queryClient.invalidateQueries({ queryKey: ['sessions'] })
       navigate('/')
+    },
+  })
+
+  const renameMutation = useMutation({
+    mutationFn: ({ name, newName }: { name: string; newName: string }) => apiFetch<SessionActionResponse>(`/api/sessions/${encodeURIComponent(name)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ new_name: newName }),
+      action: `rename session ${name}`,
+    }),
+    onSuccess: (data) => {
+      if (data.name && renamingName === activeSession?.name) setSessionName(data.name)
+      setRenamingName(null)
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (name: string) => apiFetch<SessionActionResponse>(`/api/sessions/${encodeURIComponent(name)}`, {
+      method: 'DELETE', action: `delete session ${name}`,
+    }),
+    onSuccess: (data) => {
+      if (data.active) {
+        clearChat()
+        setSessionName('')
+        navigate('/')
+      }
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
     },
   })
 
@@ -353,6 +382,9 @@ export default function SessionsPage() {
           <CheckCircle2 className="h-3.5 w-3.5 shrink-0" /> Resumed "{resumeMutation.data?.name}" ({resumeMutation.data?.messages} messages)
         </div>
       )}
+      {(renameMutation.error || deleteMutation.error) && (
+        <ErrorCard error={renameMutation.error || deleteMutation.error} action={renameMutation.error ? 'rename the session' : 'delete the session'} />
+      )}
       {resetMutation.isSuccess && !resetMutation.data?.error && (
         <div className="flex items-center gap-2 rounded-lg border border-green-900/50 bg-green-950/20 p-3 text-xs text-green-400">
           <CheckCircle2 className="h-3.5 w-3.5 shrink-0" /> Active session cleared
@@ -379,9 +411,8 @@ export default function SessionsPage() {
             <Loader2 className="h-4 w-4 animate-spin text-brand-cyan" /> Loading sessions…
           </div>
         ) : sessionsQuery.isError ? (
-          <div className="flex items-center gap-2 p-8 text-sm text-red-400">
-            <AlertCircle className="h-4 w-4" /> Failed to load sessions
-          </div>
+          <ErrorCard error={sessionsQuery.error} action="load sessions"
+                     onRetry={() => void sessionsQuery.refetch()} variant="inline" className="m-4" />
         ) : !sessionsQuery.data || sessionsQuery.data.length === 0 ? (
           <div className="p-8 text-center">
             <FolderClock className="mx-auto mb-3 h-8 w-8 text-zinc-700" />
@@ -405,6 +436,21 @@ export default function SessionsPage() {
                   session={session}
                   onResume={(name) => resumeMutation.mutate(name)}
                   isResuming={resumingName === session.name}
+                  onRename={(name) => {
+                    renameMutation.reset()
+                    const nextName = window.prompt('Rename session', name)
+                    if (nextName?.trim() && nextName.trim() !== name) {
+                      setRenamingName(name)
+                      renameMutation.mutate({ name, newName: nextName.trim() })
+                    }
+                  }}
+                  onDelete={(name) => {
+                    if (window.confirm(`Delete session "${name}"? Its saved conversation will be permanently removed.`)) {
+                      deleteMutation.reset()
+                      deleteMutation.mutate(name)
+                    }
+                  }}
+                  isBusy={renameMutation.isPending || deleteMutation.isPending || resumingName !== null}
                 />
               ))}
             </tbody>

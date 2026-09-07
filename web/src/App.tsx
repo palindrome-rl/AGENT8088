@@ -14,6 +14,7 @@ import FusionPage from '@/pages/FusionPage'
 import TasksPage from '@/pages/TasksPage'
 import SearchPage from '@/pages/SearchPage'
 import SchedulesPage from '@/pages/SchedulesPage'
+import NotFoundPage from '@/pages/NotFoundPage'
 
 export default function App() {
   return (
@@ -33,6 +34,9 @@ export default function App() {
         <Route path="/tasks" element={<TasksPage />} />
         <Route path="/search" element={<SearchPage />} />
         <Route path="/schedules" element={<SchedulesPage />} />
+        {/* Inside AppLayout on purpose: an unmatched route still gets the
+            sidebar and status bar, so there is a way back. */}
+        <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>
   )

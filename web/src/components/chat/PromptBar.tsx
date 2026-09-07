@@ -14,8 +14,12 @@ import { ImageUpload } from './ImageUpload'
  * dictation, and send. Pop-in menus, gliding highlight.
  * ───────────────────────────────────────────────────────── */
 
-function generatedSessionName() {
-  return `chat-${Date.now()}`
+const sessionStopWords = new Set(['a', 'an', 'and', 'are', 'for', 'from', 'how', 'i', 'in', 'is', 'it', 'me', 'of', 'on', 'please', 'the', 'to', 'with'])
+
+function topicSessionName(text: string) {
+  const words = text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/).filter(Boolean)
+  const meaningful = words.filter((word) => !sessionStopWords.has(word))
+  return (meaningful.length ? meaningful : words).slice(0, 7).join('-').slice(0, 64) || 'new-chat'
 }
 
 function parseToken(draft: string): { kind: 'at' | 'slash'; query: string; start: number } | null {
@@ -43,15 +47,12 @@ export function PromptBar() {
   const [showImageUpload, setShowImageUpload] = useState(false)
   const [pasteImage, setPasteImage] = useState<string | null>(null)
   const [listening, setListening] = useState(false)
-  const [expanded, setExpanded] = useState(false)
   const [sessionError, setSessionError] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [modeOpen, setModeOpen] = useState(false)
   const [modeChanging, setModeChanging] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const measureRef = useRef<HTMLSpanElement>(null)
-  const controlsRef = useRef<HTMLDivElement>(null)
   const { isStreaming, sessionName, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult } = useSessionStore()
   const { send: wsSend } = useWebSocket()
   const { data: commands = [] } = useCommandCatalog()
@@ -80,16 +81,12 @@ export function PromptBar() {
   // Auto-grow textarea
   useEffect(() => {
     const input = inputRef.current
-    const measure = measureRef.current
-    if (!input || !measure) return
-
-    const needsExpand = text.includes('\n') || measure.offsetWidth + 8 > 300
-    if (needsExpand !== expanded) setExpanded(needsExpand)
+    if (!input) return
 
     input.style.height = '0px'
     const h = Math.min(Math.max(input.scrollHeight, 28), 100)
     input.style.height = `${h}px`
-  }, [text, expanded])
+  }, [text])
 
   // Close menus on outside click
   useEffect(() => {
@@ -105,7 +102,7 @@ export function PromptBar() {
     return () => document.removeEventListener('pointerdown', close)
   }, [menu, plusOpen, modeOpen])
 
-  const ensureSession = async () => {
+  const ensureSession = async (topic = '') => {
     if (sessionName) return
 
     const statusResponse = await fetch('/api/status')
@@ -116,22 +113,27 @@ export function PromptBar() {
       return
     }
 
-    const name = generatedSessionName()
-    const response = await fetch('/api/sessions/new', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    })
-    if (!response.ok) throw new Error(`Could not create session (${response.status})`)
-    const result = await response.json() as { error?: string; name?: string }
-    if (result.error) throw new Error(result.error)
-    setSessionName(result.name || name)
-    void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+    const baseName = topicSessionName(topic)
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const name = attempt === 0 ? baseName : `${baseName}-${attempt + 1}`
+      const response = await fetch('/api/sessions/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      const result = await response.json().catch(() => ({})) as { error?: string; name?: string }
+      if (response.status === 409 || result.error?.startsWith('session exists:')) continue
+      if (!response.ok || result.error) throw new Error(result.error ?? `Could not create session (${response.status})`)
+      setSessionName(result.name || name)
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+      return
+    }
+    throw new Error('Could not create a unique session name')
   }
 
   const uploadAttachment = async (attachment: Attachment) => {
     try {
-      await ensureSession()
+      await ensureSession(attachment.file.name)
       const response = await fetch('/api/attachments', {
         method: 'POST', headers: { 'X-Filename': attachment.file.name }, body: attachment.file,
       })
@@ -195,13 +197,13 @@ export function PromptBar() {
       }
       wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
     } else {
+      const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       try {
-        await ensureSession()
+        await ensureSession(message)
       } catch (error) {
         setSessionError(error instanceof Error ? error.message : 'Could not create a session')
         return
       }
-      const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       addMessage({ role: 'user', content: message })
       wsSend({ type: 'chat', text: message, attachments: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []) })
     }
@@ -341,25 +343,10 @@ export function PromptBar() {
           className={cn(
             'relative flex flex-col overflow-visible border bg-white dark:bg-zinc-900/50 transition-[border-color] duration-150',
             'border-zinc-300 dark:border-zinc-800 focus-within:border-brand-primary/40',
-            expanded ? 'rounded-[14px] p-2.5 gap-2' : 'rounded-[14px] p-1.5 gap-1.5',
+            'rounded-[14px] p-1.5 gap-1.5',
           )}
         >
-          {/* Hidden measure span for auto-grow */}
-          <span
-            ref={measureRef}
-            aria-hidden
-            className="pointer-events-none absolute invisible whitespace-pre text-[14px] leading-[20px]"
-          >
-            {text}
-          </span>
-
-          <div
-            ref={controlsRef}
-            className={cn(
-              'flex items-end gap-1.5',
-              expanded ? 'flex-col' : 'flex-row',
-            )}
-          >
+          <div className="flex items-end gap-1.5">
             {/* Plus button — attachments */}
             <button
               type="button"
@@ -415,14 +402,14 @@ export function PromptBar() {
               aria-label="Prompt"
               className={cn(
                 'prompt-textarea min-w-0 flex-1 resize-none bg-transparent text-[14px] text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:outline-none',
-                expanded ? 'w-full px-1 py-1' : 'px-1 py-1.5',
+                'px-1 py-1.5',
                 '[overflow-wrap:anywhere]',
               )}
               style={{ minHeight: '28px' }}
             />
 
             {/* Controls row */}
-            <div className={cn('flex items-center gap-1', expanded ? 'w-full justify-end' : 'shrink-0')}>
+            <div className="flex shrink-0 items-center gap-1">
               {/* Raw model call toggle */}
               <button
                 type="button"
@@ -503,7 +490,10 @@ export function PromptBar() {
               {/* Send — tactile square */}
               <button
                 type="button"
-                aria-label="Send"
+                // The same button becomes the stop control while a turn runs;
+                // a fixed "Send" label told screen-reader users they were
+                // sending when they were interrupting.
+                aria-label={isStreaming ? 'Stop generating' : 'Send'}
                 disabled={!canSend && !isStreaming}
                 onClick={isStreaming ? () => wsSend({ type: 'interrupt' }) : handleSend}
                 className={cn(

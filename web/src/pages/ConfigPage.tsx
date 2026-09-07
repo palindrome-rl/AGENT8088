@@ -6,13 +6,13 @@ import {
 } from 'lucide-react'
 import type { ConfigInfo, ProviderInfo } from '@/types/api'
 import { cn } from '@/lib/utils'
+import { apiFetch, handled } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 // ---- API helpers ----
 
 async function fetchJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return apiFetch<T>(url, { action: 'load configuration' })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
@@ -21,8 +21,7 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return handled<T>(res)
 }
 
 interface ProvidersResponse {
@@ -673,15 +672,16 @@ export default function ConfigPage() {
 
       {/* Errors */}
       {configQuery.isError && (
-        <div className="flex items-center gap-2 rounded-lg border border-red-900/50 bg-red-950/30 p-3 text-xs text-red-400">
-          <AlertCircle className="h-3.5 w-3.5 shrink-0" /> Failed to load config
-        </div>
+        <ErrorCard error={configQuery.error} action="load configuration"
+                   onRetry={() => void configQuery.refetch()} />
       )}
 
-      {switchMutation.data?.error && (
-        <div className="flex items-center gap-2 rounded-lg border border-red-900/50 bg-red-950/30 p-3 text-xs text-red-400">
-          <AlertCircle className="h-3.5 w-3.5 shrink-0" /> Model switch failed: {switchMutation.data.error}
-        </div>
+      {(switchMutation.error || switchMutation.data?.error) && (
+        <ErrorCard
+          error={switchMutation.error ?? new Error(String(switchMutation.data?.error))}
+          action="switch the model"
+          onRetry={() => switchMutation.reset()}
+        />
       )}
       {switchMutation.data?.ok && !switchMutation.data?.error && (
         <div className="flex items-center gap-2 rounded-lg border border-green-900/50 bg-green-950/20 p-3 text-xs text-green-400">

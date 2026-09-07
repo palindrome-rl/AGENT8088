@@ -7117,6 +7117,7 @@ def _scan_json_object(text: str, start: int, limit: int = None) -> str:
 
 
 def _normalize_tool_markers(text: str) -> str:
+    text = re.sub(r"\u273fARGS(?:</arg_key>\s*)?<arg_value>\s*:?", "\u273fARGS\u273f: ", text)
     text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
     return re.sub(
         r"✿(FUNCTION|ARGS)[^:\w\s]{0,3}\s*:",
@@ -9154,6 +9155,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # web_search calls in one turn is what this costs otherwise, and in
             # a sub-run the text travels on as evidence the step failed.
             if _is_missing_argument_error(result) and missing_args_retries < 2:
+                if on_result:
+                    on_result(name, result)
                 missing_args_retries += 1
                 messages.append({"role": "user", "content": result})
                 if trace is not None:
@@ -9169,6 +9172,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # which a later escalation would ever reach the model, so the
             # actionable guidance has to be what it sees on this one chance.
             if _is_parse_error_result(result):
+                if on_result:
+                    on_result(name, result)
                 parse_error_retries += 1
                 messages.append({"role": "user", "content": (
                     f"The arguments for '{name}' could not be parsed as JSON. Do "

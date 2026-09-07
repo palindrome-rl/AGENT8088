@@ -5,6 +5,8 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { SubagentSpec } from '@/types/api'
+import { apiFetch, handled } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 /* ------------------------------------------------------------------ */
 /* Types */
@@ -22,9 +24,7 @@ interface AgentRunResult {
 /* ------------------------------------------------------------------ */
 
 async function fetchAgents(): Promise<AgentProfile[]> {
-  const res = await fetch('/api/agents')
-  if (!res.ok) throw new Error(`Failed to load sub-agents (${res.status})`)
-  return res.json() as Promise<AgentProfile[]>
+  return apiFetch<AgentProfile[]>('/api/agents', { action: 'load sub-agents' })
 }
 
 async function runAgent(name: string, task: string): Promise<AgentRunResult> {
@@ -33,25 +33,21 @@ async function runAgent(name: string, task: string): Promise<AgentRunResult> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ task }),
   })
-  if (!res.ok) throw new Error(`Agent launch failed (${res.status})`)
-  return res.json() as Promise<AgentRunResult>
+  return handled<AgentRunResult>(res)
 }
 
 async function createAgent(body: Record<string, unknown>): Promise<void> {
-  const res = await fetch('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-  const data = await res.json() as { error?: string }
-  if (!res.ok || data.error) throw new Error(data.error ?? `Profile creation failed (${res.status})`)
+  const data = await apiFetch<{ error?: string }>('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), action: 'create that profile' })
+  if (data?.error) throw new Error(data.error)
 }
 
 async function deleteAgent(name: string): Promise<void> {
-  const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, { method: 'DELETE' })
-  const data = await res.json() as { error?: string }
-  if (!res.ok || data.error) throw new Error(data.error ?? `Profile deletion failed (${res.status})`)
+  const data = await apiFetch<{ error?: string }>(`/api/agents/${encodeURIComponent(name)}`, { method: 'DELETE', action: `delete ${name}` })
+  if (data?.error) throw new Error(data.error)
 }
 async function updateAgent(name: string, body: Record<string, unknown>): Promise<void> {
-  const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-  const data = await res.json() as { error?: string }
-  if (!res.ok || data.error) throw new Error(data.error ?? `Profile update failed (${res.status})`)
+  const data = await apiFetch<{ error?: string }>(`/api/agents/${encodeURIComponent(name)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), action: `update ${name}` })
+  if (data?.error) throw new Error(data.error)
 }
 
 /* ------------------------------------------------------------------ */
@@ -215,7 +211,7 @@ export default function AgentsPage() {
   const [editing, setEditing] = useState<string | null>(null)
   const [profile, setProfile] = useState({ name: '', description: '', model: 'inherit', prompt: '', tools: '', max_turns: 8 })
 
-  const { data: agents, isLoading, isError, error } = useQuery({
+  const { data: agents, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['agents'],
     queryFn: fetchAgents,
   })
@@ -262,11 +258,7 @@ export default function AgentsPage() {
       )}
 
       {/* error */}
-      {isError && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-400">
-          {(error as Error)?.message ?? 'Failed to load sub-agents.'}
-        </div>
-      )}
+      {isError && <ErrorCard error={error} action="load sub-agents" onRetry={() => void refetch()} />}
 
       {/* cards */}
       {agents && agents.length > 0 && (

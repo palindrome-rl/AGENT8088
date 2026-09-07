@@ -18,6 +18,16 @@ from agent8088 import engine as A
 URL = "https://example.com/app"
 
 
+def test_mixed_xml_search_arguments_from_live_web_session():
+    text = ('\u273fFUNCTION\u273f: web_search \u273fARGS<arg_value>: '
+            '{"query": "Saturday Premier League scores"}</arg_value></tool_call>')
+    calls = A.find_tool_calls(text, {"web_search"})
+    assert calls == [{"name": "web_search", "arguments": {
+        "query": "Saturday Premier League scores"}}]
+    from agent8088.web_server import scrub_markup
+    assert not scrub_markup(text).strip()
+
+
 def _args(text, allowed={"browse_page"}):
     calls = A.find_tool_calls(text, allowed)
     assert calls, f"no tool call parsed from:\n{text}"

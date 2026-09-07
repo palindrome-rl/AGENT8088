@@ -275,7 +275,7 @@ def _write_trace_export(path):
 
 def _default_trace_path():
     trace_dir = Path(os.environ.get(
-        "AGENT8088_TRACE_DIR", str(Path.home() / "Documents" / "agent8088" / "traces")
+        "AGENT8088_TRACE_DIR", str(_default_agent8088_trace_dir())
     )).expanduser()
     stamp = time.strftime("%Y%m%d-%H%M%S")
     return trace_dir / f"agent8088-trace-{stamp}-{time.time_ns() % 1_000_000:06d}.json"
@@ -307,10 +307,19 @@ def _record_trace(query, trace, elapsed, interrupted=False):
             S.trace_path = ""
 
 
+# A session name becomes a filename, so it needs a length bound as well as a
+# charset one: a name that passed the charset check went straight to open() and
+# raised OSError ENAMETOOLONG (a bare HTTP 500 over the web bridge).
+SESSION_NAME_MAX = 64
+
+
 def _session_name(raw):
     name = (raw or "").strip().lower()
     if not name or not all(ch.isalnum() or ch in "_-" for ch in name):
         raise ValueError("session names use letters, numbers, _ or -")
+    if len(name) > SESSION_NAME_MAX:
+        raise ValueError(f"session names are at most {SESSION_NAME_MAX} characters "
+                         f"(got {len(name)})")
     return name
 
 
@@ -5177,6 +5186,17 @@ def _remove_agent8088_crontab_entries():
 
 
 def _default_agent8088_trace_dir():
+    """Where /trace writes when AGENT8088_TRACE_DIR is not set.
+
+    An explicit AGENT8088_HOME means the caller has asked for an isolated
+    profile, so traces belong inside it - writing them to ~/Documents anyway
+    leaked diagnostic output out of the sandbox and broke test isolation.
+    Without AGENT8088_HOME the historical location is kept, so existing installs
+    (and the uninstaller, which only removes the compiled-in default) are
+    unaffected.
+    """
+    if os.environ.get("AGENT8088_HOME"):
+        return A._agent_data_dir() / "traces"
     return Path.home() / "Documents" / "agent8088" / "traces"
 
 

@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
-  FolderOpen, Folder, FileText, Image as ImageIcon, Loader2, AlertCircle,
+  FolderOpen, Folder, FileText, Image as ImageIcon, Loader2,
   ChevronRight, Download, FileCode,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { ArtifactItem, ArtifactsListing } from '@/types/api'
+import { apiFetch } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 /* ─────────────────────────────────────────────────────────
  * ARTIFACTS — browse the agent's artifacts/ folder
@@ -14,18 +16,16 @@ import type { ArtifactItem, ArtifactsListing } from '@/types/api'
  * ───────────────────────────────────────────────────────── */
 
 async function fetchArtifacts(rel: string): Promise<ArtifactsListing> {
-  const res = await fetch(`/api/artifacts?rel=${encodeURIComponent(rel)}`)
-  if (!res.ok) throw new Error(`Failed to load artifacts (${res.status})`)
-  const data = await res.json() as ArtifactsListing & { error?: string }
-  if (data.error) throw new Error(data.error)
+  const data = await apiFetch<ArtifactsListing & { error?: string }>(
+    `/api/artifacts?rel=${encodeURIComponent(rel)}`, { action: 'load artifacts' })
+  if (data?.error) throw new Error(data.error)
   return data
 }
 
 async function fetchContent(rel: string): Promise<string> {
-  const res = await fetch(`/api/artifacts/content?rel=${encodeURIComponent(rel)}`)
-  if (!res.ok) throw new Error(`Failed to load preview (${res.status})`)
-  const data = await res.json() as { content?: string; error?: string }
-  if (data.error) throw new Error(data.error)
+  const data = await apiFetch<{ content?: string; error?: string }>(
+    `/api/artifacts/content?rel=${encodeURIComponent(rel)}`, { action: 'load that preview' })
+  if (data?.error) throw new Error(data.error)
   return data.content ?? ''
 }
 
@@ -233,7 +233,7 @@ export default function ArtifactsPage() {
   const [tab, setTab] = useState<TypeTab>('all')
   const [previewPath, setPreviewPath] = useState<string | null>(null)
 
-  const { data, isLoading, isError, error } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['artifacts', cwd],
     queryFn: () => fetchArtifacts(cwd),
   })
@@ -307,7 +307,10 @@ export default function ArtifactsPage() {
               )}
             >
               {label}
-              <span className="text-[11px] text-zinc-600">{count}</span>
+              {/* A count is only meaningful when the listing actually loaded.
+                  Rendering "0" next to a load error read as "there are no
+                  artifacts", which is a different and wrong statement. */}
+              <span className="text-[11px] text-zinc-600">{isError ? '—' : count}</span>
             </button>
           )
         })}
@@ -319,11 +322,7 @@ export default function ArtifactsPage() {
           <Loader2 className="h-6 w-6 animate-spin text-brand-cyan" />
         </div>
       )}
-      {isError && (
-        <div className="flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-400">
-          <AlertCircle className="h-4 w-4 shrink-0" /> {(error as Error)?.message ?? 'Failed to load artifacts.'}
-        </div>
-      )}
+      {isError && <ErrorCard error={error} action="load artifacts" onRetry={() => void refetch()} />}
       {!isLoading && !isError && items.length === 0 && (
         <div className="py-20 text-center">
           <FolderOpen className="mx-auto mb-3 h-10 w-10 text-zinc-700" />
