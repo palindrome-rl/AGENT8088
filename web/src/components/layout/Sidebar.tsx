@@ -2,7 +2,7 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
   FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
-  PanelLeftClose, PanelLeftOpen, Sun, Moon, Search, X, Plus,
+  PanelLeftClose, PanelLeftOpen, Sun, Moon, Search, X, Plus, MoreHorizontal, Pencil, Trash2,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { useUIStore } from '@/stores/ui'
@@ -44,6 +44,8 @@ export function Sidebar() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [resuming, setResuming] = useState<string | null>(null)
+  const [sessionAction, setSessionAction] = useState<string | null>(null)
+  const [sessionMenu, setSessionMenu] = useState<string | null>(null)
   const [sessionError, setSessionError] = useState('')
   const searchRef = useRef<HTMLInputElement>(null)
 
@@ -91,6 +93,22 @@ export function Sidebar() {
     }
   }, [settingsOpen])
 
+  useEffect(() => {
+    if (!sessionMenu) return
+    const closeMenu = (event: PointerEvent) => {
+      if (!(event.target as Element)?.closest('[data-session-menu]')) setSessionMenu(null)
+    }
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSessionMenu(null)
+    }
+    document.addEventListener('pointerdown', closeMenu)
+    document.addEventListener('keydown', handleEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeMenu)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [sessionMenu])
+
   const handleNewChat = async () => {
     if (isStreaming) return
     setSessionError('')
@@ -133,6 +151,53 @@ export function Sidebar() {
       setSessionError(error instanceof Error ? error.message : 'Could not resume session')
     } finally {
       setResuming(null)
+    }
+  }
+
+  const handleRename = async (name: string) => {
+    setSessionMenu(null)
+    const newName = window.prompt('Rename session', name)?.trim()
+    if (!newName || newName === name) return
+    setSessionAction(name)
+    setSessionError('')
+    try {
+      const result = await apiFetch<{ error?: string; name?: string }>(`/api/sessions/${encodeURIComponent(name)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_name: newName }),
+        action: `rename ${name}`,
+      })
+      if (result.error) throw new Error(result.error)
+      if (name === useSessionStore.getState().sessionName && result.name) setSessionName(result.name)
+      await sessionsQuery.refetch()
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Could not rename session')
+    } finally {
+      setSessionAction(null)
+    }
+  }
+
+  const handleDelete = async (name: string) => {
+    setSessionMenu(null)
+    if (!window.confirm(`Delete session “${name}”? Its saved messages will be permanently removed.`)) return
+    setSessionAction(name)
+    setSessionError('')
+    try {
+      const result = await apiFetch<{ error?: string; active?: boolean }>(`/api/sessions/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+        action: `delete ${name}`,
+      })
+      if (result.error) throw new Error(result.error)
+      if (result.active) {
+        clearChat()
+        setSessionName('')
+        navigate('/')
+      }
+      await sessionsQuery.refetch()
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Could not delete session')
+    } finally {
+      setSessionAction(null)
     }
   }
 
@@ -305,23 +370,60 @@ export function Sidebar() {
                   <div className="px-2 py-1.5 text-[11px] text-red-500 dark:text-red-400">{sessionError}</div>
                 )}
                 {filteredSessions.map((session) => (
-                  <button
+                  <div
                     key={session.name}
-                    type="button"
-                    disabled={session.active || isStreaming || resuming !== null}
-                    onClick={() => handleResume(session.name)}
+                    data-session-menu
                     className={cn(
-                      'group flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[12.5px] transition-colors',
+                      'group relative flex h-8 w-full items-center gap-1 rounded-lg px-2 text-left text-[12.5px] transition-colors',
                       session.active
                         ? 'bg-brand-primary/10 text-brand-cyan'
                         : 'text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800/40 hover:text-zinc-900 dark:hover:text-zinc-200',
                     )}
-                    title={session.active ? 'Active session' : `Resume ${session.name}`}
                   >
-                    <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', session.active ? 'bg-brand-cyan' : 'bg-zinc-400 dark:bg-zinc-600')} />
-                    <span className="min-w-0 flex-1 truncate">{session.name}</span>
-                    {resuming === session.name && <span className="text-[10px] text-brand-cyan">…</span>}
-                  </button>
+                    <button
+                      type="button"
+                      disabled={session.active || isStreaming || resuming !== null || sessionAction !== null}
+                      onClick={() => handleResume(session.name)}
+                      className="flex min-w-0 flex-1 items-center gap-2 truncate text-left disabled:cursor-default"
+                      title={session.active ? 'Active session' : `Resume ${session.name}`}
+                    >
+                      <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', session.active ? 'bg-brand-cyan' : 'bg-zinc-400 dark:bg-zinc-600')} />
+                      <span className="min-w-0 flex-1 truncate">{session.name}</span>
+                      {resuming === session.name && <span className="text-[10px] text-brand-cyan">…</span>}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`Session actions for ${session.name}`}
+                      aria-expanded={sessionMenu === session.name}
+                      onClick={() => setSessionMenu((open) => open === session.name ? null : session.name)}
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-zinc-500 opacity-0 transition-colors hover:bg-zinc-200 hover:text-zinc-800 focus-visible:opacity-100 focus-visible:outline-none dark:hover:bg-zinc-800 dark:hover:text-zinc-200 sm:group-hover:opacity-100"
+                      title="Session actions"
+                    >
+                      <MoreHorizontal className="h-4 w-4" />
+                    </button>
+                    {sessionMenu === session.name && (
+                      <div role="menu" aria-label={`Actions for ${session.name}`} className="absolute right-1 top-7 z-30 w-32 rounded-lg border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          disabled={isStreaming || resuming !== null || sessionAction !== null}
+                          onClick={() => void handleRename(session.name)}
+                          className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-zinc-600 hover:bg-zinc-100 hover:text-brand-cyan dark:text-zinc-300 dark:hover:bg-zinc-800"
+                        >
+                          <Pencil className="h-3.5 w-3.5" /> Rename
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          disabled={isStreaming || resuming !== null || sessionAction !== null}
+                          onClick={() => void handleDelete(session.name)}
+                          className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-zinc-600 hover:bg-zinc-100 hover:text-red-400 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" /> Delete
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 ))}
               </div>
             </>
