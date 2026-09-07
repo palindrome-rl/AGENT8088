@@ -47,15 +47,12 @@ export function PromptBar() {
   const [showImageUpload, setShowImageUpload] = useState(false)
   const [pasteImage, setPasteImage] = useState<string | null>(null)
   const [listening, setListening] = useState(false)
-  const [expanded, setExpanded] = useState(false)
   const [sessionError, setSessionError] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [modeOpen, setModeOpen] = useState(false)
   const [modeChanging, setModeChanging] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const measureRef = useRef<HTMLSpanElement>(null)
-  const controlsRef = useRef<HTMLDivElement>(null)
   const { isStreaming, sessionName, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult } = useSessionStore()
   const { send: wsSend } = useWebSocket()
   const { data: commands = [] } = useCommandCatalog()
@@ -84,16 +81,12 @@ export function PromptBar() {
   // Auto-grow textarea
   useEffect(() => {
     const input = inputRef.current
-    const measure = measureRef.current
-    if (!input || !measure) return
-
-    const needsExpand = text.includes('\n') || measure.offsetWidth + 8 > 300
-    if (needsExpand !== expanded) setExpanded(needsExpand)
+    if (!input) return
 
     input.style.height = '0px'
     const h = Math.min(Math.max(input.scrollHeight, 28), 100)
     input.style.height = `${h}px`
-  }, [text, expanded])
+  }, [text])
 
   // Close menus on outside click
   useEffect(() => {
@@ -350,25 +343,10 @@ export function PromptBar() {
           className={cn(
             'relative flex flex-col overflow-visible border bg-white dark:bg-zinc-900/50 transition-[border-color] duration-150',
             'border-zinc-300 dark:border-zinc-800 focus-within:border-brand-primary/40',
-            expanded ? 'rounded-[14px] p-2.5 gap-2' : 'rounded-[14px] p-1.5 gap-1.5',
+            'rounded-[14px] p-1.5 gap-1.5',
           )}
         >
-          {/* Hidden measure span for auto-grow */}
-          <span
-            ref={measureRef}
-            aria-hidden
-            className="pointer-events-none absolute invisible whitespace-pre text-[14px] leading-[20px]"
-          >
-            {text}
-          </span>
-
-          <div
-            ref={controlsRef}
-            className={cn(
-              'flex items-end gap-1.5',
-              expanded ? 'flex-col' : 'flex-row',
-            )}
-          >
+          <div className="flex items-end gap-1.5">
             {/* Plus button — attachments */}
             <button
               type="button"
@@ -424,14 +402,14 @@ export function PromptBar() {
               aria-label="Prompt"
               className={cn(
                 'prompt-textarea min-w-0 flex-1 resize-none bg-transparent text-[14px] text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:outline-none',
-                expanded ? 'w-full px-1 py-1' : 'px-1 py-1.5',
+                'px-1 py-1.5',
                 '[overflow-wrap:anywhere]',
               )}
               style={{ minHeight: '28px' }}
             />
 
             {/* Controls row */}
-            <div className={cn('flex items-center gap-1', expanded ? 'w-full justify-end' : 'shrink-0')}>
+            <div className="flex shrink-0 items-center gap-1">
               {/* Raw model call toggle */}
               <button
                 type="button"
