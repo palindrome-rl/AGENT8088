@@ -7,7 +7,6 @@ import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
 import { ImageUpload } from './ImageUpload'
-import { assertOk } from '@/lib/api'
 
 /* ─────────────────────────────────────────────────────────
  * PROMPT BAR — Beautiful UI style
@@ -15,8 +14,12 @@ import { assertOk } from '@/lib/api'
  * dictation, and send. Pop-in menus, gliding highlight.
  * ───────────────────────────────────────────────────────── */
 
-function generatedSessionName() {
-  return `chat-${Date.now()}`
+const sessionStopWords = new Set(['a', 'an', 'and', 'are', 'for', 'from', 'how', 'i', 'in', 'is', 'it', 'me', 'of', 'on', 'please', 'the', 'to', 'with'])
+
+function topicSessionName(text: string) {
+  const words = text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/).filter(Boolean)
+  const meaningful = words.filter((word) => !sessionStopWords.has(word))
+  return (meaningful.length ? meaningful : words).slice(0, 7).join('-').slice(0, 64) || 'new-chat'
 }
 
 function parseToken(draft: string): { kind: 'at' | 'slash'; query: string; start: number } | null {
@@ -106,7 +109,7 @@ export function PromptBar() {
     return () => document.removeEventListener('pointerdown', close)
   }, [menu, plusOpen, modeOpen])
 
-  const ensureSession = async () => {
+  const ensureSession = async (topic = '') => {
     if (sessionName) return
 
     const statusResponse = await fetch('/api/status')
@@ -117,22 +120,27 @@ export function PromptBar() {
       return
     }
 
-    const name = generatedSessionName()
-    const response = await fetch('/api/sessions/new', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    })
-    await assertOk(response, 'create a session')
-    const result = await response.json() as { error?: string; name?: string }
-    if (result.error) throw new Error(result.error)
-    setSessionName(result.name || name)
-    void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+    const baseName = topicSessionName(topic)
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const name = attempt === 0 ? baseName : `${baseName}-${attempt + 1}`
+      const response = await fetch('/api/sessions/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      const result = await response.json().catch(() => ({})) as { error?: string; name?: string }
+      if (response.status === 409 || result.error?.startsWith('session exists:')) continue
+      if (!response.ok || result.error) throw new Error(result.error ?? `Could not create session (${response.status})`)
+      setSessionName(result.name || name)
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+      return
+    }
+    throw new Error('Could not create a unique session name')
   }
 
   const uploadAttachment = async (attachment: Attachment) => {
     try {
-      await ensureSession()
+      await ensureSession(attachment.file.name)
       const response = await fetch('/api/attachments', {
         method: 'POST', headers: { 'X-Filename': attachment.file.name }, body: attachment.file,
       })
@@ -196,13 +204,13 @@ export function PromptBar() {
       }
       wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
     } else {
+      const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       try {
-        await ensureSession()
+        await ensureSession(message)
       } catch (error) {
         setSessionError(error instanceof Error ? error.message : 'Could not create a session')
         return
       }
-      const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       addMessage({ role: 'user', content: message })
       wsSend({ type: 'chat', text: message, attachments: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []) })
     }

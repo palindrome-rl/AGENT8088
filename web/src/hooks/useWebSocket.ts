@@ -106,6 +106,8 @@ function wireSocket(ws: WebSocket) {
         break
       case 'error':
         console.error('Agent error:', data.message)
+        setApprovalPending(null)
+        setPlanApprovalPending(null)
         addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}` })
         setStreaming(false)
         resetStreaming()
@@ -244,15 +246,19 @@ export function useWebSocket() {
   const queryClient = useQueryClient()
   _queryClient = queryClient
 
-  const send = useCallback((msg: WSClientMessage) => {
+  const send = useCallback((msg: WSClientMessage): boolean => {
     if (msg.type === 'chat') {
       useSessionStore.getState().resetStreaming()
       useSessionStore.getState().setActivity('Working')
       useSessionStore.getState().setStreaming(true)
     }
     if (sharedWs && sharedWs.readyState === WebSocket.OPEN) {
-      sharedWs.send(JSON.stringify(msg))
-      return
+      try {
+        sharedWs.send(JSON.stringify(msg))
+        return true
+      } catch {
+        return false
+      }
     }
     // Queue it and say so, rather than returning silently - a dropped message
     // used to leave the composer spinning on a turn that was never sent.
@@ -261,7 +267,7 @@ export function useWebSocket() {
     const store = useSessionStore.getState()
     if (msg.type === 'interrupt') {
       store.setStreaming(false)
-      return
+      return false
     }
     outbox.push(msg)
     store.setStreaming(false)
@@ -270,6 +276,7 @@ export function useWebSocket() {
       + 'as soon as the connection is back.',
     )
     ensureConnection()
+    return false
   }, [])
 
   useEffect(() => {

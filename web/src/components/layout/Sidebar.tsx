@@ -38,7 +38,7 @@ const SIDEBAR_COLLAPSED = 52
 
 export function Sidebar() {
   const { sidebarCollapsed, toggleSidebar, theme, toggleTheme } = useUIStore()
-  const { clearChat, setMessages, setSessionName } = useSessionStore()
+  const { clearChat, setMessages, setSessionName, isStreaming } = useSessionStore()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
@@ -92,16 +92,21 @@ export function Sidebar() {
   }, [settingsOpen])
 
   const handleNewChat = async () => {
-    if (useSessionStore.getState().isStreaming) return
-    const name = `chat-${crypto.randomUUID()}`
+    if (isStreaming) return
+    setSessionError('')
     try {
-      await apiFetch('/api/sessions/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }), action: 'create a new session' })
+      await apiFetch('/api/sessions/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: '' }),
+        action: 'start a new chat',
+      })
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : 'Could not reset session')
       return
     }
     clearChat()
-    setSessionName(name)
+    setSessionName('')
     setSettingsOpen(false)
     await sessionsQuery.refetch()
     navigate('/')
@@ -203,6 +208,8 @@ export function Sidebar() {
           <button
             type="button"
             onClick={handleNewChat}
+            disabled={isStreaming}
+            title={isStreaming ? 'Finish the current turn before starting a new chat' : 'Start a new chat'}
             className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/40 active:scale-[0.98]"
           >
             <Plus className="h-4 w-4 shrink-0 text-zinc-500 dark:text-zinc-400" />
@@ -301,7 +308,7 @@ export function Sidebar() {
                   <button
                     key={session.name}
                     type="button"
-                    disabled={session.active || resuming !== null}
+                    disabled={session.active || isStreaming || resuming !== null}
                     onClick={() => handleResume(session.name)}
                     className={cn(
                       'group flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[12.5px] transition-colors',

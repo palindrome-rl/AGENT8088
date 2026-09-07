@@ -858,10 +858,76 @@ class SessionActionBody(BaseModel):
     name: str = ""
     keep: int = 6
 
+class SessionRenameBody(BaseModel):
+    new_name: str
+
+@app.patch("/api/sessions/{name}")
+async def rename_session(name: str, body: SessionRenameBody):
+    """Rename a saved session without changing its transcript."""
+    C = _cl()
+    try:
+        old_name = C._session_name(name)
+        new_name = C._session_name(body.new_name)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    old_path = C._session_path(old_name)
+    new_path = C._session_path(new_name)
+    if not old_path.exists():
+        return {"error": f"session not found: {old_name}"}
+    if old_name != new_name and new_path.exists():
+        return {"error": f"session exists: {new_name} (use another name)"}
+    if old_name == new_name:
+        return {"ok": True, "name": new_name}
+    active = C.S.name == old_name
+    try:
+        old_path.rename(new_path)
+        if active:
+            C.S.name = new_name
+            C._save_active_session()
+        else:
+            data = json.loads(new_path.read_text(encoding="utf-8"))
+            data["name"] = new_name
+            C._write_private_text(new_path, json.dumps(data, indent=2))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"error": f"could not rename session: {exc}"}
+    return {"ok": True, "name": new_name}
+
+@app.delete("/api/sessions/{name}")
+async def delete_session(name: str):
+    """Delete a saved session and clear it if it is active."""
+    C = _cl()
+    try:
+        safe_name = C._session_name(name)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    path = C._session_path(safe_name)
+    if not path.exists():
+        return {"error": f"session not found: {safe_name}"}
+    active = C.S.name == safe_name
+    try:
+        path.unlink()
+    except OSError as exc:
+        return {"error": f"could not delete session: {exc}"}
+    if active:
+        C.S.messages.clear()
+        C.S.last_trace = None
+        C.S.conversation_trace.clear()
+        C.S.trace_path = ""
+        C.S.last_usage = None
+        C.S.name = ""
+    return {"ok": True, "name": safe_name, "active": active}
+
 @app.post("/api/sessions/new")
 async def new_session(body: SessionActionBody):
-    """Create a new named session."""
+    """Create a named session, or start an unnamed draft when name is blank."""
     C = _cl()
+    if not body.name.strip():
+        C._save_active_session()
+        C.S.messages.clear()
+        C.S.last_trace = None
+        C.S.last_usage = None
+        C.S.name = ""
+        return {"ok": True, "name": ""}
     try:
         safe_name = C._session_name(body.name)
     except ValueError as exc:
