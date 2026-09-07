@@ -75,12 +75,13 @@ def scrub_markup(text: str) -> str:
     session history and model context stay raw)."""
     if not text:
         return text
+    text = re.sub(r"\u273fARGS(?:</arg_key>\s*)?<arg_value>\s*:?", "\u273fARGS\u273f: ", text)
     text = _FUNC_BLOCK_RE.sub("", text)
     text = _BARE_BLOCK_RE.sub("", text)
     text = _THINK_RE.sub("", text)
     text = _MASK_RE.sub("", text)
     text = _FRAG_RE.sub("", text)
-    return text.replace(_FLOWER, "")
+    return re.sub(r"</?(?:arg_value|arg_key|tool_call)>", "", text.replace(_FLOWER, ""))
 
 
 class _StreamScrubber:

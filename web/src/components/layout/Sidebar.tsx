@@ -92,6 +92,7 @@ export function Sidebar() {
   }, [settingsOpen])
 
   const handleNewChat = async () => {
+    if (isStreaming) return
     setSessionError('')
     try {
       await apiFetch('/api/sessions/new', {
