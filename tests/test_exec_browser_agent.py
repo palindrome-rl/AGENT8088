@@ -205,10 +205,11 @@ def fake_browser_use(monkeypatch):
         return types.SimpleNamespace(**kwargs)
 
     def fake_build_browser_chat_model(client, model_name, budget=None, max_tokens=None,
-                                      extra_body=None):
+                                      extra_body=None, structured_output_mode="auto"):
         llm_calls.append({"client": client, "model_name": model_name,
                           "budget": budget, "max_tokens": max_tokens,
-                          "extra_body": extra_body})
+                          "extra_body": extra_body,
+                          "structured_output_mode": structured_output_mode})
         return object()
 
     monkeypatch.setattr(browser_use, "Agent", _FakeAgent)
@@ -471,6 +472,22 @@ def test_the_agent_is_built_without_vision_thinking_or_the_judge(fake_browser_us
     assert kwargs["max_actions_per_step"] == A.BROWSER_MAX_ACTIONS_PER_STEP
     assert "current browser state" in kwargs["extend_system_message"]
     assert kwargs["use_judge"] is False
+
+
+def test_flash_mode_is_off_by_default_and_wired_through_when_enabled(
+        fake_browser_use, monkeypatch):
+    """browser_flash_mode=1 swaps browser-use's ~22KB system prompt for a
+    ~2.4KB one and strips thinking/evaluation/plan fields from the output
+    schema - 2-4x faster per-step LLM calls on a small model, at the cost of
+    the reasoning scaffolding small models lean on. So: off by default, and
+    the constructor kwarg must track the config."""
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    assert fake_browser_use.agents[0].kwargs["flash_mode"] is False
+
+    monkeypatch.setattr(A, "BROWSER_FLASH_MODE", True)
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    # The fixture accumulates agents across runs; the second run's agent is last.
+    assert fake_browser_use.agents[-1].kwargs["flash_mode"] is True
 
 
 # --- browser_max_actions_per_step --------------------------------------------

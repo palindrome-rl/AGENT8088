@@ -3998,6 +3998,14 @@ BROWSER_STRUCTURED_OUTPUT_MODE = (
     or "auto")
 if BROWSER_STRUCTURED_OUTPUT_MODE not in ("auto", "json_object"):
     BROWSER_STRUCTURED_OUTPUT_MODE = "auto"
+# browser-use flash mode: a ~2.4KB system prompt instead of ~22KB (measured),
+# and an output schema stripped of thinking/evaluation/plan fields - so both
+# prefill AND decode shrink every step (est. 2-4x per-step LLM latency on a
+# small model). Off by default: small models also lose the reasoning
+# scaffolding those fields provide, so it trades reliability for speed and
+# must be A/B'd per model before enabling.
+BROWSER_FLASH_MODE = APP_CONFIG.get("browser_flash_mode", "0").strip().lower() in (
+    "1", "true", "yes", "on")
 
 # Where a browse has gone, captured from the SSRF proxy's on_visit hook. The
 # proxy is the one place that sees every request a browse makes (browser-use has
@@ -4579,6 +4587,13 @@ async def _run_browser_agent(url: str, task: str,
             # model can call on its own and hit the same failure, so the choice
             # stays explicit - fully off, or fully on for a model that can see.
             use_vision=_browser_screenshots(),
+            # browser-use flash mode (browser_flash_mode=1): ~2.4KB system
+            # prompt instead of ~22KB, and an output schema with no
+            # thinking/evaluation/plan fields - both prefill and decode
+            # shrink every step. It also forces use_thinking off and removes
+            # the per-step evaluation fields small models lean on, so it is
+            # opt-in and should be A/B'd per model before enabling.
+            flash_mode=BROWSER_FLASH_MODE,
             # A free-form thinking field can consume a small model's entire
             # output budget before it emits a browser action.
             use_thinking=False,
