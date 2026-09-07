@@ -3987,6 +3987,17 @@ BROWSER_SCREENSHOTS = APP_CONFIG.get("browser_screenshots", "0").strip().lower()
 # fast, cheap failure instead. Raise it only for a model that spends much of
 # its output on visible reasoning before the action JSON.
 BROWSER_LLM_MAX_TOKENS = _int_config("browser_llm_max_tokens", 4096)
+# How the browsing model's structured (action-JSON) calls request their
+# format. "auto" (default): json_schema first, json_object fallback for
+# providers that ignore it. "json_object": skip the first attempt entirely -
+# for a provider known to ignore response_format=json_schema (observed:
+# Ollama Cloud serving GLM), "auto" pays one full LLM round-trip per step to
+# rediscover that, then re-sends everything. Anything unrecognized is "auto".
+BROWSER_STRUCTURED_OUTPUT_MODE = (
+    str(APP_CONFIG.get("browser_structured_output_mode", "auto")).strip().lower()
+    or "auto")
+if BROWSER_STRUCTURED_OUTPUT_MODE not in ("auto", "json_object"):
+    BROWSER_STRUCTURED_OUTPUT_MODE = "auto"
 
 # Where a browse has gone, captured from the SSRF proxy's on_visit hook. The
 # proxy is the one place that sees every request a browse makes (browser-use has
@@ -4546,7 +4557,8 @@ async def _run_browser_agent(url: str, task: str,
         llm = build_browser_chat_model(
             client, MODEL_NAME, budget=_active_budget,
             max_tokens=BROWSER_LLM_MAX_TOKENS,
-            extra_body=_browser_llm_extra_body())
+            extra_body=_browser_llm_extra_body(),
+            structured_output_mode=BROWSER_STRUCTURED_OUTPUT_MODE)
         profile = BrowserProfile(
             user_data_dir=user_data_dir, executable_path=executable_path,
             **_browser_profile_kwargs(proxy_url))

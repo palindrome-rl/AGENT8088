@@ -150,12 +150,31 @@ def _parse_structured_output(output_format, content: str):
 class Agent8088ChatModel(ChatLiteLLM):
     budget: Optional[Any] = None  # duck-typed engine._TurnBudget: .exceeded() / .add_tokens()
     extra_body: Optional[dict] = None
+    # "auto" (default): try json_schema first, fall back to json_object on the
+    # provider errors that mean "schema ignored". "json_object": skip the
+    # first attempt entirely and go straight to the fallback - for a provider
+    # known to ignore response_format=json_schema (observed: Ollama Cloud
+    # serving GLM), "auto" pays one full LLM round-trip per step to rediscover
+    # that, then re-sends the whole request. The fallback path handles both.
+    structured_output_mode: str = "auto"
 
     async def ainvoke(self, messages, output_format=None, **kwargs):
         if self.budget is not None:
             over = self.budget.exceeded()
             if over:
                 raise RuntimeError(over)
+        if output_format is not None and self.structured_output_mode == "json_object":
+            result = await self._ainvoke_json_object_fallback(
+                messages, output_format, **kwargs)
+        else:
+            result = await self._ainvoke_auto(messages, output_format, **kwargs)
+        if self.budget is not None and result.usage is not None:
+            self.budget.add_tokens(result.usage.prompt_tokens, result.usage.completion_tokens)
+        return result
+
+    async def _ainvoke_auto(self, messages, output_format, **kwargs):
+        """The default path: json_schema first, with the json_object fallback
+        wired to exactly the provider failures it can actually fix."""
         try:
             result = (await self._ainvoke_with_extra_body(messages, output_format)
                       if self.extra_body else
@@ -187,8 +206,6 @@ class Agent8088ChatModel(ChatLiteLLM):
                 raise
             result = await self._ainvoke_json_object_fallback(
                 messages, output_format, **kwargs)
-        if self.budget is not None and result.usage is not None:
-            self.budget.add_tokens(result.usage.prompt_tokens, result.usage.completion_tokens)
         return result
 
     async def _ainvoke_with_extra_body(self, messages, output_format):
@@ -279,6 +296,7 @@ class Agent8088ChatModel(ChatLiteLLM):
 def build_browser_chat_model(
     client, model_name: str, budget=None, max_tokens: Optional[int] = None,
     extra_body: Optional[dict] = None,
+    structured_output_mode: str = "auto",
 ) -> Agent8088ChatModel:
     """Build a browser-use chat model that targets the exact same
     provider/model engine.py's main loop is already configured for.
@@ -297,8 +315,15 @@ def build_browser_chat_model(
     of 4096, a model that spends much of its budget on the "thinking" field
     before writing the actual action can get cut off mid-response, which
     browser-use reports as "Model returned empty action" and retries the
-    whole step - a silent, avoidable source of wasted round-trips."""
-    kwargs = {"budget": budget, "extra_body": extra_body}
+    whole step - a silent, avoidable source of wasted round-trips.
+
+    `structured_output_mode` mirrors engine's browser_structured_output_mode
+    config: "auto" tries json_schema first and falls back to json_object on
+    the provider failures that mean "schema ignored"; "json_object" skips
+    the doomed first attempt for providers known to ignore
+    response_format=json_schema."""
+    kwargs = {"budget": budget, "extra_body": extra_body,
+              "structured_output_mode": structured_output_mode}
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
     if isinstance(client, dict) and client.get("api_mode") == "litellm":

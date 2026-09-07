@@ -145,6 +145,43 @@ class _Output(BaseModel):
     answer: str
 
 
+@pytest.mark.asyncio
+async def test_json_object_mode_skips_the_schema_attempt_entirely(monkeypatch):
+    """structured_output_mode='json_object' must go straight to the fallback
+    path (json_object response_format + schema instruction) without paying
+    one full doomed json_schema LLM round-trip first. The fallback is what
+    'auto' mode only reaches after the first attempt fails."""
+    model = Agent8088ChatModel(model="openai/gpt-4o",
+                               structured_output_mode="json_object")
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"thinking": "", "answer": "ok"}',
+                reasoning_content=None),
+                finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    async def fail_super_ainvoke(self, messages, output_format=None, **kwargs):
+        raise AssertionError("json_object mode must not reach the json_schema path")
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fail_super_ainvoke,
+        raising=True)
+
+    result = await model.ainvoke([], output_format=_Output)
+
+    assert result.completion.answer == "ok"
+    assert len(calls) == 1
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    # The schema instruction rides in the system message, not a second call.
+    assert "JSON object matching this schema" in calls[0]["messages"][0]["content"]
+
+
 class _Action(BaseModel):
     wait: int
 
