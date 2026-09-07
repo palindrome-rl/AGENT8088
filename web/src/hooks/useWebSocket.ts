@@ -99,10 +99,12 @@ function wireSocket(ws: WebSocket) {
         addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
         setStreaming(false)
         resetStreaming()
+        drainPromptQueue()
         break
       case 'interrupted':
         setStreaming(false)
         resetStreaming()
+        pauseQueueIfPending()
         break
       case 'error':
         console.error('Agent error:', data.message)
@@ -111,6 +113,7 @@ function wireSocket(ws: WebSocket) {
         addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}` })
         setStreaming(false)
         resetStreaming()
+        pauseQueueIfPending()
         break
       case 'session_saved':
         if (data.name) setSessionName(data.name)
@@ -165,6 +168,8 @@ function wireSocket(ws: WebSocket) {
             data.result.trim().length > 0) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
+        // A queued command ends its turn here rather than with `answer`.
+        drainPromptQueue()
         break
     }
   }
@@ -236,6 +241,65 @@ async function syncSession(includeHistory = false) {
   }
 }
 
+/** Send one frame, or hold it in the outbox until the socket is back. */
+function sendFrame(msg: WSClientMessage): boolean {
+  if (msg.type === 'chat') {
+    useSessionStore.getState().resetStreaming()
+    useSessionStore.getState().setActivity('Working')
+    useSessionStore.getState().setStreaming(true)
+  }
+  if (sharedWs && sharedWs.readyState === WebSocket.OPEN) {
+    try {
+      sharedWs.send(JSON.stringify(msg))
+      return true
+    } catch {
+      return false
+    }
+  }
+  // Queue it and say so, rather than returning silently - a dropped message
+  // used to leave the composer spinning on a turn that was never sent.
+  // `interrupt` is deliberately not queued: stopping a turn that no longer
+  // exists is meaningless, and replaying it would cancel the next one.
+  const store = useSessionStore.getState()
+  if (msg.type === 'interrupt') {
+    store.setStreaming(false)
+    return false
+  }
+  outbox.push(msg)
+  store.setStreaming(false)
+  store.setSendFailure(
+    'Not connected to Agent8088 — this message is queued and will be sent '
+    + 'as soon as the connection is back.',
+  )
+  ensureConnection()
+  return false
+}
+
+/** Dispatch the head of the prompt queue. Called when a turn ends, and by
+ *  Resume. One prompt per turn: the backend refuses concurrent turns. */
+export function drainPromptQueue() {
+  const store = useSessionStore.getState()
+  if (store.queuePaused) return
+  const next = store.promptQueue[0]
+  if (!next) return
+  store.removeQueuedPrompt(next.id)
+  if (next.kind === 'command') {
+    const [command, ...rest] = next.text.replace(/^\//, '').split(' ')
+    sendFrame({ type: 'command', command, args: rest.join(' ') })
+    return
+  }
+  // The transcript echo happens here rather than at enqueue time, so a queued
+  // prompt does not appear to have been asked before it actually runs.
+  store.addMessage({ role: 'user', content: next.text })
+  sendFrame({ type: 'chat', text: next.text, attachments: next.attachmentIds })
+}
+
+/** A turn that stopped or failed holds the queue for the user to look at. */
+function pauseQueueIfPending() {
+  const store = useSessionStore.getState()
+  if (store.promptQueue.length) store.setQueuePaused(true)
+}
+
 // Late-bound to avoid a circular import at module load.
 let _queryClient: ReturnType<typeof useQueryClient> | null = null
 function useQueryClientHelper() {
@@ -246,38 +310,7 @@ export function useWebSocket() {
   const queryClient = useQueryClient()
   _queryClient = queryClient
 
-  const send = useCallback((msg: WSClientMessage): boolean => {
-    if (msg.type === 'chat') {
-      useSessionStore.getState().resetStreaming()
-      useSessionStore.getState().setActivity('Working')
-      useSessionStore.getState().setStreaming(true)
-    }
-    if (sharedWs && sharedWs.readyState === WebSocket.OPEN) {
-      try {
-        sharedWs.send(JSON.stringify(msg))
-        return true
-      } catch {
-        return false
-      }
-    }
-    // Queue it and say so, rather than returning silently - a dropped message
-    // used to leave the composer spinning on a turn that was never sent.
-    // `interrupt` is deliberately not queued: stopping a turn that no longer
-    // exists is meaningless, and replaying it would cancel the next one.
-    const store = useSessionStore.getState()
-    if (msg.type === 'interrupt') {
-      store.setStreaming(false)
-      return false
-    }
-    outbox.push(msg)
-    store.setStreaming(false)
-    store.setSendFailure(
-      'Not connected to Agent8088 — this message is queued and will be sent '
-      + 'as soon as the connection is back.',
-    )
-    ensureConnection()
-    return false
-  }, [])
+  const send = useCallback(sendFrame, [])
 
   useEffect(() => {
     consumers += 1
