@@ -20,7 +20,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("agent8088.web")
@@ -215,6 +215,43 @@ app.add_middleware(
 
 # === REST endpoints ===
 
+# --- Error contract ------------------------------------------------------
+# Every failure leaves this bridge as a real HTTP status with an {"error": ...}
+# body. The status is what generic clients, proxies and retry logic read; the
+# body keeps the human-readable message the UI shows. Returning 200 for a
+# failure (as this module used to) made every caller that checks response.ok
+# treat errors as success - the Schedules page rendered a 500 as "No scheduled
+# tasks." for exactly that reason.
+
+def _error(message: str, status: int = 400, **extra) -> JSONResponse:
+    """A failed response: real status code, {"error": message} body."""
+    payload = {"error": str(message)}
+    payload.update(extra)
+    return JSONResponse(payload, status_code=status)
+
+
+# An agent turn is bounded by max_turns; anything past this is a runaway loop,
+# and a negative value silently disabled the loop entirely.
+_MAX_TURNS_CEILING = 200
+
+
+def _active_base_url(A) -> str:
+    """Base URL of the provider actually in use, falling back to the module default."""
+    active = ""
+    if (C := _cl()) is not None:
+        active = C._active_provider_name() or ""
+    provider = A.PROVIDERS.get(active or A.DEFAULT_PROVIDER, {})
+    return provider.get("base_url") or A.MODEL_BASE_URL
+
+
+def _exc_error(exc: BaseException, status: int | None = None) -> JSONResponse:
+    """Map an exception to a status: bad input is the caller's fault (400),
+    anything else is ours (500)."""
+    if status is None:
+        status = 400 if isinstance(exc, (ValueError, TypeError, KeyError)) else 500
+    return _error(str(exc), status)
+
+
 @app.get("/api/status")
 async def get_status():
     """Current session/engine status."""
@@ -276,9 +313,20 @@ async def invoke_tool(name: str, body: dict = None):
     """Execute a single tool directly (parity with /tool <name> <args>)."""
     A = _eng()
     args = body or {}
+    if not isinstance(args, dict):
+        return _error("tool arguments must be a JSON object", 400)
     # run_tool can take minutes (shell, docker, browser) — keep it off the loop.
-    result = await asyncio.get_running_loop().run_in_executor(
-        None, lambda: A.run_tool(name, args))
+    # It also *raises* for ordinary outcomes (missing file, denied path), which
+    # used to escape as a bare non-JSON HTTP 500 and destroy the real message -
+    # the CLI prints it. Surface it the same way here.
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: A.run_tool(name, args))
+    except (ValueError, OSError) as exc:
+        return {"name": name, "result": f"Error: {exc}", "failed": True}
+    except Exception as exc:
+        log.exception("tool %s crashed", name)
+        return _exc_error(exc, 500)
     if str(result).startswith("ESCALATION_REQUEST"):
         approval_id = uuid.uuid4().hex
         _pending_direct_tools[approval_id] = {"name": name, "args": args,
@@ -293,7 +341,7 @@ async def approve_direct_tool(approval_id: str, body: dict = None):
     """Retry one approval-gated direct tool through the engine permission layer."""
     entry = _pending_direct_tools.pop(approval_id, None)
     if entry is None or time.time() - entry["created"] > 300:
-        return {"error": "approval request expired"}
+        return _error("approval request expired", 410)
     if not bool((body or {}).get("approved")):
         return {"ok": True, "cancelled": True}
     A = _eng()
@@ -303,21 +351,52 @@ async def approve_direct_tool(approval_id: str, body: dict = None):
     return {"name": entry["name"], "result": result}
 
 
+def _skill_catalog() -> list[dict]:
+    """Installed skills with metadata (lazy body load on expand)."""
+    A = _eng()
+    return [{
+        "name": name,
+        "description": pkg.get("description", ""),
+        "resources": list(pkg.get("resources", [])),
+        "enabled": name not in _cl().S.disabled_skills,
+        "category": str(pkg.get("category") or pkg.get("group") or "General"),
+    } for name, pkg in sorted(A.SKILL_PACKAGES.items())]
+
+
+def _configured_mcp_names() -> set[str]:
+    """Names of every MCP server the runtime knows about, connected or not."""
+    statuses = getattr(_eng().MCP_RUNTIME, "statuses", {}) or {}
+    return set(statuses)
+
+
+# Five space-separated fields: minute hour day-of-month month day-of-week.
+_CRON_FIELDS = 5
+
+
+def _cron_complaint(expression: str) -> str:
+    """Return why `expression` is not a usable 5-field cron string, or ""."""
+    fields = (expression or "").split()
+    if not fields:
+        return "a cron schedule is required, e.g. '0 9 * * *' for 09:00 daily"
+    if len(fields) != _CRON_FIELDS:
+        return (f"a cron schedule needs {_CRON_FIELDS} fields "
+                f"(minute hour day month weekday); got {len(fields)}")
+    for field, allowed in zip(fields, ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))):
+        for part in field.split(","):
+            part = part.split("/", 1)[0]
+            if part == "*":
+                continue
+            bounds = part.split("-")
+            if not all(b.isdigit() and allowed[0] <= int(b) <= allowed[1] for b in bounds):
+                return (f"'{field}' is not a valid cron field; use *, a number "
+                        f"{allowed[0]}-{allowed[1]}, a range, or a step")
+    return ""
+
+
 @app.get("/api/skills")
 async def get_skills():
     """Skills list with metadata (lazy body load on expand)."""
-    A = _eng()
-    skills = []
-    for name, pkg in sorted(A.SKILL_PACKAGES.items()):
-        resources = pkg.get("resources", [])
-        skills.append({
-            "name": name,
-            "description": pkg.get("description", ""),
-            "resources": [r for r in resources],
-            "enabled": name not in _cl().S.disabled_skills,
-            "category": str(pkg.get("category") or pkg.get("group") or "General"),
-        })
-    return skills
+    return _skill_catalog()
 
 
 @app.get("/api/skills/{name}/resource/{resource}")
@@ -333,6 +412,12 @@ async def toggle_skill(name: str, body: dict = None):
     """Enable/disable a skill for the current session."""
     C = _cl()
     enable = (body or {}).get("enable", True)
+    if not isinstance(enable, bool):
+        return _error("'enable' must be true or false", 400)
+    # Without this the endpoint happily "enabled" a misspelled skill and the UI
+    # confirmed an action that did nothing.
+    if name not in {skill["name"] for skill in _skill_catalog()}:
+        return _error(f"unknown skill: {name}", 404)
     if enable:
         C.S.disabled_skills.discard(name)
     else:
@@ -377,7 +462,7 @@ async def create_agent(body: dict = None):
     A = _eng()
     result = A._exec_create_subagent(body or {})
     if result.startswith("Error:"):
-        return {"error": result[6:].strip()}
+        return _error(result[6:].strip(), 400)
     A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
     return {"ok": True, "result": result}
 
@@ -389,12 +474,12 @@ async def update_agent(name: str, body: dict = None):
     A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
     profile = A.SUBAGENT_SPECS.get(name)
     if profile is None:
-        return {"error": f"unknown agent: {name}"}
+        return _error(f"unknown agent: {name}", 404)
     if profile.get("builtin"):
-        return {"error": f"'{name}' is built-in and cannot be edited"}
+        return _error(f"'{name}' is built-in and cannot be edited", 409)
     values = dict(body or {})
     if str(values.get("name", name)).strip().lower() != name:
-        return {"error": "renaming profiles is not supported"}
+        return _error("renaming profiles is not supported", 400)
     values["name"] = name
     if isinstance(values.get("tools"), list):
         values["tools"] = ",".join(str(item) for item in values["tools"])
@@ -403,7 +488,7 @@ async def update_agent(name: str, body: dict = None):
     values.setdefault("prompt", profile.get("system_prompt", ""))
     result = A.write_custom_subagent(values, allow_existing=True)
     if result.startswith("Error:"):
-        return {"error": result[6:].strip()}
+        return _error(result[6:].strip(), 400)
     A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
     return {"ok": True, "result": result}
 
@@ -415,16 +500,16 @@ async def delete_agent(name: str):
     A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
     profile = A.SUBAGENT_SPECS.get(name)
     if profile is None:
-        return {"error": f"unknown agent: {name}"}
+        return _error(f"unknown agent: {name}", 404)
     if profile.get("builtin"):
-        return {"error": f"'{name}' is built-in and cannot be deleted"}
+        return _error(f"'{name}' is built-in and cannot be deleted", 409)
     path = (A.USER_AGENTS_DIR / f"{name}.md").resolve()
     if path.parent != A.USER_AGENTS_DIR.resolve():
-        return {"error": "invalid agent name"}
+        return _error("invalid agent name", 400)
     try:
         path.unlink()
     except FileNotFoundError:
-        return {"error": f"profile not found: {name}"}
+        return _error(f"profile not found: {name}", 404)
     A.SUBAGENT_SPECS = A.load_subagent_specs(A.AGENTS_DIR, A.USER_AGENTS_DIR)
     return {"ok": True}
 
@@ -484,7 +569,7 @@ async def get_task(task_id: str):
         try:
             task = store.resolve(task_id)
         except KeyError:
-            return {"error": f"task not found: {task_id}"}
+            return _error(f"task not found: {task_id}", 404)
         return _task_view(task, store.recent_operations(task["id"]))
     finally:
         store.close()
@@ -494,7 +579,7 @@ async def get_task(task_id: str):
 async def start_task(body: dict = None):
     goal = str((body or {}).get("goal") or "").strip()
     if not goal:
-        return {"error": "A task goal is required."}
+        return _error("A task goal is required.", 400)
     store = _task_store()
     try:
         task_id = store.create(goal, _eng().PROJECT_ROOT, [{"role": "user", "content": goal}])
@@ -512,11 +597,11 @@ async def resume_task(task_id: str):
         try:
             task = store.resolve(task_id)
         except KeyError:
-            return {"error": f"task not found: {task_id}"}
+            return _error(f"task not found: {task_id}", 404)
         if task["state"] == "running":
-            return {"error": "task is already running"}
+            return _error("task is already running", 409)
         if task["state"] in {"completed", "cancelled"}:
-            return {"error": f"task is {task['state']} and cannot resume"}
+            return _error(f"task is {task['state']} and cannot resume", 409)
     finally:
         store.close()
     _start_durable_task(task["id"])
@@ -530,7 +615,7 @@ async def end_task(task_id: str):
         try:
             task = store.resolve(task_id)
         except KeyError:
-            return {"error": f"task not found: {task_id}"}
+            return _error(f"task not found: {task_id}", 404)
         return _task_view(store.cancel(task["id"]))
     finally:
         store.close()
@@ -555,7 +640,7 @@ async def set_fusion_config(body: dict = None):
     try:
         max_panel = max(1, int(body.get("max_panel", 6)))
         if len(panel) > max_panel:
-            return {"error": f"panel has {len(panel)} members; maximum is {max_panel}"}
+            return _error(f"panel has {len(panel)} members; maximum is {max_panel}", 400)
         values = {
             "fusion_panel": ",".join(panel),
             "fusion_judge_provider": str(body.get("judge_provider", "")).strip(),
@@ -565,7 +650,7 @@ async def set_fusion_config(body: dict = None):
         A.update_simple_config(A.CONFIG_PATH, values)
         A.APP_CONFIG.update({key: str(value) for key, value in values.items()})
     except (TypeError, ValueError) as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     return await get_fusion_config()
 
 
@@ -576,7 +661,7 @@ async def run_fusion(body: dict = None):
     body = body or {}
     query = str(body.get("query") or "").strip()
     if not query:
-        return {"error": "A fusion question is required."}
+        return _error("A fusion question is required.", 400)
     panel_specs = [str(item).strip() for item in body.get("panel", []) if str(item).strip()]
     try:
         panel = fusion.build_explicit_panel(panel_specs) if panel_specs else fusion.discover_panel(
@@ -596,7 +681,7 @@ async def run_fusion(body: dict = None):
             ),
         )
     except (TypeError, ValueError) as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     return {
         "query": result.query,
         "results": [{
@@ -628,7 +713,10 @@ async def get_config():
     A, C = _eng(), _cl()
     return {
         "model_name": A.MODEL_NAME,
-        "model_base_url": A.MODEL_BASE_URL,
+        # The active provider's endpoint - NOT engine.MODEL_BASE_URL, which is a
+        # module-level default that activate_model() never updates, so the
+        # Config page used to show localhost:11434 while talking to something else.
+        "model_base_url": _active_base_url(A),
         "default_provider": A.DEFAULT_PROVIDER,
         "active_provider": _cl()._active_provider_name() if _cl() else "",
         "config_path": str(A.CONFIG_PATH),
@@ -686,7 +774,7 @@ async def switch_model(body: ModelSwitchBody):
         client, model_name = A.activate_model(body.provider, body.model)
         return {"ok": True, "provider": body.provider or A.DEFAULT_PROVIDER, "model": model_name}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        return _exc_error(exc)
 
 
 class ProviderProfileBody(BaseModel):
@@ -702,20 +790,26 @@ async def configure_custom_provider(body: ProviderProfileBody, request: Request)
     """Configure an OpenAI-compatible endpoint without receiving a secret."""
     raw = await request.json()
     if any(key.lower() in {"api_key", "key", "token", "bearer"} for key in raw):
-        return {"error": "raw API keys are not accepted; set an environment variable instead"}
+        return _error("raw API keys are not accepted; set an environment variable instead", 400)
     try:
         profile = _eng().configure_provider_profile(
             body.name, body.base_url, body.model, body.api_mode, body.api_key_env)
         return {"ok": True, "provider": profile}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/models/{provider}")
 async def list_models(provider: str):
     """Fetch available models from a provider."""
     A = _eng()
-    from agent8088.providers import list_models as _list_models, FALLBACK_MODELS
+    from agent8088.providers import (list_models as _list_models, FALLBACK_MODELS,
+                                     BUILTIN_PROVIDERS)
+    # get_client() falls back to the active client for an unknown name, so this
+    # used to hand back one provider's models under another provider's label -
+    # inviting an invalid provider/model pairing in the Config picker.
+    if provider not in A.PROVIDERS and provider not in BUILTIN_PROVIDERS:
+        return _error(f"unknown provider: {provider}", 404)
     try:
         client, _ = A.get_client(provider)
         models = _list_models(provider, client)
@@ -753,10 +847,10 @@ async def get_session(name: str):
     try:
         safe_name = C._session_name(name)
     except ValueError as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     path = C._session_path(safe_name)
     if not path.exists():
-        return {"error": f"session not found: {name}"}
+        return _error(f"session not found: {name}", 404)
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -771,10 +865,10 @@ async def new_session(body: SessionActionBody):
     try:
         safe_name = C._session_name(body.name)
     except ValueError as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     path = C._session_path(safe_name)
     if path.exists():
-        return {"error": f"session exists: {safe_name} (use /resume)"}
+        return _error(f"session exists: {safe_name} (use /resume)", 409)
     C._save_active_session()
     C.S.messages.clear()
     C.S.last_trace = None
@@ -791,14 +885,14 @@ async def resume_session(body: SessionActionBody):
     try:
         safe_name = C._session_name(body.name)
     except ValueError as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     path = C._session_path(safe_name)
     if not path.exists():
-        return {"error": f"session not found: {safe_name}"}
+        return _error(f"session not found: {safe_name}", 404)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     C._save_active_session()
     messages = data.get("messages", [])
     C.S.messages[:] = messages
@@ -859,7 +953,7 @@ async def compact_session(body: SessionActionBody):
         C._save_active_session()
         return {"ok": True, "summary": summary}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/memory/search")
@@ -880,12 +974,12 @@ async def memory_add(body: MemoryAddBody):
     from agent8088.memory import store as _mem_store
     s = _mem_store()
     if s is None:
-        return {"error": "memory is not enabled"}
+        return _error("memory is not enabled", 503)
     try:
         s.add(body.text, user_id="owner", source="web-ui")
         return {"ok": True}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 @app.delete("/api/memory/{fact_id}")
 async def memory_forget(fact_id: str):
@@ -893,15 +987,15 @@ async def memory_forget(fact_id: str):
     from agent8088.memory import store as _mem_store
     s = _mem_store()
     if s is None:
-        return {"error": "memory is not enabled"}
+        return _error("memory is not enabled", 503)
     try:
         # MemoryStore.delete(memory_id) — no user_id kwarg (TypeError otherwise).
         deleted = s.delete(fact_id)
         if not deleted:
-            return {"error": f"memory not found: {fact_id}"}
+            return _error(f"memory not found: {fact_id}", 404)
         return {"ok": True}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/memory/status")
@@ -978,7 +1072,7 @@ async def use_search(body: dict = None):
     provider = str((body or {}).get("provider") or "").strip().lower()
     known = {A.web_search.AUTO, *(item.name for item in A.WEB_SEARCH_REGISTRY.all())}
     if provider not in known:
-        return {"error": f"unknown search provider: {provider}"}
+        return _error(f"unknown search provider: {provider}", 404)
     A.update_simple_config(A.CONFIG_PATH, {"web_search_provider": provider})
     A.APP_CONFIG["web_search_provider"] = provider
     return _search_status()
@@ -991,17 +1085,17 @@ async def setup_search(body: dict = None):
                 "message": "Provision a local SearXNG Docker container?"}
     A = _eng()
     if not A._docker_available():
-        return {"error": "Docker is unavailable; use the configured fallback or a remote SearXNG URL."}
+        return _error("Docker is unavailable; use the configured fallback or a remote SearXNG URL.", 503)
     from agent8088 import searxng_provision
     port = int(A.APP_CONFIG.get("searxng_port", "8080"))
     result = await asyncio.get_running_loop().run_in_executor(
         None, lambda: searxng_provision.start(A._agent_data_dir(), port=port))
     if not result.get("ok"):
-        return {"error": result.get("detail", "could not start SearXNG")}
+        return _error(result.get("detail", "could not start SearXNG"), 503)
     ready = await asyncio.get_running_loop().run_in_executor(
         None, lambda: searxng_provision.wait_ready(port=port))
     if not ready.get("ok"):
-        return {"error": ready.get("detail", "SearXNG did not become ready")}
+        return _error(ready.get("detail", "SearXNG did not become ready"), 503)
     base_url = result.get("base_url") or searxng_provision.base_url(port)
     A.update_simple_config(A.CONFIG_PATH, {"search_base_url": base_url,
                                             "web_search_provider": A.web_search.AUTO})
@@ -1031,13 +1125,22 @@ async def change_schedule(body: dict = None):
     body = body or {}
     action = str(body.get("action") or "").lower()
     if action not in {"add", "remove"}:
-        return {"error": "action must be add or remove"}
+        return _error("action must be add or remove", 400)
+    schedule = str(body.get("schedule") or "")
+    task = str(body.get("task") or "")
+    if action == "add":
+        # Validate BEFORE the confirmation round-trip: the page promises the
+        # engine's cron validation, but "not a cron" used to reach confirmation
+        # (and an empty task with it).
+        if not task.strip():
+            return _error("a task to run is required", 400)
+        if (invalid := _cron_complaint(schedule)):
+            return _error(invalid, 400)
     if not bool(body.get("confirmed")):
         return {"confirmation_required": True,
                 "message": f"{action.title()} this unattended scheduled task?"}
-    result = _eng().schedule_task(action, str(body.get("schedule") or ""),
-                                  str(body.get("task") or ""))
-    return result if result["ok"] else {"error": result["detail"]}
+    result = _eng().schedule_task(action, schedule, task)
+    return result if result["ok"] else _error(result["detail"], 400)
 
 
 @app.post("/api/mcp/reload")
@@ -1072,12 +1175,12 @@ async def mcp_add(body: McpAddBody):
         if body.project:
             args += " --project"
     else:
-        return {"error": "transport must be 'stdio' or 'http'"}
+        return _error("transport must be 'stdio' or 'http'", 400)
     try:
         C.cmd_mcp(args)
         return {"ok": True}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 class McpRemoveBody(BaseModel):
@@ -1088,14 +1191,18 @@ class McpRemoveBody(BaseModel):
 async def mcp_remove(body: McpRemoveBody):
     """Remove an MCP server."""
     C = _cl()
+    # cmd_mcp prints "server was not configured in that scope" and returns
+    # normally, so this used to answer {"ok": true} for a name that never existed.
+    if body.name not in _configured_mcp_names():
+        return _error(f"unknown MCP server: {body.name}", 404)
     args = f"remove {body.name}"
     if body.project:
         args += " --project"
     try:
         C.cmd_mcp(args)
-        return {"ok": True}
+        return {"ok": True, "name": body.name}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/sandbox")
@@ -1105,6 +1212,9 @@ async def get_sandbox():
     return A.sandbox_status()
 
 
+_SANDBOX_MODES = {"auto", "native", "docker", "local", "setup"}
+
+
 class SandboxBody(BaseModel):
     mode: str  # "auto" | "native" | "docker" | "local" | "setup"
 
@@ -1112,11 +1222,17 @@ class SandboxBody(BaseModel):
 async def set_sandbox(body: SandboxBody):
     """Configure sandbox mode."""
     C = _cl()
+    # cmd_sandbox only *prints* its complaint about an unknown mode, so without
+    # this guard the endpoint answered {"ok": true} for garbage input.
+    if body.mode not in _SANDBOX_MODES:
+        return _error(
+            f"'{body.mode}' is not a sandbox mode. "
+            f"Valid modes: {', '.join(sorted(_SANDBOX_MODES))}.", 400)
     try:
         C.cmd_sandbox(body.mode)
-        return {"ok": True}
+        return {"ok": True, "mode": body.mode}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/doctor")
@@ -1158,7 +1274,7 @@ async def doctor_fix(body: DoctorFixBody):
         C.cmd_doctor("--fix")
         return {"ok": True}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/dump")
@@ -1171,9 +1287,9 @@ async def get_dump():
         dump_path = A._agent_data_dir() / "dump.txt"
         if dump_path.exists():
             return PlainTextResponse(dump_path.read_text(encoding="utf-8"))
-        return {"error": "dump not generated"}
+        return _error("dump not generated", 500)
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/history")
@@ -1226,18 +1342,18 @@ async def upload_attachment(request: Request):
     A, C = _eng(), _cl()
     filename = str(request.headers.get("x-filename") or "").strip()
     if not filename or filename != Path(filename).name or "\\" in filename or len(filename) > 180:
-        return {"error": "invalid filename"}
+        return _error("invalid filename", 400)
     extension = Path(filename).suffix.lower()
     if extension not in _ATTACHMENT_EXTENSIONS:
-        return {"error": "unsupported attachment type"}
+        return _error("unsupported attachment type", 400)
     body = await request.body()
     if not body:
-        return {"error": "attachment is empty"}
+        return _error("attachment is empty", 400)
     if len(body) > _ATTACHMENT_MAX_BYTES:
-        return {"error": "attachment exceeds the 25MB limit"}
+        return _error("attachment exceeds the 25MB limit", 413)
     entries = _read_attachments(A, C)
     if len(entries) >= _ATTACHMENT_MAX_COUNT:
-        return {"error": f"at most {_ATTACHMENT_MAX_COUNT} attachments per session"}
+        return _error(f"at most {_ATTACHMENT_MAX_COUNT} attachments per session", 400)
     attachment_id = uuid.uuid4().hex
     target = _attachment_index(A, C).parent / f"{attachment_id}{extension}"
     target.write_bytes(body)
@@ -1252,7 +1368,7 @@ async def delete_attachment(attachment_id: str):
     entries = _read_attachments(A, C)
     metadata = entries.pop(attachment_id, None)
     if metadata is None:
-        return {"error": "attachment not found"}
+        return _error("attachment not found", 404)
     for candidate in _attachment_index(A, C).parent.glob(f"{attachment_id}.*"):
         candidate.unlink(missing_ok=True)
     _save_attachments(A, C, entries)
@@ -1302,7 +1418,7 @@ async def list_artifacts(rel: str = ""):
     A = _eng()
     target = _safe_artifact_path(A, rel)
     if target is None or not target.exists() or not target.is_dir():
-        return {"error": f"not found: {rel}"}
+        return _error(f"not found: {rel}", 404)
     base = A.ARTIFACTS_ROOT.resolve()
     items = []
     try:
@@ -1327,7 +1443,7 @@ async def list_artifacts(rel: str = ""):
                     "modified": entry.stat().st_mtime,
                 })
     except OSError as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     return {
         "root": str(base),
         "cwd": rel,
@@ -1343,7 +1459,7 @@ async def get_artifact_file(rel: str):
     A = _eng()
     target = _safe_artifact_path(A, rel)
     if target is None or not target.is_file():
-        return {"error": f"not found: {rel}"}
+        return _error(f"not found: {rel}", 404)
     media = "image/svg+xml" if target.suffix == ".svg" else None
     return FileResponse(target, filename=target.name, media_type=media)
 
@@ -1354,15 +1470,15 @@ async def get_artifact_content(rel: str):
     A = _eng()
     target = _safe_artifact_path(A, rel)
     if target is None or not target.is_file():
-        return {"error": f"not found: {rel}"}
+        return _error(f"not found: {rel}", 404)
     if target.suffix.lower() not in TEXT_EXTS:
-        return {"error": "binary file — use /api/artifacts/file"}
+        return _error("binary file — use /api/artifacts/file", 400)
     if target.stat().st_size > 1_000_000:
-        return {"error": "file too large for preview (>1MB)"}
+        return _error("file too large for preview (>1MB)", 413)
     try:
         return {"path": rel, "content": target.read_text(encoding="utf-8", errors="replace")}
     except (OSError, UnicodeDecodeError) as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 class PrefBody(BaseModel):
@@ -1379,8 +1495,12 @@ async def set_preferences(body: PrefBody):
     """Update session preferences (temp, maxturns, verbose, etc.)."""
     C = _cl()
     if body.temperature is not None:
+        if not 0.0 <= body.temperature <= 2.0:
+            return _error("temperature must be between 0.0 and 2.0", 400)
         C.S.temperature = body.temperature
     if body.max_turns is not None:
+        if not 1 <= body.max_turns <= _MAX_TURNS_CEILING:
+            return _error(f"max_turns must be between 1 and {_MAX_TURNS_CEILING}", 400)
         C.S.max_turns = body.max_turns
     if body.verbose is not None and body.verbose in {"on", "off", "full"}:
         C.S.verbose = body.verbose
@@ -1407,7 +1527,10 @@ async def set_limit(body: LimitBody):
     A, C = _eng(), _cl()
     try:
         if body.key == "max_turns":
-            old, C.S.max_turns = C.S.max_turns, int(body.value)
+            turns = int(body.value)
+            if not 1 <= turns <= _MAX_TURNS_CEILING:
+                return _error(f"max_turns must be between 1 and {_MAX_TURNS_CEILING}", 400)
+            old, C.S.max_turns = C.S.max_turns, turns
             C._save_preferences()
             return {"ok": True, "key": "max_turns", "old": old, "new": C.S.max_turns}
         if body.key == "provider":
@@ -1421,7 +1544,7 @@ async def set_limit(body: LimitBody):
             result = A.set_limit(body.key, body.value)
         return {"ok": True, **result}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 @app.get("/api/limits")
@@ -1461,6 +1584,11 @@ async def get_limits():
 class ModeBody(BaseModel):
     mode: str  # "readonly" | "full-auto" | "plan-only"
 
+# plan-only is reachable here (unlike the CLI's /mode) because the browser has
+# no separate /plan entry point - the picker is the only door into a plan session.
+_WEB_PERMISSION_MODES = {"plan-only", "readonly", "full-auto"}
+
+
 @app.post("/api/mode")
 async def set_mode(body: ModeBody):
     """Set permission mode."""
@@ -1471,7 +1599,9 @@ async def set_mode(body: ModeBody):
     if body.mode in {"readonly", "full-auto"}:
         A.set_permission_mode(body.mode)
         return {"ok": True, "mode": A.PERMISSION_MODE}
-    return {"error": "invalid permission mode"}
+    return _error(
+        f"'{body.mode}' is not a permission mode. "
+        f"Valid modes: {', '.join(sorted(_WEB_PERMISSION_MODES))}.", 400)
 
 
 @app.post("/api/audit")
@@ -1479,11 +1609,13 @@ async def toggle_audit(body: dict):
     """Toggle plan auditing."""
     C = _cl()
     enable = body.get("enable", False)
+    if not isinstance(enable, bool):
+        return _error("'enable' must be true or false", 400)
     try:
         C.cmd_audit("on" if enable else "off")
         return {"ok": True}
     except Exception as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
 
 
 # === WebSocket for streaming chat ===
@@ -1509,18 +1641,33 @@ async def websocket_endpoint(ws: WebSocket):
     """Bidirectional WebSocket for streaming agent turns, tool events, approvals."""
     await manager.connect(ws)
     A, C = _eng(), _cl()
+    # A turn runs as its own task so this loop keeps reading. Awaiting the turn
+    # inline (as this used to) meant receive_json() was not called again until
+    # the turn finished, so `interrupt`, `approval` and `plan_approval` sat
+    # unread in the socket for the whole turn - the stop button did nothing and
+    # an approval could not release the turn that was waiting on it.
+    turn: asyncio.Task | None = None
+
+    def _busy() -> bool:
+        return turn is not None and not turn.done()
+
     try:
         while True:
             msg = await ws.receive_json()
             msg_type = msg.get("type")
 
-            if msg_type == "chat":
-                await _handle_chat(ws, msg, A, C)
-            elif msg_type == "command":
-                await _handle_command(ws, msg, A, C)
+            if msg_type in ("chat", "command"):
+                if _busy():
+                    await ws.send_json({
+                        "type": "error",
+                        "message": "A turn is already running. Stop it first, "
+                                   "then send this again.",
+                    })
+                    continue
+                handler = _handle_chat if msg_type == "chat" else _handle_command
+                turn = asyncio.create_task(_run_turn(handler, ws, msg, A, C))
             elif msg_type == "interrupt":
-                # Signal the EscListener — but since we run in async, we
-                # use a threading.Event shared with the agent thread.
+                # Signal the agent thread; run_agent polls _interrupt_event.is_set.
                 _interrupt_event.set()
             elif msg_type == "approval":
                 esc_id = msg.get("id", "")
@@ -1537,11 +1684,27 @@ async def websocket_endpoint(ws: WebSocket):
                     entry["event"].set()
     except WebSocketDisconnect:
         manager.disconnect(ws)
+        _interrupt_event.set()   # let the orphaned turn wind itself down
         _fail_pending_waits()
     except Exception as exc:
         log.error("WebSocket error: %s", exc)
         manager.disconnect(ws)
+        _interrupt_event.set()
         _fail_pending_waits()
+
+
+async def _run_turn(handler, ws: WebSocket, msg: dict, A, C) -> None:
+    """Run one chat turn or command, reporting failures on the socket."""
+    try:
+        await handler(ws, msg, A, C)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.exception("turn failed")
+        try:
+            await ws.send_json({"type": "error", "message": scrub_markup(str(exc))})
+        except Exception:
+            pass
 
 
 # --- Shared state for interrupt + approval flows (engine runs in a thread) ---
@@ -1846,6 +2009,11 @@ def _mount_static(app: FastAPI, dist_dir: Path):
         from fastapi.responses import FileResponse
         @app.get("/{full_path:path}")
         async def spa_fallback(full_path: str):
+            # An unmatched /api path is a client error, not a route into the app.
+            # Serving index.html here (HTTP 200, text/html) meant a caller hitting
+            # a renamed endpoint got HTML and a JSON parse error instead of a 404.
+            if full_path == "api" or full_path.startswith("api/"):
+                return _error(f"no such endpoint: /{full_path}", 404)
             file_path = dist_dir / full_path
             if file_path.exists() and file_path.is_file():
                 return FileResponse(file_path)

@@ -8,13 +8,13 @@ import { useNavigate } from 'react-router-dom'
 import { useSessionStore } from '@/stores/session'
 import type { ChatMessage, SessionInfo } from '@/types/api'
 import { cn } from '@/lib/utils'
+import { apiFetch, handled } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 // ---- API helpers ----
 
 async function fetchJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return apiFetch<T>(url, { action: 'load sessions' })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
@@ -23,8 +23,7 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return handled<T>(res)
 }
 
 interface SessionActionResponse {
@@ -379,9 +378,8 @@ export default function SessionsPage() {
             <Loader2 className="h-4 w-4 animate-spin text-brand-cyan" /> Loading sessions…
           </div>
         ) : sessionsQuery.isError ? (
-          <div className="flex items-center gap-2 p-8 text-sm text-red-400">
-            <AlertCircle className="h-4 w-4" /> Failed to load sessions
-          </div>
+          <ErrorCard error={sessionsQuery.error} action="load sessions"
+                     onRetry={() => void sessionsQuery.refetch()} variant="inline" className="m-4" />
         ) : !sessionsQuery.data || sessionsQuery.data.length === 0 ? (
           <div className="p-8 text-center">
             <FolderClock className="mx-auto mb-3 h-8 w-8 text-zinc-700" />

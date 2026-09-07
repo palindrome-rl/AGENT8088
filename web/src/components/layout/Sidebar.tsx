@@ -10,6 +10,7 @@ import { useSessionStore } from '@/stores/session'
 import { cn } from '@/lib/utils'
 import { useState, useEffect, useRef } from 'react'
 import type { ChatMessage, SessionInfo } from '@/types/api'
+import { apiFetch } from '@/lib/api'
 
 /* ─────────────────────────────────────────────────────────
  * SIDEBAR NAV — Beautiful UI style
@@ -49,9 +50,7 @@ export function Sidebar() {
   const sessionsQuery = useQuery({
     queryKey: ['sessions'],
     queryFn: async () => {
-      const response = await fetch('/api/sessions')
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      return response.json() as Promise<SessionInfo[]>
+      return apiFetch<SessionInfo[]>('/api/sessions', { action: 'load sessions' })
     },
   })
 
@@ -96,8 +95,7 @@ export function Sidebar() {
     if (useSessionStore.getState().isStreaming) return
     const name = `chat-${crypto.randomUUID()}`
     try {
-      const response = await fetch('/api/sessions/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      await apiFetch('/api/sessions/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }), action: 'create a new session' })
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : 'Could not reset session')
       return
@@ -113,15 +111,14 @@ export function Sidebar() {
     setResuming(name)
     setSessionError('')
     try {
-      const response = await fetch('/api/sessions/resume', {
+      await apiFetch('/api/sessions/resume', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
+        action: `resume ${name}`,
       })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const historyResponse = await fetch('/api/history')
-      if (!historyResponse.ok) throw new Error(`HTTP ${historyResponse.status}`)
-      const history = await historyResponse.json() as { messages: ChatMessage[] }
+      const history = await apiFetch<{ messages: ChatMessage[] }>(
+        '/api/history', { action: 'load that session\'s history' })
       clearChat()
       setMessages(history.messages)
       setSessionName(name)

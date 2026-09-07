@@ -1,36 +1,49 @@
 import { Fragment, useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
-  Wrench, Play, X, Loader2, CheckCircle2, XCircle, ChevronDown, ChevronRight,
+  Wrench, Play, X, Loader2, CheckCircle2, XCircle, ChevronDown, ChevronRight, AlertTriangle
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { ToolSpec } from '@/types/api'
+import { apiFetch } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
+import { scrubMarkup } from '@/lib/scrub'
 
 /* ------------------------------------------------------------------ */
 /* API helpers                                                         */
 /* ------------------------------------------------------------------ */
 
 async function fetchTools(): Promise<ToolSpec[]> {
-  const res = await fetch('/api/tools')
-  if (!res.ok) throw new Error(`Failed to load tools (${res.status})`)
-  return res.json() as Promise<ToolSpec[]>
+  return apiFetch<ToolSpec[]>('/api/tools', { action: 'load the tool list' })
 }
 
-type ToolRun = { name: string; result: unknown; approval_required?: boolean; approval_id?: string }
+type ToolRun = {
+  name: string; result: unknown
+  approval_required?: boolean; approval_id?: string
+  /** The tool ran and reported its own failure (missing file, denied path).
+   *  That is a result to display, not a transport error. */
+  failed?: boolean
+}
+
 async function invokeTool(name: string, args: Record<string, unknown>): Promise<ToolRun> {
-  const res = await fetch(`/api/tool/${encodeURIComponent(name)}`, {
+  return apiFetch<ToolRun>(`/api/tool/${encodeURIComponent(name)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(args),
+    action: `run ${name}`,
+    // Tools shell out, drive a browser or hit Docker; they can take minutes.
+    timeoutMs: 300_000,
   })
-  if (!res.ok) throw new Error(`Invocation failed (${res.status})`)
-  return res.json() as Promise<ToolRun>
 }
 
 async function approveTool(id: string, approved: boolean): Promise<ToolRun> {
-  const res = await fetch(`/api/tool/approval/${id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approved }) })
-  if (!res.ok) throw new Error(`Approval failed (${res.status})`)
-  return res.json() as Promise<ToolRun>
+  return apiFetch<ToolRun>(`/api/tool/approval/${id}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approved }),
+    action: 'approve that tool call',
+    timeoutMs: 300_000,
+  })
 }
 
 /* ------------------------------------------------------------------ */
@@ -159,17 +172,27 @@ function InvokerModal({ tool, onClose }: InvokerModalProps) {
             </div>
           )}
           {mutation.isSuccess && (
-            <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
-              <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-emerald-400">
-                <CheckCircle2 className="h-3.5 w-3.5" /> Result
+            <div className={cn('rounded-md border px-3 py-2',
+              mutation.data?.failed
+                ? 'border-amber-500/30 bg-amber-500/10'
+                : 'border-emerald-500/30 bg-emerald-500/10')}>
+              {/* The tool ran; `failed` means it reported its own error (a
+                  missing file, a denied path). That is a result, not a
+                  transport failure, so it belongs here rather than in an
+                  ErrorCard - but it must not be dressed up as a success. */}
+              <div className={cn('mb-1 flex items-center gap-1.5 text-xs font-medium',
+                mutation.data?.failed ? 'text-amber-400' : 'text-emerald-400')}>
+                {mutation.data?.failed
+                  ? <><AlertTriangle className="h-3.5 w-3.5" /> The tool reported an error</>
+                  : <><CheckCircle2 className="h-3.5 w-3.5" /> Result</>}
               </div>
               <pre className="max-h-48 overflow-auto text-[11px] leading-relaxed text-zinc-300">
-{typeof mutation.data?.result === 'string'
+{scrubMarkup(typeof mutation.data?.result === 'string'
   ? mutation.data.result
-  : JSON.stringify(mutation.data?.result, null, 2)}
+  : JSON.stringify(mutation.data?.result, null, 2))}
               </pre>
               {mutation.data?.approval_required && mutation.data.approval_id && <div className="mt-2 flex gap-2"><button type="button" onClick={() => approval.mutate({ id: mutation.data!.approval_id!, approved: true })} className="rounded bg-amber-500/20 px-2 py-1 text-xs text-amber-300">Approve & run</button><button type="button" onClick={() => approval.mutate({ id: mutation.data!.approval_id!, approved: false })} className="rounded border border-zinc-700 px-2 py-1 text-xs text-zinc-400">Cancel</button></div>}
-              {approval.data && <pre className="mt-2 max-h-48 overflow-auto text-[11px] text-zinc-300">{typeof approval.data.result === 'string' ? approval.data.result : JSON.stringify(approval.data.result, null, 2)}</pre>}
+              {approval.data && <pre className="mt-2 max-h-48 overflow-auto text-[11px] text-zinc-300">{scrubMarkup(typeof approval.data.result === 'string' ? approval.data.result : JSON.stringify(approval.data.result, null, 2))}</pre>}
             </div>
           )}
 
@@ -200,7 +223,7 @@ export default function ToolsPage() {
   const [invokerTool, setInvokerTool] = useState<ToolSpec | null>(null)
   const [filter, setFilter] = useState('')
 
-  const { data: tools, isLoading, isError, error } = useQuery({
+  const { data: tools, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['tools'],
     queryFn: fetchTools,
   })
@@ -246,11 +269,7 @@ export default function ToolsPage() {
       )}
 
       {/* error */}
-      {isError && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-400">
-          {(error as Error)?.message ?? 'Failed to load tools.'}
-        </div>
-      )}
+      {isError && <ErrorCard error={error} action="load the tool list" onRetry={() => void refetch()} />}
 
       {/* table */}
       {tools && filtered.length > 0 && (

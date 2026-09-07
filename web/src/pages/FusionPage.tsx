@@ -1,21 +1,26 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Bot, CheckCircle2, Loader2, Plus, Sparkles, Trash2, Trophy, XCircle } from 'lucide-react'
+import { Bot, CheckCircle2, Loader2, Plus, Sparkles, Trash2, Trophy } from 'lucide-react'
 import type { ConfigInfo, FusionConfig, FusionResult } from '@/types/api'
+import { apiFetch } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 type Seat = { provider: string; model: string }
 
 async function getJSON<T>(url: string): Promise<T> {
-  const response = await fetch(url)
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  return response.json() as Promise<T>
+  return apiFetch<T>(url, { action: 'load the Fusion panel' })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  const data = await response.json() as T & { error?: string }
-  if (data.error) throw new Error(data.error)
+  const data = await apiFetch<T & { error?: string }>(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    action: 'run Fusion',
+    // A Fusion run queries the whole panel and then a judge.
+    timeoutMs: 300_000,
+  })
+  if (data?.error) throw new Error(data.error)
   return data
 }
 
@@ -71,7 +76,8 @@ export default function FusionPage() {
         <Sparkles className="h-5 w-5 text-brand-cyan" />
         <div><h1 className="text-lg font-semibold text-zinc-100">Fusion</h1><p className="text-xs text-zinc-500">Parallel answers, then a blind verdict.</p></div>
       </div>
-      {error && <div className="flex gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400"><XCircle className="h-4 w-4 shrink-0" />{(error as Error).message}</div>}
+      {error && <ErrorCard error={error} action="load the Fusion panel"
+                           onRetry={() => { save.reset(); run.reset(); void configQuery.refetch(); void fusionQuery.refetch() }} />}
       <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 sm:p-5">
         <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-zinc-200">Panel</h2><label className="text-xs text-zinc-500">Max seats <input aria-label="Maximum panel seats" type="number" min="1" max="8" value={maxPanel} onChange={(e) => setMaxPanel(Math.max(1, Number(e.target.value)))} className="ml-2 w-14 rounded border border-zinc-700 bg-zinc-950 px-1.5 py-1 text-zinc-200" /></label></div>
         <div className="space-y-2">
