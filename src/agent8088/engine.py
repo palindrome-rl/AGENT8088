@@ -3978,6 +3978,15 @@ BROWSER_WINDOW_POSITION = APP_CONFIG.get("browser_window_position", "").strip()
 # not something to flip per run.
 BROWSER_SCREENSHOTS = APP_CONFIG.get("browser_screenshots", "0").strip().lower() in (
     "1", "true", "yes", "on")
+# Completion-token ceiling for the browsing model's own calls. Left unset it
+# used to inherit MAX_COMPLETION_TOKENS (65000): a value sized for the main
+# chat loop's long-form answers, and an invitation for a looping small model
+# to decode for minutes inside ONE browser step before anything stops it - an
+# action batch is ~300 tokens, and even a 25-step run's final result fits in
+# a few thousand. 4096 (ChatLiteLLM's own default) bounds a stuck step to a
+# fast, cheap failure instead. Raise it only for a model that spends much of
+# its output on visible reasoning before the action JSON.
+BROWSER_LLM_MAX_TOKENS = _int_config("browser_llm_max_tokens", 4096)
 
 # Where a browse has gone, captured from the SSRF proxy's on_visit hook. The
 # proxy is the one place that sees every request a browse makes (browser-use has
@@ -4535,7 +4544,8 @@ async def _run_browser_agent(url: str, task: str,
     agent = None
     try:
         llm = build_browser_chat_model(
-            client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS,
+            client, MODEL_NAME, budget=_active_budget,
+            max_tokens=BROWSER_LLM_MAX_TOKENS,
             extra_body=_browser_llm_extra_body())
         profile = BrowserProfile(
             user_data_dir=user_data_dir, executable_path=executable_path,

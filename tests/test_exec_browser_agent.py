@@ -522,17 +522,17 @@ def test_the_batch_size_is_never_below_one(fake_browser_use, monkeypatch):
     assert fake_browser_use.agents[0].kwargs["max_actions_per_step"] == 1
 
 
-def test_the_llm_is_built_with_the_same_completion_token_ceiling_as_the_main_loop(
-        fake_browser_use):
-    """Left at ChatLiteLLM's own default (4096, half of engine.py's own 8192),
-    a model that spends much of its budget on 'thinking' before writing the
-    action can get cut off mid-response - browser-use reports this as "Model
-    returned empty action" and retries the whole step, a silent, avoidable
-    source of wasted round-trips. The browsing loop must get the same ceiling
-    the main agent loop already uses, not browser-use's unrelated default."""
+def test_the_llm_is_built_with_the_browser_specific_token_ceiling(fake_browser_use):
+    """The browsing loop gets its own completion ceiling (BROWSER_LLM_MAX_TOKENS,
+    default 4096), NOT the main chat loop's MAX_COMPLETION_TOKENS (65000).
+    That value is sized for long-form chat answers; inside a browser step an
+    action batch is ~300 tokens, and 65000 lets a looping small model decode
+    for minutes within ONE step before anything stops it. Bounded to 4096 a
+    stuck step fails fast and cheap instead."""
     asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
 
-    assert fake_browser_use.llm_calls[0]["max_tokens"] == A.MAX_COMPLETION_TOKENS
+    assert fake_browser_use.llm_calls[0]["max_tokens"] == A.BROWSER_LLM_MAX_TOKENS
+    assert A.BROWSER_LLM_MAX_TOKENS < A.MAX_COMPLETION_TOKENS
 
 
 def test_the_browser_is_closed_when_the_task_times_out(fake_browser_use, monkeypatch):

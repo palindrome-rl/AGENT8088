@@ -85,6 +85,12 @@ timeout_seconds=120
 # browser_task_timeout_seconds=600
 # Optional JSON forwarded only to browser-use model calls, for example:
 # browser_llm_extra_body={"chat_template_kwargs":{"enable_thinking":false}}
+# Completion-token ceiling for the browsing model's own LLM calls (default
+# 4096). The main loop's max_completion_tokens (65000) is sized for long chat
+# answers - inside a browser step it lets a looping model decode for minutes
+# before failing. Raise this only for a model that visibly reasons at length
+# before emitting the action JSON.
+# browser_llm_max_tokens=4096
 # Override either for one run with AGENT8088_BROWSER_MAX_STEPS or
 # AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS.
 
