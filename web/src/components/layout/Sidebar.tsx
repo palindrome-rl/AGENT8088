@@ -92,16 +92,16 @@ export function Sidebar() {
   }, [settingsOpen])
 
   const handleNewChat = async () => {
-    // /reset overwrites the saved session file with empty messages — confirm
-    // first, this is not recoverable.
-    if (!window.confirm('Reset active session? Its saved messages will be cleared.')) return
+    if (useSessionStore.getState().isStreaming) return
+    const name = `chat-${crypto.randomUUID()}`
     try {
-      await apiFetch('/api/sessions/reset', { method: 'POST', action: 'reset the session' })
+      await apiFetch('/api/sessions/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }), action: 'create a new session' })
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : 'Could not reset session')
       return
     }
     clearChat()
+    setSessionName(name)
     setSettingsOpen(false)
     await sessionsQuery.refetch()
     navigate('/')

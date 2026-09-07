@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronRight, Check, Loader2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, Check, Loader2, AlertCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /* ─────────────────────────────────────────────────────────
@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils'
 
 interface ToolChipProps {
   name: string
-  status: 'running' | 'done'
+  status: 'running' | 'done' | 'failed'
   result?: string
 }
 
@@ -33,6 +33,8 @@ export function ToolChip({ name, status, result }: ToolChipProps) {
             <>
               {status === 'running' ? (
                 <Loader2 className="h-3 w-3 animate-spin text-brand-cyan" />
+              ) : status === 'failed' ? (
+                <AlertCircle className="h-3 w-3 text-red-500" aria-label="Tool failed" />
               ) : (
                 <Check className="h-3 w-3 text-green-500 opacity-0 transition-opacity duration-100 group-hover:opacity-0" style={{ opacity: 1 }} />
               )}

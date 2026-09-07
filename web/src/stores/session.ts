@@ -6,11 +6,12 @@ interface SessionState {
   messages: ChatMessage[]
   status: StatusInfo | null
   isStreaming: boolean
+  activity: string
   streamingText: string
   streamingReasoning: string[]
   toolEvents: Array<{
     name: string
-    status: 'running' | 'done'
+    status: 'running' | 'done' | 'failed'
     result?: string
   }>
   planSteps: Array<{
@@ -39,6 +40,7 @@ interface SessionState {
   setConnection: (connection: SessionState['connection']) => void
   setSendFailure: (message: string) => void
   setStreaming: (streaming: boolean) => void
+  setActivity: (activity: string) => void
   appendStreamingText: (delta: string) => void
   appendStreamingReasoning: (delta: string) => void
   resetStreaming: () => void
@@ -53,6 +55,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   messages: [],
   status: null,
   isStreaming: false,
+  activity: 'Working',
   streamingText: '',
   streamingReasoning: [],
   toolEvents: [],
@@ -65,10 +68,10 @@ export const useSessionStore = create<SessionState>((set) => ({
   setMessages: (messages) => set({ messages }),
   setRawResult: (rawResult) => set({ rawResult }),
   setRawLoading: (rawLoading) => set({ rawLoading }),
-  setSessionName: (sessionName) => set({ sessionName }),
+  setSessionName: (sessionName) => set(s => ({ sessionName,
+    status: s.status ? { ...s.status, session_name: sessionName } : null })),
   clearChat: () => set({
     messages: [],
-    status: null,
     isStreaming: false,
     streamingText: '',
     streamingReasoning: [],
@@ -80,6 +83,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   setConnection: (connection) => set({ connection }),
   setSendFailure: (sendFailure) => set({ sendFailure }),
   setStreaming: (streaming) => set({ isStreaming: streaming }),
+  setActivity: (activity) => set({ activity }),
   appendStreamingText: (delta) => set((s) => ({ streamingText: s.streamingText + delta })),
   appendStreamingReasoning: (delta) => set((s) => ({
     streamingReasoning: [...s.streamingReasoning, delta],
@@ -91,7 +95,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   updateToolEvent: (name, result) => set((s) => ({
     toolEvents: s.toolEvents.map((e) =>
       e.name === name && e.status === 'running'
-        ? { ...e, status: 'done', result }
+        ? { ...e, status: /^(Error:|Invalid JSON|Command timed out)/i.test(result) ? 'failed' : 'done', result }
         : e
     ),
   })),
