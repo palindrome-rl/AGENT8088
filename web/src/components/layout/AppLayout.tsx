@@ -3,6 +3,7 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { ArrowLeft } from 'lucide-react'
 import { Sidebar } from './Sidebar'
 import { StatusBar } from './StatusBar'
+import { ConnectionBanner } from './ConnectionBanner'
 import { CommandPalette } from '@/components/CommandPalette'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useUIStore } from '@/stores/ui'
@@ -37,6 +38,7 @@ export function AppLayout() {
     <div className="flex h-screen overflow-hidden bg-zinc-50 dark:bg-zinc-950">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
+        <ConnectionBanner />
         {location.pathname !== '/' && (
           <div className="flex h-11 shrink-0 items-center border-b border-zinc-200 bg-white px-4 dark:border-zinc-800/60 dark:bg-zinc-950">
             <button

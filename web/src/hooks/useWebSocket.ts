@@ -19,6 +19,12 @@ let sharedWs: WebSocket | null = null
 let disposed = false
 let consumers = 0
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let reconnectAttempts = 0
+/** Messages that arrived while the socket was down, replayed on reconnect. */
+let outbox: WSClientMessage[] = []
+
+const RECONNECT_BASE_MS = 1000
+const RECONNECT_MAX_MS = 15_000
 
 function wireSocket(ws: WebSocket) {
   const {
@@ -29,7 +35,13 @@ function wireSocket(ws: WebSocket) {
   const { setApprovalPending, setPlanApprovalPending, setRawPanelOpen } = useUIStore.getState()
 
   ws.onmessage = (event) => {
-    const data: WSEvent = JSON.parse(event.data)
+    let data: WSEvent
+    try {
+      data = JSON.parse(event.data) as WSEvent
+    } catch {
+      // A frame we cannot parse is not worth tearing the socket down for.
+      return
+    }
     switch (data.type) {
       case 'status':
         setStatus(data.data)
@@ -144,11 +156,34 @@ function wireSocket(ws: WebSocket) {
     }
   }
 
+  ws.onopen = () => {
+    reconnectAttempts = 0
+    useSessionStore.getState().setConnection('open')
+    useSessionStore.getState().setSendFailure('')
+    // Anything typed while the socket was down goes now, in order.
+    const pending = outbox
+    outbox = []
+    pending.forEach((msg) => ws.send(JSON.stringify(msg)))
+    // A reconnect may have missed events, so re-read authoritative state.
+    void syncSession(true)
+  }
+
+  ws.onerror = () => {
+    // onclose always follows, which is where the retry is scheduled.
+    if (!disposed) useSessionStore.getState().setConnection('reconnecting')
+  }
+
   ws.onclose = () => {
     // Reconnect only while the app wants a socket — no zombie loops after unmount.
-    if (!disposed) {
-      reconnectTimer = setTimeout(() => ensureConnection(), 2000)
-    }
+    if (disposed) return
+    reconnectAttempts += 1
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (reconnectAttempts - 1), RECONNECT_MAX_MS)
+    const store = useSessionStore.getState()
+    store.setConnection('reconnecting')
+    // A turn cannot still be streaming over a socket that just closed; leaving
+    // isStreaming set is what used to lock the composer for good.
+    store.setStreaming(false)
+    reconnectTimer = setTimeout(() => ensureConnection(), delay)
   }
 }
 
@@ -156,7 +191,14 @@ function ensureConnection() {
   if (disposed || (sharedWs && sharedWs.readyState <= WebSocket.OPEN)) return
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${protocol}//${window.location.host}/ws`
-  const ws = new WebSocket(wsUrl)
+  if (reconnectAttempts === 0) useSessionStore.getState().setConnection('connecting')
+  let ws: WebSocket
+  try {
+    ws = new WebSocket(wsUrl)
+  } catch {
+    useSessionStore.getState().setConnection('failed')
+    return
+  }
   sharedWs = ws
   wireSocket(ws)
 }
@@ -192,29 +234,44 @@ export function useWebSocket() {
   _queryClient = queryClient
 
   const send = useCallback((msg: WSClientMessage) => {
-    if (!sharedWs || sharedWs.readyState !== WebSocket.OPEN) {
-      ensureConnection()
-      // Retry once the socket opens (or drop if it never connects).
-      const onOpen = () => sharedWs?.send(JSON.stringify(msg))
-      if (sharedWs && sharedWs.readyState === WebSocket.CONNECTING) {
-        sharedWs.addEventListener('open', onOpen, { once: true })
-      }
+    if (sharedWs && sharedWs.readyState === WebSocket.OPEN) {
+      sharedWs.send(JSON.stringify(msg))
       return
     }
-    sharedWs.send(JSON.stringify(msg))
+    // Queue it and say so, rather than returning silently - a dropped message
+    // used to leave the composer spinning on a turn that was never sent.
+    // `interrupt` is deliberately not queued: stopping a turn that no longer
+    // exists is meaningless, and replaying it would cancel the next one.
+    const store = useSessionStore.getState()
+    if (msg.type === 'interrupt') {
+      store.setStreaming(false)
+      return
+    }
+    outbox.push(msg)
+    store.setStreaming(false)
+    store.setSendFailure(
+      'Not connected to Agent8088 — this message is queued and will be sent '
+      + 'as soon as the connection is back.',
+    )
+    ensureConnection()
   }, [])
 
   useEffect(() => {
     consumers += 1
     disposed = false
     ensureConnection()
-    if (consumers === 1) void syncSession()
+    // includeHistory: the backend still holds the transcript (/api/history) and
+    // the session file is on disk, so a refresh must restore what the user can
+    // see. Syncing without it is what made every reload look like a new chat.
+    if (consumers === 1) void syncSession(true)
     return () => {
       consumers -= 1
       if (consumers <= 0) {
         consumers = 0
         disposed = true
         if (reconnectTimer) clearTimeout(reconnectTimer)
+        reconnectAttempts = 0
+        outbox = []
         sharedWs?.close()
         sharedWs = null
       }

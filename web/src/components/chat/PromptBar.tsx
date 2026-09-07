@@ -7,6 +7,7 @@ import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
 import { ImageUpload } from './ImageUpload'
+import { assertOk } from '@/lib/api'
 
 /* ─────────────────────────────────────────────────────────
  * PROMPT BAR — Beautiful UI style
@@ -122,7 +123,7 @@ export function PromptBar() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
     })
-    if (!response.ok) throw new Error(`Could not create session (${response.status})`)
+    await assertOk(response, 'create a session')
     const result = await response.json() as { error?: string; name?: string }
     if (result.error) throw new Error(result.error)
     setSessionName(result.name || name)
@@ -503,7 +504,10 @@ export function PromptBar() {
               {/* Send — tactile square */}
               <button
                 type="button"
-                aria-label="Send"
+                // The same button becomes the stop control while a turn runs;
+                // a fixed "Send" label told screen-reader users they were
+                // sending when they were interrupting.
+                aria-label={isStreaming ? 'Stop generating' : 'Send'}
                 disabled={!canSend && !isStreaming}
                 onClick={isStreaming ? () => wsSend({ type: 'interrupt' }) : handleSend}
                 className={cn(

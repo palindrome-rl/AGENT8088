@@ -6,29 +6,26 @@ import {
 } from 'lucide-react'
 import type { MemoryStatus, MemoryFact } from '@/types/api'
 import { cn } from '@/lib/utils'
+import { apiFetch } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 // ---- API helpers ----
 
 async function fetchJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return apiFetch<T>(url, { action: 'load memory' })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
+  return apiFetch<T>(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    action: 'save that change',
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
 }
 
 async function deleteJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url, { method: 'DELETE' })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return apiFetch<T>(url, { method: 'DELETE', action: 'forget that fact' })
 }
 
 interface SearchResponse {
@@ -67,10 +64,11 @@ function StatusBadge({ ok, label }: { ok: boolean | null; label: string }) {
   )
 }
 
-function StatusPanel({ status, isLoading, isError, error }: {
+function StatusPanel({ status, isLoading, isError, error, onRetry }: {
   status: MemoryStatus | undefined
   isLoading: boolean
   isError: boolean
+  onRetry?: () => void
   error: Error | null
 }) {
   if (isLoading) {
@@ -81,12 +79,8 @@ function StatusPanel({ status, isLoading, isError, error }: {
     )
   }
   if (isError || !status) {
-    return (
-      <div className="flex items-center gap-2 rounded-xl border border-red-900/50 bg-red-950/30 p-4 text-sm text-red-400">
-        <AlertCircle className="h-4 w-4 shrink-0" />
-        {error?.message ?? 'Failed to load memory status'}
-      </div>
-    )
+    return <ErrorCard error={error ?? new Error('Memory status was empty.')}
+                      action="load memory status" onRetry={onRetry} />
   }
 
   return (
@@ -297,6 +291,7 @@ export default function MemoryPage() {
         status={statusQuery.data}
         isLoading={statusQuery.isLoading}
         isError={statusQuery.isError}
+        onRetry={() => void statusQuery.refetch()}
         error={statusQuery.error}
       />
 

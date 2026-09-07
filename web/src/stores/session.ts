@@ -22,6 +22,12 @@ interface SessionState {
   }>
   rawResult: { content: string; reasoning?: string; tool_calls?: unknown } | null
   rawLoading: boolean
+  /** Live WebSocket state. Without this the UI had no way to know the socket
+   *  was gone and kept the status bar reading "ready" over a dead connection. */
+  connection: 'connecting' | 'open' | 'reconnecting' | 'failed'
+  /** Set when a send could not be delivered, so the composer can say so
+   *  instead of spinning on a message that was never transmitted. */
+  sendFailure: string
 
   setMessages: (messages: ChatMessage[]) => void
   setRawResult: (result: SessionState['rawResult']) => void
@@ -30,6 +36,8 @@ interface SessionState {
   clearChat: () => void
   addMessage: (message: ChatMessage) => void
   setStatus: (status: StatusInfo) => void
+  setConnection: (connection: SessionState['connection']) => void
+  setSendFailure: (message: string) => void
   setStreaming: (streaming: boolean) => void
   appendStreamingText: (delta: string) => void
   appendStreamingReasoning: (delta: string) => void
@@ -51,6 +59,8 @@ export const useSessionStore = create<SessionState>((set) => ({
   planSteps: [],
   rawResult: null,
   rawLoading: false,
+  connection: 'connecting',
+  sendFailure: '',
 
   setMessages: (messages) => set({ messages }),
   setRawResult: (rawResult) => set({ rawResult }),
@@ -67,6 +77,8 @@ export const useSessionStore = create<SessionState>((set) => ({
   }),
   addMessage: (message) => set((s) => ({ messages: [...s.messages, message] })),
   setStatus: (status) => set({ status }),
+  setConnection: (connection) => set({ connection }),
+  setSendFailure: (sendFailure) => set({ sendFailure }),
   setStreaming: (streaming) => set({ isStreaming: streaming }),
   appendStreamingText: (delta) => set((s) => ({ streamingText: s.streamingText + delta })),
   appendStreamingReasoning: (delta) => set((s) => ({

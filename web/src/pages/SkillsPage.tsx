@@ -5,32 +5,33 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { SkillPackage } from '@/types/api'
+import { apiFetch } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 /* ------------------------------------------------------------------ */
 /* API helpers                                                         */
 /* ------------------------------------------------------------------ */
 
 async function fetchSkills(): Promise<SkillPackage[]> {
-  const res = await fetch('/api/skills')
-  if (!res.ok) throw new Error(`Failed to load skills (${res.status})`)
-  return res.json() as Promise<SkillPackage[]>
+  return apiFetch<SkillPackage[]>('/api/skills', { action: 'load skills' })
 }
 
 async function fetchSkillResource(name: string, resource: string): Promise<string> {
-  const res = await fetch(`/api/skills/${encodeURIComponent(name)}/resource/${encodeURIComponent(resource)}`)
-  if (!res.ok) throw new Error(`Failed to load ${resource} (${res.status})`)
-  const data = await res.json() as { content: string }
+  const data = await apiFetch<{ content: string }>(
+    `/api/skills/${encodeURIComponent(name)}/resource/${encodeURIComponent(resource)}`,
+    { action: `load ${resource}` })
   return data.content
 }
 
 async function toggleSkill(name: string, enable: boolean): Promise<{ name: string; enabled: boolean }> {
-  const res = await fetch(`/api/skills/${encodeURIComponent(name)}/toggle`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enable }),
-  })
-  if (!res.ok) throw new Error(`Toggle failed (${res.status})`)
-  return res.json() as Promise<{ name: string; enabled: boolean }>
+  return apiFetch<{ name: string; enabled: boolean }>(
+    `/api/skills/${encodeURIComponent(name)}/toggle`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enable }),
+      action: `${enable ? 'enable' : 'disable'} ${name}`,
+    })
 }
 
 /* ------------------------------------------------------------------ */
@@ -149,7 +150,7 @@ function SkillCard({ skill }: SkillCardProps) {
 export default function SkillsPage() {
   const [filter, setFilter] = useState('')
 
-  const { data: skills, isLoading, isError, error } = useQuery({
+  const { data: skills, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['skills'],
     queryFn: fetchSkills,
   })
@@ -192,11 +193,7 @@ export default function SkillsPage() {
       )}
 
       {/* error */}
-      {isError && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-400">
-          {(error as Error)?.message ?? 'Failed to load skills.'}
-        </div>
-      )}
+      {isError && <ErrorCard error={error} action="load skills" onRetry={() => void refetch()} />}
 
       {/* grid */}
       {skills && filtered.length > 0 && (

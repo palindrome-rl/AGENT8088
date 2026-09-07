@@ -78,9 +78,15 @@ def test_retry_after_length_cutoff_gets_a_bigger_budget(monkeypatch, engine):
     monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
     engine.run_agent([{"role": "user", "content": "its still off"}], max_turns=5)
 
-    assert calls[0] == engine.MAX_COMPLETION_TOKENS
-    expected_retry_budget = min(engine.MAX_COMPLETION_TOKENS * 2, engine.CONTEXT_WINDOW)
-    assert calls[1] == expected_retry_budget
+    # run_agent budgets from the ACTIVE model's probed limits, not the
+    # module-level MAX_COMPLETION_TOKENS/CONTEXT_WINDOW defaults - limits are
+    # probed from the endpoint at runtime rather than read from a hardcoded
+    # catalogue (see providers.model_token_limits). Assert against the same
+    # source the engine uses, or this test only passes when the probe happens
+    # to agree with the defaults.
+    context_window, completion_limit = engine._active_model_token_limits()
+    assert calls[0] == completion_limit
+    assert calls[1] == min(completion_limit * 2, context_window)
     assert calls[1] > calls[0]
 
 

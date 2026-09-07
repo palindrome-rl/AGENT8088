@@ -5,20 +5,20 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { McpServerInfo } from '@/types/api'
+import { apiFetch, handled, assertOk } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 /* ------------------------------------------------------------------ */
 /* API helpers                                                         */
 /* ------------------------------------------------------------------ */
 
 async function fetchMcp(): Promise<McpServerInfo[]> {
-  const res = await fetch('/api/mcp')
-  if (!res.ok) throw new Error(`Failed to load MCP servers (${res.status})`)
-  return res.json() as Promise<McpServerInfo[]>
+  return apiFetch<McpServerInfo[]>('/api/mcp', { action: 'load MCP servers' })
 }
 
 async function reloadMcp(): Promise<{ ok: boolean; confirmation_required?: boolean; message?: string }> {
   let res = await fetch('/api/mcp/reload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-  if (!res.ok) throw new Error(`Reload failed (${res.status})`)
+  await assertOk(res, 'reload MCP servers')
   let data = await res.json() as { ok: boolean; confirmation_required?: boolean; message?: string }
   if (data.confirmation_required) {
     if (!window.confirm(data.message || 'Reload MCP servers?')) return data
@@ -42,8 +42,7 @@ async function addMcp(body: McpAddBody): Promise<{ ok?: boolean; error?: string 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`Add failed (${res.status})`)
-  return res.json() as Promise<{ ok?: boolean; error?: string }>
+  return handled<{ ok?: boolean; error?: string }>(res)
 }
 
 async function removeMcp(name: string, project: boolean): Promise<{ ok?: boolean; error?: string }> {
@@ -52,8 +51,7 @@ async function removeMcp(name: string, project: boolean): Promise<{ ok?: boolean
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, project }),
   })
-  if (!res.ok) throw new Error(`Remove failed (${res.status})`)
-  return res.json() as Promise<{ ok?: boolean; error?: string }>
+  return handled<{ ok?: boolean; error?: string }>(res)
 }
 
 /* ------------------------------------------------------------------ */
@@ -243,7 +241,7 @@ export default function McpPage() {
   const [showAdd, setShowAdd] = useState(false)
   const [removing, setRemoving] = useState<string | null>(null)
 
-  const { data: servers, isLoading, isError, error } = useQuery({
+  const { data: servers, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['mcp'],
     queryFn: fetchMcp,
   })
@@ -325,11 +323,7 @@ export default function McpPage() {
       )}
 
       {/* error */}
-      {isError && (
-        <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-400">
-          {(error as Error)?.message ?? 'Failed to load MCP servers.'}
-        </div>
-      )}
+      {isError && <ErrorCard error={error} action="load MCP servers" onRetry={() => void refetch()} />}
 
       {/* table */}
       {servers && servers.length > 0 && (
