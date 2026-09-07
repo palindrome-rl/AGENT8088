@@ -48,6 +48,25 @@ python agent8088_cli.py
 
 Then run `/skills` to list packages, and `/tools` to confirm the new tools loaded.
 
+## Vendored skills
+
+These ten packages are vendored from [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills)
+(MIT), commit `1c760d6`:
+
+`api-and-interface-design`, `constraint-driven-development`, `context-engineering`,
+`doubt-driven-development`, `frontend-ui-engineering`, `incremental-implementation`,
+`interview-me`, `performance-optimization`, `security-and-hardening`,
+`source-driven-development`.
+
+The only local edit is `progressive: true` added to each one's frontmatter —
+their bodies total ~140 KB, which would otherwise be inlined into every system
+prompt. Skills from that repo overlapping an existing package here (its
+`test-driven-development`, `code-simplification`, `debugging-and-error-recovery`,
+`planning-and-task-breakdown`, `code-review-and-quality`,
+`documentation-and-adrs`) were deliberately not vendored: duplicate or
+near-duplicate descriptions make skill selection ambiguous, and its
+`test-driven-development` would have collided by name with ours.
+
 ## Safety
 
 - A package **cannot override a core tool** (e.g. `execute_shell`) — core

@@ -2006,6 +2006,7 @@ COMMAND_SPECS = (
     ("sandbox", "/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation", ()),
     ("status", "/status", "Show model, context, tool, skill, and session status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
+    ("local", "/local [check|list|pull <name>|remove <name>]", "Probe this machine's hardware and recommend local Ollama models, or list/pull/remove installed ones", ()),
     ("dump", "/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report", ()),
     ("search", "/search [status|use|setup|stop]", "Inspect and configure web-search backends", ()),
     ("mode", "/mode [readonly|full-auto]", "Show or set the permission mode (edit is an alias for full-auto)", ()),
@@ -3041,6 +3042,127 @@ def cmd_doctor(rest):
                 console.print(
                     f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
                 )
+
+
+def _cmd_local_check():
+    console.print("[dim]Probing hardware...[/dim]")
+    try:
+        hw = A.local_models.probe_hardware()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]Error probing hardware:[/red] {exc}")
+        return
+
+    sys_t = Table(title="System", box=box.SIMPLE, title_style="bold #00edff",
+                  header_style="bold #00edff", border_style="#0077B6", show_header=False)
+    sys_t.add_column("Field", style="#00edff", no_wrap=True)
+    sys_t.add_column("Value", style="#237dd7")
+    cpu_val = hw.cpu_brand or "unknown"
+    if hw.cpu_cores_physical:
+        cpu_val += f" ({hw.cpu_cores_physical} cores"
+        if hw.cpu_cores_logical and hw.cpu_cores_logical != hw.cpu_cores_physical:
+            cpu_val += f" / {hw.cpu_cores_logical} threads"
+        if hw.cpu_speed_ghz:
+            cpu_val += f", {hw.cpu_speed_ghz} GHz"
+        cpu_val += ")"
+    sys_t.add_row("CPU", cpu_val)
+    sys_t.add_row("Architecture", hw.architecture or "unknown")
+    ram_color = "green" if hw.ram_total_gb >= 32 else "yellow" if hw.ram_total_gb >= 16 else "red"
+    sys_t.add_row("RAM", f"[{ram_color}]{hw.ram_free_gb:.1f} GB free / {hw.ram_total_gb:.1f} GB total[/{ram_color}]")
+    if hw.gpu_name:
+        sys_t.add_row("GPU", f"[green]{hw.gpu_name} (dedicated)[/green]")
+        sys_t.add_row("VRAM", f"{hw.vram_free_gb:.1f} GB free / {hw.vram_total_gb:.1f} GB total")
+    else:
+        sys_t.add_row("GPU", "[yellow]none detected (NVIDIA only, via nvidia-smi)[/yellow]")
+        sys_t.add_row("VRAM", "n/a -- local models run on CPU")
+    console.print(sys_t)
+    if hw.gpu_name and hw.caveat:
+        console.print(f"[dim]Note: {hw.caveat}[/dim]")
+
+    scores = A.local_models.score_models(hw)
+    mt = Table(title="Model Compatibility", box=box.SIMPLE, title_style="bold #00edff",
+               header_style="bold #00edff", border_style="#0077B6")
+    mt.add_column("Model", style="#00edff")
+    mt.add_column("Params", justify="right")
+    mt.add_column("Size", justify="right")
+    mt.add_column("Score", justify="right")
+    mt.add_column("Category")
+    cat_color = {"Compatible": "green", "Marginal": "yellow", "Poor": "red"}
+    for m in scores:
+        color = cat_color[m.category]
+        mt.add_row(m.name, f"{m.params_b}B", f"{m.size_gb:.1f} GB",
+                   f"[{color}]{m.score}/100[/{color}]", f"[{color}]{m.category}[/{color}]")
+    console.print(mt)
+
+
+def _cmd_local_list():
+    try:
+        installed = A.local_models.list_installed_models()
+        running = A.local_models.running_models()
+    except A.local_models.OllamaError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    if not installed:
+        console.print("[dim]No local models installed. Use /local pull <name>.[/dim]")
+        return
+    running_names = {m.get("name") for m in running}
+    t = Table(title="Local Ollama Models", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Name", style="#00edff")
+    t.add_column("Size", style="#237dd7")
+    t.add_column("Status", style="#237dd7")
+    for m in installed:
+        size_gb = (m.get("size") or 0) / (1024 ** 3)
+        t.add_row(str(m.get("name")), f"{size_gb:.1f} GB",
+                  "running" if m.get("name") in running_names else "")
+    console.print(t)
+
+
+def _cmd_local_pull(name: str):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /local pull <model-name>")
+        return
+    console.print(f"[dim]Pulling {name} from Ollama -- this can take a while...[/dim]")
+    try:
+        status = A.local_models.pull_model(name, timeout=1800)
+        console.print(f"[#237dd7]{name}:[/#237dd7] {status}")
+    except A.local_models.OllamaError as exc:
+        console.print(f"[red]{exc}[/red]")
+
+
+def _cmd_local_remove(name: str):
+    name = name.strip()
+    if not name:
+        console.print("[red]usage:[/red] /local remove <model-name>")
+        return
+    try:
+        if not _confirm_destructive(f"Remove local model '{name}'", name):
+            console.print("[dim]cancelled[/dim]")
+            return
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim]cancelled[/dim]")
+        return
+    try:
+        result = A.local_models.remove_model(name)
+        console.print(f"[#237dd7]{result}[/#237dd7]")
+    except A.local_models.OllamaError as exc:
+        console.print(f"[red]{exc}[/red]")
+
+
+def cmd_local(rest):
+    parts = (rest or "").strip().split(None, 1)
+    sub = parts[0].lower() if parts else "check"
+    arg = parts[1] if len(parts) > 1 else ""
+    if sub in ("check", ""):
+        _cmd_local_check()
+    elif sub == "list":
+        _cmd_local_list()
+    elif sub == "pull":
+        _cmd_local_pull(arg)
+    elif sub in ("remove", "rm", "delete"):
+        _cmd_local_remove(arg)
+    else:
+        console.print("[red]usage:[/red] /local [check|list|pull <name>|remove <name>]")
 
 
 def cmd_dump(_rest):
@@ -4622,6 +4744,7 @@ COMMANDS = {
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
     "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
+    "local": cmd_local,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,

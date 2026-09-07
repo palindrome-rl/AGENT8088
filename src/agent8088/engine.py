@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cli_anything, documents, memory, web_search
+from agent8088 import cli_anything, documents, local_models, memory, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -1450,7 +1450,7 @@ DEFAULT_SYSTEM_PROMPT = "You are Agent8088. Read full instructions from system.m
 def load_text(path: Path, fallback: str) -> str:
     try:
         if path.exists():
-            content = path.read_text().strip()
+            content = path.read_text(encoding="utf-8").strip()
             if content:
                 return content
     except Exception:
@@ -2249,7 +2249,7 @@ def _parse_arg_types(raw: str) -> dict:
 def load_tool_specs(path: Path, config: dict) -> dict:
     specs = {}
     if path.exists():
-        for raw in path.read_text().splitlines():
+        for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -2510,7 +2510,12 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
         meta, body = {}, ""
         skill_md = pkg / "SKILL.md"
         if skill_md.exists():
-            meta, body = _parse_frontmatter_md(skill_md.read_text())
+            # encoding is explicit: read_text() defaults to the locale codec, which
+            # on Windows is cp1252 and cannot decode a SKILL.md containing any
+            # non-ASCII character. That raised UnicodeDecodeError at import time,
+            # before the REPL ever appeared -- one skill file with an em dash in it
+            # took the whole agent down. Same reason as cli.py's banner read.
+            meta, body = _parse_frontmatter_md(skill_md.read_text(encoding="utf-8"))
         tools_file = pkg / "tools.txt"
         tools = load_tool_specs(tools_file, config) if tools_file.exists() else {}
         if not tools and not skill_md.exists():
@@ -2652,7 +2657,7 @@ def load_subagent_specs(agents_dir: Path, user_agents_dir: Path = None) -> dict:
         if not source_dir or not source_dir.exists() or not source_dir.is_dir():
             continue
         for path in sorted(source_dir.glob("*.md")):
-            meta, body = _parse_frontmatter_md(path.read_text())
+            meta, body = _parse_frontmatter_md(path.read_text(encoding="utf-8"))
             name = meta.get("name") or path.stem
             specs[name] = {
                 "name": name,
@@ -6131,6 +6136,167 @@ def _plan_mode_block_message() -> str:
             "call normally. Do not claim any of it is done before that happens.")
 
 
+def _run_local_models_tool(name: str, args: dict, timeout: int, approval_key: str) -> str:
+    """Dispatch for the four local_models tools. Hardware probe and listing
+    are read-only, loopback-only calls -- no permission gate, same as
+    CLI-Anything's local_tools/network_tools. Pull/remove touch the local
+    Ollama daemon's disk and go through the same host-shell permission gate
+    CLI-Anything's mutation tools use."""
+    if name == "check_local_hardware":
+        try:
+            hw = local_models.probe_hardware()
+        except Exception as exc:  # noqa: BLE001
+            return f"Error probing hardware: {exc}"
+        return local_models.format_hardware_report(hw)
+
+    if name == "list_local_models":
+        try:
+            installed = local_models.list_installed_models()
+            running = local_models.running_models()
+        except local_models.OllamaError as exc:
+            return str(exc)
+        if not installed:
+            return "No local models installed. Use pull_local_model to install one."
+        running_names = {m.get("name") for m in running}
+        lines = ["Installed local models:"]
+        for m in installed:
+            size_gb = (m.get("size") or 0) / (1024 ** 3)
+            tag = " [running]" if m.get("name") in running_names else ""
+            lines.append(f"  - {m.get('name')} (~{size_gb:.1f} GB){tag}")
+        return "\n".join(lines)
+
+    model_name = str(args.get("name") or "").strip()
+    if not model_name:
+        return "Error: 'name' is required (e.g. 'llama3.3' or 'qwen2.5-coder:32b')."
+    display = f"{name}: {model_name}"
+    if not check_permission("shell", display, host=True, approval_key=approval_key):
+        _audit("escalation_requested", tool=name, mode="shell",
+               decision="blocked", detail=display, change_type="local_execution")
+        return request_escalation(
+            target_mode="edit",
+            paths=[display],
+            change_type="local_execution",
+            reason=("Pull a local model? This downloads several GB and runs "
+                    "against your local Ollama daemon."
+                    if name == "pull_local_model" else
+                    "Remove a local model from disk?"),
+        )
+    _audit("tool_call", tool=name, mode="shell", decision="allowed", detail=display)
+    try:
+        if name == "pull_local_model":
+            status = local_models.pull_model(model_name, timeout=timeout)
+            return f"{model_name}: {status}"
+        if name == "remove_local_model":
+            return local_models.remove_model(model_name)
+        return f"Unknown local_models tool: {name}"
+    except local_models.OllamaError as exc:
+        return f"Error: {exc}"
+
+
+def _run_mcp_manage_tool(name: str, args: dict, approval_key: str) -> str:
+    """Dispatch for MCP server lifecycle tools. list_mcp_servers is read-only
+    (wraps MCP_RUNTIME.statuses); add/remove touch config on disk and connect
+    to a new process, so they go through the same host-shell permission gate
+    pull_local_model/remove_local_model use. The escalation message shows the
+    full command/url about to be configured -- a readonly-mode approval must
+    be informed by what will actually run, not just a server name."""
+    if name == "list_mcp_servers":
+        if not MCP_RUNTIME.statuses:
+            return "No MCP servers configured. Use add_mcp_server to add one."
+        lines = ["Configured MCP servers:"]
+        for server_name, status in sorted(MCP_RUNTIME.statuses.items()):
+            detail = ", ".join(status.get("tools", [])) or status.get("error", "")
+            lines.append(f"  - {server_name}: {status.get('state')}"
+                         + (f" ({detail})" if detail else ""))
+        return "\n".join(lines)
+
+    server_name = str(args.get("name") or "").strip()
+    if not server_name:
+        return "Error: 'name' is required."
+
+    if name == "remove_mcp_server":
+        display = f"remove_mcp_server: {server_name}"
+        if not check_permission("shell", display, host=True, approval_key=approval_key):
+            _audit("escalation_requested", tool=name, mode="shell",
+                   decision="blocked", detail=display, change_type="local_execution")
+            return request_escalation(
+                target_mode="edit", paths=[display], change_type="local_execution",
+                reason=f"Remove MCP server '{server_name}'?",
+            )
+        _audit("tool_call", tool=name, mode="shell", decision="allowed", detail=display)
+        try:
+            removed = MCP_RUNTIME.remove_server(server_name, project=bool(args.get("project")))
+            reload_mcp_tools()
+        except Exception as exc:  # noqa: BLE001
+            return f"Error removing MCP server: {exc}"
+        return f"Removed {server_name}" if removed else f"'{server_name}' was not configured in that scope."
+
+    if name != "add_mcp_server":
+        return f"Unknown MCP tool: {name}"
+
+    transport = str(args.get("transport") or "").strip().lower()
+    if transport == "stdio":
+        command = str(args.get("command") or "").strip()
+        if not command:
+            return "Error: transport=stdio requires 'command'."
+        raw_args = args.get("args") or []
+        if isinstance(raw_args, str) and raw_args.strip():
+            try:
+                raw_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                raw_args = raw_args.split()
+        elif isinstance(raw_args, str):
+            raw_args = []
+        if not isinstance(raw_args, list):
+            return "Error: 'args' must be a JSON array of strings."
+        config = {"command": command, "args": [str(a) for a in raw_args]}
+        display_cmd = " ".join([command, *config["args"]])
+    elif transport == "http":
+        url = str(args.get("url") or "").strip()
+        if not url:
+            return "Error: transport=http requires 'url'."
+        config = {"url": url}
+        display_cmd = url
+    else:
+        return "Error: 'transport' must be 'stdio' or 'http'."
+
+    raw_env = args.get("env")
+    if raw_env:
+        if isinstance(raw_env, str):
+            try:
+                raw_env = json.loads(raw_env)
+            except json.JSONDecodeError:
+                return "Error: 'env' must be a JSON object string of string->string."
+        if not isinstance(raw_env, dict):
+            return "Error: 'env' must be a JSON object."
+        config["env"] = {str(k): str(v) for k, v in raw_env.items()}
+
+    bearer_env = str(args.get("bearer_token_env") or "").strip()
+    if bearer_env:
+        config["bearer_token_env"] = bearer_env
+
+    display = f"add_mcp_server: {server_name} ({transport}) -> {display_cmd}"
+    if not check_permission("shell", display, host=True, approval_key=approval_key):
+        _audit("escalation_requested", tool=name, mode="shell",
+               decision="blocked", detail=display, change_type="local_execution")
+        return request_escalation(
+            target_mode="edit", paths=[display], change_type="local_execution",
+            reason=(f"Add MCP server '{server_name}'? This configures Agent8088 to "
+                    f"launch/connect: {display_cmd}"),
+        )
+    _audit("tool_call", tool=name, mode="shell", decision="allowed", detail=display)
+    try:
+        MCP_RUNTIME.set_server(server_name, config, project=bool(args.get("project")))
+        reload_mcp_tools()
+    except Exception as exc:  # noqa: BLE001
+        return f"Error adding MCP server: {exc}"
+    status = MCP_RUNTIME.statuses.get(server_name, {})
+    state = status.get("state", "unknown")
+    tools = ", ".join(status.get("tools", [])) or status.get("error", "")
+    return (f"Added '{server_name}' ({transport}). Connection state: {state}"
+            + (f" -- {tools}" if tools else ""))
+
+
 def _run_cli_anything_tool(name: str, args: dict, timeout: int,
                            approval_key: str, allow_plan: bool) -> str:
     """Run the optional CLI-Anything adapter through Agent8088's policy layer."""
@@ -6260,6 +6426,24 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "cli_anything":
         return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
+
+    if mode == "local_models":
+        missing = next(
+            (param for param in TOOL_REQUIRED_PARAMS.get(name, []) if not args.get(param)),
+            None,
+        )
+        if missing:
+            return _tool_arg_missing_error(name, missing)
+        return _run_local_models_tool(name, args, timeout, approval_key)
+
+    if mode == "mcp_manage":
+        missing = next(
+            (param for param in TOOL_REQUIRED_PARAMS.get(name, []) if not args.get(param)),
+            None,
+        )
+        if missing:
+            return _tool_arg_missing_error(name, missing)
+        return _run_mcp_manage_tool(name, args, approval_key)
 
     # --- Plan-only early gate: block gated tools BEFORE arg validation ---
     # Without this, write_file() with no args returns "write tool requires a file path"

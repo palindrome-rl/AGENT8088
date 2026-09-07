@@ -181,14 +181,18 @@ class _SSRFFilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPSer
     def handle_error(self, request, client_address):
         # Chromium routinely opens and abandons connections (speculative
         # preconnects, cancelled requests) - socketserver's default
-        # handle_error() prints the resulting ConnectionResetError/
-        # BrokenPipeError as a full traceback to stderr, which reads as a
-        # crash even though nothing actually failed. Suppress just those
-        # two expected, harmless cases; anything else still prints normally
-        # so a genuine bug in the proxy isn't silenced.
+        # handle_error() prints the resulting connection errors as a full
+        # traceback to stderr, which reads as a crash even though nothing
+        # actually failed. ConnectionAbortedError belongs here too: on
+        # Windows, a connection Chromium drops mid-read surfaces as
+        # WinError 10053 rather than the reset/broken-pipe the POSIX path
+        # raises, and it was still printing full tracebacks mid-browse.
+        # Suppress just these expected, harmless cases; anything else still
+        # prints normally so a genuine bug in the proxy isn't silenced.
         import sys
         exc_type = sys.exc_info()[0]
-        if exc_type is not None and issubclass(exc_type, (ConnectionResetError, BrokenPipeError)):
+        if exc_type is not None and issubclass(
+                exc_type, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
             return
         super().handle_error(request, client_address)
 
