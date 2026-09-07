@@ -28,7 +28,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
           <pre className="max-h-[60vh] max-w-full overflow-auto whitespace-pre rounded-lg border border-zinc-200 bg-zinc-50 p-3 font-mono text-[12px] leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
             {scrubMarkup(message.content)}
           </pre>
-        ) : <div className="min-w-0 max-w-full overflow-hidden prose prose-sm text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0 [&_pre]:max-w-full [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
+        ) : <div className="chat-markdown min-w-0 max-w-full overflow-hidden text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0 [&_pre]:max-w-full [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto">
           {/* Scrub tool-call protocol: history messages are stored raw */}
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}

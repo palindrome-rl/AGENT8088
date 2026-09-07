@@ -36,18 +36,25 @@ function wireSocket(ws: WebSocket) {
         break
       case 'spin':
         setStreaming(true)
+        useSessionStore.getState().setActivity(data.message === 'thinking...'
+          ? (useSessionStore.getState().toolEvents.length ? 'Reviewing results' : 'Preparing request')
+          : data.message)
         break
       case 'token':
         if (data.kind === 'reasoning') {
           appendStreamingReasoning(data.delta)
         } else {
           appendStreamingText(data.delta)
+          if (scrubMarkup(useSessionStore.getState().streamingText).trim()) {
+            useSessionStore.getState().setActivity('Writing answer')
+          }
         }
         break
       case 'tool_calls':
         break
       case 'tool_start':
         addToolEvent(data.name)
+        useSessionStore.getState().setActivity(data.name === 'web_search' ? 'Searching the web' : `Running ${data.name}`)
         break
       case 'tool_result':
         updateToolEvent(data.name, data.result)
@@ -73,6 +80,10 @@ function wireSocket(ws: WebSocket) {
         setPlanApprovalPending({ id: data.id, plan: data.plan })
         break
       case 'answer':
+        {
+          const current = useSessionStore.getState().status
+          if (current && data.usage) setStatus({ ...current, last_usage: data.usage })
+        }
         addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
         setStreaming(false)
         resetStreaming()
@@ -192,6 +203,11 @@ export function useWebSocket() {
   _queryClient = queryClient
 
   const send = useCallback((msg: WSClientMessage) => {
+    if (msg.type === 'chat') {
+      useSessionStore.getState().resetStreaming()
+      useSessionStore.getState().setActivity('Working')
+      useSessionStore.getState().setStreaming(true)
+    }
     if (!sharedWs || sharedWs.readyState !== WebSocket.OPEN) {
       ensureConnection()
       // Retry once the socket opens (or drop if it never connects).
@@ -208,7 +224,7 @@ export function useWebSocket() {
     consumers += 1
     disposed = false
     ensureConnection()
-    if (consumers === 1) void syncSession()
+    if (consumers === 1) void syncSession(true)
     return () => {
       consumers -= 1
       if (consumers <= 0) {
