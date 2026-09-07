@@ -1654,6 +1654,15 @@ class ModeBody(BaseModel):
 # no separate /plan entry point - the picker is the only door into a plan session.
 _WEB_PERMISSION_MODES = {"plan-only", "readonly", "full-auto"}
 
+# The modes an approved plan may run in. Approving into plan-only would leave the
+# work unrunnable, so it is not offered here even though /api/mode accepts it.
+_PLAN_RUN_MODES = {"readonly", "full-auto"}
+
+# How long a turn blocks on a human. Reading a proposed plan takes longer than
+# okaying one file write, so the plan prompt waits longer than a tool escalation.
+ESCALATION_WAIT_SECONDS = 300
+PLAN_APPROVAL_WAIT_SECONDS = 1800
+
 
 @app.post("/api/mode")
 async def set_mode(body: ModeBody):
@@ -1891,7 +1900,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                           "id": esc_id}),
             loop,
         )
-        entry["event"].wait(timeout=300)
+        entry["event"].wait(timeout=ESCALATION_WAIT_SECONDS)
         entry = _pending_approvals.pop(esc_id, entry)
         approved = entry.get("approved", False)
         if approved:
@@ -1912,7 +1921,13 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         return on_escalation("plan", escalation_text)
 
     def _plan_on_approval(escalation_text):
-        """Plan (execute_plan) approval — keyed like tool escalations."""
+        """Plan (execute_plan) approval — keyed like tool escalations.
+
+        Returns the permission mode the approved plan runs in, or "" to stay in
+        plan mode. present_plan feeds this straight to set_permission_mode, so a
+        bool would set PERMISSION_MODE to True and silently break every mode
+        gate; the mode also has to be one the browser is allowed to ask for.
+        """
         plan_id = f"plan-{int(time.time()*1000)}-{id(escalation_text)}"
         entry = {"event": threading.Event(), "mode": ""}
         _pending_plan_approvals[plan_id] = entry
@@ -1921,9 +1936,10 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                           "id": plan_id}),
             loop,
         )
-        entry["event"].wait(timeout=300)
+        entry["event"].wait(timeout=PLAN_APPROVAL_WAIT_SECONDS)
         entry = _pending_plan_approvals.pop(plan_id, entry)
-        return entry.get("mode", "") == "approved"
+        mode = entry.get("mode", "")
+        return mode if mode in _PLAN_RUN_MODES else ""
 
     def on_answer(answer):
         elapsed = time.time() - turn_start

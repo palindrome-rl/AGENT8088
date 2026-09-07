@@ -1,8 +1,8 @@
 import { useMemo, useState, useRef, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2, ChevronDown, Shield } from 'lucide-react'
+import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2, ChevronDown, Shield, Pencil, X, ListPlus } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
-import { useWebSocket } from '@/hooks/useWebSocket'
+import { useWebSocket, drainPromptQueue } from '@/hooks/useWebSocket'
 import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
@@ -53,8 +53,12 @@ export function PromptBar() {
   const [modeChanging, setModeChanging] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const { isStreaming, sessionName, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult } = useSessionStore()
+  const { isStreaming, sessionName, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult,
+    promptQueue, queuePaused, enqueuePrompt, updateQueuedPrompt, removeQueuedPrompt, clearQueue,
+    setQueuePaused } = useSessionStore()
   const { send: wsSend } = useWebSocket()
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingText, setEditingText] = useState('')
   const { data: commands = [] } = useCommandCatalog()
   const { rawPanelOpen, toggleRawPanel, setRawPanelOpen } = useUIStore()
   const queryClient = useQueryClient()
@@ -183,11 +187,69 @@ export function PromptBar() {
     }
   }
 
+  const startEditing = (id: string, current: string) => {
+    setEditingId(id)
+    setEditingText(current)
+  }
+
+  const commitEditing = () => {
+    if (!editingId) return
+    const next = editingText.trim()
+    // An emptied prompt is a deletion — keeping a blank row that sends nothing
+    // would be worse than either outcome.
+    if (next) updateQueuedPrompt(editingId, next)
+    else removeQueuedPrompt(editingId)
+    setEditingId(null)
+    setEditingText('')
+  }
+
+  const cancelEditing = () => {
+    setEditingId(null)
+    setEditingText('')
+  }
+
+  const resumeQueue = () => {
+    setQueuePaused(false)
+    drainPromptQueue()
+  }
+
+  const resetComposer = () => {
+    setText('')
+    setDismissed(false)
+    setPlusOpen(false)
+    setShowImageUpload(false)
+    setPasteImage(null)
+    setAttachments((items) => items.filter((attachment) => attachment.state === 'error'))
+  }
+
   const handleSend = async () => {
     const trimmed = text.trim()
     const readyAttachments = attachments.filter((attachment) => attachment.state === 'ready' && attachment.id)
-    if ((!trimmed && readyAttachments.length === 0) || isStreaming || attachments.some((attachment) => attachment.state === 'uploading')) return
+    if ((!trimmed && readyAttachments.length === 0) || attachments.some((attachment) => attachment.state === 'uploading')) return
     setSessionError('')
+
+    // A turn is already running and the backend refuses a second one, so the
+    // prompt waits in the queue instead of being dropped. The session is
+    // created now rather than at dispatch time, which keeps the dispatcher
+    // (in the socket handler) free of async work.
+    if (isStreaming) {
+      const queuedText = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
+      if (!queuedText.startsWith('/')) {
+        try {
+          await ensureSession(queuedText)
+        } catch (error) {
+          setSessionError(error instanceof Error ? error.message : 'Could not create a session')
+          return
+        }
+      }
+      enqueuePrompt({
+        kind: queuedText.startsWith('/') ? 'command' : 'chat',
+        text: queuedText,
+        attachmentIds: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []),
+      })
+      resetComposer()
+      return
+    }
     if (trimmed.startsWith('/')) {
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
       if (cmd.toLowerCase() === 'raw') {
@@ -207,12 +269,7 @@ export function PromptBar() {
       addMessage({ role: 'user', content: message })
       wsSend({ type: 'chat', text: message, attachments: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []) })
     }
-    setText('')
-    setDismissed(false)
-    setPlusOpen(false)
-    setShowImageUpload(false)
-    setPasteImage(null)
-    setAttachments((items) => items.filter((attachment) => attachment.state === 'error'))
+    resetComposer()
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -260,6 +317,107 @@ export function PromptBar() {
       {sessionError && (
         <div role="alert" className="mx-auto mb-2 max-w-2xl px-4 text-xs text-red-500 dark:text-red-400">
           {sessionError}
+        </div>
+      )}
+
+      {/* ── prompt queue ───────────────────────────────── */}
+      {promptQueue.length > 0 && (
+        <div className="mx-auto mb-2 max-w-2xl px-4">
+          <div className="overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900">
+            <div className="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800/60 px-3 py-1.5">
+              <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                Queued · {promptQueue.length}
+                {queuePaused && ' · paused'}
+              </span>
+              <div className="flex items-center gap-1">
+                {queuePaused && (
+                  <button
+                    type="button"
+                    aria-label="Resume queue"
+                    onClick={resumeQueue}
+                    className="rounded-md px-2 py-0.5 text-[11px] text-brand-cyan transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/60"
+                  >
+                    Resume
+                  </button>
+                )}
+                <button
+                  type="button"
+                  aria-label="Clear queue"
+                  onClick={clearQueue}
+                  className="rounded-md px-2 py-0.5 text-[11px] text-zinc-500 transition-colors hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800/60"
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+            {queuePaused && (
+              <p role="status" className="px-3 py-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                The last turn stopped before finishing, so the queue is holding.
+                Resume to run the next prompt.
+              </p>
+            )}
+            <ul>
+              {promptQueue.map((queued, index) => (
+                <li
+                  key={queued.id}
+                  className="flex items-start gap-2 border-b border-zinc-100 px-3 py-1.5 last:border-b-0 dark:border-zinc-800/40"
+                >
+                  <span className="mt-0.5 w-4 shrink-0 text-[11px] text-zinc-400 dark:text-zinc-500">
+                    {index + 1}
+                  </span>
+                  {editingId === queued.id ? (
+                    <textarea
+                      autoFocus
+                      aria-label="Edit queued prompt"
+                      value={editingText}
+                      onChange={(e) => setEditingText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault()
+                          commitEditing()
+                        } else if (e.key === 'Escape') {
+                          e.preventDefault()
+                          cancelEditing()
+                        }
+                      }}
+                      onBlur={commitEditing}
+                      rows={1}
+                      className="min-h-[24px] flex-1 resize-none bg-transparent text-[13px] text-zinc-800 outline-none dark:text-zinc-100"
+                    />
+                  ) : (
+                    <span
+                      className={cn('flex-1 whitespace-pre-wrap break-words text-[13px]',
+                        queued.kind === 'command'
+                          ? 'font-mono text-brand-cyan'
+                          : 'text-zinc-700 dark:text-zinc-200')}
+                    >
+                      {queued.text}
+                    </span>
+                  )}
+                  {editingId !== queued.id && (
+                    <div className="flex shrink-0 items-center gap-0.5">
+                      <button
+                        type="button"
+                        aria-label={`Edit queued prompt ${index + 1}`}
+                        onClick={() => startEditing(queued.id, queued.text)}
+                        className="rounded-md p-1 text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800/60 dark:hover:text-zinc-200"
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Remove queued prompt ${index + 1}`}
+                        onClick={() => removeQueuedPrompt(queued.id)}
+                        className="rounded-md p-1 text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-red-500 dark:hover:bg-zinc-800/60"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
       )}
       {/* ── / command menu ─────────────────────────────── */}
@@ -486,6 +644,20 @@ export function PromptBar() {
                   <Mic className="h-4 w-4" />
                 )}
               </button>
+
+              {/* Queue — only while a turn is running, where Send is Stop and
+                  Enter would otherwise be the sole way to queue a prompt. */}
+              {isStreaming && canSend && (
+                <button
+                  type="button"
+                  aria-label="Add to queue"
+                  title="Add to queue"
+                  onClick={() => void handleSend()}
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-zinc-200 text-zinc-600 transition-all duration-200 hover:bg-zinc-300 active:scale-95 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                >
+                  <ListPlus className="h-4 w-4" />
+                </button>
+              )}
 
               {/* Send — tactile square */}
               <button
