@@ -11,7 +11,7 @@ try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
     pass
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
@@ -3375,7 +3375,8 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
         return ("Plan not approved: this session has no way to ask the user "
                 "(non-interactive). Nothing was written or run. Report the plan "
                 "to the user as your answer instead.")
-    chosen = _plan_on_approval(plan_text)
+    with _human_wait():
+        chosen = _plan_on_approval(plan_text)
     if not chosen:
         return ("Plan not approved — still in plan mode. Revise the plan and call "
                 "present_plan again, or answer the user's questions about it. "
@@ -3433,12 +3434,13 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         for idx, step_text, tool_name in pre_parsed:
             on_step(idx, total, step_text, tool_name, "pending", None)
         if has_gated:
-            approved = on_escalation(
-                request_escalation(
-                    "edit", ["(plan)"], "plan_approval",
-                    f"Plan has {total} step(s). Review the checklist above and approve to execute."
+            with _human_wait():
+                approved = on_escalation(
+                    request_escalation(
+                        "edit", ["(plan)"], "plan_approval",
+                        f"Plan has {total} step(s). Review the checklist above and approve to execute."
+                    )
                 )
-            )
             if not approved:
                 return "Plan denied — staying in plan-only mode."
             _plan_execution_grant = True
@@ -3497,7 +3499,9 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
         # approval prompt at all — it just came back blocked.
         if (_unwrap_untrusted(result).lstrip().startswith("ESCALATION_REQUEST\x1f")
                 and callable(on_escalation)):
-            if on_escalation(result):
+            with _human_wait():
+                step_approved = on_escalation(result)
+            if step_approved:
                 try:
                     result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
                 except Exception as exc:
@@ -8456,6 +8460,9 @@ class _TurnBudget:
         self.cost_in = cost_in
         self.cost_out = cost_out
         self.started = time.monotonic()
+        # Seconds the turn sat blocked on a human. Discounted from the wall
+        # clock, because this budget bounds agent work, not the user's reading.
+        self.idle_seconds = 0.0
         self.input_tokens = 0
         self.output_tokens = 0
         # role -> [input, output]. Lets a caller answer "what did verification
@@ -8469,6 +8476,15 @@ class _TurnBudget:
         slot = self.role_tokens.setdefault(_active_role, [0, 0])
         slot[0] += prompt
         slot[1] += completion
+
+    def credit_idle(self, seconds) -> None:
+        """Discount time the turn spent waiting on a person."""
+        try:
+            spent = float(seconds or 0.0)
+        except (TypeError, ValueError):
+            return
+        if spent > 0:
+            self.idle_seconds += spent
 
     def role_total(self, role: str) -> int:
         spent = self.role_tokens.get(role)
@@ -8507,7 +8523,7 @@ class _TurnBudget:
     def exceeded(self):
         """Return a human-readable reason string, or None if within budget."""
         if self.max_seconds:
-            elapsed = time.monotonic() - self.started
+            elapsed = time.monotonic() - self.started - self.idle_seconds
             if elapsed > self.max_seconds:
                 return (f"Turn budget exceeded: {elapsed:.0f} seconds elapsed "
                         f"(limit {self.max_seconds}). Raise max_turn_seconds in "
@@ -8519,6 +8535,24 @@ class _TurnBudget:
             return (f"Turn budget exceeded: ${self.cost_usd:.4f} spent "
                     f"(limit ${self.max_cost:.4f}). Raise max_turn_cost_usd in config.txt.")
         return None
+
+
+@contextmanager
+def _human_wait():
+    """Time spent inside is not charged to the turn's wall-clock budget.
+
+    Approval prompts block inside the turn, on whichever surface is asking — a
+    console.input() in the CLI, a threading.Event in the browser. Plan mode is
+    the one mode with a wall-clock budget on by default, so charging the user's
+    reading to it meant a plan approved after a few minutes' thought had no
+    budget left to run in and died reporting "Turn budget exceeded".
+    """
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        if _active_budget is not None:
+            _active_budget.credit_idle(time.monotonic() - started)
 
 
 # ---------------------------------------------------------------------------
@@ -9203,7 +9237,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_result(name, result)
 
             if blocked and on_escalation:
-                if on_escalation(name, result):
+                with _human_wait():
+                    granted = on_escalation(name, result)
+                if granted:
                     note_approval()
                     messages.append({"role": "user", "content":
                         "Permission granted. Retry the EXACT same tool call that was blocked. "
