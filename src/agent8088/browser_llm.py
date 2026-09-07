@@ -157,12 +157,59 @@ class Agent8088ChatModel(ChatLiteLLM):
     # serving GLM), "auto" pays one full LLM round-trip per step to rediscover
     # that, then re-sends the whole request. The fallback path handles both.
     structured_output_mode: str = "auto"
+    # Adaptive completion cap, TCP-AIMD style. The old fixed cap (whether the
+    # 65000 inherited from the main loop or a hard 4096) fails in both
+    # directions: too high lets a looping model decode for minutes inside one
+    # step; too low truncates a legitimate long answer (or a reasoning-heavy
+    # model's action JSON) and burns a wasted retried step. Instead the model
+    # tunes its own cap from what the task actually uses:
+    #   - a response that hit the cap (finish_reason 'length') proves the cap
+    #     was too small -> multiply the cap (it doubles, then re-clamps);
+    #   - a response that finished normally at usage U proves U was enough ->
+    #     shrink the cap toward ~1.5x U, slowly, so a long final answer after
+    #     many short action calls still has room (that is why the shrink is
+    #     geometric toward a target rather than an immediate drop).
+    # Everything is clamped to [min_completion_tokens, max_completion_tokens]
+    # - the floor keeps the first call from failing on a verbose model, and
+    # the ceiling bounds a pathological run the AIMD logic can't see.
+    min_completion_tokens: int = 1024
+    max_completion_tokens: int = 16384
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Whether the caller set an explicit max_tokens at all: None means
+        # ChatLiteLLM's own default behavior, which we must not override.
+        self._seeded_max_tokens = self.max_tokens
+        self._adaptive_cap = max(self.min_completion_tokens, self.max_tokens or 0)
+
+    def _record_completion_usage(self, finish_reason, completion_tokens):
+        """Adapt the working cap to what this call actually needed."""
+        if not completion_tokens:
+            return
+        if finish_reason == "length" and completion_tokens >= self._adaptive_cap - 1:
+            # Ran out of room: this task legitimately needs more.
+            self._adaptive_cap = min(self._adaptive_cap * 2, self.max_completion_tokens)
+        else:
+            # Finished on its own: what it used, plus headroom, was enough.
+            target = max(self.min_completion_tokens, int(completion_tokens * 1.5))
+            self._adaptive_cap = int(max(target, self._adaptive_cap * 0.75))
+        self._adaptive_cap = max(self.min_completion_tokens,
+                                 min(self._adaptive_cap, self.max_completion_tokens))
+
+    def _completion_cap(self) -> Optional[int]:
+        return self._adaptive_cap if self._seeded_max_tokens is not None else None
 
     async def ainvoke(self, messages, output_format=None, **kwargs):
         if self.budget is not None:
             over = self.budget.exceeded()
             if over:
                 raise RuntimeError(over)
+        # ChatLiteLLM's own ainvoke reads self.max_tokens (it ignores kwargs),
+        # and both local request paths do the same via _completion_cap(), so
+        # the working cap is installed on the field for the duration of this
+        # call. max_tokens now only seeds the starting point and the clamps.
+        if self._seeded_max_tokens is not None:
+            self.max_tokens = self._completion_cap()
         if output_format is not None and self.structured_output_mode == "json_object":
             result = await self._ainvoke_json_object_fallback(
                 messages, output_format, **kwargs)
@@ -170,6 +217,11 @@ class Agent8088ChatModel(ChatLiteLLM):
             result = await self._ainvoke_auto(messages, output_format, **kwargs)
         if self.budget is not None and result.usage is not None:
             self.budget.add_tokens(result.usage.prompt_tokens, result.usage.completion_tokens)
+        # Adapt AFTER the response is charged, so budget accounting is exact.
+        self._record_completion_usage(
+            getattr(result, "stop_reason", None),
+            getattr(result.usage, "completion_tokens", 0)
+            if result.usage is not None else 0)
         return result
 
     async def _ainvoke_auto(self, messages, output_format, **kwargs):
@@ -220,8 +272,9 @@ class Agent8088ChatModel(ChatLiteLLM):
         }
         if self.temperature is not None:
             params["temperature"] = self.temperature
-        if self.max_tokens is not None:
-            params["max_tokens"] = self.max_tokens
+        cap = self._completion_cap()
+        if cap is not None:
+            params["max_tokens"] = cap
         if self.api_key:
             params["api_key"] = self.api_key
         if self.api_base:
@@ -275,8 +328,9 @@ class Agent8088ChatModel(ChatLiteLLM):
         }
         if self.temperature is not None:
             params["temperature"] = self.temperature
-        if self.max_tokens is not None:
-            params["max_tokens"] = self.max_tokens
+        cap = self._completion_cap()
+        if cap is not None:
+            params["max_tokens"] = cap
         if self.api_key:
             params["api_key"] = self.api_key
         if self.api_base:
@@ -297,6 +351,8 @@ def build_browser_chat_model(
     client, model_name: str, budget=None, max_tokens: Optional[int] = None,
     extra_body: Optional[dict] = None,
     structured_output_mode: str = "auto",
+    min_completion_tokens: Optional[int] = None,
+    max_completion_tokens: Optional[int] = None,
 ) -> Agent8088ChatModel:
     """Build a browser-use chat model that targets the exact same
     provider/model engine.py's main loop is already configured for.
@@ -324,6 +380,10 @@ def build_browser_chat_model(
     response_format=json_schema."""
     kwargs = {"budget": budget, "extra_body": extra_body,
               "structured_output_mode": structured_output_mode}
+    if min_completion_tokens is not None:
+        kwargs["min_completion_tokens"] = min_completion_tokens
+    if max_completion_tokens is not None:
+        kwargs["max_completion_tokens"] = max_completion_tokens
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
     if isinstance(client, dict) and client.get("api_mode") == "litellm":

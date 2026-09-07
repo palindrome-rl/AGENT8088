@@ -91,6 +91,18 @@ timeout_seconds=120
 # before failing. Raise this only for a model that visibly reasons at length
 # before emitting the action JSON.
 # browser_llm_max_tokens=4096
+# The completion cap is ADAPTIVE, not fixed: it starts at
+# browser_llm_max_tokens, doubles when a response is cut off by the cap, and
+# decays toward ~1.5x what responses actually use, always clamped inside
+# [browser_llm_min_tokens, browser_llm_max_completion_tokens]. So a task
+# that needs more room gets it automatically, and a looping model still
+# fails fast.
+# browser_llm_min_tokens=1024
+# browser_llm_max_completion_tokens=16384
+# The step ceiling adapts to the task too: read/extract tasks get half the
+# configured ceiling (a wandering read-only run fails fast instead of
+# burning 25 steps), interactive tasks (click/fill/submit/login/checkout)
+# get the full ceiling. Disable with AGENT8088_BROWSER_ADAPTIVE_STEPS=0.
 # How the browsing model's action-JSON calls request their output format.
 # auto (default): json_schema first, json_object fallback for providers that
 # ignore schemas. json_object: skip the first attempt - set this for a

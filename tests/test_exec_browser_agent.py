@@ -205,11 +205,15 @@ def fake_browser_use(monkeypatch):
         return types.SimpleNamespace(**kwargs)
 
     def fake_build_browser_chat_model(client, model_name, budget=None, max_tokens=None,
-                                      extra_body=None, structured_output_mode="auto"):
+                                      extra_body=None, structured_output_mode="auto",
+                                      min_completion_tokens=None,
+                                      max_completion_tokens=None):
         llm_calls.append({"client": client, "model_name": model_name,
                           "budget": budget, "max_tokens": max_tokens,
                           "extra_body": extra_body,
-                          "structured_output_mode": structured_output_mode})
+                          "structured_output_mode": structured_output_mode,
+                          "min_completion_tokens": min_completion_tokens,
+                          "max_completion_tokens": max_completion_tokens})
         return object()
 
     monkeypatch.setattr(browser_use, "Agent", _FakeAgent)
@@ -642,6 +646,40 @@ def test_env_overrides_step_timeout_and_screenshots(fake_browser_use, monkeypatc
     assert fake_browser_use.agents[0].max_steps == 3
     assert fake_browser_use.agents[0].kwargs["use_vision"] is True
     assert A._browser_task_timeout() == 7
+
+
+def test_step_ceiling_adapts_to_the_task_shape(fake_browser_use, monkeypatch):
+    """A read-only task ('read the page') is one navigation plus reading -
+    it gets half the configured ceiling so a wandering run fails fast; an
+    interactive task gets the full ceiling because it legitimately needs a
+    page per action plus retries."""
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 25)
+    monkeypatch.delenv("AGENT8088_BROWSER_ADAPTIVE_STEPS", raising=False)
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    assert fake_browser_use.agents[-1].max_steps == 12  # half of 25, floored shape
+
+    asyncio.run(A._run_browser_agent(
+        "https://example.com", "log in with the credentials and submit the form"))
+    assert fake_browser_use.agents[-1].max_steps == 25  # interactive: full ceiling
+
+
+def test_step_ceiling_adaptation_can_be_disabled(fake_browser_use, monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 25)
+    monkeypatch.setenv("AGENT8088_BROWSER_ADAPTIVE_STEPS", "0")
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    assert fake_browser_use.agents[-1].max_steps == 25
+
+
+def test_step_ceiling_floor_keeps_tiny_ceilings_usable(monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 8)
+    monkeypatch.delenv("AGENT8088_BROWSER_ADAPTIVE_STEPS", raising=False)
+    # 8 // 2 = 4 would be below the floor of 5.
+    assert A._browser_task_step_ceiling("read the page") == 5
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 3)
+    # A configured ceiling below the floor always wins - never ABOVE config.
+    assert A._browser_task_step_ceiling("read the page") == 3
 
 
 def test_browser_output_marks_truncation_and_keeps_its_own_note_outside_web_content(

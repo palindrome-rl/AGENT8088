@@ -3987,6 +3987,16 @@ BROWSER_SCREENSHOTS = APP_CONFIG.get("browser_screenshots", "0").strip().lower()
 # fast, cheap failure instead. Raise it only for a model that spends much of
 # its output on visible reasoning before the action JSON.
 BROWSER_LLM_MAX_TOKENS = _int_config("browser_llm_max_tokens", 4096)
+# Clamp bounds for the adaptive completion cap (see Agent8088ChatModel):
+# the working cap starts at browser_llm_max_tokens, doubles when a response
+# is cut off by the cap, decays toward ~1.5x observed usage when responses
+# finish on their own, and always stays inside
+# [browser_llm_min_tokens, browser_llm_max_completion_tokens]. The floor
+# keeps the first call from failing on a verbose model; the ceiling bounds a
+# pathological loop the adaptation can't see.
+BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 1024)
+BROWSER_LLM_MAX_COMPLETION_TOKENS = _int_config(
+    "browser_llm_max_completion_tokens", min(16384, MAX_COMPLETION_TOKENS))
 # How the browsing model's structured (action-JSON) calls request their
 # format. "auto" (default): json_schema first, json_object fallback for
 # providers that ignore it. "json_object": skip the first attempt entirely -
@@ -4212,15 +4222,53 @@ def _browser_max_steps() -> int:
     cap it without editing config.txt (the batch-size and headless knobs already
     work this way). A bad value falls back rather than crashing a run mid-task.
 
-    Only a ceiling: browse_page still stops as soon as the task is done, and the
-    wall-clock timeout still applies on top - this just bounds how many steps a
-    task that never finishes may burn."""
+    Only a ceiling: browse_page still stops as soon as the task is done, and
+    the wall-clock timeout still applies on top - this just bounds how many
+    steps a task that never finishes may burn."""
     raw = os.environ.get("AGENT8088_BROWSER_MAX_STEPS", "").strip()
     try:
         value = int(raw) if raw else BROWSER_MAX_STEPS
     except ValueError:
         value = BROWSER_MAX_STEPS
     return max(1, value)
+
+
+# Task shapes that demonstrably need more steps: anything that has to change
+# server-side state (auth, forms, checkout) navigates at least one page per
+# action plus retries, so it gets the full configured ceiling. Everything
+# else - read, extract, summarize, search - is one navigation plus reading,
+# and gets half the ceiling so a wandering read-only run fails fast instead
+# of burning the interactive budget. Set
+# AGENT8088_BROWSER_ADAPTIVE_STEPS=0 to always use the full ceiling.
+_INTERACTIVE_TASK_RE = re.compile(
+    r"\b(click|fill|type|enter|submit|log\s?in|sign\s?in|sign\s?up|register|"
+    r"checkout|cart|basket|add\s+to\s+cart|download|upload|form|button|"
+    r"password|username|email|pay|purchase|buy|order|vote|post|comment|"
+    r"subscribe|follow|like|share)\w*\b", re.IGNORECASE)
+
+
+def _browser_task_step_ceiling(task: str) -> int:
+    """The step ceiling for THIS task: the configured ceiling, halved for
+    read-only tasks, never below 5 and never above the configured value.
+
+    A fixed 25-step budget for every call is the wrong shape for the two
+    very different tasks browse_page serves: an interactive flow (login,
+    checkout) legitimately needs most of it, while "open this page and tell
+    me what it says" is one navigation plus reading - giving it the same
+    ceiling means a confused model wanders for 25 steps on a task that
+    should have been over in 2. Halving keeps headroom for multi-page
+    reads (pagination, 'read these three links') while bounding the
+    wanderer; the floor of 5 keeps a tiny configured ceiling from becoming
+    unusable, and the configured value itself always wins as the hard max.
+    """
+    ceiling = _browser_max_steps()
+    override = os.environ.get(
+        "AGENT8088_BROWSER_ADAPTIVE_STEPS", "").strip().lower()
+    if override in ("0", "false", "no", "off"):
+        return ceiling
+    if _INTERACTIVE_TASK_RE.search(task or ""):
+        return ceiling
+    return max(1, min(ceiling, max(5, ceiling // 2)))
 
 
 def _browser_task_timeout() -> int:
@@ -4565,6 +4613,8 @@ async def _run_browser_agent(url: str, task: str,
         llm = build_browser_chat_model(
             client, MODEL_NAME, budget=_active_budget,
             max_tokens=BROWSER_LLM_MAX_TOKENS,
+            min_completion_tokens=BROWSER_LLM_MIN_TOKENS,
+            max_completion_tokens=BROWSER_LLM_MAX_COMPLETION_TOKENS,
             extra_body=_browser_llm_extra_body(),
             structured_output_mode=BROWSER_STRUCTURED_OUTPUT_MODE)
         profile = BrowserProfile(
@@ -4627,7 +4677,7 @@ async def _run_browser_agent(url: str, task: str,
             use_judge=False,
         )
         history = await asyncio.wait_for(
-            agent.run(max_steps=_browser_max_steps()),
+            agent.run(max_steps=_browser_task_step_ceiling(task)),
             timeout=_browser_task_timeout(),
         )
     finally:
