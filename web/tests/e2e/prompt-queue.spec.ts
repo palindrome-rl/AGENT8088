@@ -108,6 +108,9 @@ test('the queue dispatches the next prompt when the turn ends', async ({ page })
   await type(page, 'queued two')
 
   await push(page, { type: 'answer', text: 'done', usage: { seconds: 1, tokens: 1 } })
+  await expect(page.getByRole('listitem').filter({ hasText: 'queued one' })).toBeVisible()
+  expect((await sent(page)).filter((f) => f.type === 'chat')).toHaveLength(0)
+  await push(page, { type: 'turn_complete' })
 
   await expect.poll(async () => (await sent(page)).filter((f) => f.type === 'chat').length)
     .toBe(1)
@@ -131,6 +134,7 @@ test('a queued prompt can be edited before it is sent', async ({ page }) => {
   await expect(page.getByRole('listitem').filter({ hasText: 'corrected prompt' })).toBeVisible()
 
   await push(page, { type: 'answer', text: 'done', usage: { seconds: 1, tokens: 1 } })
+  await push(page, { type: 'turn_complete' })
   await expect.poll(async () => (await sent(page)).filter((f) => f.type === 'chat').length).toBe(1)
   const frames = await sent(page)
   expect(frames.filter((f) => f.type === 'chat')[0].text).toBe('corrected prompt')
@@ -220,6 +224,7 @@ test('slash commands queue too and dispatch as commands', async ({ page }) => {
   await expect(page.getByRole('listitem').filter({ hasText: '/status' })).toBeVisible()
 
   await push(page, { type: 'answer', text: 'done', usage: { seconds: 1, tokens: 1 } })
+  await push(page, { type: 'turn_complete' })
 
   await expect.poll(async () => (await sent(page)).filter((f) => f.type === 'command').length).toBe(1)
   const frames = await sent(page)

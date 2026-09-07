@@ -1726,6 +1726,20 @@ async def websocket_endpoint(ws: WebSocket):
     def _busy() -> bool:
         return turn is not None and not turn.done()
 
+    async def _notify_turn_complete():
+        try:
+            await ws.send_json({"type": "turn_complete"})
+        except Exception:
+            # The socket may have closed between the turn finishing and this
+            # notification being sent.
+            pass
+
+    def _turn_finished(done: asyncio.Task):
+        nonlocal turn
+        if turn is done:
+            turn = None
+        asyncio.create_task(_notify_turn_complete())
+
     try:
         while True:
             msg = await ws.receive_json()
@@ -1741,6 +1755,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 handler = _handle_chat if msg_type == "chat" else _handle_command
                 turn = asyncio.create_task(_run_turn(handler, ws, msg, A, C))
+                turn.add_done_callback(_turn_finished)
             elif msg_type == "interrupt":
                 # Signal the agent thread; run_agent polls _interrupt_event.is_set.
                 _interrupt_event.set()

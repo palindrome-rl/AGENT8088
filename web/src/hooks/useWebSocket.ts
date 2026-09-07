@@ -97,13 +97,8 @@ function wireSocket(ws: WebSocket) {
           if (current && data.usage) setStatus({ ...current, last_usage: data.usage })
         }
         addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
-        setStreaming(false)
-        resetStreaming()
-        drainPromptQueue()
         break
       case 'interrupted':
-        setStreaming(false)
-        resetStreaming()
         pauseQueueIfPending()
         break
       case 'error':
@@ -111,9 +106,12 @@ function wireSocket(ws: WebSocket) {
         setApprovalPending(null)
         setPlanApprovalPending(null)
         addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}` })
+        pauseQueueIfPending()
+        break
+      case 'turn_complete':
         setStreaming(false)
         resetStreaming()
-        pauseQueueIfPending()
+        drainPromptQueue()
         break
       case 'session_saved':
         if (data.name) setSessionName(data.name)
@@ -168,8 +166,6 @@ function wireSocket(ws: WebSocket) {
             data.result.trim().length > 0) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
-        // A queued command ends its turn here rather than with `answer`.
-        drainPromptQueue()
         break
     }
   }
@@ -243,7 +239,7 @@ async function syncSession(includeHistory = false) {
 
 /** Send one frame, or hold it in the outbox until the socket is back. */
 function sendFrame(msg: WSClientMessage): boolean {
-  if (msg.type === 'chat') {
+  if (msg.type === 'chat' || msg.type === 'command') {
     useSessionStore.getState().resetStreaming()
     useSessionStore.getState().setActivity('Working')
     useSessionStore.getState().setStreaming(true)
