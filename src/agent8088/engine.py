@@ -4782,6 +4782,13 @@ def _which_executable(name: str) -> str | None:
     return shutil.which(name)
 
 
+# Memoized _playwright_chromium_executable results: (PLAYWRIGHT_BROWSERS_PATH
+# override, data dir) -> executable path. See that function for why only
+# successful lookups are cached and why hits are re-existence-checked.
+_chromium_executable_lock = threading.Lock()
+_chromium_executable_cache: dict = {}
+
+
 def _playwright_chromium_executable() -> str | None:
     """Locate Playwright's Chromium, or None when it is not installed.
 
@@ -4802,10 +4809,24 @@ def _playwright_chromium_executable() -> str | None:
 
     An explicit PLAYWRIGHT_BROWSERS_PATH always wins: that is the operator
     telling us where their browsers live.
+
+    The result is memoized per (explicit env override, data dir): each probe
+    spins up a whole Playwright Node driver (~200ms measured) just to read a
+    path, and browse_page pays that on every call. Only successful lookups
+    are cached, so the retry-after-install case below still re-probes; a
+    cached path is existence-checked on every hit, so a browser uninstalled
+    mid-session falls back to a fresh probe rather than a stale path.
     """
     from playwright.sync_api import sync_playwright
 
     explicit = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    data_dir = str(_agent_data_dir())
+    key = (explicit, data_dir)
+    with _chromium_executable_lock:
+        cached = _chromium_executable_cache.get(key)
+    if cached and os.path.exists(cached):
+        return cached
+
     private = str(_agent_data_dir() / "playwright-browsers")
     # None means "leave the variable unset and let Playwright use its default".
     candidates = [explicit] if explicit else [private, None]
@@ -4818,6 +4839,8 @@ def _playwright_chromium_executable() -> str | None:
         with sync_playwright() as p:
             candidate = p.chromium.executable_path
         if candidate and os.path.exists(candidate):
+            with _chromium_executable_lock:
+                _chromium_executable_cache[key] = candidate
             return candidate
 
     # Nothing found. Restore the variable to however we found it, so this stays
