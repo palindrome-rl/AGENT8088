@@ -124,6 +124,98 @@ def test_a_client_reset_mid_request_is_not_logged_as_a_crash(capsys):
     assert "ConnectionResetError" not in captured.err
 
 
+def test_approved_address_is_memoized_and_reused_without_re_resolution(monkeypatch):
+    """A page pulls dozens of assets from the same hosts; re-running
+    getaddrinfo for every request cost a median ~20ms (160ms+ cold) each. The
+    second CONNECT to the same host:port must reuse the approved address
+    without resolving again - and the same check_address must still run on
+    the cached IP, so a policy flip is honoured even mid-browse."""
+    import agent8088.browser_proxy as bp
+
+    resolve_calls = []
+    real_getaddrinfo = bp.socket.getaddrinfo
+
+    def counting_getaddrinfo(host, *args, **kwargs):
+        # Only count proxy-side resolutions: the client's own connects to the
+        # proxy port go through this same monkeypatched socket module.
+        if args and args[0] != port:
+            resolve_calls.append(host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(bp.socket, "getaddrinfo", counting_getaddrinfo)
+
+    address_checks = []
+
+    proxy_url, stop = start_ssrf_filtering_proxy(
+        lambda url: None,
+        check_address=lambda host, port_, ip: address_checks.append(ip) or None)
+    port = int(proxy_url.rsplit(":", 1)[1])
+    upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    upstream.bind(("127.0.0.1", 0))
+    upstream.listen(4)
+    upstream_port = upstream.getsockname()[1]
+    try:
+        for _ in range(3):
+            client = socket.create_connection(("127.0.0.1", port), timeout=5)
+            client.sendall(
+                f"CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+            assert client.recv(4096).startswith(b"HTTP/1.1 200")
+            client.close()
+        assert resolve_calls == ["127.0.0.1"]  # resolved once, reused twice
+        assert address_checks == ["127.0.0.1"] * 3  # policy re-checked every time
+    finally:
+        stop()
+        upstream.close()
+
+
+def test_cached_address_that_stops_connecting_is_evicted_and_re_resolved(monkeypatch):
+    """A memoized address whose server has gone away must not wedge the
+    proxy: the cache entry is dropped and the host resolved fresh."""
+    import agent8088.browser_proxy as bp
+
+    resolve_calls = []
+    real_getaddrinfo = bp.socket.getaddrinfo
+
+    def counting_getaddrinfo(host, *args, **kwargs):
+        # Only count proxy-side resolutions: the client's own connects to the
+        # proxy port go through this same monkeypatched socket module.
+        if args and args[0] != port:
+            resolve_calls.append(host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(bp.socket, "getaddrinfo", counting_getaddrinfo)
+
+    proxy_url, stop = start_ssrf_filtering_proxy(lambda url: None)
+    port = int(proxy_url.rsplit(":", 1)[1])
+    gone = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    gone.bind(("127.0.0.1", 0))
+    gone_port = gone.getsockname()[1]
+    gone.close()  # nothing is listening here anymore
+    upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    upstream.bind(("127.0.0.1", 0))
+    upstream.listen(1)
+    upstream_port = upstream.getsockname()[1]
+    try:
+        # First CONNECT to a dead port: resolves, connect fails, not cached.
+        _connect_raw(port, f"127.0.0.1:{gone_port}")
+        assert resolve_calls == ["127.0.0.1"]
+        # CONNECT to the live port: resolves, connects, cached.
+        _connect_raw(port, f"127.0.0.1:{upstream_port}")
+        assert resolve_calls == ["127.0.0.1", "127.0.0.1"]
+        # Shut the upstream down so the cached address no longer connects.
+        upstream.close()
+        time.sleep(0.2)
+        _connect_raw(port, f"127.0.0.1:{upstream_port}")
+        # Cache hit failed to connect -> evicted -> resolved fresh.
+        assert resolve_calls == ["127.0.0.1"] * 3
+    finally:
+        stop()
+        try:
+            upstream.close()
+        except OSError:
+            pass
+
+
 def test_plain_http_get_to_blocked_target_is_refused():
     proxy_url, stop = start_ssrf_filtering_proxy(lambda url: "Blocked: test policy.")
     port = int(proxy_url.rsplit(":", 1)[1])

@@ -3978,6 +3978,44 @@ BROWSER_WINDOW_POSITION = APP_CONFIG.get("browser_window_position", "").strip()
 # not something to flip per run.
 BROWSER_SCREENSHOTS = APP_CONFIG.get("browser_screenshots", "0").strip().lower() in (
     "1", "true", "yes", "on")
+# Completion-token ceiling for the browsing model's own calls. Left unset it
+# used to inherit MAX_COMPLETION_TOKENS (65000): a value sized for the main
+# chat loop's long-form answers, and an invitation for a looping small model
+# to decode for minutes inside ONE browser step before anything stops it - an
+# action batch is ~300 tokens, and even a 25-step run's final result fits in
+# a few thousand. 4096 (ChatLiteLLM's own default) bounds a stuck step to a
+# fast, cheap failure instead. Raise it only for a model that spends much of
+# its output on visible reasoning before the action JSON.
+BROWSER_LLM_MAX_TOKENS = _int_config("browser_llm_max_tokens", 4096)
+# Clamp bounds for the adaptive completion cap (see Agent8088ChatModel):
+# the working cap starts at browser_llm_max_tokens, doubles when a response
+# is cut off by the cap, decays toward ~1.5x observed usage when responses
+# finish on their own, and always stays inside
+# [browser_llm_min_tokens, browser_llm_max_completion_tokens]. The floor
+# keeps the first call from failing on a verbose model; the ceiling bounds a
+# pathological loop the adaptation can't see.
+BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 1024)
+BROWSER_LLM_MAX_COMPLETION_TOKENS = _int_config(
+    "browser_llm_max_completion_tokens", min(16384, MAX_COMPLETION_TOKENS))
+# How the browsing model's structured (action-JSON) calls request their
+# format. "auto" (default): json_schema first, json_object fallback for
+# providers that ignore it. "json_object": skip the first attempt entirely -
+# for a provider known to ignore response_format=json_schema (observed:
+# Ollama Cloud serving GLM), "auto" pays one full LLM round-trip per step to
+# rediscover that, then re-sends everything. Anything unrecognized is "auto".
+BROWSER_STRUCTURED_OUTPUT_MODE = (
+    str(APP_CONFIG.get("browser_structured_output_mode", "auto")).strip().lower()
+    or "auto")
+if BROWSER_STRUCTURED_OUTPUT_MODE not in ("auto", "json_object"):
+    BROWSER_STRUCTURED_OUTPUT_MODE = "auto"
+# browser-use flash mode: a ~2.4KB system prompt instead of ~22KB (measured),
+# and an output schema stripped of thinking/evaluation/plan fields - so both
+# prefill AND decode shrink every step (est. 2-4x per-step LLM latency on a
+# small model). Off by default: small models also lose the reasoning
+# scaffolding those fields provide, so it trades reliability for speed and
+# must be A/B'd per model before enabling.
+BROWSER_FLASH_MODE = APP_CONFIG.get("browser_flash_mode", "0").strip().lower() in (
+    "1", "true", "yes", "on")
 
 # Where a browse has gone, captured from the SSRF proxy's on_visit hook. The
 # proxy is the one place that sees every request a browse makes (browser-use has
@@ -4184,15 +4222,53 @@ def _browser_max_steps() -> int:
     cap it without editing config.txt (the batch-size and headless knobs already
     work this way). A bad value falls back rather than crashing a run mid-task.
 
-    Only a ceiling: browse_page still stops as soon as the task is done, and the
-    wall-clock timeout still applies on top - this just bounds how many steps a
-    task that never finishes may burn."""
+    Only a ceiling: browse_page still stops as soon as the task is done, and
+    the wall-clock timeout still applies on top - this just bounds how many
+    steps a task that never finishes may burn."""
     raw = os.environ.get("AGENT8088_BROWSER_MAX_STEPS", "").strip()
     try:
         value = int(raw) if raw else BROWSER_MAX_STEPS
     except ValueError:
         value = BROWSER_MAX_STEPS
     return max(1, value)
+
+
+# Task shapes that demonstrably need more steps: anything that has to change
+# server-side state (auth, forms, checkout) navigates at least one page per
+# action plus retries, so it gets the full configured ceiling. Everything
+# else - read, extract, summarize, search - is one navigation plus reading,
+# and gets half the ceiling so a wandering read-only run fails fast instead
+# of burning the interactive budget. Set
+# AGENT8088_BROWSER_ADAPTIVE_STEPS=0 to always use the full ceiling.
+_INTERACTIVE_TASK_RE = re.compile(
+    r"\b(click|fill|type|enter|submit|log\s?in|sign\s?in|sign\s?up|register|"
+    r"checkout|cart|basket|add\s+to\s+cart|download|upload|form|button|"
+    r"password|username|email|pay|purchase|buy|order|vote|post|comment|"
+    r"subscribe|follow|like|share)\w*\b", re.IGNORECASE)
+
+
+def _browser_task_step_ceiling(task: str) -> int:
+    """The step ceiling for THIS task: the configured ceiling, halved for
+    read-only tasks, never below 5 and never above the configured value.
+
+    A fixed 25-step budget for every call is the wrong shape for the two
+    very different tasks browse_page serves: an interactive flow (login,
+    checkout) legitimately needs most of it, while "open this page and tell
+    me what it says" is one navigation plus reading - giving it the same
+    ceiling means a confused model wanders for 25 steps on a task that
+    should have been over in 2. Halving keeps headroom for multi-page
+    reads (pagination, 'read these three links') while bounding the
+    wanderer; the floor of 5 keeps a tiny configured ceiling from becoming
+    unusable, and the configured value itself always wins as the hard max.
+    """
+    ceiling = _browser_max_steps()
+    override = os.environ.get(
+        "AGENT8088_BROWSER_ADAPTIVE_STEPS", "").strip().lower()
+    if override in ("0", "false", "no", "off"):
+        return ceiling
+    if _INTERACTIVE_TASK_RE.search(task or ""):
+        return ceiling
+    return max(1, min(ceiling, max(5, ceiling // 2)))
 
 
 def _browser_task_timeout() -> int:
@@ -4535,8 +4611,12 @@ async def _run_browser_agent(url: str, task: str,
     agent = None
     try:
         llm = build_browser_chat_model(
-            client, MODEL_NAME, budget=_active_budget, max_tokens=MAX_COMPLETION_TOKENS,
-            extra_body=_browser_llm_extra_body())
+            client, MODEL_NAME, budget=_active_budget,
+            max_tokens=BROWSER_LLM_MAX_TOKENS,
+            min_completion_tokens=BROWSER_LLM_MIN_TOKENS,
+            max_completion_tokens=BROWSER_LLM_MAX_COMPLETION_TOKENS,
+            extra_body=_browser_llm_extra_body(),
+            structured_output_mode=BROWSER_STRUCTURED_OUTPUT_MODE)
         profile = BrowserProfile(
             user_data_dir=user_data_dir, executable_path=executable_path,
             **_browser_profile_kwargs(proxy_url))
@@ -4557,6 +4637,13 @@ async def _run_browser_agent(url: str, task: str,
             # model can call on its own and hit the same failure, so the choice
             # stays explicit - fully off, or fully on for a model that can see.
             use_vision=_browser_screenshots(),
+            # browser-use flash mode (browser_flash_mode=1): ~2.4KB system
+            # prompt instead of ~22KB, and an output schema with no
+            # thinking/evaluation/plan fields - both prefill and decode
+            # shrink every step. It also forces use_thinking off and removes
+            # the per-step evaluation fields small models lean on, so it is
+            # opt-in and should be A/B'd per model before enabling.
+            flash_mode=BROWSER_FLASH_MODE,
             # A free-form thinking field can consume a small model's entire
             # output budget before it emits a browser action.
             use_thinking=False,
@@ -4590,7 +4677,7 @@ async def _run_browser_agent(url: str, task: str,
             use_judge=False,
         )
         history = await asyncio.wait_for(
-            agent.run(max_steps=_browser_max_steps()),
+            agent.run(max_steps=_browser_task_step_ceiling(task)),
             timeout=_browser_task_timeout(),
         )
     finally:
@@ -4772,6 +4859,13 @@ def _which_executable(name: str) -> str | None:
     return shutil.which(name)
 
 
+# Memoized _playwright_chromium_executable results: (PLAYWRIGHT_BROWSERS_PATH
+# override, data dir) -> executable path. See that function for why only
+# successful lookups are cached and why hits are re-existence-checked.
+_chromium_executable_lock = threading.Lock()
+_chromium_executable_cache: dict = {}
+
+
 def _playwright_chromium_executable() -> str | None:
     """Locate Playwright's Chromium, or None when it is not installed.
 
@@ -4792,10 +4886,24 @@ def _playwright_chromium_executable() -> str | None:
 
     An explicit PLAYWRIGHT_BROWSERS_PATH always wins: that is the operator
     telling us where their browsers live.
+
+    The result is memoized per (explicit env override, data dir): each probe
+    spins up a whole Playwright Node driver (~200ms measured) just to read a
+    path, and browse_page pays that on every call. Only successful lookups
+    are cached, so the retry-after-install case below still re-probes; a
+    cached path is existence-checked on every hit, so a browser uninstalled
+    mid-session falls back to a fresh probe rather than a stale path.
     """
     from playwright.sync_api import sync_playwright
 
     explicit = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    data_dir = str(_agent_data_dir())
+    key = (explicit, data_dir)
+    with _chromium_executable_lock:
+        cached = _chromium_executable_cache.get(key)
+    if cached and os.path.exists(cached):
+        return cached
+
     private = str(_agent_data_dir() / "playwright-browsers")
     # None means "leave the variable unset and let Playwright use its default".
     candidates = [explicit] if explicit else [private, None]
@@ -4808,6 +4916,8 @@ def _playwright_chromium_executable() -> str | None:
         with sync_playwright() as p:
             candidate = p.chromium.executable_path
         if candidate and os.path.exists(candidate):
+            with _chromium_executable_lock:
+                _chromium_executable_cache[key] = candidate
             return candidate
 
     # Nothing found. Restore the variable to however we found it, so this stays

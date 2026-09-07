@@ -35,9 +35,43 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
         connection. So resolve once here and check that exact address before
         connecting to it.
 
+        The resolved-and-approved address is memoized per proxy instance (one
+        proxy = one browse_page call): a page pulls dozens of assets from the
+        same handful of hosts, and re-resolving each time cost a median ~20ms
+        - over 160ms on a cold lookup - on every request. The cache *pins*
+        the very address check_address approved, so a short-TTL record that
+        answers differently mid-browse cannot swap the destination; the same
+        check_address runs again on the cached IP anyway. A cached address
+        that stops connecting is evicted and resolved fresh.
+
         Returns (socket, status, message): status is None on success, 403 for
         an address the guard refused, 502 for a real connectivity failure.
         """
+        key = (host, port)
+        cached = self.server.pop_resolved(key)
+        if cached is not None:
+            family, socktype, proto, sockaddr = cached
+            blocked = self.server.check_address(host, port, sockaddr[0])
+            if blocked:
+                return None, 403, blocked
+            upstream = socket.socket(family, socktype, proto)
+            try:
+                upstream.settimeout(10)
+                upstream.connect(sockaddr)
+                self.server.push_resolved(key, cached)
+                return upstream, None, ""
+            except OSError:
+                # Stale entry (server moved, v6 dropped, ...): resolve fresh.
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+            except Exception:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+                raise
         try:
             addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except OSError as exc:
@@ -52,6 +86,7 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
             try:
                 upstream.settimeout(10)
                 upstream.connect(sockaddr)
+                self.server.push_resolved(key, (family, socktype, proto, sockaddr))
                 return upstream, None, ""
             except OSError as exc:
                 last_error = exc
@@ -163,6 +198,34 @@ class _SSRFFilteringProxyServer(socketserver.ThreadingMixIn, http.server.HTTPSer
         self.check_target = check_target
         self.check_address = check_address
         self.on_visit = on_visit
+        # (host, port) -> (family, socktype, proto, sockaddr) for addresses
+        # check_address has approved and a connection succeeded to. Guarded by
+        # a lock: handler threads run concurrently (daemon_threads above).
+        # Bounded so a hostile page pulling hundreds of unique hosts cannot
+        # grow it without limit; entries are re-established on demand.
+        self._resolved_lock = threading.Lock()
+        self._resolved: dict = {}
+        self._resolved_limit = 512
+
+    def push_resolved(self, key, entry) -> None:
+        with self._resolved_lock:
+            if len(self._resolved) >= self._resolved_limit and key not in self._resolved:
+                self._resolved.pop(next(iter(self._resolved)), None)
+            self._resolved[key] = entry
+
+    def pop_resolved(self, key):
+        """Fetch and re-queue the memoized entry for `key`, or None.
+
+        Pop-then-re-push keeps the dict FIFO-fair under the size bound; the
+        entry is put straight back because a hit means it will be reused
+        immediately (and re-pushed only after another successful connect).
+        """
+        with self._resolved_lock:
+            entry = self._resolved.get(key)
+            if entry is None:
+                return None
+            self._resolved.pop(key, None)
+            return entry
 
     def record_visit(self, url: str) -> None:
         """Report one approved request to the caller's visit hook.
