@@ -207,6 +207,81 @@ html[data-sidebar-translucent='true']:not(.dark) [data-sidebar] { background-col
   transition: background-color 100ms ease, color 100ms ease;
 }
 
+/* ── Otto — composer mascot ─────────────────────────────── */
+/* One SVG, state-driven via [data-otto] on the root. All color comes from
+ * the accent CSS vars so Otto follows every theme; flat fills only. */
+.otto-arm, .otto-eye, .otto-pupil, .otto-root { transform-box: fill-box; }
+.otto-arm { transform-origin: top center; animation: otto-arm-idle 3.4s ease-in-out infinite; }
+.otto-eye { transform-origin: center; animation: otto-blink 4.6s ease-in-out infinite; }
+.otto-pupil { transform-origin: center; }
+.otto-root { transform-origin: center; animation: otto-bob 3.4s ease-in-out infinite; }
+.otto[data-otto='offline'] { opacity: 0.55; }
+
+.otto[data-otto='thinking'] .otto-root { animation: otto-bob 1.6s ease-in-out infinite; }
+.otto[data-otto='thinking'] .otto-arm  { animation: otto-arm-work 0.9s ease-in-out infinite; }
+.otto[data-otto='thinking'] .otto-pupil { animation: otto-scan 2.4s ease-in-out infinite; }
+
+.otto[data-otto='tool'] .otto-root { animation: otto-reach 1.1s ease-in-out infinite; }
+.otto[data-otto='tool'] .otto-arm  { animation: otto-arm-work 0.6s ease-in-out infinite; }
+.otto[data-otto='tool'] .otto-eye  { animation: otto-focus 1.1s ease-in-out infinite; }
+
+.otto[data-otto='writing'] .otto-root { animation: otto-pulse 1.2s ease-in-out infinite; }
+.otto[data-otto='writing'] .otto-arm  { animation: otto-arm-idle 2.2s ease-in-out infinite; }
+
+.otto[data-otto='approval'] .otto-root { animation: otto-nudge 1.5s ease-in-out infinite; }
+.otto[data-otto='error'] .otto-root    { animation: otto-shake 0.45s ease-in-out infinite; }
+.otto[data-otto='offline'] .otto-root  { animation: otto-sag 2.8s ease-in-out infinite; }
+.otto[data-otto='offline'] .otto-arm   { animation: otto-arm-idle 5.5s ease-in-out infinite; }
+
+@keyframes otto-bob {
+  0%, 100% { transform: translateY(0) scale(1, 1); }
+  50% { transform: translateY(-1.5px) scale(1.02, 0.98); }
+}
+@keyframes otto-arm-idle {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(3deg); }
+}
+@keyframes otto-arm-work {
+  0%, 100% { transform: rotate(-7deg); }
+  50% { transform: rotate(7deg); }
+}
+@keyframes otto-blink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  95% { transform: scaleY(0.08); }
+}
+@keyframes otto-scan {
+  0%, 100% { transform: translateX(-0.9px); }
+  50% { transform: translateX(0.9px); }
+}
+@keyframes otto-focus {
+  0%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(0.55); }
+}
+@keyframes otto-reach {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  40% { transform: translate(-2.2px, -1.6px) rotate(-6deg); }
+}
+@keyframes otto-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.06); }
+}
+@keyframes otto-nudge {
+  0%, 55%, 100% { transform: translateX(0); }
+  10%, 30% { transform: translateX(-1.6px); }
+  20%, 40% { transform: translateX(1.6px); }
+}
+@keyframes otto-shake {
+  0%, 100% { transform: rotate(0deg); }
+  20% { transform: rotate(-5deg); }
+  40% { transform: rotate(4deg); }
+  60% { transform: rotate(-3deg); }
+  80% { transform: rotate(2deg); }
+}
+@keyframes otto-sag {
+  0%, 100% { transform: translateY(0) scale(1, 1); }
+  50% { transform: translateY(1.2px) scale(1.01, 0.97); }
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

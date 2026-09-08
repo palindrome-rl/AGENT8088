@@ -7,6 +7,7 @@ import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
 import { ImageUpload } from './ImageUpload'
+import { Otto } from './Otto'
 
 /* ─────────────────────────────────────────────────────────
  * PROMPT BAR — Beautiful UI style
@@ -579,6 +580,9 @@ export function PromptBar() {
               )}
               style={{ minHeight: '28px' }}
             />
+
+            {/* Otto — mascot & status light, bottom-right of the composer */}
+            <Otto className="self-end mb-0.5" />
 
             {/* Controls row */}
             <div className="flex shrink-0 items-center gap-1">
