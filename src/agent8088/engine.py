@@ -2573,6 +2573,10 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
         if not tools and not skill_md.exists():
             continue  # not a skill package, just a stray directory
         name = meta.get("name") or pkg.name
+        requires_tools = frozenset(
+            item.strip() for item in str(meta.get("requires_tools", "")).split(",")
+            if item.strip()
+        )
         out[name] = {
             "name": name,
             "description": meta.get("description", default_tool_description(name)),
@@ -2583,6 +2587,7 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
             "path": str(pkg),
             "prose": body.strip(),
             "tools": tools,
+            "requires_tools": requires_tools,
         }
     return out
 
@@ -2619,6 +2624,7 @@ def render_skill_docs(skills: dict) -> str:
 
 _SKILL_RESOURCE_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml"}
 _MAX_SKILL_RESOURCE_BYTES = 512 * 1024
+_SHARED_SKILL_RESOURCE_PREFIX = "shared/"
 DISABLED_SKILLS = set()
 
 
@@ -2635,10 +2641,14 @@ def read_skill_resource(name: str, resource: str) -> str:
         raise ValueError(f"Unknown skill: {name or '(missing name)'}")
     if skill["name"] in DISABLED_SKILLS:
         raise ValueError(f"Skill is disabled for this session: {skill['name']}")
-    root = Path(skill["path"]).resolve(strict=True)
     relative = str(resource or "SKILL.md").strip().replace("\\", "/")
     if not relative or relative.startswith("/"):
         raise ValueError("Skill resource must be a relative path.")
+    if relative.startswith(_SHARED_SKILL_RESOURCE_PREFIX):
+        root = (SKILLS_DIR / "_references").resolve(strict=True)
+        relative = relative[len(_SHARED_SKILL_RESOURCE_PREFIX):]
+    else:
+        root = Path(skill["path"]).resolve(strict=True)
     # Check containment before requiring the file to exist. Besides producing a
     # clear refusal, this avoids leaking whether an escaped path exists.
     target = (root / relative).resolve(strict=False)
@@ -2651,6 +2661,75 @@ def read_skill_resource(name: str, resource: str) -> str:
     if target.stat().st_size > _MAX_SKILL_RESOURCE_BYTES:
         raise ValueError("Skill resource is too large to load.")
     return target.read_text(encoding="utf-8")
+
+
+_TASK_SKILL_RULES = (
+    ("planning-and-task-breakdown", r"\b(?:plan|break\s+down|roadmap|milestone)\b"),
+    ("code-review-and-quality", r"\b(?:review|pull request|\bpr\b|diff)\b"),
+    ("debugging-and-error-recovery", r"\b(?:debug|bug|broken|error|failure|regression)\b"),
+    ("test-driven-development", r"\b(?:test|coverage|assertion|spec)\b"),
+    ("documentation-and-adrs", r"\b(?:documentation|docs|adr|readme)\b"),
+    ("security-and-hardening", r"\b(?:security|auth|credential|secret|owasp)\b"),
+    ("performance-optimization", r"\b(?:performance|slow|latency|profil|bundle)\b"),
+    ("ci-cd-and-automation", r"\b(?:ci/cd|pipeline|github actions|deploy workflow)\b"),
+    ("deprecation-and-migration", r"\b(?:deprecat|migrat|sunset)\b"),
+    ("observability-and-instrumentation", r"\b(?:observability|telemetry|metric|tracing|logging)\b"),
+    ("shipping-and-launch", r"\b(?:ship|release|launch|rollout)\b"),
+    ("api-and-interface-design", r"\b(?:api|endpoint|interface|contract)\b"),
+    ("frontend-ui-engineering", r"\b(?:frontend|ui|ux|component|accessibility)\b"),
+    ("browsing", r"\b(?:browse|browser|website|web page)\b"),
+    ("cli-anything", r"\b(?:cli-anything|harness)\b"),
+    ("delegation-and-audit", r"\b(?:subagent|delegate|parallelize)\b"),
+    ("workspace-engineering", r"\b(?:implement|build|add|change|fix|refactor|code)\b"),
+)
+
+
+def select_task_skills(messages: list[dict], available_tools=None) -> list[str]:
+    """Return the small set of workflows that apply to the current user task."""
+    user_text = "\n".join(
+        str(message.get("content") or "") for message in messages
+        if message.get("role") == "user"
+        and not str(message.get("content") or "").startswith(_TOOL_RESULT_PREFIX)
+    ).casefold()
+    if not user_text:
+        return []
+    selected = []
+    if PERMISSION_MODE == "plan-only":
+        selected.append("planning-and-task-breakdown")
+    for name, pattern in _TASK_SKILL_RULES:
+        if re.search(pattern, user_text):
+            selected.append(name)
+            break
+    if re.search(r"\b(?:tool|harness|automation)\b", user_text):
+        selected.append("tool-orchestration")
+    for name in SKILL_PACKAGES:
+        if name.casefold() in user_text:
+            selected.append(name)
+    visible_tools = set(available_tools if available_tools is not None else TOOL_NAMES)
+    selected = [name for name in dict.fromkeys(selected)
+                if name in SKILL_PACKAGES
+                and name not in DISABLED_SKILLS
+                and SKILL_PACKAGES[name].get("requires_tools", frozenset()) <= visible_tools]
+    result = (["using-agent-skills"] if selected and "using-agent-skills" in SKILL_PACKAGES
+              and "using-agent-skills" not in DISABLED_SKILLS else []) + selected[:2]
+    return list(dict.fromkeys(result))
+
+
+def render_task_skill_docs(messages: list[dict], available_tools=None) -> str:
+    """Inject selected progressive workflows, so they are used instead of merely listed."""
+    names = select_task_skills(messages, available_tools)
+    if not names:
+        return ""
+    sections = ["\n## Active task skills",
+                "These workflows are active for this task. Follow their process and verification gates."]
+    for name in names:
+        skill = SKILL_PACKAGES[name]
+        sections.append(f"\n### {name}\n{skill.get('prose', '').strip()}")
+    sections.append(
+        "\nAgent8088 adaptation: system permission rules and existing project instructions win. "
+        "In plan-only mode, present a plan instead of writing plan files unless the user explicitly asks for them."
+    )
+    return "\n".join(sections)
 
 
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
@@ -9267,6 +9346,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     Returns the final answer string.
     """
     spin = spin or (lambda msg: nullcontext())
+    if system_prompt is None:
+        system_prompt = lambda: current_system_prompt() + render_task_skill_docs(
+            messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     last_completed = None  # consecutive identical call -> (signature, output)

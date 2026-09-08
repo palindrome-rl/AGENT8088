@@ -3,6 +3,7 @@ name: finding-mcp-servers
 description: Find, recommend, configure, and test MCP servers for the user's stated need (e.g. "add Notion"), searching punkpeye/awesome-mcp-servers and the matched server's own repo/site.
 progressive: true
 version: 1.0
+progressive: true
 ---
 
 # Finding and installing MCP servers

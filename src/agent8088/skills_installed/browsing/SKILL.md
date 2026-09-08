@@ -17,6 +17,18 @@ sub-agent cannot see this conversation and has no memory of any earlier
 browser.** Nothing persists between calls — not a login, not a cart, not
 anything clicked or typed in a previous call.
 
+## Fast path
+
+Do not launch `browse_page` for facts a targeted `web_search`, `get_page_title`,
+or a direct API/MCP tool can answer. Use it only for a user-supplied page that
+needs JavaScript, interaction, authenticated state, or visual confirmation.
+
+For a browser task, give one URL, the exact success condition, and only the
+necessary ordered actions. Avoid exploratory browsing, repeated page reads,
+and a second browser call solely to restate a successful result. Use a separate
+read only when an earlier browser action changed state and the submitted value
+or confirmation must be independently verified.
+
 This means: **if a task needs to be logged in (or otherwise mid-flow) to do
 something, the login and that something must happen inside the *same*
 `browse_page` call.** Never split an authenticated flow like "log in" as one

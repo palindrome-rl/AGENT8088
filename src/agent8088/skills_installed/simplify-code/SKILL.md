@@ -3,6 +3,7 @@ name: simplify-code
 description: Review recent code changes through four narrow lenses — reuse, quality, efficiency, altitude — then apply the safe fixes.
 version: 1.0.0
 category: software-development
+progressive: true
 ---
 
 Use this after a change is written and working, when asked to simplify, clean

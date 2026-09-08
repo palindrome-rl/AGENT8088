@@ -3,6 +3,7 @@ name: document-to-action-items
 description: Turn a read document into a structured list of obligations, deadlines, and owners, each citing where it came from.
 version: 1.0.0
 category: software-development
+progressive: true
 ---
 
 Use this once `read_text` has extracted a document (contract, report, meeting
