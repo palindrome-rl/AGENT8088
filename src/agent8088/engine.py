@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cli_anything, documents, local_models, memory, routing, web_search, efficiency
+from agent8088 import (cli_anything, documents, efficiency, local_models,
+                       memory, routing, tool_output, web_search)
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -2592,6 +2593,10 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
         if not tools and not skill_md.exists():
             continue  # not a skill package, just a stray directory
         name = meta.get("name") or pkg.name
+        requires_tools = frozenset(
+            item.strip() for item in str(meta.get("requires_tools", "")).split(",")
+            if item.strip()
+        )
         out[name] = {
             "name": name,
             "description": meta.get("description", default_tool_description(name)),
@@ -2602,6 +2607,7 @@ def load_skill_packages(skills_dir: Path, config: dict) -> dict:
             "path": str(pkg),
             "prose": body.strip(),
             "tools": tools,
+            "requires_tools": requires_tools,
         }
     return out
 
@@ -2638,6 +2644,7 @@ def render_skill_docs(skills: dict) -> str:
 
 _SKILL_RESOURCE_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml"}
 _MAX_SKILL_RESOURCE_BYTES = 512 * 1024
+_SHARED_SKILL_RESOURCE_PREFIX = "shared/"
 DISABLED_SKILLS = set()
 
 
@@ -2654,10 +2661,14 @@ def read_skill_resource(name: str, resource: str) -> str:
         raise ValueError(f"Unknown skill: {name or '(missing name)'}")
     if skill["name"] in DISABLED_SKILLS:
         raise ValueError(f"Skill is disabled for this session: {skill['name']}")
-    root = Path(skill["path"]).resolve(strict=True)
     relative = str(resource or "SKILL.md").strip().replace("\\", "/")
     if not relative or relative.startswith("/"):
         raise ValueError("Skill resource must be a relative path.")
+    if relative.startswith(_SHARED_SKILL_RESOURCE_PREFIX):
+        root = (SKILLS_DIR / "_references").resolve(strict=True)
+        relative = relative[len(_SHARED_SKILL_RESOURCE_PREFIX):]
+    else:
+        root = Path(skill["path"]).resolve(strict=True)
     # Check containment before requiring the file to exist. Besides producing a
     # clear refusal, this avoids leaking whether an escaped path exists.
     target = (root / relative).resolve(strict=False)
@@ -2670,6 +2681,75 @@ def read_skill_resource(name: str, resource: str) -> str:
     if target.stat().st_size > _MAX_SKILL_RESOURCE_BYTES:
         raise ValueError("Skill resource is too large to load.")
     return target.read_text(encoding="utf-8")
+
+
+_TASK_SKILL_RULES = (
+    ("planning-and-task-breakdown", r"\b(?:plan|break\s+down|roadmap|milestone)\b"),
+    ("code-review-and-quality", r"\b(?:review|pull request|\bpr\b|diff)\b"),
+    ("debugging-and-error-recovery", r"\b(?:debug|bug|broken|error|failure|regression)\b"),
+    ("test-driven-development", r"\b(?:test|coverage|assertion|spec)\b"),
+    ("documentation-and-adrs", r"\b(?:documentation|docs|adr|readme)\b"),
+    ("security-and-hardening", r"\b(?:security|auth|credential|secret|owasp)\b"),
+    ("performance-optimization", r"\b(?:performance|slow|latency|profil|bundle)\b"),
+    ("ci-cd-and-automation", r"\b(?:ci/cd|pipeline|github actions|deploy workflow)\b"),
+    ("deprecation-and-migration", r"\b(?:deprecat|migrat|sunset)\b"),
+    ("observability-and-instrumentation", r"\b(?:observability|telemetry|metric|tracing|logging)\b"),
+    ("shipping-and-launch", r"\b(?:ship|release|launch|rollout)\b"),
+    ("api-and-interface-design", r"\b(?:api|endpoint|interface|contract)\b"),
+    ("frontend-ui-engineering", r"\b(?:frontend|ui|ux|component|accessibility)\b"),
+    ("browsing", r"\b(?:browse|browser|website|web page)\b"),
+    ("cli-anything", r"\b(?:cli-anything|harness)\b"),
+    ("delegation-and-audit", r"\b(?:subagent|delegate|parallelize)\b"),
+    ("workspace-engineering", r"\b(?:implement|build|add|change|fix|refactor|code)\b"),
+)
+
+
+def select_task_skills(messages: list[dict], available_tools=None) -> list[str]:
+    """Return the small set of workflows that apply to the current user task."""
+    user_text = "\n".join(
+        str(message.get("content") or "") for message in messages
+        if message.get("role") == "user"
+        and not str(message.get("content") or "").startswith(_TOOL_RESULT_PREFIX)
+    ).casefold()
+    if not user_text:
+        return []
+    selected = []
+    if PERMISSION_MODE == "plan-only":
+        selected.append("planning-and-task-breakdown")
+    for name, pattern in _TASK_SKILL_RULES:
+        if re.search(pattern, user_text):
+            selected.append(name)
+            break
+    if re.search(r"\b(?:tool|harness|automation)\b", user_text):
+        selected.append("tool-orchestration")
+    for name in SKILL_PACKAGES:
+        if name.casefold() in user_text:
+            selected.append(name)
+    visible_tools = set(available_tools if available_tools is not None else TOOL_NAMES)
+    selected = [name for name in dict.fromkeys(selected)
+                if name in SKILL_PACKAGES
+                and name not in DISABLED_SKILLS
+                and SKILL_PACKAGES[name].get("requires_tools", frozenset()) <= visible_tools]
+    result = (["using-agent-skills"] if selected and "using-agent-skills" in SKILL_PACKAGES
+              and "using-agent-skills" not in DISABLED_SKILLS else []) + selected[:2]
+    return list(dict.fromkeys(result))
+
+
+def render_task_skill_docs(messages: list[dict], available_tools=None) -> str:
+    """Inject selected progressive workflows, so they are used instead of merely listed."""
+    names = select_task_skills(messages, available_tools)
+    if not names:
+        return ""
+    sections = ["\n## Active task skills",
+                "These workflows are active for this task. Follow their process and verification gates."]
+    for name in names:
+        skill = SKILL_PACKAGES[name]
+        sections.append(f"\n### {name}\n{skill.get('prose', '').strip()}")
+    sections.append(
+        "\nAgent8088 adaptation: system permission rules and existing project instructions win. "
+        "In plan-only mode, present a plan instead of writing plan files unless the user explicitly asks for them."
+    )
+    return "\n".join(sections)
 
 
 SKILL_PACKAGES = load_skill_packages(SKILLS_DIR, APP_CONFIG)
@@ -6799,6 +6879,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
+    # Captured before the execution branch reformats `command`, so the reuse
+    # check and the recording that follows it agree on one spelling.
+    ledger_command = ""
     write_path = ""
     target = None
     path_zone = "default"
@@ -6811,6 +6894,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         try:
             command = _process_display(argv) if argv else _format_with_args(
                 spec.get("command") or "{command}", args)
+            ledger_command = command
         except MissingToolArgument as exc:
             return _tool_arg_missing_error(name, exc.param)
     elif mode == "write_text":
@@ -6997,14 +7081,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode in ("write_text", "shell", "docker", "cron", "browser", "mcp"):
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=str(target) if mode == "write_text" else command[:200])
+    if mode == "write_text":
+        # Noted before the write rather than after: a partial write still
+        # changes the tree, and a crash mid-write must not leave a verdict
+        # looking current.
+        note_mutation(f"write {target}")
 
     if mode == "introspect":
         return describe_capabilities()
 
     if mode == "last_output":
-        if not _last_tool_output:
-            return "No tool has been run yet."
-        return f"Full output from '{_last_tool_name}' ({len(_last_tool_output)} chars):\n\n{_last_tool_output}"
+        return _exec_last_output(args)
 
     if mode == "plan":
         if not allow_plan:
@@ -7145,6 +7232,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return f"Error: invalid arithmetic expression: {exc}"
 
     if mode == "shell":
+        reuse = _reuse_known_verdict(ledger_command)
+        if reuse:
+            return reuse
         if _structured_tool_argv(name, args):
             return _exec_structured_tool(name, args, timeout)
         command = _format_with_args(spec.get("command") or "{command}", args)
@@ -7163,6 +7253,11 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # blocked with no way to approve it.
         if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
             return text.strip()
+        if not _readonly_shell(command):
+            # Ordered before the recording below so this run's own verdict is
+            # stamped with the sequence its side effects produced.
+            note_mutation(f"{name}: {command[:80]}")
+        _record_verdict(ledger_command or command, text)
         return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
@@ -8909,13 +9004,166 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         _document_progress, _document_interrupt, _document_root = old_document_hooks
 
 
+# Full tool outputs, kept whole so the elided middle stays retrievable. Bounded
+# because a long session would otherwise hold every byte any command printed.
+_OUTPUT_STORE = tool_output.OutputStore()
+
+# Verdicts read from command output, kept outside the message list. Tool results
+# get clamped and eventually compacted away; this record does not, so "the suite
+# passed" survives the turn that learned it.
+_VERDICT_LEDGER: dict = {}
+
+# Bumped by anything that could change what a command would now report. A
+# recorded pass describes a tree, and stops meaning anything once that tree
+# moves.
+_MUTATION_SEQ = 0
+
+REUSE_KNOWN_VERDICTS = APP_CONFIG.get("reuse_known_verdicts", "1") != "0"
+
+
+# Wide enough to be worth a turn, small enough that the window itself is not
+# then clamped — retrieval that gets truncated would just re-create the bug.
+_OUTPUT_WINDOW = 2_400
+
+
+def _exec_last_output(args: dict) -> str:
+    """Return a tool's full output, or a window into a stored one.
+
+    Without a ref this is the old behaviour: the last tool's output. With one it
+    reads the text that a clamped result elided, so the model can recover the
+    middle instead of re-running a command to see it again.
+    """
+    def _int(key, default):
+        try:
+            return max(0, int(args.get(key) or default))
+        except (TypeError, ValueError):
+            return default
+
+    ref = str(args.get("ref") or "").strip()
+    length = _int("length", _OUTPUT_WINDOW) or _OUTPUT_WINDOW
+    if not ref:
+        if not _last_tool_output:
+            return "No tool has been run yet."
+        window = {"text": _last_tool_output[:length], "total": len(_last_tool_output),
+                  "offset": 0,
+                  "next_offset": length if length < len(_last_tool_output) else None}
+        source = f"'{_last_tool_name}' (last call)"
+    else:
+        window = _OUTPUT_STORE.window(ref, offset=_int("offset", 0), length=length)
+        if window is None:
+            available = ", ".join(_OUTPUT_STORE.refs()[-5:]) or "none"
+            # Named rather than raised: a stale ref is a normal consequence of a
+            # long session, and the useful reply is which refs still exist.
+            return (f"No stored output for ref '{ref}'. Still available: {available}. "
+                    f"Call last_output with no arguments for the most recent result.")
+        source = f"ref {ref}"
+
+    more = (f"Call last_output with ref={ref or 'REF'} and "
+            f"offset={window['next_offset']} to continue."
+            if window["next_offset"] is not None else "End of output.")
+    return (f"Output from {source} — characters {window['offset']}-"
+            f"{window['offset'] + len(window['text'])} of {window['total']}. {more}\n\n"
+            f"{window['text']}")
+
+
+def note_mutation(detail: str = "") -> int:
+    """Retire every recorded verdict: something that could change them happened.
+
+    Deliberately does not write an audit line. The audit log records
+    security-relevant tool calls, and the call that caused this bump is already
+    in there; a second entry per write would be noise, and the extra file I/O
+    on every mutation showed up as timing pressure elsewhere in the suite.
+    """
+    global _MUTATION_SEQ
+    _MUTATION_SEQ += 1
+    return _MUTATION_SEQ
+
+
+def known_verdict(command: str):
+    """What this exact command last reported, or an unknown verdict."""
+    entry = _VERDICT_LEDGER.get((command or "").strip())
+    return entry["verdict"] if entry else tool_output.Verdict()
+
+
+def verdict_ledger_summary(limit: int = 10) -> str:
+    """The ledger as the model should see it: one line per command."""
+    if not _VERDICT_LEDGER:
+        return ""
+    lines = []
+    for command, entry in list(_VERDICT_LEDGER.items())[-limit:]:
+        stale = "" if entry["seq"] == _MUTATION_SEQ else " (stale: files changed since)"
+        lines.append(f"  {entry['verdict'].status.upper()}: {command}{stale}")
+    return "Verdicts already established this session:\n" + "\n".join(lines)
+
+
+def _record_verdict(command: str, output: str) -> None:
+    """Record what a command reported, if it reported anything definite."""
+    command = (command or "").strip()
+    if not command:
+        return
+    verdict = tool_output.detect_verdict(output)
+    if not verdict.known:
+        # An unrecognised result is not a verdict. Storing it as one would be
+        # the same guess this whole change exists to remove.
+        _VERDICT_LEDGER.pop(command, None)
+        return
+    _VERDICT_LEDGER[command] = {"verdict": verdict, "seq": _MUTATION_SEQ,
+                                "at": time.time()}
+
+
+def _reuse_known_verdict(command: str) -> str:
+    """Answer from the ledger instead of re-running a command already answered.
+
+    Deliberately narrow. Only a pass is reused: a failure gets re-run because
+    the agent is usually in the middle of fixing it, and an unknown result was
+    never a verdict. And only while `_MUTATION_SEQ` is unmoved — once anything
+    has been written, the recorded pass describes a tree that no longer exists.
+    """
+    if not REUSE_KNOWN_VERDICTS:
+        return ""
+    entry = _VERDICT_LEDGER.get((command or "").strip())
+    if not entry or entry["verdict"].status != tool_output.PASSED:
+        return ""
+    if entry["seq"] != _MUTATION_SEQ:
+        return ""
+    return (f"[verdict ledger] Not re-run: this exact command already reported "
+            f"PASSED and nothing has been written since.\n"
+            f"{entry['verdict'].summary}\n"
+            f"To force a fresh run, write a file first or vary the command.")
+
+
 # Every tool result the loop feeds back starts with this. It is the marker that
 # separates "the human said it" from "a web page said it".
 _TOOL_RESULT_PREFIX = "Tool result ("
 
 
+# Output that is a stream of events — a command's stdout, a page's text — is
+# denoised and then cut from the middle, because runners print their verdict
+# last. Output read top-down keeps its head instead, and is never denoised:
+# collapsing repeated lines inside a source file would corrupt text the model
+# goes on to edit from.
+_STREAM_MODES = {"shell", "docker", "last_output", "browser"}
+_HEAD_FIRST_MODES = {"read_text"}
+
+
 def _tool_result_for_model(name: str, result: str) -> str:
-    """Keep ordinary tool context small while letting the auditor inspect files."""
+    """Shape a tool result for the model without losing its verdict.
+
+    The bug this replaced kept `result[:3000]`, which dropped the last line of
+    every long command — exactly where pytest, unittest, jest and cargo print
+    whether the run succeeded. A model handed 3,000 characters of PASSED lines
+    answered "did it pass?" from the shape of the text rather than from a
+    result, and was wrong whenever the failure came late.
+
+    Three things happen here, in order:
+      1. Denoise. Colour codes and a warning repeated 400 times are bytes, not
+         information; removing them often brings the output under budget so no
+         cut is needed at all.
+      2. State the verdict up front, read from the output rather than inferred,
+         so it cannot be truncated away and does not depend on the model
+         spotting a summary line.
+      3. Cut the middle, not the tail, and say where the full text went.
+    """
     if name == "document_read":
         # document_access bounds its own payload and supplies an exact cursor.
         # Truncation here would invalidate that continuation contract.
@@ -8926,10 +9174,23 @@ def _tool_result_for_model(name: str, result: str) -> str:
         limit = 12_000
     else:
         limit = 3_000
-    if len(result) <= limit:
-        return result
-    return (result[:limit]
-            + f"\n[tool result truncated: {len(result) - limit} more characters]")
+
+    mode = (TOOL_SPECS.get(name, {}).get("mode") or "").lower()
+    streamed = mode in _STREAM_MODES
+    body = tool_output.denoise(result) if streamed else result
+    if len(body) <= limit:
+        return body
+
+    # Stated before the payload so the budget can never squeeze it out. Empty
+    # when the output is not a runner's, and empty when the verdict is unknown:
+    # an absent banner is honest, a guessed one is the original bug.
+    banner = tool_output.detect_verdict(body).banner() if streamed else ""
+    ref = _OUTPUT_STORE.put(name, result)
+    hint = f"last_output with ref={ref} and offset=N returns the middle"
+    shown = tool_output.clamp(
+        body, limit - len(banner) - 1 if banner else limit,
+        keep="head" if mode in _HEAD_FIRST_MODES else "tail", hint=hint)
+    return f"{banner}\n{shown}" if banner else shown
 
 
 def _genuine_user_turns(messages) -> list:
@@ -9156,6 +9417,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     Returns the final answer string.
     """
     spin = spin or (lambda msg: nullcontext())
+    if system_prompt is None:
+        system_prompt = lambda: current_system_prompt() + render_task_skill_docs(
+            messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     last_completed = None  # consecutive identical call -> (signature, output)

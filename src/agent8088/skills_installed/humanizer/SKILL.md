@@ -3,6 +3,7 @@ name: humanizer
 description: Strip stock AI phrasing from generated prose before returning it.
 version: 1.0.0
 category: creative
+progressive: true
 ---
 
 Use this as a pass over prose meant to read naturally — emails, reports,

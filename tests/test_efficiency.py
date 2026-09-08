@@ -99,3 +99,21 @@ def test_stream_usage_is_preserved_and_unsupported_option_retries_once(engine, m
     assert 'stream_options' not in calls[1]
     assert result.usage is usage
     assert result.first_token_ms is not None
+
+
+def test_structured_error_contract_survives_output_truncation(engine):
+    """Two features that meet at the same string, from different branches.
+
+    The recovery contract is appended to the end of a tool result; tail-first
+    clamping keeps the end. That is why they compose -- but nothing states it,
+    so a future change to either side could quietly drop the JSON and leave the
+    model with a wall of noise and no suggested_action.
+    """
+    body = "\n".join(f"line {i}: verbose tool chatter" for i in range(2000))
+    error = efficiency.tool_error('invalid_input', body,
+                                  'Correct the arguments and retry.', recoverable=True)
+    shown = engine._tool_result_for_model("execute_shell", error)
+
+    assert len(shown) < len(error), "nothing was truncated; the test proves nothing"
+    assert '"suggested_action"' in shown
+    assert '"recoverable": true' in shown

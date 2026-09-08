@@ -3,6 +3,7 @@ name: grounded-citations
 description: Trace every factual claim to a fetched source instead of answering from training data.
 version: 1.0.0
 category: research
+progressive: true
 ---
 
 Use this for anything current, disputable, or specific enough that being

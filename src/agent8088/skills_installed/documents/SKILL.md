@@ -3,6 +3,7 @@ name: documents
 description: Create and edit Word (.docx), Excel (.xlsx), PowerPoint (.pptx), and PDF files by writing Python via execute_shell; convert to PDF, read legacy .doc/.ppt/.xls, and recalculate formulas via LibreOffice when installed.
 version: 1.1.0
 category: software-development
+progressive: true
 ---
 
 No dedicated document tool exists. Write a Python script, run it with
