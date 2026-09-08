@@ -191,6 +191,18 @@ test('an interrupt pauses the queue rather than draining it', async ({ page }) =
   expect((await sent(page)).filter((f) => f.type === 'chat')).toHaveLength(0)
 })
 
+test('Stop clears the generating state immediately and ignores late frames', async ({ page }) => {
+  await bootWithFakeSocket(page)
+  await startTurn(page)
+
+  await page.getByRole('button', { name: 'Stop generating' }).click()
+
+  expect((await sent(page)).some((frame) => frame.type === 'interrupt')).toBe(true)
+  await expect(page.getByRole('button', { name: 'Stop generating' })).toHaveCount(0)
+  await push(page, { type: 'spin', message: 'thinking...', elapsed: 1, tokens: 1 })
+  await expect(page.getByRole('button', { name: 'Stop generating' })).toHaveCount(0)
+})
+
 test('resuming a paused queue dispatches the next prompt', async ({ page }) => {
   await bootWithFakeSocket(page)
   await startTurn(page)

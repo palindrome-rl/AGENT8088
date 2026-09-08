@@ -2,10 +2,10 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
   FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
-  PanelLeftClose, PanelLeftOpen, Sun, Moon, Search, X, Plus, MoreHorizontal, Pencil, Trash2,
+  PanelLeftClose, PanelLeftOpen, Sun, Moon, Monitor, Search, X, Plus, MoreHorizontal, Pencil, Trash2, Palette, Zap,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
-import { useUIStore } from '@/stores/ui'
+import { useUIStore, type Accent, type Theme } from '@/stores/ui'
 import { useSessionStore } from '@/stores/session'
 import { cn } from '@/lib/utils'
 import { useState, useEffect, useRef } from 'react'
@@ -36,8 +36,21 @@ const settingsItems = [
 const SIDEBAR_EXPANDED = 224
 const SIDEBAR_COLLAPSED = 52
 
+const appearanceThemes: { value: Theme; label: string; Icon: typeof Sun }[] = [
+  { value: 'dark', label: 'Dark', Icon: Moon },
+  { value: 'light', label: 'Light', Icon: Sun },
+  { value: 'system', label: 'System', Icon: Monitor },
+]
+
+const accentOptions: { value: Accent; label: string; colors: readonly [string, string] }[] = [
+  { value: 'ocean', label: 'Ocean', colors: ['#237dd7', '#00edff'] },
+  { value: 'violet', label: 'Violet', colors: ['#8b5cf6', '#d8b4fe'] },
+  { value: 'ember', label: 'Ember', colors: ['#f97316', '#facc15'] },
+  { value: 'mono', label: 'Mono', colors: ['#a1a1aa', '#f4f4f5'] },
+]
+
 export function Sidebar() {
-  const { sidebarCollapsed, toggleSidebar, theme, toggleTheme } = useUIStore()
+  const { sidebarCollapsed, toggleSidebar, theme, setTheme, accent, setAccent, motion, toggleMotion } = useUIStore()
   const { clearChat, setMessages, setSessionName, isStreaming } = useSessionStore()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -490,15 +503,28 @@ export function Sidebar() {
                 </nav>
                 <div className="border-t border-zinc-200 pt-2 dark:border-zinc-800/60">
                   <span className="px-2.5 text-[11px] font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Appearance</span>
-                  <button
-                    type="button"
-                    aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-                    aria-pressed={theme === 'dark'}
-                    onClick={toggleTheme}
-                    className="mt-1 flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/40 dark:hover:text-zinc-200"
-                  >
-                    {theme === 'dark' ? <Sun className="h-4 w-4 shrink-0" /> : <Moon className="h-4 w-4 shrink-0" />}
-                    {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+                  <div className="mt-1 grid grid-cols-3 gap-1 px-2" role="group" aria-label="Color mode">
+                    {appearanceThemes.map(({ value, label, Icon }) => (
+                      <button key={value} type="button" aria-pressed={theme === value} onClick={() => setTheme(value)}
+                        className={cn('flex flex-col items-center gap-1 rounded-lg py-1.5 text-[10px] transition-colors', theme === value ? 'bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100' : 'text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800/40')}>
+                        <Icon className="h-3.5 w-3.5" />{label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-2 px-2.5">
+                    <div className="mb-1.5 flex items-center gap-2 text-[12px] text-zinc-500 dark:text-zinc-400"><Palette className="h-3.5 w-3.5" /> Accent</div>
+                    <div className="grid grid-cols-4 gap-1" role="group" aria-label="Accent theme">
+                      {accentOptions.map((option) => (
+                        <button key={option.value} type="button" aria-label={`${option.label} accent`} aria-pressed={accent === option.value} onClick={() => setAccent(option.value)}
+                          className={cn('flex h-7 items-center justify-center rounded-lg transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/60', accent === option.value && 'bg-zinc-100 dark:bg-zinc-800')}>
+                          <span className="h-4 w-4 rounded-full ring-1 ring-white/40" style={{ background: `linear-gradient(135deg, ${option.colors[0]}, ${option.colors[1]})` }} />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <button type="button" aria-label={motion === 'full' ? 'Reduce interface motion' : 'Enable interface motion'} aria-pressed={motion === 'reduced'} onClick={toggleMotion}
+                    className="mt-2 flex h-8 w-full items-center gap-2 px-2.5 text-left text-[12px] text-zinc-500 transition-colors hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800/40">
+                    <Zap className="h-3.5 w-3.5" />{motion === 'full' ? 'Reduce motion' : 'Motion reduced'}
                   </button>
                 </div>
               </div>

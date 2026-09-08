@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ChatMessage, StatusInfo } from '@/types/api'
+import type { ChatAttachment, ChatMessage, StatusInfo } from '@/types/api'
 
 export interface QueuedPrompt {
   id: string
@@ -8,6 +8,7 @@ export interface QueuedPrompt {
   kind: 'chat' | 'command'
   text: string
   attachmentIds: string[]
+  attachments?: ChatAttachment[]
 }
 
 interface SessionState {

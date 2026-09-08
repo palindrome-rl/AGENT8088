@@ -10,18 +10,27 @@ import { useUIStore } from '@/stores/ui'
 
 export function AppLayout() {
   useWebSocket()
-  const { theme } = useUIStore()
+  const { theme, accent, motion } = useUIStore()
   const location = useLocation()
   const navigate = useNavigate()
 
   useEffect(() => {
     const html = document.documentElement
-    if (theme === 'dark') {
-      html.classList.add('dark')
-    } else {
-      html.classList.remove('dark')
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const syncTheme = () => {
+      html.classList.toggle('dark', theme === 'dark' || (theme === 'system' && media.matches))
     }
+    syncTheme()
+    if (theme !== 'system') return
+    media.addEventListener('change', syncTheme)
+    return () => media.removeEventListener('change', syncTheme)
   }, [theme])
+
+  useEffect(() => {
+    const html = document.documentElement
+    html.dataset.accent = accent
+    html.dataset.motion = motion
+  }, [accent, motion])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -35,7 +44,7 @@ export function AppLayout() {
   }, [])
 
   return (
-    <div className="flex h-screen overflow-hidden bg-zinc-50 dark:bg-zinc-950">
+    <div className="app-shell relative flex h-screen overflow-hidden bg-zinc-50 dark:bg-zinc-950">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
         <ConnectionBanner />
