@@ -19,6 +19,12 @@ let sharedWs: WebSocket | null = null
 let disposed = false
 let consumers = 0
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let reconnectAttempts = 0
+/** Messages that arrived while the socket was down, replayed on reconnect. */
+let outbox: WSClientMessage[] = []
+
+const RECONNECT_BASE_MS = 1000
+const RECONNECT_MAX_MS = 15_000
 
 function wireSocket(ws: WebSocket) {
   const {
@@ -29,25 +35,38 @@ function wireSocket(ws: WebSocket) {
   const { setApprovalPending, setPlanApprovalPending, setRawPanelOpen } = useUIStore.getState()
 
   ws.onmessage = (event) => {
-    const data: WSEvent = JSON.parse(event.data)
+    let data: WSEvent
+    try {
+      data = JSON.parse(event.data) as WSEvent
+    } catch {
+      // A frame we cannot parse is not worth tearing the socket down for.
+      return
+    }
     switch (data.type) {
       case 'status':
         setStatus(data.data)
         break
       case 'spin':
         setStreaming(true)
+        useSessionStore.getState().setActivity(data.message === 'thinking...'
+          ? (useSessionStore.getState().toolEvents.length ? 'Reviewing results' : 'Preparing request')
+          : data.message)
         break
       case 'token':
         if (data.kind === 'reasoning') {
           appendStreamingReasoning(data.delta)
         } else {
           appendStreamingText(data.delta)
+          if (scrubMarkup(useSessionStore.getState().streamingText).trim()) {
+            useSessionStore.getState().setActivity('Writing answer')
+          }
         }
         break
       case 'tool_calls':
         break
       case 'tool_start':
         addToolEvent(data.name)
+        useSessionStore.getState().setActivity(data.name === 'web_search' ? 'Searching the web' : `Running ${data.name}`)
         break
       case 'tool_result':
         updateToolEvent(data.name, data.result)
@@ -73,19 +92,26 @@ function wireSocket(ws: WebSocket) {
         setPlanApprovalPending({ id: data.id, plan: data.plan })
         break
       case 'answer':
+        {
+          const current = useSessionStore.getState().status
+          if (current && data.usage) setStatus({ ...current, last_usage: data.usage })
+        }
         addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
-        setStreaming(false)
-        resetStreaming()
         break
       case 'interrupted':
-        setStreaming(false)
-        resetStreaming()
+        pauseQueueIfPending()
         break
       case 'error':
         console.error('Agent error:', data.message)
+        setApprovalPending(null)
+        setPlanApprovalPending(null)
         addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}` })
+        pauseQueueIfPending()
+        break
+      case 'turn_complete':
         setStreaming(false)
         resetStreaming()
+        drainPromptQueue()
         break
       case 'session_saved':
         if (data.name) setSessionName(data.name)
@@ -115,7 +141,7 @@ function wireSocket(ws: WebSocket) {
           setRawPanelOpen(true)
         }
         if (data.result.toLowerCase().startsWith('unknown command')) {
-          addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+          addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
         // Display command output for commands that produce user-visible text
         // (parity with CLI — every /command prints to console; the web UI
@@ -127,7 +153,7 @@ function wireSocket(ws: WebSocket) {
           void syncSession(true).then(() => {
             void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
             if (data.result.trim().length > 0) {
-              addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+              addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
             }
           })
         } else {
@@ -138,17 +164,40 @@ function wireSocket(ws: WebSocket) {
             !data.result.toLowerCase().startsWith('unknown command') &&
             cmd !== 'raw' &&
             data.result.trim().length > 0) {
-          addMessage({ role: 'assistant', content: scrubMarkup(data.result) })
+          addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
         break
     }
   }
 
+  ws.onopen = () => {
+    reconnectAttempts = 0
+    useSessionStore.getState().setConnection('open')
+    useSessionStore.getState().setSendFailure('')
+    // Anything typed while the socket was down goes now, in order.
+    const pending = outbox
+    outbox = []
+    pending.forEach((msg) => ws.send(JSON.stringify(msg)))
+    // A reconnect may have missed events, so re-read authoritative state.
+    void syncSession(true)
+  }
+
+  ws.onerror = () => {
+    // onclose always follows, which is where the retry is scheduled.
+    if (!disposed) useSessionStore.getState().setConnection('reconnecting')
+  }
+
   ws.onclose = () => {
     // Reconnect only while the app wants a socket — no zombie loops after unmount.
-    if (!disposed) {
-      reconnectTimer = setTimeout(() => ensureConnection(), 2000)
-    }
+    if (disposed) return
+    reconnectAttempts += 1
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (reconnectAttempts - 1), RECONNECT_MAX_MS)
+    const store = useSessionStore.getState()
+    store.setConnection('reconnecting')
+    // A turn cannot still be streaming over a socket that just closed; leaving
+    // isStreaming set is what used to lock the composer for good.
+    store.setStreaming(false)
+    reconnectTimer = setTimeout(() => ensureConnection(), delay)
   }
 }
 
@@ -156,7 +205,14 @@ function ensureConnection() {
   if (disposed || (sharedWs && sharedWs.readyState <= WebSocket.OPEN)) return
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${protocol}//${window.location.host}/ws`
-  const ws = new WebSocket(wsUrl)
+  if (reconnectAttempts === 0) useSessionStore.getState().setConnection('connecting')
+  let ws: WebSocket
+  try {
+    ws = new WebSocket(wsUrl)
+  } catch {
+    useSessionStore.getState().setConnection('failed')
+    return
+  }
   sharedWs = ws
   wireSocket(ws)
 }
@@ -181,6 +237,65 @@ async function syncSession(includeHistory = false) {
   }
 }
 
+/** Send one frame, or hold it in the outbox until the socket is back. */
+function sendFrame(msg: WSClientMessage): boolean {
+  if (msg.type === 'chat' || msg.type === 'command') {
+    useSessionStore.getState().resetStreaming()
+    useSessionStore.getState().setActivity('Working')
+    useSessionStore.getState().setStreaming(true)
+  }
+  if (sharedWs && sharedWs.readyState === WebSocket.OPEN) {
+    try {
+      sharedWs.send(JSON.stringify(msg))
+      return true
+    } catch {
+      return false
+    }
+  }
+  // Queue it and say so, rather than returning silently - a dropped message
+  // used to leave the composer spinning on a turn that was never sent.
+  // `interrupt` is deliberately not queued: stopping a turn that no longer
+  // exists is meaningless, and replaying it would cancel the next one.
+  const store = useSessionStore.getState()
+  if (msg.type === 'interrupt') {
+    store.setStreaming(false)
+    return false
+  }
+  outbox.push(msg)
+  store.setStreaming(false)
+  store.setSendFailure(
+    'Not connected to Agent8088 — this message is queued and will be sent '
+    + 'as soon as the connection is back.',
+  )
+  ensureConnection()
+  return false
+}
+
+/** Dispatch the head of the prompt queue. Called when a turn ends, and by
+ *  Resume. One prompt per turn: the backend refuses concurrent turns. */
+export function drainPromptQueue() {
+  const store = useSessionStore.getState()
+  if (store.queuePaused) return
+  const next = store.promptQueue[0]
+  if (!next) return
+  store.removeQueuedPrompt(next.id)
+  if (next.kind === 'command') {
+    const [command, ...rest] = next.text.replace(/^\//, '').split(' ')
+    sendFrame({ type: 'command', command, args: rest.join(' ') })
+    return
+  }
+  // The transcript echo happens here rather than at enqueue time, so a queued
+  // prompt does not appear to have been asked before it actually runs.
+  store.addMessage({ role: 'user', content: next.text })
+  sendFrame({ type: 'chat', text: next.text, attachments: next.attachmentIds })
+}
+
+/** A turn that stopped or failed holds the queue for the user to look at. */
+function pauseQueueIfPending() {
+  const store = useSessionStore.getState()
+  if (store.promptQueue.length) store.setQueuePaused(true)
+}
+
 // Late-bound to avoid a circular import at module load.
 let _queryClient: ReturnType<typeof useQueryClient> | null = null
 function useQueryClientHelper() {
@@ -191,30 +306,24 @@ export function useWebSocket() {
   const queryClient = useQueryClient()
   _queryClient = queryClient
 
-  const send = useCallback((msg: WSClientMessage) => {
-    if (!sharedWs || sharedWs.readyState !== WebSocket.OPEN) {
-      ensureConnection()
-      // Retry once the socket opens (or drop if it never connects).
-      const onOpen = () => sharedWs?.send(JSON.stringify(msg))
-      if (sharedWs && sharedWs.readyState === WebSocket.CONNECTING) {
-        sharedWs.addEventListener('open', onOpen, { once: true })
-      }
-      return
-    }
-    sharedWs.send(JSON.stringify(msg))
-  }, [])
+  const send = useCallback(sendFrame, [])
 
   useEffect(() => {
     consumers += 1
     disposed = false
     ensureConnection()
-    if (consumers === 1) void syncSession()
+    // includeHistory: the backend still holds the transcript (/api/history) and
+    // the session file is on disk, so a refresh must restore what the user can
+    // see. Syncing without it is what made every reload look like a new chat.
+    if (consumers === 1) void syncSession(true)
     return () => {
       consumers -= 1
       if (consumers <= 0) {
         consumers = 0
         disposed = true
         if (reconnectTimer) clearTimeout(reconnectTimer)
+        reconnectAttempts = 0
+        outbox = []
         sharedWs?.close()
         sharedWs = null
       }

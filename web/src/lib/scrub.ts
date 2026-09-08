@@ -13,6 +13,8 @@
  * ASCII-clean: \u273f = the flower sentinel.
  */
 
+import type { ChatMessage } from '@/types/api'
+
 const FLOWER = '\u273f'
 const TC_OPEN = '<tool_call>'
 const TC_CLOSE = '</tool_call>'
@@ -49,9 +51,25 @@ const RULES: Array<[RegExp, string]> = [
 
 export function scrubMarkup(text: string): string {
   if (!text) return text
-  let out = text
+  let out = text.replace(/\u273fARGS(?:<\/arg_key>\s*)?<arg_value>\s*:?/g, '\u273fARGS\u273f:')
   for (const [re, replacement] of RULES) {
     out = out.replace(re, replacement)
   }
-  return out
+  return out.replace(/<\/?(?:arg_value|arg_key|tool_call)>/g, '')
+}
+
+// The engine stores tool feedback as user turns. Hide that feedback when
+// restoring history, while retaining real user messages (including errors).
+export function displayMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.filter((message, index) => {
+    if (message.role === 'assistant') return Boolean(scrubMarkup(message.content).trim())
+    if (message.role !== 'user') return false
+    if (message.content.startsWith('Tool result (')) return false
+    const previous = messages[index - 1]
+    const afterTool = previous?.role === 'assistant' &&
+      /\u273fFUNCTION|<tool_call>/.test(previous.content)
+    if (afterTool && message.content.startsWith('Error: ')) return false
+    if (message.content.startsWith('You keep repeating tool calls without progress.')) return false
+    return true
+  })
 }

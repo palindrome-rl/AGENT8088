@@ -145,6 +145,43 @@ class _Output(BaseModel):
     answer: str
 
 
+@pytest.mark.asyncio
+async def test_json_object_mode_skips_the_schema_attempt_entirely(monkeypatch):
+    """structured_output_mode='json_object' must go straight to the fallback
+    path (json_object response_format + schema instruction) without paying
+    one full doomed json_schema LLM round-trip first. The fallback is what
+    'auto' mode only reaches after the first attempt fails."""
+    model = Agent8088ChatModel(model="openai/gpt-4o",
+                               structured_output_mode="json_object")
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"thinking": "", "answer": "ok"}',
+                reasoning_content=None),
+                finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+    async def fail_super_ainvoke(self, messages, output_format=None, **kwargs):
+        raise AssertionError("json_object mode must not reach the json_schema path")
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "browser_use.llm.litellm.ChatLiteLLM.ainvoke", fail_super_ainvoke,
+        raising=True)
+
+    result = await model.ainvoke([], output_format=_Output)
+
+    assert result.completion.answer == "ok"
+    assert len(calls) == 1
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    # The schema instruction rides in the system message, not a second call.
+    assert "JSON object matching this schema" in calls[0]["messages"][0]["content"]
+
+
 class _Action(BaseModel):
     wait: int
 
@@ -547,3 +584,75 @@ def test_a_valid_top_level_json_array_is_not_reduced_to_its_first_object():
     parsed = _parse_structured_output(_Items, '[{"a": 1}, {"b": 2}]')
 
     assert parsed.root == [{"a": 1}, {"b": 2}]
+
+
+# --- adaptive completion cap --------------------------------------------------
+
+
+def test_cap_grows_when_a_response_is_cut_off():
+    """A response that hit the cap (finish_reason 'length') proves the task
+    needs more room than the configured starting cap - the cap must grow so
+    the retried step isn't truncated identically."""
+    model = Agent8088ChatModel(model="openai/gpt-4o", max_tokens=4096)
+    model._record_completion_usage("length", 4096)
+    assert model._adaptive_cap == 8192
+    assert model._completion_cap() == 8192
+
+
+def test_cap_never_grows_past_the_ceiling():
+    model = Agent8088ChatModel(model="openai/gpt-4o", max_tokens=4096,
+                               min_completion_tokens=1024, max_completion_tokens=6000)
+    model._record_completion_usage("length", 4096)
+    assert model._adaptive_cap == 6000  # doubling clamped by the ceiling
+
+
+def test_cap_decays_toward_observed_usage_but_never_below_the_floor():
+    """Healthy responses prove what the task actually uses; the cap shrinks
+    toward ~1.5x that (geometrically, so a later long final answer still has
+    room), but never below the configured floor."""
+    model = Agent8088ChatModel(model="openai/gpt-4o", max_tokens=4096,
+                               min_completion_tokens=1024)
+    model._record_completion_usage("stop", 300)
+    assert model._adaptive_cap < 4096          # decaying
+    assert model._adaptive_cap >= 1024        # floored
+    # Repeated healthy short responses converge to the floor.
+    for _ in range(30):
+        model._record_completion_usage("stop", 100)
+    assert model._adaptive_cap == 1024
+
+
+def test_cap_with_unset_max_tokens_starts_at_chatlitellms_own_default():
+    """ChatLiteLLM's dataclass default fills max_tokens=4096 even when the
+    caller omits it, so the first call's cap is exactly that default - i.e.
+    no behavior change for callers that never configured a cap."""
+    model = Agent8088ChatModel(model="openai/gpt-4o")
+    assert model._completion_cap() == 4096
+
+
+@pytest.mark.asyncio
+async def test_ainvoke_applies_the_adaptive_cap_and_adapts_afterwards(monkeypatch):
+    """End to end: the request carries the current working cap (not the
+    original 4096), and a length-cut response grows the cap for the NEXT
+    call."""
+    model = Agent8088ChatModel(model="openai/gpt-4o", max_tokens=4096,
+                               extra_body={"x": 1})
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"thinking": "", "answer": "ok"}',
+                reasoning_content=None),
+                finish_reason="length")],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=4096),
+        )
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    await model.ainvoke([], output_format=_Output)
+    assert calls[0]["max_tokens"] == 4096   # the working cap, applied
+    assert calls[0]["extra_body"] == {"x": 1}  # extra_body path still honored
+
+    await model.ainvoke([], output_format=_Output)
+    assert calls[1]["max_tokens"] == 8192   # adapted after the truncation

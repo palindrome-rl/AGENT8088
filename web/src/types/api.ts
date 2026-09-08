@@ -101,6 +101,8 @@ export interface SessionData {
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
+  /** CLI/Rich output is terminal text, not Markdown. */
+  format?: 'markdown' | 'terminal'
 }
 
 export interface StatusInfo {
@@ -265,6 +267,7 @@ export type WSEvent =
   | { type: 'plan_approval'; plan: string; id: string }
   | { type: 'plan_step'; index: number; total: number; step_text: string; tool_name: string; status: 'pending' | 'running' | 'done' | 'failed'; result?: string }
   | { type: 'answer'; text: string; usage: { seconds: number; tokens: number; context?: number } }
+  | { type: 'turn_complete' }
   | { type: 'interrupted'; elapsed: number; partial: string }
   | { type: 'error'; message: string }
   | { type: 'session_saved'; name: string }

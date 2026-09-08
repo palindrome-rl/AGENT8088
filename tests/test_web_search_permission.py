@@ -21,6 +21,19 @@ def _no_real_env_file(monkeypatch, engine):
     monkeypatch.delenv("EXA_API_KEY", raising=False)
 
 
+@pytest.fixture
+def escalating_mode(monkeypatch, engine):
+    """Pin a permission mode that actually gates a network request.
+
+    With no config.txt the engine defaults to full-auto, where check_permission
+    auto-approves everything - so the "still escalates" tests below passed only
+    as long as something else happened to set a stricter mode. They assert the
+    behaviour of the gate, not of full-auto, so they have to say which mode they
+    mean.
+    """
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+
+
 def test_ddgs_only_chain_is_true_with_no_other_backend_configured(engine):
     assert engine._ddgs_only_chain() is True
 
@@ -49,15 +62,18 @@ def test_web_search_skips_escalation_when_ddgs_is_the_only_backend(engine, monke
     assert calls == ["test query"]
 
 
-def test_web_search_still_escalates_when_searxng_is_configured(engine):
-    engine.APP_CONFIG["search_base_url"] = "http://localhost:8080/search?q="
+def test_web_search_still_escalates_when_searxng_is_configured(engine, escalating_mode):
+    # A remote host on purpose: a *local* SearXNG has its own opt-in no-prompt
+    # path (_local_searxng_no_prompt_enabled), which is not what this asserts.
+    engine.APP_CONFIG["search_base_url"] = "https://searx.example.com/search?q="
     engine.SEARCH_BASE_URL_CONFIGURED = True
     result = engine.exec_tool("web_search", json.dumps({"query": "test query"}))
     assert result.startswith("ESCALATION_REQUEST\x1f")
     assert result.split("\x1f")[2] == "network_request"
 
 
-def test_web_search_still_escalates_when_a_keyed_backend_is_configured(engine, monkeypatch):
+def test_web_search_still_escalates_when_a_keyed_backend_is_configured(
+        engine, monkeypatch, escalating_mode):
     monkeypatch.setenv("TAVILY_API_KEY", "test-key")
     result = engine.exec_tool("web_search", json.dumps({"query": "test query"}))
     assert result.startswith("ESCALATION_REQUEST\x1f")

@@ -26,6 +26,9 @@ from agent8088 import engine
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    # Each test gets a fresh memoization cache: cached successes from another
+    # test's fake playwright/data-dir would otherwise leak across tests.
+    monkeypatch.setattr(engine, "_chromium_executable_cache", {})
 
 
 def _install_fake_playwright(monkeypatch, rel=None, default_root=None):
@@ -85,6 +88,33 @@ def test_a_failed_lookup_leaves_no_env_state_behind(monkeypatch, tmp_path):
 
     assert engine._playwright_chromium_executable() is None
     assert "PLAYWRIGHT_BROWSERS_PATH" not in os.environ
+
+
+def test_a_successful_lookup_is_memoized_and_reused_without_reprobing(
+        monkeypatch, tmp_path):
+    """Each probe spins up a whole Playwright Node driver (~200ms measured)
+    just to read a path; browse_page pays that on every call. A second lookup
+    with the same (env override, data dir) must not probe again - but a cached
+    path that has since vanished must be re-probed, not returned stale."""
+    home = tmp_path / "agent8088"
+    private = home / "playwright-browsers"
+    exe = private / "chromium-1234" / "chrome"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("stub")
+
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: home)
+    monkeypatch.setattr(engine, "_playwright_available", lambda: True)
+    _install_fake_playwright(monkeypatch, rel="chromium-1234/chrome",
+                             default_root=tmp_path / "shared")
+    # The stub's context manager is the "probe": the second lookup must hit
+    # the cache and not enter it again.
+    assert engine._playwright_chromium_executable() == str(exe)
+    assert engine._playwright_chromium_executable() == str(exe)
+    assert engine._chromium_executable_cache  # memoized, not re-resolved
+
+    # A cached path whose file has disappeared must not be returned stale.
+    exe.unlink()
+    assert engine._playwright_chromium_executable() is None
 
 
 def test_exec_browser_respects_existing_override(monkeypatch, tmp_path):

@@ -6,13 +6,13 @@ import {
 } from 'lucide-react'
 import type { DoctorCheck } from '@/types/api'
 import { cn } from '@/lib/utils'
+import { apiFetch, handled, assertOk } from '@/lib/api'
+import { ErrorCard } from '@/components/ErrorCard'
 
 // ---- API helpers ----
 
 async function fetchJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return apiFetch<T>(url, { action: 'run diagnostics' })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
@@ -21,8 +21,7 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return res.json() as Promise<T>
+  return handled<T>(res)
 }
 
 interface FixResponse {
@@ -150,7 +149,9 @@ export default function DoctorPage() {
   const handleDump = async () => {
     try {
       const res = await fetch('/api/dump')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      // A dump is plain text, not JSON, so this reads the body directly - but
+      // the status still goes through the shared error path.
+      await assertOk(res, 'generate the diagnostic bundle')
       const text = await res.text()
       const blob = new Blob([text], { type: 'text/plain' })
       const url = URL.createObjectURL(blob)
@@ -223,9 +224,8 @@ export default function DoctorPage() {
 
       {/* Error */}
       {doctorQuery.isError && !doctorQuery.isLoading && (
-        <div className="flex items-center gap-2 rounded-xl border border-red-900/50 bg-red-950/30 p-6 text-sm text-red-400">
-          <AlertCircle className="h-4 w-4 shrink-0" /> Failed to run diagnostics
-        </div>
+        <ErrorCard error={doctorQuery.error} action="run diagnostics"
+                   onRetry={() => void doctorQuery.refetch()} />
       )}
 
       {/* Content */}

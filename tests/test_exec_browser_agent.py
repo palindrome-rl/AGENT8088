@@ -205,10 +205,15 @@ def fake_browser_use(monkeypatch):
         return types.SimpleNamespace(**kwargs)
 
     def fake_build_browser_chat_model(client, model_name, budget=None, max_tokens=None,
-                                      extra_body=None):
+                                      extra_body=None, structured_output_mode="auto",
+                                      min_completion_tokens=None,
+                                      max_completion_tokens=None):
         llm_calls.append({"client": client, "model_name": model_name,
                           "budget": budget, "max_tokens": max_tokens,
-                          "extra_body": extra_body})
+                          "extra_body": extra_body,
+                          "structured_output_mode": structured_output_mode,
+                          "min_completion_tokens": min_completion_tokens,
+                          "max_completion_tokens": max_completion_tokens})
         return object()
 
     monkeypatch.setattr(browser_use, "Agent", _FakeAgent)
@@ -473,6 +478,22 @@ def test_the_agent_is_built_without_vision_thinking_or_the_judge(fake_browser_us
     assert kwargs["use_judge"] is False
 
 
+def test_flash_mode_is_off_by_default_and_wired_through_when_enabled(
+        fake_browser_use, monkeypatch):
+    """browser_flash_mode=1 swaps browser-use's ~22KB system prompt for a
+    ~2.4KB one and strips thinking/evaluation/plan fields from the output
+    schema - 2-4x faster per-step LLM calls on a small model, at the cost of
+    the reasoning scaffolding small models lean on. So: off by default, and
+    the constructor kwarg must track the config."""
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    assert fake_browser_use.agents[0].kwargs["flash_mode"] is False
+
+    monkeypatch.setattr(A, "BROWSER_FLASH_MODE", True)
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    # The fixture accumulates agents across runs; the second run's agent is last.
+    assert fake_browser_use.agents[-1].kwargs["flash_mode"] is True
+
+
 # --- browser_max_actions_per_step --------------------------------------------
 # Measured on a local 35B: prefill runs ~1250 tok/s and llama.cpp prefix-caches
 # the (fixed, ~30k char) system prompt, but generation runs ~68 tok/s - so a
@@ -522,17 +543,17 @@ def test_the_batch_size_is_never_below_one(fake_browser_use, monkeypatch):
     assert fake_browser_use.agents[0].kwargs["max_actions_per_step"] == 1
 
 
-def test_the_llm_is_built_with_the_same_completion_token_ceiling_as_the_main_loop(
-        fake_browser_use):
-    """Left at ChatLiteLLM's own default (4096, half of engine.py's own 8192),
-    a model that spends much of its budget on 'thinking' before writing the
-    action can get cut off mid-response - browser-use reports this as "Model
-    returned empty action" and retries the whole step, a silent, avoidable
-    source of wasted round-trips. The browsing loop must get the same ceiling
-    the main agent loop already uses, not browser-use's unrelated default."""
+def test_the_llm_is_built_with_the_browser_specific_token_ceiling(fake_browser_use):
+    """The browsing loop gets its own completion ceiling (BROWSER_LLM_MAX_TOKENS,
+    default 4096), NOT the main chat loop's MAX_COMPLETION_TOKENS (65000).
+    That value is sized for long-form chat answers; inside a browser step an
+    action batch is ~300 tokens, and 65000 lets a looping small model decode
+    for minutes within ONE step before anything stops it. Bounded to 4096 a
+    stuck step fails fast and cheap instead."""
     asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
 
-    assert fake_browser_use.llm_calls[0]["max_tokens"] == A.MAX_COMPLETION_TOKENS
+    assert fake_browser_use.llm_calls[0]["max_tokens"] == A.BROWSER_LLM_MAX_TOKENS
+    assert A.BROWSER_LLM_MAX_TOKENS < A.MAX_COMPLETION_TOKENS
 
 
 def test_the_browser_is_closed_when_the_task_times_out(fake_browser_use, monkeypatch):
@@ -625,6 +646,40 @@ def test_env_overrides_step_timeout_and_screenshots(fake_browser_use, monkeypatc
     assert fake_browser_use.agents[0].max_steps == 3
     assert fake_browser_use.agents[0].kwargs["use_vision"] is True
     assert A._browser_task_timeout() == 7
+
+
+def test_step_ceiling_adapts_to_the_task_shape(fake_browser_use, monkeypatch):
+    """A read-only task ('read the page') is one navigation plus reading -
+    it gets half the configured ceiling so a wandering run fails fast; an
+    interactive task gets the full ceiling because it legitimately needs a
+    page per action plus retries."""
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 25)
+    monkeypatch.delenv("AGENT8088_BROWSER_ADAPTIVE_STEPS", raising=False)
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    assert fake_browser_use.agents[-1].max_steps == 12  # half of 25, floored shape
+
+    asyncio.run(A._run_browser_agent(
+        "https://example.com", "log in with the credentials and submit the form"))
+    assert fake_browser_use.agents[-1].max_steps == 25  # interactive: full ceiling
+
+
+def test_step_ceiling_adaptation_can_be_disabled(fake_browser_use, monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 25)
+    monkeypatch.setenv("AGENT8088_BROWSER_ADAPTIVE_STEPS", "0")
+
+    asyncio.run(A._run_browser_agent("https://example.com", "read the page"))
+    assert fake_browser_use.agents[-1].max_steps == 25
+
+
+def test_step_ceiling_floor_keeps_tiny_ceilings_usable(monkeypatch):
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 8)
+    monkeypatch.delenv("AGENT8088_BROWSER_ADAPTIVE_STEPS", raising=False)
+    # 8 // 2 = 4 would be below the floor of 5.
+    assert A._browser_task_step_ceiling("read the page") == 5
+    monkeypatch.setattr(A, "BROWSER_MAX_STEPS", 3)
+    # A configured ceiling below the floor always wins - never ABOVE config.
+    assert A._browser_task_step_ceiling("read the page") == 3
 
 
 def test_browser_output_marks_truncation_and_keeps_its_own_note_outside_web_content(

@@ -2,9 +2,16 @@ import base64
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# Every assertion in this module is about the Windows installer path
+# (conhost.exe, WindowsPowerShell\\v1.0). There was no platform guard, so
+# the suite failed on macOS/Linux for a test that cannot apply there.
+pytestmark = pytest.mark.skipif(sys.platform != "win32",
+                                reason="Windows installer behaviour")
 
 
 ROOT = Path(__file__).resolve().parents[1]

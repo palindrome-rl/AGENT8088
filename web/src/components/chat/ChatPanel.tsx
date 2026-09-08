@@ -7,26 +7,17 @@ import { ThinkingTrace } from './ThinkingTrace'
 import { ApprovalCard } from './ApprovalCard'
 import { PromptBar } from './PromptBar'
 import { RawPanel } from './RawPanel'
-import { scrubMarkup } from '@/lib/scrub'
+import { scrubMarkup, displayMessages } from '@/lib/scrub'
 
 export function ChatPanel() {
   const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
   const { theme, rawPanelOpen } = useUIStore()
   const scrollRef = useRef<HTMLDivElement>(null)
-  const [showLoader, setShowLoader] = useState(false)
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages, isStreaming, toolEvents, streamingText])
 
-  // Show loader after 300ms of streaming with no text yet (agent is "thinking")
-  useEffect(() => {
-    if (isStreaming && !streamingText) {
-      const t = setTimeout(() => setShowLoader(true), 300)
-      return () => clearTimeout(t)
-    }
-    setShowLoader(false)
-  }, [isStreaming, streamingText])
 
   const isEmpty = messages.length === 0 && !isStreaming
 
@@ -61,29 +52,27 @@ export function ChatPanel() {
           </div>
         )}
 
-        {messages.map((msg, i) => (
+        {displayMessages(messages).map((msg, i) => (
           <MessageBubble key={i} message={msg} />
         ))}
 
-        {/* Loading state — Beautiful UI pixel-grid loader while agent thinks */}
-        {isStreaming && showLoader && !streamingText && (
-          <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
-            <PixelLoader theme={theme} />
-          </div>
-        )}
-
-        {/* Streaming response with word-by-word reveal */}
-        {isStreaming && streamingText && (
+        {/* Tool activity is visible even before answer text arrives. */}
+        {isStreaming && (
           <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
             <ThinkingTrace />
             {toolEvents.map((tool, i) => (
               <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
             ))}
-            <StreamingReveal text={scrubMarkup(streamingText)} />
+            {scrubMarkup(streamingText).trim() && <MessageBubble message={{ role: 'assistant', content: scrubMarkup(streamingText) }} />}
           </div>
         )}
         <ApprovalCard />
       </div>
+      {isStreaming && (
+        <div className="mx-auto w-full max-w-3xl px-6 py-2">
+          <PixelLoader theme={theme} />
+        </div>
+      )}
       {rawPanelOpen && <RawPanel />}
       <PromptBar />
     </div>
@@ -92,6 +81,7 @@ export function ChatPanel() {
 
 /** Beautiful UI pixel-grid loader — 3x3 grid with chevron wavefront */
 function PixelLoader({ theme }: { theme: string }) {
+  const activity = useSessionStore(s => s.activity)
   const [ds, setDs] = useState(0)
   useEffect(() => {
     const t = setInterval(() => setDs(d => d + 1), 100)
@@ -117,53 +107,13 @@ function PixelLoader({ theme }: { theme: string }) {
           />
         ))}
       </span>
-      <span
-        className="text-[13px] font-medium"
-        style={{
-          color: theme === 'dark' ? '#71717a' : '#a1a1aa',
-          backgroundImage: `linear-gradient(90deg, ${theme === 'dark' ? '#71717a' : '#a1a1aa'} 35%, ${theme === 'dark' ? '#e4e4e7' : '#18181b'} 50%, ${theme === 'dark' ? '#71717a' : '#a1a1aa'} 65%)`,
-          backgroundSize: '200% 100%',
-          WebkitBackgroundClip: 'text',
-          backgroundClip: 'text',
-          WebkitTextFillColor: 'transparent',
-          animation: 'shimmer-text 1.4s linear infinite',
-        }}
-      >
-        Generating
+      <span className="text-[13px] font-medium text-zinc-700 dark:text-zinc-200">
+        {activity}
       </span>
       <span className="font-mono text-[12px] text-zinc-400 dark:text-zinc-500 tabular-nums">
         {elapsed}
       </span>
     </div>
-  )
-}
-
-/** Beautiful UI streaming text — words resolve out of blur as they arrive */
-function StreamingReveal({ text }: { text: string }) {
-  const words = text.split(' ')
-
-  return (
-    <p className="text-[14px] leading-relaxed text-zinc-800 dark:text-zinc-200">
-      {words.map((word, i) => (
-        <span
-          key={i}
-          className="inline"
-          style={{
-            animation: i === words.length - 1
-              ? 'word-reveal 200ms ease-out both'
-              : 'word-reveal 200ms ease-out both',
-            filter: i === words.length - 1 ? 'blur(0px)' : 'none',
-          }}
-        >
-          {word}{' '}
-        </span>
-      ))}
-      {/* Blinking cursor while streaming */}
-      <span
-        className="ml-0.5 inline-block h-3.5 w-0.5 translate-y-0.5 rounded-full bg-brand-cyan"
-        style={{ animation: 'blink 1s step-end infinite' }}
-      />
-    </p>
   )
 }
 

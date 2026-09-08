@@ -74,7 +74,7 @@ def _windows_cpu_name() -> str | None:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "(Get-CimInstance Win32_Processor).Name"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         ).stdout.strip()
         return out or None
     except (OSError, subprocess.SubprocessError):

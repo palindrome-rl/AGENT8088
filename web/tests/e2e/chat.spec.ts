@@ -64,7 +64,11 @@ test('an exact slash command submits with Enter', async ({ page }) => {
   const textarea = page.locator('textarea')
   await textarea.fill('/help')
   await textarea.press('Enter')
-  await expect(page.getByText('Commands', { exact: true })).toBeVisible()
+  // /help output arrives as one terminal-formatted <pre> holding the whole
+  // command table, so no element's text is exactly "Commands" - assert on the
+  // transcript content instead of an exact-text element match.
+  await expect(page.locator('body')).toContainText('Commands')
+  await expect(page.locator('body')).toContainText('/tools')
 })
 
 test('an exact command wins over a longer autocomplete match', async ({ page }) => {

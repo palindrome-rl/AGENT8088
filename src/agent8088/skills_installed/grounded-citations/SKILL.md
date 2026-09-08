@@ -31,6 +31,7 @@ might be neither.
 - Training-data knowledge is fine for stable facts (how a language feature
   works, a historical date) that don't need a citation. Reserve `web_search`
   for what could plausibly have changed since the model was trained.
-- `browse_page` after a search, when the question needs more than the search
-  snippet gives — don't stop at the snippet if it doesn't actually answer the
-  question asked.
+- If search results lack a requested detail, make a targeted follow-up
+  `web_search` or report what could not be verified. Do not automatically call
+  `browse_page` to supplement search results; browser use for that purpose
+  requires an explicit user request. Do not invent details missing from sources.
