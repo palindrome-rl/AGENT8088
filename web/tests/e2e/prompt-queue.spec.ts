@@ -252,7 +252,7 @@ test('with no turn running a prompt still sends immediately', async ({ page }) =
   await expect(page.getByRole('listitem').filter({ hasText: 'straight through' })).toHaveCount(0)
 })
 
-test('the model picker is available from the sidebar', async ({ page }) => {
+test('the model picker sits in the content-pane header, not the sidebar', async ({ page }) => {
   await page.route('**/api/providers', (route) => route.fulfill({
     status: 200, contentType: 'application/json',
     body: JSON.stringify({ configured: ['ollama'], builtins: [], active: 'ollama' }),
@@ -266,12 +266,34 @@ test('the model picker is available from the sidebar', async ({ page }) => {
   await bootWithFakeSocket(page)
   await push(page, { type: 'status', data: { provider: 'ollama', model: 'qwen2.5', permission_mode: 'readonly', context_pct: 0, session_name: 'queue-spec' } })
 
-  const sidebar = page.locator('aside')
-  await expect(sidebar.getByRole('button', { name: 'Change model' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Change model' })).toHaveCount(1)
-  await sidebar.getByRole('button', { name: 'Change model' }).click()
-  await sidebar.getByLabel('Provider').selectOption('ollama')
-  await sidebar.getByLabel('Model').fill('qwen3')
-  await sidebar.getByRole('button', { name: 'Switch model' }).click()
-  await expect(sidebar.getByRole('button', { name: 'Change model' })).toHaveText('ollama:qwen3')
+  const trigger = page.getByRole('button', { name: 'Change model' })
+  await expect(trigger).toBeVisible()
+  await expect(trigger).toHaveCount(1)
+  // It moved out of the navigation rail and into the header above the chat.
+  await expect(page.locator('aside').getByRole('button', { name: 'Change model' })).toHaveCount(0)
+  // The trigger shows the bare model name; the provider stays in the tooltip.
+  await expect(trigger).toHaveText('qwen2.5')
+  await expect(trigger).toHaveAttribute('title', 'ollama:qwen2.5')
+
+  // Scope to the switcher: "Model" as a bare substring also matches the
+  // sidebar's session-action buttons now that this control is page-level.
+  const switcher = page.locator('[data-model-menu]')
+  await trigger.click()
+  await switcher.getByLabel('Provider', { exact: true }).selectOption('ollama')
+  await switcher.getByLabel('Model', { exact: true }).fill('qwen3')
+  await switcher.getByRole('button', { name: 'Switch model' }).click()
+  await expect(trigger).toHaveText('qwen3')
+})
+
+test('the header keeps the model picker on a settings page, beside Back to chat', async ({ page }) => {
+  await page.route('**/api/providers', (route) => route.fulfill({
+    status: 200, contentType: 'application/json',
+    body: JSON.stringify({ configured: ['ollama'], builtins: [], active: 'ollama' }),
+  }))
+  await bootWithFakeSocket(page)
+  // addInitScript survives navigation, so the socket stub is reinstalled here.
+  await page.goto('/appearance', { waitUntil: 'domcontentloaded' })
+
+  await expect(page.getByRole('button', { name: 'Back to chat' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Change model' })).toBeVisible()
 })

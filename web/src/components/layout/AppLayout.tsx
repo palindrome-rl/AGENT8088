@@ -5,6 +5,7 @@ import { Sidebar } from './Sidebar'
 import { StatusBar } from './StatusBar'
 import { ConnectionBanner } from './ConnectionBanner'
 import { CommandPalette } from '@/components/CommandPalette'
+import { ModelSwitcher } from '@/components/ModelSwitcher'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useUIStore } from '@/stores/ui'
 
@@ -64,8 +65,8 @@ export function AppLayout() {
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
         <ConnectionBanner />
-        {location.pathname !== '/' && (
-          <div className="flex h-11 shrink-0 items-center border-b border-zinc-200 bg-white px-4 dark:border-zinc-800/60 dark:bg-zinc-950">
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-zinc-200 bg-white px-3 dark:border-zinc-800/60 dark:bg-zinc-950">
+          {location.pathname !== '/' && (
             <button
               type="button"
               aria-label="Back to chat"
@@ -75,8 +76,9 @@ export function AppLayout() {
               <ArrowLeft className="h-4 w-4" />
               Back to chat
             </button>
-          </div>
-        )}
+          )}
+          <ModelSwitcher />
+        </div>
         <main className="flex-1 overflow-auto">
           <Outlet />
         </main>

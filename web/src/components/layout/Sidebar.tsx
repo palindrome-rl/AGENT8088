@@ -2,9 +2,9 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
   FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
-  PanelLeftClose, PanelLeftOpen, Sun, Moon, Monitor, Search, X, Plus, MoreHorizontal, Pencil, Trash2, Palette, ChevronDown, Loader2,
+  PanelLeftClose, PanelLeftOpen, Sun, Moon, Monitor, Search, X, Plus, MoreHorizontal, Pencil, Trash2, Palette,
 } from 'lucide-react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { useUIStore, type Theme } from '@/stores/ui'
 import { useSessionStore } from '@/stores/session'
 import { cn } from '@/lib/utils'
@@ -43,15 +43,11 @@ const appearanceThemes: { value: Theme; label: string; Icon: typeof Sun }[] = [
   { value: 'system', label: 'System', Icon: Monitor },
 ]
 
-type ProvidersResponse = { configured: string[]; builtins: string[]; active: string }
-type ModelsResponse = { models: string[] }
-type ModelSwitchResponse = { ok: boolean; provider?: string; model?: string; error?: string }
 
 export function Sidebar() {
   const { sidebarCollapsed, toggleSidebar, theme, setTheme } = useUIStore()
-  const { clearChat, setMessages, setSessionName, setStatus, status, isStreaming } = useSessionStore()
+  const { clearChat, setMessages, setSessionName, isStreaming } = useSessionStore()
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -59,11 +55,6 @@ export function Sidebar() {
   const [sessionAction, setSessionAction] = useState<string | null>(null)
   const [sessionMenu, setSessionMenu] = useState<string | null>(null)
   const [sessionError, setSessionError] = useState('')
-  const [modelMenuOpen, setModelMenuOpen] = useState(false)
-  const [selectedProvider, setSelectedProvider] = useState('')
-  const [selectedModel, setSelectedModel] = useState('')
-  const [modelError, setModelError] = useState('')
-  const [modelChanging, setModelChanging] = useState(false)
   const searchRef = useRef<HTMLInputElement>(null)
 
   const sessionsQuery = useQuery({
@@ -72,16 +63,6 @@ export function Sidebar() {
       return apiFetch<SessionInfo[]>('/api/sessions', { action: 'load sessions' })
     },
   })
-  const providersQuery = useQuery({
-    queryKey: ['providers'],
-    queryFn: () => apiFetch<ProvidersResponse>('/api/providers', { action: 'load providers' }),
-  })
-  const modelsQuery = useQuery({
-    queryKey: ['models', selectedProvider],
-    queryFn: () => apiFetch<ModelsResponse>(`/api/models/${encodeURIComponent(selectedProvider)}`, { action: 'load models' }),
-    enabled: Boolean(selectedProvider),
-  })
-
   useEffect(() => {
     const media = window.matchMedia('(max-width: 720px)')
     const syncSidebar = () => {
@@ -120,22 +101,6 @@ export function Sidebar() {
   }, [settingsOpen])
 
   useEffect(() => {
-    if (!modelMenuOpen) return
-    const closeModelMenu = (event: PointerEvent) => {
-      if (!(event.target as Element)?.closest('[data-model-menu]')) setModelMenuOpen(false)
-    }
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setModelMenuOpen(false)
-    }
-    document.addEventListener('pointerdown', closeModelMenu)
-    document.addEventListener('keydown', handleEscape)
-    return () => {
-      document.removeEventListener('pointerdown', closeModelMenu)
-      document.removeEventListener('keydown', handleEscape)
-    }
-  }, [modelMenuOpen])
-
-  useEffect(() => {
     if (!sessionMenu) return
     const closeMenu = (event: PointerEvent) => {
       if (!(event.target as Element)?.closest('[data-session-menu]')) setSessionMenu(null)
@@ -170,35 +135,6 @@ export function Sidebar() {
     setSettingsOpen(false)
     await sessionsQuery.refetch()
     navigate('/')
-  }
-
-  const openModelMenu = () => {
-    setModelError('')
-    setSelectedProvider(status?.provider || providersQuery.data?.active || '')
-    setSelectedModel(status?.model || '')
-    setModelMenuOpen((open) => !open)
-  }
-
-  const switchModel = async () => {
-    if (!selectedProvider || !selectedModel) return
-    setModelChanging(true)
-    setModelError('')
-    try {
-      const result = await apiFetch<ModelSwitchResponse>('/api/model/switch', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: selectedProvider, model: selectedModel }),
-        action: 'switch the model',
-      })
-      if (!result.ok) throw new Error(result.error || 'Could not switch the model')
-      if (status) setStatus({ ...status, provider: result.provider || selectedProvider, model: result.model || selectedModel })
-      setModelMenuOpen(false)
-      void queryClient.invalidateQueries({ queryKey: ['providers'] })
-      void queryClient.invalidateQueries({ queryKey: ['config'] })
-    } catch (error) {
-      setModelError(error instanceof Error ? error.message : 'Could not switch the model')
-    } finally {
-      setModelChanging(false)
-    }
   }
 
   const handleResume = async (name: string) => {
@@ -339,40 +275,6 @@ export function Sidebar() {
             </button>
           )}
         </div>
-
-        {!sidebarCollapsed && (
-          <div data-model-menu className="relative mx-2 mb-1">
-            <button
-              type="button"
-              aria-label="Change model"
-              aria-expanded={modelMenuOpen}
-              disabled={isStreaming}
-              onClick={openModelMenu}
-              className="flex h-10 w-full items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-2.5 text-left text-[12px] text-zinc-600 transition-colors hover:border-zinc-300 hover:bg-white hover:text-zinc-900 disabled:opacity-40 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-900 dark:hover:text-zinc-100"
-              title={status ? `${status.provider}:${status.model}` : 'Change model'}
-            >
-              <span className="min-w-0 flex-1 truncate font-medium">{status ? `${status.provider}:${status.model}` : 'Choose model'}</span>
-              <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-            </button>
-            {modelMenuOpen && (
-              <div className="absolute left-0 top-full z-30 mt-2 w-full rounded-xl border border-zinc-200 bg-white p-3 shadow-xl shadow-black/10 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-black/40">
-                <p className="mb-2 text-xs font-medium text-zinc-800 dark:text-zinc-100">Switch model</p>
-                <label className="mb-1 block text-[11px] text-zinc-500">Provider</label>
-                <select value={selectedProvider} onChange={(event) => { setSelectedProvider(event.target.value); setSelectedModel('') }} className="mb-2 w-full rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none focus:border-brand-primary dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100">
-                  <option value="">Select provider…</option>
-                  {[...new Set([...(providersQuery.data?.configured || []), ...(providersQuery.data?.builtins || [])])].sort().map((provider) => <option key={provider} value={provider}>{provider}</option>)}
-                </select>
-                <label className="mb-1 block text-[11px] text-zinc-500">Model</label>
-                <input list="sidebar-model-options" value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} placeholder={modelsQuery.isLoading ? 'Loading models…' : 'Select or type a model'} className="w-full rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none placeholder:text-zinc-400 focus:border-brand-primary dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
-                <datalist id="sidebar-model-options">{modelsQuery.data?.models.map((model) => <option key={model} value={model} />)}</datalist>
-                {modelError && <p role="alert" className="mt-2 text-[11px] text-red-500 dark:text-red-400">{modelError}</p>}
-                <button type="button" disabled={!selectedProvider || !selectedModel || modelChanging} onClick={() => void switchModel()} className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-brand-primary px-2 py-1.5 text-xs font-medium text-white disabled:opacity-40">
-                  {modelChanging && <Loader2 className="h-3.5 w-3.5 animate-spin" />}Switch model
-                </button>
-              </div>
-            )}
-          </div>
-        )}
 
         {/* New chat button */}
         <div className="mx-2 mb-1">
