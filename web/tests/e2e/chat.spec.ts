@@ -35,6 +35,20 @@ test('command palette opens with Cmd+K', async ({ page }) => {
   await expect(page.getByPlaceholder(/Search pages and commands/)).toBeVisible()
 })
 
+test('the command palette uses the platform shortcut and dismisses reliably', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByText('Ctrl+K', { exact: true })).toBeVisible()
+
+  await page.keyboard.press('Control+k')
+  await expect(page.getByRole('dialog', { name: 'Command palette' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog', { name: 'Command palette' })).toHaveCount(0)
+
+  await page.keyboard.press('Control+k')
+  await page.mouse.click(8, 8)
+  await expect(page.getByRole('dialog', { name: 'Command palette' })).toHaveCount(0)
+})
+
 test('prompt bar accepts text and slash commands', async ({ page }) => {
   await page.goto('/')
   const textarea = page.locator('textarea')

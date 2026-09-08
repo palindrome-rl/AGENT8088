@@ -12,6 +12,7 @@ import { scrubMarkup, displayMessages } from '@/lib/scrub'
 export function ChatPanel() {
   const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
   const { theme, rawPanelOpen } = useUIStore()
+  const paletteShortcut = navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl+K'
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -45,7 +46,7 @@ export function ChatPanel() {
 
             <div className="mt-5 flex items-center gap-1.5 text-[11px] text-zinc-400 dark:text-zinc-600">
               <kbd className="rounded border border-zinc-300 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-900 px-1.5 py-0.5 font-mono text-zinc-500 dark:text-zinc-400">
-                ⌘K
+                {paletteShortcut}
               </kbd>
               <span>command palette</span>
             </div>

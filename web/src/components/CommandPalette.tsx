@@ -53,6 +53,7 @@ export function CommandPalette() {
   const [selected, setSelected] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const paletteRef = useRef<HTMLDivElement>(null)
 
   // Reset state on open
   useEffect(() => {
@@ -62,6 +63,25 @@ export function CommandPalette() {
       setTimeout(() => inputRef.current?.focus(), 50)
     }
   }, [commandPaletteOpen])
+
+  useEffect(() => {
+    if (!commandPaletteOpen) return
+    const dismissPalette = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setCommandPaletteOpen(false)
+      }
+    }
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!paletteRef.current?.contains(event.target as Node)) setCommandPaletteOpen(false)
+    }
+    window.addEventListener('keydown', dismissPalette)
+    window.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => {
+      window.removeEventListener('keydown', dismissPalette)
+      window.removeEventListener('pointerdown', closeOnOutsidePointer)
+    }
+  }, [commandPaletteOpen, setCommandPaletteOpen])
 
   // Filter results
   const results = useMemo<ResultEntry[]>(() => {
@@ -111,9 +131,6 @@ export function CommandPalette() {
     } else if (e.key === 'Enter') {
       e.preventDefault()
       selectResult(results[selected])
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      setCommandPaletteOpen(false)
     }
   }
 
@@ -137,12 +154,14 @@ export function CommandPalette() {
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Command palette"
       className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 pt-20"
-      onClick={() => setCommandPaletteOpen(false)}
     >
       <div
+        ref={paletteRef}
         className="w-full max-w-xl overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900"
-        onClick={(e) => e.stopPropagation()}
         style={{ animation: 'pop-in 180ms cubic-bezier(0.23,1,0.32,1) both' }}
       >
         {/* Search input */}
