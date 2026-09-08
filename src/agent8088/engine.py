@@ -8726,6 +8726,13 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         reset_turn_approval_state()
         global memory_capture_thread
         memory_capture_thread = None
+        # Paint before recall, not after. Recall does a network round trip, and
+        # the loop's own first spin("thinking...") is on the far side of it --
+        # so without this the terminal stays blank for the whole call and the
+        # status line then appears already reading several elapsed seconds,
+        # because turn_start was set back when the user hit enter.
+        if kwargs.get("spin"):
+            kwargs["spin"]("thinking...")
         kwargs["system_prompt"] = _recalled_memory_prompt(
             messages, kwargs.get("system_prompt"), identity=memory_identity)
     answer = None
