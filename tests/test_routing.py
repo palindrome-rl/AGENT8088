@@ -95,6 +95,27 @@ def test_cooldown_ignores_nonpositive():
     assert routing.cooling("groq", "m") is False
 
 
+def test_param_count_score_maps_size_to_tier():
+    assert routing._param_count_score("some-model-120b") == 90
+    assert routing._param_count_score("qwen2.5-coder:32b") == 70
+    assert routing._param_count_score("llama-3.1-8b-instant") == 30
+    assert routing._param_count_score("tiny-1.5b") == 15
+
+
+def test_param_count_score_none_when_no_count_present():
+    assert routing._param_count_score("gpt-4o-mini") is None
+    assert routing._param_count_score("mistral-small-2603") is None
+
+
+def test_keyword_score_matches_existing_tiers():
+    assert routing._keyword_score("claude-opus-4") == 100
+    assert routing._keyword_score("gemini-2.0-flash") == 20
+
+
+def test_keyword_score_none_when_nothing_matches():
+    assert routing._keyword_score("some-totally-unknown-id") is None
+
+
 # --- selection -------------------------------------------------------------
 CHAIN = [("ollama", "a"), ("groq", "b"), ("openai", "c")]
 

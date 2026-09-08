@@ -81,13 +81,53 @@ def starting_rung(model_name: str, chain_len: int) -> int:
     return chain_len - 1 if variant(model_name) == "smart" else 0
 
 
-def rank_hint(model_id: str) -> int:
-    """Rough strength score for a model id. Seeding only -- see _STRENGTH_HINTS."""
-    text = str(model_id or "").lower()
+_PARAM_COUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[bB](?:\b|[:_-])")
+
+# Threshold -> score, checked highest-first. Below the lowest threshold falls
+# through to a fixed floor rather than another tuple, since there is no
+# meaningful lower bound on parameter count.
+_PARAM_TIERS: list[tuple[float, int]] = [
+    (100.0, 90), (30.0, 70), (10.0, 50), (3.0, 30),
+]
+
+
+def _param_count_score(text: str) -> int | None:
+    """Parse a parameter count out of a model id (30b, 70B, 1.5b) and map it
+    to a strength tier. None if no count is present -- distinct from a real
+    tier match, so the caller can combine this with _keyword_score."""
+    match = _PARAM_COUNT_RE.search(text)
+    if not match:
+        return None
+    count = float(match.group(1))
+    for threshold, score in _PARAM_TIERS:
+        if count >= threshold:
+            return score
+    return 15
+
+
+def _keyword_score(text: str) -> int | None:
+    """Match today's name-substring tiers. None if nothing matches -- this is
+    what changed from the old rank_hint: it used to return _DEFAULT_STRENGTH
+    here, which made "no signal" indistinguishable from "matched the default
+    tier" and made combining two heuristics impossible."""
     for pattern, score in _STRENGTH_HINTS:
         if re.search(pattern, text):
             return score
-    return _DEFAULT_STRENGTH
+    return None
+
+
+def rank_hint(model_id: str) -> int:
+    """Rough strength score for a model id, guessed from its name alone.
+
+    Combines a parsed parameter count (30b/70B) with today's keyword tiers,
+    taking whichever signal is stronger; the existing default only applies
+    when neither matches. Superseded by Task 4, which checks the maintained
+    catalog before ever calling this.
+    """
+    text = str(model_id or "").lower()
+    candidates = [s for s in (_param_count_score(text), _keyword_score(text))
+                 if s is not None]
+    return max(candidates) if candidates else _DEFAULT_STRENGTH
 
 
 def order_for_seed(candidates):
