@@ -251,3 +251,27 @@ test('with no turn running a prompt still sends immediately', async ({ page }) =
   await expect.poll(async () => (await sent(page)).filter((f) => f.type === 'chat').length).toBe(1)
   await expect(page.getByRole('listitem').filter({ hasText: 'straight through' })).toHaveCount(0)
 })
+
+test('the model picker is available from the sidebar', async ({ page }) => {
+  await page.route('**/api/providers', (route) => route.fulfill({
+    status: 200, contentType: 'application/json',
+    body: JSON.stringify({ configured: ['ollama'], builtins: [], active: 'ollama' }),
+  }))
+  await page.route('**/api/models/ollama', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ models: ['qwen3'] }),
+  }))
+  await page.route('**/api/model/switch', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, provider: 'ollama', model: 'qwen3' }),
+  }))
+  await bootWithFakeSocket(page)
+  await push(page, { type: 'status', data: { provider: 'ollama', model: 'qwen2.5', permission_mode: 'readonly', context_pct: 0, session_name: 'queue-spec' } })
+
+  const sidebar = page.locator('aside')
+  await expect(sidebar.getByRole('button', { name: 'Change model' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Change model' })).toHaveCount(1)
+  await sidebar.getByRole('button', { name: 'Change model' }).click()
+  await sidebar.getByLabel('Provider').selectOption('ollama')
+  await sidebar.getByLabel('Model').fill('qwen3')
+  await sidebar.getByRole('button', { name: 'Switch model' }).click()
+  await expect(sidebar.getByRole('button', { name: 'Change model' })).toHaveText('ollama:qwen3')
+})

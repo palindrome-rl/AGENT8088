@@ -1,12 +1,11 @@
 import { useMemo, useState, useRef, useEffect } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQueryClient } from '@tanstack/react-query'
 import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2, ChevronDown, Shield, Pencil, X, ListPlus } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
 import { useWebSocket, drainPromptQueue } from '@/hooks/useWebSocket'
 import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
-import { apiFetch } from '@/lib/api'
 import { ImageUpload } from './ImageUpload'
 
 /* ─────────────────────────────────────────────────────────
@@ -41,10 +40,6 @@ const permissionModes = [
   { value: 'full-auto', label: 'Full auto', description: 'Run with configured permissions' },
 ] as const
 
-type ProvidersResponse = { configured: string[]; builtins: string[]; active: string }
-type ModelsResponse = { models: string[] }
-type ModelSwitchResponse = { ok: boolean; provider?: string; model?: string; error?: string }
-
 export function PromptBar() {
   const [text, setText] = useState('')
   const [dismissed, setDismissed] = useState(false)
@@ -56,11 +51,6 @@ export function PromptBar() {
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [modeOpen, setModeOpen] = useState(false)
   const [modeChanging, setModeChanging] = useState(false)
-  const [modelMenuOpen, setModelMenuOpen] = useState(false)
-  const [selectedProvider, setSelectedProvider] = useState('')
-  const [selectedModel, setSelectedModel] = useState('')
-  const [modelError, setModelError] = useState('')
-  const [modelChanging, setModelChanging] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const { isStreaming, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult,
@@ -72,15 +62,6 @@ export function PromptBar() {
   const { data: commands = [] } = useCommandCatalog()
   const { rawPanelOpen, toggleRawPanel, setRawPanelOpen } = useUIStore()
   const queryClient = useQueryClient()
-  const providersQuery = useQuery({
-    queryKey: ['providers'],
-    queryFn: () => apiFetch<ProvidersResponse>('/api/providers', { action: 'load providers' }),
-  })
-  const modelsQuery = useQuery({
-    queryKey: ['models', selectedProvider],
-    queryFn: () => apiFetch<ModelsResponse>(`/api/models/${encodeURIComponent(selectedProvider)}`, { action: 'load models' }),
-    enabled: Boolean(selectedProvider),
-  })
 
   const token = dismissed ? null : parseToken(text)
   const menu = plusOpen ? 'at' : token?.kind ?? null
@@ -113,18 +94,17 @@ export function PromptBar() {
 
   // Close menus on outside click
   useEffect(() => {
-    if (!menu && !plusOpen && !modeOpen && !modelMenuOpen) return
+    if (!menu && !plusOpen && !modeOpen) return
     const close = (e: PointerEvent) => {
       if (!(e.target as Element)?.closest('[data-promptbar]')) {
         setPlusOpen(false)
         setModeOpen(false)
-        setModelMenuOpen(false)
         setDismissed(true)
       }
     }
     document.addEventListener('pointerdown', close)
     return () => document.removeEventListener('pointerdown', close)
-  }, [menu, plusOpen, modeOpen, modelMenuOpen])
+  }, [menu, plusOpen, modeOpen])
 
   const sessionCreation = useRef<Promise<void> | null>(null)
   const createSession = async (topic = '') => {
@@ -212,35 +192,6 @@ export function PromptBar() {
       setSessionError(error instanceof Error ? error.message : 'Could not change permission mode')
     } finally {
       setModeChanging(false)
-    }
-  }
-
-  const openModelMenu = () => {
-    setModelError('')
-    setSelectedProvider(status?.provider || providersQuery.data?.active || '')
-    setSelectedModel(status?.model || '')
-    setModelMenuOpen((open) => !open)
-  }
-
-  const switchModel = async () => {
-    if (!selectedProvider || !selectedModel) return
-    setModelChanging(true)
-    setModelError('')
-    try {
-      const result = await apiFetch<ModelSwitchResponse>('/api/model/switch', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: selectedProvider, model: selectedModel }),
-        action: 'switch the model',
-      })
-      if (!result.ok) throw new Error(result.error || 'Could not switch the model')
-      if (status) setStatus({ ...status, provider: result.provider || selectedProvider, model: result.model || selectedModel })
-      setModelMenuOpen(false)
-      void queryClient.invalidateQueries({ queryKey: ['providers'] })
-      void queryClient.invalidateQueries({ queryKey: ['config'] })
-    } catch (error) {
-      setModelError(error instanceof Error ? error.message : 'Could not switch the model')
-    } finally {
-      setModelChanging(false)
     }
   }
 
@@ -578,38 +529,6 @@ export function PromptBar() {
             >
               <Plus className="h-4 w-4" />
             </button>
-
-            <div className="relative shrink-0">
-              <button
-                type="button"
-                aria-label="Change model"
-                aria-expanded={modelMenuOpen}
-                disabled={isStreaming}
-                onClick={openModelMenu}
-                className="flex h-7 max-w-36 items-center gap-1 rounded-lg px-2 text-[11px] font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-zinc-100"
-                title={status ? `${status.provider}:${status.model}` : 'Change model'}
-              >
-                <span className="truncate">{status ? `${status.provider}:${status.model}` : 'Model'}</span>
-                <ChevronDown className="h-3 w-3 shrink-0" />
-              </button>
-              {modelMenuOpen && (
-                <div className="absolute bottom-full left-0 z-20 mb-2 w-72 rounded-xl border border-zinc-200 bg-white p-3 shadow-xl shadow-black/10 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-black/40">
-                  <p className="mb-2 text-xs font-medium text-zinc-800 dark:text-zinc-100">Switch model</p>
-                  <label className="mb-1 block text-[11px] text-zinc-500">Provider</label>
-                  <select value={selectedProvider} onChange={(event) => { setSelectedProvider(event.target.value); setSelectedModel('') }} className="mb-2 w-full rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none focus:border-brand-primary dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100">
-                    <option value="">Select provider…</option>
-                    {[...new Set([...(providersQuery.data?.configured || []), ...(providersQuery.data?.builtins || [])])].sort().map((provider) => <option key={provider} value={provider}>{provider}</option>)}
-                  </select>
-                  <label className="mb-1 block text-[11px] text-zinc-500">Model</label>
-                  <input list="home-model-options" value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} placeholder={modelsQuery.isLoading ? 'Loading models…' : 'Select or type a model'} className="w-full rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none placeholder:text-zinc-400 focus:border-brand-primary dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
-                  <datalist id="home-model-options">{modelsQuery.data?.models.map((model) => <option key={model} value={model} />)}</datalist>
-                  {modelError && <p role="alert" className="mt-2 text-[11px] text-red-500 dark:text-red-400">{modelError}</p>}
-                  <button type="button" disabled={!selectedProvider || !selectedModel || modelChanging} onClick={() => void switchModel()} className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-brand-primary px-2 py-1.5 text-xs font-medium text-white disabled:opacity-40">
-                    {modelChanging && <Loader2 className="h-3.5 w-3.5 animate-spin" />}Switch model
-                  </button>
-                </div>
-              )}
-            </div>
 
             <div className="relative shrink-0">
               <button
