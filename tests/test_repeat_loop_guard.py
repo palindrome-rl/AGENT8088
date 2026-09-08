@@ -38,3 +38,27 @@ def test_a_repeated_identical_shell_call_is_stopped_not_rerun(monkeypatch, engin
     # means the same command was executed over and over.
     assert len(runs) <= 3, (
         f"identical call executed {len(runs)} times before the loop broke out")
+
+
+def test_an_opaque_cli_repeat_reruns_but_still_does_not_count_as_progress(monkeypatch, engine):
+    """Re-running observes external state; it must not also buy another round.
+
+    Two rules that pull opposite ways: an opaque external CLI can legitimately
+    return something new for identical arguments, so its repeat re-runs; but a
+    repeat is never progress, or the stall detector never fires and the model
+    polls until max_turns.
+    """
+    runs = []
+    args = {"name": "gimp", "arguments": ["part", "info", "0"], "cwd": "."}
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback",
+                        lambda *a, **k: _tool_call_response("cli_anything_run", args))
+    monkeypatch.setattr(engine, "exec_tool",
+                        lambda name, raw, **k: runs.append(name) or "state")
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+
+    engine.run_agent([{"role": "user", "content": "poll it"}], max_turns=8,
+                     allowed_tools={"cli_anything_run"}, tools_def=[])
+
+    assert runs, "the opaque CLI never ran; it must re-run, not be served from cache"
+    assert len(runs) <= 3, f"repeat counted as progress; polled {len(runs)} times"

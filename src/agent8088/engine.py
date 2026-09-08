@@ -9127,6 +9127,12 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
     return limit
 
 
+# Modes whose identical repeat is worth re-running: their result reflects
+# external state this process does not own, so a cached answer can be stale in
+# a way a re-read cannot. They still do not count as progress -- see the loop.
+_REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -9560,23 +9566,33 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # different bytes once anything else has run.
             #
             # `last_completed` is the LOOP BREAKER, and it has to cover every
-            # tool, not just reads. Nothing ran between two consecutive
-            # identical calls, so the second one is the model spinning rather
-            # than making progress — and for a write or a shell command,
-            # re-running it repeats the side effect. Serving it from the
-            # previous output leaves `executed` False, which is what trips the
-            # stall detector below. Narrowing this to reads let a repeated
-            # execute_shell run once per round until max_turns.
+            # tool. Nothing ran between two consecutive identical calls, so the
+            # second one is the model spinning, not progress — that is what
+            # leaves `executed` False and trips the stall detector below.
+            # Narrowing this to reads let a repeated execute_shell run once per
+            # round until max_turns.
+            #
+            # Whether to RE-RUN the repeat is a separate question from whether
+            # it counts as progress. Re-running a write or a shell command
+            # repeats its side effect, so those are served from the previous
+            # output. An opaque external CLI or a browser action can legitimately
+            # observe state that changed outside this process, so those re-run —
+            # they just still do not count as progress.
             read_key = efficiency.read_signature(name, args, resolve_user_path, PERMISSION_MODE)
             if read_key is None:
                 read_results.clear()
             previous_output = None
             repeated = False
+            no_progress = False
             if read_key is not None and read_key in read_results:
                 previous_output, repeated = read_results[read_key], True
             elif ("__parse_error__" not in args and last_completed
                     and sig == last_completed[0]):
                 previous_output, repeated = last_completed[1], True
+            # Re-running these observes the world, not our own side effect.
+            if repeated and (spec_mode := (TOOL_SPECS.get(name, {}).get("mode") or "")) in _REPEAT_RERUNS:
+                repeated, previous_output = False, None
+                no_progress = True
             if repeated:
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
                           if previous_output else f"Already tried {name} with no output. Give your final answer now.")
@@ -9637,7 +9653,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",
                                   "tool": name, "count": parse_error_retries})
                 continue
-            executed = True
+            executed = executed or not no_progress
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
