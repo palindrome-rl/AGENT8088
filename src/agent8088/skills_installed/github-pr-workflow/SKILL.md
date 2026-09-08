@@ -3,6 +3,7 @@ name: github-pr-workflow
 description: Take a change from working tree to an opened pull request using the git_* tools, in the right order.
 version: 1.0.0
 category: software-development
+progressive: true
 ---
 
 Use this whenever the user asks for a PR, or to push/commit/open a change.

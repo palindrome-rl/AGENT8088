@@ -3,6 +3,7 @@ name: spike
 description: Answer a feasibility question as cheaply as correctness allows, without building anything meant to be kept.
 version: 1.0.0
 category: workflow
+progressive: true
 ---
 
 Use this for "can we...", "is it possible...", "does X work if...", "quick

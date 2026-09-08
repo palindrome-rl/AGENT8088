@@ -364,7 +364,7 @@ res.set('Cache-Control', 'public, max-age=300'); // 5 minutes
 
 **Guard against the stampede.** A hot key expires, every concurrent request misses together, and the origin takes the full load at once, which is how a cache turns into an outage instead of preventing one. Serve stale while a single request recomputes (`stale-while-revalidate`), or coalesce concurrent misses behind one in-flight promise so N waiters cause one recompute.
 
-**Do not cache:** anything whose staleness is a correctness bug (balances, permissions, inventory at checkout), or per-user data under a key that does not identify the user. See `../../references/performance-checklist.md` for request coalescing, write strategies, negative caching, and the cache checklist.
+**Do not cache:** anything whose staleness is a correctness bug (balances, permissions, inventory at checkout), or per-user data under a key that does not identify the user. See `shared/performance-checklist.md` for request coalescing, write strategies, negative caching, and the cache checklist.
 
 ### Step 4: Verify (Keep or Revert)
 
@@ -441,7 +441,7 @@ npx lhci autorun
 
 ## See Also
 
-For detailed performance checklists, optimization commands, and anti-pattern reference, see `../../references/performance-checklist.md`.
+For detailed performance checklists, optimization commands, and anti-pattern reference, see `shared/performance-checklist.md`.
 
 
 ## Common Rationalizations
