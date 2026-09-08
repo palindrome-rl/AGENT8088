@@ -2009,7 +2009,7 @@ COMMAND_SPECS = (
     ("image", "/image <path-or-url> [question]", "Analyze a screenshot/diagram with a vision model", ()),
     ("paste", "/paste [question]", "Analyze an image from the OS clipboard (Windows/macOS)", ()),
     ("raw", "/raw <text>", "One raw model call — shows content, reasoning, tool_calls", ()),
-    ("model", "/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider", ()),
+    ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
     ("sandbox", "/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation", ()),
@@ -2627,12 +2627,27 @@ def cmd_raw(rest):
 
 
 def cmd_image(rest, resolver=None):
-    parts = rest.split(None, 1)
-    if not parts:
+    rest = rest.strip()
+    if not rest:
         console.print("[red]usage:[/red] /image <path-or-url> [question]")
         return
-    ref = parts[0]
-    question = parts[1] if len(parts) > 1 else "Describe this image."
+    tokens = rest.split()
+    ref, question = tokens[0], " ".join(tokens[1:]).strip() or "Describe this image."
+    # Windows paths contain spaces ("screenshot 2.png"), and split() reads
+    # them as path "screenshot" + question "2.png" - the same trap
+    # _detect_pasted_file solves for bare pastes, which then re-entered here
+    # via _handle_pasted_file and broke a second time. Try the longest
+    # leading token join first; the longest prefix naming a real file is the
+    # path, the rest is the question. URLs and short names resolve at j=1.
+    for j in range(len(tokens), 0, -1):
+        candidate = " ".join(tokens[:j])
+        try:
+            if Path(candidate).expanduser().is_file():
+                ref = candidate
+                question = " ".join(tokens[j:]).strip() or "Describe this image."
+                break
+        except OSError:
+            continue
     # A path typed directly into /image is the same "the user typed this by
     # hand" case the bare-paste feature exists for — no reason /image should
     # be more restrictive than pasting the same path with no command at all.
@@ -2738,7 +2753,7 @@ def _detect_pasted_file(line: str):
     # Unquoted Windows paths with spaces (e.g. "C:\...\Palindrome Business
     # Plan.pdf") were split into tokens by the \S+ scan above, none of which
     # resolved to a file. Re-join consecutive tokens starting from a
-    # drive-letter token (X:\) and check if the joined path is a real file —
+    # drive-letter token (X:\) and check if the joined path is a real file -
     # the same "must exist on disk" guard against misfiring on chat.
     drive_re = re.compile(r"^[A-Za-z]:[\\/]")
     for i, (candidate, (start, _)) in enumerate(spans):
@@ -2748,6 +2763,30 @@ def _detect_pasted_file(line: str):
             joined = " ".join(s[0] for s in spans[i:j])
             try:
                 path = Path(joined).resolve()
+            except OSError:
+                continue
+            if path.is_file():
+                end = spans[j - 1][1][1]
+                question = (stripped[:start] + stripped[end:]).strip()
+                return path, question
+
+    # A path glued to surrounding text ("what is in this fileC:\...\x.png")
+    # - the paste lost its separating space, so no token starts with X:\ and
+    # every pass above misses it. Carve a real file out of the first
+    # X:\-anchored span onward: grow token by token until the accumulated
+    # string names an existing file. The text before the drive token stays
+    # the question; the same must-exist guard holds.
+    for i, (candidate, (start, _)) in enumerate(spans):
+        if not re.search(r"[A-Za-z]:[\\/]", candidate):
+            continue
+        for j in range(len(spans), i, -1):
+            # glue: first token minus any words riding on its front
+            # (drive_re.search, not match, keeps "fileC:\" split correctly)
+            glued = candidate[re.search(r"[A-Za-z]:[\\/]", candidate).start():]
+            parts = [glued] + [s[0] for s in spans[i + 1:j]]
+            accumulated = " ".join(parts)
+            try:
+                path = Path(accumulated).resolve()
             except OSError:
                 continue
             if path.is_file():
@@ -2787,6 +2826,94 @@ def _handle_pasted_file(path, question):
     instruction = question or f"Here is the content of {resolved.name}."
     do_chat(f"{instruction}\n\n{body}")
     return True
+def _cmd_model_auto_setup():
+    """Propose an `auto` ladder from providers that both have a working key
+    AND are reachable right now.
+
+    `discover_panel()` alone only checks the first half: local Ollama carries
+    a hardcoded placeholder key (it needs no real credential), so it passes
+    the key check even when the daemon isn't running. Without a live
+    reachability check the ladder would include a rung that fails on first
+    use -- the exact bug reported when qwen14b-tooluse-v3 showed up with
+    Ollama not started. `_endpoint_probe` is a TCP-only connect test (no
+    prompt, no token, no key spent), the same one /doctor already uses.
+
+    Ordering uses routing.rank_hint, which is consulted here and nowhere else:
+    the result is saved as ordinary config the user can edit, so a bad guess
+    costs one edit rather than a wrong route on every call. That is the
+    difference from the MODEL_TIERS table deleted in the subagent redesign.
+    """
+    from agent8088 import fusion
+    try:
+        panel = fusion.discover_panel(max_panel_size=12)
+    except Exception as exc:
+        console.print(f"[red]could not discover providers:[/red] {exc}")
+        return
+    candidates = [(member.provider, member.model) for member in panel]
+    if not candidates:
+        console.print("[yellow]no usable providers[/yellow] — none of the configured "
+                      "providers has both a working API key and a model set.")
+        return
+
+    # One probe per distinct provider (not per candidate) -- several models
+    # can share a base_url, and a placeholder-keyed local provider is the
+    # common case (currently just Ollama) where "has a key" and "is running"
+    # genuinely differ.
+    reachable, unreachable = {}, {}
+    for provider, _model in candidates:
+        if provider in reachable or provider in unreachable:
+            continue
+        base_url = A.PROVIDERS.get(provider, {}).get("base_url", "")
+        result = _endpoint_probe(base_url)
+        (reachable if result.startswith("reachable") else unreachable)[provider] = result
+
+    candidates = [(p, m) for p, m in candidates if p in reachable]
+    if unreachable:
+        console.print("[dim]excluded (not reachable right now):[/dim]")
+        for provider, result in unreachable.items():
+            console.print(f"[dim]  {provider} — {result}[/dim]")
+    if not candidates:
+        console.print("[yellow]no reachable providers[/yellow] — every keyed provider "
+                      "failed a connection check. If a local one should be running, "
+                      "start it and re-run [#237dd7]/model auto setup[/#237dd7].")
+        return
+    ordered = A.routing.order_for_seed(candidates)
+    labels = [f"{provider}:{model}  (strength {A.routing.rank_hint(provider, model)})"
+              for provider, model in ordered]
+    label_to_pair = dict(zip(labels, ordered))
+
+    console.print("[dim]Reachable candidates, cheapest first. Uncheck any you don't "
+                  "want on the ladder.[/dim]")
+    picked_labels = _multi_choice_prompt(
+        "Select models for your auto ladder (space to toggle, enter to confirm):",
+        labels, checked=labels)
+    if not picked_labels:
+        console.print("[dim]nothing selected — not saved[/dim]")
+        return
+
+    # The picker returns selections in list order (already weakest-first from
+    # `ordered`), not click order, so the ladder's escalation direction is
+    # preserved regardless of which boxes the user happened to toggle.
+    selected = [label_to_pair[label] for label in labels if label in picked_labels]
+
+    t = Table(title="Auto ladder", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Rung", style="#237dd7", justify="right")
+    t.add_column("Model", style="#237dd7")
+    t.add_column("Strength hint", style="#237dd7", justify="right")
+    for index, (provider, model) in enumerate(selected, 1):
+        t.add_row(str(index), f"{provider}:{model}", str(A.routing.rank_hint(provider, model)))
+    console.print(t)
+
+    spec = ",".join(f"{provider}:{model}" for provider, model in selected)
+    A.update_simple_config(A.CONFIG_PATH, {"auto_chain": spec})
+    A.APP_CONFIG["auto_chain"] = spec
+    A.reload_auto_chain()
+    console.print(f"[#237dd7]auto ladder saved[/#237dd7] ({len(selected)} rung"
+                  f"{'s' if len(selected) != 1 else ''}) — select it with "
+                  f"[#237dd7]/model auto[/#237dd7]")
+
+
 def cmd_model(rest):
     raw_arg = rest.strip()
     arg = raw_arg.lower()
@@ -2799,6 +2926,23 @@ def cmd_model(rest):
     if arg == "setup":
         configure_model_profile()
         banner()
+        return
+    if arg in ("auto setup", "auto-setup"):
+        _cmd_model_auto_setup()
+        return
+    if arg in ("auto", "auto:fast", "auto:smart"):
+        chain = A.reload_auto_chain()
+        if not chain:
+            console.print("[yellow]no auto chain configured[/yellow] — build one with "
+                          "[#237dd7]/model auto setup[/#237dd7]")
+            return
+        A.MODEL_NAME = arg
+        start = A.routing.starting_rung(arg, len(chain))
+        console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{arg}[/#237dd7] "
+                      f"[dim](starting on {chain[start][0]}:{chain[start][1]})[/dim]")
+        console.print("[dim]  ladder: " + " → ".join(f"{p}:{m}" for p, m in chain) + "[/dim]")
+        console.print("[dim]  climbs a rung when a turn shows a length cutoff, bad tool "
+                      "calls, or no progress; resets each turn.[/dim]")
         return
     if not arg:
         if A.PROVIDERS:
@@ -2936,8 +3080,19 @@ def cmd_status(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Item", style="#00edff", no_wrap=True)
     t.add_column("Value", style="#237dd7")
-    active = _active_provider_name()
-    t.add_row("Model", f"{active}:{A.MODEL_NAME}")
+    if A.routing.is_auto(A.MODEL_NAME):
+        chain = A._auto_chain
+        rung = A._last_auto_rung if chain else None
+        if chain and rung is not None:
+            provider, model = chain[rung]
+            t.add_row("Model", f"{A.MODEL_NAME} → {provider}:{model} (rung {rung + 1}/{len(chain)})")
+        elif chain:
+            t.add_row("Model", f"{A.MODEL_NAME} (not yet run this session)")
+        else:
+            t.add_row("Model", f"{A.MODEL_NAME} [red](no ladder — run /model auto setup)[/red]")
+    else:
+        active = _active_provider_name()
+        t.add_row("Model", f"{active}:{A.MODEL_NAME}")
     t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
     connected = sum(item.get("state") == "connected" for item in A.MCP_RUNTIME.statuses.values())

@@ -50,8 +50,13 @@ prompt_paths=~
 # blocked_paths=/etc,/home,~/.ssh
 
 # --- model ---
-# Active provider (built-in base URLs are used automatically):
-default_provider=ollama
+# Active provider (built-in base URLs are used automatically). Leave unset for
+# no configured default -- get_client() then falls through its own precedence
+# chain (AGENT8088_PROVIDER env, legacy USE_GEMMA4 toggle, then the flat
+# model_base_url/model_name settings a few lines below, which still point at
+# local Ollama by default). Removing this line does not remove that fallback;
+# it only removes it from config.txt as the explicit choice.
+# default_provider=ollama
 
 # Provider config (base_url is built-in, only set api_key + model):
 # provider.ollama.model=qwen14b-tooluse-v3
@@ -395,3 +400,18 @@ web_search_no_prompt=1
 # blocked_paths first. Sensitive files and shell startup files (.zshrc etc.)
 # are refused regardless of this setting.
 # mcp_server_allow_writes=0
+
+# --- auto model routing (/model auto) ---
+# An opt-in strength ladder, cheapest rung first. Only consulted when the
+# selected model is `auto`, `auto:fast` or `auto:smart` -- with any explicit
+# model nothing here is read and behaviour is unchanged.
+#
+# Distinct from fallback_models on purpose: fallback_models answers "what to try
+# when the primary is unreachable" (ordered by preference), auto_chain answers
+# "what is stronger" (ordered by capability). Escalation moves left to right,
+# and only on evidence the turn is failing -- a truncated response, repeated
+# invalid tool calls, or no progress. It resets at the start of each turn.
+#
+# Build one from the providers you hold working keys for with:
+#   /model auto setup
+# auto_chain=ollama:qwen14b-tooluse-v3,groq:llama-3.3-70b-versatile,anthropic:claude-sonnet-4-6

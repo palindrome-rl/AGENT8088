@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cli_anything, documents, local_models, memory, web_search
+from agent8088 import cli_anything, documents, local_models, memory, routing, web_search
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -1558,6 +1558,24 @@ def configure_provider_profile(name: str, base_url: str, model: str, api_mode: s
 PROVIDERS = load_providers(APP_CONFIG, include_builtins=True)
 DEFAULT_PROVIDER = APP_CONFIG.get("default_provider", "")
 ACTIVE_PROVIDER = ""
+# The `auto` strength ladder, cheapest rung first. Parsed once against the known
+# providers so an entry naming a provider the user has since removed is dropped
+# rather than failing mid-turn. Empty unless the user ran `/model auto setup`,
+# and read only when the selected model is `auto` -- see routing.py.
+_auto_chain = routing.parse_chain(APP_CONFIG.get("auto_chain", ""), PROVIDERS)
+# The rung the loop last actually resolved to, so `/status` (called between
+# turns, with no access to the loop's local `auto_rung`) can show where `auto`
+# really landed rather than just echoing the raw "auto"/"auto:smart" selector.
+# None until the loop has run at least once this session.
+_last_auto_rung: int | None = None
+
+
+def reload_auto_chain() -> list:
+    """Re-parse auto_chain after config changes (e.g. `/model auto setup`)."""
+    global _auto_chain, _last_auto_rung
+    _auto_chain = routing.parse_chain(APP_CONFIG.get("auto_chain", ""), PROVIDERS)
+    _last_auto_rung = None
+    return _auto_chain
 
 
 def _provider_api_key(provider: dict) -> str:
@@ -2034,6 +2052,10 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             last_error = primary_error
             retry_after_ms = _extract_retry_after(primary_error)
             if retry_after_ms is not None and retry_after_ms > API_RETRY_MAX_DELAY_MS:
+                # Rate-limited for longer than we're willing to wait. Record it so
+                # `auto` skips this rung until the window passes instead of walking
+                # back into the same 429 next round.
+                routing.mark_cooldown(active_provider, active_model, retry_after_ms / 1000.0)
                 break  # skip remaining retries, fall through to fallback chain
             if attempt <= API_MAX_RETRIES:
                 time.sleep(_retry_delay(attempt, retry_after_ms))
@@ -8947,6 +8969,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
                     depth=0, budget=None, client=None, provider_name=None,
                     model_name=None):
+    global _last_auto_rung
     """Drive the model until it gives a final answer or hits max_turns.
 
     Optional hooks keep presentation out of the loop:
@@ -8973,6 +8996,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
     plan_mutation_retries = 0
+    # Current rung on the `auto` ladder. Sticky for the rest of this turn once
+    # escalated -- climbing back down mid-turn would oscillate between a model
+    # that just failed and the one that rescued it. A new user turn starts fresh
+    # at the cheap rung, so a one-off hard prompt doesn't tax every later one.
+    auto_rung = routing.starting_rung(model_name or MODEL_NAME, len(_auto_chain))
+    auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
     forced_stop = False
@@ -9034,6 +9063,53 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         loop_client = client
         loop_provider = provider_name
         loop_model = model_name
+        # Captured before resolution overwrites loop_model with a concrete
+        # provider:model id below -- the exception handler needs to know
+        # whether THIS ROUND started as `auto`, and `loop_model` won't say so
+        # by the time an error reaches it.
+        _round_is_auto = bool(_auto_chain) and routing.is_auto(loop_model or MODEL_NAME)
+        # Auto routing: resolve the `auto` ladder to a concrete (provider, model)
+        # for this round. Inert unless the user selected `auto` -- with any
+        # explicit model this is a single boolean test and nothing changes.
+        if _round_is_auto:
+            # Climb a rung when the run has produced evidence of struggle. Each
+            # distinct signal escalates at most once, so a single failure mode
+            # can't walk the whole ladder in one turn.
+            _signal = routing.quality_failure(
+                length_retries=length_retries,
+                parse_error_retries=parse_error_retries,
+                missing_args_retries=missing_args_retries,
+                unknown_retries=unknown_retries,
+                forcing=forcing,
+            )
+            if (_signal and _signal not in auto_signals_seen
+                    and auto_rung < len(_auto_chain) - 1):
+                auto_signals_seen.add(_signal)
+                auto_rung += 1
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "model_escalation",
+                                  "reason": _signal, "rung": auto_rung})
+                _log.info("auto routing escalated to rung %d (%s)", auto_rung, _signal)
+            # Escalating onto a *smaller*-window model would overflow, so a rung
+            # only qualifies if it can hold what we already have. Same estimator
+            # auto-compaction uses, converted chars -> tokens.
+            _min_context_needed = _estimate_context_chars(
+                messages, round_system_prompt or "") // 4
+            _picked = routing.select(
+                _auto_chain, auto_rung,
+                fits=lambda p, m: _active_model_token_limits(p, m)[0] >= _min_context_needed,
+            )
+            if _picked is not None:
+                auto_rung, _auto_provider, _auto_model = _picked
+                try:
+                    loop_client, _ = get_client(_auto_provider)
+                    loop_provider, loop_model = _auto_provider, _auto_model
+                    # Exposed at module level so `/status`, called between turns
+                    # with no view into this local, can show where auto landed.
+                    _last_auto_rung = auto_rung
+                except Exception as exc:      # unreachable provider: cool it, retry next round
+                    routing.mark_cooldown(_auto_provider, _auto_model, 60)
+                    _log.warning("auto routing could not open %s: %s", _auto_provider, exc)
         turn_context_window, turn_completion_limit = _active_model_token_limits(loop_provider, loop_model)
         # Auto-compaction: fires against *this* turn's real context window so
         # it stays correct across mid-session model switches. Skips once the
@@ -9072,13 +9148,58 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         except AgentInterrupted:
             raise
         except Exception as e:
-            # Backend/model error (timeout, context overflow, 5xx): don't crash the
-            # turn — return the best we have, guarded.
-            fallback = _last_tool_output[:1000] if _last_tool_output else f"The model backend errored: {e}"
-            answer = _guard_answer(fallback)
-            if on_answer:
-                on_answer(answer)
-            return answer
+            # A hard, non-retryable error (a renamed/deprecated model id, an
+            # invalid key) raises straight through _create_completion_with_fallback
+            # without ever trying an alternative -- see _retryable_model_error,
+            # which only matches transport failures. Under `auto` that must not
+            # mean "the turn dies": try the remaining rungs before giving up.
+            # Bounded by chain length, so this can never loop indefinitely.
+            if _round_is_auto:
+                routing.mark_cooldown(loop_provider, loop_model, 3600)
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "model_escalation",
+                                  "reason": "hard_error", "detail": str(e)[:200]})
+                response = None
+                for _ in range(len(_auto_chain) - 1):
+                    _picked = routing.select(_auto_chain, auto_rung)
+                    if _picked is None:
+                        break
+                    auto_rung, loop_provider, loop_model = _picked
+                    _last_auto_rung = auto_rung
+                    try:
+                        loop_client, _ = get_client(loop_provider)
+                        with spin("thinking..."):
+                            response = _create_completion_with_fallback(
+                                messages, round_tools_def, temperature=temperature,
+                                system_prompt=round_system_prompt, on_token=on_token,
+                                interrupt_check=interrupt_check, trace=trace, turn=turn,
+                                max_tokens=turn_max_tokens,
+                                client_override=loop_client,
+                                provider_override=loop_provider,
+                                model_override=loop_model,
+                            )
+                        break
+                    except AgentInterrupted:
+                        raise
+                    except Exception as retry_error:
+                        routing.mark_cooldown(loop_provider, loop_model, 3600)
+                        e = retry_error
+                        continue
+                if response is None:
+                    fallback = (_last_tool_output[:1000] if _last_tool_output
+                               else f"The model backend errored: {e}")
+                    answer = _guard_answer(fallback)
+                    if on_answer:
+                        on_answer(answer)
+                    return answer
+            else:
+                # Backend/model error (timeout, context overflow, 5xx): don't crash
+                # the turn -- return the best we have, guarded.
+                fallback = _last_tool_output[:1000] if _last_tool_output else f"The model backend errored: {e}"
+                answer = _guard_answer(fallback)
+                if on_answer:
+                    on_answer(answer)
+                return answer
 
         # Strip chain-of-thought BEFORE storing: keeps runaway reasoning out of the
         # context window (the usual cause of the "loops in the reasoning block" crash)
