@@ -1047,6 +1047,10 @@ def on_result(name, result):
         console.print(Text(f"  ⎿  {message}", style="dim"))
         return
 
+    if result.lstrip().startswith('Error:'):
+        console.print(Text(f"  ⎿  {result}", style='red'))
+        return
+
     if name == "web_search":
         # The raw result carries a "[Retrieved ...]" date stamp and an
         # <<<EXTERNAL_UNTRUSTED_CONTENT>>> tag for the model's benefit, not
@@ -2025,6 +2029,7 @@ COMMAND_SPECS = (
     ("reset", "/reset", "Clear the active session while retaining its name", ()),
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
+    ("cost", "/cost [task-id]", "Summarize recorded model-call telemetry — estimates only; unknown costs stay unknown", ()),
     ("memory", "/memory [on|off|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
     ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
     ("history", "/history", "Show the current conversation", ()),
@@ -4900,7 +4905,30 @@ def _configure_custom_models_endpoint():
     banner()
 
 
+def cmd_cost(args):
+    """Read existing local telemetry; never invent missing usage or pricing."""
+    from agent8088.efficiency import telemetry_summary
+    task_id = args.strip() or None
+    try:
+        report = telemetry_summary(A.MODEL_TELEMETRY_PATH, task_id=task_id)
+    except OSError as exc:
+        console.print(f"Could not read telemetry: {exc}", markup=False)
+        return
+    if not report['available']:
+        console.print('No telemetry file yet. Set model_telemetry=1 in config and restart to record future calls.', markup=False)
+        return
+    console.print(f"Calls: {report['calls']} | Errors: {report['errors']} | Summed call latency: {report['latency_ms']/1000:.1f}s", markup=False)
+    cost_label = f"${report['known_cost_usd']:.6f}" if report['estimated_cost_calls'] else 'unknown (no complete priced calls)'
+    console.print(f"Recorded cost estimates: {cost_label} | Calls with unknown cost: {report['unknown_cost_calls']}", markup=False)
+    console.print('Not an invoice. Unknown costs are excluded; summed latency is not task wall time. /cost <task-id> filters one task.', markup=False)
+    for task, calls in report['tasks'].items():
+        console.print(f"  {task}: {calls} calls", markup=False)
+    if report['truncated'] or report['malformed_records']:
+        console.print(f"Partial history: tail-only={report['truncated']}; skipped malformed records={report['malformed_records']}", markup=False)
+
+
 COMMANDS = {
+    "cost": cmd_cost,
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,

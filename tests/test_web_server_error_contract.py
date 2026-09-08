@@ -19,6 +19,12 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "home" / "config.txt"))
     (tmp_path / "home").mkdir(parents=True, exist_ok=True)
     from agent8088 import web_server
+    from agent8088 import cli
+    # cli may already be imported by another test, so environment changes alone
+    # do not replace its module-level path. Never create sessions in user data.
+    sessions = tmp_path / 'sessions'
+    sessions.mkdir()
+    monkeypatch.setattr(cli, 'SESSIONS_DIR', sessions)
     return TestClient(web_server.app)
 
 

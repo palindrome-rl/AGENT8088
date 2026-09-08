@@ -9,6 +9,13 @@ a few minutes' read left no budget to execute with, and the turn died reporting
 
 import time
 
+# Windows' default timer resolution is ~15.6ms, and a sleep can return that
+# much *before* an equivalent monotonic delta. These asserts are checking that
+# the wait was credited at all, not that the clock is exact, so they carry one
+# tick of slack. Without it they fail on ordering alone -- 0.188 >= 0.2 -- and
+# whichever test file happens to run first decides the result.
+TIMER_SLACK = 0.03
+
 
 def test_credit_idle_discounts_human_wait(engine):
     budget = engine._TurnBudget(max_seconds=5)
@@ -44,7 +51,7 @@ def test_human_wait_credits_the_active_budget(engine, monkeypatch):
     with engine._human_wait():
         time.sleep(0.2)
 
-    assert budget.idle_seconds >= 0.2
+    assert budget.idle_seconds >= 0.2 - TIMER_SLACK
 
 
 def test_human_wait_credits_even_when_the_prompt_raises(engine, monkeypatch):
@@ -61,7 +68,7 @@ def test_human_wait_credits_even_when_the_prompt_raises(engine, monkeypatch):
     except Boom:
         pass
 
-    assert budget.idle_seconds >= 0.1
+    assert budget.idle_seconds >= 0.1 - TIMER_SLACK
 
 
 def test_human_wait_is_safe_with_no_active_budget(engine, monkeypatch):
@@ -87,4 +94,4 @@ def test_plan_approval_wait_is_not_charged_to_the_budget(engine, monkeypatch):
     result = engine._exec_present_plan({"plan": "1. do the thing"})
 
     assert "Plan approved" in result
-    assert budget.idle_seconds >= 0.2, "the human's read time was charged to the turn"
+    assert budget.idle_seconds >= 0.2 - TIMER_SLACK, "the human's read time was charged to the turn"
