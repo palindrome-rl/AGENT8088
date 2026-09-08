@@ -2,10 +2,10 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
   FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
-  PanelLeftClose, PanelLeftOpen, Sun, Moon, Search, X, Plus, MoreHorizontal, Pencil, Trash2,
+  PanelLeftClose, PanelLeftOpen, Sun, Moon, Monitor, Search, X, Plus, MoreHorizontal, Pencil, Trash2, Palette,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
-import { useUIStore } from '@/stores/ui'
+import { useUIStore, type Theme } from '@/stores/ui'
 import { useSessionStore } from '@/stores/session'
 import { cn } from '@/lib/utils'
 import { useState, useEffect, useRef } from 'react'
@@ -29,6 +29,7 @@ const settingsItems = [
   { to: '/mcp', label: 'MCP', icon: Network },
   { to: '/memory', label: 'Memory', icon: Brain },
   { to: '/sessions', label: 'Sessions', icon: FolderClock },
+  { to: '/appearance', label: 'Appearance', icon: Palette },
   { to: '/config', label: 'Config', icon: Settings },
   { to: '/doctor', label: 'Doctor', icon: Stethoscope },
 ]
@@ -36,8 +37,15 @@ const settingsItems = [
 const SIDEBAR_EXPANDED = 224
 const SIDEBAR_COLLAPSED = 52
 
+const appearanceThemes: { value: Theme; label: string; Icon: typeof Sun }[] = [
+  { value: 'dark', label: 'Dark', Icon: Moon },
+  { value: 'light', label: 'Light', Icon: Sun },
+  { value: 'system', label: 'System', Icon: Monitor },
+]
+
+
 export function Sidebar() {
-  const { sidebarCollapsed, toggleSidebar, theme, toggleTheme } = useUIStore()
+  const { sidebarCollapsed, toggleSidebar, theme, setTheme } = useUIStore()
   const { clearChat, setMessages, setSessionName, isStreaming } = useSessionStore()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -55,7 +63,6 @@ export function Sidebar() {
       return apiFetch<SessionInfo[]>('/api/sessions', { action: 'load sessions' })
     },
   })
-
   useEffect(() => {
     const media = window.matchMedia('(max-width: 720px)')
     const syncSidebar = () => {
@@ -208,6 +215,7 @@ export function Sidebar() {
 
   return (
     <aside
+      data-sidebar
       data-sidebar-collapsed={sidebarCollapsed}
       aria-label="Workspace navigation"
       className="relative flex shrink-0 flex-col overflow-hidden border-r border-zinc-200 dark:border-zinc-800/60 bg-white dark:bg-zinc-950"
@@ -489,17 +497,15 @@ export function Sidebar() {
                   ))}
                 </nav>
                 <div className="border-t border-zinc-200 pt-2 dark:border-zinc-800/60">
-                  <span className="px-2.5 text-[11px] font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Appearance</span>
-                  <button
-                    type="button"
-                    aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-                    aria-pressed={theme === 'dark'}
-                    onClick={toggleTheme}
-                    className="mt-1 flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/40 dark:hover:text-zinc-200"
-                  >
-                    {theme === 'dark' ? <Sun className="h-4 w-4 shrink-0" /> : <Moon className="h-4 w-4 shrink-0" />}
-                    {theme === 'dark' ? 'Light mode' : 'Dark mode'}
-                  </button>
+                  <span className="px-2.5 text-[11px] font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Color mode</span>
+                  <div className="mt-1 grid grid-cols-3 gap-1 px-2" role="group" aria-label="Color mode">
+                    {appearanceThemes.map(({ value, label, Icon }) => (
+                      <button key={value} type="button" aria-pressed={theme === value} onClick={() => setTheme(value)}
+                        className={cn('flex flex-col items-center gap-1 rounded-lg py-1.5 text-[10px] transition-colors', theme === value ? 'bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100' : 'text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800/40')}>
+                        <Icon className="h-3.5 w-3.5" />{label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
       )}

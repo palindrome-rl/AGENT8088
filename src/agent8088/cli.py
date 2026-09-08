@@ -7179,7 +7179,9 @@ def main():
         return
     if args.web:
         from agent8088.web_server import run_web_server
-        run_web_server(host=args.web_host, port=args.web_port, dev=args.web_dev)
+        project_root = Path(__file__).resolve().parents[2]
+        dev_from_uv = bool(os.environ.get("UV")) and (project_root / "web" / "package.json").exists()
+        run_web_server(host=args.web_host, port=args.web_port, dev=args.web_dev or dev_from_uv)
         return
     if args.full_auto:
         A.PERMISSION_MODE = "full-auto"

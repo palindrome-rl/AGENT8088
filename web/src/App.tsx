@@ -14,6 +14,7 @@ import FusionPage from '@/pages/FusionPage'
 import TasksPage from '@/pages/TasksPage'
 import SearchPage from '@/pages/SearchPage'
 import SchedulesPage from '@/pages/SchedulesPage'
+import AppearancePage from '@/pages/AppearancePage'
 import NotFoundPage from '@/pages/NotFoundPage'
 
 export default function App() {
@@ -28,6 +29,7 @@ export default function App() {
         <Route path="/mcp" element={<McpPage />} />
         <Route path="/memory" element={<MemoryPage />} />
         <Route path="/sessions" element={<SessionsPage />} />
+        <Route path="/appearance" element={<AppearancePage />} />
         <Route path="/config" element={<ConfigPage />} />
         <Route path="/doctor" element={<DoctorPage />} />
         <Route path="/fusion" element={<FusionPage />} />

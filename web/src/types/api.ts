@@ -103,6 +103,14 @@ export interface ChatMessage {
   content: string
   /** CLI/Rich output is terminal text, not Markdown. */
   format?: 'markdown' | 'terminal'
+  attachments?: ChatAttachment[]
+}
+
+export interface ChatAttachment {
+  id?: string
+  name: string
+  type?: string
+  size?: number
 }
 
 export interface StatusInfo {

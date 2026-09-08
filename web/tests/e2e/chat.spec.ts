@@ -10,6 +10,7 @@ test('web UI loads with sidebar navigation', async ({ page }) => {
   await expect(page.locator('a:has-text("MCP")')).toBeVisible()
   await expect(page.locator('a:has-text("Memory")')).toBeVisible()
   await expect(page.locator('a:has-text("Sessions")')).toBeVisible()
+  await expect(page.locator('a:has-text("Appearance")')).toBeVisible()
   await expect(page.locator('a:has-text("Config")')).toBeVisible()
   await expect(page.locator('a:has-text("Doctor")')).toBeVisible()
 })
@@ -29,10 +30,46 @@ test('settings pages have an explicit back to chat control', async ({ page }) =>
   await expect(page).toHaveURL(/\/$/)
 })
 
+test('appearance settings update the workspace', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Settings' }).click()
+  await page.getByRole('link', { name: 'Appearance', exact: true }).click()
+  await expect(page).toHaveURL(/\/appearance$/)
+  await expect(page.getByRole('heading', { name: 'Appearance' })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Dracula preset' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-accent', 'rose')
+  await page.getByLabel('UI font').selectOption('serif')
+  await expect(page.locator('html')).toHaveAttribute('data-ui-font', 'serif')
+  await page.getByRole('switch', { name: 'Translucent sidebar' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-sidebar-translucent', 'true')
+  await page.getByLabel('Contrast').fill('110')
+  await expect(page.getByText('110%', { exact: true })).toBeVisible()
+})
+
 test('command palette opens with Cmd+K', async ({ page }) => {
   await page.goto('/')
   await page.getByRole('textbox', { name: 'Prompt' }).press('Control+k')
   await expect(page.getByPlaceholder(/Search pages and commands/)).toBeVisible()
+})
+
+test('the command palette uses the platform shortcut and dismisses reliably', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByText('Ctrl+K', { exact: true })).toBeVisible()
+
+  await page.keyboard.press('Control+k')
+  await expect(page.getByRole('dialog', { name: 'Command palette' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('dialog', { name: 'Command palette' })).toHaveCount(0)
+
+  await page.keyboard.press('Control+k')
+  await page.mouse.click(8, 8)
+  await expect(page.getByRole('dialog', { name: 'Command palette' })).toHaveCount(0)
+})
+
+test('the composer keeps the chat backdrop continuous', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.locator('[data-promptbar]')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
 })
 
 test('prompt bar accepts text and slash commands', async ({ page }) => {

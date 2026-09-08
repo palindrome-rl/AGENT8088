@@ -7,10 +7,7 @@ An optional TypeScript web interface for Agent8088, providing 1:1 parity with ev
 ### Production mode (serves built frontend)
 
 ```bash
-# Build the frontend
-cd web && npm install && npm run build
-
-# Launch from the repo root
+# Launch from the repo root (builds the frontend if needed)
 agent8088 --web
 # Or: agent8088 --web --web-port 8180 --web-host 127.0.0.1
 ```
@@ -20,11 +17,8 @@ Open `http://127.0.0.1:8180` in your browser.
 ### Development mode (Vite dev server + FastAPI backend)
 
 ```bash
-# Terminal 1: Start the FastAPI backend
-PYTHONPATH=src python -m agent8088.cli --web --web-port 8180 --web-dev
-
-# Terminal 2: Start the Vite dev server
-cd web && npm run dev
+# Starts the FastAPI backend and Vite together
+uv run agent8088 --web
 ```
 
 Open `http://127.0.0.1:5180` — Vite proxies `/api` and `/ws` to the FastAPI backend.
@@ -48,7 +42,7 @@ Browser (React/Vite)  ←──WebSocket──→  FastAPI (web_server.py)  ─�
 agent8088 --web              # Launch web UI (production, serves built files)
 agent8088 --web --web-port 3000   # Custom port
 agent8088 --web --web-host 0.0.0.0  # Bind to all interfaces
-agent8088 --web --web-dev     # Dev mode (don't serve built files)
+uv run agent8088 --web         # Dev mode (FastAPI + Vite)
 ```
 
 ## 1:1 CLI Surface Mapping

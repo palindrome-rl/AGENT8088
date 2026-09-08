@@ -32,7 +32,7 @@ function parseToken(draft: string): { kind: 'at' | 'slash'; query: string; start
   }
 }
 
-type Attachment = { localId: string; file: File; id?: string; state: 'uploading' | 'ready' | 'error'; error?: string }
+type Attachment = { localId: string; file: File; id?: string; state: 'uploading' | 'ready' | 'error'; error?: string; warning?: string }
 
 const permissionModes = [
   { value: 'plan-only', label: 'Plan', description: 'Research and propose before running' },
@@ -53,7 +53,7 @@ export function PromptBar() {
   const [modeChanging, setModeChanging] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const { isStreaming, sessionName, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult,
+  const { isStreaming, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult,
     promptQueue, queuePaused, enqueuePrompt, updateQueuedPrompt, removeQueuedPrompt, clearQueue,
     setQueuePaused } = useSessionStore()
   const { send: wsSend } = useWebSocket()
@@ -106,8 +106,9 @@ export function PromptBar() {
     return () => document.removeEventListener('pointerdown', close)
   }, [menu, plusOpen, modeOpen])
 
-  const ensureSession = async (topic = '') => {
-    if (sessionName) return
+  const sessionCreation = useRef<Promise<void> | null>(null)
+  const createSession = async (topic = '') => {
+    if (useSessionStore.getState().sessionName) return
 
     const statusResponse = await fetch('/api/status')
     if (!statusResponse.ok) throw new Error(`Could not read session status (${statusResponse.status})`)
@@ -135,16 +136,23 @@ export function PromptBar() {
     throw new Error('Could not create a unique session name')
   }
 
+  const ensureSession = (topic = '') => {
+    if (!sessionCreation.current) {
+      sessionCreation.current = createSession(topic).finally(() => { sessionCreation.current = null })
+    }
+    return sessionCreation.current
+  }
+
   const uploadAttachment = async (attachment: Attachment) => {
     try {
       await ensureSession(attachment.file.name)
       const response = await fetch('/api/attachments', {
         method: 'POST', headers: { 'X-Filename': attachment.file.name }, body: attachment.file,
       })
-      const result = await response.json() as { id?: string; error?: string }
+      const result = await response.json() as { id?: string; error?: string; warning?: string }
       if (!response.ok || !result.id) throw new Error(result.error ?? 'Upload failed')
       setAttachments((items) => items.map((item) => item.localId === attachment.localId
-        ? { ...item, id: result.id, state: 'ready', error: undefined } : item))
+        ? { ...item, id: result.id, state: 'ready', error: undefined, warning: result.warning } : item))
     } catch (error) {
       setAttachments((items) => items.map((item) => item.localId === attachment.localId
         ? { ...item, state: 'error', error: error instanceof Error ? error.message : 'Upload failed' } : item))
@@ -246,6 +254,7 @@ export function PromptBar() {
         kind: queuedText.startsWith('/') ? 'command' : 'chat',
         text: queuedText,
         attachmentIds: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []),
+        attachments: readyAttachments.map(({ id, file }) => ({ id, name: file.name, type: file.type, size: file.size })),
       })
       resetComposer()
       return
@@ -266,7 +275,10 @@ export function PromptBar() {
         setSessionError(error instanceof Error ? error.message : 'Could not create a session')
         return
       }
-      addMessage({ role: 'user', content: message })
+      addMessage({
+        role: 'user', content: message,
+        attachments: readyAttachments.map(({ id, file }) => ({ id, name: file.name, type: file.type, size: file.size })),
+      })
       wsSend({ type: 'chat', text: message, attachments: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []) })
     }
     resetComposer()
@@ -312,7 +324,7 @@ export function PromptBar() {
   return (
     <div
       data-promptbar
-      className="relative bg-zinc-50 dark:bg-zinc-950 pb-4 pt-2"
+      className="relative pb-4 pt-2"
     >
       {sessionError && (
         <div role="alert" className="mx-auto mb-2 max-w-2xl px-4 text-xs text-red-500 dark:text-red-400">
@@ -493,6 +505,8 @@ export function PromptBar() {
           {attachments.map((attachment) => <div key={attachment.localId} className="flex max-w-full items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-300">
             {attachment.state === 'uploading' ? <Loader2 className="h-3 w-3 animate-spin text-brand-cyan" /> : attachment.state === 'error' ? <AlertCircle className="h-3 w-3 text-red-400" /> : <Paperclip className="h-3 w-3 text-brand-cyan" />}
             <span className="max-w-40 truncate">{attachment.file.name}</span>
+            <span role="status" className="text-zinc-400">{attachment.state === 'uploading' ? 'Uploading / extracting' : attachment.state === 'ready' ? 'Ready' : 'Upload failed'}</span>
+            {attachment.warning && <span title={attachment.warning} className="text-amber-400">Needs attention: {attachment.warning}</span>}
             {attachment.state === 'error' && <button type="button" title={attachment.error} onClick={() => void uploadAttachment({ ...attachment, state: 'uploading' })} className="text-red-300 hover:text-red-100">Retry</button>}
             <button type="button" aria-label={`Remove ${attachment.file.name}`} onClick={() => void removeAttachment(attachment)} className="text-zinc-500 hover:text-zinc-200"><Trash2 className="h-3 w-3" /></button>
           </div>)}

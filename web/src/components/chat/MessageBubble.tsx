@@ -2,6 +2,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { CodeBlock } from './CodeBlock'
 import { scrubMarkup } from '@/lib/scrub'
+import { FileText } from 'lucide-react'
 
 import type { ChatMessage } from '@/types/api'
 
@@ -14,6 +15,17 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
       <div className="user-msg-enter mx-auto flex max-w-3xl justify-end px-6 py-2">
         <div className="w-fit max-w-[85%] rounded-2xl rounded-tr-md border border-brand-primary/25 bg-brand-primary/15 px-4 py-3 text-[14px] leading-relaxed text-zinc-900 shadow-sm dark:border-brand-primary/30 dark:bg-brand-primary/20 dark:text-zinc-100">
           {message.content}
+          {message.attachments?.length ? (
+            <div className="mt-2 flex flex-wrap gap-1.5 border-t border-brand-primary/20 pt-2">
+              {message.attachments.map((attachment) => (
+                <span key={attachment.id || attachment.name} className="inline-flex max-w-full items-center gap-1 rounded-md bg-white/45 px-2 py-1 text-[11px] text-zinc-700 dark:bg-black/20 dark:text-zinc-200">
+                  <FileText className="h-3 w-3 shrink-0" />
+                  <span className="max-w-44 truncate">{attachment.name}</span>
+                  {attachment.size != null && <span className="shrink-0 opacity-65">{formatBytes(attachment.size)}</span>}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
       </div>
     )
@@ -55,4 +67,8 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
       </div>
     </div>
   )
+}
+
+function formatBytes(size: number) {
+  return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`
 }
