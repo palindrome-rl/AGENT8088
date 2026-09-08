@@ -49,6 +49,11 @@ test('the command palette uses the platform shortcut and dismisses reliably', as
   await expect(page.getByRole('dialog', { name: 'Command palette' })).toHaveCount(0)
 })
 
+test('the composer keeps the chat backdrop continuous', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.locator('[data-promptbar]')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+})
+
 test('prompt bar accepts text and slash commands', async ({ page }) => {
   await page.goto('/')
   const textarea = page.locator('textarea')

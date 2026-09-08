@@ -324,7 +324,7 @@ export function PromptBar() {
   return (
     <div
       data-promptbar
-      className="relative bg-zinc-50 dark:bg-zinc-950 pb-4 pt-2"
+      className="relative pb-4 pt-2"
     >
       {sessionError && (
         <div role="alert" className="mx-auto mb-2 max-w-2xl px-4 text-xs text-red-500 dark:text-red-400">
