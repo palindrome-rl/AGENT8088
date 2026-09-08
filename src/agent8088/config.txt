@@ -142,6 +142,13 @@ timeout_seconds=120
 # Global fallbacks when no per-provider value is set:
 # context_window=32768
 # max_completion_tokens=8192
+# How many document chunks `document_read` action=process keeps in flight.
+# Chunk requests are independent, so this multiplies throughput on a large
+# document almost linearly until the provider starts rate-limiting. Raise it
+# for a fast provider with generous limits; lower it to 1 to serialize.
+# Clamped to 1-16.
+# document_process_concurrency=4
+
 # Automatically summarize older conversation messages when estimated context
 # usage crosses this percentage. Set to 0 to disable.
 # compaction_threshold_pct=75

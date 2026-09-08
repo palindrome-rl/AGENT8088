@@ -23,6 +23,11 @@ _cache = OrderedDict()
 _lock = RLock()
 _CACHE_CHARS = 10 * 1024 * 1024
 CHUNK_CHARS = 64000
+# Ceiling for one `process` chunk. Separate from CHUNK_CHARS, which bounds a
+# `read` response: a chunk is model *input* and can be far larger than the
+# slice we hand back to the main turn.
+MAX_PROCESS_CHUNK_CHARS = 200000
+PROCESS_CONCURRENCY = 4
 _jobs = OrderedDict()
 
 
@@ -59,6 +64,14 @@ def _limit_worker_memory():
         raise OSError(ctypes.get_last_error(), 'Cannot enforce parser memory limit')
     # Keep this handle alive until process exit; closing it early drops limits.
     globals()['_parser_job'] = job
+
+
+def _positive(value, fallback):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
 
 
 def _workbook_text(path):
@@ -105,7 +118,7 @@ def discard(path):
 
 
 def process(path, task, complete, *, chunk_chars=24000, progress=None, check=None,
-            identity="", max_chunks=48):
+            identity="", max_chunks=48, concurrency=PROCESS_CONCURRENCY):
     """Process every chunk against a task; checkpoint only completed evidence.
 
     The caller supplies a budgeted, tool-free completion function. This is
@@ -116,7 +129,8 @@ def process(path, task, complete, *, chunk_chars=24000, progress=None, check=Non
     text = load(path)
     if not task or len(task) > 8000:
         raise ValueError("Provide a task of 1 to 8000 characters")
-    chunk_chars = max(1000, min(CHUNK_CHARS, chunk_chars))
+    chunk_chars = max(1000, min(MAX_PROCESS_CHUNK_CHARS, chunk_chars))
+    concurrency = max(1, min(16, _positive(concurrency, PROCESS_CONCURRENCY)))
     total = max(1, (len(text) + chunk_chars - 1) // chunk_chars)
     if total > max_chunks:
         raise ValueError(f"Document requires {total} chunks; limit is {max_chunks}. Narrow the request or use focused search. No model calls made.")
@@ -155,24 +169,39 @@ def process(path, task, complete, *, chunk_chars=24000, progress=None, check=Non
         if not note.strip():
             raise ValueError("Document model returned empty evidence. Repeat the task to resume.")
         return {"start": start, "end": end, "evidence": note[:5000], "note_truncated": len(note)>5000}
-    # Two in flight at most; commit in source order so every checkpoint is a
-    # contiguous prefix and can be resumed without gaps or duplicate ranges.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        for first in range(len(notes), total, 2):
-            if progress:
-                progress(f"Processing document: {len(notes)}/{total} chunks complete")
-            futures = [pool.submit(extract_chunk, i) for i in range(first, min(first+2,total))]
-            for future in futures:
-                notes.append(future.result())
-                if checkpoint:
-                    fd, temporary = tempfile.mkstemp(dir=checkpoint.parent, suffix=".tmp")
-                    try:
-                        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                            json.dump(notes, stream, ensure_ascii=False)
-                        os.replace(temporary, checkpoint)
-                    finally:
-                        if os.path.exists(temporary):
-                            os.unlink(temporary)
+
+    def save():
+        if not checkpoint:
+            return
+        fd, temporary = tempfile.mkstemp(dir=checkpoint.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(notes, stream, ensure_ascii=False)
+            os.replace(temporary, checkpoint)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    # A rolling window keeps `concurrency` requests in flight continuously
+    # rather than draining a fixed batch, so one slow chunk no longer stalls
+    # the rest. Results still commit in source order, so every checkpoint stays
+    # a contiguous prefix and resumes without gaps or duplicate ranges.
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending, submitted = {}, len(notes)
+        try:
+            while len(notes) < total:
+                while submitted < total and len(pending) < concurrency:
+                    pending[submitted] = pool.submit(extract_chunk, submitted)
+                    submitted += 1
+                if progress:
+                    progress(f"Processing document: {len(notes)}/{total} chunks complete")
+                notes.append(pending.pop(len(notes)).result())
+                save()
+        finally:
+            # A chunk whose evidence can no longer be committed in order is not
+            # worth paying a provider for.
+            for future in pending.values():
+                future.cancel()
     if progress:
         progress(f"Document processed: {total}/{total} chunks; preparing answer")
     return json.dumps({"source": Path(path).name, "processed_characters": len(text),

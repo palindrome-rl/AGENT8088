@@ -28,10 +28,20 @@ preserves coordinates and formula strings; it does not evaluate formulas.
 Scans and malformed files surface warnings instead of being called ready for
 text analysis. Image understanding and OCR are not supplied by this tool.
 
-Processing has at most two model requests in flight, 48 chunks, and a ten-minute
-pre-call deadline, plus the normal active agent token/cost/time checks. A call
-already in flight may outlast that deadline. Provider latency is not guaranteed.
-Chunk notes commit in source order. Web-upload checkpoints are stored under the
+Processing keeps `document_process_concurrency` model requests in flight
+(default 4, clamped to 1-16) in a rolling window, so one slow chunk does not
+stall the rest. It is bounded to 48 chunks and a ten-minute pre-call deadline,
+plus the normal active agent token/cost/time checks. A call already in flight
+may outlast that deadline. Provider latency is not guaranteed. Chunk notes
+commit in source order, so a failure keeps every chunk before it and discards
+completed work after it -- the price of a resumable contiguous prefix.
+
+Chunk size is derived from the context window minus the per-call output
+reservation, converted to characters, and capped at `MAX_PROCESS_CHUNK_CHARS`
+(200k). It is deliberately not derived from `max_completion_tokens`: that is
+the model's ceiling for a whole chat turn, not this tool's per-call output, and
+subtracting it collapsed the chunk to its 1000-character floor whenever it was
+configured at or above the context window. Web-upload checkpoints are stored under the
 session's `.document-jobs` directory and survive restart. Repeat the same
 `process` query with the same model and source to reuse completed work. Changed
 content or task creates a different checkpoint. Deleting the attachment deletes
@@ -67,6 +77,26 @@ and saves local screenshots/results under ignored `web/test-results`.
   extracted characters and returned rendered tables covering sections 1–7
   (359.8 seconds). This establishes workflow completion, not independent
   verification of every research claim or every generated summary sentence.
+
+## Chunking and concurrency rework (2026-09-08)
+
+The 359.8s run above spent ~99% of its time in per-chunk model calls;
+extraction of that document measures 0.25s. Two changes address that:
+
+- Chunk sizing no longer subtracts `max_completion_tokens` and no longer
+  divides tokens by 3 to get characters. On a 128k-context model the 374,711
+  character report goes from 18 chunks to 2 — 9x fewer model calls, so ~9x
+  less cost as well. At the shipped 32768/65000 defaults it previously
+  computed 375 chunks and failed the 48-chunk preflight outright; it now
+  computes 6 and runs. Regression coverage in
+  `tests/test_document_access.py::test_chunk_budget_survives_completion_ceiling_at_or_above_context`.
+- The fixed batch of two was replaced by a rolling window. Measured with a
+  jittered stub over 24 chunks: 2.71s serial, 1.31s at 4, 0.86s at 8.
+
+Combined, a simulation of the 87-page report at 128k context improves 8.9x
+(18 calls in 9 barriered waves → 2 calls in 1). This is a wall-clock and
+call-count measurement against a latency stub, not a re-run of the live
+provider acceptance suite; the numbers above should be re-measured live.
 - Two-policy comparison (18.8 seconds; repeated after upload race fix, 20.5s),
   exact requirements with injected instructions treated as data (12.7s), and
   missing-price refusal (11.2s) passed.
