@@ -2753,7 +2753,7 @@ def _detect_pasted_file(line: str):
     # Unquoted Windows paths with spaces (e.g. "C:\...\Palindrome Business
     # Plan.pdf") were split into tokens by the \S+ scan above, none of which
     # resolved to a file. Re-join consecutive tokens starting from a
-    # drive-letter token (X:\) and check if the joined path is a real file —
+    # drive-letter token (X:\) and check if the joined path is a real file -
     # the same "must exist on disk" guard against misfiring on chat.
     drive_re = re.compile(r"^[A-Za-z]:[\\/]")
     for i, (candidate, (start, _)) in enumerate(spans):
@@ -2763,6 +2763,30 @@ def _detect_pasted_file(line: str):
             joined = " ".join(s[0] for s in spans[i:j])
             try:
                 path = Path(joined).resolve()
+            except OSError:
+                continue
+            if path.is_file():
+                end = spans[j - 1][1][1]
+                question = (stripped[:start] + stripped[end:]).strip()
+                return path, question
+
+    # A path glued to surrounding text ("what is in this fileC:\...\x.png")
+    # - the paste lost its separating space, so no token starts with X:\ and
+    # every pass above misses it. Carve a real file out of the first
+    # X:\-anchored span onward: grow token by token until the accumulated
+    # string names an existing file. The text before the drive token stays
+    # the question; the same must-exist guard holds.
+    for i, (candidate, (start, _)) in enumerate(spans):
+        if not re.search(r"[A-Za-z]:[\\/]", candidate):
+            continue
+        for j in range(len(spans), i, -1):
+            # glue: first token minus any words riding on its front
+            # (drive_re.search, not match, keeps "fileC:\" split correctly)
+            glued = candidate[re.search(r"[A-Za-z]:[\\/]", candidate).start():]
+            parts = [glued] + [s[0] for s in spans[i + 1:j]]
+            accumulated = " ".join(parts)
+            try:
+                path = Path(accumulated).resolve()
             except OSError:
                 continue
             if path.is_file():
