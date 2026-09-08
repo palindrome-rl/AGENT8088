@@ -2029,6 +2029,7 @@ COMMAND_SPECS = (
     ("reset", "/reset", "Clear the active session while retaining its name", ()),
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
+    ("cost", "/cost [task-id]", "Summarize recorded model-call telemetry — estimates only; unknown costs stay unknown", ()),
     ("memory", "/memory [on|off|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
     ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
     ("history", "/history", "Show the current conversation", ()),

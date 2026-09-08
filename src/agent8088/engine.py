@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, asyncio, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.parse  # readline enables input history
+import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.parse  # readline enables input history
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -7923,6 +7923,14 @@ def _model_usage(response) -> tuple[dict, str]:
     return {"input_tokens": None, "output_tokens": len(content) // 4}, "output_estimate"
 
 
+def _stable_prefix_hash(prompt: str, tools) -> str:
+    """Short digest of the cacheable request prefix. Truncated deliberately --
+    this is for spotting drift across calls, not for integrity."""
+    prefix = (prompt or "").split(RUNTIME_CONTEXT_HEADING)[0]
+    return hashlib.sha256(
+        (prefix + json.dumps(tools or [], sort_keys=True)).encode()).hexdigest()[:16]
+
+
 def _record_model_telemetry(provider: str, model: str, attempt: str, started: float,
                             *, max_tokens: int, response=None, error=None,
                             first_token_ms=None, prompt='', tools=None) -> None:
@@ -7955,8 +7963,11 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
             "outcome": "error" if error else "success",
             "latency_ms": round((time.monotonic() - started) * 1000),
             "first_token_ms": first_token_ms,
-            "stable_prefix_hash": __import__('hashlib').sha256(
-                (prompt.split(RUNTIME_CONTEXT_HEADING)[0] + json.dumps(tools or [], sort_keys=True)).encode()).hexdigest(),
+            # Fingerprints the part of the request a provider can cache: the
+            # system prompt up to the runtime section, plus the tool schemas.
+            # If this changes between calls the prefix is not stable and no
+            # provider-side cache will hit -- that is the thing to measure.
+            "stable_prefix_hash": _stable_prefix_hash(prompt, tools),
             "cached_input_tokens": getattr(getattr(getattr(response, 'usage', None),
                 'prompt_tokens_details', None), 'cached_tokens', None),
             "max_tokens": max_tokens,
