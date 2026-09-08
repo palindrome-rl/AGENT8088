@@ -2839,7 +2839,7 @@ def _cmd_model_auto_setup():
                       "start it and re-run [#237dd7]/model auto setup[/#237dd7].")
         return
     ordered = A.routing.order_for_seed(candidates)
-    labels = [f"{provider}:{model}  (strength {A.routing.rank_hint(model)})"
+    labels = [f"{provider}:{model}  (strength {A.routing.rank_hint(provider, model)})"
               for provider, model in ordered]
     label_to_pair = dict(zip(labels, ordered))
 
@@ -2863,7 +2863,7 @@ def _cmd_model_auto_setup():
     t.add_column("Model", style="#237dd7")
     t.add_column("Strength hint", style="#237dd7", justify="right")
     for index, (provider, model) in enumerate(selected, 1):
-        t.add_row(str(index), f"{provider}:{model}", str(A.routing.rank_hint(model)))
+        t.add_row(str(index), f"{provider}:{model}", str(A.routing.rank_hint(provider, model)))
     console.print(t)
 
     spec = ",".join(f"{provider}:{model}" for provider, model in selected)

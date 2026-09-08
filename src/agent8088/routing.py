@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 import time
 
+from agent8088 import model_catalog
+
 # Ordered strongest-hint first. Used ONCE, when seeding a chain in `/model auto
 # setup`, and never at run time -- which is the whole difference from the
 # MODEL_TIERS table that was deleted in the 2026-08-28 subagent redesign. A
@@ -81,13 +83,57 @@ def starting_rung(model_name: str, chain_len: int) -> int:
     return chain_len - 1 if variant(model_name) == "smart" else 0
 
 
-def rank_hint(model_id: str) -> int:
-    """Rough strength score for a model id. Seeding only -- see _STRENGTH_HINTS."""
-    text = str(model_id or "").lower()
+_PARAM_COUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[bB](?:\b|[:_-])")
+
+# Threshold -> score, checked highest-first. Below the lowest threshold falls
+# through to a fixed floor rather than another tuple, since there is no
+# meaningful lower bound on parameter count.
+_PARAM_TIERS: list[tuple[float, int]] = [
+    (100.0, 90), (30.0, 70), (10.0, 50), (3.0, 30),
+]
+
+
+def _param_count_score(text: str) -> int | None:
+    """Parse a parameter count out of a model id (30b, 70B, 1.5b) and map it
+    to a strength tier. None if no count is present -- distinct from a real
+    tier match, so the caller can combine this with _keyword_score."""
+    match = _PARAM_COUNT_RE.search(text)
+    if not match:
+        return None
+    count = float(match.group(1))
+    for threshold, score in _PARAM_TIERS:
+        if count >= threshold:
+            return score
+    return 15
+
+
+def _keyword_score(text: str) -> int | None:
+    """Match today's name-substring tiers. None if nothing matches -- this is
+    what changed from the old rank_hint: it used to return _DEFAULT_STRENGTH
+    here, which made "no signal" indistinguishable from "matched the default
+    tier" and made combining two heuristics impossible."""
     for pattern, score in _STRENGTH_HINTS:
         if re.search(pattern, text):
             return score
-    return _DEFAULT_STRENGTH
+    return None
+
+
+def rank_hint(provider: str, model_id: str) -> int:
+    """Strength score for a provider:model pair.
+
+    Checks the maintained catalog (bundled + user override, model_catalog.py)
+    first. Only when neither has an entry does it fall back to guessing from
+    the name: a parsed parameter count and today's keyword tiers, taking
+    whichever signal is stronger. Seeding only -- consulted by order_for_seed
+    when building a proposed auto_chain, never at routing time.
+    """
+    entry = model_catalog.lookup(provider, model_id)
+    if entry is not None:
+        return int(entry.get("rank", _DEFAULT_STRENGTH))
+    text = str(model_id or "").lower()
+    candidates = [s for s in (_param_count_score(text), _keyword_score(text))
+                 if s is not None]
+    return max(candidates) if candidates else _DEFAULT_STRENGTH
 
 
 def order_for_seed(candidates):
@@ -97,7 +143,7 @@ def order_for_seed(candidates):
     right. Ties keep discovery order, which is the user's provider ordering.
     """
     return [c for _, _, c in
-            sorted(((rank_hint(m), i, (p, m))
+            sorted(((rank_hint(p, m), i, (p, m))
                     for i, (p, m) in enumerate(candidates)),
                    key=lambda t: (t[0], t[1]))]
 

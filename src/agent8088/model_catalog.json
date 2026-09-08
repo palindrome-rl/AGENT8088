@@ -1,0 +1,48 @@
+{
+  "ollama:qwen14b-tooluse-v3": {"rank": 35, "vision": false, "tools": true},
+  "ollama:llama3.3": {"rank": 55, "vision": false, "tools": true},
+  "ollama:qwen2.5-coder:32b": {"rank": 45, "vision": false, "tools": true},
+
+  "openrouter:anthropic/claude-sonnet-4": {"rank": 82, "vision": true, "tools": true},
+  "openrouter:openrouter/auto": {"rank": 50, "vision": false, "tools": true},
+  "openrouter:openai/gpt-4o": {"rank": 78, "vision": true, "tools": true},
+
+  "openai:gpt-4o": {"rank": 78, "vision": true, "tools": true},
+  "openai:gpt-4o-mini": {"rank": 30, "vision": true, "tools": true},
+  "openai:gpt-3.5-turbo": {"rank": 20, "vision": false, "tools": true},
+
+  "gemini:gemini-2.0-flash": {"rank": 25, "vision": true, "tools": true},
+  "gemini:gemini-2.5-pro": {"rank": 85, "vision": true, "tools": true},
+  "gemini:gemini-1.5-flash": {"rank": 22, "vision": true, "tools": true},
+
+  "cerebras:gpt-oss-120b": {"rank": 65, "vision": false, "tools": true},
+  "cerebras:gemma-4-31b": {"rank": 45, "vision": false, "tools": true},
+  "cerebras:zai-glm-4.7": {"rank": 60, "vision": false, "tools": true},
+
+  "deepseek:deepseek-chat": {"rank": 55, "vision": false, "tools": true},
+  "deepseek:deepseek-reasoner": {"rank": 88, "vision": false, "tools": true},
+
+  "groq:llama-3.3-70b-versatile": {"rank": 58, "vision": false, "tools": true},
+  "groq:llama-3.1-8b-instant": {"rank": 20, "vision": false, "tools": true},
+  "groq:mixtral-8x7b-32768": {"rank": 40, "vision": false, "tools": true},
+
+  "mistral:mistral-small-2603": {"rank": 35, "vision": false, "tools": true},
+  "mistral:mistral-medium-3-5": {"rank": 55, "vision": false, "tools": true},
+  "mistral:mistral-large-2512": {"rank": 75, "vision": false, "tools": true},
+
+  "moonshot:kimi-k2.6": {"rank": 78, "vision": false, "tools": true},
+  "moonshot:moonshot-v1-8k": {"rank": 25, "vision": false, "tools": true},
+  "moonshot:moonshot-v1-32k": {"rank": 35, "vision": false, "tools": true},
+
+  "qwen:qwen-plus": {"rank": 55, "vision": false, "tools": true},
+  "qwen:qwen-max": {"rank": 75, "vision": false, "tools": true},
+  "qwen:qwen-turbo": {"rank": 20, "vision": false, "tools": true},
+
+  "ollama-cloud:gpt-oss:120b": {"rank": 65, "vision": false, "tools": true},
+  "ollama-cloud:qwen3:14b": {"rank": 35, "vision": false, "tools": true},
+  "ollama-cloud:llama3.3": {"rank": 55, "vision": false, "tools": true},
+
+  "anthropic:claude-sonnet-4-6": {"rank": 85, "vision": true, "tools": true},
+  "anthropic:claude-opus-5": {"rank": 97, "vision": true, "tools": true},
+  "anthropic:claude-haiku-3.5": {"rank": 25, "vision": true, "tools": true}
+}

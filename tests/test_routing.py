@@ -95,6 +95,52 @@ def test_cooldown_ignores_nonpositive():
     assert routing.cooling("groq", "m") is False
 
 
+def test_param_count_score_maps_size_to_tier():
+    assert routing._param_count_score("some-model-120b") == 90
+    assert routing._param_count_score("qwen2.5-coder:32b") == 70
+    assert routing._param_count_score("llama-3.1-8b-instant") == 30
+    assert routing._param_count_score("tiny-1.5b") == 15
+
+
+def test_param_count_score_none_when_no_count_present():
+    assert routing._param_count_score("gpt-4o-mini") is None
+    assert routing._param_count_score("mistral-small-2603") is None
+
+
+def test_keyword_score_matches_existing_tiers():
+    assert routing._keyword_score("claude-opus-4") == 100
+    assert routing._keyword_score("gemini-2.0-flash") == 20
+
+
+def test_keyword_score_none_when_nothing_matches():
+    assert routing._keyword_score("some-totally-unknown-id") is None
+
+
+def test_rank_hint_prefers_the_catalog_over_the_heuristic():
+    # gemini:gemini-2.5-pro is rank 85 in the bundled catalog (Task 1). If the
+    # heuristic ran instead, "flash"/"pro" keyword matching would give a very
+    # different number -- this proves the catalog wins.
+    assert routing.rank_hint("gemini", "gemini-2.5-pro") == 85
+
+
+def test_rank_hint_falls_back_to_the_heuristic_for_an_unlisted_model():
+    # Not in the catalog. Falls through to the param-count + keyword combo
+    # from Task 3: "70b" -> 70 beats no keyword match.
+    assert routing.rank_hint("some-custom-provider", "mystery-model-70b") == 70
+
+
+def test_rank_hint_uses_the_shared_default_when_nothing_matches_at_all():
+    assert routing.rank_hint("some-custom-provider", "totally-opaque-id") == 50
+
+
+def test_order_for_seed_still_works_with_the_new_two_argument_rank_hint():
+    ordered = routing.order_for_seed([
+        ("a", "claude-opus-4"), ("b", "llama-3.1-8b-instant"), ("c", "gpt-4o"),
+    ])
+    assert ordered[0] == ("b", "llama-3.1-8b-instant")
+    assert ordered[-1] == ("a", "claude-opus-4")
+
+
 # --- selection -------------------------------------------------------------
 CHAIN = [("ollama", "a"), ("groq", "b"), ("openai", "c")]
 
