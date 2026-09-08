@@ -53,3 +53,15 @@ def test_delete_clears_derivatives(monkeypatch,tmp_path):
     asyncio.run(web.delete_attachment(result['id']))
     assert not list(tmp_path.rglob('*.txt'))
     assert not list(tmp_path.rglob('*-*.json'))
+
+
+def test_history_keeps_attachment_chip_but_hides_model_context():
+    attachment_id = 'a' * 32
+    message = {
+        'role': 'user',
+        'content': ('Please summarize this.' + web._ATTACHMENT_CONTEXT_HEADER
+                    + f'- report.pdf (attachment {attachment_id}): uploads/report.pdf'),
+    }
+    public = web._history_message(message)
+    assert public['content'] == 'Please summarize this.'
+    assert public['attachments'] == [{'id': attachment_id, 'name': 'report.pdf'}]

@@ -22,6 +22,8 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectAttempts = 0
 /** Messages that arrived while the socket was down, replayed on reconnect. */
 let outbox: WSClientMessage[] = []
+/** Once Stop is pressed, late stream frames must not turn the composer red again. */
+let interruptRequested = false
 
 const RECONNECT_BASE_MS = 1000
 const RECONNECT_MAX_MS = 15_000
@@ -47,12 +49,14 @@ function wireSocket(ws: WebSocket) {
         setStatus(data.data)
         break
       case 'spin':
+        if (interruptRequested) break
         setStreaming(true)
         useSessionStore.getState().setActivity(data.message === 'thinking...'
           ? (useSessionStore.getState().toolEvents.length ? 'Reviewing results' : 'Preparing request')
           : data.message)
         break
       case 'token':
+        if (interruptRequested) break
         if (data.kind === 'reasoning') {
           appendStreamingReasoning(data.delta)
         } else {
@@ -65,13 +69,16 @@ function wireSocket(ws: WebSocket) {
       case 'tool_calls':
         break
       case 'tool_start':
+        if (interruptRequested) break
         addToolEvent(data.name)
         useSessionStore.getState().setActivity(data.name === 'web_search' ? 'Searching the web' : `Running ${data.name}`)
         break
       case 'tool_result':
+        if (interruptRequested) break
         updateToolEvent(data.name, data.result)
         break
       case 'plan_step':
+        if (interruptRequested) break
         updatePlanStep({
           index: data.index,
           stepText: data.step_text,
@@ -92,6 +99,7 @@ function wireSocket(ws: WebSocket) {
         setPlanApprovalPending({ id: data.id, plan: data.plan })
         break
       case 'answer':
+        if (interruptRequested) break
         {
           const current = useSessionStore.getState().status
           if (current && data.usage) setStatus({ ...current, last_usage: data.usage })
@@ -99,7 +107,7 @@ function wireSocket(ws: WebSocket) {
         addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
         break
       case 'interrupted':
-        pauseQueueIfPending()
+        stopLocally()
         break
       case 'error':
         console.error('Agent error:', data.message)
@@ -109,9 +117,14 @@ function wireSocket(ws: WebSocket) {
         pauseQueueIfPending()
         break
       case 'turn_complete':
+        {
+          const wasInterrupted = interruptRequested
+          interruptRequested = false
+          if (wasInterrupted) pauseQueueIfPending()
+          else drainPromptQueue()
+        }
         setStreaming(false)
         resetStreaming()
-        drainPromptQueue()
         break
       case 'session_saved':
         if (data.name) setSessionName(data.name)
@@ -239,7 +252,12 @@ async function syncSession(includeHistory = false) {
 
 /** Send one frame, or hold it in the outbox until the socket is back. */
 function sendFrame(msg: WSClientMessage): boolean {
+  if (msg.type === 'interrupt') {
+    interruptRequested = true
+    stopLocally()
+  }
   if (msg.type === 'chat' || msg.type === 'command') {
+    interruptRequested = false
     useSessionStore.getState().resetStreaming()
     useSessionStore.getState().setActivity('Working')
     useSessionStore.getState().setStreaming(true)
@@ -258,7 +276,6 @@ function sendFrame(msg: WSClientMessage): boolean {
   // exists is meaningless, and replaying it would cancel the next one.
   const store = useSessionStore.getState()
   if (msg.type === 'interrupt') {
-    store.setStreaming(false)
     return false
   }
   outbox.push(msg)
@@ -286,7 +303,7 @@ export function drainPromptQueue() {
   }
   // The transcript echo happens here rather than at enqueue time, so a queued
   // prompt does not appear to have been asked before it actually runs.
-  store.addMessage({ role: 'user', content: next.text })
+  store.addMessage({ role: 'user', content: next.text, attachments: next.attachments })
   sendFrame({ type: 'chat', text: next.text, attachments: next.attachmentIds })
 }
 
@@ -294,6 +311,16 @@ export function drainPromptQueue() {
 function pauseQueueIfPending() {
   const store = useSessionStore.getState()
   if (store.promptQueue.length) store.setQueuePaused(true)
+}
+
+function stopLocally() {
+  const store = useSessionStore.getState()
+  const partial = scrubMarkup(store.streamingText).trim()
+  if (partial) store.addMessage({ role: 'assistant', content: partial })
+  store.setStreaming(false)
+  store.resetStreaming()
+  store.setActivity('Stopped')
+  pauseQueueIfPending()
 }
 
 // Late-bound to avoid a circular import at module load.

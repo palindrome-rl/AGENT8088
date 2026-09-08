@@ -7,9 +7,9 @@ export default {
     extend: {
       colors: {
         brand: {
-          primary: '#237dd7',
-          cyan: '#00edff',
-          border: '#0077B6',
+          primary: 'rgb(var(--brand-primary-rgb) / <alpha-value>)',
+          cyan: 'rgb(var(--brand-cyan-rgb) / <alpha-value>)',
+          border: 'rgb(var(--brand-border-rgb) / <alpha-value>)',
         },
       },
       fontFamily: {

@@ -1,3 +1,4 @@
+@config "../tailwind.config.ts";
 @import "tailwindcss";
 .chat-markdown p { margin: 0.8em 0; }
 .chat-markdown table { border-collapse: collapse; margin: 1em 0; }
@@ -14,7 +15,16 @@
   --brand-primary: #237dd7;
   --brand-cyan: #00edff;
   --brand-border: #0077B6;
+  --brand-primary-rgb: 35 125 215;
+  --brand-cyan-rgb: 0 237 255;
+  --brand-border-rgb: 0 119 182;
+  --ambient-primary-rgb: 35 125 215;
+  --ambient-secondary-rgb: 0 237 255;
 }
+
+html[data-accent='violet'] { --brand-primary: #8b5cf6; --brand-cyan: #d8b4fe; --brand-border: #7c3aed; --brand-primary-rgb: 139 92 246; --brand-cyan-rgb: 216 180 254; --brand-border-rgb: 124 58 237; --ambient-primary-rgb: 139 92 246; --ambient-secondary-rgb: 216 180 254; }
+html[data-accent='ember'] { --brand-primary: #f97316; --brand-cyan: #facc15; --brand-border: #ea580c; --brand-primary-rgb: 249 115 22; --brand-cyan-rgb: 250 204 21; --brand-border-rgb: 234 88 12; --ambient-primary-rgb: 249 115 22; --ambient-secondary-rgb: 250 204 21; }
+html[data-accent='mono'] { --brand-primary: #a1a1aa; --brand-cyan: #f4f4f5; --brand-border: #71717a; --brand-primary-rgb: 161 161 170; --brand-cyan-rgb: 244 244 245; --brand-border-rgb: 113 113 122; --ambient-primary-rgb: 161 161 170; --ambient-secondary-rgb: 244 244 245; }
 
 /* Dark mode (default) */
 html.dark {
@@ -39,6 +49,21 @@ body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
 }
+
+.app-shell { isolation: isolate; }
+.app-shell::before {
+  content: '';
+  position: absolute;
+  inset: -20%;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 20%, rgb(var(--ambient-primary-rgb) / 0.14), transparent 28%),
+    radial-gradient(circle at 82% 72%, rgb(var(--ambient-secondary-rgb) / 0.08), transparent 24%);
+  animation: ambient-drift 18s ease-in-out infinite alternate;
+}
+.app-shell > * { position: relative; z-index: 1; }
+@keyframes ambient-drift { from { transform: translate3d(-1%, -1%, 0) scale(1); } to { transform: translate3d(2%, 2%, 0) scale(1.04); } }
 
 /* Beautiful UI — pixel-grid loader */
 .pixel-grid-loader {
@@ -186,6 +211,9 @@ body {
 .prompt-textarea:focus-visible {
   outline: none;
 }
+
+html[data-motion='reduced'] * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+@media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; } }
 
 /* Legacy pages predate the dark: variants used by the newer shell. Keep their
    existing class names usable when the theme is switched to light. */

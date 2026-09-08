@@ -1370,7 +1370,8 @@ async def get_dump():
 async def get_history():
     """Full current conversation."""
     C = _cl()
-    return {"messages": C.S.messages, "conversation_trace": C.S.conversation_trace}
+    return {"messages": [_history_message(message) for message in C.S.messages],
+            "conversation_trace": C.S.conversation_trace}
 
 
 # Browser uploads are deliberately raw request bodies rather than multipart:
@@ -1379,6 +1380,7 @@ _ATTACHMENT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".pdf", ".docx", ".xls
                           ".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 _ATTACHMENT_MAX_COUNT = 5
+_ATTACHMENT_CONTEXT_HEADER = "\n\n[Agent8088 attachment context — not shown in chat]\n"
 
 
 def _attachment_session(C) -> str:
@@ -1398,6 +1400,23 @@ def _read_attachments(A, C) -> dict:
         return loaded if isinstance(loaded, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _history_message(message: dict) -> dict:
+    """Hide model-only attachment instructions while preserving file chips."""
+    public = dict(message)
+    content = public.get("content")
+    if not isinstance(content, str) or _ATTACHMENT_CONTEXT_HEADER not in content:
+        return public
+    visible, context = content.split(_ATTACHMENT_CONTEXT_HEADER, 1)
+    public["content"] = visible
+    attachments = [
+        {"id": match.group("id"), "name": match.group("name")}
+        for match in re.finditer(r"^- (?P<name>.+?) \(attachment (?P<id>[a-f0-9]{32})\):", context, re.MULTILINE)
+    ]
+    if attachments:
+        public["attachments"] = attachments
+    return public
 
 
 def _save_attachments(A, C, entries: dict) -> None:
@@ -1875,7 +1894,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
             refs.append(f"- {attachment['name']} (attachment {attachment['id']}): {relative}")
             if attachment.get("warning"):
                 refs.append("  Extraction warning: " + attachment["warning"])
-        text += ("\n\nAttached session artifacts (use document_read for text/document access; "
+        text += (_ATTACHMENT_CONTEXT_HEADER + "Attached session artifacts (use document_read for text/document access; "
                  "use appropriate visual tools for images). For whole-document synthesis or analysis, use "
                  "document_read action=process with the user's task as query; it processes every chunk. "
                  "For exact exhaustive extraction, read all chunks instead of relying on lossy notes. "
