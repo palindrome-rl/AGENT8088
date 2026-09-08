@@ -82,3 +82,6 @@ logs/
 # Local agent plans and generated artifacts
 .hermes/
 tmp/
+
+# Git worktrees (superpowers subagent-driven-development)
+.worktrees/
