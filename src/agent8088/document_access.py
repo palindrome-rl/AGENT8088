@@ -31,12 +31,34 @@ PROCESS_CONCURRENCY = 4
 _jobs = OrderedDict()
 
 
+_NO_CEILING = ("warning: this OS refused a parser memory ceiling; extraction is "
+               "bounded by its timeout and size caps only")
+
+
 def _limit_worker_memory():
-    """Set a 1GiB parser-process memory ceiling before opening the document."""
+    """Apply a 1GiB parser-process memory ceiling where the OS allows one.
+
+    Best effort by necessity: macOS refuses every memory rlimit outright --
+    RLIMIT_AS, RLIMIT_DATA and RLIMIT_RSS all raise "current limit exceeds
+    maximum limit" even though they report an infinite hard limit. Raising
+    there aborted the worker before it read a byte, so every PDF and Office
+    upload came back as needs_attention. Where no ceiling can be set the
+    worker still runs under the 45-second timeout and the 25MB/64MB size
+    caps, so this degrades one layer of defence rather than the only bound.
+    """
     ceiling = 1024 * 1024 * 1024
     if os.name != "nt":
         import resource
-        resource.setrlimit(resource.RLIMIT_AS, (ceiling, ceiling))
+        for name in ("RLIMIT_AS", "RLIMIT_DATA"):
+            limit = getattr(resource, name, None)
+            if limit is None:
+                continue
+            try:
+                resource.setrlimit(limit, (ceiling, ceiling))
+                return
+            except (ValueError, OSError):
+                continue
+        print(_NO_CEILING, file=sys.stderr)
         return
     import ctypes
     from ctypes import wintypes
@@ -61,7 +83,10 @@ def _limit_worker_memory():
     limits.basic.flags = 0x100  # JOB_OBJECT_LIMIT_PROCESS_MEMORY
     limits.process_memory = ceiling
     if not job or not api.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)) or not api.AssignProcessToJobObject(job, api.GetCurrentProcess()):
-        raise OSError(ctypes.get_last_error(), 'Cannot enforce parser memory limit')
+        # Same trade as the POSIX branch: a refused ceiling must not be the
+        # reason a document cannot be read at all.
+        print(_NO_CEILING, file=sys.stderr)
+        return
     # Keep this handle alive until process exit; closing it early drops limits.
     globals()['_parser_job'] = job
 

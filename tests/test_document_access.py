@@ -191,3 +191,13 @@ def test_document_budgets_fit_the_context_window(engine):
         assert chunk >= 1000 and read_chars >= 1000 and output >= 512
         assert chunk // 3 + output < context, f'chunk+output overflows ctx={context}'
         assert read_chars // 3 + output < context
+
+
+def test_extraction_survives_an_os_that_refuses_memory_limits(monkeypatch, capsys):
+    """macOS rejects every memory rlimit; that must not abort extraction."""
+    import resource
+    def refuse(*args, **kwargs):
+        raise ValueError('current limit exceeds maximum limit')
+    monkeypatch.setattr(resource, 'setrlimit', refuse)
+    access._limit_worker_memory()  # must not raise
+    assert 'memory ceiling' in capsys.readouterr().err
