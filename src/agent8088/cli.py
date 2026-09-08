@@ -2000,7 +2000,7 @@ COMMAND_SPECS = (
     ("image", "/image <path-or-url> [question]", "Analyze a screenshot/diagram with a vision model", ()),
     ("paste", "/paste [question]", "Analyze an image from the OS clipboard (Windows/macOS)", ()),
     ("raw", "/raw <text>", "One raw model call — shows content, reasoning, tool_calls", ()),
-    ("model", "/model [provider[:model]|provider model|setup]", "Show/switch providers or add a provider", ()),
+    ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
     ("sandbox", "/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation", ()),
@@ -2778,6 +2778,94 @@ def _handle_pasted_file(path, question):
     instruction = question or f"Here is the content of {resolved.name}."
     do_chat(f"{instruction}\n\n{body}")
     return True
+def _cmd_model_auto_setup():
+    """Propose an `auto` ladder from providers that both have a working key
+    AND are reachable right now.
+
+    `discover_panel()` alone only checks the first half: local Ollama carries
+    a hardcoded placeholder key (it needs no real credential), so it passes
+    the key check even when the daemon isn't running. Without a live
+    reachability check the ladder would include a rung that fails on first
+    use -- the exact bug reported when qwen14b-tooluse-v3 showed up with
+    Ollama not started. `_endpoint_probe` is a TCP-only connect test (no
+    prompt, no token, no key spent), the same one /doctor already uses.
+
+    Ordering uses routing.rank_hint, which is consulted here and nowhere else:
+    the result is saved as ordinary config the user can edit, so a bad guess
+    costs one edit rather than a wrong route on every call. That is the
+    difference from the MODEL_TIERS table deleted in the subagent redesign.
+    """
+    from agent8088 import fusion
+    try:
+        panel = fusion.discover_panel(max_panel_size=12)
+    except Exception as exc:
+        console.print(f"[red]could not discover providers:[/red] {exc}")
+        return
+    candidates = [(member.provider, member.model) for member in panel]
+    if not candidates:
+        console.print("[yellow]no usable providers[/yellow] — none of the configured "
+                      "providers has both a working API key and a model set.")
+        return
+
+    # One probe per distinct provider (not per candidate) -- several models
+    # can share a base_url, and a placeholder-keyed local provider is the
+    # common case (currently just Ollama) where "has a key" and "is running"
+    # genuinely differ.
+    reachable, unreachable = {}, {}
+    for provider, _model in candidates:
+        if provider in reachable or provider in unreachable:
+            continue
+        base_url = A.PROVIDERS.get(provider, {}).get("base_url", "")
+        result = _endpoint_probe(base_url)
+        (reachable if result.startswith("reachable") else unreachable)[provider] = result
+
+    candidates = [(p, m) for p, m in candidates if p in reachable]
+    if unreachable:
+        console.print("[dim]excluded (not reachable right now):[/dim]")
+        for provider, result in unreachable.items():
+            console.print(f"[dim]  {provider} — {result}[/dim]")
+    if not candidates:
+        console.print("[yellow]no reachable providers[/yellow] — every keyed provider "
+                      "failed a connection check. If a local one should be running, "
+                      "start it and re-run [#237dd7]/model auto setup[/#237dd7].")
+        return
+    ordered = A.routing.order_for_seed(candidates)
+    labels = [f"{provider}:{model}  (strength {A.routing.rank_hint(model)})"
+              for provider, model in ordered]
+    label_to_pair = dict(zip(labels, ordered))
+
+    console.print("[dim]Reachable candidates, cheapest first. Uncheck any you don't "
+                  "want on the ladder.[/dim]")
+    picked_labels = _multi_choice_prompt(
+        "Select models for your auto ladder (space to toggle, enter to confirm):",
+        labels, checked=labels)
+    if not picked_labels:
+        console.print("[dim]nothing selected — not saved[/dim]")
+        return
+
+    # The picker returns selections in list order (already weakest-first from
+    # `ordered`), not click order, so the ladder's escalation direction is
+    # preserved regardless of which boxes the user happened to toggle.
+    selected = [label_to_pair[label] for label in labels if label in picked_labels]
+
+    t = Table(title="Auto ladder", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Rung", style="#237dd7", justify="right")
+    t.add_column("Model", style="#237dd7")
+    t.add_column("Strength hint", style="#237dd7", justify="right")
+    for index, (provider, model) in enumerate(selected, 1):
+        t.add_row(str(index), f"{provider}:{model}", str(A.routing.rank_hint(model)))
+    console.print(t)
+
+    spec = ",".join(f"{provider}:{model}" for provider, model in selected)
+    A.update_simple_config(A.CONFIG_PATH, {"auto_chain": spec})
+    A.APP_CONFIG["auto_chain"] = spec
+    A.reload_auto_chain()
+    console.print(f"[#237dd7]auto ladder saved[/#237dd7] ({len(selected)} rung"
+                  f"{'s' if len(selected) != 1 else ''}) — select it with "
+                  f"[#237dd7]/model auto[/#237dd7]")
+
+
 def cmd_model(rest):
     raw_arg = rest.strip()
     arg = raw_arg.lower()
@@ -2790,6 +2878,23 @@ def cmd_model(rest):
     if arg == "setup":
         configure_model_profile()
         banner()
+        return
+    if arg in ("auto setup", "auto-setup"):
+        _cmd_model_auto_setup()
+        return
+    if arg in ("auto", "auto:fast", "auto:smart"):
+        chain = A.reload_auto_chain()
+        if not chain:
+            console.print("[yellow]no auto chain configured[/yellow] — build one with "
+                          "[#237dd7]/model auto setup[/#237dd7]")
+            return
+        A.MODEL_NAME = arg
+        start = A.routing.starting_rung(arg, len(chain))
+        console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{arg}[/#237dd7] "
+                      f"[dim](starting on {chain[start][0]}:{chain[start][1]})[/dim]")
+        console.print("[dim]  ladder: " + " → ".join(f"{p}:{m}" for p, m in chain) + "[/dim]")
+        console.print("[dim]  climbs a rung when a turn shows a length cutoff, bad tool "
+                      "calls, or no progress; resets each turn.[/dim]")
         return
     if not arg:
         if A.PROVIDERS:
@@ -2927,8 +3032,19 @@ def cmd_status(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Item", style="#00edff", no_wrap=True)
     t.add_column("Value", style="#237dd7")
-    active = _active_provider_name()
-    t.add_row("Model", f"{active}:{A.MODEL_NAME}")
+    if A.routing.is_auto(A.MODEL_NAME):
+        chain = A._auto_chain
+        rung = A._last_auto_rung if chain else None
+        if chain and rung is not None:
+            provider, model = chain[rung]
+            t.add_row("Model", f"{A.MODEL_NAME} → {provider}:{model} (rung {rung + 1}/{len(chain)})")
+        elif chain:
+            t.add_row("Model", f"{A.MODEL_NAME} (not yet run this session)")
+        else:
+            t.add_row("Model", f"{A.MODEL_NAME} [red](no ladder — run /model auto setup)[/red]")
+    else:
+        active = _active_provider_name()
+        t.add_row("Model", f"{active}:{A.MODEL_NAME}")
     t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
     connected = sum(item.get("state") == "connected" for item in A.MCP_RUNTIME.statuses.values())
