@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 import time
 
+from agent8088 import model_catalog
+
 # Ordered strongest-hint first. Used ONCE, when seeding a chain in `/model auto
 # setup`, and never at run time -- which is the whole difference from the
 # MODEL_TIERS table that was deleted in the 2026-08-28 subagent redesign. A
@@ -116,14 +118,18 @@ def _keyword_score(text: str) -> int | None:
     return None
 
 
-def rank_hint(model_id: str) -> int:
-    """Rough strength score for a model id, guessed from its name alone.
+def rank_hint(provider: str, model_id: str) -> int:
+    """Strength score for a provider:model pair.
 
-    Combines a parsed parameter count (30b/70B) with today's keyword tiers,
-    taking whichever signal is stronger; the existing default only applies
-    when neither matches. Superseded by Task 4, which checks the maintained
-    catalog before ever calling this.
+    Checks the maintained catalog (bundled + user override, model_catalog.py)
+    first. Only when neither has an entry does it fall back to guessing from
+    the name: a parsed parameter count and today's keyword tiers, taking
+    whichever signal is stronger. Seeding only -- consulted by order_for_seed
+    when building a proposed auto_chain, never at routing time.
     """
+    entry = model_catalog.lookup(provider, model_id)
+    if entry is not None:
+        return int(entry.get("rank", _DEFAULT_STRENGTH))
     text = str(model_id or "").lower()
     candidates = [s for s in (_param_count_score(text), _keyword_score(text))
                  if s is not None]
@@ -137,7 +143,7 @@ def order_for_seed(candidates):
     right. Ties keep discovery order, which is the user's provider ordering.
     """
     return [c for _, _, c in
-            sorted(((rank_hint(m), i, (p, m))
+            sorted(((rank_hint(p, m), i, (p, m))
                     for i, (p, m) in enumerate(candidates)),
                    key=lambda t: (t[0], t[1]))]
 
