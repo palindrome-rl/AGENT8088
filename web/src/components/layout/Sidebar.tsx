@@ -2,10 +2,10 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import {
   MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
   FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
-  PanelLeftClose, PanelLeftOpen, Sun, Moon, Monitor, Search, X, Plus, MoreHorizontal, Pencil, Trash2, Palette, Zap, ChevronDown, Loader2,
+  PanelLeftClose, PanelLeftOpen, Sun, Moon, Monitor, Search, X, Plus, MoreHorizontal, Pencil, Trash2, Palette, ChevronDown, Loader2,
 } from 'lucide-react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useUIStore, type Accent, type Theme } from '@/stores/ui'
+import { useUIStore, type Theme } from '@/stores/ui'
 import { useSessionStore } from '@/stores/session'
 import { cn } from '@/lib/utils'
 import { useState, useEffect, useRef } from 'react'
@@ -29,6 +29,7 @@ const settingsItems = [
   { to: '/mcp', label: 'MCP', icon: Network },
   { to: '/memory', label: 'Memory', icon: Brain },
   { to: '/sessions', label: 'Sessions', icon: FolderClock },
+  { to: '/appearance', label: 'Appearance', icon: Palette },
   { to: '/config', label: 'Config', icon: Settings },
   { to: '/doctor', label: 'Doctor', icon: Stethoscope },
 ]
@@ -42,19 +43,12 @@ const appearanceThemes: { value: Theme; label: string; Icon: typeof Sun }[] = [
   { value: 'system', label: 'System', Icon: Monitor },
 ]
 
-const accentOptions: { value: Accent; label: string; colors: readonly [string, string] }[] = [
-  { value: 'ocean', label: 'Ocean', colors: ['#237dd7', '#00edff'] },
-  { value: 'violet', label: 'Violet', colors: ['#8b5cf6', '#d8b4fe'] },
-  { value: 'ember', label: 'Ember', colors: ['#f97316', '#facc15'] },
-  { value: 'mono', label: 'Mono', colors: ['#a1a1aa', '#f4f4f5'] },
-]
-
 type ProvidersResponse = { configured: string[]; builtins: string[]; active: string }
 type ModelsResponse = { models: string[] }
 type ModelSwitchResponse = { ok: boolean; provider?: string; model?: string; error?: string }
 
 export function Sidebar() {
-  const { sidebarCollapsed, toggleSidebar, theme, setTheme, accent, setAccent, motion, toggleMotion } = useUIStore()
+  const { sidebarCollapsed, toggleSidebar, theme, setTheme } = useUIStore()
   const { clearChat, setMessages, setSessionName, setStatus, status, isStreaming } = useSessionStore()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -285,6 +279,7 @@ export function Sidebar() {
 
   return (
     <aside
+      data-sidebar
       data-sidebar-collapsed={sidebarCollapsed}
       aria-label="Workspace navigation"
       className="relative flex shrink-0 flex-col overflow-hidden border-r border-zinc-200 dark:border-zinc-800/60 bg-white dark:bg-zinc-950"
@@ -600,7 +595,7 @@ export function Sidebar() {
                   ))}
                 </nav>
                 <div className="border-t border-zinc-200 pt-2 dark:border-zinc-800/60">
-                  <span className="px-2.5 text-[11px] font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Appearance</span>
+                  <span className="px-2.5 text-[11px] font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Color mode</span>
                   <div className="mt-1 grid grid-cols-3 gap-1 px-2" role="group" aria-label="Color mode">
                     {appearanceThemes.map(({ value, label, Icon }) => (
                       <button key={value} type="button" aria-pressed={theme === value} onClick={() => setTheme(value)}
@@ -609,21 +604,6 @@ export function Sidebar() {
                       </button>
                     ))}
                   </div>
-                  <div className="mt-2 px-2.5">
-                    <div className="mb-1.5 flex items-center gap-2 text-[12px] text-zinc-500 dark:text-zinc-400"><Palette className="h-3.5 w-3.5" /> Accent</div>
-                    <div className="grid grid-cols-4 gap-1" role="group" aria-label="Accent theme">
-                      {accentOptions.map((option) => (
-                        <button key={option.value} type="button" aria-label={`${option.label} accent`} aria-pressed={accent === option.value} onClick={() => setAccent(option.value)}
-                          className={cn('flex h-7 items-center justify-center rounded-lg transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/60', accent === option.value && 'bg-zinc-100 dark:bg-zinc-800')}>
-                          <span className="h-4 w-4 rounded-full ring-1 ring-white/40" style={{ background: `linear-gradient(135deg, ${option.colors[0]}, ${option.colors[1]})` }} />
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <button type="button" aria-label={motion === 'full' ? 'Reduce interface motion' : 'Enable interface motion'} aria-pressed={motion === 'reduced'} onClick={toggleMotion}
-                    className="mt-2 flex h-8 w-full items-center gap-2 px-2.5 text-left text-[12px] text-zinc-500 transition-colors hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800/40">
-                    <Zap className="h-3.5 w-3.5" />{motion === 'full' ? 'Reduce motion' : 'Motion reduced'}
-                  </button>
                 </div>
               </div>
       )}

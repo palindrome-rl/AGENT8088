@@ -10,7 +10,7 @@ import { useUIStore } from '@/stores/ui'
 
 export function AppLayout() {
   useWebSocket()
-  const { theme, accent, motion } = useUIStore()
+  const { theme, accent, motion, customAccent, uiFont, contentFont, codeFont, sidebarTranslucent, contrast } = useUIStore()
   const location = useLocation()
   const navigate = useNavigate()
 
@@ -30,7 +30,23 @@ export function AppLayout() {
     const html = document.documentElement
     html.dataset.accent = accent
     html.dataset.motion = motion
-  }, [accent, motion])
+    html.dataset.uiFont = uiFont
+    html.dataset.contentFont = contentFont
+    html.dataset.codeFont = codeFont
+    html.dataset.sidebarTranslucent = String(sidebarTranslucent)
+    html.style.setProperty('--ui-contrast', String(contrast / 100))
+    if (accent !== 'custom') {
+      for (const name of ['--brand-primary', '--brand-cyan', '--brand-border', '--brand-primary-rgb', '--brand-cyan-rgb', '--brand-border-rgb', '--ambient-primary-rgb', '--ambient-secondary-rgb']) html.style.removeProperty(name)
+      return
+    }
+    const hex = customAccent.replace('#', '')
+    if (!/^[0-9a-f]{6}$/i.test(hex)) return
+    const rgb = `${parseInt(hex.slice(0, 2), 16)} ${parseInt(hex.slice(2, 4), 16)} ${parseInt(hex.slice(4, 6), 16)}`
+    html.style.setProperty('--brand-primary', customAccent)
+    html.style.setProperty('--brand-cyan', customAccent)
+    html.style.setProperty('--brand-border', customAccent)
+    for (const name of ['--brand-primary-rgb', '--brand-cyan-rgb', '--brand-border-rgb', '--ambient-primary-rgb', '--ambient-secondary-rgb']) html.style.setProperty(name, rgb)
+  }, [accent, motion, customAccent, uiFont, contentFont, codeFont, sidebarTranslucent, contrast])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

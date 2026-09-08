@@ -25,6 +25,10 @@
 html[data-accent='violet'] { --brand-primary: #8b5cf6; --brand-cyan: #d8b4fe; --brand-border: #7c3aed; --brand-primary-rgb: 139 92 246; --brand-cyan-rgb: 216 180 254; --brand-border-rgb: 124 58 237; --ambient-primary-rgb: 139 92 246; --ambient-secondary-rgb: 216 180 254; }
 html[data-accent='ember'] { --brand-primary: #f97316; --brand-cyan: #facc15; --brand-border: #ea580c; --brand-primary-rgb: 249 115 22; --brand-cyan-rgb: 250 204 21; --brand-border-rgb: 234 88 12; --ambient-primary-rgb: 249 115 22; --ambient-secondary-rgb: 250 204 21; }
 html[data-accent='mono'] { --brand-primary: #a1a1aa; --brand-cyan: #f4f4f5; --brand-border: #71717a; --brand-primary-rgb: 161 161 170; --brand-cyan-rgb: 244 244 245; --brand-border-rgb: 113 113 122; --ambient-primary-rgb: 161 161 170; --ambient-secondary-rgb: 244 244 245; }
+html[data-accent='cobalt'] { --brand-primary: #2563eb; --brand-cyan: #60a5fa; --brand-border: #1d4ed8; --brand-primary-rgb: 37 99 235; --brand-cyan-rgb: 96 165 250; --brand-border-rgb: 29 78 216; --ambient-primary-rgb: 37 99 235; --ambient-secondary-rgb: 96 165 250; }
+html[data-accent='rose'] { --brand-primary: #db2777; --brand-cyan: #f9a8d4; --brand-border: #be185d; --brand-primary-rgb: 219 39 119; --brand-cyan-rgb: 249 168 212; --brand-border-rgb: 190 24 93; --ambient-primary-rgb: 219 39 119; --ambient-secondary-rgb: 249 168 212; }
+html[data-accent='forest'] { --brand-primary: #4d7c0f; --brand-cyan: #bef264; --brand-border: #3f6212; --brand-primary-rgb: 77 124 15; --brand-cyan-rgb: 190 242 100; --brand-border-rgb: 63 98 18; --ambient-primary-rgb: 77 124 15; --ambient-secondary-rgb: 190 242 100; }
+html[data-accent='gold'] { --brand-primary: #d97706; --brand-cyan: #fcd34d; --brand-border: #b45309; --brand-primary-rgb: 217 119 6; --brand-cyan-rgb: 252 211 77; --brand-border-rgb: 180 83 9; --ambient-primary-rgb: 217 119 6; --ambient-secondary-rgb: 252 211 77; }
 
 /* Dark mode (default) */
 html.dark {
@@ -50,7 +54,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-.app-shell { isolation: isolate; }
+.app-shell { isolation: isolate; filter: contrast(var(--ui-contrast, 1)); }
 .app-shell::before {
   content: '';
   position: absolute;
@@ -63,6 +67,15 @@ body {
   animation: ambient-drift 18s ease-in-out infinite alternate;
 }
 .app-shell > * { position: relative; z-index: 1; }
+html[data-ui-font='system'] body, html[data-content-font='system'] .chat-markdown { font-family: system-ui, ui-sans-serif, sans-serif; }
+html[data-ui-font='inter'] body, html[data-content-font='inter'] .chat-markdown { font-family: Inter, system-ui, ui-sans-serif, sans-serif; }
+html[data-ui-font='serif'] body, html[data-content-font='serif'] .chat-markdown { font-family: Georgia, ui-serif, serif; }
+html[data-ui-font='mono'] body, html[data-content-font='mono'] .chat-markdown { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+html[data-code-font='system'] :is(code, pre) { font-family: system-ui, ui-sans-serif, sans-serif; }
+html[data-code-font='mono'] :is(code, pre) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+html[data-code-font='serif'] :is(code, pre) { font-family: Georgia, ui-serif, serif; }
+html[data-sidebar-translucent='true'][class~='dark'] [data-sidebar] { background-color: rgb(9 9 11 / 0.72) !important; backdrop-filter: blur(18px); }
+html[data-sidebar-translucent='true']:not(.dark) [data-sidebar] { background-color: rgb(255 255 255 / 0.72) !important; backdrop-filter: blur(18px); }
 @keyframes ambient-drift { from { transform: translate3d(-1%, -1%, 0) scale(1); } to { transform: translate3d(2%, 2%, 0) scale(1.04); } }
 
 /* Beautiful UI — pixel-grid loader */
