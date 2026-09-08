@@ -71,5 +71,7 @@ export function displayMessages(messages: ChatMessage[]): ChatMessage[] {
     if (afterTool && message.content.startsWith('Error: ')) return false
     if (message.content.startsWith('You keep repeating tool calls without progress.')) return false
     return true
-  })
+  }).map(message => message.role === 'user' && message.content.includes('(attachment ') && message.content.includes('.web-attachments')
+    ? { ...message, content: message.content.split('\n\nAttached session artifacts (')[0] }
+    : message)
 }
