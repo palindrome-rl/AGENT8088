@@ -308,7 +308,7 @@ expected_tools = {
     "describe_capabilities": "introspect",
     "present_plan": "plan", "execute_plan": "plan",
     "git_status": "shell", "git_diff": "shell", "git_log": "shell",
-    "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
+    "git_init": "shell", "git_clone": "shell", "git_commit": "shell", "git_push": "shell",
     "git_create_pr": "shell", "schedule_task": "cron", "run_sandboxed": "docker",
     "browse_page": "browser",
     "view_skill": "skill",

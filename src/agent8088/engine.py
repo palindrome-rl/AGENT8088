@@ -3059,12 +3059,48 @@ def _kill_detached_process(process):
         process.wait()
 
 
+# Variables that let a child process open an interactive prompt of its own.
+# `git push` to an HTTPS remote with no cached credential opens /dev/tty
+# directly — not stdin — and blocks on "Username for 'https://github.com':".
+# The terminal it grabs is the one the REPL is reading, so the CLI and git end
+# up fighting over the same keystrokes and the turn hangs until the tool
+# timeout. Redirecting stdin alone does not stop it; only these do.
+_NON_INTERACTIVE_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "",
+    "SSH_ASKPASS": "",
+    "GCM_INTERACTIVE": "never",
+}
+
+
+def _non_interactive_env() -> dict:
+    """The caller's environment with every interactive prompt hook disabled."""
+    env = dict(os.environ)
+    env.update(_NON_INTERACTIVE_ENV)
+    # GIT_TERMINAL_PROMPT only governs git's own HTTPS credential prompt. Over
+    # SSH the blocking question comes from ssh instead — an unknown host key, or
+    # a passphrase for an encrypted key — and it is asked on /dev/tty just the
+    # same. BatchMode turns both into an immediate failure. Extended rather than
+    # replaced so a user's own GIT_SSH_COMMAND (a deploy key, a jump host) still
+    # applies; without that, fixing the hang would break their working setup.
+    ssh_command = env.get("GIT_SSH_COMMAND", "").strip() or "ssh"
+    if "batchmode" not in ssh_command.lower():
+        ssh_command = f"{ssh_command} -o BatchMode=yes"
+    env["GIT_SSH_COMMAND"] = ssh_command
+    return env
+
+
 def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     kwargs = {
         "shell": shell,
+        # Closed, not inherited: a child that reads stdin would otherwise
+        # consume the REPL's own input. See _NON_INTERACTIVE_ENV for the
+        # /dev/tty half of the same problem.
+        "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "cwd": str(SHELL_CWD),
+        "env": _non_interactive_env(),
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -3120,7 +3156,51 @@ def _process_display(argv: list) -> str:
     return subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
 
 
+# Auth failures git reports once prompting is disabled. Each is a dead end the
+# model cannot fix by retrying, so the raw text is kept (it names the remote)
+# and guidance the user can act on is appended to it.
+_GIT_AUTH_FAILURES = (
+    "could not read username",
+    "could not read password",
+    "terminal prompts disabled",
+    "authentication failed",
+    "permission denied (publickey)",
+    # BatchMode turns ssh's interactive questions into these two.
+    "host key verification failed",
+    "could not read from remote repository",
+    "invalid username or password",
+    "support for password authentication was removed",
+)
+
+_GIT_AUTH_GUIDANCE = (
+    "Git could not authenticate to the remote and cannot prompt for credentials "
+    "here — an interactive prompt would hang this session, so it is disabled. "
+    "This needs the user to set it up once, outside the agent: run `gh auth login` "
+    "for GitHub over HTTPS, configure a git credential helper, or switch the "
+    "remote to SSH with a loaded key. Report this to the user; do not retry the "
+    "push, it will fail the same way."
+)
+
+
+def _git_auth_hint(result: str) -> str:
+    """Turn an unauthenticated-git failure into something actionable.
+
+    Without this the model receives a bare "terminal prompts disabled", reads it
+    as a transient glitch, and retries the push until the turn runs out.
+    """
+    text = result or ""
+    if not any(marker in text.lower() for marker in _GIT_AUTH_FAILURES):
+        return result
+    return f"{text.strip()}\n\n{_GIT_AUTH_GUIDANCE}"
+
+
 def _structured_tool_argv(name: str, args: dict):
+    if name == "git_init":
+        directory = str(args.get("directory", "") or "").strip()
+        if any(char in directory for char in ("\0", "\r", "\n")):
+            raise ValueError("git init requires a safe destination path.")
+        # `--` so a directory that begins with a dash is a path, not a flag.
+        return ["git", "init"] + (["--", directory] if directory else [])
     if name == "git_clone":
         url = str(args.get("url", ""))
         directory = str(args.get("directory", ""))
@@ -3139,6 +3219,10 @@ def _structured_tool_argv(name: str, args: dict):
     return None
 
 
+# The git tools that talk to a remote, and so can fail on authentication.
+_REMOTE_GIT_TOOLS = frozenset(["git_push", "git_clone", "git_create_pr"])
+
+
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     argv = _structured_tool_argv(name, args)
     on_host = bool((TOOL_SPECS.get(name) or {}).get("host"))
@@ -3148,7 +3232,8 @@ def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
         staged = runner(["git", "add", "-A"])
         if "exited with status" in staged or "timed out" in staged:
             return staged
-    return _missing_binary_hint(argv[0] if argv else "", runner(argv))
+    result = _missing_binary_hint(argv[0] if argv else "", runner(argv))
+    return _git_auth_hint(result) if name in _REMOTE_GIT_TOOLS else result
 
 
 def _missing_binary_hint(program: str, result: str) -> str:
