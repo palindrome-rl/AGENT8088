@@ -2627,12 +2627,27 @@ def cmd_raw(rest):
 
 
 def cmd_image(rest, resolver=None):
-    parts = rest.split(None, 1)
-    if not parts:
+    rest = rest.strip()
+    if not rest:
         console.print("[red]usage:[/red] /image <path-or-url> [question]")
         return
-    ref = parts[0]
-    question = parts[1] if len(parts) > 1 else "Describe this image."
+    tokens = rest.split()
+    ref, question = tokens[0], " ".join(tokens[1:]).strip() or "Describe this image."
+    # Windows paths contain spaces ("screenshot 2.png"), and split() reads
+    # them as path "screenshot" + question "2.png" - the same trap
+    # _detect_pasted_file solves for bare pastes, which then re-entered here
+    # via _handle_pasted_file and broke a second time. Try the longest
+    # leading token join first; the longest prefix naming a real file is the
+    # path, the rest is the question. URLs and short names resolve at j=1.
+    for j in range(len(tokens), 0, -1):
+        candidate = " ".join(tokens[:j])
+        try:
+            if Path(candidate).expanduser().is_file():
+                ref = candidate
+                question = " ".join(tokens[j:]).strip() or "Describe this image."
+                break
+        except OSError:
+            continue
     # A path typed directly into /image is the same "the user typed this by
     # hand" case the bare-paste feature exists for — no reason /image should
     # be more restrictive than pasting the same path with no command at all.
