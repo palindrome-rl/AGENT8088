@@ -54,11 +54,9 @@ tools, permissions, and configuration used by the CLI.
 
 ### Production
 
-Build the frontend, then launch the server from the repository root:
+Launch the server from the repository root (it builds the frontend when needed):
 
 ```sh
-cd web && npm install && npm run build
-cd ..
 agent8088 --web
 ```
 
@@ -73,14 +71,10 @@ agent8088 --web --web-host 0.0.0.0
 
 ### Development
 
-Run the backend and Vite in separate terminals:
+Run the backend and Vite together:
 
 ```sh
-# Terminal 1
-PYTHONPATH=src python -m agent8088.cli --web --web-dev
-
-# Terminal 2
-cd web && npm run dev
+uv run agent8088 --web
 ```
 
 Open `http://127.0.0.1:5180`. Vite proxies `/api` and `/ws` to the backend.

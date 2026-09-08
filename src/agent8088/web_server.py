@@ -10,7 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -2183,17 +2186,60 @@ def _mount_static(app: FastAPI, dist_dir: Path):
             return FileResponse(dist_dir / "index.html")
 
 
+def _frontend_root() -> Path | None:
+    """Return the source checkout's frontend when this is a development install."""
+    for root in (Path.cwd(), *Path.cwd().parents, Path(__file__).resolve().parents[2]):
+        candidate = root / "web"
+        if (candidate / "package.json").exists():
+            return candidate
+    return None
+
+
+def _start_vite(web_root: Path, backend_port: int, host: str) -> subprocess.Popen[str]:
+    if not (web_root / "node_modules").exists():
+        raise RuntimeError(f"web dependencies are missing — run 'npm install' in {web_root}")
+    if not shutil.which("npm"):
+        raise RuntimeError("npm is required to run the web UI in development mode")
+    env = os.environ | {"AGENT8088_WEB_BACKEND": f"http://127.0.0.1:{backend_port}"}
+    return subprocess.Popen(
+        ["npm", "run", "dev", "--", "--host", host, "--port", "5180", "--strictPort"],
+        cwd=web_root, env=env, text=True,
+    )
+
+
+def _build_frontend(web_root: Path) -> Path:
+    dist_dir = web_root / "dist"
+    if dist_dir.exists():
+        return dist_dir
+    if not (web_root / "node_modules").exists():
+        raise RuntimeError(f"web UI is not built and dependencies are missing — run 'npm install' in {web_root}")
+    if not shutil.which("npm"):
+        raise RuntimeError("npm is required to build the web UI")
+    subprocess.run(["npm", "run", "build"], cwd=web_root, check=True)
+    return dist_dir
+
+
 def run_web_server(host: str = "127.0.0.1", port: int = 8180, dev: bool = False):
-    """Launch the web server. Called from cli.py when --web flag is used."""
+    """Launch the API server and, in development, its Vite frontend."""
     import uvicorn
-    if not dev:
-        # Try to mount the built frontend
-        dist_dir = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
-        if not dist_dir.exists():
-            log.warning(
-                "web/dist not found — production UI will 404. "
-                "Run 'cd web && npm install && npm run build' first, or use --web-dev."
-            )
-        _mount_static(app, dist_dir)
-    print(f"Agent8088 web UI on http://{host}:{port}", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    web_root = _frontend_root()
+    vite: subprocess.Popen[str] | None = None
+    if dev:
+        if web_root is None:
+            raise RuntimeError("development web UI requires an Agent8088 source checkout")
+        vite = _start_vite(web_root, port, host)
+        print("Agent8088 web UI on http://127.0.0.1:5180", flush=True)
+    else:
+        if web_root is None:
+            raise RuntimeError("web frontend files are unavailable in this installation")
+        _mount_static(app, _build_frontend(web_root))
+        print(f"Agent8088 web UI on http://{host}:{port}", flush=True)
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="warning")
+    finally:
+        if vite and vite.poll() is None:
+            vite.terminate()
+            try:
+                vite.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                vite.kill()

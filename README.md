@@ -103,20 +103,17 @@ See the [Web UI CLI reference](docs/wiki/10-cli-reference.md#web-ui) for details
 
 ```sh
 # Production
-cd web && npm install && npm run build
-cd ..
 agent8088 --web
 ```
 
 ```sh
-# Development — Terminal 1
-PYTHONPATH=src python -m agent8088.cli --web --web-dev
-
-# Development — Terminal 2
-cd web && npm run dev
+# Development (FastAPI + Vite)
+uv run agent8088 --web
 ```
 
 Production: http://127.0.0.1:8180  ·  Development: http://127.0.0.1:5180
+
+The first source-checkout run needs `npm install` in `web`; production builds the frontend automatically when needed.
 
 Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
 
