@@ -9141,6 +9141,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     spin = spin or (lambda msg: nullcontext())
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
+    last_completed = None  # consecutive identical call -> (signature, output)
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
@@ -9540,13 +9541,32 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                      "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                     continue
 
-            # Reuse only unchanged file reads, with state/permission identity.
-            # All other operations invalidate the local read cache.
+            # Two separate jobs, deliberately not merged.
+            #
+            # `read_results` is RESULT REUSE: serve a file read again without
+            # touching the disk, but only while that exact file is provably
+            # unchanged. Narrow on purpose — identical arguments can return
+            # different bytes once anything else has run.
+            #
+            # `last_completed` is the LOOP BREAKER, and it has to cover every
+            # tool, not just reads. Nothing ran between two consecutive
+            # identical calls, so the second one is the model spinning rather
+            # than making progress — and for a write or a shell command,
+            # re-running it repeats the side effect. Serving it from the
+            # previous output leaves `executed` False, which is what trips the
+            # stall detector below. Narrowing this to reads let a repeated
+            # execute_shell run once per round until max_turns.
             read_key = efficiency.read_signature(name, args, resolve_user_path, PERMISSION_MODE)
             if read_key is None:
                 read_results.clear()
+            previous_output = None
+            repeated = False
             if read_key is not None and read_key in read_results:
-                previous_output = read_results[read_key]
+                previous_output, repeated = read_results[read_key], True
+            elif ("__parse_error__" not in args and last_completed
+                    and sig == last_completed[0]):
+                previous_output, repeated = last_completed[1], True
+            if repeated:
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
                           if previous_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
@@ -9648,11 +9668,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Tell the user what you could not do and why the task cannot be completed."})
                 continue
 
-            if read_key is not None and not _plan_step_failed(result) and not result.startswith('ESCALATION_REQUEST'):
+            usable = (not _plan_step_failed(result)
+                      and not result.startswith('ESCALATION_REQUEST'))
+            if read_key is not None and usable:
                 if len(read_results) >= 16:
                     read_results.pop(next(iter(read_results)))
                 if len(result) <= 64000:
                     read_results[read_key] = result
+            # Loop-breaker state, kept for every tool. The web_search exception
+            # stands: an unusable search must be retryable, not latched.
+            if ("__parse_error__" not in args
+                    and not (name == "web_search" and not _search_was_usable(result))):
+                last_completed = (sig, result)
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}
