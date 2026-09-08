@@ -46,7 +46,7 @@ def test_cli_anything_read_can_repeat_after_a_state_change(monkeypatch, engine):
 
     def execute(name, raw_args, **_kwargs):
         executed.append((name, json.loads(raw_args)))
-        return ("before", "mutated", "after")[len(executed) - 1]
+        return ("before", "mutated", "after", "after again")[len(executed) - 1]
 
     monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
     monkeypatch.setattr(engine, "exec_tool", execute)
@@ -56,9 +56,9 @@ def test_cli_anything_read_can_repeat_after_a_state_change(monkeypatch, engine):
         messages, max_turns=5, system_prompt="", tools_def=[],
         allowed_tools={"cli_anything_run"},
     ) == "done"
-    assert [args for _name, args in executed] == [info, mutate, info]
-    assert any("already ran with this output" in message["content"]
-               and "after" in message["content"] for message in messages)
+    # Opaque external CLI operations are not safe to cache, even consecutively.
+    assert [args for _name, args in executed] == [info, mutate, info, info]
+    assert not any("already ran with this output" in message["content"] for message in messages)
 
 
 def test_cli_anything_hybrid_argument_markup_keeps_export_arguments(engine):

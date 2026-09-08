@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import cli_anything, documents, local_models, memory, routing, web_search
+from agent8088 import cli_anything, documents, local_models, memory, routing, web_search, efficiency
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -1854,10 +1854,15 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
     started = time.monotonic()
     selected_model = model_name or MODEL_NAME
     provider = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    first_token = [None]
+    def observe_token(kind, delta):
+        if delta and first_token[0] is None:
+            first_token[0] = round((time.monotonic() - started) * 1000)
+        on_token(kind, delta)
     try:
         response = _create_completion(
             client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
-            temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
+            temperature=temperature, on_token=observe_token if on_token else None, interrupt_check=interrupt_check,
             model_name=selected_model, provider_name=provider,
         )
     except Exception as exc:
@@ -1865,7 +1870,8 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
                                 max_tokens=max_tokens, error=exc)
         raise
     _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
-                            max_tokens=max_tokens, response=response)
+                            max_tokens=max_tokens, response=response, first_token_ms=first_token[0] if first_token[0] is not None else getattr(response, 'first_token_ms', None),
+                            prompt=system_prompt or current_system_prompt(), tools=tools)
     return response
 
 
@@ -1885,7 +1891,7 @@ def _is_unknown_param_error(exc: Exception) -> bool:
 
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
-                       model_name: str = "", provider_name: str = ""):
+                       model_name: str = "", provider_name: str = "", _skip_optional=False):
     selected_model = model_name or MODEL_NAME
     full_messages = [{"role": "system", "content": system_prompt or current_system_prompt()}, *messages]
     penalties = {}
@@ -1947,7 +1953,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     effort = ""
     if provider_name:
         effort = str((PROVIDERS.get(provider_name) or {}).get("reasoning_effort") or "").strip()
-    if effort:
+    if effort and not _skip_optional:
         request_options["extra_body"] = {"reasoning_effort": effort}
     _raise_if_interrupted(interrupt_check)
     if on_token is None:
@@ -1958,23 +1964,34 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 return client.chat.completions.create(**request_options)
             raise
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
+    if MODEL_TELEMETRY_ENABLED and not _skip_optional:
+        request_options['stream_options'] = {'include_usage': True}
+    stream_started = time.monotonic()
     try:
         stream = client.chat.completions.create(**request_options, stream=True)
     except Exception as exc:
-        if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
+        if not _skip_optional and _is_unknown_param_error(exc):
             return _create_completion(
                 client, messages, tools, max_tokens=max_tokens,
                 system_prompt=system_prompt, temperature=temperature,
                 on_token=on_token, interrupt_check=interrupt_check,
-                model_name=model_name, provider_name=provider_name)
+                model_name=model_name, provider_name=provider_name, _skip_optional=True)
         raise
     collected, tool_chunks, finish_reason = [], {}, None
+    stream_usage = None
+    stream_first = None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
     try:
         for chunk in stream:
             _raise_if_interrupted(interrupt_check, stream)
+            if getattr(chunk, 'usage', None) is not None:
+                stream_usage = chunk.usage
+            if not chunk.choices:
+                continue
             choice = chunk.choices[0]
             delta = choice.delta
+            if stream_first is None and any(getattr(delta, key, None) for key in ('content', 'reasoning_content', 'tool_calls')):
+                stream_first = round((time.monotonic() - stream_started) * 1000)
             finish_reason = getattr(choice, "finish_reason", None) or finish_reason
             rc = getattr(delta, "reasoning_content", None)
             if rc:
@@ -1990,7 +2007,10 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         raise
     finally:
         _finish_interrupt_watcher(stop, watcher)
-    return _build_response("".join(collected), tool_chunks, finish_reason)
+    response = _build_response("".join(collected), tool_chunks, finish_reason)
+    response.usage = stream_usage
+    response.first_token_ms = stream_first
+    return response
 
 
 def _fallback_targets() -> list:
@@ -2331,7 +2351,7 @@ def required_params(spec: dict) -> list:
 
 def build_tools_def(tool_specs: dict) -> list:
     result = []
-    for name, spec in tool_specs.items():
+    for name, spec in sorted(tool_specs.items()):
         # MCP tools declare their own parameters schema; built-in tools use args + arg_types
         if "parameters" in spec:
             params = spec["parameters"]
@@ -2494,7 +2514,7 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
     if "create_document" in specs:
         lines.append("- A direct request to create a .docx/.xlsx/.pptx file from content MUST call create_document, not write_file or execute_shell.")
-    for name, s in specs.items():
+    for name, s in sorted(specs.items()):
         args = ", ".join(s["args"]) or "no args"
         lines.append(f"- {name}({args}): {s['description']}")
         if name == "spawn_subagent":
@@ -6574,7 +6594,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
     if not spec:
-        return f"Unknown tool: {name}"
+        return efficiency.tool_error('unknown_tool', f"Unknown tool: {name}",
+            'Choose a tool from the available tool list and follow its argument schema.', recoverable=True)
 
     mode = (spec.get("mode") or "").lower()
     _declared_timeout = int(spec.get("timeout") or 25)
@@ -7163,7 +7184,11 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     try:
         args = json.loads(arguments)
     except Exception:
-        return "Invalid JSON"
+        return efficiency.tool_error('invalid_json', 'Tool arguments must be valid JSON.',
+            'Use a JSON object with double-quoted keys and strings; escape Windows backslashes.', recoverable=True)
+    if not isinstance(args, dict):
+        return efficiency.tool_error('invalid_arguments', 'Tool arguments must be an object, not a list or scalar.',
+                                     'Send an object matching the tool schema.', recoverable=True)
     # Durable task runs record intent before a side effect and its result after it.
     # Import lazily so ordinary interactive turns keep the existing dependency graph.
     try:
@@ -7181,9 +7206,27 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     try:
         result = run_tool(name, args, depth=depth)
     except subprocess.TimeoutExpired:
-        result = "Command timed out"
+        result = efficiency.tool_error('timeout', 'Command timed out; its side effects may already have occurred.',
+            'Inspect the current state before retrying. Do not repeat writes or external actions blindly.')
+    except FileNotFoundError:
+        result = efficiency.tool_error('not_found', 'The requested file or executable was not found.',
+            'Check the path or installed executable, correct the arguments, then retry.', recoverable=True)
+    except PermissionError:
+        result = efficiency.tool_error('permission_denied', 'The operating system denied access.',
+            'Ask the user to resolve access or choose an accessible path. Do not bypass permissions.')
+    except (ValueError, TypeError) as e:
+        result = efficiency.tool_error('invalid_input', str(e),
+            'Inspect the tool schema and correct the input; do not repeat unchanged arguments.', recoverable=True)
     except Exception as e:
         result = f"Error: {e}"
+
+    if result.startswith('Error:') and '"suggested_action"' not in result:
+        validation = _is_missing_argument_error(result) or _is_parse_error_result(result)
+        result = efficiency.tool_error('invalid_arguments' if validation else 'tool_failure',
+            result.removeprefix('Error:').strip(),
+            'Correct the named arguments using the provided example, then retry; do not repeat unchanged input.' if validation else
+            'Inspect the reported cause and tool schema. Resolve the prerequisite before retrying; do not bypass permissions.',
+            recoverable=validation)
 
     # A blocked call has not done anything yet, so there is nothing to verify —
     # it gets audited on the retry that follows approval. The prefix is
@@ -7881,7 +7924,8 @@ def _model_usage(response) -> tuple[dict, str]:
 
 
 def _record_model_telemetry(provider: str, model: str, attempt: str, started: float,
-                            *, max_tokens: int, response=None, error=None) -> None:
+                            *, max_tokens: int, response=None, error=None,
+                            first_token_ms=None, prompt='', tools=None) -> None:
     """Write local model-call health metadata; prompts and responses never leave memory."""
     if not MODEL_TELEMETRY_ENABLED:
         return
@@ -7891,7 +7935,9 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
         input_tokens = usage["input_tokens"] or 0
         output_tokens = usage["output_tokens"] or 0
         cost = None
-        if COST_PER_1K_INPUT or COST_PER_1K_OUTPUT:
+        if ((COST_PER_1K_INPUT or COST_PER_1K_OUTPUT)
+                and usage['input_tokens'] is not None and usage['output_tokens'] is not None
+                and provider == ACTIVE_PROVIDER and model == MODEL_NAME):
             cost = round((input_tokens / 1000) * COST_PER_1K_INPUT
                          + (output_tokens / 1000) * COST_PER_1K_OUTPUT, 8)
         choices = getattr(response, "choices", ()) or ()
@@ -7900,12 +7946,19 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "event": "model_call",
+            "task_id": getattr(_active_budget, 'task_id', None),
+            "cost_source": 'configured_rates_estimate' if cost is not None else 'unavailable',
             "provider": _redact_secrets(str(provider)),
             "model": _redact_secrets(str(model)),
             "attempt": attempt,
             "role": _active_role,
             "outcome": "error" if error else "success",
             "latency_ms": round((time.monotonic() - started) * 1000),
+            "first_token_ms": first_token_ms,
+            "stable_prefix_hash": __import__('hashlib').sha256(
+                (prompt.split(RUNTIME_CONTEXT_HEADING)[0] + json.dumps(tools or [], sort_keys=True)).encode()).hexdigest(),
+            "cached_input_tokens": getattr(getattr(getattr(response, 'usage', None),
+                'prompt_tokens_details', None), 'cached_tokens', None),
             "max_tokens": max_tokens,
             "token_source": token_source,
             "input_tokens": usage["input_tokens"],
@@ -8663,6 +8716,7 @@ class _TurnBudget:
 
     def __init__(self, max_seconds=0, max_tokens=0, max_cost=0.0,
                  cost_in=0.0, cost_out=0.0):
+        self.task_id = uuid.uuid4().hex
         self.max_seconds = max_seconds
         self.max_tokens = max_tokens
         self.max_cost = max_cost
@@ -9087,7 +9141,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     spin = spin or (lambda msg: nullcontext())
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
-    last_completed = None  # consecutive identical call -> (signature, output)
+    read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
@@ -9486,11 +9540,13 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                      "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                     continue
 
-            # Only consecutive repeats are safe to cache. A matching read after
-            # another tool call may observe state that changed in between.
-            if ("__parse_error__" not in args and last_completed
-                    and sig == last_completed[0]):
-                previous_output = last_completed[1]
+            # Reuse only unchanged file reads, with state/permission identity.
+            # All other operations invalidate the local read cache.
+            read_key = efficiency.read_signature(name, args, resolve_user_path, PERMISSION_MODE)
+            if read_key is None:
+                read_results.clear()
+            if read_key is not None and read_key in read_results:
+                previous_output = read_results[read_key]
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
                           if previous_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append({"role": "user", "content": cached})
@@ -9592,9 +9648,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Tell the user what you could not do and why the task cannot be completed."})
                 continue
 
-            if ("__parse_error__" not in args
-                    and not (name == "web_search" and not _search_was_usable(result))):
-                last_completed = (sig, result)
+            if read_key is not None and not _plan_step_failed(result) and not result.startswith('ESCALATION_REQUEST'):
+                if len(read_results) >= 16:
+                    read_results.pop(next(iter(read_results)))
+                if len(result) <= 64000:
+                    read_results[read_key] = result
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}
