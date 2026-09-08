@@ -210,7 +210,7 @@ $SandboxInstalled = $false
 function Write-Banner {
     Write-Host ""
     Write-Host "+---------------------------------------------------------+" -ForegroundColor Magenta
-    Write-Host "|             * Agent8088 Installer                        |" -ForegroundColor Magenta
+    Write-Host "|             * Agent8088 Installer                       |" -ForegroundColor Magenta
     Write-Host "+---------------------------------------------------------+" -ForegroundColor Magenta
     Write-Host "|  A local AI agent by Palindrome Research Labs.          |" -ForegroundColor Magenta
     Write-Host "+---------------------------------------------------------+" -ForegroundColor Magenta
