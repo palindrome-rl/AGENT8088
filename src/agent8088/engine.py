@@ -1890,11 +1890,37 @@ def _is_unknown_param_error(exc: Exception) -> bool:
     )
 
 
+def _normalised_messages(system_prompt: str, messages: list) -> list:
+    """One system message, at index 0, with everything else in order.
+
+    Auto-compaction replaces the history with [system("Conversation summary:
+    ..."), *recent]; prepending the real system prompt then put that summary at
+    index 1. Strict OpenAI-compatible servers reject it outright -- "System
+    message must be at the beginning" -- so every turn after a compaction
+    failed on a long conversation.
+
+    Folding rather than dropping: the summary is the only remaining record of
+    the turns compaction discarded, so it is appended to the system prompt
+    instead of being thrown away. Applied to system messages anywhere in the
+    list, not just the first, so no future caller can reintroduce this.
+    """
+    leading = [system_prompt or ""]
+    rest = []
+    for message in messages:
+        if message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                leading.append(content)
+            continue
+        rest.append(message)
+    return [{"role": "system", "content": "\n\n".join(part for part in leading if part)}, *rest]
+
+
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False):
     selected_model = model_name or MODEL_NAME
-    full_messages = [{"role": "system", "content": system_prompt or current_system_prompt()}, *messages]
+    full_messages = _normalised_messages(system_prompt or current_system_prompt(), messages)
     penalties = {}
     if FREQUENCY_PENALTY:
         penalties["frequency_penalty"] = FREQUENCY_PENALTY
