@@ -1654,7 +1654,19 @@ def _positive_int(value, fallback: int) -> int:
 
 
 _DOCUMENT_CHARS_PER_TOKEN = 3
+# Room held back in the context window for the model's reply. Deliberately
+# larger than what is requested below: a reasoning model spends tokens thinking
+# before it writes, and that thinking has to fit somewhere.
 _DOCUMENT_OUTPUT_TOKENS = 8192
+# What a chunk is actually asked to write. document_access keeps the first 5000
+# characters of a note -- roughly 1250 tokens -- so asking for 8192 paid for
+# about six times more generation than survives, took some six minutes per
+# chunk on a 23 tok/s endpoint, and did not fit the default 120s request
+# timeout. This still comfortably exceeds both what is kept and the "use at
+# most 700 words" instruction the chunk prompt gives. When it does turn out to
+# be too small for a particular model, _document_evidence buys a larger budget
+# once and remembers it.
+_DOCUMENT_EVIDENCE_TOKENS = 2048
 _DOCUMENT_OVERHEAD_TOKENS = 2000
 
 
@@ -1675,11 +1687,15 @@ def _document_budgets(context: int, completion: int) -> tuple[int, int, int]:
     also convert to characters by multiplying, not dividing.
     """
     from . import document_access
-    output = max(512, min(_DOCUMENT_OUTPUT_TOKENS, completion, max(1024, context // 4)))
-    usable = max(1000, context - output - _DOCUMENT_OVERHEAD_TOKENS) * _DOCUMENT_CHARS_PER_TOKEN
+    # Reserve and request are separate quantities. usable = context - reserve,
+    # so deriving both from one number meant that asking for less silently
+    # produced larger passages -- and a larger passage is more reasoning, which
+    # is the opposite of what a smaller request is for.
+    reserve = max(512, min(_DOCUMENT_OUTPUT_TOKENS, completion, max(1024, context // 4)))
+    usable = max(1000, context - reserve - _DOCUMENT_OVERHEAD_TOKENS) * _DOCUMENT_CHARS_PER_TOKEN
     return (max(1000, min(document_access.MAX_PROCESS_CHUNK_CHARS, usable)),
             max(1000, min(document_access.CHUNK_CHARS, usable)),
-            output)
+            max(512, min(_DOCUMENT_EVIDENCE_TOKENS, reserve)))
 
 
 def _active_model_token_limits(provider_name: str = "", model_name: str = "") -> tuple[int, int]:
