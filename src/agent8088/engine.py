@@ -1661,7 +1661,26 @@ def _positive_int(value, fallback: int) -> int:
 
 
 _DOCUMENT_CHARS_PER_TOKEN = 3
+# Room held back in the context window for the model's reply. Deliberately
+# larger than what is requested below: a reasoning model spends tokens thinking
+# before it writes, and that thinking has to fit somewhere.
 _DOCUMENT_OUTPUT_TOKENS = 8192
+# What a chunk is actually asked to write. Sizing this down to what survives
+# truncation looked like free speed and was measured to be wrong: a reasoning
+# model spends its budget thinking before it writes anything, so a small ask
+# does not buy a short answer, it buys no answer. On a real 67KB chunk this
+# model returned empty content with finish_reason="length" at 2048, 4096, 8192
+# and 16384 tokens, and only produced evidence at 32768 -- having spent about
+# 14000 tokens reasoning first. Under-asking therefore costs a wasted
+# generation and then a retry, which is strictly worse than asking properly.
+#
+# So the request matches the reserve, and _document_evidence climbs to the
+# model's own ceiling once when even that is not enough, remembering the
+# budget that worked for the remaining chunks. The split from the reserve is
+# kept because the two are genuinely different quantities: usable = context -
+# reserve, so folding them into one number makes a change to the request
+# silently resize every chunk.
+_DOCUMENT_EVIDENCE_TOKENS = _DOCUMENT_OUTPUT_TOKENS
 _DOCUMENT_OVERHEAD_TOKENS = 2000
 
 
@@ -1682,11 +1701,15 @@ def _document_budgets(context: int, completion: int) -> tuple[int, int, int]:
     also convert to characters by multiplying, not dividing.
     """
     from . import document_access
-    output = max(512, min(_DOCUMENT_OUTPUT_TOKENS, completion, max(1024, context // 4)))
-    usable = max(1000, context - output - _DOCUMENT_OVERHEAD_TOKENS) * _DOCUMENT_CHARS_PER_TOKEN
+    # Reserve and request are separate quantities. usable = context - reserve,
+    # so deriving both from one number meant that asking for less silently
+    # produced larger passages -- and a larger passage is more reasoning, which
+    # is the opposite of what a smaller request is for.
+    reserve = max(512, min(_DOCUMENT_OUTPUT_TOKENS, completion, max(1024, context // 4)))
+    usable = max(1000, context - reserve - _DOCUMENT_OVERHEAD_TOKENS) * _DOCUMENT_CHARS_PER_TOKEN
     return (max(1000, min(document_access.MAX_PROCESS_CHUNK_CHARS, usable)),
             max(1000, min(document_access.CHUNK_CHARS, usable)),
-            output)
+            max(512, min(_DOCUMENT_EVIDENCE_TOKENS, reserve)))
 
 
 def _active_model_token_limits(provider_name: str = "", model_name: str = "") -> tuple[int, int]:
