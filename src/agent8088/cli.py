@@ -1612,7 +1612,7 @@ def _handle_escalation(result_text, live=None, esc=None):
     _, target_mode, change_type, paths, reason = parts
     # Session allowlist: if this change_type was approved for the session, auto-approve
     if change_type in _session_allowlist:
-        A.grant_escalation(change_type)
+        A.grant_escalation(change_type, paths)
         return True
     if live is not None:
         live.stop()
@@ -1660,19 +1660,19 @@ def _handle_escalation(result_text, live=None, esc=None):
 
         if plan_only:
             if choice == "approve":
-                A.grant_escalation(change_type)
+                A.grant_escalation(change_type, paths)
                 console.print("[green]Plan approved. Steps will run.[/green]")
                 approved = True
             else:
                 console.print("[red]Plan denied — staying in plan-only mode.[/red]")
                 approved = False
         elif choice == "once":
-            A.grant_escalation(change_type)
+            A.grant_escalation(change_type, paths)
             console.print("[green]Approved for this action only.[/green]")
             approved = True
         elif choice == "session":
             _session_allowlist.add(change_type)
-            A.grant_escalation(change_type)
+            A.grant_escalation(change_type, paths)
             console.print(f"[green]Approved for this session. '{change_type}' won't ask again.[/green]")
             approved = True
         else:

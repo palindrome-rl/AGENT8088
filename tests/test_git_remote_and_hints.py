@@ -38,9 +38,19 @@ def test_missing_remote_does_not_get_credentials_advice(engine):
         "credentials advice given for a missing remote")
 
 
-def test_repository_not_found_does_not_get_credentials_advice(engine):
+def test_repository_not_found_is_not_answered_with_bare_credentials_advice(engine):
+    """This assertion was wrong in both directions before it was right.
+
+    Originally "not found" got the blanket credentials advice, which is wrong
+    when the URL is simply mistyped. The first correction ruled credentials out
+    entirely, which is wrong the other way -- GitHub returns "not found" for a
+    private repository you cannot see. The answer is to present both causes and
+    say the error cannot distinguish them.
+    """
     hinted = engine._git_auth_hint(REPO_NOT_FOUND)
-    assert "gh auth login" not in hinted
+    assert "two possible causes" in hinted.lower()
+    assert "git_remote" in hinted, "the wrong-url path must be offered"
+    assert "gh auth login" in hinted, "the no-access path must be offered too"
 
 
 @pytest.mark.parametrize("text", [REAL_AUTH, REAL_AUTH_SSH])
@@ -111,3 +121,69 @@ def test_git_push_accepts_a_remote_and_branch(engine, args, expected):
 def test_git_push_rejects_flags_and_control_characters(engine, bad):
     with pytest.raises(ValueError):
         engine._structured_tool_argv("git_push", bad)
+
+
+# --- consent must name, and be bound to, the real target -------------------
+
+def _escalation_for(engine, args):
+    """The escalation text git_push raises for these arguments."""
+    engine._remote_git_grant = False
+    return engine.run_tool("git_push", args)
+
+
+def test_the_approval_prompt_names_the_actual_remote_and_branch(engine):
+    """The prompt is the only thing the user reads before consenting.
+
+    Worse than cosmetic: on approval the harness tells the model to "retry the
+    EXACT same tool call", and a model that reads `origin HEAD` in the prompt
+    complies with *that* rather than its own arguments. A prompt naming the
+    wrong remote steers the retry to the wrong remote.
+    """
+    text = _escalation_for(engine, {"remote": "production", "branch": "main"})
+    assert "production" in text, f"prompt does not name the real remote: {text[:300]}"
+    assert "main" in text
+    assert "origin HEAD" not in text
+
+
+def test_the_default_push_still_reads_as_origin(engine):
+    text = _escalation_for(engine, {})
+    assert "origin" in text and "HEAD" in text
+
+
+def test_an_approval_does_not_authorise_a_different_target(engine, monkeypatch):
+    """A bare boolean grant let an approval for one remote push to another."""
+    calls = []
+    monkeypatch.setattr(engine, "_exec_structured_tool",
+                        lambda name, args, timeout: calls.append(args) or "pushed")
+
+    engine._remote_git_grant = False
+    engine.run_tool("git_push", {"remote": "staging"})      # asks
+    engine._remote_git_grant = True                          # user approves *staging*
+    out = engine.run_tool("git_push", {"remote": "production"})  # different target
+
+    assert not calls, (
+        "an approval for one remote authorised a push to a different one")
+    assert "ESCALATION_REQUEST" in out, "the changed target must re-ask"
+
+
+def test_repository_not_found_keeps_permissions_on_the_table(engine):
+    """GitHub answers 404 for a private repo you cannot see.
+
+    It does that deliberately, so a stranger cannot probe which private repos
+    exist. So "Repository not found" means *either* a wrong URL *or* no access
+    — asserting it is definitely not an auth problem is as wrong as the
+    original blanket credentials advice, just in the other direction.
+    """
+    hinted = engine._git_auth_hint(REPO_NOT_FOUND)
+    low = hinted.lower()
+    assert "not an authentication problem" not in low, (
+        "ruled out permissions for an error GitHub also returns when you lack access")
+    assert "access" in low or "permission" in low, (
+        "does not mention the access possibility at all")
+    assert "git_remote" in hinted, "still needs the wrong-url path"
+
+
+def test_unambiguous_causes_still_rule_out_auth(engine):
+    """A missing remote or a dead host really is not about credentials."""
+    for text in (MISSING_REMOTE, "fatal: unable to access: Could not resolve host: nope\n"):
+        assert "not an authentication problem" in engine._git_auth_hint(text).lower()
