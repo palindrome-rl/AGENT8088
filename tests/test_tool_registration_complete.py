@@ -55,3 +55,37 @@ def test_every_registered_tool_reaches_the_model(engine):
     offered = {t["function"]["name"] for t in engine.build_tools_def(engine.TOOL_SPECS)}
     assert "git_remote" in offered
     assert "describe_tool" in offered
+
+
+# --- arguments count too, not just tool names ------------------------------
+
+# A tool the engine reads an argument from, and the argument it must therefore
+# declare. Restoring a tools.txt line from the wrong revision silently drops
+# these: the engine still honours the argument, the schema stops offering it,
+# and the tests for the implementation keep passing. That is how write_file
+# lost source_url in the very commit that fixed the same bug for git_remote.
+_REQUIRED_ARGS = {
+    "write_file": ["filename", "content", "source_url"],
+    "git_push": ["remote", "branch", "set_upstream"],
+    "git_remote": ["action", "name", "url"],
+}
+
+
+def test_tools_declare_the_arguments_their_implementation_reads(engine):
+    missing = {}
+    for tool, expected in _REQUIRED_ARGS.items():
+        declared = set(engine.TOOL_SPECS.get(tool, {}).get("args") or [])
+        gap = [a for a in expected if a not in declared]
+        if gap:
+            missing[tool] = gap
+    assert not missing, (
+        f"the engine reads these arguments but the schema does not offer them, "
+        f"so the model cannot pass them: {missing}")
+
+
+def test_write_file_can_still_be_told_a_source_url(engine):
+    """Named on its own: this one was lost and restored twice in two days."""
+    args = engine.TOOL_SPECS["write_file"].get("args") or []
+    assert "source_url" in args, (
+        "write_file no longer offers source_url, so fetching remote/binary "
+        "content is unreachable from the model")
