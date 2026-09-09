@@ -7233,6 +7233,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                     _raise_if_interrupted(_document_interrupt)
                     if _active_budget is not None and _active_budget.exceeded():
                         raise ValueError("Document processing reached the active turn budget; completed chunks remain available for retry.")
+                # Shared across this document's chunks: once one chunk proves the
+                # model needs a larger budget, the rest start there instead of
+                # each paying the failed first attempt over again.
+                _document_budget = [output_tokens]
                 def complete_document(task, passage):
                     check_document()
                     def call_document(max_output):
@@ -7261,7 +7265,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                     # return nothing; _document_evidence buys one larger budget
                     # before giving up, and says so rather than asking for a
                     # retry that would fail identically.
-                    evidence = _document_evidence(call_document, output_tokens)
+                    def learned(tokens):
+                        _document_budget[0] = max(_document_budget[0], tokens)
+                    evidence = _document_evidence(call_document, _document_budget[0],
+                                                  ceiling=completion, remember=learned)
                     check_document()
                     return evidence
                 return document_access.process(read_target, str(args.get("query") or ""),
@@ -7804,26 +7811,42 @@ def _reasoning_exhausted_output(response, text: str) -> bool:
         return False
 
 
-def _document_evidence(call, output_tokens: int) -> str:
+def _document_evidence(call, output_tokens: int, ceiling: int = 0, remember=None) -> str:
     """One chunk's evidence, buying a bigger budget once if reasoning ate it.
 
     `call(max_tokens)` performs the completion and handles its own usage
     accounting, so this stays responsible only for the retry decision.
+
+    `ceiling` is the model's own completion limit: asking past it cannot help,
+    and discovering that costs a full generation, so a budget already at the
+    ceiling fails at once instead. `remember` receives a budget that worked
+    after a retry, so the rest of the document starts there rather than paying
+    the failed first attempt once per chunk.
     """
     response = call(output_tokens)
     text = _strip_reasoning(response.choices[0].message.content or "")
     if not _reasoning_exhausted_output(response, text):
         return text
-    response = call(output_tokens * _DOCUMENT_REASONING_RETRY_FACTOR)
+    larger = output_tokens * _DOCUMENT_REASONING_RETRY_FACTOR
+    if ceiling:
+        larger = min(larger, ceiling)
+    if larger <= output_tokens:
+        raise ValueError(
+            f"This model spent its largest output budget ({output_tokens} tokens) on reasoning "
+            "and returned no evidence for this chunk. Its own completion limit leaves no room "
+            "to retry larger. Use a model that does not reason before answering, or split the "
+            "document into smaller files.")
+    response = call(larger)
     text = _strip_reasoning(response.choices[0].message.content or "")
     if _reasoning_exhausted_output(response, text):
         # Naming the cause matters: the caller's generic message asks the user
         # to repeat the task, and repeating reproduces this failure every time.
         raise ValueError(
-            f"This model spent its whole {output_tokens * _DOCUMENT_REASONING_RETRY_FACTOR}-token "
-            "output budget on reasoning and returned no evidence for this chunk. "
-            "Raise the provider's max_completion_tokens, or use a model that does not "
-            "reason before answering, for documents this large.")
+            f"This model spent its whole {larger}-token output budget on reasoning and "
+            "returned no evidence for this chunk. Raise the provider's max_completion_tokens, "
+            "or use a model that does not reason before answering, for documents this large.")
+    if remember:
+        remember(larger)
     return text
 
 
