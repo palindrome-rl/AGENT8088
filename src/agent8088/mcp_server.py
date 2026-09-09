@@ -65,6 +65,7 @@ EXPOSED_TOOLS = (
     # guardrails — instead of hardcoding assumptions about it. Reads no files and
     # makes no requests, and the report is redacted like any other output.
     "describe_capabilities",
+    "describe_tool",
 )
 
 # Mutating tools, exposed only when the operator explicitly opts in with

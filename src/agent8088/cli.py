@@ -379,7 +379,7 @@ def _active_tool_specs():
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
     if A.PERMISSION_MODE == "plan-only":
         allowed &= {
-            "present_plan", "read_text", "calculate", "describe_capabilities",
+            "present_plan", "read_text", "calculate", "describe_capabilities", "describe_tool",
             "git_status", "git_diff", "git_log", "last_output", "web_search",
             "view_skill",
         }
@@ -2000,7 +2000,7 @@ def parse_tool_args(raw):
 
 COMMAND_SPECS = (
     ("", "<text>", "Chat — run the full agent loop on your message", ()),
-    ("tools", "/tools", "List every tool with its args, mode, and description", ()),
+    ("tools", "/tools [name]", "List tools, or describe one exact tool without executing it", ()),
     ("capabilities", "/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails", ()),
     ("tool", "/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)", ()),
     ("agents", "/agents [new|edit|delete|models]", "Manage sub-agent profiles and model routing", ()),
@@ -2067,7 +2067,10 @@ def cmd_help(_):
     console.print(t)
 
 
-def cmd_tools(_):
+def cmd_tools(rest):
+    if rest.strip():
+        console.print(Text(A.describe_tool(rest.strip(), _active_tool_specs())))
+        return
     t = Table(title="Tools", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Name", style="#237dd7")
@@ -2571,6 +2574,9 @@ def cmd_agents(rest):
 
 def cmd_tool(rest):
     parts = rest.split(None, 1)
+    if parts and parts[0] == 'describe':
+        console.print(Text(A.describe_tool(parts[1] if len(parts) > 1 else '', _active_tool_specs())))
+        return
     if not parts:
         console.print("[red]usage:[/red] /tool <name> <json-or-key=value args>")
         return
@@ -5101,7 +5107,9 @@ def _command_matches(text, slash=True):
 def _live_matches(text):
     """Return the token being edited and its live completion candidates."""
     stripped = text.lstrip()
-    for command, names in (("/agent ", A.SUBAGENT_SPECS), ("/model ", A.PROVIDERS), ("/tool ", A.TOOL_NAMES)):
+    for command, names in (("/agent ", A.SUBAGENT_SPECS), ("/model ", A.PROVIDERS),
+                           ("/tool describe ", _active_tool_specs()),
+                           ("/tools ", _active_tool_specs()), ("/tool ", A.TOOL_NAMES)):
         if stripped.startswith(command):
             token = stripped[len(command):].rsplit(" ", 1)[-1]
             return token, [name for name in sorted(names) if name.startswith(token)]
@@ -5213,6 +5221,8 @@ def _completer(text, state):
         matches = [n for n in sorted(A.SUBAGENT_SPECS) if n.startswith(text)]
     elif buf.startswith("/model "):
         matches = [n for n in sorted(A.PROVIDERS) if n.startswith(text)]
+    elif buf.startswith(("/tool describe ", "/tools ")):
+        matches = [n for n in sorted(_active_tool_specs()) if n.startswith(text)]
     elif buf.startswith("/tool "):
         matches = [n for n in sorted(A.TOOL_NAMES) if n.startswith(text)]
     elif buf.startswith("/"):

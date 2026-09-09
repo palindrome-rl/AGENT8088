@@ -2,9 +2,22 @@
 
 [← Wiki index](README.md)
 
-36 built-in tools, registered from `src/agent8088/tools.txt`. The `mode` column
+Built-in tools are registered from `src/agent8088/tools.txt`. The `mode` column
 is what the permission layer gates on — see
 [Permissions & Security](03-permissions-and-security.md).
+
+## Describe one tool
+
+Use `/tools read_text` or `/tool describe read_text` to inspect one tool without
+executing it. With no name, `/tools` still lists all active tools. Names must match
+the registry exactly; unknown names return an actionable error, not the full list.
+
+The model-facing `describe_tool(tool_name)` uses the same live schema, including
+required fields, optional fields, types, and native MCP parameter schemas. It is
+available in read-only and plan-only modes and exposed by the MCP server. Web API
+clients can request `GET /api/capabilities?tool_name=read_text`; omitting the query
+parameter preserves the full report. Invalid names return HTTP 400, and unknown
+names return HTTP 404. Describing a tool does not grant permission to execute it.
 
 ## Full inventory
 

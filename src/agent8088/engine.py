@@ -7173,6 +7173,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         note_mutation(f"write {target}")
 
     if mode == "introspect":
+        if name == "describe_tool":
+            return describe_tool(args.get("tool_name"))
         return describe_capabilities()
 
     if mode == "last_output":
@@ -8790,6 +8792,25 @@ def _on_off(value, unit: str = "") -> str:
     if not value:
         return "not set"
     return f"{value}{unit}"
+
+
+def describe_tool(tool_name, specs=None) -> str:
+    """Return one live tool schema without executing the described tool."""
+    registry = TOOL_SPECS if specs is None else specs
+    if not isinstance(tool_name, str) or not tool_name.strip() or len(tool_name) > 200:
+        return "Error: Provide one exact tool name, e.g. read_text. Use /tools to list available names."
+    name = tool_name.strip()
+    spec = registry.get(name)
+    if spec is None:
+        return f"Error: Unknown or unavailable tool {name!r}. Use /tools to list available names. No tool was executed."
+    schema = build_tools_def({name: spec})[0]["function"]["parameters"]
+    return _redact_secrets(json.dumps({
+        "name": name,
+        "description": spec.get("description", ""),
+        "mode": spec.get("mode", ""),
+        "parameters": schema,
+        "execution": "Description only; the tool was not executed. Normal permissions apply when invoking it.",
+    }, ensure_ascii=False, indent=2))
 
 
 def describe_capabilities() -> str:

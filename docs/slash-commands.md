@@ -22,7 +22,8 @@ Complete inventory of slash commands across all three Agent8088 surfaces.
 ### Tools & Skills
 | Command | What it does |
 |---|---|
-| `/tools` | List every tool with args, mode, description |
+| `/tools [name]` | List tools, or describe one exact tool and its live argument schema without executing it |
+| `/tool describe <name>` | Describe one tool without executing it (alias of `/tools <name>`) |
 | `/tool <name> <args>` | Invoke ONE tool directly (JSON or key=value args) |
 | `/skills [name\|enable\|disable]` | Browse a skill or enable/disable for this session |
 | `/cli-anything [task]` | Find, run, build, refine, test, or validate an app CLI |

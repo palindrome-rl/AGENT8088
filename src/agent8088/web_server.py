@@ -712,10 +712,13 @@ async def run_fusion(body: dict = None):
 
 
 @app.get("/api/capabilities")
-async def get_capabilities():
-    """Full self-report."""
+async def get_capabilities(tool_name: str | None = None):
+    """Full self-report, or one named tool's live schema without execution."""
     A = _eng()
-    return {"report": A.describe_capabilities()}
+    report = A.describe_tool(tool_name) if tool_name is not None else A.describe_capabilities()
+    if tool_name is not None and report.startswith("Error:"):
+        return _error(report, 400 if not tool_name.strip() or len(tool_name) > 200 else 404)
+    return {"report": report}
 
 
 @app.get("/api/config")
