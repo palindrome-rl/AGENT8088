@@ -2043,6 +2043,7 @@ COMMAND_SPECS = (
     ("save", "/save <file>", "Save conversation + last trace to a JSON file", ()),
     ("clear", "/clear", "Clear the conversation context", ()),
     ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
+    ("schedule", "/schedule [list|add <cron> <task>|remove <index-or-task>]", "Add/list/remove a recurring run of this agent (cron/Task Scheduler)", ()),
     ("help", "/help", "Show this list", ()),
     ("exit", "/exit, /quit", "Leave", ("quit",)),
 )
@@ -3332,6 +3333,102 @@ def cmd_local(rest):
         _cmd_local_remove(arg)
     else:
         console.print("[red]usage:[/red] /local [check|list|pull <name>|remove <name>]")
+
+
+def _print_schedule_usage():
+    console.print("[red]usage:[/red]")
+    console.print("  /schedule list                       Show all scheduled tasks")
+    console.print("  /schedule add <cron> <task>           Add a new scheduled task")
+    console.print("  /schedule remove <index-or-task>      Remove a scheduled task "
+                   "(by its # from list, or its exact task text)")
+    console.print("  cron is 5 fields: minute hour day month weekday, "
+                   "e.g. \"0 9 * * *\" = daily at 9am")
+
+
+def _cmd_schedule_list():
+    result = A.schedule_task(action="list")
+    entries = result.get("entries") or []
+    if not entries:
+        console.print(result.get("detail") or "No scheduled tasks.")
+        return
+    t = Table(title="Scheduled Tasks", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("#", style="#237dd7")
+    t.add_column("Schedule", style="#237dd7")
+    t.add_column("Task", style="#237dd7")
+    for i, entry in enumerate(entries, 1):
+        t.add_row(str(i), entry.get("schedule", ""), entry.get("task", ""))
+    console.print(t)
+
+
+def _cmd_schedule_add(arg):
+    try:
+        tokens = shlex.split(arg or "")
+    except ValueError as exc:
+        console.print(f"[red]Could not parse arguments: {exc}[/red]")
+        return
+    # Accept either a quoted cron string as one token ("0 9 * * *" task...)
+    # or five bare tokens (0 9 * * * task...) — both are natural to type.
+    first_fields = tokens[0].split() if tokens else []
+    if len(first_fields) == 5:
+        schedule, task_tokens = tokens[0], tokens[1:]
+    elif len(tokens) >= 6:
+        schedule, task_tokens = " ".join(tokens[:5]), tokens[5:]
+    else:
+        _print_schedule_usage()
+        return
+    task = " ".join(task_tokens)
+    if not task:
+        console.print("[red]Missing task text after the cron schedule.[/red]")
+        return
+    result = A.schedule_task(action="add", schedule=schedule, task=task)
+    if result["ok"]:
+        console.print(f"[green]Scheduled:[/green] {schedule} -> {task}")
+    else:
+        console.print(f"[red]{result['detail']}[/red]")
+
+
+def _cmd_schedule_remove(arg):
+    arg = (arg or "").strip()
+    if not arg:
+        console.print("[red]usage:[/red] /schedule remove <index-or-task-text>")
+        console.print("  run /schedule list first to see index numbers")
+        return
+    task = arg
+    if arg.isdigit():
+        entries = A.schedule_task(action="list").get("entries") or []
+        idx = int(arg)
+        if not (1 <= idx <= len(entries)):
+            console.print(f"[red]No scheduled task #{idx}. Run /schedule list to see valid numbers.[/red]")
+            return
+        task = entries[idx - 1].get("task", "")
+        if not task:
+            console.print("[red]Could not resolve that entry's task text; "
+                           "remove it by its exact task text instead.[/red]")
+            return
+    result = A.schedule_task(action="remove", task=task)
+    if result["ok"]:
+        console.print(f"[green]Removed:[/green] {task}")
+    else:
+        console.print(f"[red]{result['detail']}[/red]")
+
+
+def cmd_schedule(rest):
+    """Manage this agent's own recurring runs (cron on macOS/Linux, Task
+    Scheduler on Windows) — a direct interface to the same schedule_task tool
+    models call, for when you want to add/list/remove a schedule yourself
+    without phrasing it as a chat request."""
+    parts = (rest or "").strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    arg = parts[1] if len(parts) > 1 else ""
+    if sub == "list":
+        _cmd_schedule_list()
+    elif sub == "add":
+        _cmd_schedule_add(arg)
+    elif sub in ("remove", "rm", "delete"):
+        _cmd_schedule_remove(arg)
+    else:
+        _print_schedule_usage()
 
 
 def cmd_dump(_rest):
@@ -4945,6 +5042,7 @@ COMMANDS = {
     "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
     "memory": cmd_memory,
     "task": cmd_task,
+    "schedule": cmd_schedule,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 
