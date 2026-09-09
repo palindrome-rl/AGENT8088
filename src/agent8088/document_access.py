@@ -32,6 +32,9 @@ PROCESS_CONCURRENCY = 4
 # so hitting this loses no finished work -- it bounds how long a document can
 # hold a turn before the user is told what is happening.
 PROCESS_DEADLINE_SECONDS = 600
+# How often a waiting `process` looks for an interrupt or its deadline. Short
+# enough that Stop feels immediate, long enough not to spin a core.
+INTERRUPT_POLL_SECONDS = 0.25
 
 
 def _deadline_message(deadline_seconds) -> str:
@@ -223,32 +226,52 @@ def process(path, task, complete, *, chunk_chars=24000, progress=None, check=Non
     # rather than draining a fixed batch, so one slow chunk no longer stalls
     # the rest. Results still commit in source order, so every checkpoint stays
     # a contiguous prefix and resumes without gaps or duplicate ranges.
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        pending, submitted = {}, len(notes)
-        try:
-            while len(notes) < total:
-                while submitted < total and len(pending) < concurrency:
-                    pending[submitted] = pool.submit(extract_chunk, submitted)
-                    submitted += 1
-                if progress:
-                    progress(f"Processing document: {len(notes)}/{total} chunks complete")
-                # Wait with a deadline rather than indefinitely. Checking the
-                # budget only when a chunk *started* let chunks already in
-                # flight carry a run minutes past it, which is exactly the case
-                # a slow model produces: the run looked hung, not over budget.
-                remaining = deadline_seconds - (time.monotonic() - started)
-                if remaining <= 0:
+    # Deliberately not a `with` block: ThreadPoolExecutor.__exit__ calls
+    # shutdown(wait=True), which blocks until every in-flight chunk returns.
+    # That is precisely the wait Stop needs to avoid -- interrupting promptly
+    # and then blocking for a minute in __exit__ is indistinguishable, to the
+    # user, from Stop doing nothing at all.
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+    pending, submitted = {}, len(notes)
+    try:
+        while len(notes) < total:
+            while submitted < total and len(pending) < concurrency:
+                pending[submitted] = pool.submit(extract_chunk, submitted)
+                submitted += 1
+            if progress:
+                progress(f"Processing document: {len(notes)}/{total} chunks complete")
+            # Wait with a deadline rather than indefinitely. Checking the
+            # budget only when a chunk *started* let chunks already in
+            # flight carry a run minutes past it, which is exactly the case
+            # a slow model produces: the run looked hung, not over budget.
+            # Wait in slices rather than one long block. A chunk can take a
+            # minute or more, and waiting on it uninterruptibly meant Stop
+            # set its event, nothing observed it until the chunk returned,
+            # and the next message came back "a turn is already running".
+            future = pending.pop(len(notes))
+            while True:
+                if check:
+                    check()
+                elapsed = time.monotonic() - started
+                if elapsed > deadline_seconds:
+                    future.cancel()
                     raise ValueError(_deadline_message(deadline_seconds))
                 try:
-                    notes.append(pending.pop(len(notes)).result(timeout=remaining))
+                    notes.append(future.result(
+                        timeout=min(INTERRUPT_POLL_SECONDS, deadline_seconds - elapsed)))
+                    break
                 except FuturesTimeout:
-                    raise ValueError(_deadline_message(deadline_seconds)) from None
-                save()
-        finally:
-            # A chunk whose evidence can no longer be committed in order is not
-            # worth paying a provider for.
-            for future in pending.values():
-                future.cancel()
+                    continue
+            save()
+    finally:
+        # A chunk whose evidence can no longer be committed in order is not
+        # worth paying a provider for.
+        for future in pending.values():
+            future.cancel()
+        # wait=False so an interrupt returns now. Threads already inside a
+        # provider call cannot be killed, but they are no longer holding
+        # the turn open, and their results are discarded.
+        pool.shutdown(wait=False, cancel_futures=True)
     if progress:
         progress(f"Document processed: {total}/{total} chunks; preparing answer")
     return json.dumps({"source": Path(path).name, "processed_characters": len(text),

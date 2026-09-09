@@ -19,11 +19,17 @@ from agent8088 import engine as A
 from agent8088 import document_access
 
 
-def test_the_request_is_sized_to_the_evidence_that_is_kept():
+def test_the_request_is_not_trimmed_below_the_reserve():
+    """Measured, not assumed. Sizing the ask down to what survives truncation
+    looked like free speed; on a real 67KB chunk this model returned empty
+    content with finish_reason="length" at 2048, 4096, 8192 and 16384 tokens,
+    producing evidence only at 32768 after ~14000 tokens of reasoning. A small
+    ask does not buy a short answer from a reasoning model, it buys no answer,
+    so under-asking costs a wasted generation and then a retry."""
     _chunk, _read, requested = A._document_budgets(32768, 32768)
     kept_tokens = 5000 // A._DOCUMENT_CHARS_PER_TOKEN
-    assert requested < A._DOCUMENT_OUTPUT_TOKENS
-    assert requested > kept_tokens, "must still exceed what document_access keeps"
+    assert requested >= A._DOCUMENT_OUTPUT_TOKENS
+    assert requested > kept_tokens
 
 
 def test_the_request_covers_the_seven_hundred_word_instruction():
@@ -32,13 +38,15 @@ def test_the_request_covers_the_seven_hundred_word_instruction():
     assert requested >= 1400  # ~700 words with headroom
 
 
-def test_a_smaller_request_does_not_enlarge_the_chunk():
-    """usable = context - reserve. Spending both from one number meant a
-    smaller ask produced a bigger passage, which is the opposite of the goal."""
-    chunk, _read, requested = A._document_budgets(32768, 32768)
-    assert requested < chunk // A._DOCUMENT_CHARS_PER_TOKEN
-    assert chunk <= (32768 - A._DOCUMENT_OUTPUT_TOKENS
-                     - A._DOCUMENT_OVERHEAD_TOKENS) * A._DOCUMENT_CHARS_PER_TOKEN
+def test_changing_the_request_cannot_resize_the_chunk(monkeypatch):
+    """usable = context - reserve, so folding the two into one number made a
+    change to the request silently resize every passage -- and a larger
+    passage is more reasoning, the opposite of what a smaller ask is for."""
+    baseline, _read, _requested = A._document_budgets(32768, 32768)
+    monkeypatch.setattr(A, "_DOCUMENT_EVIDENCE_TOKENS", 1024)
+    smaller_ask, _read, requested = A._document_budgets(32768, 32768)
+    assert requested == 1024
+    assert smaller_ask == baseline, "the chunk moved when only the ask changed"
 
 
 def test_chunk_sizing_is_unchanged_by_this_split():

@@ -1658,15 +1658,22 @@ _DOCUMENT_CHARS_PER_TOKEN = 3
 # larger than what is requested below: a reasoning model spends tokens thinking
 # before it writes, and that thinking has to fit somewhere.
 _DOCUMENT_OUTPUT_TOKENS = 8192
-# What a chunk is actually asked to write. document_access keeps the first 5000
-# characters of a note -- roughly 1250 tokens -- so asking for 8192 paid for
-# about six times more generation than survives, took some six minutes per
-# chunk on a 23 tok/s endpoint, and did not fit the default 120s request
-# timeout. This still comfortably exceeds both what is kept and the "use at
-# most 700 words" instruction the chunk prompt gives. When it does turn out to
-# be too small for a particular model, _document_evidence buys a larger budget
-# once and remembers it.
-_DOCUMENT_EVIDENCE_TOKENS = 2048
+# What a chunk is actually asked to write. Sizing this down to what survives
+# truncation looked like free speed and was measured to be wrong: a reasoning
+# model spends its budget thinking before it writes anything, so a small ask
+# does not buy a short answer, it buys no answer. On a real 67KB chunk this
+# model returned empty content with finish_reason="length" at 2048, 4096, 8192
+# and 16384 tokens, and only produced evidence at 32768 -- having spent about
+# 14000 tokens reasoning first. Under-asking therefore costs a wasted
+# generation and then a retry, which is strictly worse than asking properly.
+#
+# So the request matches the reserve, and _document_evidence climbs to the
+# model's own ceiling once when even that is not enough, remembering the
+# budget that worked for the remaining chunks. The split from the reserve is
+# kept because the two are genuinely different quantities: usable = context -
+# reserve, so folding them into one number makes a change to the request
+# silently resize every chunk.
+_DOCUMENT_EVIDENCE_TOKENS = _DOCUMENT_OUTPUT_TOKENS
 _DOCUMENT_OVERHEAD_TOKENS = 2000
 
 
