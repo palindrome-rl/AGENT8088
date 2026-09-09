@@ -724,7 +724,7 @@ _ANY_GRANT_KEY = "\x00any\x00"
 _one_shot_grants: set = set()
 _pending_approval_key = ""
 _local_fallback_grant = False
-_remote_git_grant = False
+_remote_git_grant = ""
 _plan_on_step = None        # set by CLI do_chat so _exec_plan can render the checklist
 _plan_on_escalation = None  # set by CLI do_chat so _exec_plan escalations reach _handle_escalation
 _plan_on_approval = None    # set by CLI do_chat; shows the plan and returns the mode to run it in
@@ -1426,7 +1426,7 @@ def request_escalation(target_mode: str, paths: list, change_type: str, reason: 
     )
 
 
-def grant_escalation(change_type: str = ""):
+def grant_escalation(change_type: str = "", target: str = ""):
     """Allow exactly one blocked tool call to run, then revert to readonly.
     The user is prompted for every write/mutation - no session-wide grants.
 
@@ -1436,7 +1436,8 @@ def grant_escalation(change_type: str = ""):
     together), and each grant is spent independently by check_permission."""
     global _local_fallback_grant, _remote_git_grant, _pending_approval_key
     if change_type == "git_remote_write":
-        _remote_git_grant = True
+        # Bound to the approved target, so a retry aimed elsewhere re-asks.
+        _remote_git_grant = target or True
         _local_fallback_grant = False
         _pending_approval_key = ""
         return
@@ -3192,6 +3193,44 @@ _GIT_AUTH_FAILURES = (
     "support for password authentication was removed",
 )
 
+# "Could not read from remote repository." is git's *second* line for several
+# unrelated failures, so on its own it proves nothing. Where one of these named
+# a cause first, that cause is the real one and credentials are a red herring.
+_GIT_NOT_AUTH = (
+    "does not appear to be a git repository",
+    "could not resolve host",
+    "connection refused",
+    "connection timed out",
+    "no such file or directory",
+)
+
+# GitHub answers "not found" for a private repository the caller cannot see --
+# deliberately, so nobody can probe which private repos exist. So this means
+# either a wrong URL or no access, and saying which would be a guess.
+_GIT_AMBIGUOUS_NOT_FOUND = (
+    "repository not found",
+    "not found",
+)
+
+_GIT_NOT_FOUND_GUIDANCE = (
+    "The remote answered 'not found'. That has two possible causes and the "
+    "error cannot tell them apart: the URL is wrong, or the repository is "
+    "private and these credentials cannot see it (GitHub returns 'not found' "
+    "rather than 'forbidden' so that private repositories stay unlistable). "
+    "Check the URL first with `git_remote(action='list')` and correct it with "
+    "action='set-url' if it is wrong. If the URL is right, it is an access "
+    "problem: the user needs `gh auth login` or a credential with permission "
+    "on that repository. Report both possibilities; do not retry unchanged."
+)
+
+_GIT_REMOTE_GUIDANCE = (
+    "This is not an authentication problem - git could not find the remote it "
+    "was told to push to. List remotes with `git_remote(action='list')`; add one "
+    "with `git_remote(action='add', name='origin', url=...)`, or correct it with "
+    "action='set-url'. If the remote exists under another name, pass it to "
+    "git_push as `remote`. Do not ask the user for credentials."
+)
+
 _GIT_AUTH_GUIDANCE = (
     "Git could not authenticate to the remote and cannot prompt for credentials "
     "here — an interactive prompt would hang this session, so it is disabled. "
@@ -3209,9 +3248,51 @@ def _git_auth_hint(result: str) -> str:
     as a transient glitch, and retries the push until the turn runs out.
     """
     text = result or ""
-    if not any(marker in text.lower() for marker in _GIT_AUTH_FAILURES):
+    lowered = text.lower()
+    if any(marker in lowered for marker in _GIT_AMBIGUOUS_NOT_FOUND):
+        return f"{text.strip()}\n\n{_GIT_NOT_FOUND_GUIDANCE}"
+    if any(marker in lowered for marker in _GIT_NOT_AUTH):
+        # A named cause outranks the generic 'could not read from remote' line.
+        return f"{text.strip()}\n\n{_GIT_REMOTE_GUIDANCE}"
+    if not any(marker in lowered for marker in _GIT_AUTH_FAILURES):
         return result
     return f"{text.strip()}\n\n{_GIT_AUTH_GUIDANCE}"
+
+
+def _git_safe_value(value, what):
+    """One argv element that git will read as data, not as a flag.
+
+    argv already prevents shell metacharacters from meaning anything, but it
+    does not stop git itself from reading a leading dash as an option --
+    `--upload-pack=...` as a remote name runs a command on the far side.
+    """
+    text = str(value or "").strip()
+    if any(ch in text for ch in (chr(0), chr(13), chr(10))):
+        raise ValueError(f"git {what} must not contain control characters.")
+    if text.startswith("-"):
+        raise ValueError(f"git {what} must not start with a dash.")
+    return text
+
+
+_GIT_REMOTE_ACTIONS = ("list", "add", "set-url", "remove")
+
+
+def _git_push_target(args: dict) -> str:
+    """The "<remote> <branch>" a git_push would use, for the approval prompt.
+
+    Derived from the same argv builder the push runs, so the text the user
+    approves cannot describe a different action than the one performed.
+    """
+    try:
+        argv = _structured_tool_argv("git_push", args or {})
+    except ValueError:
+        return "origin HEAD"
+    flags = [a for a in argv[2:] if a.startswith("-")]
+    target = " ".join(a for a in argv[2:] if not a.startswith("-"))
+    # "-u" is a property of the push, not part of where it goes. Left in the
+    # target it produced "Push to -u origin master?" -- argv leaking into a
+    # sentence a human reads before consenting.
+    return target + (" (and set it as upstream)" if "-u" in flags else "")
 
 
 def _structured_tool_argv(name: str, args: dict):
@@ -3221,6 +3302,23 @@ def _structured_tool_argv(name: str, args: dict):
             raise ValueError("git init requires a safe destination path.")
         # `--` so a directory that begins with a dash is a path, not a flag.
         return ["git", "init"] + (["--", directory] if directory else [])
+    if name == "git_remote":
+        action = _git_safe_value(args.get("action", "list") or "list", "action")
+        if action not in _GIT_REMOTE_ACTIONS:
+            raise ValueError(
+                "git remote action must be one of: "
+                + ", ".join(_GIT_REMOTE_ACTIONS) + ".")
+        if action == "list":
+            return ["git", "remote", "-v"]
+        remote = _git_safe_value(args.get("name"), "remote name")
+        if not remote:
+            raise ValueError("git remote " + action + " requires a remote name.")
+        if action == "remove":
+            return ["git", "remote", "remove", remote]
+        url = _git_safe_value(args.get("url"), "remote url")
+        if not url:
+            raise ValueError("git remote " + action + " requires a url.")
+        return ["git", "remote", action, remote, url]
     if name == "git_clone":
         url = str(args.get("url", ""))
         directory = str(args.get("directory", ""))
@@ -3232,7 +3330,12 @@ def _structured_tool_argv(name: str, args: dict):
     if name == "git_commit":
         return ["git", "commit", "-m", str(args.get("message", ""))]
     if name == "git_push":
-        return ["git", "push", "origin", "HEAD"]
+        # Defaults unchanged: a bare git_push is still `git push origin HEAD`.
+        remote = _git_safe_value(args.get("remote") or "origin", "remote name")
+        branch = _git_safe_value(args.get("branch") or "HEAD", "branch name")
+        upstream = str(args.get("set_upstream", "")).strip().lower() in (
+            "1", "true", "yes", "on")
+        return ["git", "push"] + (["-u"] if upstream else []) + [remote, branch]
     if name == "git_create_pr":
         return ["gh", "pr", "create", "--title", str(args.get("title", "")),
                 "--body", str(args.get("body", ""))]
@@ -3256,10 +3359,27 @@ def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     return _git_auth_hint(result) if name in _REMOTE_GIT_TOOLS else result
 
 
+# What a shell says when the program itself is absent. Matching a bare
+# "not found" anywhere in the output is not enough: GitHub answers
+# "remote: Repository not found." for a missing repository, and this function
+# *replaces* the result rather than adding to it -- so that reported git as
+# uninstalled and threw the real push error away. Seen live.
+_MISSING_BINARY_MARKERS = (
+    "status 127",
+    "command not found",
+    "is not recognized as an internal or external command",
+    "no such file or directory",
+)
+
+
 def _missing_binary_hint(program: str, result: str) -> str:
-    """Turn a bare 'not found' / status 127 into an actionable message. Without this a
+    """Turn a genuinely absent program into an actionable message. Without this a
     missing binary inside the sandbox surfaced as an opaque `sh: 1: git: not found`."""
-    if program and ("not found" in result or "status 127" in result):
+    if not program:
+        return result
+    lowered = (result or "").lower()
+    named = f"{program.lower()}: not found"          # sh: 1: git: not found
+    if named in lowered or any(m in lowered for m in _MISSING_BINARY_MARKERS):
         return (f"'{program}' is not available where this tool ran. "
                 f"Install {program}, or set host=1 for this tool if it needs host binaries.")
     return result
@@ -7061,13 +7181,23 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     elif mode == "mcp":
         command = f"{spec['mcp_server']}:{spec['mcp_tool']}"
 
-    remote_git_approved = name == "git_push" and _remote_git_grant
+    # What this push would actually do, in the words the user will read. The
+    # prompt is the only description of the action they get -- and on approval
+    # the loop asks the MODEL to "retry the EXACT same tool call", so a model
+    # that reads the prompt takes its wording as the call. A prompt hardcoded
+    # to "origin HEAD" therefore did not merely mislabel a push to another
+    # remote, it steered the retry to origin. Observed live.
+    push_target = _git_push_target(args) if name == "git_push" else ""
+    # The grant is that exact target, not a bare yes: approving a push to
+    # staging must not also authorise one to production.
+    remote_git_approved = (name == "git_push"
+                           and _remote_git_grant == push_target)
     if name == "git_push" and not remote_git_approved:
         return request_escalation(
             target_mode="edit",
-            paths=["origin HEAD"],
+            paths=[push_target],
             change_type="git_remote_write",
-            reason="Push the current branch to origin? This changes a remote repository.",
+            reason=(f"Push to {push_target}? This changes a remote repository."),
         )
     if remote_git_approved:
         _remote_git_grant = False
