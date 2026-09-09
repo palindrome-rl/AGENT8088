@@ -187,3 +187,51 @@ def test_unambiguous_causes_still_rule_out_auth(engine):
     """A missing remote or a dead host really is not about credentials."""
     for text in (MISSING_REMOTE, "fatal: unable to access: Could not resolve host: nope\n"):
         assert "not an authentication problem" in engine._git_auth_hint(text).lower()
+
+
+# --- a missing binary is not the same as a missing repository --------------
+
+GH_REPO_MISSING = (
+    "remote: Repository not found.\n"
+    "fatal: repository 'https://github.com/x/y.git/' not found\n"
+    "Command exited with status 128."
+)
+SHELL_NO_GIT = "sh: 1: git: not found\nCommand exited with status 127."
+
+
+def test_a_missing_repository_is_not_reported_as_a_missing_binary(engine):
+    """Found live: this replaced the real error, it did not merely add to it.
+
+    GitHub's "Repository not found" contains the substring "not found", so the
+    missing-binary hint claimed git was not installed and threw the actual
+    error away. The agent then told the user its sandbox lacked git and gave
+    up, with the push failure never surfacing.
+    """
+    out = engine._missing_binary_hint("git", GH_REPO_MISSING)
+    assert "is not available where this tool ran" not in out, (
+        "a missing repository was reported as a missing git binary")
+    assert "Repository not found" in out, "the real error was discarded"
+
+
+def test_a_genuinely_missing_binary_is_still_explained(engine):
+    out = engine._missing_binary_hint("git", SHELL_NO_GIT)
+    assert "is not available where this tool ran" in out
+    assert "host=1" in out
+
+
+def test_status_127_alone_still_counts(engine):
+    out = engine._missing_binary_hint("soffice", "Command exited with status 127.")
+    assert "is not available where this tool ran" in out
+
+
+def test_the_prompt_reads_as_english_not_argv(engine):
+    """A consent prompt is read by a human under time pressure.
+
+    "Push to -u origin master?" leaks a git flag into the sentence. The target
+    is origin master; setting upstream is a property of the push, so it is
+    said as one.
+    """
+    text = _escalation_for(engine, {"set_upstream": True, "branch": "main"})
+    assert "-u origin" not in text, f"argv leaked into the prompt: {text[:200]}"
+    assert "origin main" in text
+    assert "upstream" in text.lower(), "the extra effect must still be disclosed"

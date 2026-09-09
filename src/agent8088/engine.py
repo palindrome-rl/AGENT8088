@@ -3287,7 +3287,12 @@ def _git_push_target(args: dict) -> str:
         argv = _structured_tool_argv("git_push", args or {})
     except ValueError:
         return "origin HEAD"
-    return " ".join(argv[2:])
+    flags = [a for a in argv[2:] if a.startswith("-")]
+    target = " ".join(a for a in argv[2:] if not a.startswith("-"))
+    # "-u" is a property of the push, not part of where it goes. Left in the
+    # target it produced "Push to -u origin master?" -- argv leaking into a
+    # sentence a human reads before consenting.
+    return target + (" (and set it as upstream)" if "-u" in flags else "")
 
 
 def _structured_tool_argv(name: str, args: dict):
@@ -3354,10 +3359,27 @@ def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     return _git_auth_hint(result) if name in _REMOTE_GIT_TOOLS else result
 
 
+# What a shell says when the program itself is absent. Matching a bare
+# "not found" anywhere in the output is not enough: GitHub answers
+# "remote: Repository not found." for a missing repository, and this function
+# *replaces* the result rather than adding to it -- so that reported git as
+# uninstalled and threw the real push error away. Seen live.
+_MISSING_BINARY_MARKERS = (
+    "status 127",
+    "command not found",
+    "is not recognized as an internal or external command",
+    "no such file or directory",
+)
+
+
 def _missing_binary_hint(program: str, result: str) -> str:
-    """Turn a bare 'not found' / status 127 into an actionable message. Without this a
+    """Turn a genuinely absent program into an actionable message. Without this a
     missing binary inside the sandbox surfaced as an opaque `sh: 1: git: not found`."""
-    if program and ("not found" in result or "status 127" in result):
+    if not program:
+        return result
+    lowered = (result or "").lower()
+    named = f"{program.lower()}: not found"          # sh: 1: git: not found
+    if named in lowered or any(m in lowered for m in _MISSING_BINARY_MARKERS):
         return (f"'{program}' is not available where this tool ran. "
                 f"Install {program}, or set host=1 for this tool if it needs host binaries.")
     return result
