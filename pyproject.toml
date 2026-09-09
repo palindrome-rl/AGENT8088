@@ -84,6 +84,17 @@ dev = ["pytest>=7.0.0,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.8,<1", "pip-audi
 # `pip install agent8088[litellm]` stays valid instead of erroring on an
 # unknown extra.
 litellm = ["litellm>=1,<2"]
+# OCR for models without vision. Optional because it is the one part of the
+# runtime a text-only setup never touches, and because onnxruntime has no wheel
+# on every platform this project otherwise installs on -- the installers add it
+# best-effort, and ocr.available() reports the gap instead of raising.
+#
+# rapidocr runs on ONNX Runtime rather than torch or paddle, and pypdfium2
+# rasterizes scanned PDF pages (pypdf extracts text but cannot render). Both
+# are permissively licensed with no system binary, which is why they are here
+# and Surya (restricted weights, needs vllm or llama.cpp alongside), PyMuPDF
+# (AGPL) and Tesseract (per-OS system binary) are not.
+ocr = ["rapidocr>=3,<4", "onnxruntime>=1.17,<2", "pypdfium2>=4,<6"]
 
 [project.scripts]
 agent8088 = "agent8088.cli:main"

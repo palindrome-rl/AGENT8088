@@ -12,6 +12,8 @@ import importlib
 import json
 import sys
 
+import types
+
 import pytest
 
 
@@ -125,11 +127,50 @@ def test_cmd_image_resolves_outside_allowed_paths_by_default(cli, engine, tmp_pa
     def reached_the_model(*a, **k):
         raise RuntimeError("reached the model call — path resolution succeeded")
     monkeypatch.setattr(cli.A, "create_completion", reached_the_model)
+    # Pin the multimodal route: /image now asks the active model whether it can
+    # see, and the test's default model is uncatalogued (so, no vision), which
+    # would send this down the OCR branch and test path resolution there
+    # instead. That branch gets its own test below.
+    monkeypatch.setattr(cli, "_vision_capable", lambda: True)
 
     cli.cmd_image(str(f))
     out = capsys.readouterr().out
     assert "Path not allowed" not in out
     assert "reached the model call" in out
+
+
+def test_cmd_image_ocr_route_also_resolves_outside_allowed_paths(cli, engine, tmp_path, monkeypatch, capsys):
+    """The OCR branch must be no more restrictive about paths than the
+    multimodal one above -- both are the user typing a path by hand."""
+    f = tmp_path / "photo.png"
+    f.write_bytes(b"\x89PNG\r\n\x1a\n")
+    engine.ALLOWED_PATHS = [tmp_path / "elsewhere"]  # deliberately excludes f
+
+    def reached_the_model(*a, **k):
+        raise RuntimeError("reached the model call — path resolution succeeded")
+    monkeypatch.setattr(cli.A, "create_completion", reached_the_model)
+    monkeypatch.setattr(cli, "_vision_capable", lambda: False)
+    monkeypatch.setattr(cli, "_ocr_module", lambda: types.SimpleNamespace(
+        text_for=lambda path, **k: "TRANSCRIBED"))
+
+    cli.cmd_image(str(f))
+    out = capsys.readouterr().out
+    assert "Path not allowed" not in out
+    assert "reached the model call" in out
+
+
+def test_cmd_image_error_keeps_the_pip_extra_readable(cli, engine, tmp_path, monkeypatch, capsys):
+    """rich reads `[ocr]` as a style tag and swallows it, which turned the one
+    actionable part of the message into `pip install -e "."`."""
+    f = tmp_path / "photo.png"
+    f.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr(cli, "_vision_capable", lambda: False)
+    monkeypatch.setattr(cli, "_ocr_module", lambda: types.SimpleNamespace(
+        text_for=lambda path, **k: (_ for _ in ()).throw(
+            ValueError('OCR is not installed. Install the extra with: pip install -e ".[ocr]"'))))
+
+    cli.cmd_image(str(f))
+    assert '.[ocr]' in capsys.readouterr().out
 
 
 # --- _handle_pasted_file: document branch -----------------------------------

@@ -62,6 +62,11 @@ uvicorn[standard]>=0.34.0,<1
 #   pip install -e ".[gateway]"   Slack, Discord, WhatsApp, Telegram, email
 #   pip install -e ".[dev]"       pytest, pytest-asyncio, ruff, pip-audit
 #   pip install -e ".[litellm]"   alias — litellm is already a core dep
+#   pip install -e ".[ocr]"       rapidocr + onnxruntime + pypdfium2, so models
+#                                 without vision can still read attached images
+#                                 and scanned PDFs. Installed best-effort by the
+#                                 installers; absent, ocr.available() is False
+#                                 and attachments report why.
 #
 # browser and search are aliases for packages that are already core, kept so the
 # installers' existing steps and any documented command keep working. They were
@@ -76,3 +81,4 @@ uvicorn[standard]>=0.34.0,<1
 #   dev:     pytest>=7.0.0,<10      pytest-asyncio>=0.23,<2
 #            ruff>=0.8,<1            pip-audit>=2.7,<3
 #   litellm: litellm>=1,<2
+#   ocr:     rapidocr>=3,<4         onnxruntime>=1.17,<2   pypdfium2>=4,<6

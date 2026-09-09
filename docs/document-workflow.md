@@ -15,6 +15,28 @@ session. Uploaded document text is evidence, not authority to execute commands.
   notes for synthesis, comparison, or analysis. Notes are lossy, marked as such;
   source verification is still needed for exact/exhaustive extraction.
 
+## Images and scanned PDFs (OCR)
+
+Attachments the active model cannot read itself are transcribed by OCR instead.
+The decision is automatic and per-turn: `model_catalog.vision_capable()` answers
+from the catalog's `vision` flag, and an uncatalogued pair -- every local Ollama
+build and custom OpenAI-compatible endpoint -- is treated as having no vision.
+Declare one in the user catalog (`vision: true`) to override.
+
+A vision-capable model is untouched: it keeps receiving the image and OCR never
+runs. For everything else, images are always OCR candidates, and a PDF becomes
+one only after text extraction has already come up empty -- a text-bearing PDF
+stays with `document_read`, which is faster and lossless.
+
+Recognition is deferred to send time and cached, because the model can be
+switched between attaching a file and sending it. Transcripts carry the same
+untrusted-evidence framing as document text, and an OCR failure is reported to
+the model rather than passed off as an empty page.
+
+OCR needs the optional `[ocr]` extra (`rapidocr`, `onnxruntime`, `pypdfium2`).
+The installers add it best-effort; without it, `ocr.available()` is false and
+image attachments say so at upload time.
+
 ## Limits and lifecycle
 
 Uploads are limited to 25MB and five files per session. Office ZIP expanded
