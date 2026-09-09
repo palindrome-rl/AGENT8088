@@ -7293,8 +7293,18 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                     # retry that would fail identically.
                     def learned(tokens):
                         _document_budget[0] = max(_document_budget[0], tokens)
-                    evidence = _document_evidence(call_document, _document_budget[0],
-                                                  ceiling=completion, remember=learned)
+                    try:
+                        evidence = _document_evidence(call_document, _document_budget[0],
+                                                      ceiling=completion, remember=learned)
+                    except Exception as chunk_error:
+                        # A timeout here is deterministic: the same request needs
+                        # the same generation time, so the retry the caller would
+                        # otherwise attempt cannot succeed. It produced a run that
+                        # sat at "0/N chunks complete" indefinitely with no error.
+                        if _is_timeout_error(chunk_error):
+                            raise ValueError(_document_timeout_message(
+                                _document_budget[0], TIMEOUT_SECONDS)) from None
+                        raise
                     check_document()
                     return evidence
                 return document_access.process(read_target, str(args.get("query") or ""),
@@ -8305,6 +8315,39 @@ def _is_system_leak(answer: str) -> bool:
     if hits >= 2:
         return True
     return len(answer) >= 200 and answer.strip()[:200] in BASE_SYSTEM_PROMPT
+
+
+_TIMEOUT_SIGNATURES = ("timeout", "timed out")
+
+
+def _is_timeout_error(error) -> bool:
+    """Whether a failed completion was a timeout rather than a real refusal.
+
+    Type name as well as message: providers wrap timeouts in their own classes
+    (openai.APITimeoutError, httpx.ReadTimeout), and the harness must not
+    import every one of them to recognise the case.
+    """
+    if isinstance(error, TimeoutError):
+        return True
+    haystack = f"{type(error).__name__} {error}".lower()
+    return any(signature in haystack for signature in _TIMEOUT_SIGNATURES)
+
+
+def _document_timeout_message(output_tokens: int, timeout_seconds: int) -> str:
+    """Why a document chunk could not be read, with the arithmetic behind it.
+
+    Deliberately not a retry suggestion. A timeout here is deterministic --
+    the same request needs the same generation time -- so the previous
+    behaviour of retrying silently could never succeed, and left the UI
+    reporting progress it was not making.
+    """
+    return (f"This chunk could not be read in time. Each chunk may generate up to "
+            f"{output_tokens} tokens, and the request is cut off after "
+            f"{timeout_seconds}s ({{}}), so a slower model never finishes one. "
+            "Raise timeout_seconds in your config to cover the generation, use a "
+            "faster or non-reasoning model for documents, or ask a focused question "
+            "so document_read can search instead of processing every chunk."
+            ).format("timeout_seconds")
 
 
 _FALLBACK_EXCERPT_CHARS = 1800

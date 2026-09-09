@@ -6,7 +6,7 @@ and keyed by resolved file identity; it is never an authorization mechanism.
 from collections import OrderedDict
 from pathlib import Path
 from threading import RLock
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import hashlib
 import json
 import re
@@ -28,6 +28,17 @@ CHUNK_CHARS = 64000
 # slice we hand back to the main turn.
 MAX_PROCESS_CHUNK_CHARS = 200000
 PROCESS_CONCURRENCY = 4
+# Wall-clock ceiling for one `process` call. Completed chunks are checkpointed,
+# so hitting this loses no finished work -- it bounds how long a document can
+# hold a turn before the user is told what is happening.
+PROCESS_DEADLINE_SECONDS = 600
+
+
+def _deadline_message(deadline_seconds) -> str:
+    return (f"Document processing stopped at its {int(deadline_seconds)}s budget with "
+            "chunks still unread. Completed chunks are saved and resume if you repeat "
+            "the same task, but a document this large needs a faster model, a larger "
+            "timeout_seconds, or a focused question instead of whole-document processing.")
 _jobs = OrderedDict()
 
 
@@ -143,7 +154,8 @@ def discard(path):
 
 
 def process(path, task, complete, *, chunk_chars=24000, progress=None, check=None,
-            identity="", max_chunks=48, concurrency=PROCESS_CONCURRENCY):
+            identity="", max_chunks=48, concurrency=PROCESS_CONCURRENCY,
+            deadline_seconds=PROCESS_DEADLINE_SECONDS):
     """Process every chunk against a task; checkpoint only completed evidence.
 
     The caller supplies a budgeted, tool-free completion function. This is
@@ -184,8 +196,8 @@ def process(path, task, complete, *, chunk_chars=24000, progress=None, check=Non
     def extract_chunk(index):
         if check:
             check()
-        if time.monotonic() - started > 600:
-            raise ValueError("Document processing paused at its 10-minute budget. Repeat the same task to resume completed chunks.")
+        if time.monotonic() - started > deadline_seconds:
+            raise ValueError(_deadline_message(deadline_seconds))
         start, end = index * chunk_chars, min(len(text), (index + 1) * chunk_chars)
         # Include the preceding page/slide/sheet label when a chunk starts mid-page.
         markers = list(re.finditer(r"(?m)^## .+$", text[:start]))
@@ -220,7 +232,17 @@ def process(path, task, complete, *, chunk_chars=24000, progress=None, check=Non
                     submitted += 1
                 if progress:
                     progress(f"Processing document: {len(notes)}/{total} chunks complete")
-                notes.append(pending.pop(len(notes)).result())
+                # Wait with a deadline rather than indefinitely. Checking the
+                # budget only when a chunk *started* let chunks already in
+                # flight carry a run minutes past it, which is exactly the case
+                # a slow model produces: the run looked hung, not over budget.
+                remaining = deadline_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise ValueError(_deadline_message(deadline_seconds))
+                try:
+                    notes.append(pending.pop(len(notes)).result(timeout=remaining))
+                except FuturesTimeout:
+                    raise ValueError(_deadline_message(deadline_seconds)) from None
                 save()
         finally:
             # A chunk whose evidence can no longer be committed in order is not
