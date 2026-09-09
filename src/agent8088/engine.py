@@ -6514,17 +6514,30 @@ def schedule_task(action: str = "list", schedule: str = "", task: str = "") -> d
     for line in result.splitlines():
         if _CRON_MARKER not in line:
             continue
-        match = re.match(r"^(\S+(?:\s+\S+){4})\s+", line)
-        task_match = re.search(r"printf '%s\\n'\s+(.+?)\s+\|", line)
-        if not match or not task_match:
-            entries.append({"schedule": "", "task": "", "entry": line})
+        # Extract schedule (first 5 fields) and task (everything until the marker)
+        schedule_match = re.match(r"^(\S+(?:\s+\S+){4})\s+", line)
+        if not schedule_match:
             continue
-        try:
-            parsed = shlex.split(task_match.group(1))
-            scheduled_task = parsed[0] if len(parsed) == 1 else task_match.group(1)
-        except ValueError:
-            scheduled_task = task_match.group(1)
-        entries.append({"schedule": match.group(1), "task": scheduled_task})
+        schedule = schedule_match.group(1)
+        # Remove schedule and extract task. Unix format has "printf '%s\n' TASK | agent8088 #marker"
+        # Windows format has "SCHEDULE TASK #marker"
+        after_schedule = line[schedule_match.end():]
+        marker_idx = after_schedule.find(_CRON_MARKER)
+        if marker_idx < 0:
+            continue
+        task_part = after_schedule[:marker_idx].strip()
+        # Try to parse Unix printf format first
+        unix_match = re.search(r"printf '%s\\n'\s+(.+?)\s+\|", line)
+        if unix_match:
+            try:
+                parsed = shlex.split(unix_match.group(1))
+                scheduled_task = parsed[0] if len(parsed) == 1 else unix_match.group(1)
+            except ValueError:
+                scheduled_task = unix_match.group(1)
+        else:
+            # Fall back to Windows format: just the task text
+            scheduled_task = task_part
+        entries.append({"schedule": schedule, "task": scheduled_task})
     return {"ok": not result.startswith(("Cron unavailable", "Windows scheduler error")),
             "detail": "" if entries else result, "entries": entries}
 
