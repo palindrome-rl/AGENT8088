@@ -12,6 +12,28 @@ def test_browser_workflow_uses_one_session():
     assert "each call starts a fresh browser session" in prompt
 
 
+def test_download_requests_route_to_write_file_source_url():
+    prompt = render_tool_docs({
+        "browse_page": {"args": ["url", "task"], "description": "Browse a page."},
+        "write_file": {"args": ["filename", "content", "source_url"], "description": "Write a file."},
+    })
+
+    assert "MUST call write_file with source_url" in prompt
+
+
+def test_browser_system_message_treats_dead_host_as_terminal():
+    """The browser sub-agent must stop after repeated navigation failures to
+    the same host instead of wandering to other sites -- live regression:
+    a browse_page on a connection-closed host ended up 'visiting
+    mtalk.google.com' for the remaining steps."""
+    import inspect
+    from agent8088 import engine
+
+    src = inspect.getsource(engine._run_browser_agent)
+    assert "dead or unreachable" in src
+    assert "stop the task" in src
+
+
 def test_browser_receives_the_complete_user_goal(engine, monkeypatch):
     responses = iter((
         '✿FUNCTION✿: browse_page ✿ARGS✿: {"url":"https://example.com",'

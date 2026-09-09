@@ -11,7 +11,7 @@ import inspect
 import pytest
 
 from agent8088 import web_search
-from agent8088.web_search import DdgsProvider, SearchFailure, SearchSuccess
+from agent8088.web_search import DdgsProvider, SearchFailure, SearchSuccess, SearxngProvider
 
 
 class FakeCtx:
@@ -430,3 +430,60 @@ def test_snippets_are_truncated(monkeypatch):
     _stub(monkeypatch, lambda q, l, *, backend, timeout, proxy=None, region=None: raw)
     out = DdgsProvider().search("q", 5, FakeCtx())
     assert len(out.results[0].snippet) <= web_search.MAX_SNIPPET_CHARS
+
+
+# --------------------------------------------------------------------------
+# SearXNG image-category routing
+# --------------------------------------------------------------------------
+def test_searxng_image_queries_use_the_images_category(monkeypatch):
+    """'download me a picture of X' style queries must hit SearXNG's images
+    category so results are actual image URLs, not article pages."""
+    seen = {}
+
+    def fake_get_json(url, timeout=None):
+        seen["url"] = url
+        return {"results": [{"title": "Ferrari 488", "url": "https://img.test/488.jpg",
+                             "content": "img", "score": 2}]}
+
+    monkeypatch.setattr(web_search, "_http_get_json", fake_get_json)
+    ctx = FakeCtx(config={"search_base_url": "http://127.0.0.1:8899/search?q="})
+    out = SearxngProvider().search("inter vs real madrid 2026", 5, ctx, images=True)
+    assert "categories=images" in seen["url"]
+    assert isinstance(out, SearchSuccess)
+
+
+def test_searxng_ordinary_queries_stay_general(monkeypatch):
+    seen = {}
+
+    def fake_get_json(url, timeout=None):
+        seen["url"] = url
+        return {"results": []}
+
+    monkeypatch.setattr(web_search, "_http_get_json", fake_get_json)
+    ctx = FakeCtx(config={"search_base_url": "http://127.0.0.1:8899/search?q="})
+    SearxngProvider().search("ferrari 488 specs", 5, ctx)
+    assert "categories=images" not in seen["url"]
+
+
+def test_run_search_passes_images_flag_to_provider(monkeypatch):
+    """The engine's images=true arg must thread through run_search to the
+    provider -- keyword-in-query matching alone already missed a live case
+    where the model reformulated 'download me the picture of X' into a
+    keyword-only query."""
+    got = {}
+
+    class FakeProvider:
+        name = "searxng"
+
+        def is_available(self, ctx):
+            return True
+
+        def search(self, query, limit, ctx, images=False):
+            got["images"] = images
+            return SearchSuccess([web_search.SearchResult("t", "https://a.test", "s")], "searxng")
+
+    ctx = FakeCtx(config={})
+    out = web_search.run_search("inter vs real madrid", 5,
+                                web_search.Registry([FakeProvider()]), {}, ctx, images=True)
+    assert got["images"] is True
+    assert "https://a.test" in out
