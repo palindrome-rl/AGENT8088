@@ -158,7 +158,8 @@ sensitive-file floor still applies unconditionally.
 
 | Command | Does |
 |---|---|
-| `/tools` | List tools with mode, args, description |
+| `/tools [name]` | List tools, or describe one exact tool without executing it |
+| `/tool describe <name>` | Describe one tool and its argument schema without executing it |
 | `/capabilities` | Full self-report: tools, MCP servers, skills, subagents, limits, active guardrails |
 | `/tool <name> <json>` | Invoke one tool directly |
 | `/plan [task]` | Enter plan mode: propose a plan, approve it, then it runs |
