@@ -13,7 +13,7 @@ except ImportError:
     pass
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088 import (cli_anything, documents, efficiency, local_models,
@@ -266,12 +266,19 @@ def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
 # no global read). This lets a project directory own its full config (provider,
 # keys, token limits) without polluting the global install, and /limits
 # provider writes stay local when CWD config is active.
+#
+# Inside an activated Python venv, the CWD config is ALWAYS preferred, even
+# before the file exists yet -- a project's venv should own its own config.txt
+# (created there by --setup) rather than silently falling back to the global
+# install's config just because nothing has been written to the project
+# directory yet.
+_in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 _cwd_config = Path.cwd() / "config.txt"
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
 if os.environ.get("AGENT8088_CONFIG"):
     CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
-elif _cwd_config.exists():
+elif _cwd_config.exists() or _in_venv:
     CONFIG_PATH = _cwd_config
 elif _user_config.exists():
     CONFIG_PATH = _user_config
@@ -2401,9 +2408,30 @@ def build_tools_def(tool_specs: dict) -> list:
     return result
 
 
+def _ground_execute_shell_description(specs: dict) -> None:
+    """Append real OS/shell/cwd/python facts to execute_shell's description.
+
+    Without this, a weak model has no signal about which shell dialect or
+    Python interpreter actually exists here and will guess (python3, a
+    Linux-style workspace path) — see the failed GSMArena image-download
+    session this was written to fix."""
+    spec = specs.get("execute_shell")
+    if not spec:
+        return
+    shell_kind = "PowerShell/cmd.exe" if sys.platform == "win32" else "a POSIX shell (bash/sh)"
+    check_cmd = "where <name>" if sys.platform == "win32" else "command -v <name>"
+    spec["description"] += (
+        f" Environment: {sys.platform}, using {shell_kind}. Working directory: "
+        f"{SHELL_CWD}. If you need Python, use \"{sys.executable}\" -- do not assume "
+        f"`python3` is on PATH. Before guessing any interpreter or command name, "
+        f"check it exists first with `{check_cmd}`."
+    )
+
+
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
 MCP_RUNTIME = MCPRuntime(PROJECT_ROOT)
 TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
+_ground_execute_shell_description(TOOL_SPECS)
 TOOLS_DEF = build_tools_def(TOOL_SPECS)
 TOOL_NAMES = set(TOOL_SPECS.keys())
 TOOL_REQUIRED_PARAMS = {name: required_params(spec) for name, spec in TOOL_SPECS.items()}
@@ -2538,6 +2566,7 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
     if "browse_page" in specs:
         lines.append("- A multi-step website workflow MUST use one browse_page call whose task contains the entire end-to-end workflow. Do not split login, cart, checkout, or navigation across browse_page calls: each call starts a fresh browser session.")
+        lines.append("- A request to save/download a file, image, or document from the web MUST call write_file with source_url when the URL is known. Do NOT use browse_page or execute_shell for a plain download: browse_page burns a full browser session on one file, and shell curl guesses a wrong interpreter/path. Only use browse_page when the asset is behind interaction or login, or execute_shell when write_file's fetch failed and the shell can do better.")
     if "convert_document" in specs:
         lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
     if "create_document" in specs:
@@ -2911,6 +2940,24 @@ def _from_container_path(raw_path: str) -> str:
     return str(ARTIFACTS_ROOT / relative)
 
 
+def _path_is_allowed(resolved: Path) -> bool:
+    """True when `resolved` falls inside an ALLOWED_PATHS base. Both sides are
+    normalized with os.path.normcase so the comparison survives the Windows
+    short-form (8.3 "ADMINI~1") vs long-form ("Administrator") mismatch:
+    tempfile and env-var paths come in either shape, and Path.resolve() only
+    normalizes the side it touches."""
+    import os
+
+    if not ALLOWED_PATHS:
+        return True
+    norm = os.path.normcase(str(resolved))
+    for base in ALLOWED_PATHS:
+        base_norm = os.path.normcase(str(Path(str(base)).resolve()))
+        if norm == base_norm or norm.startswith(base_norm.rstrip("\\/") + os.sep):
+            return True
+    return False
+
+
 def resolve_user_path(raw_path: str) -> Path:
     p = Path(_from_container_path(raw_path)).expanduser()
     if not p.is_absolute():
@@ -2918,7 +2965,7 @@ def resolve_user_path(raw_path: str) -> Path:
         artifact_path = ARTIFACTS_ROOT / p
         p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
     resolved = p.resolve()
-    if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
+    if not _path_is_allowed(resolved):
         raise ValueError(f"Path not allowed: {resolved}")
     return resolved
 
@@ -2971,7 +3018,7 @@ def resolve_write_path(raw_path: str) -> Path:
             resolved = project_path
         else:
             resolved = (ARTIFACTS_ROOT / p).resolve()
-    if ALLOWED_PATHS and not any(resolved == base or base in resolved.parents for base in ALLOWED_PATHS):
+    if not _path_is_allowed(resolved):
         raise ValueError(f"Path not allowed: {resolved}")
     return resolved
 
@@ -4316,6 +4363,66 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     return _wrap_untrusted(_strip_special_tokens(result), url)
 
 
+def _fetch_url_bytes(url: str) -> tuple:
+    """Fetch binary content from a remote URL with SSRF and redirect validation.
+    Returns (bytes, error, content_type)."""
+    import urllib.error
+    import urllib.request
+
+    blocked = _egress_check(url) or _ssrf_check(url)
+    if blocked:
+        return (None, blocked, None)
+
+    class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, msg, response_headers, new_url):
+            redirect_blocked = _egress_check(new_url) or _ssrf_check(new_url)
+            if redirect_blocked:
+                raise urllib.error.URLError(redirect_blocked)
+            return super().redirect_request(
+                request, fp, code, msg, response_headers, new_url)
+
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; Agent8088)"},
+    )
+    opener = urllib.request.build_opener(SafeRedirectHandler())
+    try:
+        with opener.open(request, timeout=25) as response:
+            raw = response.read(MAX_HTTP_BYTES + 1)
+            content_type = response.headers.get("Content-Type") or ""
+    except urllib.error.HTTPError as exc:
+        return (None, f"HTTP {exc.code}: {exc.reason}", None)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return (None, f"Fetch failed: {exc}", None)
+
+    if len(raw) > MAX_HTTP_BYTES:
+        return (None, f"Remote file exceeded the {MAX_HTTP_BYTES}-byte limit.", None)
+    return (raw, None, content_type.split(";")[0].strip().lower())
+
+
+# Common Content-Type -> extension for assets saved without one in the URL.
+_CONTENT_TYPE_EXT = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "image/svg+xml": ".svg", "image/bmp": ".bmp",
+    "application/pdf": ".pdf", "text/html": ".html", "text/plain": ".txt",
+}
+
+
+def _target_with_derived_extension(target, source_url: str, content_type: str | None):
+    """An extensionless save target gets an extension: from the URL's own
+    path first (a site that serves /pic.jpg knows its name), else from the
+    response Content-Type. Neither known: leave the name as-is."""
+    from urllib.parse import urlparse
+
+    url_ext = PurePosixPath(urlparse(source_url).path).suffix
+    if url_ext and len(url_ext) <= 5 and url_ext.isascii():
+        return target.with_name(target.name + url_ext)
+    ext = _CONTENT_TYPE_EXT.get((content_type or "").split(";")[0].strip().lower())
+    if ext:
+        return target.with_name(target.name + ext)
+    return target
+
+
 # ---------------------------------------------------------------------------
 # Browser — real page rendering via Playwright (optional dependency)
 # ---------------------------------------------------------------------------
@@ -5046,7 +5153,11 @@ async def _run_browser_agent(url: str, task: str,
                 "browser state. After navigation, inspect the new state before "
                 "acting. After an input action reports success, submit the form "
                 "once even if a later DOM summary omits the value. Retry typing "
-                "only when the site displays a validation error."
+                "only when the site displays a validation error. If navigation "
+                "fails twice in a row to the same host (connection closed, DNS "
+                "or timeout errors), that host is dead or unreachable for this "
+                "session -- stop the task immediately and report the failure; "
+                "do not navigate to other sites to compensate."
             ),
             # browser-use defaults use_judge=True: after every completed task
             # it runs one more full LLM call to self-critique the result. Its
@@ -7049,8 +7160,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         query = str(args.get("query") or "").strip()
         if not query:
             return "Error: web_search requires 'query'."
-        # Date-qualify BEFORE the guards: they must inspect what actually
-        # leaves the machine, not the string the model happened to produce.
+        # images=true: the user wants pictures, not articles about the topic
+        # -- thread it to backends that support an image category. Also set
+        # when the query itself says "picture of X", so a model that dropped
+        # the keyword while reformulating still gets image results.
+        wants_images = (str(args.get("images") or "").strip().lower()
+                        in ("1", "true", "yes")) or _query_wants_images(query)
         query = _augment_relative_time_query(query)
         sensitive = _web_search_query_guard(query)
         if sensitive:
@@ -7092,17 +7207,19 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             _audit("tool_call", tool=name, mode=mode, decision="allowed",
                    detail=query[:200], change_type="network_fallback")
             return _frame_search_results(web_search.run_search(
-                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
+                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
+                images=wants_images))
 
         _audit_extra = {"reason": "ddgs_no_prompt"} if ddgs_only and not local_no_prompt else {}
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=query[:200], **_audit_extra)
         if not local_no_prompt:
             return _frame_search_results(web_search.run_search(
-                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context))
+                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
+                images=wants_images))
         outcome = web_search.run_search(
             query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
-            return_failures=True)
+            return_failures=True, images=wants_images)
         # Embedders may supply an older custom registry implementation. A plain
         # string is still a valid result; it simply cannot request this fallback.
         if not isinstance(outcome, tuple):
@@ -7457,6 +7574,27 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "write_text":
         global _last_write_diff
         content_arg = spec.get("content_arg") or "content"
+        if args.get("source_url") and not args.get(content_arg):
+            source_url = str(args.get("source_url")).strip()
+            fetched, fetch_error, fetch_content_type = _fetch_url_bytes(source_url)
+            if fetch_error:
+                return fetch_error
+            _turn_writes += 1
+            # A bare filename ("download as image") would otherwise save
+            # as "image" with no extension -- derive one from the URL's
+            # own path, else the response Content-Type.
+            if not target.suffix:
+                target = _target_with_derived_extension(
+                    target, source_url, fetch_content_type)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(fetched)
+            _last_write_diff = None  # binary output -- a text diff would be noise
+            result = f"Wrote {len(fetched)} bytes to {target} (fetched from {source_url})"
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path if you meant to "
+                           f"edit the project's own file.")
+            return result
         content = _structured_text_argument(args.get(content_arg, ""))
         _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -8821,6 +8959,15 @@ _MONTH_GRANULARITY = re.compile(
     r"as\s+of\s+now)\b", re.IGNORECASE)
 
 _EXPLICIT_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _query_wants_images(query: str) -> bool:
+    """The user's intent is pictures; the model's reformulated query may drop
+    the keyword, so the engine also checks the (possibly rewritten) query
+    string -- and the images=true arg exists for exactly that miss."""
+    lowered = (query or "").lower()
+    return any(w in lowered for w in (
+        "picture", "photo", "image", "logo", "wallpaper", "screenshot"))
 
 
 def _augment_relative_time_query(query: str, now=None) -> str:

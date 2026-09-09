@@ -158,8 +158,7 @@ sensitive-file floor still applies unconditionally.
 
 | Command | Does |
 |---|---|
-| `/tools [name]` | List tools, or describe one exact tool without executing it |
-| `/tool describe <name>` | Describe one tool and its argument schema without executing it |
+| `/tools` | List tools with mode, args, description |
 | `/capabilities` | Full self-report: tools, MCP servers, skills, subagents, limits, active guardrails |
 | `/tool <name> <json>` | Invoke one tool directly |
 | `/plan [task]` | Enter plan mode: propose a plan, approve it, then it runs |
@@ -203,6 +202,9 @@ sensitive-file floor still applies unconditionally.
 | `/limits subagent <name> <turns>` | Per-profile sub-agent round cap |
 | `/limits tool <name> <seconds>` | Per-tool timeout |
 | `/limits provider <name> <key> <value>` | Per-provider token limit (`context_window` or `max_completion_tokens`) |
+| `/schedule list` | Show all scheduled recurring tasks (displays: #, cron schedule, task text) |
+| `/schedule add <cron> <task>` | Add a recurring task; cron is 5 fields (minute hour day month weekday), e.g. `/schedule add "0 9 * * *" check disk space` |
+| `/schedule remove <index-or-task>` | Remove by the # from `/schedule list`, or by exact task text |
 | `/config` | Active config + file path |
 | `/capabilities` | What the agent can do and which guardrails are in force |
 | `/doctor [--fix]` | Environment health check; `--fix` repairs a broken web-search install |

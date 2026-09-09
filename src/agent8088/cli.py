@@ -2019,7 +2019,7 @@ COMMAND_SPECS = (
     ("sandbox", "/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation", ()),
     ("status", "/status", "Show model, context, tool, skill, and session status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
-    ("local", "/local [check|list|pull <name>|remove <name>]", "Probe this machine's hardware and recommend local Ollama models, or list/pull/remove installed ones", ()),
+    ("local", "/local [check|list|available [query]|pull <name>|remove <name>]", "Probe hardware, show installed Ollama models or browse pullable ones", ()),
     ("dump", "/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report", ()),
     ("search", "/search [status|use|setup|stop]", "Inspect and configure web-search backends", ()),
     ("mode", "/mode [readonly|full-auto]", "Show or set the permission mode (edit is an alias for full-auto)", ()),
@@ -3285,30 +3285,33 @@ def _cmd_local_check():
     sys_t.add_row("Architecture", hw.architecture or "unknown")
     ram_color = "green" if hw.ram_total_gb >= 32 else "yellow" if hw.ram_total_gb >= 16 else "red"
     sys_t.add_row("RAM", f"[{ram_color}]{hw.ram_free_gb:.1f} GB free / {hw.ram_total_gb:.1f} GB total[/{ram_color}]")
+    sys_t.add_row("Backend", A.local_models.backend_label(hw))
     if hw.gpu_name:
-        sys_t.add_row("GPU", f"[green]{hw.gpu_name} (dedicated)[/green]")
-        sys_t.add_row("VRAM", f"{hw.vram_free_gb:.1f} GB free / {hw.vram_total_gb:.1f} GB total")
+        tag = " (dedicated)" if hw.vram_total_gb is not None else ""
+        sys_t.add_row("GPU", f"[green]{hw.gpu_name}{tag}[/green]")
+        if hw.vram_total_gb is not None:
+            free = f"{hw.vram_free_gb:.1f} GB free / " if hw.vram_free_gb is not None else ""
+            sys_t.add_row("VRAM", f"{free}{hw.vram_total_gb:.1f} GB total")
+        else:
+            # integrated GPU shares system RAM -- display it, but scoring
+            # still budgets on free RAM (the aperture figure is untrustworthy)
+            sys_t.add_row("VRAM", f"[yellow]{hw.ram_total_gb:.0f} GB shared (Integrated)[/yellow]")
     else:
-        sys_t.add_row("GPU", "[yellow]none detected (NVIDIA only, via nvidia-smi)[/yellow]")
+        sys_t.add_row("GPU", "[yellow]none detected[/yellow]")
         sys_t.add_row("VRAM", "n/a -- local models run on CPU")
+    dedicated = [n for n, kind in (hw.all_gpus or []) if kind == "dedicated"]
+    integrated = [n for n, kind in (hw.all_gpus or []) if kind == "integrated"]
+    if hw.all_gpus is not None:
+        sys_t.add_row("Dedicated GPUs", ", ".join(dedicated) if dedicated else "None")
+        sys_t.add_row("Integrated GPUs", ", ".join(integrated) if integrated else "None")
+    tier_color = {"HIGH": "green", "MEDIUM HIGH": "green", "MEDIUM LOW": "yellow", "LOW": "red", "ULTRA LOW": "red"}
+    tier = A.local_models.hardware_tier(hw)
+    sys_t.add_row("Hardware Tier", f"[{tier_color[tier]}]{tier}[/{tier_color[tier]}]")
     console.print(sys_t)
     if hw.gpu_name and hw.caveat:
         console.print(f"[dim]Note: {hw.caveat}[/dim]")
 
-    scores = A.local_models.score_models(hw)
-    mt = Table(title="Model Compatibility", box=box.SIMPLE, title_style="bold #00edff",
-               header_style="bold #00edff", border_style="#0077B6")
-    mt.add_column("Model", style="#00edff")
-    mt.add_column("Params", justify="right")
-    mt.add_column("Size", justify="right")
-    mt.add_column("Score", justify="right")
-    mt.add_column("Category")
-    cat_color = {"Compatible": "green", "Marginal": "yellow", "Poor": "red"}
-    for m in scores:
-        color = cat_color[m.category]
-        mt.add_row(m.name, f"{m.params_b}B", f"{m.size_gb:.1f} GB",
-                   f"[{color}]{m.score}/100[/{color}]", f"[{color}]{m.category}[/{color}]")
-    console.print(mt)
+    _print_local_usage()
 
 
 def _cmd_local_list():
@@ -3366,20 +3369,58 @@ def _cmd_local_remove(name: str):
         console.print(f"[red]{exc}[/red]")
 
 
+def _cmd_local_available(query: str):
+    console.print("[dim]Browsing ollama.com catalog...[/dim]")
+    try:
+        hw = A.local_models.probe_hardware()
+        scores = A.local_models.available_models(hw, query=query.strip(), limit=10)
+    except OSError as exc:
+        console.print(f"[red]Couldn't reach ollama.com: {exc}[/red]")
+        return
+    if not scores:
+        console.print("[dim]No matching models found.[/dim]")
+        return
+    mt = Table(title="Models you could pull", box=box.SIMPLE, title_style="bold #00edff",
+               header_style="bold #00edff", border_style="#0077B6")
+    mt.add_column("Model", style="#00edff")
+    mt.add_column("Size", justify="right")
+    mt.add_column("Score", justify="right")
+    mt.add_column("Category")
+    cat_color = {"Compatible": "green", "Marginal": "yellow", "Poor": "red"}
+    for m in scores:
+        color = cat_color[m.category]
+        mt.add_row(m.name, f"{m.size_gb:.1f} GB",
+                   f"[{color}]{m.score}/100[/{color}]", f"[{color}]{m.category}[/{color}]")
+    console.print(mt)
+    console.print("[dim]Pull with: /local pull <model>[/dim]")
+
+
+def _print_local_usage():
+    console.print("[red]usage:[/red] /local [subcommand]")
+    console.print("  /local                      Probe hardware + score installed models")
+    console.print("  /local available [query]    Browse ollama.com for models you could pull,")
+    console.print("                                scored for THIS machine (query filters, e.g. coder)")
+    console.print("  /local list                 List models already pulled via the Ollama daemon")
+    console.print("  /local pull <name>          Download a model (e.g. /local pull qwen3:0.6b)")
+    console.print("  /local remove <name>        Delete a pulled model")
+
+
 def cmd_local(rest):
     parts = (rest or "").strip().split(None, 1)
-    sub = parts[0].lower() if parts else "check"
+    sub = parts[0].lower() if parts else ""
     arg = parts[1] if len(parts) > 1 else ""
-    if sub in ("check", ""):
+    if sub == "":
         _cmd_local_check()
     elif sub == "list":
         _cmd_local_list()
+    elif sub == "available":
+        _cmd_local_available(arg)
     elif sub == "pull":
         _cmd_local_pull(arg)
     elif sub in ("remove", "rm", "delete"):
         _cmd_local_remove(arg)
     else:
-        console.print("[red]usage:[/red] /local [check|list|pull <name>|remove <name>]")
+        _print_local_usage()
 
 
 def _print_schedule_usage():
@@ -5400,12 +5441,16 @@ def _resolve_config_path():
 
     AGENT8088_CONFIG env > CWD ./config.txt > ~/.agent8088/config.txt >
     %LOCALAPPDATA%/agent8088/config.txt. A CWD ./config.txt is exclusive
-    — setup writes go there, not the global install.
+    — setup writes go there, not the global install. Inside an activated
+    Python venv, the CWD config wins even before it exists yet — a
+    project's venv should own its own config.txt rather than falling back
+    to the global install.
     """
     if os.environ.get("AGENT8088_CONFIG"):
         return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
     cwd_config = Path.cwd() / "config.txt"
-    if cwd_config.exists():
+    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    if cwd_config.exists() or in_venv:
         return cwd_config
     return Path(_agent8088_home() / "config.txt")
 

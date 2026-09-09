@@ -7,10 +7,13 @@ Written with mode `0600`.
 
 **Location**, in resolution order:
 
-1. `$AGENT8088_CONFIG` if set
-2. `~/.agent8088/config.txt`
-3. `%LOCALAPPDATA%/agent8088/config.txt` (Windows)
-4. the packaged `src/agent8088/config.txt` as a last-resort default
+1. `$AGENT8088_CONFIG` env var if set
+2. `./config.txt` in the current directory — **always preferred if running inside an active Python venv** (detected via `VIRTUAL_ENV` env var or `sys.prefix` differing from `sys.base_prefix`), even before the file exists; otherwise only if it already exists
+3. `~/.agent8088/config.txt`
+4. `%LOCALAPPDATA%/agent8088/config.txt` (Windows)
+5. the packaged `src/agent8088/config.txt` as a last-resort default
+
+Running inside an activated project venv means `config.txt` lives in that project directory (created by `--setup`) instead of the global install, so each venv-based project can own its own configuration.
 
 Secrets do **not** belong here — see [API keys](#api-keys-and-the-env-store).
 

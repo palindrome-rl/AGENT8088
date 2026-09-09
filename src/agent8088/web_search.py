@@ -270,11 +270,14 @@ def format_results(success: SearchSuccess, ctx: SearchContext) -> str:
 
 
 def run_search(query: str, limit: int, registry: Registry, config: dict,
-               ctx: SearchContext, *, return_failures: bool = False):
+               ctx: SearchContext, *, return_failures: bool = False,
+               images: bool = False):
     """Search the configured chain, optionally returning retryable failures.
 
     The opt-in failure list lets engine.py distinguish a local SearXNG outage
     from a policy denial without parsing text that may be shown to the model.
+    images=True asks image-capable backends for image results (SearXNG's
+    images category); backends without image support ignore it.
     """
     failed_providers = []
 
@@ -297,7 +300,11 @@ def run_search(query: str, limit: int, registry: Registry, config: dict,
 
     failures = []
     for provider in chain:
-        outcome = provider.search(query, limit, ctx)
+        try:
+            outcome = provider.search(query, limit, ctx, images=images)
+        except TypeError:
+            # A custom/embedder provider predating the images kwarg.
+            outcome = provider.search(query, limit, ctx)
         if isinstance(outcome, SearchSuccess) and outcome.results:
             return finish(format_results(outcome, ctx))
         if isinstance(outcome, SearchFailure):
@@ -338,11 +345,21 @@ class SearxngProvider(WebSearchProvider):
     def is_available(self, ctx):
         return bool(self._base(ctx))
 
-    def search(self, query, limit, ctx):
+    def search(self, query, limit, ctx, images=False):
         base = self._base(ctx)
         if not base:
             return SearchFailure("search_base_url is not set")
-        url = f"{base}{urllib.parse.quote(query)}&format=json"
+        # An image hunt ("download me the picture of X", images=true) wants
+        # actual image URLs, not article pages about X -- SearXNG's images
+        # category returns exactly that. The engine also sets this when the
+        # model passes images=true, so a reformulated keyword-only query
+        # still routes right.
+        lowered = query.lower()
+        wants_images = images or any(w in lowered for w in (
+            "picture", "photo", "image", "pictures", "photos", "images", "logo",
+            "wallpaper", "screenshot"))
+        category = "&categories=images" if wants_images else ""
+        url = f"{base}{urllib.parse.quote(query)}{category}&format=json"
 
         parts = urllib.parse.urlparse(url)
         # Plaintext HTTP is fine to a box you control; over the internet it puts

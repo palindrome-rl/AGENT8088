@@ -88,6 +88,14 @@ call. If no, split freely.
 - `get_page_title` is a plain HTTP fetch (no browser, no JS, no login) —
   reach for it before `browse_page` when only a title is needed and no
   interaction or authenticated content is involved.
+- Navigation to the same host failing twice in a row (`ERR_CONNECTION_CLOSED`,
+  DNS, timeout) — that host is dead for this session. Report the failure and
+  stop; do not wander to other URLs to compensate.
+- `HTTP 403` from `write_file source_url` while the page itself loads in a
+  browser — hotlink protection. The site checks the Referer/UA header. Retry
+  once with `browse_page`, and if the asset is only reachable from the
+  page's own session, save it via the browser inside that call. Don't retry
+  the direct fetch more than once — the 403 is deliberate.
 
 ## Chained tasks — verify, don't just relay
 
@@ -100,3 +108,26 @@ on the very next step anyway. When the actual submitted/extracted values
 matter, follow up with a separate read (another `browse_page` or
 `get_page_title` call that visits the resulting page and reports its real
 content) rather than trusting the first call's own narration at face value.
+
+## Saving content found while browsing
+
+When a page has an asset (image, PDF, file) at a known URL that needs to be
+saved to disk, prefer `write_file` with its `source_url` argument. `write_file`
+accepts `source_url` instead of `content` to fetch and save binary/remote
+content directly. Only fall back to `execute_shell` for cases where the direct
+fetch can't work, such as an asset gated behind the page's own session/cookies
+that only the browser can access.
+
+Getting the right asset URL matters more than the fetch itself:
+
+- A search result for an image usually lands on a *page*, not the image file.
+  Don't browse the page to "see the picture" — extract the direct asset URL
+  (from the page's `<img src>` / download link) and hand it to
+  `write_file source_url`.
+- Wikimedia pages: `https://commons.wikimedia.org/wiki/File:X.jpg` is a
+  description page. The direct file is
+  `https://commons.wikimedia.org/wiki/Special:FilePath/X.jpg` (no `File:`
+  prefix needed). Same trick for Wikipedia image pages.
+- Give the saved file the right extension. Use the URL's own extension when it
+  has one; otherwise `write_file` derives it from the response Content-Type
+  (image/jpeg -> .jpg, image/png -> .png, application/pdf -> .pdf).
