@@ -8281,6 +8281,35 @@ def _is_system_leak(answer: str) -> bool:
     return len(answer) >= 200 and answer.strip()[:200] in BASE_SYSTEM_PROMPT
 
 
+_FALLBACK_EXCERPT_CHARS = 1800
+
+
+def _fallback_answer(last_tool_output: str, error) -> str:
+    """The answer to show when the model call fails after a tool has run.
+
+    The tool result is the only material left, but pasting it raw made a
+    document_read envelope arrive in chat as `{"version": ...}`, truncated
+    mid-sentence, with nothing marking it as a failure -- and two failed turns
+    produced two identical blobs that read as the agent ignoring the question.
+    So: say what broke first, unwrap the envelope to the text a person can
+    actually read, and label it as unsummarised source rather than an answer.
+    """
+    reason = f"I could not answer: the model backend errored ({error})."
+    body = (last_tool_output or "").strip()
+    if not body:
+        return reason
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+            body = parsed["text"].strip()
+    except (ValueError, TypeError):
+        pass
+    if len(body) > _FALLBACK_EXCERPT_CHARS:
+        body = body[:_FALLBACK_EXCERPT_CHARS].rstrip() + "\n[…truncated]"
+    return (f"{reason}\n\nBelow is the raw, unsummarised material the last tool "
+            f"returned. It has not been read or condensed by the model:\n\n{body}")
+
+
 def _guard_answer(answer: str) -> str:
     """Final safety net on every answer: block system-prompt leaks and redact
     secrets, no matter what the model produced (defense in depth vs. prompt
@@ -9815,17 +9844,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         e = retry_error
                         continue
                 if response is None:
-                    fallback = (_last_tool_output[:1000] if _last_tool_output
-                               else f"The model backend errored: {e}")
-                    answer = _guard_answer(fallback)
+                    answer = _guard_answer(_fallback_answer(_last_tool_output, e))
                     if on_answer:
                         on_answer(answer)
                     return answer
             else:
                 # Backend/model error (timeout, context overflow, 5xx): don't crash
                 # the turn -- return the best we have, guarded.
-                fallback = _last_tool_output[:1000] if _last_tool_output else f"The model backend errored: {e}"
-                answer = _guard_answer(fallback)
+                answer = _guard_answer(_fallback_answer(_last_tool_output, e))
                 if on_answer:
                     on_answer(answer)
                 return answer
