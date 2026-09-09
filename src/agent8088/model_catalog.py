@@ -68,3 +68,16 @@ def lookup(provider: str, model: str) -> dict | None:
     """{"rank": int, "vision": bool, "tools": bool} for an exact provider:model
     match, or None if neither the bundled nor the user catalog has it."""
     return load_catalog().get(f"{provider}:{model}")
+
+
+def vision_capable(provider: str, model: str) -> bool:
+    """Whether this model can read images itself.
+
+    An uncatalogued pair -- every local Ollama build and every custom
+    OpenAI-compatible endpoint -- answers False. That is the safe direction:
+    a vision model handed OCR text can still read it, while a text-only model
+    handed image parts gets nothing usable and, on most providers, an error.
+    Declare a local vision model in the user catalog to override.
+    """
+    entry = lookup(provider, model)
+    return bool(entry.get("vision")) if entry else False

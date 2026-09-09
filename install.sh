@@ -188,6 +188,7 @@ INITIAL_SETUP_RAN=false
 GATEWAY_EXTRAS_INSTALLED=false
 SEARCH_EXTRAS_INSTALLED=false
 CHROMIUM_INSTALLED=false
+OCR_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
 SANDBOX_INSTALLED=false
@@ -264,6 +265,7 @@ T_GIT=$((600          * TIMEOUT_SCALE))   # shallow clone: small, but a stalled 
 # download set here, so it gets the same 10m ceiling as Chromium rather than a
 # looser one. AGENT8088_TIMEOUT_SCALE raises it for a genuinely slow link.
 T_CORE_INSTALL=$((600 * TIMEOUT_SCALE))
+T_OCR_MODELS=$((600   * TIMEOUT_SCALE))   # OCR detection + recognition models
 T_VENV=$((300         * TIMEOUT_SCALE))   # uv may download a CPython build
 T_UV_BOOT=$((300      * TIMEOUT_SCALE))   # uv self-installer
 
@@ -938,6 +940,46 @@ install_deps() {
     fi
     [ "$SEARCH_EXTRAS_INSTALLED" = true ] && log_success "Keyless web search backend installed"
 
+    # --- OCR (optional [ocr] extra) + recognition models ---
+    # Lets a model without vision read attached images and scanned PDFs. Both
+    # steps are non-fatal: ocr.available() reports the gap at runtime and the
+    # attachment tells the model why it could not be read, which is a better
+    # outcome than failing an install over an onnxruntime wheel that does not
+    # exist for this platform.
+    log_info "Installing OCR engine (optional, for models without vision)..."
+    local _ocr_installed=false
+    _ocr_rc=0
+    if [ "$DISTRO" = "termux" ]; then
+        run_with_timeout "$T_PIP" pip install -e ".[ocr]" >/dev/null 2>&1 || _ocr_rc=$?
+    else
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[ocr]" >/dev/null 2>&1 || _ocr_rc=$?
+    fi
+    if [ "$_ocr_rc" -eq 0 ]; then
+        _ocr_installed=true
+    else
+        warn_stage "$_ocr_rc" "$T_PIP" "OCR engine" \
+            "images attached to a non-vision model will report OCR as unavailable" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[ocr]\""
+    fi
+    if [ "$_ocr_installed" = true ]; then
+        # RapidOCR fetches its models on first construction. Doing that here
+        # rather than mid-conversation keeps the first OCR instant and lets a
+        # machine that is offline later still work.
+        log_info "Downloading OCR models (~90 MB)..."
+        _ocr_models_rc=0
+        run_with_timeout "$T_OCR_MODELS" "$_py" -c \
+            "from rapidocr import RapidOCR; RapidOCR()" >/dev/null 2>&1 || _ocr_models_rc=$?
+        if [ "$_ocr_models_rc" -eq 0 ]; then
+            OCR_INSTALLED=true
+        else
+            warn_stage "$_ocr_models_rc" "$T_OCR_MODELS" "OCR models" \
+                "the first OCR will download them instead" \
+                "$_py -c \"from rapidocr import RapidOCR; RapidOCR()\""
+        fi
+    fi
+    [ "$OCR_INSTALLED" = true ] && log_success "OCR engine and models installed"
+
     # --- Playwright (optional [browser] extra) + Chromium binary ---
     # playwright degrades gracefully at runtime (engine.py: _playwright_available()),
     # so it's an optional extra, not a core dep - a platform/Python combo without
@@ -1492,6 +1534,11 @@ verify_install() {
         echo "  Browser:  Chromium installed (browse_page ready)"
     else
         echo "  Browser:  Chromium missing (browse_page will show install instructions)"
+    fi
+    if [ "$OCR_INSTALLED" = true ]; then
+        echo "  OCR:      ready (models without vision can read attached images)"
+    else
+        echo "  OCR:      unavailable - attached images need a vision-capable model"
     fi
     if [ "$WHATSAPP_BRIDGE_READY" = true ]; then
         echo "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"

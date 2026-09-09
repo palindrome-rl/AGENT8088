@@ -200,6 +200,7 @@ $InitialSetupRan = $false
 $GatewayExtrasInstalled = $false
 $SearchExtrasInstalled = $false
 $ChromiumInstalled = $false
+$OcrInstalled = $false
 $NodeInstalled = $false
 $WhatsAppBridgeReady = $false
 $SandboxInstalled = $false
@@ -247,6 +248,7 @@ $TOllamaCheck = 15  * $TimeoutScale   # nothing, local - instant unless the daem
 $TOllamaPull  = 600 * $TimeoutScale   # 274 MB embedding model
 $TNpm         = 300 * $TimeoutScale   # 142 small packages, mostly round-trips
 $TChromium    = 600 * $TimeoutScale   # ~150 MB browser download
+$TOcrModels   = 600 * $TimeoutScale   # OCR detection + recognition models
 $TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
 $TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
 $TLibreOffice = 1800 * $TimeoutScale  # ~350 MB MSI plus dependency resolution/install
@@ -1892,6 +1894,42 @@ function Install-Gateway-Extras {
             }
         }
 
+        # OCR ([ocr] extra) lets a model without vision read attached images
+        # and scanned PDFs. Non-fatal at both steps: ocr.available() reports
+        # the gap at runtime rather than the install failing over it.
+        if (Test-StageComplete "ocr") {
+            $script:OcrInstalled = $true
+            Write-Success "OCR engine already installed (skipping)"
+        } else {
+            Write-Info "Installing OCR engine (optional, for models without vision)..."
+            $ocrResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+                -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[ocr]") `
+                -TimeoutSec $TPip -Activity "Installing OCR engine"
+            if ($ocrResult.ExitCode -eq 0) {
+                # RapidOCR fetches its models on first construction. Doing it
+                # here keeps the first OCR instant and works offline later.
+                Write-Info "Downloading OCR models (~90 MB)..."
+                $ocrModelResult = Invoke-WithTimeout -FilePath $py `
+                    -Arguments @("-c", "from rapidocr import RapidOCR; RapidOCR()") `
+                    -TimeoutSec $TOcrModels -Activity "Downloading OCR models"
+                if ($ocrModelResult.ExitCode -eq 0) {
+                    $script:OcrInstalled = $true
+                    Set-StageComplete "ocr"
+                    Write-Success "OCR engine and models installed"
+                } else {
+                    Write-StageWarning -Result $ocrModelResult -TimeoutSec $TOcrModels `
+                        -What "OCR models" `
+                        -Consequence "the first OCR will download them instead" `
+                        -Fix "`"$py`" -c `"from rapidocr import RapidOCR; RapidOCR()`""
+                }
+            } else {
+                Write-StageWarning -Result $ocrResult -TimeoutSec $TPip `
+                    -What "OCR engine" `
+                    -Consequence "images attached to a non-vision model will report OCR as unavailable" `
+                    -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[ocr]`""
+            }
+        }
+
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
         if (Test-StageComplete "chromium") {
@@ -2445,6 +2483,11 @@ function Verify-Install {
     } else {
         Write-Host "  Browser:  Chromium missing (browse_page will show install instructions)"
     }
+    if ($script:OcrInstalled) {
+        Write-Host "  OCR:      ready (models without vision can read attached images)"
+    } else {
+        Write-Host "  OCR:      unavailable - attached images need a vision-capable model"
+    }
     if ($script:WhatsAppBridgeReady) {
         Write-Host "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"
     } elseif ($script:NodeInstalled) {
@@ -2551,7 +2594,7 @@ Show-LongPathWarningIfNeeded
 Test-HostConnectivity
 if (-not $env:AGENT8088_TIMEOUT_SCALE -and (Test-SlowConnection)) {
     Write-Warn "Slow connection detected - doubling all download timeouts."
-    $TOllamaPull *= 2; $TNpm *= 2; $TChromium *= 2; $TDownload *= 2; $TPip *= 2
+    $TOllamaPull *= 2; $TNpm *= 2; $TChromium *= 2; $TDownload *= 2; $TPip *= 2; $TOcrModels *= 2
     $TCoreInstall *= 2; $TVenv *= 2; $TUvBoot *= 2; $TExtract *= 2; $TSandboxSetup *= 2
 }
 # Wrapped so an unexpected exception (e.g. Install-Deps's throw, or any
