@@ -71,7 +71,7 @@ _BLOCK_HEADER = (
 )
 
 _RUNTIME = {}
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 _LAST_CAPTURE = {}
 
 
@@ -229,8 +229,11 @@ def recall(query, *, identity=None, limit=None):
         active_store = store()
         if active_store is None:
             return []
-        active_embedder = embedder()
-        vector = active_embedder.embed_one(query) if active_embedder else []
+        engine_name = _RUNTIME.get("engine_name", "native")
+        vector = []
+        if engine_name != "mem0":
+            active_embedder = embedder()
+            vector = active_embedder.embed_one(query) if active_embedder else []
         return active_store.search(
             str(query),
             user_id=user_id(identity),

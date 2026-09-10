@@ -63,8 +63,6 @@ class Mem0MemoryStore:
                     pass
 
             llm_provider = str(self.config.get("llm_provider") or "").strip().lower()
-            if not llm_provider and client_base_url:
-                llm_provider = "openai"
 
             llm_section = None
             if llm_provider:
@@ -175,7 +173,7 @@ class Mem0MemoryStore:
 
     # -- writes ------------------------------------------------------------
 
-    def add(self, text, *, user_id: str, embedding=None, embed_model: str = "",
+    def add(self, text, *, user_id: str = "owner", embedding=None, embed_model: str = "",
             project: Optional[str] = None, agent_id: Optional[str] = None,
             run_id: Optional[str] = None, categories=None, source: str = "extracted") -> Optional[str]:
         mem = self._init_memory()
@@ -193,7 +191,10 @@ class Mem0MemoryStore:
             "source": source,
         }
         try:
-            resp = mem.add(text, user_id=str(user_id), metadata=metadata)
+            try:
+                resp = mem.add(text, user_id=str(user_id), metadata=metadata, infer=False)
+            except TypeError:
+                resp = mem.add(text, user_id=str(user_id), metadata=metadata)
             items = []
             if isinstance(resp, dict):
                 items = resp.get("results") or []
@@ -217,7 +218,7 @@ class Mem0MemoryStore:
             log.debug("mem0 delete failed: %s", exc)
             return False
 
-    def delete_all(self, *, user_id: str) -> int:
+    def delete_all(self, *, user_id: str = "owner") -> int:
         mem = self._init_memory()
         if mem is None:
             return 0
@@ -238,7 +239,7 @@ class Mem0MemoryStore:
 
     # -- reads -------------------------------------------------------------
 
-    def search(self, query: str, *, user_id: str, embedding=None, model: str = "",
+    def search(self, query: str, *, user_id: str = "owner", embedding=None, model: str = "",
                limit: int = 5, rrf_k: int = 60, min_score: float = 0.0,
                record_access: bool = True) -> List[Dict[str, Any]]:
         mem = self._init_memory()
@@ -276,7 +277,7 @@ class Mem0MemoryStore:
             log.debug("mem0 search failed: %s", exc)
             return []
 
-    def get_all(self, *, user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    def get_all(self, *, user_id: str = "owner", limit: int = 200) -> List[Dict[str, Any]]:
         mem = self._init_memory()
         if mem is None:
             return []
@@ -306,7 +307,7 @@ class Mem0MemoryStore:
             log.debug("mem0 get_all failed: %s", exc)
             return []
 
-    def recent(self, *, user_id: str, run_id: Optional[str] = None, limit: int = 20) -> List[str]:
+    def recent(self, *, user_id: str = "owner", run_id: Optional[str] = None, limit: int = 20) -> List[str]:
         items = self.get_all(user_id=user_id, limit=limit)
         return [item["text"] for item in items if item.get("text")]
 
