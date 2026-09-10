@@ -30,6 +30,10 @@ def telemetry_summary(path, task_id=None, max_bytes=16 * 1024 * 1024):
     path = Path(path)
     result = dict(calls=0, errors=0, known_cost_usd=0.0, unknown_cost_calls=0,
                   estimated_cost_calls=0, latency_ms=0, malformed_records=0,
+                  # Routing is time the turn spent before any model was called.
+                  # Counted apart from model calls: it is real cost, but it is
+                  # not a billed request and must not inflate the call count.
+                  routing_decisions=0, routing_applied=0, routing_latency_ms=0,
                   truncated=False, tasks={}, available=path.exists())
     if not path.exists():
         return result
@@ -44,6 +48,13 @@ def telemetry_summary(path, task_id=None, max_bytes=16 * 1024 * 1024):
                 record = json.loads(line)
                 if not isinstance(record, dict):
                     raise ValueError('expected object')
+                if record.get('event') == 'routing_decision':
+                    if task_id and (record.get('task_id') or 'unattributed') != task_id:
+                        continue
+                    result['routing_decisions'] += 1
+                    result['routing_applied'] += bool(record.get('applied'))
+                    result['routing_latency_ms'] += max(0, int(record.get('latency_ms') or 0))
+                    continue
                 if record.get('event') != 'model_call':
                     continue
                 task = record.get('task_id') or 'unattributed'

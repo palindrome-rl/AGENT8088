@@ -8519,12 +8519,43 @@ def _model_usage(response) -> tuple[dict, str]:
     return {"input_tokens": None, "output_tokens": len(content) // 4}, "output_estimate"
 
 
-def _stable_prefix_hash(prompt: str, tools) -> str:
+def _stable_prefix_hash(prompt: str, tools, model: str = "") -> str:
     """Short digest of the cacheable request prefix. Truncated deliberately --
-    this is for spotting drift across calls, not for integrity."""
+    this is for spotting drift across calls, not for integrity.
+
+    The model is part of the key because a provider's prompt cache is per
+    model: the same prefix sent to a different model is a cold cache, not a
+    hit. Leaving it out meant a router that switches models each turn reported
+    one stable prefix while discarding the cache on every turn -- the metric
+    said cache-friendly exactly when it had stopped being true."""
     prefix = (prompt or "").split(RUNTIME_CONTEXT_HEADING)[0]
     return hashlib.sha256(
-        (prefix + json.dumps(tools or [], sort_keys=True)).encode()).hexdigest()[:16]
+        (prefix + json.dumps(tools or [], sort_keys=True)
+         + chr(31) + str(model or "")).encode()).hexdigest()[:16]
+
+
+def record_routing_decision(decision: dict) -> None:
+    """Record what routing cost and whether it changed anything.
+
+    The decision used to go only to the application log, so `/cost` -- whose
+    whole purpose is answering what a turn cost -- reported the time the
+    router adds as nothing. It is a separate event type, never a model_call,
+    so it cannot be mistaken for a billed request."""
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "routing_decision",
+            "task_id": getattr(_active_budget, "task_id", None),
+        }
+        for key in ("backend", "mode", "reason", "selected", "applied",
+                    "latency_ms", "error_type"):
+            if key in decision:
+                entry[key] = decision[key]
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, entry)
+    except Exception as exc:  # noqa: BLE001 -- telemetry must not break a turn
+        _log.debug("routing telemetry write failed: %s", exc)
 
 
 def _record_model_telemetry(provider: str, model: str, attempt: str, started: float,
@@ -8563,7 +8594,7 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
             # system prompt up to the runtime section, plus the tool schemas.
             # If this changes between calls the prefix is not stable and no
             # provider-side cache will hit -- that is the thing to measure.
-            "stable_prefix_hash": _stable_prefix_hash(prompt, tools),
+            "stable_prefix_hash": _stable_prefix_hash(prompt, tools, model),
             "cached_input_tokens": getattr(getattr(getattr(response, 'usage', None),
                 'prompt_tokens_details', None), 'cached_tokens', None),
             "max_tokens": max_tokens,
@@ -9985,6 +10016,26 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
 _REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
 
 
+def _consult_llmrouter(config, messages, eligible):
+    """Ask the optional router, or explain why not. Never raises.
+
+    The adapter imports httpx, which is declared in the gateway extra rather
+    than core -- it is present on most installs only because openai pulls it
+    in. An unguarded import inside the loop meant enabling routing on an
+    install without it killed the turn, while every other routing failure
+    logs and falls back. Routing is optional; it must fail like it.
+    """
+    try:
+        from agent8088.llmrouter_adapter import recommend
+        return recommend(config, messages, eligible)
+    except Exception as exc:  # noqa: BLE001 -- optional path, never fatal
+        return None, {"type": "routing_decision", "backend": "llmrouter",
+                      "mode": str(config.get("llmrouter_mode", "off")).lower(),
+                      "reason": "router_unavailable_or_invalid",
+                      "error_type": type(exc).__name__,
+                      "applied": False, "latency_ms": 0}
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -10028,6 +10079,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # that just failed and the one that rescued it. A new user turn starts fresh
     # at the cheap rung, so a one-off hard prompt doesn't tax every later one.
     auto_rung = routing.starting_rung(model_name or MODEL_NAME, len(_auto_chain))
+    llmrouter_consulted = False
     auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
@@ -10122,6 +10174,24 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # auto-compaction uses, converted chars -> tokens.
             _min_context_needed = _estimate_context_chars(
                 messages, round_system_prompt or "") // 4
+            if (not llmrouter_consulted and routing.variant(model_name or MODEL_NAME) != 'smart'
+                    and APP_CONFIG.get('llmrouter_mode', 'off') in ('shadow', 'enabled')):
+                llmrouter_consulted = True
+                eligible = []
+                for p, m in _auto_chain:
+                    context, completion = _active_model_token_limits(p, m)
+                    if not routing.cooling(p, m) and context >= _min_context_needed + completion:
+                        eligible.append((p, m))
+                routing_messages = [dict(message, content=_redact_secrets(message['content']))
+                                    if isinstance(message.get('content'), str) else message
+                                    for message in _genuine_user_turns(messages)]
+                selected, decision = _consult_llmrouter(APP_CONFIG, routing_messages, eligible)
+                if trace is not None:
+                    trace.append(dict(decision, turn=turn))
+                _log.info('LLMRouter decision: %s', decision)
+                record_routing_decision(decision)
+                if selected is not None:
+                    auto_rung = _auto_chain.index(selected)
             _picked = routing.select(
                 _auto_chain, auto_rung,
                 fits=lambda p, m: _active_model_token_limits(p, m)[0] >= _min_context_needed,

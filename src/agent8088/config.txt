@@ -422,3 +422,11 @@ web_search_no_prompt=1
 # Build one from the providers you hold working keys for with:
 #   /model auto setup
 # auto_chain=ollama:qwen14b-tooluse-v3,groq:llama-3.3-70b-versatile,anthropic:claude-sonnet-4-6
+
+# Optional selection-only LLMRouter service. See docs/llmrouter.md.
+# Off by default; explicit models and auto:smart never consult it.
+# Modes: off, shadow (observe only), enabled (choose initial auto rung).
+# llmrouter_mode=off
+# llmrouter_url=http://127.0.0.1:8191/route
+# llmrouter_token_env=AGENT8088_ROUTER_TOKEN
+# llmrouter_timeout_seconds=2
