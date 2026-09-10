@@ -215,6 +215,7 @@ class Session:
     def __init__(self):
         config = A.APP_CONFIG
         self.messages = []
+        self.trajectory_state = {}
         try:
             self.temperature = float(config.get("temperature", "0.1"))
         except ValueError:
@@ -261,10 +262,11 @@ def _write_private_text(path, content):
 
 def _trace_export_data():
     return {
-        "version": 1,
+        "version": 2,
         "session": S.name or None,
         "model": A.MODEL_NAME,
         "messages": S.messages,
+        "trajectory_state": S.trajectory_state,
         "trace": S.conversation_trace,
     }
 
@@ -333,9 +335,10 @@ def _save_active_session():
         return
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     _write_private_text(_session_path(S.name), json.dumps({
-        "version": 1,
+        "version": 2,
         "name": S.name,
         "messages": S.messages,
+        "trajectory_state": S.trajectory_state,
         "temperature": S.temperature,
         "max_turns": S.max_turns,
         "show_trace": S.show_trace,
@@ -1938,6 +1941,8 @@ def do_chat(query):
                 system_prompt=_session_system_prompt,
                 tools_def=lambda: A.build_tools_def(_active_tool_specs()),
                 allowed_tools=lambda: set(_active_tool_specs()),
+                trajectory_state=S.trajectory_state,
+                on_trajectory_state=lambda _state: _save_active_session(),
             )
         except A.AgentInterrupted:
             answer = None
@@ -4222,6 +4227,7 @@ def cmd_new(rest):
         return
     _save_active_session()
     S.messages.clear()
+    S.trajectory_state.clear()
     S.last_trace = None
     S.last_usage = None
     S.name = name
@@ -4275,6 +4281,8 @@ def cmd_resume(rest):
         return
     _save_active_session()
     S.messages[:] = messages
+    S.trajectory_state = (data.get("trajectory_state", {})
+                          if isinstance(data.get("trajectory_state", {}), dict) else {})
     S.name = name
     S.temperature = float(data.get("temperature", 0.1))
     S.max_turns = int(data.get("max_turns", 10))
@@ -4298,6 +4306,7 @@ def cmd_reset(_):
         console.print("[#237dd7]kept[/#237dd7]")
         return
     S.messages.clear()
+    S.trajectory_state.clear()
     S.last_trace = None
     S.conversation_trace.clear()
     S.trace_path = ""

@@ -43,7 +43,8 @@ class TaskStore:
           id TEXT PRIMARY KEY, goal TEXT NOT NULL, workspace TEXT NOT NULL,
           state TEXT NOT NULL, slice_no INTEGER NOT NULL DEFAULT 0,
           messages_json TEXT NOT NULL, last_answer TEXT NOT NULL DEFAULT '',
-          error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL
+          error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+          trajectory_json TEXT NOT NULL DEFAULT '{}'
         );
         CREATE TABLE IF NOT EXISTS task_events (
           id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
@@ -57,13 +58,18 @@ class TaskStore:
         CREATE INDEX IF NOT EXISTS task_events_task ON task_events(task_id, id);
         CREATE INDEX IF NOT EXISTS task_operations_task ON task_operations(task_id, started_at);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}
+        if "trajectory_json" not in columns:
+            self.db.execute("ALTER TABLE tasks ADD COLUMN trajectory_json TEXT NOT NULL DEFAULT '{}'")
         self.db.commit()
 
     def create(self, goal: str, workspace: str | Path, messages: list[dict]) -> str:
         task_id = uuid.uuid4().hex
         now = _now()
         self.db.execute(
-            "INSERT INTO tasks VALUES (?, ?, ?, 'queued', 0, ?, '', '', ?, ?)",
+            "INSERT INTO tasks (id, goal, workspace, state, slice_no, messages_json, "
+            "last_answer, error, created_at, updated_at, trajectory_json) "
+            "VALUES (?, ?, ?, 'queued', 0, ?, '', '', ?, ?, '{}')",
             (task_id, goal, str(workspace), json.dumps(messages), now, now),
         )
         self.event(task_id, "created", {"goal": goal})
@@ -114,7 +120,7 @@ class TaskStore:
         return self.get(task_id)
 
     def update(self, task_id: str, **fields) -> None:
-        allowed = {"state", "slice_no", "messages_json", "last_answer", "error"}
+        allowed = {"state", "slice_no", "messages_json", "last_answer", "error", "trajectory_json"}
         fields = {k: v for k, v in fields.items() if k in allowed}
         if not fields:
             return
@@ -123,7 +129,8 @@ class TaskStore:
         self.db.execute(f"UPDATE tasks SET {sql} WHERE id=?", (*fields.values(), task_id))
         self.db.commit()
 
-    def checkpoint(self, task_id: str, *, messages=None, answer=None, state=None, error=None):
+    def checkpoint(self, task_id: str, *, messages=None, answer=None, state=None, error=None,
+                   trajectory=None):
         task = self.get(task_id)
         if not task:
             raise KeyError(task_id)
@@ -134,6 +141,8 @@ class TaskStore:
             last_answer=str(answer if answer is not None else task["last_answer"])[-6000:],
             state=state or task["state"],
             error=str(error or ""),
+            trajectory_json=json.dumps(trajectory if trajectory is not None
+                                       else json.loads(task.get("trajectory_json") or "{}")),
         )
 
     def event(self, task_id: str, kind: str, payload: dict) -> None:
@@ -187,6 +196,7 @@ class TaskRuntime:
     def __init__(self, store: TaskStore, task_id: str):
         self.store, self.task_id = store, task_id
         self.messages: list[dict] | None = None
+        self.trajectory_state: dict = {}
 
     def bind(self, messages: list[dict]):
         self.messages = messages
@@ -257,7 +267,12 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
                      "final answer with TASK_COMPLETE; otherwise end it with TASK_PROGRESS.\n\n"
                      + goal}]
         task_id = store.create(goal, workspace, messages)
+    task = store.get(task_id)
     runtime = TaskRuntime(store, task_id)
+    try:
+        runtime.trajectory_state = json.loads(task.get("trajectory_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        runtime.trajectory_state = {}
     for _ in range(max_slices):
         task = store.get(task_id)
         if task["state"] == "cancelled":
@@ -267,6 +282,13 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         if on_slice:
             on_slice(task, "running")
         runtime.bind(messages)
+
+        def checkpoint_trajectory(state: dict) -> None:
+            snapshot = dict(state)
+            runtime.trajectory_state.clear()
+            runtime.trajectory_state.update(snapshot)
+            store.checkpoint(task_id, messages=_compact(messages), trajectory=runtime.trajectory_state)
+
         try:
             with runtime.active():
                 # A slice already IS the continuation mechanism: run_task
@@ -274,11 +296,14 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
                 # context intact. Letting each slice grow its own turn
                 # budget on top of that multiplies instead of extending.
                 answer = agent(messages, max_turns=slice_turns,
-                               dynamic_turns=False, **agent_kwargs)
+                               dynamic_turns=False, trajectory_state=runtime.trajectory_state,
+                               on_trajectory_state=checkpoint_trajectory, **agent_kwargs)
         except Exception as exc:
-            store.checkpoint(task_id, messages=_compact(messages), state="paused", error=str(exc))
+            store.checkpoint(task_id, messages=_compact(messages), state="paused", error=str(exc),
+                             trajectory=runtime.trajectory_state)
             break
-        store.checkpoint(task_id, messages=_compact(messages), answer=answer)
+        store.checkpoint(task_id, messages=_compact(messages), answer=answer,
+                         trajectory=runtime.trajectory_state)
         task = store.get(task_id)
         if task["state"] == "cancelled":
             break
@@ -306,7 +331,8 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
             "with tools. Report TASK_COMPLETE if the task is now fully complete and "
             "verified; otherwise report TASK_PROGRESS. Never claim completion without proof."
             + (f"\nVerifier feedback: {feedback}" if feedback else "")})
-        store.checkpoint(task_id, messages=_compact(messages), state="queued")
+        store.checkpoint(task_id, messages=_compact(messages), state="queued",
+                         trajectory=runtime.trajectory_state)
     else:
         store.update(task_id, state="paused")
     task = store.get(task_id)
