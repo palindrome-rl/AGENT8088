@@ -1049,6 +1049,8 @@ def _dangerous_git_args(tokens: list) -> bool:
             or any(flag in ("-f", "--force") for flag in flags)
             or any(not flag.startswith("-") for flag in flags)
         ))
+        or (action == "switch" and any(
+            flag in ("-f", "--force", "--discard-changes") for flag in flags))
         or (action == "stash" and any(flag in ("drop", "clear") for flag in flags))
     )
 
@@ -3486,10 +3488,16 @@ def _structured_tool_argv(name: str, args: dict):
         branch = _git_safe_value(args.get("name"), "branch name")
         if not branch:
             raise ValueError("git checkout requires a branch name.")
-        # -b takes the name as its own argument, so `--` would read as a path.
+        # `switch`, not `checkout`. `git checkout <anything>` is hard-blocked,
+        # and rightly: `git checkout -- src/` silently discards uncommitted
+        # work, and the argv gives the hardline no way to tell that from moving
+        # to a branch. `switch` is the half that only ever moves HEAD; it
+        # refuses rather than clobber a dirty tree, and the flags that would
+        # override that are unreachable here because a value starting with a
+        # dash is rejected above.
         if _git_flag_is_set(args.get("create")):
-            return _git_prefix(args) + ["checkout", "-b", branch]
-        return _git_prefix(args) + ["checkout", "--", branch]
+            return _git_prefix(args) + ["switch", "-c", branch]
+        return _git_prefix(args) + ["switch", branch]
     if name == "git_push":
         # Defaults unchanged: a bare git_push is still `git push origin HEAD`.
         remote = _git_safe_value(args.get("remote") or "origin", "remote name")

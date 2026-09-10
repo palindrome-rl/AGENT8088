@@ -45,20 +45,20 @@ def test_git_branch_requires_a_name(engine):
 
 def test_git_checkout_argv(engine):
     argv = engine._structured_tool_argv("git_checkout", {"name": "main"})
-    assert argv == ["git", "checkout", "--", "main"]
+    assert argv == ["git", "switch", "main"]
 
 
 def test_git_checkout_creates_and_switches_in_one_step(engine):
     argv = engine._structured_tool_argv(
         "git_checkout", {"name": "feature/first", "create": "true"})
-    assert argv == ["git", "checkout", "-b", "feature/first"]
+    assert argv == ["git", "switch", "-c", "feature/first"]
 
 
 def test_git_checkout_create_false_does_not_create(engine):
     """The model passes booleans as strings; "false" must not read as true."""
     argv = engine._structured_tool_argv(
         "git_checkout", {"name": "main", "create": "false"})
-    assert argv == ["git", "checkout", "--", "main"]
+    assert argv == ["git", "switch", "main"]
 
 
 @pytest.mark.parametrize("tool", ["git_branch", "git_checkout"])
@@ -86,7 +86,7 @@ def test_git_branch_really_creates_a_branch(engine, tmp_path, monkeypatch):
 @pytest.mark.parametrize("tool,args,tail", [
     ("git_commit", {"message": "m"}, ["commit", "-m", "m"]),
     ("git_branch", {"name": "b"}, ["branch", "--", "b"]),
-    ("git_checkout", {"name": "b"}, ["checkout", "--", "b"]),
+    ("git_checkout", {"name": "b"}, ["switch", "b"]),
     ("git_push", {"branch": "main"}, ["push", "origin", "main"]),
     ("git_remote", {"action": "add", "name": "origin", "url": "https://x/y.git"},
      ["remote", "add", "origin", "https://x/y.git"]),
@@ -178,3 +178,40 @@ def test_a_bare_filename_still_goes_to_artifacts(engine, tmp_path, monkeypatch):
 
     assert engine.resolve_write_path("sample.txt") == \
         tmp_path / "artifacts" / "sample.txt"
+
+
+# --- 4. the hardline must still stand -----------------------------------
+#
+# `git checkout <anything>` is hard-blocked because `git checkout -- src/`
+# discards uncommitted work and the argv cannot distinguish that from moving to
+# a branch. git_checkout therefore emits `switch`, and these tests pin both
+# halves of that bargain: the tool's own commands pass the hardline, and the
+# destructive spellings are still refused.
+
+@pytest.mark.parametrize("args", [
+    {"name": "feature/first", "create": "true"},
+    {"name": "main"},
+    {"name": "feature/first", "create": "true", "repo": "sub"},
+])
+def test_git_checkout_commands_pass_the_hardline(engine, args):
+    argv = engine._structured_tool_argv("git_checkout", args)
+    assert not engine._hard_blocked_shell(" ".join(argv))
+
+
+def test_git_branch_commands_pass_the_hardline(engine):
+    argv = engine._structured_tool_argv("git_branch", {"name": "feature/first"})
+    assert not engine._hard_blocked_shell(" ".join(argv))
+
+
+@pytest.mark.parametrize("command", [
+    "git checkout -- src/",
+    "git checkout main",
+    "git checkout -f main",
+    "git switch --discard-changes main",
+    "git switch -f main",
+    "git branch -D main",
+    "git restore src/main.py",
+])
+def test_destructive_spellings_are_still_hard_blocked(engine, command):
+    """Including `switch --discard-changes`, which nothing blocked before."""
+    assert engine._hard_blocked_shell(command)
