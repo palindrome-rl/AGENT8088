@@ -29,6 +29,37 @@ function parseSeat(value: string): Seat {
   return { provider, model: model.join(':') }
 }
 
+type ModelsResponse = { models: string[] }
+
+/** Same fetch-and-datalist pattern as ModelSwitcher's model field, applied
+ * per seat here since each seat can name a different provider. */
+function ModelField({ provider, value, onChange, ariaLabel }: {
+  provider: string
+  value: string
+  onChange: (value: string) => void
+  ariaLabel: string
+}) {
+  const modelsQuery = useQuery({
+    queryKey: ['models', provider],
+    queryFn: () => getJSON<ModelsResponse>(`/api/models/${encodeURIComponent(provider)}`),
+    enabled: Boolean(provider),
+  })
+  const listId = `fusion-models-${provider || 'none'}`
+  return (
+    <>
+      <input
+        aria-label={ariaLabel}
+        list={listId}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={modelsQuery.isLoading ? 'Loading models…' : 'model (default if blank)'}
+        className="min-w-0 rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-2 text-sm text-zinc-200 placeholder:text-zinc-600"
+      />
+      <datalist id={listId}>{modelsQuery.data?.models.map((m) => <option key={m} value={m} />)}</datalist>
+    </>
+  )
+}
+
 export default function FusionPage() {
   const [question, setQuestion] = useState('')
   const [seats, setSeats] = useState<Seat[]>([])
@@ -46,7 +77,7 @@ export default function FusionPage() {
   }, [fusionQuery.data])
 
   const providers = Object.entries(configQuery.data?.providers ?? {})
-  const defaultSeat = (): Seat => ({ provider: providers[0]?.[0] ?? '', model: providers[0]?.[1]?.model ?? '' })
+  const defaultSeat = (): Seat => ({ provider: '', model: '' })
   const save = useMutation({
     mutationFn: () => postJSON<FusionConfig>('/api/fusion/config', {
       panel: seats.filter((seat) => seat.provider).map((seat) => `${seat.provider}${seat.model ? `:${seat.model}` : ''}`),
@@ -82,13 +113,13 @@ export default function FusionPage() {
         <div className="mb-4 flex items-center justify-between"><h2 className="text-sm font-semibold text-zinc-200">Panel</h2><label className="text-xs text-zinc-500">Max seats <input aria-label="Maximum panel seats" type="number" min="1" max="8" value={maxPanel} onChange={(e) => setMaxPanel(Math.max(1, Number(e.target.value)))} className="ml-2 w-14 rounded border border-zinc-700 bg-zinc-950 px-1.5 py-1 text-zinc-200" /></label></div>
         <div className="space-y-2">
           {seats.map((seat, index) => <div key={index} className="grid grid-cols-[1fr_1fr_auto] gap-2">
-            <select aria-label={`Panel provider ${index + 1}`} value={seat.provider} onChange={(e) => { const provider = e.target.value; updateSeat(index, 'provider', provider); updateSeat(index, 'model', (configQuery.data?.providers[provider]?.model ?? '')) }} className="min-w-0 rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-2 text-sm text-zinc-200"><option value="">Provider…</option>{providers.map(([name]) => <option key={name} value={name}>{name}</option>)}</select>
-            <input aria-label={`Panel model ${index + 1}`} value={seat.model} onChange={(e) => updateSeat(index, 'model', e.target.value)} placeholder="model (default if blank)" className="min-w-0 rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-2 text-sm text-zinc-200 placeholder:text-zinc-600" />
+            <select aria-label={`Panel provider ${index + 1}`} value={seat.provider} onChange={(e) => { updateSeat(index, 'provider', e.target.value); updateSeat(index, 'model', '') }} className="min-w-0 rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-2 text-sm text-zinc-200"><option value="">Provider…</option>{providers.map(([name]) => <option key={name} value={name}>{name}</option>)}</select>
+            <ModelField ariaLabel={`Panel model ${index + 1}`} provider={seat.provider} value={seat.model} onChange={(value) => updateSeat(index, 'model', value)} />
             <button aria-label={`Remove panel member ${index + 1}`} onClick={() => setSeats((current) => current.filter((_, i) => i !== index))} className="rounded-lg border border-zinc-800 px-2 text-zinc-500 hover:text-red-400"><Trash2 className="h-4 w-4" /></button>
           </div>)}
         </div>
         <button onClick={() => setSeats((current) => current.length < maxPanel ? [...current, defaultSeat()] : current)} disabled={seats.length >= maxPanel} className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-brand-primary disabled:opacity-40"><Plus className="h-3.5 w-3.5" />Add member</button>
-        <div className="mt-5 border-t border-zinc-800 pt-4"><p className="mb-2 text-xs font-medium text-zinc-400">Blind judge <span className="font-normal text-zinc-600">(blank uses the active model)</span></p><div className="grid grid-cols-2 gap-2"><select aria-label="Judge provider" value={judge.provider} onChange={(e) => setJudge({ provider: e.target.value, model: configQuery.data?.providers[e.target.value]?.model ?? '' })} className="rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-2 text-sm text-zinc-200"><option value="">Active provider</option>{providers.map(([name]) => <option key={name} value={name}>{name}</option>)}</select><input aria-label="Judge model" value={judge.model} onChange={(e) => setJudge((current) => ({ ...current, model: e.target.value }))} placeholder="model" className="rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-2 text-sm text-zinc-200 placeholder:text-zinc-600" /></div></div>
+        <div className="mt-5 border-t border-zinc-800 pt-4"><p className="mb-2 text-xs font-medium text-zinc-400">Blind judge <span className="font-normal text-zinc-600">(blank uses the active model)</span></p><div className="grid grid-cols-2 gap-2"><select aria-label="Judge provider" value={judge.provider} onChange={(e) => setJudge({ provider: e.target.value, model: '' })} className="rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-2 text-sm text-zinc-200"><option value="">Active provider</option>{providers.map(([name]) => <option key={name} value={name}>{name}</option>)}</select><ModelField ariaLabel="Judge model" provider={judge.provider} value={judge.model} onChange={(value) => setJudge((current) => ({ ...current, model: value }))} /></div></div>
         <button onClick={() => save.mutate()} disabled={save.isPending} className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-brand-primary disabled:opacity-40">{save.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}Save panel</button>
       </section>
       <section className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 sm:p-5"><label className="mb-2 block text-sm font-semibold text-zinc-200">Question</label><textarea value={question} onChange={(e) => setQuestion(e.target.value)} rows={3} placeholder="Ask the panel…" className="w-full resize-y rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-brand-primary/50 focus:outline-none" /><button onClick={() => run.mutate()} disabled={!question.trim() || run.isPending} className="mt-3 inline-flex items-center gap-2 rounded-lg bg-brand-primary px-3 py-2 text-sm font-medium text-white disabled:opacity-40">{run.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Bot className="h-4 w-4" />}{run.isPending ? 'Panel is answering…' : 'Run Fusion'}</button></section>

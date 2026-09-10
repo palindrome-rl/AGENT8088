@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088 import (cli_anything, documents, efficiency, local_models,
-                       memory, routing, tool_output, web_search)
+                       memory, providers, routing, tool_output, web_search)
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -449,6 +449,10 @@ LIMIT_SPECS = {
     "dynamic_turns_ceiling_multiplier": ("DYNAMIC_TURNS_CEILING_MULTIPLIER", int,
                                          "Turn ceiling as a multiple of max_turns (1 = fixed)"),
     "dynamic_turns_extension":   ("DYNAMIC_TURNS_EXTENSION", int, "Rounds granted per extension"),
+    "max_tool_timeout_seconds":  ("MAX_TOOL_TIMEOUT_SECONDS", int, "Default per-tool timeout ceiling"),
+    "denial_breaker_threshold":  ("DENIAL_BREAKER_THRESHOLD", int, "Repeated denials before the breaker trips"),
+    "context_window":            ("CONTEXT_WINDOW", int, "Global fallback context window"),
+    "max_completion_tokens":     ("MAX_COMPLETION_TOKENS", int, "Global fallback completion ceiling"),
 }
 
 # For most of these 0 means "no limit", so the numeric direction of a change is
@@ -1627,6 +1631,64 @@ def _provider_api_key(provider: dict) -> str:
     return ""
 
 
+class _OpenRouterUsagePoller:
+    """OpenRouter's usage/limit isn't on the inference response like Tier-1
+    providers' headers -- it lives at GET /key, so it needs its own periodic
+    background fetch. Lazily started the first time OpenRouter becomes the
+    active provider; never blocks a turn, and a failed poll just leaves the
+    previous cached value (or None) in place."""
+
+    _INTERVAL = 60.0
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+
+    def ensure_started(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        while True:
+            self._poll_once()
+            if self._stop.wait(self._INTERVAL):
+                return
+
+    def _poll_once(self):
+        global _last_rate_limit_status
+        import urllib.error
+        import urllib.request
+
+        provider = PROVIDERS.get("openrouter") or {}
+        api_key = _provider_api_key(provider)
+        if not api_key:
+            return
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/key",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read()).get("data") or {}
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return
+        limit = data.get("limit")
+        remaining = data.get("limit_remaining")
+        if limit is None or remaining is None:
+            return  # null limit means "unlimited" -- nothing to show a % of
+        try:
+            pct = max(0, min(100, round(100.0 * float(remaining) / max(1.0, float(limit)))))
+        except (TypeError, ValueError):
+            return
+        _last_rate_limit_status = {"provider": "openrouter",
+                                   "pct_remaining": pct, "balance": None}
+
+
+_openrouter_usage_poller = _OpenRouterUsagePoller()
+
+
 def get_client(provider: str = None):
     """Return (client, model_name) for a named provider.
 
@@ -1646,6 +1708,8 @@ def get_client(provider: str = None):
                 "api_base": p.get("base_url", ""),
                 "api_key": _provider_api_key(p),
             }, p.get("model", MODEL_NAME)
+        if name == "openrouter":
+            _openrouter_usage_poller.ensure_started()
         return OpenAI(base_url=p["base_url"],
                       api_key=_provider_api_key(p) or "none",
                       timeout=TIMEOUT_SECONDS), p.get("model", MODEL_NAME)
@@ -1964,6 +2028,68 @@ def _normalised_messages(system_prompt: str, messages: list) -> list:
     return [{"role": "system", "content": "\n\n".join(part for part in leading if part)}, *rest]
 
 
+# Latest parsed rate-limit/usage status, overwritten on every inference call
+# (or every OpenRouter poll) -- only the most recent value matters, this is
+# a status-bar indicator, not a history. See providers.RATE_LIMIT_HEADERS
+# for which providers this gets populated for. Shape:
+#   {"provider": str,
+#    "pct_remaining": int|None,
+#    "balance": {"amount": float, "currency": str}|None}
+# None (the default) means "nothing to show" -- the status bar renders no
+# segment at all rather than a placeholder.
+#
+# The "provider" tag is load-bearing: this is one global, but a session
+# switches providers freely (/model setup, /model <name>). Without it, a
+# percentage read from Groq kept being displayed after switching to a
+# provider that publishes no quota at all (a custom endpoint, OpenRouter
+# before its first poll) -- a stale number under the wrong provider's name,
+# which is worse than showing nothing. current_rate_limit_status() is the
+# only supported reader and enforces the match.
+_last_rate_limit_status = None
+
+
+def current_rate_limit_status(provider_name: str) -> dict | None:
+    """The live status IF it belongs to `provider_name`, else None.
+
+    Callers must go through this rather than reading _last_rate_limit_status
+    directly, so a value captured under one provider can never be rendered
+    under another."""
+    status = _last_rate_limit_status
+    if not status or not provider_name:
+        return None
+    return status if status.get("provider") == provider_name else None
+
+
+def _parse_rate_limit_headers(provider_name: str, headers) -> dict | None:
+    """Best-effort: a header missing, malformed, or unparseable just means a
+    smaller/absent normalized dict, never an exception -- this must not be
+    able to break an otherwise-successful inference call."""
+    spec = providers.RATE_LIMIT_HEADERS.get(provider_name)
+    if not spec:
+        return None
+    try:
+        def _get(key):
+            name = spec.get(key)
+            return headers.get(name) if name else None
+
+        tokens_remaining = _get("tokens_remaining")
+        tokens_limit = _get("tokens_limit")
+        requests_remaining = _get("requests_remaining")
+        requests_limit = _get("requests_limit")
+        pct_candidates = []
+        if tokens_remaining is not None and tokens_limit is not None:
+            pct_candidates.append(100.0 * float(tokens_remaining) / max(1.0, float(tokens_limit)))
+        if requests_remaining is not None and requests_limit is not None:
+            pct_candidates.append(100.0 * float(requests_remaining) / max(1.0, float(requests_limit)))
+        if not pct_candidates:
+            return None
+        return {"provider": provider_name,
+                "pct_remaining": max(0, min(100, round(min(pct_candidates)))),
+                "balance": None}
+    except (TypeError, ValueError):
+        return None
+
+
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False):
@@ -2031,20 +2157,62 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     if effort and not _skip_optional:
         request_options["extra_body"] = {"reasoning_effort": effort}
     _raise_if_interrupted(interrupt_check)
+    global _last_rate_limit_status
+    track_rate_limits = provider_name in providers.RATE_LIMIT_HEADERS
+
+    def _do_create():
+        # Only Tier-1 providers (providers.RATE_LIMIT_HEADERS) pay for the
+        # raw-response detour; everyone else keeps today's plain .create()
+        # call completely unchanged.
+        global _last_rate_limit_status
+        if not track_rate_limits:
+            return client.chat.completions.create(**request_options)
+        raw = client.chat.completions.with_raw_response.create(**request_options)
+        parsed = _parse_rate_limit_headers(provider_name, raw.headers)
+        if parsed is not None:
+            _last_rate_limit_status = parsed
+        return raw.parse()
+
     if on_token is None:
         try:
-            return client.chat.completions.create(**request_options)
+            return _do_create()
         except Exception as exc:
             if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
-                return client.chat.completions.create(**request_options)
+                return _do_create()
             raise
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
     if MODEL_TELEMETRY_ENABLED and not _skip_optional:
         request_options['stream_options'] = {'include_usage': True}
     stream_started = time.monotonic()
+    # with_raw_response (used by _do_create above) is fine for a fully-buffered
+    # non-streaming reply, but would eagerly read the whole SSE body before
+    # .parse() returns -- defeating live token-by-token rendering. Tier-1
+    # streaming instead uses with_streaming_response, a context manager that
+    # keeps the connection open for lazy iteration; headers arrive with the
+    # response before any chunk is read, so they're captured right after
+    # entering. _close_stream_ctx never raises -- cleanup must not be able to
+    # mask the real exception or crash an otherwise-fine turn.
+    stream_ctx = None
+
+    def _close_stream_ctx():
+        if stream_ctx is not None:
+            try:
+                stream_ctx.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
     try:
-        stream = client.chat.completions.create(**request_options, stream=True)
+        if track_rate_limits:
+            stream_ctx = client.chat.completions.with_streaming_response.create(**request_options, stream=True)
+            raw = stream_ctx.__enter__()
+            parsed = _parse_rate_limit_headers(provider_name, raw.headers)
+            if parsed is not None:
+                _last_rate_limit_status = parsed
+            stream = raw.parse()
+        else:
+            stream = client.chat.completions.create(**request_options, stream=True)
     except Exception as exc:
+        _close_stream_ctx()
         if not _skip_optional and _is_unknown_param_error(exc):
             return _create_completion(
                 client, messages, tools, max_tokens=max_tokens,
@@ -2082,6 +2250,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         raise
     finally:
         _finish_interrupt_watcher(stop, watcher)
+        _close_stream_ctx()
     response = _build_response("".join(collected), tool_chunks, finish_reason)
     response.usage = stream_usage
     response.first_token_ms = stream_first

@@ -316,6 +316,35 @@ def test_probe_finds_top_provider_max_completion_tokens():
     assert out == 8192
 
 
+def test_probe_finds_top_level_max_completion_tokens():
+    """Groq (and others) publish max_completion_tokens directly on the model
+    object, not nested under top_provider like OpenRouter -- a 512-token
+    classifier model (e.g. Llama Prompt Guard 2) reported this way was being
+    missed entirely, so a real turn kept its 65000-token default and 400'd."""
+    from agent8088 import providers
+
+    class _M:
+        id = "meta-llama/llama-prompt-guard-2-86m"
+        context_window = 512
+        max_completion_tokens = 512
+
+    class _Resp:
+        data = [_M()]
+
+    class _Client:
+        base_url = "http://groq.example.com/v1"
+        api_key = ""
+        class models:
+            @staticmethod
+            def list():
+                return _Resp()
+
+    ctx, out = providers.probe_model_context_window(
+        _Client(), "meta-llama/llama-prompt-guard-2-86m", provider_name="groq")
+    assert ctx == 512
+    assert out == 512
+
+
 def test_probe_returns_none_when_no_field():
     from agent8088 import providers
 

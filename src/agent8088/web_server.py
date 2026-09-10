@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -267,6 +268,7 @@ async def get_status():
         "permission_mode": A.PERMISSION_MODE,
         "session_name": S.name or "",
         "last_usage": S.last_usage,
+        "rate_limit_status": A.current_rate_limit_status(C._active_provider_name()),
         "verbose": S.verbose,
         "usage_mode": S.usage_mode,
         "show_trace": S.show_trace,
@@ -771,7 +773,12 @@ async def get_providers():
         "builtins": list(BUILTIN_PROVIDERS.keys()),
         "active": _cl()._active_provider_name() if _cl() else "",
         "details": {k: {"label": v.get("label", k), "base_url": v.get("base_url", ""),
-                        "default_model": v.get("default_model", ""), "api_key_env": v.get("api_key_env", "")}
+                        "default_model": v.get("default_model", ""), "api_key_env": v.get("api_key_env", ""),
+                        # Whether a key is actually resolvable right now (.env, config,
+                        # or ambient env var -- see _provider_api_key's precedence) --
+                        # runtime PROVIDERS may have a key the static BUILTIN_PROVIDERS
+                        # defaults don't know about, so check the merged config first.
+                        "has_key": bool(A._provider_api_key(A.PROVIDERS.get(k) or v))}
                     for k, v in BUILTIN_PROVIDERS.items()},
     }
 
@@ -1837,9 +1844,31 @@ class _ConnectionManager:
 manager = _ConnectionManager()
 
 
+def _websocket_origin_allowed(ws: WebSocket) -> bool:
+    """Reject a cross-origin WebSocket handshake (CSWSH): a page on another
+    site cannot open a WS to this local server and ride the browser's
+    same-origin cookies/session. Allowed: same-origin as this server's own
+    Host header (correct regardless of --web-host/--web-port), plus the
+    fixed Vite dev-proxy origins already trusted by CORS above. A request
+    with no Origin header at all (non-browser clients: curl, native tools)
+    is let through -- Origin checks are a browser-enforced mechanism and
+    cannot meaningfully gate non-browser callers anyway."""
+    origin = ws.headers.get("origin", "")
+    if not origin:
+        return True
+    host = ws.headers.get("host", "")
+    origin_host = urllib.parse.urlparse(origin).netloc
+    if host and origin_host == host:
+        return True
+    return origin in {"http://127.0.0.1:5180", "http://localhost:5180"}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     """Bidirectional WebSocket for streaming agent turns, tool events, approvals."""
+    if not _websocket_origin_allowed(ws):
+        await ws.close(code=4403)
+        return
     await manager.connect(ws)
     A, C = _eng(), _cl()
     # A turn runs as its own task so this loop keeps reading. Awaiting the turn
@@ -2108,7 +2137,9 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "answer", "text": scrub_markup(answer),
                           "usage": {"seconds": elapsed, "tokens": tokens_ref[0],
-                                    "context": C._estimate_context_pct()}}),
+                                    "context": C._estimate_context_pct()},
+                          "rate_limit_status": A.current_rate_limit_status(
+                              C._active_provider_name())}),
             loop,
         )
 
@@ -2136,17 +2167,26 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                 tools_def=lambda: A.build_tools_def(C._active_tool_specs()),
                 allowed_tools=lambda: set(C._active_tool_specs()),
             )
-            S.last_usage = {"seconds": time.time() - turn_start,
+            elapsed = time.time() - turn_start
+            S.last_usage = {"seconds": elapsed,
                              "tokens": tokens_ref[0],
                              "context": C._estimate_context_pct()}
+            # The CLI's do_chat calls this same helper on every successful
+            # turn (cli.py's own success path) -- the web path built `trace`
+            # above but never recorded it, so GET /api/history's
+            # conversation_trace (what the Sessions page's trace viewer
+            # reads) stayed empty even with "Show trace" on.
+            C._record_trace(text, trace, elapsed)
             C._save_active_session()
             asyncio.run_coroutine_threadsafe(
                 ws.send_json({"type": "session_saved", "name": S.name or ""}),
                 loop,
             )
         except A.AgentInterrupted:
+            elapsed = time.time() - turn_start
+            C._record_trace(text, trace, elapsed, interrupted=True)
             asyncio.run_coroutine_threadsafe(
-                ws.send_json({"type": "interrupted", "elapsed": time.time() - turn_start,
+                ws.send_json({"type": "interrupted", "elapsed": elapsed,
                               "partial": ""}),
                 loop,
             )
