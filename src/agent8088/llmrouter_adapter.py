@@ -5,6 +5,19 @@ from urllib.parse import urlsplit
 
 import httpx
 
+# A refused connection is not free: Windows retransmits the SYN before giving
+# up, so a stopped service costs seconds per turn rather than microseconds.
+# Same reasoning as the memory embedder's breaker -- a service that is down
+# fails identically every time, so learning that once is enough.
+_BREAKER_SECONDS = 60
+_failed_at = 0.0
+
+
+def reset_breaker() -> None:
+    """Forget a recorded failure. For tests and for a deliberate re-probe."""
+    global _failed_at
+    _failed_at = 0.0
+
 
 def recommend(config, messages, candidates):
     """Return (candidate or None, metadata). Fail closed to the existing ladder.
@@ -12,11 +25,16 @@ def recommend(config, messages, candidates):
     candidates is an operator-approved, already context/health-filtered list of
     (provider, model) pairs. Never accept a new provider from the service.
     """
+    global _failed_at
     started = time.monotonic()
     mode = str(config.get('llmrouter_mode', 'off')).lower()
     meta = {'type': 'routing_decision', 'backend': 'llmrouter', 'mode': mode}
     if mode not in ('shadow', 'enabled'):
         return None, dict(meta, reason='disabled')
+    breaker = float(config.get('llmrouter_breaker_seconds', _BREAKER_SECONDS))
+    if _failed_at and (time.monotonic() - _failed_at) < breaker:
+        return None, dict(meta, reason='router_unavailable_recently',
+                          applied=False, latency_ms=0)
     try:
         url = str(config.get('llmrouter_url', 'http://127.0.0.1:8191/route'))
         parsed = urlsplit(url)
@@ -55,8 +73,10 @@ def recommend(config, messages, candidates):
             raise ValueError('router selected an ineligible model')
         meta.update(reason='selected', selected=selected,
                     applied=mode == 'enabled')
+        _failed_at = 0.0
         return (ids[selected] if mode == 'enabled' else None), meta
     except Exception as exc:
+        _failed_at = time.monotonic()
         # Never log response bodies, input text, tokens or exception messages.
         meta.update(reason='router_unavailable_or_invalid', error_type=type(exc).__name__, applied=False)
         return None, meta

@@ -8,6 +8,20 @@ import pytest
 from agent8088 import llmrouter_adapter as adapter
 
 
+@pytest.fixture(autouse=True)
+def _fresh_breaker():
+    """The adapter remembers a failed router at module scope.
+
+    That is the point -- a service that is down should not be re-probed once
+    per turn. It also means one test's failure would silence the next one's
+    request, so each test starts from a clean slate.
+    """
+    from agent8088 import llmrouter_adapter
+    llmrouter_adapter.reset_breaker()
+    yield
+    llmrouter_adapter.reset_breaker()
+
+
 def transport(monkeypatch, result=None, status=200):
     calls = []
     real = httpx.Client
@@ -110,3 +124,61 @@ def test_service_auth_and_selection():
     assert response.json() == {'model_name':'p:strong'}
     body['candidates'] = ['p:cheap']
     assert client.post('/route', json=body, headers={'Authorization':'Bearer test-token'}).status_code == 422
+
+
+# --- a dead router must not tax every turn ---------------------------------
+
+def test_a_failed_router_is_not_retried_on_the_next_turn(monkeypatch):
+    """Found live: a refused loopback connect costs ~2.4s on Windows.
+
+    Windows retransmits the SYN before giving up, so 'nothing is listening'
+    is not free the way it is on Linux. Paid once per turn, an operator who
+    stopped the service sees every turn get slower for no stated reason. The
+    same breaker the memory embedder uses applies: fail once, then stop
+    asking until the window passes.
+    """
+    from agent8088 import llmrouter_adapter as adapter
+    adapter.reset_breaker()
+    calls = []
+
+    class Boom:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, *a, **k):
+            calls.append(1)
+            raise OSError("connection refused")
+
+    monkeypatch.setattr(adapter.httpx, "Client", Boom)
+    monkeypatch.setenv("AGENT8088_ROUTER_TOKEN", "t")
+    config = {"llmrouter_mode": "enabled"}
+    messages = [{"role": "user", "content": "hello"}]
+    candidates = [("p", "m")]
+
+    first, meta1 = adapter.recommend(config, messages, candidates)
+    second, meta2 = adapter.recommend(config, messages, candidates)
+
+    assert first is None and second is None, "a failing router must not select"
+    assert len(calls) == 1, (
+        f"the dead router was contacted {len(calls)} times; the second turn "
+        f"should have been short-circuited by the breaker")
+    assert meta2["reason"] == "router_unavailable_recently"
+
+
+def test_the_breaker_reopens_after_its_window(monkeypatch):
+    from agent8088 import llmrouter_adapter as adapter
+    adapter.reset_breaker()
+
+    class Boom:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, *a, **k): raise OSError("refused")
+
+    monkeypatch.setattr(adapter.httpx, "Client", Boom)
+    monkeypatch.setenv("AGENT8088_ROUTER_TOKEN", "t")
+    config = {"llmrouter_mode": "enabled", "llmrouter_breaker_seconds": "0"}
+    adapter.recommend(config, [{"role": "user", "content": "x"}], [("p", "m")])
+    _, meta = adapter.recommend(config, [{"role": "user", "content": "x"}], [("p", "m")])
+    assert meta["reason"] != "router_unavailable_recently", (
+        "a zero-length window must not latch the breaker shut")
