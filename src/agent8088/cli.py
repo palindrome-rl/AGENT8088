@@ -2649,9 +2649,29 @@ def _ocr_module():
     return ocr
 
 
+_VISION_NOTICE_SHOWN = set()
+
+
 def _vision_capable() -> bool:
+    """Whether the active model can read images, saying so when it is a guess.
+
+    The client is handed over so an uncatalogued model can be probed rather
+    than merely assumed blind. When even that comes back empty the fallback is
+    announced once per provider:model -- not once per attachment, which would
+    be noise -- because an unannounced fallback is how a stale catalog stays
+    stale: a vision model quietly receives OCR text and nobody ever finds out.
+    """
     from agent8088 import model_catalog
-    return model_catalog.vision_capable(_active_provider_name(), A.MODEL_NAME)
+
+    provider = _active_provider_name()
+    decision = model_catalog.vision_decision(
+        provider, A.MODEL_NAME, client=getattr(A, "client", None))
+    key = f"{provider}:{A.MODEL_NAME}"
+    if decision.source == "default" and key not in _VISION_NOTICE_SHOWN:
+        _VISION_NOTICE_SHOWN.add(key)
+        console.print(f"[dim]treating {key} as text-only (uncatalogued) — using OCR. "
+                      f"Declare it in model_catalog.json if it can see.[/dim]")
+    return decision.vision
 
 
 _OCR_NOTE = ("[Agent8088 OCR transcript — this model cannot read images, so the "

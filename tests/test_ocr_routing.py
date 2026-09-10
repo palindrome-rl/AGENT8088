@@ -85,7 +85,7 @@ def _stub_ocr(monkeypatch, text="RECOGNISED TEXT", error=None):
 
 def test_a_blind_model_gets_ocr_text_for_an_image(monkeypatch, tmp_path):
     calls = _stub_ocr(monkeypatch)
-    monkeypatch.setattr(web, "_vision_capable", lambda: False)
+    monkeypatch.setattr(web, "_vision_capable_probed", lambda: False)
     context = web._attachment_ocr_context([_attachment(tmp_path)])
     assert "RECOGNISED TEXT" in context
     assert len(calls) == 1
@@ -93,14 +93,14 @@ def test_a_blind_model_gets_ocr_text_for_an_image(monkeypatch, tmp_path):
 
 def test_a_vision_model_gets_no_ocr_and_the_engine_is_never_called(monkeypatch, tmp_path):
     calls = _stub_ocr(monkeypatch)
-    monkeypatch.setattr(web, "_vision_capable", lambda: True)
+    monkeypatch.setattr(web, "_vision_capable_probed", lambda: True)
     assert web._attachment_ocr_context([_attachment(tmp_path)]) == ""
     assert calls == []
 
 
 def test_a_scanned_pdf_is_ocrd_only_once_extraction_has_come_up_empty(monkeypatch, tmp_path):
     calls = _stub_ocr(monkeypatch)
-    monkeypatch.setattr(web, "_vision_capable", lambda: False)
+    monkeypatch.setattr(web, "_vision_capable_probed", lambda: False)
     scanned = _attachment(tmp_path, "scan.pdf", warning="This PDF has no extractable text")
     assert "RECOGNISED TEXT" in web._attachment_ocr_context([scanned])
     assert len(calls) == 1
@@ -108,7 +108,7 @@ def test_a_scanned_pdf_is_ocrd_only_once_extraction_has_come_up_empty(monkeypatc
 
 def test_a_text_bearing_pdf_is_left_to_document_read(monkeypatch, tmp_path):
     calls = _stub_ocr(monkeypatch)
-    monkeypatch.setattr(web, "_vision_capable", lambda: False)
+    monkeypatch.setattr(web, "_vision_capable_probed", lambda: False)
     readable = _attachment(tmp_path, "report.pdf")
     assert web._attachment_ocr_context([readable]) == ""
     assert calls == []
@@ -116,7 +116,7 @@ def test_a_text_bearing_pdf_is_left_to_document_read(monkeypatch, tmp_path):
 
 def test_ocr_failure_is_reported_to_the_model_not_swallowed(monkeypatch, tmp_path):
     _stub_ocr(monkeypatch, error="OCR is not installed")
-    monkeypatch.setattr(web, "_vision_capable", lambda: False)
+    monkeypatch.setattr(web, "_vision_capable_probed", lambda: False)
     context = web._attachment_ocr_context([_attachment(tmp_path)])
     assert "could not be read" in context
     assert "OCR is not installed" in context
@@ -124,14 +124,14 @@ def test_ocr_failure_is_reported_to_the_model_not_swallowed(monkeypatch, tmp_pat
 
 def test_the_ocr_block_names_the_file_and_frames_it_as_untrusted(monkeypatch, tmp_path):
     _stub_ocr(monkeypatch)
-    monkeypatch.setattr(web, "_vision_capable", lambda: False)
+    monkeypatch.setattr(web, "_vision_capable_probed", lambda: False)
     context = web._attachment_ocr_context([_attachment(tmp_path, "invoice.png")])
     assert "invoice.png" in context
     assert "untrusted" in context.lower()
 
 
 def test_one_failing_attachment_does_not_lose_the_others(monkeypatch, tmp_path):
-    monkeypatch.setattr(web, "_vision_capable", lambda: False)
+    monkeypatch.setattr(web, "_vision_capable_probed", lambda: False)
 
     def text_for(path, **kwargs):
         if "bad" in str(path):
@@ -244,3 +244,138 @@ def test_a_vision_model_never_probes_the_ocr_engine_on_upload(monkeypatch, tmp_p
     result = asyncio.run(web.upload_attachment(
         Request({"type": "http", "headers": [(b"x-filename", b"shot.png")]}, receive)))
     assert result["status"] == "ready"
+
+
+# --- capability source is reported to the user ------------------------------
+#
+# The old gate answered False for anything it did not recognise and said
+# nothing, so a stale catalog stayed stale: a vision model quietly received an
+# OCR transcript for the life of the install. These cover the replacement --
+# the wider match, and the one line that makes a fallback visible.
+
+class _RecordingConsole:
+    """Stand-in for cli.console recording print() calls as text."""
+
+    def __init__(self):
+        self.lines = []
+
+    def print(self, *args, **kwargs):
+        self.lines.append(" ".join(str(a) for a in args))
+
+    def text(self):
+        return "\n".join(self.lines)
+
+
+def _cli_with_model(monkeypatch, provider, model, client=object()):
+    from agent8088 import cli
+
+    recorder = _RecordingConsole()
+    monkeypatch.setattr(cli, "console", recorder)
+    monkeypatch.setattr(cli, "_active_provider_name", lambda: provider)
+    monkeypatch.setattr(cli.A, "MODEL_NAME", model)
+    monkeypatch.setattr(cli.A, "client", client, raising=False)
+    cli._VISION_NOTICE_SHOWN.clear()
+    return cli, recorder
+
+
+def test_an_uncatalogued_model_says_so_once(monkeypatch):
+    cli, recorder = _cli_with_model(monkeypatch, "rtx3090", "qwen3.8-27b-rtx3090-long")
+    monkeypatch.setattr("agent8088.providers.probe_model_vision", lambda *a, **k: None)
+
+    assert cli._vision_capable() is False
+    assert cli._vision_capable() is False
+
+    # Once per provider:model per session, not once per attachment.
+    assert recorder.text().count("text-only") == 1
+    assert "qwen3.8-27b-rtx3090-long" in recorder.text()
+
+
+def test_a_catalogued_model_says_nothing(monkeypatch):
+    cli, recorder = _cli_with_model(monkeypatch, "openai", "gpt-4o")
+    assert cli._vision_capable() is True
+    assert recorder.text() == ""
+
+
+def test_a_probed_answer_says_nothing(monkeypatch):
+    """Only the bare fallback is worth a line; a live answer is not a guess."""
+    cli, recorder = _cli_with_model(monkeypatch, "rtx3090", "some-vl-build")
+    monkeypatch.setattr("agent8088.providers.probe_model_vision", lambda *a, **k: True)
+    assert cli._vision_capable() is True
+    assert recorder.text() == ""
+
+
+def test_a_version_suffixed_vision_model_keeps_the_image_path(monkeypatch, tmp_path):
+    """The end-to-end point of the change: gemini-2.5-flash-002 is the same
+    model as the catalogued gemini-2.5-flash and must not be sent OCR text."""
+    cli, _ = _cli_with_model(monkeypatch, "gemini", "gemini-2.5-flash-002")
+    shot = tmp_path / "shot.png"
+    shot.write_bytes(b"bytes")
+
+    monkeypatch.setattr(cli, "_ocr_module", lambda: types.SimpleNamespace(
+        text_for=lambda path, **k: (_ for _ in ()).throw(
+            AssertionError("a vision model must not be sent OCR text")),
+        needs_ocr=lambda p: True))
+    monkeypatch.setattr(cli.A, "build_image_message",
+                        lambda text, refs, resolver=None: {"role": "user", "content": [{"type": "text", "text": text}]})
+
+    message = cli._image_user_message("What is this?", str(shot))
+    assert isinstance(message["content"], list)
+
+
+def test_the_cli_gate_passes_its_client_so_a_probe_can_run(monkeypatch):
+    seen = []
+    sentinel = object()
+    cli, _ = _cli_with_model(monkeypatch, "rtx3090", "unknown-build", client=sentinel)
+
+    def _probe(client, model_id, provider_name="", **kwargs):
+        seen.append((client, model_id, provider_name))
+        return False
+
+    monkeypatch.setattr("agent8088.providers.probe_model_vision", _probe)
+    assert cli._vision_capable() is False
+    assert seen == [(sentinel, "unknown-build", "rtx3090")]
+
+
+def test_the_upload_chip_never_pays_for_a_probe(monkeypatch, tmp_path):
+    """The chip is advisory feedback while an upload is in flight; a network
+    round-trip there would be charged to the user's wait, so it stays offline."""
+    import asyncio
+    from types import SimpleNamespace
+    from starlette.requests import Request
+
+    monkeypatch.setattr(web, "_eng", lambda: SimpleNamespace(
+        ARTIFACTS_ROOT=tmp_path, MODEL_NAME="qwen3.8-27b-rtx3090-long", client=object()))
+    monkeypatch.setattr(web, "_cl", lambda: SimpleNamespace(
+        S=SimpleNamespace(name="s"), _active_provider_name=lambda: "rtx3090"))
+    monkeypatch.setattr(web, "_ocr_module", lambda: types.SimpleNamespace(available=lambda: True))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("the upload chip must not probe the endpoint")
+
+    monkeypatch.setattr("agent8088.providers.probe_model_vision", unexpected)
+
+    async def receive():
+        return {"type": "http.request", "body": b"bytes", "more_body": False}
+
+    result = asyncio.run(web.upload_attachment(
+        Request({"type": "http", "headers": [(b"x-filename", b"shot.png")]}, receive)))
+    assert result["status"] == "ready"
+
+
+def test_the_web_send_path_passes_its_client(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    seen = []
+    sentinel = object()
+    monkeypatch.setattr(web, "_eng", lambda: SimpleNamespace(
+        MODEL_NAME="unknown-build", client=sentinel))
+    monkeypatch.setattr(web, "_cl", lambda: SimpleNamespace(
+        _active_provider_name=lambda: "rtx3090"))
+
+    def _probe(client, model_id, provider_name="", **kwargs):
+        seen.append((client, model_id, provider_name))
+        return False
+
+    monkeypatch.setattr("agent8088.providers.probe_model_vision", _probe)
+    assert web._vision_capable_probed() is False
+    assert seen == [(sentinel, "unknown-build", "rtx3090")]
