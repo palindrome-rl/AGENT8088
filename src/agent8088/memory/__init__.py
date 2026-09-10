@@ -20,6 +20,7 @@ Two invariants hold across this whole package:
 """
 
 import logging
+import os
 import threading
 
 from .embed import Embedder
@@ -35,7 +36,22 @@ from .store import MemoryStore, MemoryStoreError
 log = logging.getLogger("agent8088.memory")
 
 __all__ = ["MemoryStore", "MemoryStoreError", "capture", "configure", "embedder",
-           "enabled", "recall", "recall_block", "reset", "status", "store"]
+           "enabled", "parse_memory_engine_config", "recall", "recall_block",
+           "reset", "status", "store"]
+
+def parse_memory_engine_config(config=None):
+    """Extract memory engine selection and Mem0 settings from configuration dict."""
+    config = config or {}
+    engine_name = str(config.get("memory_engine", "native")).strip().lower()
+    if engine_name not in {"native", "mem0"}:
+        engine_name = "native"
+
+    mem0_cfg = {
+        "vector_store": str(config.get("memory_mem0_vector_store", "qdrant")).strip().lower(),
+        "path": os.path.expanduser(str(config.get("memory_mem0_dir", "~/.agent8088/mem0")).strip()),
+        "disable_telemetry": True,
+    }
+    return engine_name, mem0_cfg
 
 # The header the recalled block carries into the system prompt. The framing is
 # load-bearing rather than decorative: memory poisoning to privilege escalation

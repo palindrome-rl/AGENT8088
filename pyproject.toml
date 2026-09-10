@@ -95,6 +95,7 @@ litellm = ["litellm>=1,<2"]
 # and Surya (restricted weights, needs vllm or llama.cpp alongside), PyMuPDF
 # (AGPL) and Tesseract (per-OS system binary) are not.
 ocr = ["rapidocr>=3,<4", "onnxruntime>=1.17,<2", "pypdfium2>=4,<6"]
+mem0 = ["mem0ai>=0.1.40"]
 
 [project.scripts]
 agent8088 = "agent8088.cli:main"

@@ -226,8 +226,17 @@ sandbox_runtime_version=0.0.73
 # never authorise a tool call: check_permission does not read them.
 memory=1
 #
-# Where memories live. One SQLite file, mode 0600. Delete it and memory is gone;
-# nothing else is affected.
+# Memory engine backend: `native` (default built-in SQLite with BM25 + vector RRF)
+# or `mem0` (uses Mem0 library with graph/vector entity management).
+# memory_engine=native
+#
+# Mem0 vector store backend (defaults to embedded local qdrant)
+# memory_mem0_vector_store=qdrant
+#
+# Mem0 local data directory
+# memory_mem0_dir=~/.agent8088/mem0
+#
+# Where memories live for the native engine. One SQLite file, mode 0600.
 # memory_db_path=~/.agent8088/memory.db
 #
 # Who owns the memories. One identity by default, so a fact learned in the
