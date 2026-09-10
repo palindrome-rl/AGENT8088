@@ -201,3 +201,104 @@ def test_a_caller_can_opt_out_of_growth(loop, engine):
 
     assert len(executed) == 4, (
         f"dynamic_turns=False still extended to {len(executed)} rounds")
+
+
+# --- abuse: what "progress" must NOT be worth ------------------------------
+
+class _AlternatingModel:
+    """Two commands, alternating. Never an exact consecutive repeat.
+
+    The stall detector compares a call to the one immediately before it, so
+    A/B/A/B slips past it forever while doing nothing. This is not an exotic
+    attack -- a model oscillating between two tools is an ordinary failure.
+    """
+
+    def __init__(self):
+        self.rounds = 0
+
+    def __call__(self, messages, tools, **kwargs):
+        self.rounds += 1
+        if not tools:
+            return _text_response("I did not get anywhere")
+        return _tool_call_response(
+            "execute_shell", {"command": "echo A" if self.rounds % 2 else "echo B"})
+
+
+def test_alternating_no_op_calls_do_not_farm_extensions(monkeypatch, engine):
+    """Churn through two commands the run has already seen is not progress."""
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _AlternatingModel())
+    executed = []
+    monkeypatch.setattr(engine, "run_tool",
+                        lambda name, args, **kw: executed.append(args) or "ok")
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+
+    engine.run_agent([{"role": "user", "content": "go"}], max_turns=4)
+
+    assert len(executed) <= 6, (
+        f"two alternating no-op commands farmed {len(executed)} rounds")
+
+
+def test_one_good_round_in_five_does_not_buy_the_next_five(loop, engine):
+    """The grant covers a block, so the block -- not one round -- must earn it.
+
+    Checking only the round that happens to sit on the boundary lets a run that
+    is failing 80% of the time reach the full ceiling.
+    """
+    model, _ = loop()
+    monkeypatch_multiplier(engine, 4)
+    calls = [0]
+
+    def tool(name, args, **kw):
+        calls[0] += 1
+        # The 4th, 9th and 14th calls are the ones sitting on a boundary.
+        return "ok" if calls[0] in {4, 9, 14} else "Error: that did not work"
+
+    engine.run_tool = tool
+
+    engine.run_agent([{"role": "user", "content": "go"}], max_turns=4)
+
+    assert calls[0] <= 9, (
+        f"a run succeeding 1 round in 5 reached {calls[0]} rounds")
+
+
+# --- sub-agents: growth and its guards, end to end -------------------------
+
+def test_a_subagent_doing_serial_work_grows_past_its_own_max_turns(loop, engine):
+    """A delegated task can be as serial as the one that delegated it."""
+    monkeypatch_multiplier(engine, 4)
+    _, executed = loop()
+    engine._active_role = "subagent:researcher"
+
+    engine.run_agent([{"role": "user", "content": "follow the chain"}],
+                     max_turns=4, depth=1)
+
+    assert len(executed) > 4, (
+        f"sub-agent stopped at {len(executed)} rounds while still progressing")
+
+
+def test_the_auditor_never_grows_however_well_it_is_doing(loop, engine):
+    """Verification is bounded work; growth here inflates the audit share."""
+    monkeypatch_multiplier(engine, 4)
+    _, executed = loop()
+    engine._active_role = "subagent:auditor"
+
+    engine.run_agent([{"role": "user", "content": "verify it"}],
+                     max_turns=4, depth=1)
+
+    assert len(executed) == 4, (
+        f"auditor grew to {len(executed)} rounds")
+
+
+def test_churn_inside_a_subagent_is_guarded_too(monkeypatch, engine):
+    """The block ledger is in the shared loop, so delegation cannot escape it."""
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _AlternatingModel())
+    executed = []
+    monkeypatch.setattr(engine, "run_tool",
+                        lambda name, args, **kw: executed.append(args) or "ok")
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    engine._active_role = "subagent:researcher"
+
+    engine.run_agent([{"role": "user", "content": "go"}], max_turns=4, depth=1)
+
+    assert len(executed) <= 6, (
+        f"a sub-agent farmed {len(executed)} rounds on two no-op commands")

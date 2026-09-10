@@ -9672,25 +9672,42 @@ class _TurnPolicy:
         self.limit = max(1, int(limit))
         self.ceiling = max(self.limit, int(ceiling))
         self.extension = max(1, int(extension))
+        # A grant buys a BLOCK of rounds, so the block has to earn it. Judging
+        # only the round that happens to land on the boundary is a sampling
+        # error a run can walk straight through: succeed once every fifth
+        # round and the whole ceiling is yours.
+        self._block_start = 0
+        self._productive = 0
 
     @property
     def growable(self) -> bool:
         return self.ceiling > self.limit
 
-    def extend(self, turn: int, *, last_output: str | None):
-        """Grant another block of rounds, or return None.
+    def record_round(self, *, fresh: bool, output: str | None) -> None:
+        """Count one round that ran a tool, productive or not.
 
-        Called only from the loop's "a new tool ran this round" branch, so
-        progress is already established; what is checked here is that the run is
-        actually up against its limit and that the work it just did held up.
+        Productive means both halves: the run did something it had not already
+        done, and that something worked. Either half alone is cheap to fake --
+        a model alternating between two commands it has already run never trips
+        the consecutive-repeat guard, and a run that fails constantly still
+        lands the occasional success.
         """
+        if fresh and output is not None and not _plan_step_failed(output):
+            self._productive += 1
+
+    def extend(self, turn: int):
+        """Grant another block of rounds, or return None."""
         if not self.growable or turn + 1 != self.limit:
             return None
-        if last_output is None or _plan_step_failed(last_output):
+        block = self.limit - self._block_start
+        if self._productive * 2 <= block:   # most of the block did nothing new
             return None
         previous = self.limit
         self.limit = min(self.limit + self.extension, self.ceiling)
-        return (previous, self.limit) if self.limit > previous else None
+        if self.limit <= previous:
+            return None
+        self._block_start, self._productive = previous, 0
+        return (previous, self.limit)
 
 
 def _turn_policy(max_turns: int, *, depth: int = 0, role: str | None = None,
@@ -9781,6 +9798,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     last_completed = None  # consecutive identical call -> (signature, output)
+    seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
@@ -10139,6 +10157,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             on_calls(calls)
 
         executed = False
+        round_fresh = False  # did this round do something the run had not done?
         turn_tools = [] if trace is not None else None
         for call in calls:
             name = call["name"]
@@ -10275,6 +10294,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                   "tool": name, "count": parse_error_retries})
                 continue
             executed = executed or not no_progress
+            if not no_progress and sig not in seen_signatures:
+                round_fresh = True
+            seen_signatures.add(sig)
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
@@ -10374,8 +10396,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed:
             forcing = False
-            granted = policy.extend(
-                turn, last_output=tool_outputs[-1] if tool_outputs else None)
+            policy.record_round(
+                fresh=round_fresh,
+                output=tool_outputs[-1] if tool_outputs else None)
+            granted = policy.extend(turn)
             if granted and trace is not None:
                 trace.append({"turn": turn, "type": "turn_extension",
                               "from": granted[0], "to": granted[1]})
