@@ -49,6 +49,10 @@ def parse_memory_engine_config(config=None):
     mem0_cfg = {
         "vector_store": str(config.get("memory_mem0_vector_store", "qdrant")).strip().lower(),
         "path": os.path.expanduser(str(config.get("memory_mem0_dir", "~/.agent8088/mem0")).strip()),
+        "llm_provider": str(config.get("memory_mem0_llm_provider") or config.get("provider") or "").strip().lower(),
+        "llm_model": str(config.get("memory_mem0_llm_model") or config.get("model") or "").strip(),
+        "embed_provider": str(config.get("memory_mem0_embed_provider") or config.get("memory_embed_provider") or "").strip().lower(),
+        "embed_model": str(config.get("memory_mem0_embed_model") or config.get("memory_embed_model") or "").strip(),
         "disable_telemetry": True,
     }
     return engine_name, mem0_cfg

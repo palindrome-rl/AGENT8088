@@ -58,6 +58,28 @@ class Mem0MemoryStore:
                 },
                 "version": "v1.1",
             }
+            llm_provider = str(self.config.get("llm_provider") or "").strip().lower()
+            if llm_provider:
+                cfg["llm"] = {
+                    "provider": llm_provider,
+                    "config": {
+                        "model": str(self.config.get("llm_model") or ""),
+                    }
+                }
+                if llm_provider == "ollama":
+                    cfg["llm"]["config"]["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+            embed_provider = str(self.config.get("embed_provider") or "").strip().lower()
+            if embed_provider:
+                cfg["embedder"] = {
+                    "provider": embed_provider,
+                    "config": {
+                        "model": str(self.config.get("embed_model") or ""),
+                    }
+                }
+                if embed_provider == "ollama":
+                    cfg["embedder"]["config"]["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
             if hasattr(memory_cls, "from_config"):
                 self._memory = memory_cls.from_config(cfg)
             else:
