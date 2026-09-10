@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088 import (cli_anything, documents, efficiency, local_models,
-                       memory, providers, routing, tool_output, web_search)
+                       memory, providers, routing, tool_output, trajectory, web_search)
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -1328,16 +1328,28 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
 
 
 def _readonly_shell(command: str) -> bool:
+    if "|" in command:
+        if re.search(r"[&;<>\n`]|\$\(", command):
+            return False
+        return all(_readonly_shell(part.strip()) for part in command.split("|"))
     parts = _shell_parts(command)
     if not parts:
         return False
     executable = Path(parts[0]).stem.lower()
+    if executable == "find":
+        unsafe = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0"}
+        return not any(part.lower() in unsafe for part in parts[1:])
     if executable != "git":
         return executable in READONLY_SAFE_COMMANDS
-    if len(parts) < 2:
+    cursor = 1
+    while cursor < len(parts) and parts[cursor] in {"-C", "--git-dir", "--work-tree"}:
+        if cursor + 1 >= len(parts):
+            return False
+        cursor += 2
+    if cursor >= len(parts):
         return False
-    action = parts[1].lower()
-    rest = parts[2:]
+    action = parts[cursor].lower()
+    rest = parts[cursor + 1:]
     if action == "branch":
         return all(
             part in _GIT_BRANCH_FLAGS or part.startswith("--color=")
@@ -9814,7 +9826,8 @@ _document_usage_lock = threading.Lock()
 
 
 def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
-              memory_background=False, memory_capture=True, **kwargs):
+              memory_background=False, memory_capture=True,
+              trajectory_state=None, on_trajectory_state=None, **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
 
@@ -9831,6 +9844,19 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     neither recalls nor writes.
     """
     global _active_budget
+    user_turns = _genuine_user_turns(messages)
+    goal = str(user_turns[-1].get("content") or "") if user_turns else ""
+    run_trajectory = trajectory.TrajectoryState(trajectory_state, goal, len(messages))
+
+    def trajectory_changed():
+        if on_trajectory_state is None:
+            return
+        try:
+            on_trajectory_state(run_trajectory.snapshot())
+        except Exception as exc:
+            _log.warning("could not checkpoint trajectory state: %s", exc)
+
+    trajectory_changed()
     if budget is None:
         max_seconds = (MAX_TURN_SECONDS or PLAN_MODE_TIMEOUT_SECONDS
                        if PERMISSION_MODE == "plan-only" else MAX_TURN_SECONDS)
@@ -9865,9 +9891,14 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             messages, kwargs.get("system_prompt"), identity=memory_identity)
     answer = None
     try:
-        answer = _run_agent_loop(messages, budget=budget, **kwargs)
+        answer = _run_agent_loop(
+            messages, budget=budget, trajectory=run_trajectory,
+            on_trajectory_state=trajectory_changed, **kwargs,
+        )
         return answer
     finally:
+        run_trajectory.finish(answer)
+        trajectory_changed()
         # Read the share before the budget goes out of scope. Verification spends
         # the parent's tokens, and an audit on the post-approval path reports no
         # cost of its own — so without this the only unattributed verification
@@ -10411,7 +10442,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_token=None, interrupt_check=None, trace=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
                     depth=0, budget=None, client=None, provider_name=None,
-                    model_name=None, dynamic_turns=True):
+                    model_name=None, dynamic_turns=True, trajectory=None,
+                    on_trajectory_state=None):
     global _last_auto_rung
     """Drive the model until it gives a final answer or hits max_turns.
 
@@ -10489,6 +10521,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             round_allowed_tools.discard("execute_shell")
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
+        if trajectory is not None:
+            round_system_prompt = (round_system_prompt or "") + trajectory.prompt()
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         # Resource ceiling. Checked before the model call so an exhausted budget
@@ -10798,7 +10832,19 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
+            if trajectory is not None and trajectory.request_verification():
+                if on_trajectory_state:
+                    on_trajectory_state()
+                messages.append({"role": "user", "content": (
+                    "Controller state says a changed result has no fresh verification evidence. "
+                    "Before your final answer, inspect or test the changed result if a suitable "
+                    "tool is available. If verification is not possible, say that plainly."
+                )})
+                continue
             answer = _guard_answer(answer)
+            if trajectory is not None and trajectory.needs_verification():
+                answer += ("\n\nVerification note: changes were made, but no fresh automated "
+                           "verification evidence was recorded.")
             if on_answer:
                 on_answer(answer)
             if trace is not None:
@@ -10900,11 +10946,26 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             _raise_if_interrupted(interrupt_check)
             if on_tool:
                 on_tool(name)
+            operation = None
+            mutation_seq_before = _MUTATION_SEQ
+            if trajectory is not None:
+                operation = trajectory.before_tool(name)
+                if on_trajectory_state:
+                    on_trajectory_state()
             # on_calls already announced "Searching the web..." once; this spinner
             # is the next beat, not a repeat of it.
             spin_msg = "Fetching results…" if name == "web_search" else f"running {name}..."
             with spin(spin_msg):
                 result = exec_tool(name, json.dumps(args), depth=depth)
+            if trajectory is not None and operation is not None:
+                verdict = tool_output.detect_verdict(result)
+                trajectory.after_tool(
+                    operation, result, failed=_plan_step_failed(result),
+                    blocked=result.startswith("ESCALATION_REQUEST\x1f"),
+                    mutated=_MUTATION_SEQ != mutation_seq_before, verdict=verdict.status,
+                )
+                if on_trajectory_state:
+                    on_trajectory_state()
             if (PERMISSION_MODE == "plan-only"
                     and result.startswith("Error: plan mode")):
                 plan_mutation_retries += 1
