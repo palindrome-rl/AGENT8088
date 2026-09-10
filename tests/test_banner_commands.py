@@ -19,9 +19,15 @@ def _render(width):
     return console.file.getvalue()
 
 
-def test_essential_commands_are_the_ones_a_new_user_needs():
-    listed = [command for command, _ in cli._ESSENTIAL_COMMANDS]
+def test_setup_commands_are_the_ones_a_new_user_needs():
+    listed = [command for command, _ in cli._SETUP_COMMANDS]
     assert listed[:4] == ["/model setup", "/mode", "/search", "/doctor"]
+
+
+def test_the_two_groups_pair_up_row_for_row():
+    # The wide layout zips them; unequal groups would drop the tail of the longer one.
+    assert len(cli._SETUP_COMMANDS) == len(cli._SESSION_COMMANDS)
+    assert cli._ESSENTIAL_COMMANDS == cli._SETUP_COMMANDS + cli._SESSION_COMMANDS
 
 
 def test_every_essential_command_is_a_real_command():
@@ -30,7 +36,7 @@ def test_every_essential_command_is_a_real_command():
         assert command.lstrip("/").split()[0] in known
 
 
-@pytest.mark.parametrize("width", [140, 120, 100, 80, 72, 69, 55, 40])
+@pytest.mark.parametrize("width", [140, 120, 110, 108, 100, 80, 75, 72, 69, 55, 40])
 def test_banner_keeps_the_headings_and_drops_the_catalogues(width):
     rendered = _render(width)
     if width >= 70:
@@ -41,7 +47,7 @@ def test_banner_keeps_the_headings_and_drops_the_catalogues(width):
     assert "spec-driven-development" not in rendered
 
 
-@pytest.mark.parametrize("width", [140, 120, 100, 80, 72, 69, 55, 40])
+@pytest.mark.parametrize("width", [140, 120, 110, 108, 100, 80, 75, 72, 69, 55, 40])
 def test_banner_shows_the_essential_commands_at_every_width(width):
     rendered = _render(width)
     for command, _ in cli._ESSENTIAL_COMMANDS:
@@ -49,22 +55,44 @@ def test_banner_shows_the_essential_commands_at_every_width(width):
         assert command.split()[-1] in rendered
 
 
-@pytest.mark.parametrize("width", [140, 120, 100, 80, 72, 69, 55, 40])
+@pytest.mark.parametrize("width", [140, 120, 110, 108, 100, 80, 75, 72, 69, 55, 40])
 def test_banner_never_overflows_the_terminal(width):
     for line in _render(width).splitlines():
         assert len(line) <= width, f"{width}: {line!r}"
 
 
-def test_descriptions_stay_aligned_while_they_are_shown():
+def _column_of(rendered, needle):
+    return [line.index(needle) for line in rendered.splitlines() if needle in line]
+
+
+def test_one_block_layout_keeps_every_description_aligned():
     rendered = _render(100)
-    columns = [line.index("Add or switch a provider") for line in rendered.splitlines()
-               if "Add or switch a provider" in line]
-    assert columns, "the two-column layout should be used at 100 columns"
+    columns = _column_of(rendered, "Add or switch models")
+    assert columns, "100 columns should use the single-block layout"
     for _, description in cli._ESSENTIAL_COMMANDS:
-        matches = [line.index(description) for line in rendered.splitlines() if description in line]
-        assert matches == columns
+        assert _column_of(rendered, description) == columns
 
 
-def test_descriptions_are_dropped_rather_than_wrapped_when_space_is_tight():
+def test_wide_layout_splits_the_groups_with_one_continuous_divider():
+    rendered = _render(120)
+    divider_rows = [line for line in rendered.splitlines() if cli._DIVIDER in line
+                    and any(command in line for command, _ in cli._SESSION_COMMANDS)]
+    assert len(divider_rows) == len(cli._SESSION_COMMANDS)
+    # One column for every row is what makes the glyphs read as a single rule.
+    assert len({line.index(cli._DIVIDER) for line in divider_rows}) == 1
+
+
+def test_wide_layout_aligns_each_group_independently():
+    rendered = _render(120)
+    for group in (cli._SETUP_COMMANDS, cli._SESSION_COMMANDS):
+        columns = _column_of(rendered, group[0][1])
+        for _, description in group:
+            assert _column_of(rendered, description) == columns
+
+
+def test_layout_tier_is_chosen_by_available_width():
     assert isinstance(cli._essential_commands(cli._COMMANDS_MIN_WIDTH - 1), cli.Text)
-    assert not isinstance(cli._essential_commands(cli._COMMANDS_MIN_WIDTH), cli.Text)
+    one_block = cli._essential_commands(cli._COMMANDS_MIN_WIDTH)
+    assert not isinstance(one_block, cli.Text)
+    assert len(one_block.columns) == 2
+    assert len(cli._essential_commands(cli._COMMANDS_TWO_BLOCK_WIDTH).columns) == 5
