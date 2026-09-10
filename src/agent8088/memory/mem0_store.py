@@ -15,9 +15,22 @@ log = logging.getLogger("agent8088.memory.mem0")
 os.environ["MEM0_TELEMETRY"] = "false"
 os.environ["POSTHOG_DISABLED"] = "1"
 
+# Silence noisy third-party library warnings (e.g. spaCy optional models, posthog)
+for _noisy_logger in ("mem0", "mem0.utils.spacy_models", "posthog"):
+    logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
+
 
 def _import_mem0():
     try:
+        for _noisy_logger in ("mem0", "mem0.utils.spacy_models", "posthog"):
+            logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
+        try:
+            import mem0.utils.spacy_models as _spacy_mod
+            _spacy_mod.logger.setLevel(logging.ERROR)
+            _spacy_mod._load_failed_full = True
+            _spacy_mod._load_failed_lemma = True
+        except Exception:
+            pass
         import mem0
         return getattr(mem0, "Memory", None)
     except Exception as exc:

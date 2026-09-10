@@ -434,13 +434,13 @@ web_search_no_prompt=1
 
 project_root=.
 
-default_provider=ollama-cloud
+default_provider=custom
 
-provider.custom.base_url=https://envious-evangeline-tayyabimam1-e2e3b082.koyeb.app/v1
+provider.custom.base_url=http://127.0.0.1:8080/v1
 
 provider.custom.api_mode=openai
 
-provider.custom.model=llama-3.1-8b-instruct-fast
+provider.custom.model=ornith-1.0-35b
 
 provider.custom.api_key_env=CUSTOM_API_KEY
 
@@ -477,7 +477,7 @@ provider.cerebras.native_tools=True
 
 provider.gemini.base_url=https://generativelanguage.googleapis.com/v1beta/openai
 
-provider.gemini.model=gemini-2.5-flash-lite
+provider.gemini.model=gemini-2.5-flash
 
 provider.gemini.api_key_env=GEMINI_API_KEY
 provider.gemini.native_tools=True
