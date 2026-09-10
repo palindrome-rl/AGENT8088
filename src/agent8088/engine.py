@@ -10028,6 +10028,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # that just failed and the one that rescued it. A new user turn starts fresh
     # at the cheap rung, so a one-off hard prompt doesn't tax every later one.
     auto_rung = routing.starting_rung(model_name or MODEL_NAME, len(_auto_chain))
+    llmrouter_consulted = False
     auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
@@ -10122,6 +10123,24 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # auto-compaction uses, converted chars -> tokens.
             _min_context_needed = _estimate_context_chars(
                 messages, round_system_prompt or "") // 4
+            if (not llmrouter_consulted and routing.variant(model_name or MODEL_NAME) != 'smart'
+                    and APP_CONFIG.get('llmrouter_mode', 'off') in ('shadow', 'enabled')):
+                llmrouter_consulted = True
+                from agent8088.llmrouter_adapter import recommend
+                eligible = []
+                for p, m in _auto_chain:
+                    context, completion = _active_model_token_limits(p, m)
+                    if not routing.cooling(p, m) and context >= _min_context_needed + completion:
+                        eligible.append((p, m))
+                routing_messages = [dict(message, content=_redact_secrets(message['content']))
+                                    if isinstance(message.get('content'), str) else message
+                                    for message in _genuine_user_turns(messages)]
+                selected, decision = recommend(APP_CONFIG, routing_messages, eligible)
+                if trace is not None:
+                    trace.append(dict(decision, turn=turn))
+                _log.info('LLMRouter decision: %s', decision)
+                if selected is not None:
+                    auto_rung = _auto_chain.index(selected)
             _picked = routing.select(
                 _auto_chain, auto_rung,
                 fits=lambda p, m: _active_model_token_limits(p, m)[0] >= _min_context_needed,
