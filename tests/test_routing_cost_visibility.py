@@ -66,3 +66,30 @@ def test_the_prefix_hash_is_still_stable_for_one_model(engine):
     a = engine._stable_prefix_hash("SYS", [{"function": {"name": "x"}}], model="m")
     b = engine._stable_prefix_hash("SYS", [{"function": {"name": "x"}}], model="m")
     assert a == b, "the fingerprint must stay stable when nothing changed"
+
+
+def test_a_missing_dependency_degrades_instead_of_killing_the_turn(engine, monkeypatch):
+    """httpx is declared only in the gateway extra, not core.
+
+    It is present today because openai pulls it in transitively, which is a
+    side effect and not a guarantee. The adapter import sat unguarded inside
+    the agent loop, so on an install without it, switching llmrouter_mode on
+    would raise ImportError mid-turn and kill the turn -- while every other
+    routing failure logs and falls back. The whole design intent is that
+    routing degrades invisibly.
+    """
+    import builtins
+    real_import = builtins.__import__
+
+    def no_adapter(name, *args, **kwargs):
+        if "llmrouter_adapter" in name:
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_adapter)
+    selected, decision = engine._consult_llmrouter(
+        {"llmrouter_mode": "enabled"}, [{"role": "user", "content": "hi"}], [("p", "m")])
+
+    assert selected is None, "a broken import must not select a model"
+    assert decision["reason"] == "router_unavailable_or_invalid"
+    assert decision["applied"] is False

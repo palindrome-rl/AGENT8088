@@ -10016,6 +10016,26 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
 _REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
 
 
+def _consult_llmrouter(config, messages, eligible):
+    """Ask the optional router, or explain why not. Never raises.
+
+    The adapter imports httpx, which is declared in the gateway extra rather
+    than core -- it is present on most installs only because openai pulls it
+    in. An unguarded import inside the loop meant enabling routing on an
+    install without it killed the turn, while every other routing failure
+    logs and falls back. Routing is optional; it must fail like it.
+    """
+    try:
+        from agent8088.llmrouter_adapter import recommend
+        return recommend(config, messages, eligible)
+    except Exception as exc:  # noqa: BLE001 -- optional path, never fatal
+        return None, {"type": "routing_decision", "backend": "llmrouter",
+                      "mode": str(config.get("llmrouter_mode", "off")).lower(),
+                      "reason": "router_unavailable_or_invalid",
+                      "error_type": type(exc).__name__,
+                      "applied": False, "latency_ms": 0}
+
+
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
@@ -10157,7 +10177,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if (not llmrouter_consulted and routing.variant(model_name or MODEL_NAME) != 'smart'
                     and APP_CONFIG.get('llmrouter_mode', 'off') in ('shadow', 'enabled')):
                 llmrouter_consulted = True
-                from agent8088.llmrouter_adapter import recommend
                 eligible = []
                 for p, m in _auto_chain:
                     context, completion = _active_model_token_limits(p, m)
@@ -10166,7 +10185,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 routing_messages = [dict(message, content=_redact_secrets(message['content']))
                                     if isinstance(message.get('content'), str) else message
                                     for message in _genuine_user_turns(messages)]
-                selected, decision = recommend(APP_CONFIG, routing_messages, eligible)
+                selected, decision = _consult_llmrouter(APP_CONFIG, routing_messages, eligible)
                 if trace is not None:
                     trace.append(dict(decision, turn=turn))
                 _log.info('LLMRouter decision: %s', decision)
