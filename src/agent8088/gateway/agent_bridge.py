@@ -54,6 +54,7 @@ def run_turn(session_key: str, user_text: str, session_store: SessionStore,
     agent thread) and should block until the user responds.
     """
     messages = session_store.load(session_key)
+    trajectory_state = session_store.load_trajectory(session_key)
     # Inbound platform text is sanitized before it ever reaches the model. A
     # message containing `<|im_start|>system` is tokenized as a real role
     # boundary by self-hosted ChatML/Llama chat templates, so a plain WhatsApp
@@ -78,8 +79,10 @@ def run_turn(session_key: str, user_text: str, session_store: SessionStore,
         tools_def=A.build_tools_def(A.TOOL_SPECS),
         allowed_tools=set(A.TOOL_SPECS),
         on_escalation=on_escalation,
+        trajectory_state=trajectory_state,
+        on_trajectory_state=lambda state: session_store.save(session_key, messages, state),
     )
 
     messages.append({"role": "assistant", "content": answer})
-    session_store.save(session_key, messages)
+    session_store.save(session_key, messages, trajectory_state)
     return answer

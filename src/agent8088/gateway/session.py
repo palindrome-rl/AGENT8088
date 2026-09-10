@@ -35,13 +35,31 @@ class SessionStore:
 
     def load(self, key: str) -> list:
         p = self._path(key)
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+        if not p.exists():
+            return []
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(payload, list):  # Legacy session files.
+            return payload
+        return payload.get("messages", []) if isinstance(payload, dict) else []
 
-    def save(self, key: str, messages: list) -> None:
+    def load_trajectory(self, key: str) -> dict:
+        p = self._path(key)
+        if not p.exists():
+            return {}
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        state = payload.get("trajectory_state", {}) if isinstance(payload, dict) else {}
+        return state if isinstance(state, dict) else {}
+
+    def save(self, key: str, messages: list, trajectory_state: dict | None = None) -> None:
         fd, temporary = tempfile.mkstemp(prefix=".session-", suffix=".tmp", dir=self.dir)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(messages, stream, ensure_ascii=False)
+                payload = (messages if trajectory_state is None else {
+                    "version": 2,
+                    "messages": messages,
+                    "trajectory_state": trajectory_state,
+                })
+                json.dump(payload, stream, ensure_ascii=False)
             os.replace(temporary, self._path(key))
         finally:
             Path(temporary).unlink(missing_ok=True)

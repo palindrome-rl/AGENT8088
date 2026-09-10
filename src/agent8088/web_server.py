@@ -931,6 +931,7 @@ async def delete_session(name: str):
         return {"error": f"could not delete session: {exc}"}
     if active:
         C.S.messages.clear()
+        C.S.trajectory_state.clear()
         C.S.last_trace = None
         C.S.conversation_trace.clear()
         C.S.trace_path = ""
@@ -945,6 +946,7 @@ async def new_session(body: SessionActionBody):
     if not body.name.strip():
         C._save_active_session()
         C.S.messages.clear()
+        C.S.trajectory_state.clear()
         C.S.last_trace = None
         C.S.last_usage = None
         C.S.name = ""
@@ -958,6 +960,7 @@ async def new_session(body: SessionActionBody):
         return _error(f"session exists: {safe_name} (use /resume)", 409)
     C._save_active_session()
     C.S.messages.clear()
+    C.S.trajectory_state.clear()
     C.S.last_trace = None
     C.S.last_usage = None
     C.S.name = safe_name
@@ -983,6 +986,8 @@ async def resume_session(body: SessionActionBody):
     C._save_active_session()
     messages = data.get("messages", [])
     C.S.messages[:] = messages
+    C.S.trajectory_state = (data.get("trajectory_state", {})
+                            if isinstance(data.get("trajectory_state", {}), dict) else {})
     C.S.name = safe_name
     C.S.temperature = float(data.get("temperature", 0.1))
     C.S.max_turns = int(data.get("max_turns", 10))
@@ -999,6 +1004,7 @@ async def reset_session():
     """Clear active session, retain name."""
     C = _cl()
     C.S.messages.clear()
+    C.S.trajectory_state.clear()
     C.S.last_trace = None
     C.S.conversation_trace.clear()
     C.S.trace_path = ""
@@ -2166,6 +2172,8 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                 system_prompt=C._session_system_prompt,
                 tools_def=lambda: A.build_tools_def(C._active_tool_specs()),
                 allowed_tools=lambda: set(C._active_tool_specs()),
+                trajectory_state=S.trajectory_state,
+                on_trajectory_state=lambda _state: C._save_active_session(),
             )
             elapsed = time.time() - turn_start
             S.last_usage = {"seconds": elapsed,

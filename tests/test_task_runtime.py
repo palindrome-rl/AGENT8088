@@ -88,3 +88,17 @@ def test_a_slice_does_not_get_a_growing_turn_budget(tmp_path):
              max_slices=1, slice_turns=3)
 
     assert seen == [False], f"slice ran with dynamic_turns={seen}"
+
+
+def test_task_checkpoints_controller_state_for_a_later_resume(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+
+    def agent(_messages, *, trajectory_state, on_trajectory_state, **_kwargs):
+        trajectory_state.update({"version": 2, "goal": "durable", "operations": [{"tool": "read_text", "status": "done"}]})
+        on_trajectory_state(trajectory_state)
+        return "TASK_COMPLETE"
+
+    row = run_task("durable", agent, store=store, workspace=tmp_path, max_slices=1)
+
+    assert row["state"] == "completed"
+    assert json.loads(row["trajectory_json"])["operations"][-1]["tool"] == "read_text"
