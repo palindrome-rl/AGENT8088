@@ -13,6 +13,7 @@ log = logging.getLogger("agent8088.memory.mem0")
 
 # Telemetry is disabled unconditionally -- nothing leaves the machine.
 os.environ["MEM0_TELEMETRY"] = "false"
+os.environ["POSTHOG_DISABLED"] = "1"
 
 
 def _import_mem0():
@@ -49,36 +50,98 @@ class Mem0MemoryStore:
 
         try:
             self.path.mkdir(parents=True, exist_ok=True)
+            embed_dims = 384
+
+            client_api_key = None
+            client_base_url = None
+            if self.client_factory:
+                try:
+                    c = self.client_factory()
+                    client_api_key = getattr(c, "api_key", None)
+                    client_base_url = str(getattr(c, "base_url", "")).rstrip("/")
+                except Exception:
+                    pass
+
+            llm_provider = str(self.config.get("llm_provider") or "").strip().lower()
+            if not llm_provider and client_base_url:
+                llm_provider = "openai"
+
+            llm_section = None
+            if llm_provider:
+                llm_cfg = {
+                    "model": str(self.config.get("llm_model") or "gpt-4o-mini"),
+                }
+                if client_api_key:
+                    llm_cfg["api_key"] = client_api_key
+                if client_base_url:
+                    llm_cfg["openai_base_url"] = client_base_url
+                if llm_provider == "ollama":
+                    llm_cfg["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+                llm_section = {
+                    "provider": llm_provider,
+                    "config": llm_cfg,
+                }
+
+            embedder_section = None
+            embed_provider = str(self.config.get("embed_provider") or "").strip().lower()
+            if embed_provider == "ollama":
+                embed_dims = 768
+                embedder_section = {
+                    "provider": "ollama",
+                    "config": {
+                        "model": str(self.config.get("embed_model") or "nomic-embed-text"),
+                        "ollama_base_url": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+                    },
+                }
+            elif embed_provider in {"openai", "custom"} and client_base_url:
+                embed_dims = 1536
+                embedder_section = {
+                    "provider": "openai",
+                    "config": {
+                        "model": str(self.config.get("embed_model") or "text-embedding-3-small"),
+                        "api_key": client_api_key or "none",
+                        "openai_base_url": client_base_url,
+                    },
+                }
+            else:
+                try:
+                    import fastembed
+                    embed_dims = 384
+                    embedder_section = {
+                        "provider": "fastembed",
+                        "config": {
+                            "model": "sentence-transformers/all-MiniLM-L6-v2",
+                        },
+                    }
+                except ImportError:
+                    if client_base_url:
+                        embed_dims = 1536
+                        embedder_section = {
+                            "provider": "openai",
+                            "config": {
+                                "model": str(self.config.get("embed_model") or "text-embedding-3-small"),
+                                "api_key": client_api_key or "none",
+                                "openai_base_url": client_base_url,
+                            },
+                        }
+
+            qdrant_cfg = {
+                "path": str(self.path),
+            }
+            if embed_dims:
+                qdrant_cfg["embedding_model_dims"] = embed_dims
+
             cfg = {
                 "vector_store": {
                     "provider": self.vector_store_type,
-                    "config": {
-                        "path": str(self.path),
-                    },
+                    "config": qdrant_cfg,
                 },
                 "version": "v1.1",
             }
-            llm_provider = str(self.config.get("llm_provider") or "").strip().lower()
-            if llm_provider:
-                cfg["llm"] = {
-                    "provider": llm_provider,
-                    "config": {
-                        "model": str(self.config.get("llm_model") or ""),
-                    }
-                }
-                if llm_provider == "ollama":
-                    cfg["llm"]["config"]["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-
-            embed_provider = str(self.config.get("embed_provider") or "").strip().lower()
-            if embed_provider:
-                cfg["embedder"] = {
-                    "provider": embed_provider,
-                    "config": {
-                        "model": str(self.config.get("embed_model") or ""),
-                    }
-                }
-                if embed_provider == "ollama":
-                    cfg["embedder"]["config"]["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+            if llm_section:
+                cfg["llm"] = llm_section
+            if embedder_section:
+                cfg["embedder"] = embedder_section
 
             if hasattr(memory_cls, "from_config"):
                 self._memory = memory_cls.from_config(cfg)
@@ -160,7 +223,10 @@ class Mem0MemoryStore:
             return 0
         try:
             if hasattr(mem, "delete_all"):
-                mem.delete_all(user_id=str(user_id))
+                try:
+                    mem.delete_all(filters={"user_id": str(user_id)})
+                except (TypeError, ValueError):
+                    mem.delete_all(user_id=str(user_id))
                 return 1
             existing = self.get_all(user_id=user_id)
             for item in existing:
@@ -179,7 +245,10 @@ class Mem0MemoryStore:
         if mem is None:
             return []
         try:
-            resp = mem.search(str(query), user_id=str(user_id), limit=int(limit))
+            try:
+                resp = mem.search(str(query), filters={"user_id": str(user_id)}, limit=int(limit))
+            except (TypeError, ValueError):
+                resp = mem.search(str(query), user_id=str(user_id), limit=int(limit))
             items = []
             if isinstance(resp, dict):
                 items = resp.get("results") or []
@@ -212,7 +281,10 @@ class Mem0MemoryStore:
         if mem is None:
             return []
         try:
-            resp = mem.get_all(user_id=str(user_id))
+            try:
+                resp = mem.get_all(filters={"user_id": str(user_id)})
+            except (TypeError, ValueError):
+                resp = mem.get_all(user_id=str(user_id))
             items = []
             if isinstance(resp, dict):
                 items = resp.get("results") or []

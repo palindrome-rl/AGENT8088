@@ -43,7 +43,7 @@ def test_mem0_store_add_and_search_delegates():
         assert hits[0]["text"] == "Prefers python over go"
         assert hits[0]["score"] == 0.95
         mock_mem0_instance.search.assert_called_once_with(
-            "coding preferences", user_id="alice", limit=3
+            "coding preferences", filters={"user_id": "alice"}, limit=3
         )
         
         # Test recent

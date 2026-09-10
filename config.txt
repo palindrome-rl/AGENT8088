@@ -228,13 +228,13 @@ memory=1
 #
 # Memory engine backend: `native` (default built-in SQLite with BM25 + vector RRF)
 # or `mem0` (uses Mem0 library with graph/vector entity management).
-# memory_engine=native
-#
+memory_engine=mem0
+
 # Mem0 vector store backend (defaults to embedded local qdrant)
-# memory_mem0_vector_store=qdrant
-#
+memory_mem0_vector_store=qdrant
+
 # Mem0 local data directory
-# memory_mem0_dir=~/.agent8088/mem0
+memory_mem0_dir=~/.agent8088/mem0
 #
 # Where memories live for the native engine. One SQLite file, mode 0600.
 # memory_db_path=~/.agent8088/memory.db
@@ -434,7 +434,7 @@ web_search_no_prompt=1
 
 project_root=.
 
-default_provider=custom
+default_provider=ollama-cloud
 
 provider.custom.base_url=https://envious-evangeline-tayyabimam1-e2e3b082.koyeb.app/v1
 
@@ -446,7 +446,7 @@ provider.custom.api_key_env=CUSTOM_API_KEY
 
 provider.ollama-cloud.base_url=https://ollama.com/v1
 
-provider.ollama-cloud.model=gpt-oss:20b
+provider.ollama-cloud.model=glm-5.3
 
 provider.ollama-cloud.api_key_env=OLLAMA_CLOUD_API_KEY
 provider.ollama-cloud.native_tools=True
