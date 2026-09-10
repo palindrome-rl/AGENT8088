@@ -9846,7 +9846,9 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     global _active_budget
     user_turns = _genuine_user_turns(messages)
     goal = str(user_turns[-1].get("content") or "") if user_turns else ""
-    run_trajectory = trajectory.TrajectoryState(trajectory_state, goal, len(messages))
+    run_trajectory = trajectory.TrajectoryState(
+        trajectory_state, goal, len(messages), workspace=str(PROJECT_ROOT),
+    )
 
     def trajectory_changed():
         if on_trajectory_state is None:
@@ -10832,6 +10834,15 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
+            if trajectory is not None and trajectory.request_replan():
+                if on_trajectory_state:
+                    on_trajectory_state()
+                messages.append({"role": "user", "content": (
+                    "Controller state says two recent actions failed or were blocked. "
+                    "Do not repeat them. State a short revised approach, then take one "
+                    "different safe next action; if blocked by missing access, say so plainly."
+                )})
+                continue
             if trajectory is not None and trajectory.request_verification():
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -10845,6 +10856,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trajectory is not None and trajectory.needs_verification():
                 answer += ("\n\nVerification note: changes were made, but no fresh automated "
                            "verification evidence was recorded.")
+            elif trajectory is not None and (review := trajectory.review()):
+                answer += f"\n\nTask-state note: {review}"
             if on_answer:
                 on_answer(answer)
             if trace is not None:

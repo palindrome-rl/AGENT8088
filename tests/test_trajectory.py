@@ -101,3 +101,66 @@ def test_readonly_pipeline_does_not_look_like_a_mutation(engine):
     assert engine._readonly_shell("find . -type f | head -50")
     assert not engine._readonly_shell("find . -delete | head -50")
     assert engine._readonly_shell("git -C /repo status")
+
+
+def test_trajectory_upgrades_legacy_state_with_workspace_and_checklist():
+    state = {"version": 1, "goal": "fix it", "operations": []}
+
+    trajectory = TrajectoryState(state, "fix it", 1, workspace="/repo")
+
+    assert state["version"] == 2
+    assert state["workspace"] == "/repo"
+    assert [step["status"] for step in state["checklist"]] == ["pending", "pending", "not_needed"]
+    operation = trajectory.before_tool("read_text")
+    trajectory.after_tool(operation, "ok", failed=False, blocked=False, mutated=False)
+    assert "Workspace: use relative paths from the project workspace" in trajectory.prompt()
+
+
+def test_trajectory_stalls_after_two_setbacks_and_keeps_evidence():
+    trajectory = TrajectoryState({}, "repair it", 1, workspace="/repo")
+    first = trajectory.before_tool("read_text")
+    trajectory.after_tool(first, "Error: missing", failed=True, blocked=False, mutated=False)
+    second = trajectory.before_tool("execute_shell")
+    trajectory.after_tool(second, "Error: unavailable", failed=True, blocked=False, mutated=False)
+
+    assert trajectory.needs_replan()
+    assert trajectory.request_replan()
+    assert "different safe tool" in trajectory.prompt()
+
+    proof = trajectory.before_tool("execute_shell")
+    trajectory.after_tool(proof, "3 passed", failed=False, blocked=False,
+                          mutated=True, verdict="passed")
+    assert trajectory.data["verification"] == "verified"
+    assert trajectory.data["evidence"][-1]["result"] == "3 passed"
+
+
+def test_read_back_is_inspection_evidence_not_an_automated_pass():
+    trajectory = TrajectoryState({}, "write it", 1)
+    write = trajectory.before_tool("write_file")
+    trajectory.after_tool(write, "written", failed=False, blocked=False, mutated=True)
+    read = trajectory.before_tool("read_text")
+    trajectory.after_tool(read, "Read 1 line", failed=False, blocked=False, mutated=False)
+
+    assert trajectory.data["verification"] == "inspected"
+    assert not trajectory.needs_verification()
+    assert "no automated verification" in trajectory.review()
+
+
+def test_main_loop_requests_one_different_approach_after_repeated_failures(monkeypatch, engine):
+    replies = iter([
+        '✿FUNCTION✿: read_text ✿ARGS✿: {"filename":"missing-a.txt"}',
+        '✿FUNCTION✿: read_text ✿ARGS✿: {"filename":"missing-b.txt"}',
+        "I cannot continue.",
+        "The two files are unavailable; I would ask for their correct paths next.",
+    ])
+    messages = [{"role": "user", "content": "inspect two files"}]
+    monkeypatch.setattr(engine, "_create_completion_with_fallback",
+                        lambda *args, **kwargs: _response(next(replies)))
+    monkeypatch.setattr(engine, "exec_tool", lambda *args, **kwargs: "Error: missing file")
+
+    answer = engine.run_agent(messages, max_turns=4, tools_def=[], allowed_tools={"read_text"},
+                              trajectory_state={})
+
+    assert "correct paths next" in answer
+    assert any("Do not repeat them" in str(message["content"]) for message in messages)
+    assert "Unresolved tool work remains" in answer
