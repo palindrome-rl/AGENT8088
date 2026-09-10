@@ -471,12 +471,44 @@ if not _PALINDROME_ANSI_LOGO.is_file():
 _PALINDROME_BRIGHTNESS = 1.3
 
 
-def _catalog(items, columns=4):
-    """Render a compact, complete terminal catalogue without hiding installed items."""
-    names = sorted(items)
-    if not names:
-        return "none installed"
-    return "\n".join("  ".join(names[i:i + columns]) for i in range(0, len(names), columns))
+# The banner deliberately does NOT list every tool and skill: the full catalogue ran
+# to dozens of lines and pushed the one thing a new user actually needs — how to point
+# the CLI at a model — off the top of the screen. The headings stay (so the counts are
+# still visible at a glance) and the space they freed goes to the commands below.
+# Descriptions are kept short on purpose: the widest row has to fit the banner's
+# right-hand column at an 80-column terminal, which is the narrowest width that still
+# renders the full panel. _essential_commands() drops them entirely below that.
+_ESSENTIAL_COMMANDS = (
+    ("/model setup", "Add or switch a provider"),
+    ("/mode", "Set the permission mode"),
+    ("/search", "Configure web search"),
+    ("/doctor", "Diagnose your setup"),
+    ("/tools", "Browse the tool list"),
+    ("/skills", "Browse the skill list"),
+)
+
+_COMMAND_COLUMN = max(len(command) for command, _ in _ESSENTIAL_COMMANDS)
+_DESCRIPTION_COLUMN = max(len(description) for _, description in _ESSENTIAL_COMMANDS)
+# command + two spaces of padding + description
+_COMMANDS_MIN_WIDTH = _COMMAND_COLUMN + 2 + _DESCRIPTION_COLUMN
+
+
+def _essential_commands(available):
+    """Must-know commands, as a two-column grid when `available` columns allow it.
+
+    A grid rather than hand-padded strings: rich measures the command column, so the
+    descriptions stay aligned no matter which commands are listed. Below the width the
+    widest row needs, the descriptions are dropped rather than wrapped — a wrapped
+    description turns six tidy rows into a ragged fifteen.
+    """
+    if available < _COMMANDS_MIN_WIDTH:
+        return Text(" · ".join(command for command, _ in _ESSENTIAL_COMMANDS), style="bold #00edff")
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold #00edff", no_wrap=True, justify="left", width=_COMMAND_COLUMN)
+    grid.add_column(style="#237dd7", no_wrap=True)
+    for command, description in _ESSENTIAL_COMMANDS:
+        grid.add_row(command, description)
+    return grid
 
 
 def _brighten_logo_colour(colour):
@@ -562,8 +594,12 @@ def banner():
         console.print(Text("Palindrome Research Labs", style="bold #00edff"), justify="center")
         compact = Text()
         compact.append(f"{active_profile}:{A.MODEL_NAME}", style="bold #00edff")
-        compact.append(f" · {len(_active_tool_specs())} tools · {len(_active_skills())} skills · /help", style="#237dd7")
+        compact.append(f" · {len(_active_tool_specs())} tools · {len(_active_skills())} skills", style="#237dd7")
         console.print(compact, justify="center")
+        # One wrapping line rather than the two-column grid: below 70 columns the grid's
+        # description column collapses to a few characters per line.
+        console.print(Text(" · ".join(command for command, _ in _ESSENTIAL_COMMANDS) + " · /help",
+                           style="#237dd7"), justify="center")
         return
 
     brand = Text("\n")
@@ -579,12 +615,19 @@ def banner():
     details.add_row("Subagents", f"{len(A.SUBAGENT_SPECS)} loaded · {', '.join(sorted(A.SUBAGENT_SPECS))}")
     details.add_row("Session", f"temperature {S.temperature} · max turns {S.max_turns}")
 
+    headings = Table.grid(padding=(0, 2))
+    headings.add_column(style="bold #00edff", no_wrap=True)
+    headings.add_column(style="#237dd7", no_wrap=True)
+    headings.add_row("Available Tools", f"({len(_active_tool_specs())})")
+    headings.add_row("Available Skills", f"({len(_active_skills())})")
+
+    # Panel border and padding (4) + the brand column (30) + the grid's inter-column
+    # padding (6) is what the right-hand column does not get.
     catalogue = Group(
-        Text(f"Available Tools  ({len(_active_tool_specs())})", style="bold #00edff"),
-        Text(_catalog(_active_tool_specs()), style="#237dd7"),
-        Text(f"\nAvailable Skills  ({len(_active_skills())})", style="bold #00edff"),
-        Text(_catalog(_active_skills()), style="#237dd7"),
-        Text("\nUse /tools, /skills, or /help for details.", style="#237dd7"),
+        headings,
+        Text(""),
+        _essential_commands(console.width - 40),
+        Text("\nUse /help for the full command list.", style="#237dd7"),
     )
     layout = Table.grid(expand=True, padding=(0, 3))
     layout.add_column(width=30)
