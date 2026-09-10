@@ -1064,6 +1064,8 @@ def _dangerous_git_args(tokens: list) -> bool:
             or any(flag in ("-f", "--force") for flag in flags)
             or any(not flag.startswith("-") for flag in flags)
         ))
+        or (action == "switch" and any(
+            flag in ("-f", "--force", "--discard-changes") for flag in flags))
         or (action == "stash" and any(flag in ("drop", "clear") for flag in flags))
     )
 
@@ -3026,6 +3028,27 @@ def resolve_pasted_path(raw_path: str) -> Path:
     return p
 
 
+def _inside_a_repository(target: Path) -> bool:
+    """Is this path inside a git repository below the project root?
+
+    A repository states where its own files belong, so a write into one is not
+    an invented location and must not be diverted to artifacts/. Without this a
+    file written as `repo/sample.txt` landed in artifacts/repo/ while the repo
+    itself sat at repo/: the commit had nothing to stage, and nothing could
+    repair it afterwards because the sandbox denies writes under .git.
+
+    The project root itself does not count. Treating it as a repository would
+    exempt every bare filename in a checked-out project, which is the diversion
+    this function is a narrow exception to, not a replacement for.
+    """
+    for parent in target.parents:
+        if parent == PROJECT_ROOT or PROJECT_ROOT not in parent.parents:
+            return False
+        if (parent / ".git").exists():
+            return True
+    return False
+
+
 def resolve_write_path(raw_path: str) -> Path:
     """Store what the agent creates in artifacts/; honour a stated location.
 
@@ -3052,7 +3075,9 @@ def resolve_write_path(raw_path: str) -> Path:
         resolved = (ARTIFACTS_ROOT / p).resolve()
     else:
         project_path = (PROJECT_ROOT / p).resolve()
-        if project_path.exists() or project_path == ARTIFACTS_ROOT or ARTIFACTS_ROOT in project_path.parents:
+        if (project_path.exists() or project_path == ARTIFACTS_ROOT
+                or ARTIFACTS_ROOT in project_path.parents
+                or _inside_a_repository(project_path)):
             resolved = project_path
         else:
             resolved = (ARTIFACTS_ROOT / p).resolve()
@@ -3388,6 +3413,25 @@ def _git_safe_value(value, what):
 _GIT_REMOTE_ACTIONS = ("list", "add", "set-url", "remove")
 
 
+def _git_prefix(args: dict) -> list:
+    """`git -C <dir>` so a repository below the shell cwd is reachable.
+
+    Every git tool ran in SHELL_CWD and nothing could point it elsewhere, so a
+    repo the agent had just created one directory down answered "not a git
+    repository" to every follow-up -- and the shell could not stand in for the
+    tools, because the sandbox denies writes under .git.
+    """
+    repo = _git_safe_value(args.get("repo"), "repository directory")
+    return ["git", "-C", repo] if repo else ["git"]
+
+
+def _git_flag_is_set(value) -> bool:
+    """The model passes booleans as strings, so "false" must not read as true."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _git_push_target(args: dict) -> str:
     """The "<remote> <branch>" a git_push would use, for the approval prompt.
 
@@ -3398,8 +3442,12 @@ def _git_push_target(args: dict) -> str:
         argv = _structured_tool_argv("git_push", args or {})
     except ValueError:
         return "origin HEAD"
-    flags = [a for a in argv[2:] if a.startswith("-")]
-    target = " ".join(a for a in argv[2:] if not a.startswith("-"))
+    # Slice from the subcommand, not a fixed offset: a `repo` argument puts
+    # `-C <dir>` in front of it, and read positionally that directory became
+    # part of the target the user was asked to approve.
+    rest = argv[argv.index("push") + 1:]
+    flags = [a for a in rest if a.startswith("-")]
+    target = " ".join(a for a in rest if not a.startswith("-"))
     # "-u" is a property of the push, not part of where it goes. Left in the
     # target it produced "Push to -u origin master?" -- argv leaking into a
     # sentence a human reads before consenting.
@@ -3420,16 +3468,16 @@ def _structured_tool_argv(name: str, args: dict):
                 "git remote action must be one of: "
                 + ", ".join(_GIT_REMOTE_ACTIONS) + ".")
         if action == "list":
-            return ["git", "remote", "-v"]
+            return _git_prefix(args) + ["remote", "-v"]
         remote = _git_safe_value(args.get("name"), "remote name")
         if not remote:
             raise ValueError("git remote " + action + " requires a remote name.")
         if action == "remove":
-            return ["git", "remote", "remove", remote]
+            return _git_prefix(args) + ["remote", "remove", remote]
         url = _git_safe_value(args.get("url"), "remote url")
         if not url:
             raise ValueError("git remote " + action + " requires a url.")
-        return ["git", "remote", action, remote, url]
+        return _git_prefix(args) + ["remote", action, remote, url]
     if name == "git_clone":
         url = str(args.get("url", ""))
         directory = str(args.get("directory", ""))
@@ -3438,15 +3486,41 @@ def _structured_tool_argv(name: str, args: dict):
         if any(char in directory for char in ("\0", "\r", "\n")):
             raise ValueError("git clone requires a safe destination path.")
         return ["git", "clone", "--", url] + ([directory] if directory else [])
+    if name == "git_status":
+        return _git_prefix(args) + ["status", "--short", "--branch"]
+    if name == "git_log":
+        return _git_prefix(args) + ["log", "--oneline", "-20"]
+    if name == "git_diff":
+        return _git_prefix(args) + ["diff"]
     if name == "git_commit":
-        return ["git", "commit", "-m", str(args.get("message", ""))]
+        return _git_prefix(args) + ["commit", "-m", str(args.get("message", ""))]
+    if name == "git_branch":
+        branch = _git_safe_value(args.get("name"), "branch name")
+        if not branch:
+            raise ValueError("git branch requires a branch name.")
+        return _git_prefix(args) + ["branch", "--", branch]
+    if name == "git_checkout":
+        branch = _git_safe_value(args.get("name"), "branch name")
+        if not branch:
+            raise ValueError("git checkout requires a branch name.")
+        # `switch`, not `checkout`. `git checkout <anything>` is hard-blocked,
+        # and rightly: `git checkout -- src/` silently discards uncommitted
+        # work, and the argv gives the hardline no way to tell that from moving
+        # to a branch. `switch` is the half that only ever moves HEAD; it
+        # refuses rather than clobber a dirty tree, and the flags that would
+        # override that are unreachable here because a value starting with a
+        # dash is rejected above.
+        if _git_flag_is_set(args.get("create")):
+            return _git_prefix(args) + ["switch", "-c", branch]
+        return _git_prefix(args) + ["switch", branch]
     if name == "git_push":
         # Defaults unchanged: a bare git_push is still `git push origin HEAD`.
         remote = _git_safe_value(args.get("remote") or "origin", "remote name")
         branch = _git_safe_value(args.get("branch") or "HEAD", "branch name")
         upstream = str(args.get("set_upstream", "")).strip().lower() in (
             "1", "true", "yes", "on")
-        return ["git", "push"] + (["-u"] if upstream else []) + [remote, branch]
+        return _git_prefix(args) + ["push"] + (["-u"] if upstream else []) \
+            + [remote, branch]
     if name == "git_create_pr":
         return ["gh", "pr", "create", "--title", str(args.get("title", "")),
                 "--body", str(args.get("body", ""))]
@@ -3463,7 +3537,7 @@ def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     runner = (lambda a: _exec_process(a, timeout=timeout)) if on_host else (
         lambda a: _exec_sandbox_argv(a, timeout=timeout))
     if name == "git_commit":
-        staged = runner(["git", "add", "-A"])
+        staged = runner(_git_prefix(args) + ["add", "-A"])
         if "exited with status" in staged or "timed out" in staged:
             return staged
     result = _missing_binary_hint(argv[0] if argv else "", runner(argv))
