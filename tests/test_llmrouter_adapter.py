@@ -182,3 +182,42 @@ def test_the_breaker_reopens_after_its_window(monkeypatch):
     _, meta = adapter.recommend(config, [{"role": "user", "content": "x"}], [("p", "m")])
     assert meta["reason"] != "router_unavailable_recently", (
         "a zero-length window must not latch the breaker shut")
+
+
+def test_an_image_turn_does_not_disable_routing_for_later_text_turns(monkeypatch):
+    """A multimodal turn is expected, not a service failure.
+
+    Routing is text-only by design -- an attachment keeps the existing ladder.
+    But that refusal is local and says nothing about the router's health, so
+    latching the breaker on it meant one screenshot silenced routing for the
+    next minute of ordinary turns. Interaction between the breaker and the
+    OCR/vision work, found by testing them together.
+    """
+    from agent8088 import llmrouter_adapter as adapter
+    adapter.reset_breaker()
+    reached = []
+
+    class Reached:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def stream(self, *a, **k):
+            reached.append(1)
+            raise OSError("service really is down")
+
+    monkeypatch.setattr(adapter.httpx, "Client", Reached)
+    monkeypatch.setenv("AGENT8088_ROUTER_TOKEN", "t")
+    config = {"llmrouter_mode": "enabled"}
+    image = [{"role": "user", "content": [{"type": "text", "text": "describe"},
+                                          {"type": "image_url", "image_url": {"url": "x"}}]}]
+    text = [{"role": "user", "content": "what is 2 plus 2"}]
+
+    _, first = adapter.recommend(config, image, [("p", "m")])
+    assert first["reason"] == "not_routable", (
+        f"an image turn should be reported as unroutable, not as a failure: {first['reason']}")
+    assert not reached, "an unroutable request must not reach the network"
+
+    _, second = adapter.recommend(config, text, [("p", "m")])
+    assert second["reason"] != "router_unavailable_recently", (
+        "an image turn latched the breaker and silenced the next text turn")
+    assert reached, "the text turn should have been allowed to try the router"

@@ -13,6 +13,16 @@ _BREAKER_SECONDS = 60
 _failed_at = 0.0
 
 
+class _NotRoutable(Exception):
+    """This request is not one we route, decided locally.
+
+    Distinct from a service failure on purpose. A multimodal turn or an
+    oversized query says nothing about the router's health, so it must not
+    latch the breaker -- one screenshot would otherwise silence routing for
+    every ordinary turn in the next minute.
+    """
+
+
 def reset_breaker() -> None:
     """Forget a recorded failure. For tests and for a deliberate re-probe."""
     global _failed_at
@@ -49,11 +59,11 @@ def recommend(config, messages, candidates):
             raise ValueError('invalid timeout')
         candidates = list(dict.fromkeys(candidates))
         if not candidates or len(candidates) > 64:
-            raise ValueError('no eligible candidates or too many candidates')
+            raise _NotRoutable('no eligible candidates or too many candidates')
         # No raw attachments, tool results, system instructions or whole history.
         content = next((m.get('content') for m in reversed(messages) if m.get('role') == 'user'), '')
         if not isinstance(content, str) or not content.strip() or len(content) > 12000:
-            raise ValueError('unsupported or oversized query')
+            raise _NotRoutable('unsupported or oversized query')
         ids = {f'{p}:{m}': (p, m) for p, m in candidates}
         with httpx.Client(timeout=timeout, trust_env=False, follow_redirects=False) as client:
             with client.stream('POST', url, headers={'Authorization': f'Bearer {token}'},
@@ -75,6 +85,10 @@ def recommend(config, messages, candidates):
                     applied=mode == 'enabled')
         _failed_at = 0.0
         return (ids[selected] if mode == 'enabled' else None), meta
+    except _NotRoutable as exc:
+        # Local refusal: the breaker stays open, the next turn still asks.
+        meta.update(reason='not_routable', error_type=type(exc).__name__, applied=False)
+        return None, meta
     except Exception as exc:
         _failed_at = time.monotonic()
         # Never log response bodies, input text, tokens or exception messages.
