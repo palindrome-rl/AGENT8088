@@ -4556,6 +4556,8 @@ def _show_memory_status():
     table = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
     table.add_column("Setting", style="#237dd7")
     table.add_column("Value", style="#237dd7")
+    engine_name = report.get("engine", "native")
+    table.add_row("Engine", f"{engine_name} ({'Mem0 graph/vector' if engine_name == 'mem0' else 'SQLite BM25+vector'})")
     table.add_row("Memories", str(report["count"]))
     table.add_row("Scope", report["user_id"]
                   + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
@@ -4607,10 +4609,10 @@ def _show_memory_search(query):
     for row in results:
         table.add_row(
             f"{row['score']:.4f}",
-            str(row["bm25_rank"] or "—"),
-            str(row["vector_rank"] or "—"),
-            row["text"][:80],
-            row["id"][:8],
+            str(row.get("bm25_rank") or "—"),
+            str(row.get("vector_rank") or "—"),
+            str(row.get("text", ""))[:80],
+            str(row.get("id", ""))[:8],
         )
     console.print(table)
     # The per-leg ranks are the point of this view: they show whether a hit came
