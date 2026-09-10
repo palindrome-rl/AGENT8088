@@ -196,9 +196,14 @@ def test_turn_limit_reports_error_and_latest_tool_result(monkeypatch, engine):
     monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
     monkeypatch.setattr(engine, "exec_tool", lambda *_args, **_kwargs: next(results))
 
+    # Growth off: this test is about what the exhaustion REPORT says, and a
+    # run that keeps earning rounds never reaches it. The wrap-up round is the
+    # third completion, which the two-item iterator refuses -- so the fallback
+    # path below is what gets exercised, which is the point.
     answer = engine.run_agent(
         [{"role": "user", "content": "test"}], max_turns=2,
         system_prompt="", tools_def=[], allowed_tools={"read_text"},
+        dynamic_turns=False,
     )
 
     assert answer.startswith("Error: Agent reached the 2-turn limit")

@@ -71,3 +71,20 @@ def test_task_tells_the_agent_how_to_finish(tmp_path):
 
     assert row["state"] == "completed"
     assert all("TASK_COMPLETE" in prompt for prompt in prompts)
+
+
+def test_a_slice_does_not_get_a_growing_turn_budget(tmp_path):
+    """run_task already grants continuation by re-running; slices stay fixed."""
+    from agent8088.task_runtime import TaskStore, run_task
+
+    store = TaskStore(tmp_path / "tasks.db")
+    seen = []
+
+    def agent(messages, **kwargs):
+        seen.append(kwargs.get("dynamic_turns"))
+        return "TASK_COMPLETE"
+
+    run_task("do it", agent, store=store, workspace=tmp_path,
+             max_slices=1, slice_turns=3)
+
+    assert seen == [False], f"slice ran with dynamic_turns={seen}"

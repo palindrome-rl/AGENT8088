@@ -188,6 +188,38 @@ never does — and a recalled memory can never authorise a tool call.
 | `browser_screenshots` | Enable browser screenshots for a vision-capable model (default `0`); override once with `AGENT8088_BROWSER_SCREENSHOTS=1`. |
 | `browser_llm_extra_body` | JSON fields sent only to browser-use model calls; use `{"chat_template_kwargs":{"enable_thinking":false}}` for Qwen served by vLLM. |
 
+### Dynamic turn budget
+
+`max_turns` is what a request *starts* with, not what it is allowed. A run that
+is still producing new, successful tool results has not failed, so ending it on
+a number chosen before the task began throws away real work. When the loop is
+one round from its soft limit and that round ran a new, non-repeated tool whose
+result did not fail, it is granted another block of rounds — up to a hard
+ceiling of `max_turns x dynamic_turns_ceiling_multiplier`.
+
+The signals come from state the loop already tracks, so extension costs no
+extra tokens and the model cannot request rounds it has not earned: a run that
+starts repeating itself, or whose steps start failing, simply stops earning
+them and ends where it is.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `dynamic_turns_ceiling_multiplier` | `4` | Hard turn ceiling as a multiple of `max_turns`. `1` disables growth and restores a fixed limit. |
+| `dynamic_turns_extension` | `5` | Rounds granted per extension. |
+
+Growth applies to the top-level request and to delegated sub-agents. It does
+**not** apply to the auditor (verification is bounded work, and letting it grow
+inflates the share of a request spent checking rather than doing), to anything
+nested deeper than one sub-agent, to single-round calls, or to durable-task
+slices — a slice already re-enters the agent up to `max_slices` times, so
+growth there would multiply rather than extend.
+
+When a request does exhaust its ceiling, it spends one final round with no
+tools available, asking the model to answer from what it already has. The user
+gets the partial result and a note that the budget ran out, rather than an
+error and a raw tool dump. If that round fails, the plain error report is
+returned instead.
+
 ### Turn budget
 
 `max_turns` bounds how many *rounds* a request takes. These bound what those

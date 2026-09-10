@@ -399,6 +399,18 @@ MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
 COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
 COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
 
+# --- Dynamic turn budget ---------------------------------------------------
+# max_turns is what a run STARTS with, not what it is allowed. A run still
+# producing new, successful tool results has not failed, so ending it on a
+# number chosen before the task began throws away real work and reports it as
+# an error. Progress buys more rounds, up to max_turns * this multiplier.
+# 1 disables growth entirely and restores the old fixed limit.
+DYNAMIC_TURNS_CEILING_MULTIPLIER = max(
+    1, int(APP_CONFIG.get("dynamic_turns_ceiling_multiplier", "4")))
+# Rounds granted per extension. Small on purpose: a run that has stalled should
+# have to re-prove progress often rather than coast to the ceiling.
+DYNAMIC_TURNS_EXTENSION = max(1, int(APP_CONFIG.get("dynamic_turns_extension", "5")))
+
 # --- Retry before failover ---
 # Retries the same provider this many times (with exponential backoff) before
 # falling through the fallback_models chain. 0 = immediate failover.
@@ -434,6 +446,9 @@ LIMIT_SPECS = {
     "max_subagent_answer_chars": ("MAX_SUBAGENT_ANSWER_CHARS", int, "Sub-agent answer cap"),
     "subagent_max_depth":        ("SUBAGENT_MAX_DEPTH", int, "Nested sub-agent depth"),
     "max_tool_output_bytes":     ("MAX_TOOL_OUTPUT_BYTES", int, "Bytes kept from one tool result"),
+    "dynamic_turns_ceiling_multiplier": ("DYNAMIC_TURNS_CEILING_MULTIPLIER", int,
+                                         "Turn ceiling as a multiple of max_turns (1 = fixed)"),
+    "dynamic_turns_extension":   ("DYNAMIC_TURNS_EXTENSION", int, "Rounds granted per extension"),
 }
 
 # For most of these 0 means "no limit", so the numeric direction of a change is
@@ -10010,6 +10025,117 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
     return limit
 
 
+# Roles whose budget must stay fixed no matter what they are doing. Verification
+# is bounded work by definition, and letting the auditor grow inflates the share
+# of a turn spent checking rather than doing -- the one number a caller reads to
+# decide whether verification is worth its cost.
+_FIXED_BUDGET_ROLES = frozenset({"subagent:auditor"})
+
+
+class _TurnPolicy:
+    """How many rounds this run starts with, and how many it may still earn.
+
+    `limit` is the soft budget the loop stops at; `ceiling` is the hard bound it
+    can never pass. They are equal when growth is disabled, which is what makes
+    every non-growing caller (depth, opt-out, multiplier 1) a single code path
+    rather than a branch in the loop.
+    """
+
+    def __init__(self, limit: int, ceiling: int, extension: int):
+        self.limit = max(1, int(limit))
+        self.ceiling = max(self.limit, int(ceiling))
+        self.extension = max(1, int(extension))
+        # A grant buys a BLOCK of rounds, so the block has to earn it. Judging
+        # only the round that happens to land on the boundary is a sampling
+        # error a run can walk straight through: succeed once every fifth
+        # round and the whole ceiling is yours.
+        self._block_start = 0
+        self._productive = 0
+
+    @property
+    def growable(self) -> bool:
+        return self.ceiling > self.limit
+
+    def record_round(self, *, fresh: bool, output: str | None) -> None:
+        """Count one round that ran a tool, productive or not.
+
+        Productive means both halves: the run did something it had not already
+        done, and that something worked. Either half alone is cheap to fake --
+        a model alternating between two commands it has already run never trips
+        the consecutive-repeat guard, and a run that fails constantly still
+        lands the occasional success.
+        """
+        if fresh and output is not None and not _plan_step_failed(output):
+            self._productive += 1
+
+    def extend(self, turn: int):
+        """Grant another block of rounds, or return None."""
+        if not self.growable or turn + 1 != self.limit:
+            return None
+        block = self.limit - self._block_start
+        if self._productive * 2 <= block:   # most of the block did nothing new
+            return None
+        previous = self.limit
+        self.limit = min(self.limit + self.extension, self.ceiling)
+        if self.limit <= previous:
+            return None
+        self._block_start, self._productive = previous, 0
+        return (previous, self.limit)
+
+
+def _turn_policy(max_turns: int, *, depth: int = 0, role: str | None = None,
+                 messages: list[dict] | None = None,
+                 dynamic: bool = True) -> _TurnPolicy:
+    """Decide one run's turn budget from who is running and what was asked."""
+    limit = max(1, int(max_turns))
+    if messages is not None and _cli_anything_requested(messages):
+        # cli-anything keeps its own hand-tuned floor and ceiling: a stateful
+        # external CLI has a lifecycle to finish, which is a different claim on
+        # rounds than "still making progress".
+        floor = max(limit, CLI_ANYTHING_MIN_TURNS)
+        return _TurnPolicy(floor, max(floor, CLI_ANYTHING_MAX_TURNS),
+                           CLI_ANYTHING_EXTENSION_TURNS)
+    fixed = (not dynamic
+             or limit <= 1              # a caller asking for exactly one round
+             or depth > 1               # nested past a delegated sub-agent
+             or (role or "") in _FIXED_BUDGET_ROLES)
+    ceiling = limit if fixed else limit * DYNAMIC_TURNS_CEILING_MULTIPLIER
+    return _TurnPolicy(limit, ceiling, DYNAMIC_TURNS_EXTENSION)
+
+
+def _answer_from_context(messages, *, system_prompt, temperature, budget, on_token,
+                         interrupt_check, trace, turn, client, provider_name,
+                         model_name):
+    """One last round with no tools, so an exhausted run reports its work.
+
+    The run is over either way; the only question is whether the user gets what
+    was actually found or an error string and a raw tool dump. Best effort by
+    design -- a failure here falls back to the old report rather than replacing
+    one bad ending with a crash.
+    """
+    ask = ("You have reached this turn's budget and no more tools will run. "
+           "Answer now from what you already have: give the result you did "
+           "reach and say plainly what is still missing. Do not ask to "
+           "continue and do not request another tool.")
+    try:
+        response = _create_completion_with_fallback(
+            messages + [{"role": "user", "content": ask}], [],
+            temperature=temperature, system_prompt=system_prompt,
+            on_token=on_token, interrupt_check=interrupt_check,
+            trace=trace, turn=turn, client_override=client,
+            provider_override=provider_name, model_override=model_name,
+        )
+    except AgentInterrupted:
+        raise
+    except Exception as exc:
+        _log.info("final wrap-up round failed: %s", exc)
+        return None
+    message = response.choices[0].message
+    if budget is not None:
+        budget.add_usage(response, text=(message.content or ""))
+    return _strip_reasoning(message.content or "").strip() or None
+
+
 # Modes whose identical repeat is worth re-running: their result reflects
 # external state this process does not own, so a cached answer can be stale in
 # a way a re-read cannot. They still do not count as progress -- see the loop.
@@ -10042,7 +10168,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_token=None, interrupt_check=None, trace=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
                     depth=0, budget=None, client=None, provider_name=None,
-                    model_name=None):
+                    model_name=None, dynamic_turns=True):
     global _last_auto_rung
     """Drive the model until it gives a final answer or hits max_turns.
 
@@ -10065,6 +10191,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     last_completed = None  # consecutive identical call -> (signature, output)
+    seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
@@ -10105,12 +10232,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": 0, "type": "preflight_refusal", "content": refusal})
         return refusal
 
-    turn_limit = _turn_limit_for_messages(messages, max_turns)
-    dynamic_cli = _cli_anything_requested(messages)
+    policy = _turn_policy(max_turns, depth=depth, role=_active_role,
+                          messages=messages, dynamic=dynamic_turns)
     no_execute_shell = _execute_shell_forbidden(messages)
-    hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
-    for turn in range(hard_turn_limit):
-        if turn >= turn_limit:
+    for turn in range(policy.ceiling):
+        if turn >= policy.limit:
             break
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
@@ -10440,6 +10566,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             on_calls(calls)
 
         executed = False
+        round_fresh = False  # did this round do something the run had not done?
         turn_tools = [] if trace is not None else None
         for call in calls:
             name = call["name"]
@@ -10576,6 +10703,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                   "tool": name, "count": parse_error_retries})
                 continue
             executed = executed or not no_progress
+            if not no_progress and sig not in seen_signatures:
+                round_fresh = True
+            seen_signatures.add(sig)
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
@@ -10675,12 +10805,13 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed:
             forcing = False
-            near_limit = (turn + 1 == turn_limit and turn_limit < hard_turn_limit
-                          and tool_outputs and not _plan_step_failed(tool_outputs[-1]))
-            if dynamic_cli and near_limit:
-                turn_limit = min(
-                    turn_limit + CLI_ANYTHING_EXTENSION_TURNS, hard_turn_limit
-                )
+            policy.record_round(
+                fresh=round_fresh,
+                output=tool_outputs[-1] if tool_outputs else None)
+            granted = policy.extend(turn)
+            if granted and trace is not None:
+                trace.append({"turn": turn, "type": "turn_extension",
+                              "from": granted[0], "to": granted[1]})
         elif forcing:
             forced_stop = True
             break
@@ -10692,7 +10823,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).
     reason = ("stopped because repeated tool calls made no progress"
-              if forced_stop else f"reached the {turn_limit}-turn limit before completing the task")
+              if forced_stop else f"reached the {policy.limit}-turn limit before completing the task")
+    wrapped = _answer_from_context(
+        messages, system_prompt=(system_prompt() if callable(system_prompt)
+                                 else system_prompt),
+        temperature=temperature, budget=budget, on_token=on_token,
+        interrupt_check=interrupt_check, trace=trace, turn=policy.limit,
+        client=client, provider_name=provider_name, model_name=model_name)
+    if wrapped:
+        answer = _guard_answer(f"{wrapped}\n\n_(The agent {reason}.)_")
+        if on_answer:
+            on_answer(answer)
+        if trace is not None:
+            trace.append({"turn": -1, "type": "budget_wrap_up", "content": answer})
+        return answer
     latest = tool_outputs[-1] if tool_outputs else _last_tool_output
     fallback = f"Error: Agent {reason}."
     if latest:
