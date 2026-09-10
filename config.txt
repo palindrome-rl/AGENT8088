@@ -502,3 +502,4 @@ provider.moonshot.native_tools=True
 plan_audit=1
 max_completion_tokens=65000
 max_turn_seconds=0
+auto_chain=groq:meta-llama/llama-prompt-guard-2-22m,openrouter:nex-agi/nex-n2.5-mini:free,ollama:qwen14b-tooluse-v3,cerebras:qwen-3.8-27b,ollama-cloud:glm-5.3,custom:ornith-1.0-35b,anthropic:claude-sonnet-4-6,gemini:gemini-2.5-flash,mistral:mistral-small-latest
