@@ -8519,12 +8519,43 @@ def _model_usage(response) -> tuple[dict, str]:
     return {"input_tokens": None, "output_tokens": len(content) // 4}, "output_estimate"
 
 
-def _stable_prefix_hash(prompt: str, tools) -> str:
+def _stable_prefix_hash(prompt: str, tools, model: str = "") -> str:
     """Short digest of the cacheable request prefix. Truncated deliberately --
-    this is for spotting drift across calls, not for integrity."""
+    this is for spotting drift across calls, not for integrity.
+
+    The model is part of the key because a provider's prompt cache is per
+    model: the same prefix sent to a different model is a cold cache, not a
+    hit. Leaving it out meant a router that switches models each turn reported
+    one stable prefix while discarding the cache on every turn -- the metric
+    said cache-friendly exactly when it had stopped being true."""
     prefix = (prompt or "").split(RUNTIME_CONTEXT_HEADING)[0]
     return hashlib.sha256(
-        (prefix + json.dumps(tools or [], sort_keys=True)).encode()).hexdigest()[:16]
+        (prefix + json.dumps(tools or [], sort_keys=True)
+         + chr(31) + str(model or "")).encode()).hexdigest()[:16]
+
+
+def record_routing_decision(decision: dict) -> None:
+    """Record what routing cost and whether it changed anything.
+
+    The decision used to go only to the application log, so `/cost` -- whose
+    whole purpose is answering what a turn cost -- reported the time the
+    router adds as nothing. It is a separate event type, never a model_call,
+    so it cannot be mistaken for a billed request."""
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "routing_decision",
+            "task_id": getattr(_active_budget, "task_id", None),
+        }
+        for key in ("backend", "mode", "reason", "selected", "applied",
+                    "latency_ms", "error_type"):
+            if key in decision:
+                entry[key] = decision[key]
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, entry)
+    except Exception as exc:  # noqa: BLE001 -- telemetry must not break a turn
+        _log.debug("routing telemetry write failed: %s", exc)
 
 
 def _record_model_telemetry(provider: str, model: str, attempt: str, started: float,
@@ -8563,7 +8594,7 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
             # system prompt up to the runtime section, plus the tool schemas.
             # If this changes between calls the prefix is not stable and no
             # provider-side cache will hit -- that is the thing to measure.
-            "stable_prefix_hash": _stable_prefix_hash(prompt, tools),
+            "stable_prefix_hash": _stable_prefix_hash(prompt, tools, model),
             "cached_input_tokens": getattr(getattr(getattr(response, 'usage', None),
                 'prompt_tokens_details', None), 'cached_tokens', None),
             "max_tokens": max_tokens,
@@ -10139,6 +10170,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 if trace is not None:
                     trace.append(dict(decision, turn=turn))
                 _log.info('LLMRouter decision: %s', decision)
+                record_routing_decision(decision)
                 if selected is not None:
                     auto_rung = _auto_chain.index(selected)
             _picked = routing.select(
