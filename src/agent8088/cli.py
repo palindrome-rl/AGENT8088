@@ -5172,7 +5172,7 @@ def _status_bar_fragments():
     last = S.last_usage or {}
     ctx_window, ctx_output = A._active_model_token_limits()
     ctx_label = f"{ctx_window // 1024}K" if ctx_window >= 1024 else str(ctx_window)
-    return [
+    fragments = [
         ("fg:#00edff bold", " ◆ 8088 "),
         ("fg:#237dd7 bold", f"· {_active_provider_name()}:{A.MODEL_NAME}"[:28]),
         ("", " │ "),
@@ -5184,8 +5184,19 @@ def _status_bar_fragments():
         ("fg:#237dd7", (S.name or "ephemeral")[:18]),
         ("", " │ "),
         ("fg:#237dd7", f"last {last.get('seconds', 0):.1f}s ↑{last.get('tokens', 0)}"),
-        ("fg:#00edff bold", " │ ● ready "),
     ]
+    # Read live (not a cached per-turn copy) so switching providers drops the
+    # segment immediately instead of showing the previous provider's number
+    # until the next turn happens to refresh it.
+    rl = A.current_rate_limit_status(_active_provider_name()) or {}
+    if rl.get("pct_remaining") is not None:
+        fragments.append(("", " │ "))
+        fragments.append(("fg:#237dd7", f"⚡{rl['pct_remaining']}%"))
+    elif rl.get("balance"):
+        fragments.append(("", " │ "))
+        fragments.append(("fg:#237dd7", f"⚡${rl['balance']['amount']:.2f}"))
+    fragments.append(("fg:#00edff bold", " │ ● ready "))
+    return fragments
 
 
 class _ThrottledLive:

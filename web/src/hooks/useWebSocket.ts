@@ -102,7 +102,9 @@ function wireSocket(ws: WebSocket) {
         if (interruptRequested) break
         {
           const current = useSessionStore.getState().status
-          if (current && data.usage) setStatus({ ...current, last_usage: data.usage })
+          if (current && data.usage) {
+            setStatus({ ...current, last_usage: data.usage, rate_limit_status: data.rate_limit_status ?? current.rate_limit_status })
+          }
         }
         addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
         break

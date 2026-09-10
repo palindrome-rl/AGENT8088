@@ -125,6 +125,10 @@ export interface StatusInfo {
     context?: number
     interrupted?: boolean
   } | null
+  rate_limit_status: {
+    pct_remaining: number | null
+    balance: { amount: number; currency: string } | null
+  } | null
   verbose: string
   usage_mode: string
   show_trace: boolean
@@ -274,7 +278,7 @@ export type WSEvent =
   | { type: 'escalation'; tool_name: string; change_type: string; description: string; id: string }
   | { type: 'plan_approval'; plan: string; id: string }
   | { type: 'plan_step'; index: number; total: number; step_text: string; tool_name: string; status: 'pending' | 'running' | 'done' | 'failed'; result?: string }
-  | { type: 'answer'; text: string; usage: { seconds: number; tokens: number; context?: number } }
+  | { type: 'answer'; text: string; usage: { seconds: number; tokens: number; context?: number }; rate_limit_status: StatusInfo['rate_limit_status'] }
   | { type: 'turn_complete' }
   | { type: 'interrupted'; elapsed: number; partial: string }
   | { type: 'error'; message: string }

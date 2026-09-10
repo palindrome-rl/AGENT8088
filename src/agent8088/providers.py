@@ -24,6 +24,54 @@ for _name, _provider in BUILTIN_PROVIDERS.items():
 
 def default_provider_name():
     return "ollama"
+
+# Providers that return live rate-limit headers on every inference response
+# (verified against each vendor's current docs) -- everything else either
+# needs a separate call (OpenRouter's /key), only exposes a currency balance
+# (DeepSeek, Moonshot), or nothing at all without an admin/management key
+# (Mistral, Gemini, Qwen) or has no quota concept (Ollama, custom). Field
+# names: request/token remaining+limit header, plus a reset header. Reset
+# format differs per provider (RFC3339 timestamp for Anthropic, a duration
+# string like "6m0s" for OpenAI, seconds for Groq) -- parsed accordingly in
+# engine.py, not normalized here.
+#
+# Cerebras is genuinely Tier 1 but its docs disagreed on whether requests and
+# tokens get separate headers or share one pair -- until verified live,
+# engine.py treats its single Remaining/Limit/Reset triplet as tokens-only.
+RATE_LIMIT_HEADERS = {
+    "anthropic": {
+        "requests_remaining": "anthropic-ratelimit-requests-remaining",
+        "requests_limit": "anthropic-ratelimit-requests-limit",
+        "tokens_remaining": "anthropic-ratelimit-tokens-remaining",
+        "tokens_limit": "anthropic-ratelimit-tokens-limit",
+        "reset": "anthropic-ratelimit-tokens-reset",
+        "reset_format": "rfc3339",
+    },
+    "openai": {
+        "requests_remaining": "x-ratelimit-remaining-requests",
+        "requests_limit": "x-ratelimit-limit-requests",
+        "tokens_remaining": "x-ratelimit-remaining-tokens",
+        "tokens_limit": "x-ratelimit-limit-tokens",
+        "reset": "x-ratelimit-reset-tokens",
+        "reset_format": "duration",
+    },
+    "groq": {
+        "requests_remaining": "x-ratelimit-remaining-requests",
+        "requests_limit": "x-ratelimit-limit-requests",
+        "tokens_remaining": "x-ratelimit-remaining-tokens",
+        "tokens_limit": "x-ratelimit-limit-tokens",
+        "reset": "x-ratelimit-reset-tokens",
+        "reset_format": "seconds",
+    },
+    "cerebras": {
+        "requests_remaining": None,
+        "requests_limit": None,
+        "tokens_remaining": "x-ratelimit-remaining",
+        "tokens_limit": "x-ratelimit-limit",
+        "reset": "x-ratelimit-reset",
+        "reset_format": "seconds",
+    },
+}
 FALLBACK_MODELS = {
     "ollama":       ["qwen14b-tooluse-v3", "llama3.3", "qwen2.5-coder:32b"],
     "openrouter":   ["anthropic/claude-sonnet-4", "openrouter/auto", "openai/gpt-4o"],
@@ -276,16 +324,30 @@ def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL
                             pass
                     if ctx:
                         break
-                # OpenRouter puts max_completion_tokens inside top_provider
+                # OpenRouter puts max_completion_tokens inside top_provider;
+                # Groq (and others) publish it as a top-level field directly
+                # -- e.g. a 512-token classifier model like Llama Prompt
+                # Guard 2 reports max_completion_tokens=512 right on the
+                # model object, distinct from context_window/context_length.
                 out = None
-                tp = getattr(m, "top_provider", None)
-                if isinstance(tp, dict):
-                    out = tp.get("max_completion_tokens")
-                    if out:
+                for attr in ("max_completion_tokens", "max_output_length",
+                             "max_output_tokens"):
+                    v = getattr(m, attr, None)
+                    if v:
                         try:
-                            out = int(out)
+                            out = int(v)
                         except (TypeError, ValueError):
-                            out = None
+                            continue
+                        break
+                if out is None:
+                    tp = getattr(m, "top_provider", None)
+                    if isinstance(tp, dict):
+                        out = tp.get("max_completion_tokens")
+                        if out:
+                            try:
+                                out = int(out)
+                            except (TypeError, ValueError):
+                                out = None
                 if ctx:
                     return ctx, out
     except Exception:

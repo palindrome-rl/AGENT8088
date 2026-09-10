@@ -50,6 +50,18 @@ export function StatusBar() {
           <span>{status.last_usage.seconds?.toFixed(1)}s ↑{status.last_usage.tokens}</span>
         </>
       )}
+      {status.rate_limit_status?.pct_remaining != null && (
+        <>
+          <span className="text-zinc-300 dark:text-zinc-700">·</span>
+          <span>⚡{status.rate_limit_status.pct_remaining}%</span>
+        </>
+      )}
+      {status.rate_limit_status?.balance && (
+        <>
+          <span className="text-zinc-300 dark:text-zinc-700">·</span>
+          <span>⚡${status.rate_limit_status.balance.amount.toFixed(2)}</span>
+        </>
+      )}
     </div>
   )
 }
