@@ -353,3 +353,102 @@ def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL
     except Exception:
         pass
     return None, None
+
+
+# A model's modalities do not change, but the name pointing at them does: a
+# locally re-pulled `qwen2.5vl:7b` can be a different build by Friday. A week
+# keeps the probe effectively free without pinning a stale answer forever.
+VISION_CACHE_SECONDS = 7 * 24 * 3600
+
+
+def _ollama_vision(base_url, model_id, headers, timeout):
+    """Ollama's /api/show `capabilities`, which lists "vision" verbatim.
+
+    An absent or empty list is None, not False: builds predating the field
+    report nothing, and "did not say" must stay retryable.
+    """
+    import httpx
+    show_url = base_url.replace("/v1", "") + "/api/show"
+    r = httpx.post(show_url, json={"model": model_id}, headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    capabilities = r.json().get("capabilities")
+    if not isinstance(capabilities, list) or not capabilities:
+        return None
+    return "vision" in [str(item).lower() for item in capabilities]
+
+
+def _listing_vision(base_url, model_id, headers, timeout):
+    """`architecture.input_modalities` from an OpenAI-compatible /models list.
+
+    Read over raw httpx rather than `client.models.list()` — unlike the
+    context-window probe next door, the field wanted here is a nested dict on
+    a non-standard key, which the SDK's typed model object does not surface.
+    OpenRouter publishes it for all 436 of its models; most other endpoints
+    publish nothing, which is a None (unknown), never a False.
+    """
+    import httpx
+    r = httpx.get(f"{base_url}/models", headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    for entry in r.json().get("data", []):
+        if not isinstance(entry, dict) or str(entry.get("id", "")) != str(model_id):
+            continue
+        architecture = entry.get("architecture")
+        if not isinstance(architecture, dict):
+            return None
+        modalities = architecture.get("input_modalities")
+        if not isinstance(modalities, list) or not modalities:
+            return None
+        return "image" in [str(item).lower() for item in modalities]
+    return None
+
+
+def probe_model_vision(client, model_id, provider_name="", timeout=MODEL_LIST_TIMEOUT_SECONDS):
+    """Best-effort: ask the endpoint whether this model can read images.
+
+    Returns True, False, or None for "the endpoint did not say". Never raises.
+
+    The three-valued answer is the whole contract. Only True and False are
+    cached; a timeout, a 404 or a silent endpoint stays None and gets asked
+    again next time, because caching a failure would mark a vision model blind
+    for a week on the strength of one dropped packet.
+
+    Strategies, in order, and only ones verified against a live endpoint:
+    1. Ollama native /api/show — `capabilities` contains "vision".
+    2. OpenAI-compatible /models — `architecture.input_modalities` contains
+       "image". Authoritative on OpenRouter.
+
+    Gemini is deliberately absent: its native endpoint publishes
+    `supportedGenerationMethods`, not modalities, so there is no vision signal
+    to read. Those models are covered by the bundled catalog instead.
+    """
+    base_url = str(getattr(client, "base_url", "")).rstrip("/")
+    api_key = str(getattr(client, "api_key", ""))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    identity = hashlib.sha256(api_key.encode()).hexdigest()[:12] if api_key else "anonymous"
+    cache_key = f"vision|{provider_name}|{base_url}|{identity}|{model_id}"
+
+    now = time.time()
+    disk = _load_disk_cache()
+    cached = disk.get(cache_key)
+    if (isinstance(cached, dict) and isinstance(cached.get("vision"), bool)
+            and (now - cached.get("ts", 0)) < VISION_CACHE_SECONDS):
+        return cached["vision"]
+
+    answer = None
+    if provider_name in ("ollama", "ollama-cloud") or "ollama" in base_url:
+        try:
+            answer = _ollama_vision(base_url, model_id, headers, timeout)
+        except Exception:
+            answer = None
+    if answer is None:
+        try:
+            answer = _listing_vision(base_url, model_id, headers, timeout)
+        except Exception:
+            answer = None
+
+    if answer is not None:
+        disk[cache_key] = {"ts": now, "vision": answer}
+        _save_disk_cache(disk)
+    return answer

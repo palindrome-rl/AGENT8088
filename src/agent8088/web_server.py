@@ -1559,9 +1559,28 @@ def _ocr_module():
 
 
 def _vision_capable() -> bool:
+    """Catalog-only, deliberately offline.
+
+    Used by the upload handler to decide an advisory chip while the user is
+    waiting on the upload itself, so it must not spend a network round-trip.
+    The send path uses _vision_capable_probed() instead.
+    """
     A, C = _eng(), _cl()
     from . import model_catalog
     return model_catalog.vision_capable(C._active_provider_name(), A.MODEL_NAME)
+
+
+def _vision_capable_probed() -> bool:
+    """The same question, allowed to ask the endpoint.
+
+    Only for the send path, which already runs off the event loop (see the
+    asyncio.to_thread call around _attachment_ocr_context), so the probe's
+    blocking HTTP call cannot stall the server.
+    """
+    A, C = _eng(), _cl()
+    from . import model_catalog
+    return model_catalog.vision_capable(
+        C._active_provider_name(), A.MODEL_NAME, client=getattr(A, "client", None))
 
 
 def _wants_ocr(attachment: dict, ocr) -> bool:
@@ -1582,7 +1601,7 @@ def _attachment_ocr_context(attachments: list[dict]) -> str:
     Empty string when the model has vision, which is the whole point: a
     multimodal model keeps using its own capability and never pays for this.
     """
-    if not attachments or _vision_capable():
+    if not attachments or _vision_capable_probed():
         return ""
     ocr = _ocr_module()
     blocks = []
