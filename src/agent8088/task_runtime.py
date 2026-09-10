@@ -269,7 +269,12 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         runtime.bind(messages)
         try:
             with runtime.active():
-                answer = agent(messages, max_turns=slice_turns, **agent_kwargs)
+                # A slice already IS the continuation mechanism: run_task
+                # re-enters the agent up to max_slices times with the
+                # context intact. Letting each slice grow its own turn
+                # budget on top of that multiplies instead of extending.
+                answer = agent(messages, max_turns=slice_turns,
+                               dynamic_turns=False, **agent_kwargs)
         except Exception as exc:
             store.checkpoint(task_id, messages=_compact(messages), state="paused", error=str(exc))
             break

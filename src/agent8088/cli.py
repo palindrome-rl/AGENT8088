@@ -5106,6 +5106,15 @@ def cmd_cost(args):
     cost_label = f"${report['known_cost_usd']:.6f}" if report['estimated_cost_calls'] else 'unknown (no complete priced calls)'
     console.print(f"Recorded cost estimates: {cost_label} | Calls with unknown cost: {report['unknown_cost_calls']}", markup=False)
     console.print('Not an invoice. Unknown costs are excluded; summed latency is not task wall time. /cost <task-id> filters one task.', markup=False)
+    if report.get('routing_decisions'):
+        # Time the turn spent choosing a model, before any model was called.
+        # Shown apart from call latency because it is not a billed request --
+        # but it is not free either, and it was invisible until now.
+        console.print(
+            f"Model routing: {report['routing_decisions']} decisions "
+            f"({report['routing_applied']} changed the model) | "
+            f"{report['routing_latency_ms'] / 1000:.1f}s spent deciding",
+            markup=False)
     for task, calls in report['tasks'].items():
         console.print(f"  {task}: {calls} calls", markup=False)
     if report['truncated'] or report['malformed_records']:

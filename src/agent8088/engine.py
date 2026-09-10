@@ -399,6 +399,18 @@ MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
 COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
 COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
 
+# --- Dynamic turn budget ---------------------------------------------------
+# max_turns is what a run STARTS with, not what it is allowed. A run still
+# producing new, successful tool results has not failed, so ending it on a
+# number chosen before the task began throws away real work and reports it as
+# an error. Progress buys more rounds, up to max_turns * this multiplier.
+# 1 disables growth entirely and restores the old fixed limit.
+DYNAMIC_TURNS_CEILING_MULTIPLIER = max(
+    1, int(APP_CONFIG.get("dynamic_turns_ceiling_multiplier", "4")))
+# Rounds granted per extension. Small on purpose: a run that has stalled should
+# have to re-prove progress often rather than coast to the ceiling.
+DYNAMIC_TURNS_EXTENSION = max(1, int(APP_CONFIG.get("dynamic_turns_extension", "5")))
+
 # --- Retry before failover ---
 # Retries the same provider this many times (with exponential backoff) before
 # falling through the fallback_models chain. 0 = immediate failover.
@@ -434,6 +446,9 @@ LIMIT_SPECS = {
     "max_subagent_answer_chars": ("MAX_SUBAGENT_ANSWER_CHARS", int, "Sub-agent answer cap"),
     "subagent_max_depth":        ("SUBAGENT_MAX_DEPTH", int, "Nested sub-agent depth"),
     "max_tool_output_bytes":     ("MAX_TOOL_OUTPUT_BYTES", int, "Bytes kept from one tool result"),
+    "dynamic_turns_ceiling_multiplier": ("DYNAMIC_TURNS_CEILING_MULTIPLIER", int,
+                                         "Turn ceiling as a multiple of max_turns (1 = fixed)"),
+    "dynamic_turns_extension":   ("DYNAMIC_TURNS_EXTENSION", int, "Rounds granted per extension"),
     "max_tool_timeout_seconds":  ("MAX_TOOL_TIMEOUT_SECONDS", int, "Default per-tool timeout ceiling"),
     "denial_breaker_threshold":  ("DENIAL_BREAKER_THRESHOLD", int, "Repeated denials before the breaker trips"),
     "context_window":            ("CONTEXT_WINDOW", int, "Global fallback context window"),
@@ -1053,6 +1068,8 @@ def _dangerous_git_args(tokens: list) -> bool:
             or any(flag in ("-f", "--force") for flag in flags)
             or any(not flag.startswith("-") for flag in flags)
         ))
+        or (action == "switch" and any(
+            flag in ("-f", "--force", "--discard-changes") for flag in flags))
         or (action == "stash" and any(flag in ("drop", "clear") for flag in flags))
     )
 
@@ -3180,6 +3197,27 @@ def resolve_pasted_path(raw_path: str) -> Path:
     return p
 
 
+def _inside_a_repository(target: Path) -> bool:
+    """Is this path inside a git repository below the project root?
+
+    A repository states where its own files belong, so a write into one is not
+    an invented location and must not be diverted to artifacts/. Without this a
+    file written as `repo/sample.txt` landed in artifacts/repo/ while the repo
+    itself sat at repo/: the commit had nothing to stage, and nothing could
+    repair it afterwards because the sandbox denies writes under .git.
+
+    The project root itself does not count. Treating it as a repository would
+    exempt every bare filename in a checked-out project, which is the diversion
+    this function is a narrow exception to, not a replacement for.
+    """
+    for parent in target.parents:
+        if parent == PROJECT_ROOT or PROJECT_ROOT not in parent.parents:
+            return False
+        if (parent / ".git").exists():
+            return True
+    return False
+
+
 def resolve_write_path(raw_path: str) -> Path:
     """Store what the agent creates in artifacts/; honour a stated location.
 
@@ -3206,7 +3244,9 @@ def resolve_write_path(raw_path: str) -> Path:
         resolved = (ARTIFACTS_ROOT / p).resolve()
     else:
         project_path = (PROJECT_ROOT / p).resolve()
-        if project_path.exists() or project_path == ARTIFACTS_ROOT or ARTIFACTS_ROOT in project_path.parents:
+        if (project_path.exists() or project_path == ARTIFACTS_ROOT
+                or ARTIFACTS_ROOT in project_path.parents
+                or _inside_a_repository(project_path)):
             resolved = project_path
         else:
             resolved = (ARTIFACTS_ROOT / p).resolve()
@@ -3542,6 +3582,25 @@ def _git_safe_value(value, what):
 _GIT_REMOTE_ACTIONS = ("list", "add", "set-url", "remove")
 
 
+def _git_prefix(args: dict) -> list:
+    """`git -C <dir>` so a repository below the shell cwd is reachable.
+
+    Every git tool ran in SHELL_CWD and nothing could point it elsewhere, so a
+    repo the agent had just created one directory down answered "not a git
+    repository" to every follow-up -- and the shell could not stand in for the
+    tools, because the sandbox denies writes under .git.
+    """
+    repo = _git_safe_value(args.get("repo"), "repository directory")
+    return ["git", "-C", repo] if repo else ["git"]
+
+
+def _git_flag_is_set(value) -> bool:
+    """The model passes booleans as strings, so "false" must not read as true."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _git_push_target(args: dict) -> str:
     """The "<remote> <branch>" a git_push would use, for the approval prompt.
 
@@ -3552,8 +3611,12 @@ def _git_push_target(args: dict) -> str:
         argv = _structured_tool_argv("git_push", args or {})
     except ValueError:
         return "origin HEAD"
-    flags = [a for a in argv[2:] if a.startswith("-")]
-    target = " ".join(a for a in argv[2:] if not a.startswith("-"))
+    # Slice from the subcommand, not a fixed offset: a `repo` argument puts
+    # `-C <dir>` in front of it, and read positionally that directory became
+    # part of the target the user was asked to approve.
+    rest = argv[argv.index("push") + 1:]
+    flags = [a for a in rest if a.startswith("-")]
+    target = " ".join(a for a in rest if not a.startswith("-"))
     # "-u" is a property of the push, not part of where it goes. Left in the
     # target it produced "Push to -u origin master?" -- argv leaking into a
     # sentence a human reads before consenting.
@@ -3574,16 +3637,16 @@ def _structured_tool_argv(name: str, args: dict):
                 "git remote action must be one of: "
                 + ", ".join(_GIT_REMOTE_ACTIONS) + ".")
         if action == "list":
-            return ["git", "remote", "-v"]
+            return _git_prefix(args) + ["remote", "-v"]
         remote = _git_safe_value(args.get("name"), "remote name")
         if not remote:
             raise ValueError("git remote " + action + " requires a remote name.")
         if action == "remove":
-            return ["git", "remote", "remove", remote]
+            return _git_prefix(args) + ["remote", "remove", remote]
         url = _git_safe_value(args.get("url"), "remote url")
         if not url:
             raise ValueError("git remote " + action + " requires a url.")
-        return ["git", "remote", action, remote, url]
+        return _git_prefix(args) + ["remote", action, remote, url]
     if name == "git_clone":
         url = str(args.get("url", ""))
         directory = str(args.get("directory", ""))
@@ -3592,15 +3655,41 @@ def _structured_tool_argv(name: str, args: dict):
         if any(char in directory for char in ("\0", "\r", "\n")):
             raise ValueError("git clone requires a safe destination path.")
         return ["git", "clone", "--", url] + ([directory] if directory else [])
+    if name == "git_status":
+        return _git_prefix(args) + ["status", "--short", "--branch"]
+    if name == "git_log":
+        return _git_prefix(args) + ["log", "--oneline", "-20"]
+    if name == "git_diff":
+        return _git_prefix(args) + ["diff"]
     if name == "git_commit":
-        return ["git", "commit", "-m", str(args.get("message", ""))]
+        return _git_prefix(args) + ["commit", "-m", str(args.get("message", ""))]
+    if name == "git_branch":
+        branch = _git_safe_value(args.get("name"), "branch name")
+        if not branch:
+            raise ValueError("git branch requires a branch name.")
+        return _git_prefix(args) + ["branch", "--", branch]
+    if name == "git_checkout":
+        branch = _git_safe_value(args.get("name"), "branch name")
+        if not branch:
+            raise ValueError("git checkout requires a branch name.")
+        # `switch`, not `checkout`. `git checkout <anything>` is hard-blocked,
+        # and rightly: `git checkout -- src/` silently discards uncommitted
+        # work, and the argv gives the hardline no way to tell that from moving
+        # to a branch. `switch` is the half that only ever moves HEAD; it
+        # refuses rather than clobber a dirty tree, and the flags that would
+        # override that are unreachable here because a value starting with a
+        # dash is rejected above.
+        if _git_flag_is_set(args.get("create")):
+            return _git_prefix(args) + ["switch", "-c", branch]
+        return _git_prefix(args) + ["switch", branch]
     if name == "git_push":
         # Defaults unchanged: a bare git_push is still `git push origin HEAD`.
         remote = _git_safe_value(args.get("remote") or "origin", "remote name")
         branch = _git_safe_value(args.get("branch") or "HEAD", "branch name")
         upstream = str(args.get("set_upstream", "")).strip().lower() in (
             "1", "true", "yes", "on")
-        return ["git", "push"] + (["-u"] if upstream else []) + [remote, branch]
+        return _git_prefix(args) + ["push"] + (["-u"] if upstream else []) \
+            + [remote, branch]
     if name == "git_create_pr":
         return ["gh", "pr", "create", "--title", str(args.get("title", "")),
                 "--body", str(args.get("body", ""))]
@@ -3617,7 +3706,7 @@ def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     runner = (lambda a: _exec_process(a, timeout=timeout)) if on_host else (
         lambda a: _exec_sandbox_argv(a, timeout=timeout))
     if name == "git_commit":
-        staged = runner(["git", "add", "-A"])
+        staged = runner(_git_prefix(args) + ["add", "-A"])
         if "exited with status" in staged or "timed out" in staged:
             return staged
     result = _missing_binary_hint(argv[0] if argv else "", runner(argv))
@@ -8688,12 +8777,43 @@ def _model_usage(response) -> tuple[dict, str]:
     return {"input_tokens": None, "output_tokens": len(content) // 4}, "output_estimate"
 
 
-def _stable_prefix_hash(prompt: str, tools) -> str:
+def _stable_prefix_hash(prompt: str, tools, model: str = "") -> str:
     """Short digest of the cacheable request prefix. Truncated deliberately --
-    this is for spotting drift across calls, not for integrity."""
+    this is for spotting drift across calls, not for integrity.
+
+    The model is part of the key because a provider's prompt cache is per
+    model: the same prefix sent to a different model is a cold cache, not a
+    hit. Leaving it out meant a router that switches models each turn reported
+    one stable prefix while discarding the cache on every turn -- the metric
+    said cache-friendly exactly when it had stopped being true."""
     prefix = (prompt or "").split(RUNTIME_CONTEXT_HEADING)[0]
     return hashlib.sha256(
-        (prefix + json.dumps(tools or [], sort_keys=True)).encode()).hexdigest()[:16]
+        (prefix + json.dumps(tools or [], sort_keys=True)
+         + chr(31) + str(model or "")).encode()).hexdigest()[:16]
+
+
+def record_routing_decision(decision: dict) -> None:
+    """Record what routing cost and whether it changed anything.
+
+    The decision used to go only to the application log, so `/cost` -- whose
+    whole purpose is answering what a turn cost -- reported the time the
+    router adds as nothing. It is a separate event type, never a model_call,
+    so it cannot be mistaken for a billed request."""
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "routing_decision",
+            "task_id": getattr(_active_budget, "task_id", None),
+        }
+        for key in ("backend", "mode", "reason", "selected", "applied",
+                    "latency_ms", "error_type"):
+            if key in decision:
+                entry[key] = decision[key]
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, entry)
+    except Exception as exc:  # noqa: BLE001 -- telemetry must not break a turn
+        _log.debug("routing telemetry write failed: %s", exc)
 
 
 def _record_model_telemetry(provider: str, model: str, attempt: str, started: float,
@@ -8732,7 +8852,7 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
             # system prompt up to the runtime section, plus the tool schemas.
             # If this changes between calls the prefix is not stable and no
             # provider-side cache will hit -- that is the thing to measure.
-            "stable_prefix_hash": _stable_prefix_hash(prompt, tools),
+            "stable_prefix_hash": _stable_prefix_hash(prompt, tools, model),
             "cached_input_tokens": getattr(getattr(getattr(response, 'usage', None),
                 'prompt_tokens_details', None), 'cached_tokens', None),
             "max_tokens": max_tokens,
@@ -10148,10 +10268,141 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
     return limit
 
 
+# Roles whose budget must stay fixed no matter what they are doing. Verification
+# is bounded work by definition, and letting the auditor grow inflates the share
+# of a turn spent checking rather than doing -- the one number a caller reads to
+# decide whether verification is worth its cost.
+_FIXED_BUDGET_ROLES = frozenset({"subagent:auditor"})
+
+
+class _TurnPolicy:
+    """How many rounds this run starts with, and how many it may still earn.
+
+    `limit` is the soft budget the loop stops at; `ceiling` is the hard bound it
+    can never pass. They are equal when growth is disabled, which is what makes
+    every non-growing caller (depth, opt-out, multiplier 1) a single code path
+    rather than a branch in the loop.
+    """
+
+    def __init__(self, limit: int, ceiling: int, extension: int):
+        self.limit = max(1, int(limit))
+        self.ceiling = max(self.limit, int(ceiling))
+        self.extension = max(1, int(extension))
+        # A grant buys a BLOCK of rounds, so the block has to earn it. Judging
+        # only the round that happens to land on the boundary is a sampling
+        # error a run can walk straight through: succeed once every fifth
+        # round and the whole ceiling is yours.
+        self._block_start = 0
+        self._productive = 0
+
+    @property
+    def growable(self) -> bool:
+        return self.ceiling > self.limit
+
+    def record_round(self, *, fresh: bool, output: str | None) -> None:
+        """Count one round that ran a tool, productive or not.
+
+        Productive means both halves: the run did something it had not already
+        done, and that something worked. Either half alone is cheap to fake --
+        a model alternating between two commands it has already run never trips
+        the consecutive-repeat guard, and a run that fails constantly still
+        lands the occasional success.
+        """
+        if fresh and output is not None and not _plan_step_failed(output):
+            self._productive += 1
+
+    def extend(self, turn: int):
+        """Grant another block of rounds, or return None."""
+        if not self.growable or turn + 1 != self.limit:
+            return None
+        block = self.limit - self._block_start
+        if self._productive * 2 <= block:   # most of the block did nothing new
+            return None
+        previous = self.limit
+        self.limit = min(self.limit + self.extension, self.ceiling)
+        if self.limit <= previous:
+            return None
+        self._block_start, self._productive = previous, 0
+        return (previous, self.limit)
+
+
+def _turn_policy(max_turns: int, *, depth: int = 0, role: str | None = None,
+                 messages: list[dict] | None = None,
+                 dynamic: bool = True) -> _TurnPolicy:
+    """Decide one run's turn budget from who is running and what was asked."""
+    limit = max(1, int(max_turns))
+    if messages is not None and _cli_anything_requested(messages):
+        # cli-anything keeps its own hand-tuned floor and ceiling: a stateful
+        # external CLI has a lifecycle to finish, which is a different claim on
+        # rounds than "still making progress".
+        floor = max(limit, CLI_ANYTHING_MIN_TURNS)
+        return _TurnPolicy(floor, max(floor, CLI_ANYTHING_MAX_TURNS),
+                           CLI_ANYTHING_EXTENSION_TURNS)
+    fixed = (not dynamic
+             or limit <= 1              # a caller asking for exactly one round
+             or depth > 1               # nested past a delegated sub-agent
+             or (role or "") in _FIXED_BUDGET_ROLES)
+    ceiling = limit if fixed else limit * DYNAMIC_TURNS_CEILING_MULTIPLIER
+    return _TurnPolicy(limit, ceiling, DYNAMIC_TURNS_EXTENSION)
+
+
+def _answer_from_context(messages, *, system_prompt, temperature, budget, on_token,
+                         interrupt_check, trace, turn, client, provider_name,
+                         model_name):
+    """One last round with no tools, so an exhausted run reports its work.
+
+    The run is over either way; the only question is whether the user gets what
+    was actually found or an error string and a raw tool dump. Best effort by
+    design -- a failure here falls back to the old report rather than replacing
+    one bad ending with a crash.
+    """
+    ask = ("You have reached this turn's budget and no more tools will run. "
+           "Answer now from what you already have: give the result you did "
+           "reach and say plainly what is still missing. Do not ask to "
+           "continue and do not request another tool.")
+    try:
+        response = _create_completion_with_fallback(
+            messages + [{"role": "user", "content": ask}], [],
+            temperature=temperature, system_prompt=system_prompt,
+            on_token=on_token, interrupt_check=interrupt_check,
+            trace=trace, turn=turn, client_override=client,
+            provider_override=provider_name, model_override=model_name,
+        )
+    except AgentInterrupted:
+        raise
+    except Exception as exc:
+        _log.info("final wrap-up round failed: %s", exc)
+        return None
+    message = response.choices[0].message
+    if budget is not None:
+        budget.add_usage(response, text=(message.content or ""))
+    return _strip_reasoning(message.content or "").strip() or None
+
+
 # Modes whose identical repeat is worth re-running: their result reflects
 # external state this process does not own, so a cached answer can be stale in
 # a way a re-read cannot. They still do not count as progress -- see the loop.
 _REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
+
+
+def _consult_llmrouter(config, messages, eligible):
+    """Ask the optional router, or explain why not. Never raises.
+
+    The adapter imports httpx, which is declared in the gateway extra rather
+    than core -- it is present on most installs only because openai pulls it
+    in. An unguarded import inside the loop meant enabling routing on an
+    install without it killed the turn, while every other routing failure
+    logs and falls back. Routing is optional; it must fail like it.
+    """
+    try:
+        from agent8088.llmrouter_adapter import recommend
+        return recommend(config, messages, eligible)
+    except Exception as exc:  # noqa: BLE001 -- optional path, never fatal
+        return None, {"type": "routing_decision", "backend": "llmrouter",
+                      "mode": str(config.get("llmrouter_mode", "off")).lower(),
+                      "reason": "router_unavailable_or_invalid",
+                      "error_type": type(exc).__name__,
+                      "applied": False, "latency_ms": 0}
 
 
 def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
@@ -10160,7 +10411,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_token=None, interrupt_check=None, trace=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
                     depth=0, budget=None, client=None, provider_name=None,
-                    model_name=None):
+                    model_name=None, dynamic_turns=True):
     global _last_auto_rung
     """Drive the model until it gives a final answer or hits max_turns.
 
@@ -10183,6 +10434,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     last_completed = None  # consecutive identical call -> (signature, output)
+    seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
@@ -10197,6 +10449,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # that just failed and the one that rescued it. A new user turn starts fresh
     # at the cheap rung, so a one-off hard prompt doesn't tax every later one.
     auto_rung = routing.starting_rung(model_name or MODEL_NAME, len(_auto_chain))
+    llmrouter_consulted = False
     auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
@@ -10222,12 +10475,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": 0, "type": "preflight_refusal", "content": refusal})
         return refusal
 
-    turn_limit = _turn_limit_for_messages(messages, max_turns)
-    dynamic_cli = _cli_anything_requested(messages)
+    policy = _turn_policy(max_turns, depth=depth, role=_active_role,
+                          messages=messages, dynamic=dynamic_turns)
     no_execute_shell = _execute_shell_forbidden(messages)
-    hard_turn_limit = max(turn_limit, CLI_ANYTHING_MAX_TURNS) if dynamic_cli else turn_limit
-    for turn in range(hard_turn_limit):
-        if turn >= turn_limit:
+    for turn in range(policy.ceiling):
+        if turn >= policy.limit:
             break
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
@@ -10291,6 +10543,24 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # auto-compaction uses, converted chars -> tokens.
             _min_context_needed = _estimate_context_chars(
                 messages, round_system_prompt or "") // 4
+            if (not llmrouter_consulted and routing.variant(model_name or MODEL_NAME) != 'smart'
+                    and APP_CONFIG.get('llmrouter_mode', 'off') in ('shadow', 'enabled')):
+                llmrouter_consulted = True
+                eligible = []
+                for p, m in _auto_chain:
+                    context, completion = _active_model_token_limits(p, m)
+                    if not routing.cooling(p, m) and context >= _min_context_needed + completion:
+                        eligible.append((p, m))
+                routing_messages = [dict(message, content=_redact_secrets(message['content']))
+                                    if isinstance(message.get('content'), str) else message
+                                    for message in _genuine_user_turns(messages)]
+                selected, decision = _consult_llmrouter(APP_CONFIG, routing_messages, eligible)
+                if trace is not None:
+                    trace.append(dict(decision, turn=turn))
+                _log.info('LLMRouter decision: %s', decision)
+                record_routing_decision(decision)
+                if selected is not None:
+                    auto_rung = _auto_chain.index(selected)
             _picked = routing.select(
                 _auto_chain, auto_rung,
                 fits=lambda p, m: _active_model_token_limits(p, m)[0] >= _min_context_needed,
@@ -10539,6 +10809,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             on_calls(calls)
 
         executed = False
+        round_fresh = False  # did this round do something the run had not done?
         turn_tools = [] if trace is not None else None
         for call in calls:
             name = call["name"]
@@ -10675,6 +10946,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                   "tool": name, "count": parse_error_retries})
                 continue
             executed = executed or not no_progress
+            if not no_progress and sig not in seen_signatures:
+                round_fresh = True
+            seen_signatures.add(sig)
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
                 # Remember what this query returned so a reworded repeat can be
@@ -10774,12 +11048,13 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed:
             forcing = False
-            near_limit = (turn + 1 == turn_limit and turn_limit < hard_turn_limit
-                          and tool_outputs and not _plan_step_failed(tool_outputs[-1]))
-            if dynamic_cli and near_limit:
-                turn_limit = min(
-                    turn_limit + CLI_ANYTHING_EXTENSION_TURNS, hard_turn_limit
-                )
+            policy.record_round(
+                fresh=round_fresh,
+                output=tool_outputs[-1] if tool_outputs else None)
+            granted = policy.extend(turn)
+            if granted and trace is not None:
+                trace.append({"turn": turn, "type": "turn_extension",
+                              "from": granted[0], "to": granted[1]})
         elif forcing:
             forced_stop = True
             break
@@ -10791,7 +11066,20 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).
     reason = ("stopped because repeated tool calls made no progress"
-              if forced_stop else f"reached the {turn_limit}-turn limit before completing the task")
+              if forced_stop else f"reached the {policy.limit}-turn limit before completing the task")
+    wrapped = _answer_from_context(
+        messages, system_prompt=(system_prompt() if callable(system_prompt)
+                                 else system_prompt),
+        temperature=temperature, budget=budget, on_token=on_token,
+        interrupt_check=interrupt_check, trace=trace, turn=policy.limit,
+        client=client, provider_name=provider_name, model_name=model_name)
+    if wrapped:
+        answer = _guard_answer(f"{wrapped}\n\n_(The agent {reason}.)_")
+        if on_answer:
+            on_answer(answer)
+        if trace is not None:
+            trace.append({"turn": -1, "type": "budget_wrap_up", "content": answer})
+        return answer
     latest = tool_outputs[-1] if tool_outputs else _last_tool_output
     fallback = f"Error: Agent {reason}."
     if latest:
