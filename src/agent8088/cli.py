@@ -4561,24 +4561,28 @@ def _show_memory_status():
     table.add_row("Memories", str(report["count"]))
     table.add_row("Scope", report["user_id"]
                   + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
-    where = report.get("embed_provider") or "active provider"
-    if report["embedder_ok"]:
-        retrieval = f"keyword + semantic ({report['embed_model']} on {where})"
+    if engine_name == "mem0":
+        table.add_row("Vector DB", "qdrant (~/.agent8088/mem0)")
+        table.add_row("Embedder", "sentence-transformers/all-MiniLM-L6-v2 (fastembed local)")
     else:
-        # Naming both the reason and the endpoint: recall still works on keywords
-        # alone, so a user who thinks memory is broken will switch it off instead
-        # of fixing it -- and the fix depends on *which* host was asked, since
-        # "pull the model" cannot help a host that never had the request.
-        reason = report["embedder_error"] or "not reachable"
-        retrieval = f"keyword only — {report['embed_model']} on {where}: {reason}"
-    table.add_row("Retrieval", retrieval)
+        where = report.get("embed_provider") or "active provider"
+        if report["embedder_ok"]:
+            retrieval = f"keyword + semantic ({report['embed_model']} on {where})"
+        else:
+            # Naming both the reason and the endpoint: recall still works on keywords
+            # alone, so a user who thinks memory is broken will switch it off instead
+            # of fixing it -- and the fix depends on *which* host was asked, since
+            # "pull the model" cannot help a host that never had the request.
+            reason = report["embedder_error"] or "not reachable"
+            retrieval = f"keyword only — {report['embed_model']} on {where}: {reason}"
+        table.add_row("Retrieval", retrieval)
+        table.add_row("Store", f"{report['db_path']}"
+                      + (f" ({report.get('db_bytes', 0) / 1024:.0f} KB)"
+                         if report.get("db_bytes") else ""))
     table.add_row("Learning", "on" if report["capture_enabled"] else "off (recall only)")
     table.add_row("Notifications", S.memory_notifications)
     table.add_row("Extractor", report["extract_model"])
     table.add_row("Injected per turn", str(report["recall_limit"]))
-    table.add_row("Store", f"{report['db_path']}"
-                  + (f" ({report.get('db_bytes', 0) / 1024:.0f} KB)"
-                     if report.get("db_bytes") else ""))
     if report["stale_vectors"]:
         table.add_row("Needs re-embedding", f"{report['stale_vectors']} "
                       "(embedding model changed)")
