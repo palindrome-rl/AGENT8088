@@ -59,9 +59,20 @@ PREFERENCE = ("searxng", "ddgs", "tavily", "exa")
 # deliberately RESOLVES to a real name at startup instead of staying dynamic.
 AUTO = "auto"
 
-# One probe, short timeout: this runs on the startup path, so an unreachable
-# instance must not stall launch. Startup only — never per search.
+# This runs on the startup path, so an unreachable instance must not stall
+# launch. Startup only — never per search.
+#
+# Two budgets, because "unreachable" fails in two very different ways. A remote
+# instance behind a dropping firewall hangs for the whole timeout, so its budget
+# has to stay short. A loopback instance cannot: with nothing listening the
+# connection is refused immediately (measured at 0.2ms), so the budget only ever
+# applies to an instance that is actually answering — and a SearXNG search fans
+# out to every configured engine, which measured 0.96s-3.0s locally. Three
+# seconds sat on that boundary and made startup selection a coin flip: an
+# overrunning probe pinned ddgs for the session while /search status, probing
+# again later, reported searxng available.
 STARTUP_PROBE_TIMEOUT = 3
+LOCAL_PROBE_TIMEOUT = 10
 
 MAX_SEARCH_BYTES = 2 * 1024 * 1024
 MAX_SNIPPET_CHARS = 400
@@ -399,7 +410,28 @@ class SearxngProvider(WebSearchProvider):
         return SearchSuccess(results, provider=self.name)
 
 
-def probe_searxng(ctx: SearchContext, timeout: int = STARTUP_PROBE_TIMEOUT) -> bool:
+def _probe_timeout(base_url: str) -> int:
+    """Budget for probing `base_url` — see STARTUP_PROBE_TIMEOUT.
+
+    Deliberately does not resolve the host: this is on the startup path, and a
+    DNS round-trip to classify the endpoint would cost the very milliseconds the
+    short remote budget exists to protect. A name that resolves to loopback but
+    is not spelled like one simply gets the conservative budget.
+    """
+    try:
+        host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return STARTUP_PROBE_TIMEOUT
+    if host == "localhost":
+        return LOCAL_PROBE_TIMEOUT
+    try:
+        return (LOCAL_PROBE_TIMEOUT if ipaddress.ip_address(host).is_loopback
+                else STARTUP_PROBE_TIMEOUT)
+    except ValueError:  # not an IP literal — a real name, treat as remote
+        return STARTUP_PROBE_TIMEOUT
+
+
+def probe_searxng(ctx: SearchContext, timeout: int = None) -> bool:
     """Does the configured SearXNG answer the JSON API right now?
 
     Startup-only, called by Registry.startup_pick. Deliberately NOT wired into
@@ -415,6 +447,8 @@ def probe_searxng(ctx: SearchContext, timeout: int = STARTUP_PROBE_TIMEOUT) -> b
     url = f"{base}{urllib.parse.quote('agent8088-startup-probe')}&format=json"
     if ctx.check_url(url):
         return False
+    if timeout is None:
+        timeout = _probe_timeout(base)
     try:
         payload = _http_get_json(url, timeout=timeout)
         return isinstance(payload, dict) and isinstance(payload.get("results"), list)

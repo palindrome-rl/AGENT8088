@@ -169,7 +169,7 @@ fi
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
-REPO_URL="https://github.com/tayyabimam1/AGENT8088.git"
+REPO_URL="https://github.com/palindrome-rl/AGENT8088.git"
 REPO_BRANCH="${AGENT8088_BRANCH:-development}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
@@ -731,9 +731,8 @@ check_git() {
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
 
-    # Suppress git credential prompts - the repo is public, anonymous clone
-    # works. Without this, git may prompt for username/password on HTTPS.
-    export GIT_TERMINAL_PROMPT=0
+    # The repository is private, so allow Git to use the member's existing
+    # GitHub credentials or request them when needed.
 
     # An interrupted previous clone leaves .git with no initial commit.
     if [ -d "$INSTALL_DIR/.git" ] && ! git -C "$INSTALL_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
@@ -1553,7 +1552,7 @@ verify_install() {
         echo "  Sandbox:  Docker fallback is automatic when available"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/tayyabimam1/AGENT8088/$BRANCH/install.sh | bash"
+    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of

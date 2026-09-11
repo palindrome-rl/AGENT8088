@@ -1192,8 +1192,8 @@ async def setup_search(body: dict = None):
     base_url = result.get("base_url") or searxng_provision.base_url(port)
     A.update_simple_config(A.CONFIG_PATH, {"search_base_url": base_url,
                                             "web_search_provider": A.web_search.AUTO})
-    A.APP_CONFIG.update({"search_base_url": base_url, "web_search_provider": A.web_search.AUTO})
-    A.SEARCH_BASE_URL_CONFIGURED = True
+    A.activate_search_base_url(base_url)
+    A.APP_CONFIG["web_search_provider"] = A.web_search.AUTO
     A.resolve_auto_search_provider()
     return _search_status()
 

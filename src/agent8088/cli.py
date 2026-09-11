@@ -3894,8 +3894,7 @@ def cmd_search(rest):
             "search_base_url": base_url,
             "web_search_provider": A.web_search.AUTO,
         })
-        A.APP_CONFIG["search_base_url"] = base_url
-        A.SEARCH_BASE_URL_CONFIGURED = True
+        A.activate_search_base_url(base_url)
         A.APP_CONFIG["web_search_provider"] = A.web_search.AUTO
         A.resolve_auto_search_provider()
         console.print(f"Saved [#237dd7]search_base_url={base_url}[/#237dd7]")
