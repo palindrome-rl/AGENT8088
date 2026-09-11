@@ -2008,7 +2008,8 @@ def do_chat(query):
             if live is not None:
                 live.start()
             if not ans:
-                return "Action completed in the browser by user. Please inspect the updated page state and continue."
+                from agent8088.browser_hitl import _format_empty_human_response
+                return _format_empty_human_response()
             return ans
 
         A.human_input_handler = _on_human_input

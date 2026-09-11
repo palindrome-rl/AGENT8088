@@ -4754,7 +4754,7 @@ BROWSER_MAX_ACTIONS_PER_STEP = int(APP_CONFIG.get("browser_max_actions_per_step"
 # no way to *watch* a run - which is exactly what a demo or a stuck-selector
 # debugging session needs. Opt in with browser_headless=0, or per-run with
 # AGENT8088_BROWSER_HEADLESS=0. Visibility only; every other guard is unchanged.
-BROWSER_HEADLESS = APP_CONFIG.get("browser_headless", "0").strip().lower() in (
+BROWSER_HEADLESS = APP_CONFIG.get("browser_headless", "1").strip().lower() in (
     "1", "true", "yes", "on")
 # Only meaningful when the window is visible: a browsing window that lands on
 # top of the terminal defeats the point of watching, and the window is rebuilt

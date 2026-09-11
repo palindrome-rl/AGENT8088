@@ -11,9 +11,16 @@ from browser_use import Controller
 _log = logging.getLogger(__name__)
 
 
-def format_hitl_prompt(question: str, reason: str = "") -> str:
+def format_hitl_prompt(question: str, reason: str = "", headless: bool | None = None) -> str:
     """Format a styled CLI notification box requesting human intervention."""
     import textwrap
+    if headless is None:
+        try:
+            from agent8088 import engine as A
+            headless = getattr(A, "_browser_headless", lambda: True)()
+        except Exception:
+            headless = True
+
     width = 72
     lines = [
         "",
@@ -24,14 +31,42 @@ def format_hitl_prompt(question: str, reason: str = "") -> str:
     if reason:
         for line in textwrap.wrap(f"Reason:   {reason}", width=width):
             lines.append(f"│ {line:<{width}} │")
-    action_1 = "Action:   Complete in the browser window and press [Enter],"
-    action_2 = "          or type your answer below:"
-    lines.extend([
-        f"│ {action_1:<{width}} │",
-        f"│ {action_2:<{width}} │",
-        "╰" + ("─" * (width + 2)) + "╯",
-    ])
+    if headless:
+        action = "Action:   Type your answer below and press [Enter]:"
+        lines.extend([
+            f"│ {action:<{width}} │",
+            "╰" + ("─" * (width + 2)) + "╯",
+        ])
+    else:
+        action_1 = "Action:   Complete in the browser window and press [Enter],"
+        action_2 = "          or type your answer below:"
+        lines.extend([
+            f"│ {action_1:<{width}} │",
+            f"│ {action_2:<{width}} │",
+            "╰" + ("─" * (width + 2)) + "╯",
+        ])
     return "\n".join(lines)
+
+
+def _format_empty_human_response() -> str:
+    """Return an appropriate message to the agent when the user presses Enter without typing."""
+    try:
+        from agent8088 import engine as A
+        headless = getattr(A, "_browser_headless", lambda: True)()
+    except Exception:
+        headless = True
+
+    if headless:
+        return (
+            "Action completed in the browser (running in headless mode). "
+            "User pressed [Enter] without providing typed input. Do not ask the same question again; "
+            "choose a sensible default option (e.g. the first available choice) and proceed with the task."
+        )
+    return (
+        "Action completed in the browser by user. "
+        "Inspect the updated page state to verify. "
+        "If a choice or clarification was requested, please proceed using your best judgment."
+    )
 
 
 def _drain_keys() -> None:
@@ -66,7 +101,7 @@ def request_human_input(question: str, reason: str = "") -> str:
         ans = ""
 
     if not ans:
-        return "Action completed in the browser by user. Please inspect the updated page state and continue."
+        return _format_empty_human_response()
     return ans
 
 
@@ -80,13 +115,16 @@ def create_browser_controller(
         "Pause the browsing task and ask the human user for intervention or information. "
         "Use this when you encounter bot checks, CAPTCHAs, Cloudflare verification, "
         "2FA/OTP prompts, login credentials, payment/checkout confirmation, or need "
-        "clarification on which choice to make on a page."
+        "clarification on which choice to make on a page.",
+        terminates_sequence=True,
     )
     async def ask_human(question: str, reason: str = "") -> str:
-        # Bring browser window to front so human sees it immediately
+        # Bring browser window to front if running headfully
         try:
-            from agent8088.browser_session import bring_browser_to_front
-            bring_browser_to_front()
+            from agent8088 import engine as A
+            if not getattr(A, "_browser_headless", lambda: True)():
+                from agent8088.browser_session import bring_browser_to_front
+                bring_browser_to_front()
         except Exception as e:
             _log.debug("bring_browser_to_front failed: %s", e)
 
