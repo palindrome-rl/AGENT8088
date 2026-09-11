@@ -143,6 +143,11 @@ timeout_seconds=120
 # Screenshots stay off for text-only models. Enable this, or set
 # AGENT8088_BROWSER_SCREENSHOTS=1 for one run, only with a vision-capable model.
 # browser_screenshots=0
+# Keep the browser window alive across consecutive tasks in the current CLI session,
+# preserving cookies and in-memory tabs without persisting credentials permanently to disk.
+# browser_reuse_session=1
+# Enable human-in-the-loop interactive interrupts (ask_human) for captchas, passwords, and user input.
+# browser_hitl=1
 
 # Global fallbacks when no per-provider value is set:
 # context_window=32768

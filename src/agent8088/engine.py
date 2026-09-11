@@ -4764,6 +4764,13 @@ BROWSER_WINDOW_POSITION = APP_CONFIG.get("browser_window_position", "").strip()
 # not something to flip per run.
 BROWSER_SCREENSHOTS = APP_CONFIG.get("browser_screenshots", "0").strip().lower() in (
     "1", "true", "yes", "on")
+# Keep the browser window alive across consecutive calls in the active CLI session,
+# preserving cookies and in-memory tabs without persisting credentials permanently.
+BROWSER_REUSE_SESSION = APP_CONFIG.get("browser_reuse_session", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+# Enable human-in-the-loop interactive interrupts (ask_human action).
+BROWSER_HITL = APP_CONFIG.get("browser_hitl", "1").strip().lower() in (
+    "1", "true", "yes", "on")
 # Completion-token ceiling for the browsing model's own calls. Left unset it
 # used to inherit MAX_COMPLETION_TOKENS (65000): a value sized for the main
 # chat loop's long-form answers, and an invitation for a looping small model
@@ -5131,6 +5138,24 @@ def _browser_headless() -> bool:
     return BROWSER_HEADLESS
 
 
+def _browser_reuse_session() -> bool:
+    override = os.environ.get("AGENT8088_BROWSER_REUSE_SESSION", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return BROWSER_REUSE_SESSION
+
+
+def _browser_hitl() -> bool:
+    override = os.environ.get("AGENT8088_BROWSER_HITL", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    return BROWSER_HITL
+
+
 def _browser_window_pair(value: str) -> dict:
     """Parse a "W,H"/"X,Y" setting into BrowserProfile's ViewportSize shape.
 
@@ -5378,22 +5403,55 @@ async def _run_browser_agent(url: str, task: str,
     from agent8088.browser_proxy import start_ssrf_filtering_proxy
 
     _reset_browse_visits()
-    proxy_url, stop_proxy = start_ssrf_filtering_proxy(
-        lambda target_url: _egress_check(target_url) or _ssrf_check(target_url),
-        check_address=_browser_address_check,
-        on_visit=_record_browse_visit)
-    # Left unset, BrowserProfile's own field validator silently mkdtemp()s a
-    # user-data-dir under the OS temp dir - and browser-use's cleanup code
-    # only recognizes a different temp-dir prefix, so that directory is never
-    # removed. Owning the path here means it can actually be deleted below.
-    # Before adding one more profile, clear out any left behind by a session
-    # that was killed outright - along with the browser still holding it.
-    try:
-        _sweep_stale_browser_profiles()
-    except Exception as e:  # noqa: BLE001 - never let cleanup fail the task
-        logging.getLogger(__name__).debug(
-            "browse_page: stale-profile sweep skipped: %s", e)
-    user_data_dir = tempfile.mkdtemp(prefix=_BROWSER_PROFILE_PREFIX)
+    reuse_session = _browser_reuse_session()
+    if reuse_session:
+        from agent8088.browser_session import (
+            build_session_browser_profile,
+            get_or_create_session_proxy,
+        )
+        proxy_url, stop_proxy = get_or_create_session_proxy(
+            lambda: start_ssrf_filtering_proxy(
+                lambda target_url: _egress_check(target_url) or _ssrf_check(target_url),
+                check_address=_browser_address_check,
+                on_visit=_record_browse_visit,
+            )
+        )
+        profile = build_session_browser_profile(
+            proxy_url=proxy_url,
+            base_kwargs=_browser_profile_kwargs(proxy_url),
+            executable_path=executable_path,
+        )
+        user_data_dir = None
+    else:
+        proxy_url, stop_proxy = start_ssrf_filtering_proxy(
+            lambda target_url: _egress_check(target_url) or _ssrf_check(target_url),
+            check_address=_browser_address_check,
+            on_visit=_record_browse_visit)
+        try:
+            _sweep_stale_browser_profiles()
+        except Exception as e:  # noqa: BLE001 - never let cleanup fail the task
+            logging.getLogger(__name__).debug(
+                "browse_page: stale-profile sweep skipped: %s", e)
+        user_data_dir = tempfile.mkdtemp(prefix=_BROWSER_PROFILE_PREFIX)
+        profile = BrowserProfile(
+            user_data_dir=user_data_dir, executable_path=executable_path,
+            **_browser_profile_kwargs(proxy_url))
+
+    from agent8088.browser_memory import (
+        extract_domain,
+        recall_browser_domain_preferences,
+        record_browser_preference,
+    )
+    domain = extract_domain(url)
+    stored_prefs = recall_browser_domain_preferences(domain)
+
+    controller = None
+    if _browser_hitl():
+        from agent8088.browser_hitl import create_browser_controller
+        controller = create_browser_controller(
+            on_human_input=lambda q, r, a: record_browser_preference(domain, a) if a else None
+        )
+
     agent = None
     try:
         llm = build_browser_chat_model(
@@ -5403,69 +5461,45 @@ async def _run_browser_agent(url: str, task: str,
             max_completion_tokens=BROWSER_LLM_MAX_COMPLETION_TOKENS,
             extra_body=_browser_llm_extra_body(),
             structured_output_mode=BROWSER_STRUCTURED_OUTPUT_MODE)
-        profile = BrowserProfile(
-            user_data_dir=user_data_dir, executable_path=executable_path,
-            **_browser_profile_kwargs(proxy_url))
-        agent = Agent(
-            task=task,
-            llm=llm,
-            browser_profile=profile,
-            initial_actions=[{"navigate": {"url": url, "new_tab": False}}],
-            # browser-use defaults to use_vision=True (sends a screenshot with
-            # every step) and errors out entirely against a model that
-            # doesn't accept image input - which is exactly the situation for
-            # a large share of the providers/models agent8088 supports (local
-            # or text-only). Since this adapter must work with "whatever
-            # provider the user already has configured," the default is off -
-            # but a vision-capable model can turn it back on with
-            # browser_screenshots=1 (see _browser_screenshots). It is a plain
-            # bool, not "auto": "auto" still exposes a "screenshot" action the
-            # model can call on its own and hit the same failure, so the choice
-            # stays explicit - fully off, or fully on for a model that can see.
-            use_vision=_browser_screenshots(),
-            # browser-use flash mode (browser_flash_mode=1): ~2.4KB system
-            # prompt instead of ~22KB, and an output schema with no
-            # thinking/evaluation/plan fields - both prefill and decode
-            # shrink every step. It also forces use_thinking off and removes
-            # the per-step evaluation fields small models lean on, so it is
-            # opt-in and should be A/B'd per model before enabling.
-            flash_mode=BROWSER_FLASH_MODE,
-            # A free-form thinking field can consume a small model's entire
-            # output budget before it emits a browser action.
-            use_thinking=False,
-            # Browser Use otherwise guesses 75s for an unknown model name. Use
-            # Agent8088's provider timeout so a slow local completion is not
-            # discarded and retried just before it arrives.
-            llm_timeout=TIMEOUT_SECONDS,
-            # A small model often batches actions for the old DOM after the
-            # first click navigates. One action per fresh state trades calls for
-            # reliability and prevents the stale-index cascade seen in checkout.
-            max_actions_per_step=_browser_max_actions_per_step(),
-            extend_system_message=(
-                "Reliability rules: use only element indices from the current "
-                "browser state. After navigation, inspect the new state before "
-                "acting. After an input action reports success, submit the form "
-                "once even if a later DOM summary omits the value. Retry typing "
-                "only when the site displays a validation error. If navigation "
-                "fails twice in a row to the same host (connection closed, DNS "
-                "or timeout errors), that host is dead or unreachable for this "
-                "session -- stop the task immediately and report the failure; "
-                "do not navigate to other sites to compensate."
-            ),
-            # browser-use defaults use_judge=True: after every completed task
-            # it runs one more full LLM call to self-critique the result. Its
-            # own verdict doesn't retry or change what's returned - it's
-            # advisory-only logging - so it's pure extra latency and token
-            # cost for no behavioral benefit. Worse, its rubric leans on
-            # screenshot evidence, which use_vision=False above deliberately
-            # never produces - so with vision off it tends to report a
-            # confident, correct answer as failed for lacking screenshots
-            # that were never going to exist. Off, for the same reason vision
-            # is off: this adapter has to work the same way regardless of
-            # which model/provider is configured, not assume one judge_llm
-            # call will reliably agree with itself.
-            use_judge=False,
-        )
+
+        sys_rules = [
+            "Reliability rules: use only element indices from the current "
+            "browser state. After navigation, inspect the new state before "
+            "acting. After an input action reports success, submit the form "
+            "once even if a later DOM summary omits the value. Retry typing "
+            "only when the site displays a validation error. If navigation "
+            "fails twice in a row to the same host (connection closed, DNS "
+            "or timeout errors), that host is dead or unreachable for this "
+            "session -- stop the task immediately and report the failure; "
+            "do not navigate to other sites to compensate."
+        ]
+        if _browser_hitl():
+            sys_rules.append(
+                "Human-in-the-loop: If you encounter a bot verification, CAPTCHA, "
+                "Cloudflare challenge, 2FA/OTP prompt, login credentials request, "
+                "payment/checkout confirmation, or need clarification, you MUST "
+                "call ask_human instead of guessing or failing."
+            )
+        if stored_prefs:
+            sys_rules.append("Known user preferences for this site: " + "; ".join(stored_prefs))
+
+        agent_kwargs = {
+            "task": task,
+            "llm": llm,
+            "browser_profile": profile,
+            "initial_actions": [{"navigate": {"url": url, "new_tab": False}}],
+            "use_vision": _browser_screenshots(),
+            "flash_mode": BROWSER_FLASH_MODE,
+            "use_thinking": False,
+            "llm_timeout": TIMEOUT_SECONDS,
+            "max_actions_per_step": _browser_max_actions_per_step(),
+            "extend_system_message": "\n\n".join(sys_rules),
+            "use_judge": False,
+        }
+        if controller is not None:
+            agent_kwargs["controller"] = controller
+
+        agent = Agent(**agent_kwargs)
         history = await asyncio.wait_for(
             agent.run(max_steps=_browser_task_step_ceiling(task)),
             timeout=_browser_task_timeout(),
@@ -5481,8 +5515,10 @@ async def _run_browser_agent(url: str, task: str,
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     "browse_page: agent.close() did not finish cleanly: %s", e)
-        stop_proxy()
-        shutil.rmtree(user_data_dir, ignore_errors=True)
+        if not reuse_session:
+            stop_proxy()
+            if user_data_dir:
+                shutil.rmtree(user_data_dir, ignore_errors=True)
         # Record where the browse actually went, and drop the live "visiting"
         # line. The proxy saw every host; without this line there is no answer
         # to "what did it visit?" - browse_page only ever logged the start URL.
