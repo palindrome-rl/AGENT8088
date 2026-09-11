@@ -404,6 +404,7 @@ def _session_system_prompt():
     native = A._native_tools_enabled(A.build_tools_def(specs))
     prompt = (A.BASE_SYSTEM_PROMPT + "\n"
               + A.render_tool_docs(specs, catalogue=not native)
+              + (A.render_deferred_tool_index(specs) if A.TOOL_SEARCH_ENABLED else "")
               + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE)
               + A.render_runtime_context())
     # Inject current permission mode so the model knows what it can/can't do right now

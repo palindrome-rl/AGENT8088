@@ -58,7 +58,16 @@ def test_fixed_overhead_within_budget():
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 14_600, f"fixed overhead regressed to {total} tokens"
+    assert total < 14_700, f"fixed overhead regressed to {total} tokens"
+
+
+def test_deferral_saves_substantially_more_when_opted_in():
+    """tool_search=1 is off by default (the model must cooperate), but when a
+    deployment opts in the saving must be real: 17,958 -> ~11,150."""
+    prompt = E.current_system_prompt(native_tools=True)
+    schema = json.dumps(E.build_tools_def(E.TOOL_SPECS, defer=True))
+    total = approx_tokens(prompt) + approx_tokens(schema)
+    assert total < 12_000, f"deferred overhead regressed to {total} tokens"
 
 
 def test_cli_session_prompt_follows_the_provider(monkeypatch):

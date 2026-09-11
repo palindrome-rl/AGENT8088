@@ -2566,6 +2566,12 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         # setting that only appears to work.
         "timeout": int(config.get(f"tool_timeout.{name}") or g("timeout", "tool_timeout", "25")),
         "arg_types": _parse_arg_types(g("arg_types", "tool_arg_types")),
+        # core  = full JSON schema in every request.
+        # deferred = one index line; the schema loads on demand via tool_search.
+        # Defaults to deferred so a newly added tool cannot silently re-inflate
+        # every request. `tool_tier.<name>` in config.txt lets a user promote
+        # a tool they lean on.
+        "tier": (g("tier", "tool_tier", "deferred").strip().lower() or "deferred"),
     }
 
 
@@ -2612,9 +2618,40 @@ def required_params(spec: dict) -> list:
     return [arg for arg in (spec.get("args") or []) if arg not in optional]
 
 
-def build_tools_def(tool_specs: dict) -> list:
+# Default OFF, on live evidence rather than preference. Deferring tool schemas
+# saves ~6,900 tokens per request, but it only pays off if the model reliably
+# reaches for tool_search when no loaded tool fits. Measured on
+# ornith-1.0-35b (a 35B local model), 6 runs of "what local models can my
+# machine run":
+#   tool_search=0 : check_local_hardware called first, 3/3 runs
+#   tool_search=1 : never called; the model hand-rolled sysctl/nvidia-smi
+#                   probing instead, and searched in only 1/6 runs -- even
+#                   with the instruction promoted into the mandatory-routing
+#                   block.
+# The Agent SDK's own guidance notes the tradeoff: a search costs a round-trip,
+# and below ~10 tools upfront is faster. A model that will not search turns the
+# saving into a capability regression, so opt in per deployment after measuring
+# on the model you actually run. Set tool_search=1 in config.txt.
+TOOL_SEARCH_ENABLED = str(APP_CONFIG.get("tool_search", "0")).strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def build_tools_def(tool_specs: dict, defer: bool | None = None) -> list:
+    """Build the OpenAI tools array.
+
+    defer=True advertises only tier=core tools; the rest stay reachable through
+    tool_search. defer=None reads the `tool_search` config key (default on).
+
+    Set tool_search=0 in config.txt to send every schema upfront. The Agent SDK
+    notes that below ~10 tools upfront is faster, since each search costs one
+    extra round-trip -- so this is a real choice, not a legacy flag.
+    """
+    if defer is None:
+        defer = TOOL_SEARCH_ENABLED
     result = []
     for name, spec in sorted(tool_specs.items()):
+        if defer and spec.get("tier") != "core":
+            continue
         # MCP tools declare their own parameters schema; built-in tools use args + arg_types
         if "parameters" in spec:
             params = spec["parameters"]
@@ -2770,6 +2807,7 @@ def current_system_prompt(native_tools: bool | None = None) -> str:
         native_tools = _native_tools_enabled(TOOLS_DEF)
     base = (BASE_SYSTEM_PROMPT + "\n"
             + render_tool_docs(TOOL_SPECS, catalogue=not native_tools)
+            + (render_deferred_tool_index(TOOL_SPECS) if TOOL_SEARCH_ENABLED else "")
             + render_skill_docs(SKILL_PACKAGES)
             + render_persona(USER_FILE))
     return base.split(RUNTIME_CONTEXT_HEADING)[0] + render_runtime_context()
@@ -2809,6 +2847,16 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
         "",
     ]
     lines.append("Mandatory routing — call the matching tool before writing an answer:")
+    if any(s.get("tier") != "core" for s in specs.values()):
+        # Placed in the mandatory-routing block deliberately: live testing showed
+        # the model ignores the softer "More tools available on demand" section
+        # and hand-rolls execute_shell probing instead of searching. It does
+        # follow routing rules, so the instruction belongs here.
+        lines.append(
+            "- If no loaded tool fits the request, you MUST call tool_search with "
+            "the capability you need BEFORE falling back to execute_shell. Other "
+            "tools exist that are not loaded; hand-rolling a shell equivalent of "
+            "a tool you have not searched for is wrong.")
     if "read_text" in specs:
         lines.append("- A direct request to read a file MUST call read_text.")
     if "execute_shell" in specs:
@@ -2831,6 +2879,99 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
                 if agent_types:
                     lines.append(f"  Available agent_type values: {', '.join(agent_types)}.")
     return "\n".join(lines)
+
+
+def render_deferred_tool_index(specs: dict) -> str:
+    """One line per deferred tool: name plus a short hint.
+
+    Full schemas for all 48 tools cost ~5,600 tokens per request, and tool
+    selection accuracy degrades past ~30-50 loaded tools. Deferred tools stay
+    fully callable -- run_tool gates on TOOL_NAMES, not on what was
+    advertised -- so this changes only what the model is shown upfront.
+
+    The index lives in the system prompt rather than the schema array so that
+    ollama, which rejects the tools param, can see it too.
+    """
+    deferred = {n: s for n, s in specs.items() if s.get("tier") != "core"}
+    if not deferred:
+        return ""
+    lines = [
+        "",
+        "## More tools available on demand",
+        "These tools exist but are not loaded. Call tool_search with a short "
+        "description of the capability you need; it returns their full schemas, "
+        "and you can then call them as normal. Never guess arguments for a tool "
+        "listed here -- search for it first.",
+        "",
+    ]
+    for name, spec in sorted(deferred.items()):
+        hint = (spec.get("search_hint")
+                or str(spec.get("description", "")).split(".")[0].strip())
+        lines.append(f"- {name}: {hint[:80]}")
+    return "\n".join(lines) + "\n"
+
+
+def tool_search(query: str, specs=None, limit: int = 5) -> str:
+    """Load the schemas of up to `limit` deferred tools matching `query`.
+
+    limit=5 follows the Agent SDK default: loading more per search hands back
+    the context the deferred tier was meant to save.
+    """
+    specs = specs if specs is not None else TOOL_SPECS
+    terms = {w for w in re.split(r"\W+", (query or "").lower()) if len(w) > 2}
+    if not terms:
+        return ("tool_search needs a query describing the capability you need, "
+                "e.g. \"push commits to a git remote\".")
+
+    scored = []
+    already_loaded = []
+    for name, spec in specs.items():
+        haystack = " ".join((
+            name.replace("_", " "),
+            str(spec.get("description", "")),
+            " ".join(spec.get("keywords") or ()),
+        )).lower()
+        if spec.get("tier") == "core":
+            # Core tools are already in context. Returning their schemas again
+            # would spend the tokens deferral just saved, so note the match and
+            # move on -- the model can already see them.
+            if any(w in haystack for w in terms):
+                already_loaded.append(name)
+            continue
+        score = sum(1 for w in terms if w in haystack)
+        # A name match outranks a description match: "git push" should surface
+        # git_push above a tool that merely mentions git in its prose.
+        score += 2 * sum(1 for w in terms if w in name.lower())
+        if score:
+            scored.append((score, name))
+
+    if not scored:
+        if already_loaded:
+            return (f"No unloaded tool matches {query!r}. These already-loaded "
+                    f"tools look relevant, call one directly: "
+                    f"{', '.join(sorted(already_loaded))}.")
+        loaded = sorted(n for n, s in specs.items() if s.get("tier") == "core")
+        return (f"No tool matches {query!r}. Already loaded: {', '.join(loaded)}. "
+                f"If none of those fit, say so rather than guessing.")
+
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    found = [name for _, name in scored[:limit]]
+    schemas = "\n\n".join(
+        describe_tool(name, specs,
+                      execution_note="Loaded and callable now -- invoke it as a "
+                                     "tool call by this name.")
+        for name in found)
+    # describe_tool ends each schema with "Description only; the tool was not
+    # executed", which is right for /describe_tool and wrong here: searching is
+    # how a deferred tool becomes callable. Left unqualified, a model read that
+    # as "you may not call this" and ran `execute_shell check_local_hardware`
+    # instead -- sh: not found, exit 127. Say plainly what is now possible.
+    header = (f"Loaded {len(found)} tool(s): {', '.join(found)}.\n"
+              f"These are now loaded and callable. Call them directly by name as "
+              f"a tool call. Do NOT pass the name to execute_shell -- these are "
+              f"tools, not shell commands, and the name is not a program on "
+              f"PATH.\n\n")
+    return header + schemas
 
 
 def _parse_frontmatter_md(text: str) -> tuple:
@@ -7785,6 +7926,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "introspect":
         if name == "describe_tool":
             return describe_tool(args.get("tool_name"))
+        if name == "tool_search":
+            return tool_search(args.get("query", ""))
         return describe_capabilities()
 
     if mode == "last_output":
@@ -9634,8 +9777,14 @@ def _on_off(value, unit: str = "") -> str:
     return f"{value}{unit}"
 
 
-def describe_tool(tool_name, specs=None) -> str:
-    """Return one live tool schema without executing the described tool."""
+def describe_tool(tool_name, specs=None, execution_note: str = "") -> str:
+    """Return one live tool schema without executing the described tool.
+
+    execution_note overrides the trailing "execution" line. tool_search passes
+    its own, because the default wording ("the tool was not executed") reads as
+    a prohibition and made a model shell out instead of calling the tool it had
+    just loaded.
+    """
     registry = TOOL_SPECS if specs is None else specs
     if not isinstance(tool_name, str) or not tool_name.strip() or len(tool_name) > 200:
         return "Error: Provide one exact tool name, e.g. read_text. Use /tools to list available names."
@@ -9643,13 +9792,18 @@ def describe_tool(tool_name, specs=None) -> str:
     spec = registry.get(name)
     if spec is None:
         return f"Error: Unknown or unavailable tool {name!r}. Use /tools to list available names. No tool was executed."
-    schema = build_tools_def({name: spec})[0]["function"]["parameters"]
+    # defer=False: describing a tool by name must work for deferred tools too
+    # -- that is the whole point of tool_search. With the default the filter
+    # would drop the very tool being described and this would IndexError.
+    schema = build_tools_def({name: spec}, defer=False)[0]["function"]["parameters"]
     return _redact_secrets(json.dumps({
         "name": name,
         "description": spec.get("description", ""),
         "mode": spec.get("mode", ""),
         "parameters": schema,
-        "execution": "Description only; the tool was not executed. Normal permissions apply when invoking it.",
+        "execution": execution_note or (
+            "Description only; the tool was not executed. Normal permissions "
+            "apply when invoking it."),
     }, ensure_ascii=False, indent=2))
 
 
