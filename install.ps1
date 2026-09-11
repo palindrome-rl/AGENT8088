@@ -947,8 +947,7 @@ function Get-InstallerInvocation {
 
     $sourceUrl = $InstallerSourceUrl
     if (-not $sourceUrl) {
-        $escapedBranch = [Uri]::EscapeDataString($Branch).Replace('%2F', '/')
-        $sourceUrl = "https://raw.githubusercontent.com/$RepoSlug/$escapedBranch/install.ps1"
+        $sourceUrl = "https://agent8088-installer.pages.dev/install.ps1"
     }
     $urlLiteral = ConvertTo-PowerShellLiteral $sourceUrl
     $tlsCommand = "try { [Net.ServicePointManager]::SecurityProtocol = " +
@@ -1194,7 +1193,7 @@ function Test-SlowConnection {
     $tmp = $null
     try {
         $tmp = [System.IO.Path]::GetTempFileName()
-        $probeUrl = "https://raw.githubusercontent.com/$RepoSlug/$Branch/install.ps1"
+        $probeUrl = "https://agent8088-installer.pages.dev/install.ps1"
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $dl = Invoke-BoundedDownload -Uri $probeUrl -OutFile $tmp -TimeoutSec 8 -Proxy $script:ResolvedProxy
         $sw.Stop()
@@ -1643,12 +1642,8 @@ function Remove-IncompleteInstallDirectory {
 function Clone-Repo {
     Write-Info "Installing to $InstallDir..."
 
-    # Suppress git credential prompts - the repo is public, anonymous clone
-    # works. Without these, Git Credential Manager on Windows pops a login
-    # dialog even for public repos. If the repo were private, the clone would
-    # fail cleanly instead of hanging on a prompt.
-    $env:GIT_TERMINAL_PROMPT = "0"
-    $env:GCM_INTERACTIVE = "never"
+    # The repository is private, so allow Git Credential Manager to use the
+    # member's existing GitHub credentials or request them when needed.
 
     # An interrupted previous clone leaves .git with no initial commit.
     if ((Test-Path (Join-Path $InstallDir ".git")) -and -not (& git -C $InstallDir rev-parse --verify HEAD 2>$null)) {
@@ -2502,7 +2497,7 @@ function Verify-Install {
         Write-Host "            Native is not set up on Windows yet (optional, may fail):"
         Write-Host "            elevated agent8088 --sandbox-setup"
     }
-    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/$RepoSlug/$Branch/install.ps1)"
+    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://agent8088-installer.pages.dev/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
