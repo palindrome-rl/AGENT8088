@@ -395,7 +395,15 @@ def _active_provider_name():
 
 def _session_system_prompt():
     specs = _active_tool_specs()
-    prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
+    # catalogue=False when the provider takes native tool calls: the JSON
+    # schema array already describes every tool, and sending the prose
+    # catalogue as well costs ~3,500 tokens on every request. This prompt is
+    # passed as system_prompt=, which outranks engine.current_system_prompt(),
+    # so the decision has to be made here too -- patching only the engine
+    # saves nothing on the CLI path.
+    native = A._native_tools_enabled(A.build_tools_def(specs))
+    prompt = (A.BASE_SYSTEM_PROMPT + "\n"
+              + A.render_tool_docs(specs, catalogue=not native)
               + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE)
               + A.render_runtime_context())
     # Inject current permission mode so the model knows what it can/can't do right now
@@ -5276,7 +5284,11 @@ def _estimate_context_pct():
     window — good enough for a progress hint, not meant to be exact. Image
     parts count as a flat allowance rather than their (huge) base64 length,
     which would peg the meter at 100%."""
-    chars = A._estimate_context_chars(S.messages, A.SYSTEM_PROMPT)
+    # _session_system_prompt() is what actually goes on the wire; A.SYSTEM_PROMPT
+    # is the module-level build from import time and no longer matches it (it
+    # still carries the prose tool catalogue this session omits), so the meter
+    # was reporting a prompt that is not sent.
+    chars = A._estimate_context_chars(S.messages, _session_system_prompt())
     ctx_window, _ = A._active_model_token_limits()
     if not ctx_window:
         return 0

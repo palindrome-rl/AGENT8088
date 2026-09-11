@@ -2748,23 +2748,46 @@ def render_runtime_context(now=None, channel: str = "", chat_type: str = "") -> 
     return "".join(lines)
 
 
-def current_system_prompt() -> str:
+def current_system_prompt(native_tools: bool | None = None) -> str:
     """The default system prompt, carrying today's date rather than import day's.
 
     SYSTEM_PROMPT is built once at module import. That is fine for a one-shot
     CLI invocation and wrong for the gateway and cron, which stay up long
     enough for the date to move underneath them. Splitting on the heading
     keeps repeated calls from stacking context blocks.
+
+    native_tools=True omits the per-tool catalogue, because the JSON schema
+    array already carries it -- worth ~4,000 tokens per request. False keeps
+    it, which ollama needs: it rejects the tools param, so the prompt is its
+    only source of tool knowledge. None asks the active provider.
+
+    The prompt is assembled per call rather than sliced out of the prebuilt
+    SYSTEM_PROMPT, because the catalogue decision is per-provider. The
+    render_* helpers are pure string builders over already-loaded specs, so
+    this does no I/O.
     """
-    base = SYSTEM_PROMPT.split(RUNTIME_CONTEXT_HEADING)[0]
-    return base + render_runtime_context()
+    if native_tools is None:
+        native_tools = _native_tools_enabled(TOOLS_DEF)
+    base = (BASE_SYSTEM_PROMPT + "\n"
+            + render_tool_docs(TOOL_SPECS, catalogue=not native_tools)
+            + render_skill_docs(SKILL_PACKAGES)
+            + render_persona(USER_FILE))
+    return base.split(RUNTIME_CONTEXT_HEADING)[0] + render_runtime_context()
 
 
-def render_tool_docs(specs: dict) -> str:
+def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
     """Generate the tool section of the system prompt from TOOL_SPECS, so the
     prompt can never drift from tools.txt. Required because the Ollama backend
     rejects the OpenAI tools param: the system prompt is the model's ONLY
-    source of tool knowledge."""
+    source of tool knowledge.
+
+    catalogue=False omits the per-tool "- name(args): description" list.
+    Providers with native tool calling already receive that list as the JSON
+    schema array; sending both costs ~4,000 tokens per request and gives the
+    model two descriptions of one tool that can disagree. The calling
+    convention and the mandatory-routing rules are kept in both modes -- they
+    are behavioural instructions, not tool definitions, and the schema does
+    not carry them."""
     if not specs:
         # No tools loaded: do NOT prime tool-calling. Answer directly, and don't
         # announce the (lack of) tools — otherwise every prompt gets "I have no tools".
@@ -2799,13 +2822,14 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
     if "create_document" in specs:
         lines.append("- A direct request to create a .docx/.xlsx/.pptx file from content MUST call create_document, not write_file or execute_shell.")
-    for name, s in sorted(specs.items()):
-        args = ", ".join(s["args"]) or "no args"
-        lines.append(f"- {name}({args}): {s['description']}")
-        if name == "spawn_subagent":
-            agent_types = sorted(globals().get("SUBAGENT_SPECS") or {})
-            if agent_types:
-                lines.append(f"  Available agent_type values: {', '.join(agent_types)}.")
+    if catalogue:
+        for name, s in sorted(specs.items()):
+            args = ", ".join(s["args"]) or "no args"
+            lines.append(f"- {name}({args}): {s['description']}")
+            if name == "spawn_subagent":
+                agent_types = sorted(globals().get("SUBAGENT_SPECS") or {})
+                if agent_types:
+                    lines.append(f"  Available agent_type values: {', '.join(agent_types)}.")
     return "\n".join(lines)
 
 
