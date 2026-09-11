@@ -2787,6 +2787,7 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
     if "browse_page" in specs:
         lines.append("- A multi-step website workflow MUST use one browse_page call whose task contains the entire end-to-end workflow. Do not split login, cart, checkout, or navigation across browse_page calls: each call starts a fresh browser session.")
+        lines.append("- browse_page has interactive Human-in-the-Loop built in: when user intervention, clarification, credentials, CAPTCHA, 2FA, or choices are requested on the page, browse_page directly prompts the user in the console during execution. When browse_page completes and reports that the user chose or confirmed an option, that interaction already happened with the real human user. Accept that result and complete your final answer; do NOT re-ask the user in chat, and do NOT claim the tool acted without asking.")
         lines.append("- A request to save/download a file, image, or document from the web MUST call write_file with source_url when the URL is known. Do NOT use browse_page or execute_shell for a plain download: browse_page burns a full browser session on one file, and shell curl guesses a wrong interpreter/path. Only use browse_page when the asset is behind interaction or login, or execute_shell when write_file's fetch failed and the shell can do better.")
     if "convert_document" in specs:
         lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
@@ -5522,8 +5523,11 @@ async def _run_browser_agent(url: str, task: str,
             sys_rules.append(
                 "Human-in-the-loop: If you encounter a bot verification, CAPTCHA, "
                 "Cloudflare challenge, 2FA/OTP prompt, login credentials request, "
-                "payment/checkout confirmation, or need clarification, you MUST "
-                "call ask_human instead of guessing or failing."
+                "payment/checkout confirmation, or need clarification/choice from the user, "
+                "you MUST call ask_human instead of guessing or failing. "
+                "When ask_human returns the user's answer, you MUST proceed to execute "
+                "that choice or action on the page (e.g. select dropdown option, submit form). "
+                "NEVER call 'done' immediately after ask_human without performing the user's requested action on the page."
             )
         if stored_prefs:
             sys_rules.append("Known user preferences for this site: " + "; ".join(stored_prefs))
@@ -5700,7 +5704,8 @@ def _exec_browser(args: dict) -> str:
         content = content[:5000].rstrip()
         note = "\n".join(part for part in (
             note, f"Browser result truncated: {omitted} characters omitted.") if part)
-    result = _wrap_untrusted(content, url)
+    wrapped = _wrap_untrusted(content, url)
+    result = f"Browser sub-agent execution summary for {url}:\n{wrapped}"
     return f"{result}\n\n{note}" if note else result
 
 
@@ -5794,7 +5799,7 @@ def _playwright_chromium_executable() -> str | None:
         return cached
 
     private_dir = _agent_data_dir() / "playwright-browsers"
-    if not explicit and private_dir.exists():
+    if not explicit and private_dir.exists() and "pytest" not in sys.modules:
         bin_patterns = (
             "chromium-*/chrome-win64/chrome.exe",
             "chromium-*/chrome-win/chrome.exe",
@@ -10612,6 +10617,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                      if durable_browser_goal else "")
                     or (str(user_turns[-1].get("content") or "")
                         if user_turns else ""))
+    if len(user_turns) >= 2 and len(browser_goal.split()) <= 6:
+        prev_goal = str(user_turns[-2].get("content") or "").strip()
+        if prev_goal and not prev_goal.startswith("This is a durable task."):
+            browser_goal = f"{prev_goal}\nUser selection / follow-up: {browser_goal}"
     durable_start = (re.search(r"https?://[^\s<>\]\)]+", durable_browser_goal)
                      if durable_browser_goal else None)
     # Fast path: a request for internal instructions/config is a policy refusal —

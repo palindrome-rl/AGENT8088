@@ -1649,6 +1649,11 @@ def _drain_queued_keys():
     """
     if sys.platform == "win32":
         try:
+            import ctypes
+            ctypes.windll.kernel32.FlushConsoleInputBuffer(ctypes.windll.kernel32.GetStdHandle(-10))
+        except Exception:
+            pass
+        try:
             import msvcrt
             while msvcrt.kbhit():
                 msvcrt.getch()

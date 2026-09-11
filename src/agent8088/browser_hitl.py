@@ -69,8 +69,26 @@ def _format_empty_human_response() -> str:
     )
 
 
+def format_human_answer_for_agent(ans: str) -> str:
+    """Format the human user's typed input into a clear directive for the browser agent."""
+    if not ans:
+        return _format_empty_human_response()
+    if ans.startswith("Action completed in the browser") or ans.startswith("No human input available"):
+        return ans
+    return (
+        f"User answered: {ans}. "
+        "Proceed immediately to execute this choice or action on the webpage using the appropriate browser action. "
+        "Do not call 'done' until you have actually performed the action on the page."
+    )
+
+
 def _drain_keys() -> None:
     if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.FlushConsoleInputBuffer(ctypes.windll.kernel32.GetStdHandle(-10))
+        except Exception:
+            pass
         try:
             import msvcrt
             while msvcrt.kbhit():
@@ -100,8 +118,6 @@ def request_human_input(question: str, reason: str = "") -> str:
     except (EOFError, KeyboardInterrupt):
         ans = ""
 
-    if not ans:
-        return _format_empty_human_response()
     return ans
 
 
@@ -138,6 +154,6 @@ def create_browser_controller(
             except Exception as e:
                 _log.debug("on_human_input callback failed: %s", e)
 
-        return answer
+        return format_human_answer_for_agent(answer)
 
     return controller
