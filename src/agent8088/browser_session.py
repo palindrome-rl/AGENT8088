@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any
+from typing import Any, Callable, Tuple
 
 from browser_use import BrowserProfile
 
@@ -20,6 +20,8 @@ _log = logging.getLogger(__name__)
 
 _SESSION_DIR: Path | None = None
 _ACTIVE_PROFILE: BrowserProfile | None = None
+_SESSION_PROXY_URL: str | None = None
+_SESSION_PROXY_STOP: Callable[[], None] | None = None
 
 
 def get_session_user_data_dir() -> Path:
@@ -35,6 +37,16 @@ def get_session_user_data_dir() -> Path:
 def is_browser_session_active() -> bool:
     """Return True if an in-session browser profile or directory is currently allocated."""
     return _SESSION_DIR is not None and _SESSION_DIR.exists()
+
+
+def get_or_create_session_proxy(
+    proxy_factory: Callable[[], Tuple[str, Callable[[], None]]],
+) -> Tuple[str, Callable[[], None]]:
+    """Get or start the session-lived SSRF filtering proxy."""
+    global _SESSION_PROXY_URL, _SESSION_PROXY_STOP
+    if _SESSION_PROXY_URL is None or _SESSION_PROXY_STOP is None:
+        _SESSION_PROXY_URL, _SESSION_PROXY_STOP = proxy_factory()
+    return _SESSION_PROXY_URL, _SESSION_PROXY_STOP
 
 
 def build_session_browser_profile(
@@ -56,10 +68,18 @@ def build_session_browser_profile(
 
 
 def cleanup_browser_session() -> None:
-    """Clean up the active browser session and remove the session temp directory."""
-    global _SESSION_DIR, _ACTIVE_PROFILE
+    """Clean up the active browser session, proxy, and remove the session temp directory."""
+    global _SESSION_DIR, _ACTIVE_PROFILE, _SESSION_PROXY_URL, _SESSION_PROXY_STOP
     if _ACTIVE_PROFILE is not None:
         _ACTIVE_PROFILE = None
+
+    if _SESSION_PROXY_STOP is not None:
+        try:
+            _SESSION_PROXY_STOP()
+        except Exception as e:
+            _log.debug("Error stopping session proxy: %s", e)
+        _SESSION_PROXY_STOP = None
+        _SESSION_PROXY_URL = None
 
     if _SESSION_DIR is not None and _SESSION_DIR.exists():
         try:
