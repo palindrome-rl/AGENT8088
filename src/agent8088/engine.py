@@ -9077,6 +9077,29 @@ def _local_search_allowance(base_url: str) -> set:
 
 _SEARCH_ALLOW_HOSTS = _local_search_allowance(APP_CONFIG.get("search_base_url", ""))
 
+
+def activate_search_base_url(base_url: str) -> None:
+    """Point web search at `base_url` for the rest of this process.
+
+    Three pieces of state have to move together, and the loopback exemption is
+    the one that was missed: it is derived from search_base_url at import time,
+    so a session that started without a SearXNG kept an empty exemption even
+    after `/search setup` provisioned one. _ssrf_check then refused the very
+    endpoint that had just been confirmed healthy, probe_searxng returned False,
+    and the status table called the running backend "not ready" until the next
+    restart -- which is what "SearXNG is not detected" looked like from outside.
+
+    Both entry points that can provision an instance (the REPL's /search setup
+    and the WebUI's /api/search/setup) go through here so neither can update two
+    of the three again. Persisting the value to config.txt stays with the
+    caller: this is the in-process half.
+    """
+    global SEARCH_BASE_URL_CONFIGURED, _SEARCH_ALLOW_HOSTS
+    base_url = str(base_url or "").strip()
+    APP_CONFIG["search_base_url"] = base_url
+    SEARCH_BASE_URL_CONFIGURED = bool(base_url)
+    _SEARCH_ALLOW_HOSTS = _local_search_allowance(base_url)
+
 # --- Egress domain policy ---
 # _ssrf_check blocks INTERNAL addresses; this bounds which PUBLIC hosts the
 # agent may reach. Empty allowlist = allow all (unchanged default). The
