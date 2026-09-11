@@ -3119,6 +3119,10 @@ SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 # Left None, sub-agents run silently (benchmark, one-shot, plain REPL) — so this
 # is fully backward-compatible. Kept out of the loop, same as every other hook.
 subagent_ui = None
+# Human-in-the-loop hook: a presentation layer (e.g. Rich CLI) may set this to
+#   human_input_handler(question, reason) -> str
+# to present an interactive prompt with terminal UI controls (e.g. pausing spinners).
+human_input_handler = None
 
 
 # ---------------------------------------------------------------------------
@@ -5403,11 +5407,19 @@ async def _run_browser_agent(url: str, task: str,
     from agent8088.browser_proxy import start_ssrf_filtering_proxy
 
     _reset_browse_visits()
+    try:
+        _sweep_stale_browser_profiles()
+    except Exception as e:  # noqa: BLE001 - never let cleanup fail the task
+        logging.getLogger(__name__).debug(
+            "browse_page: stale-profile sweep skipped: %s", e)
+
     reuse_session = _browser_reuse_session()
     if reuse_session:
         from agent8088.browser_session import (
             build_session_browser_profile,
+            get_or_create_session_browser,
             get_or_create_session_proxy,
+            mark_session_started,
         )
         proxy_url, stop_proxy = get_or_create_session_proxy(
             lambda: start_ssrf_filtering_proxy(
@@ -5421,21 +5433,18 @@ async def _run_browser_agent(url: str, task: str,
             base_kwargs=_browser_profile_kwargs(proxy_url),
             executable_path=executable_path,
         )
+        browser_session = get_or_create_session_browser(profile)
         user_data_dir = None
     else:
         proxy_url, stop_proxy = start_ssrf_filtering_proxy(
             lambda target_url: _egress_check(target_url) or _ssrf_check(target_url),
             check_address=_browser_address_check,
             on_visit=_record_browse_visit)
-        try:
-            _sweep_stale_browser_profiles()
-        except Exception as e:  # noqa: BLE001 - never let cleanup fail the task
-            logging.getLogger(__name__).debug(
-                "browse_page: stale-profile sweep skipped: %s", e)
         user_data_dir = tempfile.mkdtemp(prefix=_BROWSER_PROFILE_PREFIX)
         profile = BrowserProfile(
             user_data_dir=user_data_dir, executable_path=executable_path,
             **_browser_profile_kwargs(proxy_url))
+        browser_session = None
 
     from agent8088.browser_memory import (
         extract_domain,
@@ -5496,10 +5505,14 @@ async def _run_browser_agent(url: str, task: str,
             "extend_system_message": "\n\n".join(sys_rules),
             "use_judge": False,
         }
+        if browser_session is not None:
+            agent_kwargs["browser_session"] = browser_session
         if controller is not None:
             agent_kwargs["controller"] = controller
 
         agent = Agent(**agent_kwargs)
+        if reuse_session:
+            mark_session_started()
         history = await asyncio.wait_for(
             agent.run(max_steps=_browser_task_step_ceiling(task)),
             timeout=_browser_task_timeout(),
@@ -5509,16 +5522,23 @@ async def _run_browser_agent(url: str, task: str,
         # timeout (or any other exception) it is cancelled mid-step and the
         # Chromium process it launched would be orphaned. close() kills the
         # session; it is safe to call on an already-closed one.
-        if agent is not None:
-            try:
-                await asyncio.wait_for(agent.close(), timeout=30)
-            except Exception as e:
-                logging.getLogger(__name__).warning(
-                    "browse_page: agent.close() did not finish cleanly: %s", e)
         if not reuse_session:
+            if agent is not None:
+                try:
+                    await asyncio.wait_for(agent.close(), timeout=30)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(
+                        "browse_page: agent.close() did not finish cleanly: %s", e)
             stop_proxy()
             if user_data_dir:
                 shutil.rmtree(user_data_dir, ignore_errors=True)
+        else:
+            if agent is not None and getattr(agent, "state", None) and not getattr(agent.state, "is_done", False):
+                try:
+                    await asyncio.wait_for(agent.close(), timeout=10)
+                except Exception as e:
+                    logging.getLogger(__name__).debug(
+                        "browse_page: agent.close() on timeout/cancel: %s", e)
         # Record where the browse actually went, and drop the live "visiting"
         # line. The proxy saw every host; without this line there is no answer
         # to "what did it visit?" - browse_page only ever logged the start URL.
@@ -5595,7 +5615,14 @@ def _exec_browser(args: dict) -> str:
 
     saved_role, _active_role = _active_role, "subagent:browser"
     try:
-        browser_result = asyncio.run(_run_browser_agent(url, task, executable_path))
+        if _browser_reuse_session():
+            from agent8088.browser_session import run_in_session_loop
+            browser_result = run_in_session_loop(
+                _run_browser_agent(url, task, executable_path),
+                timeout=_browser_task_timeout() + 30,
+            )
+        else:
+            browser_result = asyncio.run(_run_browser_agent(url, task, executable_path))
     except asyncio.TimeoutError:
         return (f"Browser error: task exceeded the {_browser_task_timeout()}s "
                 f"time limit (raise AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS for this "

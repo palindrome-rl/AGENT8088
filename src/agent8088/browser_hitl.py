@@ -28,6 +28,31 @@ def format_hitl_prompt(question: str, reason: str = "") -> str:
     return "\n".join(lines)
 
 
+def request_human_input(question: str, reason: str = "") -> str:
+    """Prompt the user for input, delegating to the active UI handler if set."""
+    from agent8088 import engine as A
+    handler = getattr(A, "human_input_handler", None)
+    if handler is not None:
+        return handler(question, reason)
+
+    prompt_text = format_hitl_prompt(question, reason)
+    print(prompt_text, flush=True)
+
+    # Check if running in an interactive terminal
+    if not sys.stdin.isatty():
+        _log.warning("ask_human called in non-interactive terminal; auto-resuming")
+        return "No human input available (non-interactive terminal). Please proceed if possible or report status."
+
+    try:
+        ans = input("8088 [Human input] › ").strip()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+
+    if not ans:
+        return "Action completed in the browser by user. Please inspect the updated page state and continue."
+    return ans
+
+
 def create_browser_controller(
     on_human_input: Optional[Callable[[str, str, str], None]] = None,
 ) -> Controller:
@@ -41,17 +66,9 @@ def create_browser_controller(
         "clarification on which choice to make on a page."
     )
     async def ask_human(question: str, reason: str = "") -> str:
-        prompt_text = format_hitl_prompt(question, reason)
-        print(prompt_text, flush=True)
-
-        # Check if running in an interactive terminal
-        if not sys.stdin.isatty():
-            _log.warning("ask_human called in non-interactive terminal; auto-resuming")
-            return "No human input available (non-interactive terminal). Please proceed if possible or report status."
-
         # Wait for user input asynchronously in thread pool so event loop isn't blocked
         loop = asyncio.get_running_loop()
-        answer = await loop.run_in_executor(None, lambda: input("8088 [Human input] › ").strip())
+        answer = await loop.run_in_executor(None, lambda: request_human_input(question, reason))
 
         if on_human_input:
             try:
@@ -59,8 +76,6 @@ def create_browser_controller(
             except Exception as e:
                 _log.debug("on_human_input callback failed: %s", e)
 
-        if not answer:
-            return "Action completed in the browser by user. Please inspect the updated page state and continue."
         return answer
 
     return controller

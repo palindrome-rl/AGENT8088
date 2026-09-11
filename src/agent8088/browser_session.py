@@ -12,16 +12,43 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import asyncio
+import threading
 from typing import Any, Callable, Tuple
 
-from browser_use import BrowserProfile
+from browser_use import BrowserProfile, BrowserSession
 
 _log = logging.getLogger(__name__)
 
 _SESSION_DIR: Path | None = None
 _ACTIVE_PROFILE: BrowserProfile | None = None
+_ACTIVE_SESSION: BrowserSession | None = None
+_SESSION_STARTED: bool = False
 _SESSION_PROXY_URL: str | None = None
 _SESSION_PROXY_STOP: Callable[[], None] | None = None
+_SESSION_LOOP: asyncio.AbstractEventLoop | None = None
+_SESSION_THREAD: threading.Thread | None = None
+
+
+def get_session_event_loop() -> asyncio.AbstractEventLoop:
+    """Return the persistent asyncio event loop for browser tasks in this CLI session."""
+    global _SESSION_LOOP, _SESSION_THREAD
+    if _SESSION_LOOP is None or not _SESSION_LOOP.is_running():
+        _SESSION_LOOP = asyncio.new_event_loop()
+        _SESSION_THREAD = threading.Thread(
+            target=_SESSION_LOOP.run_forever,
+            daemon=True,
+            name="agent8088-browser-session-loop",
+        )
+        _SESSION_THREAD.start()
+    return _SESSION_LOOP
+
+
+def run_in_session_loop(coro, timeout: float | None = None) -> Any:
+    """Execute a coroutine on the session event loop and block for the result."""
+    loop = get_session_event_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=timeout)
 
 
 def get_session_user_data_dir() -> Path:
@@ -35,7 +62,10 @@ def get_session_user_data_dir() -> Path:
 
 
 def is_browser_session_active() -> bool:
-    """Return True if an in-session browser profile or directory is currently allocated."""
+    """Return True if an in-session browser is currently active."""
+    global _ACTIVE_SESSION, _SESSION_DIR
+    if _ACTIVE_SESSION is not None and getattr(_ACTIVE_SESSION, "is_cdp_connected", False):
+        return True
     return _SESSION_DIR is not None and _SESSION_DIR.exists()
 
 
@@ -56,6 +86,9 @@ def build_session_browser_profile(
 ) -> BrowserProfile:
     """Create or return a reusable BrowserProfile scoped to the current process session."""
     global _ACTIVE_PROFILE
+    if _ACTIVE_PROFILE is not None:
+        return _ACTIVE_PROFILE
+
     user_data_dir = str(get_session_user_data_dir())
     kwargs = dict(base_kwargs or {})
     kwargs["user_data_dir"] = user_data_dir
@@ -67,9 +100,41 @@ def build_session_browser_profile(
     return _ACTIVE_PROFILE
 
 
+def get_or_create_session_browser(profile: BrowserProfile) -> BrowserSession:
+    """Return the reusable BrowserSession for this process session."""
+    global _ACTIVE_SESSION, _SESSION_STARTED
+    if _ACTIVE_SESSION is not None and _SESSION_STARTED and not getattr(_ACTIVE_SESSION, "is_cdp_connected", False):
+        _log.info("Previous active browser session disconnected; recreating session.")
+        _ACTIVE_SESSION = None
+        _SESSION_STARTED = False
+
+    if _ACTIVE_SESSION is None:
+        _ACTIVE_SESSION = BrowserSession(browser_profile=profile)
+        _SESSION_STARTED = False
+    return _ACTIVE_SESSION
+
+
+def mark_session_started() -> None:
+    """Mark the active browser session as started."""
+    global _SESSION_STARTED
+    _SESSION_STARTED = True
+
+
 def cleanup_browser_session() -> None:
     """Clean up the active browser session, proxy, and remove the session temp directory."""
-    global _SESSION_DIR, _ACTIVE_PROFILE, _SESSION_PROXY_URL, _SESSION_PROXY_STOP
+    global _SESSION_DIR, _ACTIVE_PROFILE, _ACTIVE_SESSION, _SESSION_STARTED
+    global _SESSION_PROXY_URL, _SESSION_PROXY_STOP, _SESSION_LOOP, _SESSION_THREAD
+
+    if _ACTIVE_SESSION is not None:
+        if _SESSION_LOOP is not None and _SESSION_LOOP.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(_ACTIVE_SESSION.kill(), _SESSION_LOOP)
+                future.result(timeout=5)
+            except Exception as e:
+                _log.debug("Error stopping browser session: %s", e)
+        _ACTIVE_SESSION = None
+        _SESSION_STARTED = False
+
     if _ACTIVE_PROFILE is not None:
         _ACTIVE_PROFILE = None
 
@@ -88,6 +153,16 @@ def cleanup_browser_session() -> None:
         except Exception as e:
             _log.debug("Error cleaning up session browser directory: %s", e)
         _SESSION_DIR = None
+
+    if _SESSION_LOOP is not None and _SESSION_LOOP.is_running():
+        try:
+            _SESSION_LOOP.call_soon_threadsafe(_SESSION_LOOP.stop)
+            if _SESSION_THREAD is not None and _SESSION_THREAD.is_alive():
+                _SESSION_THREAD.join(timeout=2)
+        except Exception as e:
+            _log.debug("Error stopping session loop: %s", e)
+        _SESSION_LOOP = None
+        _SESSION_THREAD = None
 
 
 # Register process-exit cleanup

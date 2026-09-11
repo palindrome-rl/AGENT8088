@@ -1993,6 +1993,24 @@ def do_chat(query):
         def _on_escalation(_name, result):
             return _handle_escalation(result, live, esc)
 
+        def _on_human_input(question: str, reason: str = "") -> str:
+            if live is not None:
+                live.stop()
+            with (esc.paused() if esc is not None else nullcontext()):
+                from agent8088.browser_hitl import format_hitl_prompt
+                console.print(format_hitl_prompt(question, reason))
+                try:
+                    ans = input("8088 [Human input] › ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    ans = ""
+            if live is not None:
+                live.start()
+            if not ans:
+                return "Action completed in the browser by user. Please inspect the updated page state and continue."
+            return ans
+
+        A.human_input_handler = _on_human_input
+
         # Wire plan execution callbacks so execute_plan tool calls render the
         # checklist and route write-step escalations to the approval menu.
         _plan_steps_state = {}
@@ -2043,6 +2061,7 @@ def do_chat(query):
         except A.AgentInterrupted:
             answer = None
         finally:
+            A.human_input_handler = None
             A.memory_on_capture = None
             A.subagent_ui = None
             A._plan_on_step = None

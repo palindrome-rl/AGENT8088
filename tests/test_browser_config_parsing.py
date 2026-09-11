@@ -21,15 +21,20 @@ def _config(tmp_path, key, value):
 
 
 def _import_engine(tmp_path, config_path):
+    import os
+    env = dict(os.environ)
+    env.update({
+        "HOME": str(tmp_path),
+        "AGENT8088_HOME": str(tmp_path),
+        "AGENT8088_CONFIG": str(config_path),
+    })
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent("""
             import agent8088.engine as A
             print(A.BROWSER_MAX_STEPS, A.BROWSER_TASK_TIMEOUT_SECONDS)
         """)],
         capture_output=True, text=True, timeout=180,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
-             "AGENT8088_HOME": str(tmp_path),
-             "AGENT8088_CONFIG": str(config_path)},
+        env=env,
     )
 
 

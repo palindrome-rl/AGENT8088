@@ -7,6 +7,7 @@ from agent8088.browser_session import (
     cleanup_browser_session,
     is_browser_session_active,
     build_session_browser_profile,
+    get_or_create_session_browser,
 )
 
 
@@ -32,4 +33,12 @@ def test_build_session_browser_profile_sets_keep_alive_and_user_data_dir():
     session_dir = get_session_user_data_dir().resolve()
     assert Path(profile.user_data_dir).resolve() == session_dir
     assert is_browser_session_active()
+    cleanup_browser_session()
+
+
+def test_get_or_create_session_browser_reuses_same_session():
+    profile = build_session_browser_profile(proxy_url="http://127.0.0.1:8888")
+    s1 = get_or_create_session_browser(profile)
+    s2 = get_or_create_session_browser(profile)
+    assert s1 is s2
     cleanup_browser_session()
