@@ -165,5 +165,70 @@ def cleanup_browser_session() -> None:
         _SESSION_THREAD = None
 
 
+def bring_browser_to_front() -> None:
+    """Bring the active browser window to the foreground on the user's desktop."""
+    global _ACTIVE_SESSION, _SESSION_LOOP
+
+    # 1. Ask CDP to bring active page to front
+    if _ACTIVE_SESSION is not None and _SESSION_LOOP is not None and _SESSION_LOOP.is_running():
+        async def _cdp_front():
+            try:
+                session = await _ACTIVE_SESSION.get_or_create_cdp_session(focus=True)
+                if session and session.cdp_client:
+                    await session.cdp_client.send.Page.bringToFront(session_id=session.session_id)
+            except Exception:
+                pass
+        try:
+            asyncio.run_coroutine_threadsafe(_cdp_front(), _SESSION_LOOP)
+        except Exception:
+            pass
+
+    # 2. On Windows, use Win32 API to find and restore/focus the Chrome window
+    import sys
+    if sys.platform == "win32":
+        try:
+            import win32gui
+            import win32con
+            import win32process
+            import psutil
+
+            pids = set()
+            watchdog = getattr(_ACTIVE_SESSION, "_local_browser_watchdog", None) if _ACTIVE_SESSION else None
+            subproc = getattr(watchdog, "_subprocess", None) if watchdog else None
+            root_pid = getattr(subproc, "pid", None)
+            if root_pid:
+                pids.add(root_pid)
+                try:
+                    p = psutil.Process(root_pid)
+                    for child in p.children(recursive=True):
+                        pids.add(child.pid)
+                except Exception:
+                    pass
+
+            target_hwnds = []
+            def _enum_win(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd):
+                    try:
+                        _, win_pid = win32process.GetWindowThreadProcessId(hwnd)
+                        cls = win32gui.GetClassName(hwnd)
+                        if (pids and win_pid in pids) or ("Chrome_WidgetWin_1" in cls and not pids):
+                            target_hwnds.append(hwnd)
+                    except Exception:
+                        pass
+                return True
+
+            win32gui.EnumWindows(_enum_win, None)
+            for hwnd in target_hwnds:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.BringWindowToTop(hwnd)
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+        except Exception as e:
+            _log.debug("bring_browser_to_front win32 error: %s", e)
+
+
 # Register process-exit cleanup
 atexit.register(cleanup_browser_session)
+

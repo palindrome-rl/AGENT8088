@@ -34,6 +34,16 @@ def format_hitl_prompt(question: str, reason: str = "") -> str:
     return "\n".join(lines)
 
 
+def _drain_keys() -> None:
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        except Exception:
+            pass
+
+
 def request_human_input(question: str, reason: str = "") -> str:
     """Prompt the user for input, delegating to the active UI handler if set."""
     from agent8088 import engine as A
@@ -49,6 +59,7 @@ def request_human_input(question: str, reason: str = "") -> str:
         _log.warning("ask_human called in non-interactive terminal; auto-resuming")
         return "No human input available (non-interactive terminal). Please proceed if possible or report status."
 
+    _drain_keys()
     try:
         ans = input("8088 [Human input] › ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -72,6 +83,13 @@ def create_browser_controller(
         "clarification on which choice to make on a page."
     )
     async def ask_human(question: str, reason: str = "") -> str:
+        # Bring browser window to front so human sees it immediately
+        try:
+            from agent8088.browser_session import bring_browser_to_front
+            bring_browser_to_front()
+        except Exception as e:
+            _log.debug("bring_browser_to_front failed: %s", e)
+
         # Wait for user input asynchronously in thread pool so event loop isn't blocked
         loop = asyncio.get_running_loop()
         answer = await loop.run_in_executor(None, lambda: request_human_input(question, reason))

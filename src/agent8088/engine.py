@@ -4861,6 +4861,25 @@ _BROWSER_BACKGROUND_HOSTS = frozenset({
     "safebrowsing.googleapis.com",
     "accounts.google.com",
 })
+_browse_target_host: str | None = None
+
+
+def _is_browser_background_host(host: str) -> bool:
+    """Return True if host is a Chromium background service (push, telemetry, sync)."""
+    h = str(host or "").lower().split(":")[0]
+    target = str(_browse_target_host or "").lower()
+    if target and (h == target or h.endswith("." + target)):
+        return False
+    if h in _BROWSER_BACKGROUND_HOSTS:
+        return True
+    return any(h.endswith(suffix) for suffix in (
+        ".google.com",
+        ".googleapis.com",
+        ".gvt1.com",
+        ".gvt2.com",
+        ".googleusercontent.com",
+        ".gstatic.com",
+    ))
 
 
 def _record_browse_visit(url: str) -> None:
@@ -4876,7 +4895,7 @@ def _record_browse_visit(url: str) -> None:
     except Exception:  # noqa: BLE001 - a visit record must never fail a request
         host = url
     with _browse_visit_lock:
-        if str(host).lower() not in _BROWSER_BACKGROUND_HOSTS:
+        if not _is_browser_background_host(host):
             _browse_current_host = host
         if host not in _browse_visited_hosts:
             _browse_visited_hosts.append(host)
@@ -5149,8 +5168,6 @@ def _browser_headless() -> bool:
         return True
     if override in ("0", "false", "no", "off"):
         return False
-    if _browser_hitl():
-        return False
     return BROWSER_HEADLESS
 
 
@@ -5419,6 +5436,12 @@ async def _run_browser_agent(url: str, task: str,
     from agent8088.browser_proxy import start_ssrf_filtering_proxy
 
     _reset_browse_visits()
+    global _browse_target_host
+    try:
+        import urllib.parse
+        _browse_target_host = urllib.parse.urlsplit(url).hostname
+    except Exception:
+        _browse_target_host = None
     try:
         _sweep_stale_browser_profiles()
     except Exception as e:  # noqa: BLE001 - never let cleanup fail the task

@@ -1999,6 +1999,8 @@ def do_chat(query):
             with (esc.paused() if esc is not None else nullcontext()):
                 from agent8088.browser_hitl import format_hitl_prompt
                 console.print(format_hitl_prompt(question, reason))
+                time.sleep(0.05)
+                _drain_queued_keys()
                 try:
                     ans = console.input("[bold cyan]8088 [Human input] › [/bold cyan]").strip()
                 except (EOFError, KeyboardInterrupt):

@@ -133,7 +133,7 @@ timeout_seconds=120
 # work in a real window — useful for demos and for debugging a stuck selector.
 # Visibility only: the SSRF proxy and every other guard are unaffected.
 # Override for one run with AGENT8088_BROWSER_HEADLESS=0.
-# browser_headless=1
+browser_headless=0
 # Where the visible window opens, as "W,H" and "X,Y". Ignored when headless.
 # Handy for a side-by-side screen recording: keep the terminal on the left and
 # put the browser on the right.
