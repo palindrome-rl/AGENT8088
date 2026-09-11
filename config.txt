@@ -453,7 +453,7 @@ provider.ollama-cloud.native_tools=True
 
 search_base_url=http://127.0.0.1:8888/search?q=
 temperature=0.1
-max_turns=10
+max_turns=50
 show_trace=0
 show_reasoning=1
 verbose=on
