@@ -1815,6 +1815,11 @@ def _active_model_token_limits(provider_name: str = "", model_name: str = "") ->
     """
     from agent8088.providers import model_token_limits
 
+    # Lazy probe: this is the accessor every consumer of a token limit goes
+    # through, so probing here keeps /doctor and the context meter accurate
+    # without taxing import. Cached per (provider, model) inside the probe.
+    _maybe_probe_context_window()
+
     active_provider = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
     active_model = model_name or MODEL_NAME
     profile = PROVIDERS.get(active_provider, {})
@@ -1913,10 +1918,12 @@ def _maybe_probe_context_window():
         PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
 
 
-# Probe once at import: without this, a fresh launch shows the conservative
-# 32k/8k defaults in /doctor until the user reconfigures via /model setup,
-# because activate_model is the only other caller.
-_maybe_probe_context_window()
+# NOT probed at import. The probe is a network round-trip, and at import time
+# every CLI invocation paid for it -- `agent8088 --help` and `pytest
+# --collect-only` included -- for 16.7s against an unreachable endpoint
+# (3 SDK retries x a 5s timeout). _active_model_token_limits() probes lazily
+# instead, so the cost lands on the first caller that actually needs a limit.
+# See tests/test_startup_no_network.py.
 
 
 def _native_tools_enabled(tools, provider_name: str = "") -> bool:
