@@ -2000,7 +2000,7 @@ def do_chat(query):
                 from agent8088.browser_hitl import format_hitl_prompt
                 console.print(format_hitl_prompt(question, reason))
                 try:
-                    ans = input("8088 [Human input] › ").strip()
+                    ans = console.input("[bold cyan]8088 [Human input] › [/bold cyan]").strip()
                 except (EOFError, KeyboardInterrupt):
                     ans = ""
             if live is not None:

@@ -4854,6 +4854,15 @@ def _end_browse_visits() -> list:
     return visited
 
 
+_BROWSER_BACKGROUND_HOSTS = frozenset({
+    "mtalk.google.com",
+    "clients2.google.com",
+    "optimizationguide-pa.googleapis.com",
+    "safebrowsing.googleapis.com",
+    "accounts.google.com",
+})
+
+
 def _record_browse_visit(url: str) -> None:
     """Proxy on_visit callback: one approved request the browser just made.
 
@@ -4867,7 +4876,8 @@ def _record_browse_visit(url: str) -> None:
     except Exception:  # noqa: BLE001 - a visit record must never fail a request
         host = url
     with _browse_visit_lock:
-        _browse_current_host = host
+        if str(host).lower() not in _BROWSER_BACKGROUND_HOSTS:
+            _browse_current_host = host
         if host not in _browse_visited_hosts:
             _browse_visited_hosts.append(host)
 
@@ -5138,6 +5148,8 @@ def _browser_headless() -> bool:
     if override in ("1", "true", "yes", "on"):
         return True
     if override in ("0", "false", "no", "off"):
+        return False
+    if _browser_hitl():
         return False
     return BROWSER_HEADLESS
 

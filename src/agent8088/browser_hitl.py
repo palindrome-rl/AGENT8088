@@ -13,17 +13,23 @@ _log = logging.getLogger(__name__)
 
 def format_hitl_prompt(question: str, reason: str = "") -> str:
     """Format a styled CLI notification box requesting human intervention."""
+    import textwrap
+    width = 72
     lines = [
         "",
-        "╭─ ⚠️  Human in the Loop Required ──────────────────────────────────────────╮",
-        f"│ Question: {question[:66]:<66} │",
+        "╭─ ⚠️  Human in the Loop Required " + ("─" * (width - 29)) + "╮",
     ]
+    for line in textwrap.wrap(f"Question: {question}", width=width):
+        lines.append(f"│ {line:<{width}} │")
     if reason:
-        lines.append(f"│ Reason:   {reason[:66]:<66} │")
+        for line in textwrap.wrap(f"Reason:   {reason}", width=width):
+            lines.append(f"│ {line:<{width}} │")
+    action_1 = "Action:   Complete in the browser window and press [Enter],"
+    action_2 = "          or type your answer below:"
     lines.extend([
-        "│ Action:   Complete in the browser window and press [Enter],              │",
-        "│           or type your answer below:                                     │",
-        "╰──────────────────────────────────────────────────────────────────────────╯",
+        f"│ {action_1:<{width}} │",
+        f"│ {action_2:<{width}} │",
+        "╰" + ("─" * (width + 2)) + "╯",
     ])
     return "\n".join(lines)
 

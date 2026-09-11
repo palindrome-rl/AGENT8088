@@ -137,8 +137,8 @@ browser_headless=0
 # Where the visible window opens, as "W,H" and "X,Y". Ignored when headless.
 # Handy for a side-by-side screen recording: keep the terminal on the left and
 # put the browser on the right.
-browser_window_size=1280,900
-browser_window_position=680,0
+# browser_window_size=1280,900
+# browser_window_position=680,0
 # Both also accept AGENT8088_BROWSER_WINDOW_SIZE / _POSITION for one run.
 # Screenshots stay off for text-only models. Enable this, or set
 # AGENT8088_BROWSER_SCREENSHOTS=1 for one run, only with a vision-capable model.
