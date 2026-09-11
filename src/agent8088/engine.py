@@ -4754,7 +4754,7 @@ BROWSER_MAX_ACTIONS_PER_STEP = int(APP_CONFIG.get("browser_max_actions_per_step"
 # no way to *watch* a run - which is exactly what a demo or a stuck-selector
 # debugging session needs. Opt in with browser_headless=0, or per-run with
 # AGENT8088_BROWSER_HEADLESS=0. Visibility only; every other guard is unchanged.
-BROWSER_HEADLESS = APP_CONFIG.get("browser_headless", "1").strip().lower() in (
+BROWSER_HEADLESS = APP_CONFIG.get("browser_headless", "0").strip().lower() in (
     "1", "true", "yes", "on")
 # Only meaningful when the window is visible: a browsing window that lands on
 # top of the terminal defeats the point of watching, and the window is rebuilt
@@ -5238,6 +5238,7 @@ def _browser_profile_kwargs(proxy_url: str) -> dict:
         # needs the user's stored credentials.
         kwargs["args"] = ["--use-mock-keychain"]
     if not kwargs["headless"]:
+        kwargs["ignore_default_args"] = ["--disable-window-activation", "--disable-focus-on-load"]
         # Placement only matters for a window someone is actually watching.
         for field, setting in (
                 ("window_size", os.environ.get("AGENT8088_BROWSER_WINDOW_SIZE")
@@ -5792,7 +5793,23 @@ def _playwright_chromium_executable() -> str | None:
     if cached and os.path.exists(cached):
         return cached
 
-    private = str(_agent_data_dir() / "playwright-browsers")
+    private_dir = _agent_data_dir() / "playwright-browsers"
+    if not explicit and private_dir.exists():
+        bin_patterns = (
+            "chromium-*/chrome-win64/chrome.exe",
+            "chromium-*/chrome-win/chrome.exe",
+            "chromium-*/chrome-linux/chrome",
+            "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+        )
+        for pattern in bin_patterns:
+            matches = list(private_dir.glob(pattern))
+            if matches and matches[0].is_file():
+                found = str(matches[0])
+                with _chromium_executable_lock:
+                    _chromium_executable_cache[key] = found
+                return found
+
+    private = str(private_dir)
     # None means "leave the variable unset and let Playwright use its default".
     candidates = [explicit] if explicit else [private, None]
 
