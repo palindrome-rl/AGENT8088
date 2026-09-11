@@ -102,6 +102,16 @@ def test_installed_models_with_sub_billion_params_are_catalogued(monkeypatch):
     assert catalog["llama3.1:8b"][0] == pytest.approx(8.03)
 
 
+def test_cloud_models_with_no_download_size_are_not_scored_locally(monkeypatch):
+    monkeypatch.setattr(L, "list_installed_models", lambda host=None: [
+        {"name": "glm-5.2:cloud", "size": 0,
+         "details": {"parameter_size": "9B"}},
+        {"name": "moondream:latest", "size": 1.6 * L._GIB,
+         "details": {"parameter_size": "1.8B"}},
+    ])
+    assert [name for name, _, _ in L._model_catalog()] == ["moondream:latest"]
+
+
 def test_installed_models_replace_the_static_catalog(monkeypatch):
     """User request: when the daemon has models pulled, /local must show ONLY
     those real models -- the hardcoded recommendation list must not appear

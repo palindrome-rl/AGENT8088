@@ -7,6 +7,7 @@ A single shared agent loop (run_agent) drives both modes:
   - one-shot / benchmark mode (query as args, optional --trace)
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.parse  # readline enables input history
+from collections import Counter
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -2610,6 +2611,127 @@ def required_params(spec: dict) -> list:
     """
     optional = set(spec.get("optional") or ())
     return [arg for arg in (spec.get("args") or []) if arg not in optional]
+
+
+TOOL_SELECTION = str(APP_CONFIG.get("tool_selection", "full")).strip().lower()
+TOOL_SELECTION_MODELS = frozenset(parse_csv(APP_CONFIG.get("tool_selection_models", "")))
+TOOL_SELECTION_TOP_K = 10
+_TOOL_SELECTION_ALWAYS = frozenset({"last_output", "describe_tool"})
+_TOOL_INDEX_CACHE = {}
+
+
+def _tool_selection_text(name: str, spec: dict) -> str:
+    """Stable, local search text for one tool. Tool output is never indexed."""
+    return " ".join((
+        name.replace("_", " "),
+        str(spec.get("description") or ""),
+        " ".join(str(arg).replace("_", " ") for arg in spec.get("args") or ()),
+    ))
+
+
+def _tool_selection_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(text or "").lower().replace("_", " "))
+
+
+def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[list[float]]]:
+    """Return a cached catalog snapshot and its vectors, if embeddings work.
+
+    A catalog changes rarely; embed all of it once rather than making every user
+    turn pay for 48 tool descriptions. The existing embedder has its own circuit
+    breaker, so a missing embedding model degrades to full tool exposure.
+    """
+    entries = [(name, _tool_selection_text(name, TOOL_SPECS[name]))
+               for name in sorted(names) if name in TOOL_SPECS]
+    key = tuple(entries)
+    cached = _TOOL_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    vectors = []
+    try:
+        active_embedder = memory.embedder()
+        if active_embedder is not None:
+            vectors = active_embedder.embed([text for _, text in entries])
+    except Exception as exc:  # noqa: BLE001 - optional performance path
+        _log.debug("tool selection embeddings unavailable: %s", exc)
+    result = ([name for name, _ in entries], [text for _, text in entries], vectors)
+    _TOOL_INDEX_CACHE.clear()
+    _TOOL_INDEX_CACHE[key] = result
+    return result
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    product = sum(a * b for a, b in zip(left, right))
+    left_size = math.sqrt(sum(a * a for a in left))
+    right_size = math.sqrt(sum(b * b for b in right))
+    return product / (left_size * right_size) if left_size and right_size else 0.0
+
+
+def _bm25_tool_ranking(query: str, texts: list[str]) -> list[int]:
+    """Small in-memory BM25 ranker for the tiny, static tool catalog."""
+    terms = _tool_selection_tokens(query)
+    documents = [_tool_selection_tokens(text) for text in texts]
+    if not terms or not documents:
+        return []
+    query_terms = set(terms)
+    document_frequency = {term: sum(term in doc for doc in documents)
+                          for term in query_terms}
+    average_length = sum(map(len, documents)) / len(documents)
+    scores = []
+    for index, doc in enumerate(documents):
+        counts = Counter(doc)
+        score = 0.0
+        for term in query_terms:
+            frequency = counts.get(term, 0)
+            if not frequency:
+                continue
+            idf = math.log(1 + (len(documents) - document_frequency[term] + 0.5)
+                           / (document_frequency[term] + 0.5))
+            score += idf * frequency * 2.2 / (frequency + 1.2 * (
+                1 - 0.75 + 0.75 * len(doc) / max(average_length, 1)))
+        scores.append((score, index))
+    return [index for score, index in sorted(scores, reverse=True) if score > 0]
+
+
+def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | None = None,
+                                  provider: str = "", model: str = "") -> set[str]:
+    """Choose direct schemas before the model sees a request, or fail open.
+
+    This is deliberately not a chat-model router. BM25 handles literal tool
+    language and the existing embedding endpoint handles paraphrases; RRF keeps
+    either signal from dominating. If the semantic leg is unavailable or the two
+    rankers have no shared candidate, retain the old full catalog.
+    """
+    selected_mode = (mode or TOOL_SELECTION or "full").lower()
+    if selected_mode == "auto":
+        identity = f"{provider}:{model}" if provider and model else model
+        selected_mode = "hybrid" if identity in TOOL_SELECTION_MODELS else "full"
+    if selected_mode != "hybrid" or len(allowed) <= TOOL_SELECTION_TOP_K:
+        return set(allowed)
+    names, texts, vectors = _tool_selection_index(set(allowed))
+    if len(vectors) != len(names):
+        return set(allowed)
+    try:
+        active_embedder = memory.embedder()
+        query_vector = active_embedder.embed_one(query) if active_embedder else []
+    except Exception as exc:  # noqa: BLE001 - optional performance path
+        _log.debug("tool selection query embedding unavailable: %s", exc)
+        return set(allowed)
+    if not query_vector:
+        return set(allowed)
+    lexical = _bm25_tool_ranking(query, texts)
+    semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
+                      reverse=True)
+    semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
+    if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
+        return set(allowed)
+    scores = Counter()
+    for ranking in (lexical, semantic):
+        for position, index in enumerate(ranking, 1):
+            scores[index] += 1 / (60 + position)
+    picked = {names[index] for index, _ in scores.most_common(TOOL_SELECTION_TOP_K)}
+    return (picked | _TOOL_SELECTION_ALWAYS) & set(allowed)
 
 
 def build_tools_def(tool_specs: dict) -> list:
@@ -9903,6 +10025,30 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     run_trajectory = trajectory.TrajectoryState(
         trajectory_state, goal, len(messages), workspace=str(PROJECT_ROOT),
     )
+
+    # Choose a smaller native schema surface once for the human request, before
+    # the model's first completion. Tool-result messages are deliberately not
+    # input: untrusted output must never steer which privileged tool is offered.
+    # Text-only backends keep their full prompt catalog because it is their only
+    # tool knowledge.
+    configured_tools = kwargs.get("allowed_tools", TOOL_NAMES)
+    available_tools = set(configured_tools() if callable(configured_tools) else configured_tools)
+    selection_identity = f"{kwargs.get('provider_name') or ACTIVE_PROVIDER}:{kwargs.get('model_name') or MODEL_NAME}"
+    selection_requested = (TOOL_SELECTION == "hybrid" or
+                           (TOOL_SELECTION == "auto" and
+                            selection_identity in TOOL_SELECTION_MODELS))
+    if goal and selection_requested:
+        configured_defs = kwargs.get("tools_def", TOOLS_DEF)
+        probe_defs = configured_defs() if callable(configured_defs) else configured_defs
+        if not _native_tools_enabled(probe_defs, kwargs.get("provider_name", "")):
+            probe_defs = []
+    else:
+        probe_defs = []
+    if probe_defs:
+        kwargs["allowed_tools"] = select_tool_names_for_request(
+            goal, available_tools, provider=kwargs.get("provider_name") or ACTIVE_PROVIDER,
+            model=kwargs.get("model_name") or MODEL_NAME,
+        )
 
     def trajectory_changed():
         if on_trajectory_state is None:
