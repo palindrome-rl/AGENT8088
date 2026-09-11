@@ -1,4 +1,4 @@
-[[<p align="center">
+<p align="center">
   <img src="assets/palindrome-research-labs-agent8088.png" alt="Palindrome Research Labs" width="420">
   <br>
   <img src="assets/agent8088-wordmark-readme.png" alt="Agent8088" width="540">
@@ -223,4 +223,3 @@ See the [contribution guide](docs/wiki/14-contributing.md) for the required isol
 <div align="center">
   <img src="assets/palindrome-research-labs-footer.png" alt="Palindrome Research Labs" width="320">
 </div>
-](https://agent8088-installer.pages.dev/install.sh)](https://agent8088-installer.pages.dev/install.ps1)
