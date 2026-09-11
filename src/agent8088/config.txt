@@ -85,12 +85,12 @@ prompt_paths=~
 # provider.<name>.max_completion_tokens=32768
 
 timeout_seconds=120
-# Tool schemas sent with each native function-calling request. `full` is the
-# safe default. `hybrid` uses keyword + embedding retrieval to send the 10
+# Tool schemas sent with each native function-calling request. `hybrid` is the
+# default: it uses keyword + embedding retrieval to send the 10
 # most relevant schemas, but falls back to full when the retrieval signals
-# disagree or embeddings are unavailable. `auto` enables hybrid only for the
-# explicitly measured provider:model entries below; unknown models stay full.
-# tool_selection=full
+# disagree or embeddings are unavailable. `full` always sends every schema.
+# `auto` enables hybrid only for the explicitly measured provider:model entries.
+tool_selection=hybrid
 # tool_selection_models=custom:ornith-1.0-35b
 # max_tool_timeout_seconds=600
 # browser_max_steps=25

@@ -460,6 +460,32 @@ function ModeSelector({ onSet, setting }: {
   )
 }
 
+function ToolSelectionSelector({ mode, onSet, setting }: {
+  mode: string
+  onSet: (mode: string) => void
+  setting: boolean
+}) {
+  return (
+    <div className="flex gap-2">
+      {['hybrid', 'full', 'auto'].map((value) => (
+        <button
+          key={value}
+          onClick={() => onSet(value)}
+          disabled={setting || mode === value}
+          className={cn(
+            'flex-1 rounded-lg border px-3 py-2 text-sm font-medium capitalize transition-colors disabled:opacity-40',
+            mode === value
+              ? 'border-brand-primary bg-brand-primary/10 text-brand-cyan'
+              : 'border-zinc-700 text-zinc-300 hover:bg-zinc-800',
+          )}
+        >
+          {value}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // ---- Audit Toggle ----
 
 function AuditToggle({ onToggle, toggling }: { onToggle: (enable: boolean) => void; toggling: boolean }) {
@@ -637,6 +663,11 @@ export default function ConfigPage() {
     mutationFn: (mode: string) => postJSON<ActionResponse>('/api/mode', { mode }),
   })
 
+  const toolSelectionMutation = useMutation({
+    mutationFn: (mode: string) => postJSON<ActionResponse>('/api/tool-selection', { mode }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['config'] }),
+  })
+
   // Audit
   const auditMutation = useMutation({
     mutationFn: (enable: boolean) => postJSON<ActionResponse>('/api/audit', { enable }),
@@ -707,6 +738,12 @@ export default function ConfigPage() {
         </div>
       )}
 
+      {toolSelectionMutation.data?.ok && (
+        <div className="flex items-center gap-2 rounded-lg border border-green-900/50 bg-green-950/20 p-3 text-xs text-green-400">
+          <Check className="h-3.5 w-3.5" /> Tool selection: {toolSelectionMutation.data.mode}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         {/* Left column */}
         <div className="space-y-6">
@@ -736,6 +773,15 @@ export default function ConfigPage() {
           {/* Mode Selector */}
           <Section icon={Shield} title="Permission Mode" subtitle="Control agent autonomy">
             <ModeSelector onSet={(mode) => modeMutation.mutate(mode)} setting={modeMutation.isPending} />
+          </Section>
+
+          <Section icon={Sliders} title="Tool Selection" subtitle="Schemas sent to native tool-calling models">
+            <ToolSelectionSelector
+              mode={configQuery.data?.tool_selection ?? 'hybrid'}
+              onSet={(mode) => toolSelectionMutation.mutate(mode)}
+              setting={toolSelectionMutation.isPending}
+            />
+            {toolSelectionMutation.data?.error && <p className="mt-2 text-xs text-red-400">{toolSelectionMutation.data.error}</p>}
           </Section>
 
           {/* Audit Toggle */}
@@ -831,6 +877,7 @@ export default function ConfigPage() {
             <InfoRow label="Default provider" value={configQuery.data.default_provider} mono />
             <InfoRow label="Active provider" value={configQuery.data.active_provider} mono />
             <InfoRow label="Context window" value={configQuery.data.context_window} mono />
+            <InfoRow label="Tool selection" value={configQuery.data.tool_selection} mono />
             <InfoRow label="Max turns" value={configQuery.data.max_turns} mono />
             <InfoRow label="Temperature" value={configQuery.data.temperature} mono />
             <InfoRow label="Config path" value={configQuery.data.config_path} mono />

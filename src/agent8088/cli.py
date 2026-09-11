@@ -2149,6 +2149,7 @@ COMMAND_SPECS = (
     ("reasoning", "/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)", ()),
     ("temp", "/temp <float>", "Set sampling temperature (current: {temperature})", ()),
     ("maxturns", "/maxturns <int>", "Set max agent turns (current: {max_turns})", ()),
+    ("tool-selection", "/tool-selection [hybrid|full|auto]", "Set native tool schemas sent to the model (persists)", ()),
     ("save", "/save <file>", "Save conversation + last trace to a JSON file", ()),
     ("clear", "/clear", "Clear the conversation context", ()),
     ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
@@ -3243,7 +3244,7 @@ def cmd_config(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Key", style="#237dd7")
     t.add_column("Value", style="#237dd7")
-    keys = ["default_provider", "temperature", "max_turns", "show_trace", "show_reasoning",
+    keys = ["default_provider", "tool_selection", "temperature", "max_turns", "show_trace", "show_reasoning",
             "verbose", "usage_mode", "syntax_theme", "disabled_skills",
             "timeout_seconds", "allowed_paths",
             "search_base_url", "ssrf_allow_hosts", "prompt_paths", "blocked_paths"]
@@ -3283,7 +3284,7 @@ def cmd_status(_):
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}; {sandbox['requested']}) · network {sandbox['network']}")
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
-    t.add_row("Detail", f"verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
+    t.add_row("Detail", f"tools {A.TOOL_SELECTION} · verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
     console.print(t)
 
@@ -4608,6 +4609,19 @@ def cmd_maxturns(rest):
     _save_preferences()
 
 
+def cmd_tool_selection(rest):
+    mode = rest.strip().lower()
+    if not mode:
+        console.print(f"tool selection = [#237dd7]{A.TOOL_SELECTION}[/#237dd7] · use /tool-selection [hybrid|full|auto]")
+        return
+    try:
+        selected = A.set_tool_selection(mode)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    console.print(f"tool selection = [#237dd7]{selected}[/#237dd7] [dim](saved)[/dim]")
+
+
 def _fmt_limit(key, value):
     """0 means 'no limit' for most budgets — printing a bare 0 reads as 'off by
     accident' rather than 'deliberately unbounded'."""
@@ -5268,7 +5282,7 @@ COMMANDS = {
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
-    "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
+    "maxturns": cmd_maxturns, "tool-selection": cmd_tool_selection, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
     "memory": cmd_memory,
     "task": cmd_task,
     "schedule": cmd_schedule,

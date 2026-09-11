@@ -52,6 +52,15 @@ def test_auto_mode_only_enables_measured_models(engine, monkeypatch):
         provider="custom", model="unknown") == allowed
 
 
+def test_tool_selection_setting_updates_runtime_and_config(engine, monkeypatch, tmp_path):
+    config_path = tmp_path / "config.txt"
+    monkeypatch.setattr(engine, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(engine, "TOOL_SELECTION", "hybrid")
+    assert engine.set_tool_selection("full") == "full"
+    assert engine.TOOL_SELECTION == "full"
+    assert config_path.read_text() == "tool_selection=full\n"
+
+
 def test_run_agent_filters_native_schemas_before_first_completion(engine, monkeypatch):
     specs = {
         "check_local_hardware": engine.TOOL_SPECS["check_local_hardware"],

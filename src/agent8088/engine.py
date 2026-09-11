@@ -2613,11 +2613,26 @@ def required_params(spec: dict) -> list:
     return [arg for arg in (spec.get("args") or []) if arg not in optional]
 
 
-TOOL_SELECTION = str(APP_CONFIG.get("tool_selection", "full")).strip().lower()
+_TOOL_SELECTION_MODES = frozenset({"full", "hybrid", "auto"})
+TOOL_SELECTION = str(APP_CONFIG.get("tool_selection", "hybrid")).strip().lower()
+if TOOL_SELECTION not in _TOOL_SELECTION_MODES:
+    TOOL_SELECTION = "hybrid"
 TOOL_SELECTION_MODELS = frozenset(parse_csv(APP_CONFIG.get("tool_selection_models", "")))
 TOOL_SELECTION_TOP_K = 10
 _TOOL_SELECTION_ALWAYS = frozenset({"last_output", "describe_tool"})
 _TOOL_INDEX_CACHE = {}
+
+
+def set_tool_selection(mode: str) -> str:
+    """Set and persist the native tool-schema selection mode."""
+    selected = str(mode or "").strip().lower()
+    if selected not in _TOOL_SELECTION_MODES:
+        raise ValueError("tool selection must be full, hybrid, or auto")
+    global TOOL_SELECTION
+    TOOL_SELECTION = selected
+    APP_CONFIG["tool_selection"] = selected
+    update_simple_config(CONFIG_PATH, {"tool_selection": selected})
+    return selected
 
 
 def _tool_selection_text(name: str, spec: dict) -> str:
@@ -2703,7 +2718,7 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
     either signal from dominating. If the semantic leg is unavailable or the two
     rankers have no shared candidate, retain the old full catalog.
     """
-    selected_mode = (mode or TOOL_SELECTION or "full").lower()
+    selected_mode = (mode or TOOL_SELECTION or "hybrid").lower()
     if selected_mode == "auto":
         identity = f"{provider}:{model}" if provider and model else model
         selected_mode = "hybrid" if identity in TOOL_SELECTION_MODELS else "full"
