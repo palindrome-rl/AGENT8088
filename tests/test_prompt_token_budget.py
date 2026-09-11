@@ -61,14 +61,24 @@ def test_fixed_overhead_within_budget():
     assert total < 14_600, f"fixed overhead regressed to {total} tokens"
 
 
-def test_cli_session_prompt_also_drops_the_catalogue():
+def test_cli_session_prompt_follows_the_provider(monkeypatch):
     """The CLI builds its own prompt and passes it as system_prompt=, which
     outranks engine.current_system_prompt() at engine.py:2116.
 
     Patching only the engine therefore saved nothing on the CLI path -- caught
-    by live testing, not by the unit tests above.
+    by live testing, not by the unit tests above. Drive the provider decision
+    explicitly rather than depending on whatever provider the test environment
+    happens to have configured.
     """
     import agent8088.cli as C
-    prompt = C._session_system_prompt()
-    assert "- execute_shell(" not in prompt
-    assert "Mandatory routing" in prompt
+
+    monkeypatch.setattr(E, "_native_tools_enabled", lambda *a, **k: True)
+    native = C._session_system_prompt()
+    assert "- execute_shell(" not in native
+    assert "Mandatory routing" in native
+
+    monkeypatch.setattr(E, "_native_tools_enabled", lambda *a, **k: False)
+    prose = C._session_system_prompt()
+    assert "- execute_shell(" in prose
+
+    assert len(native) < len(prose), "native-tool prompt must be the smaller one"
