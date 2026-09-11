@@ -2145,6 +2145,7 @@ COMMAND_SPECS = (
     ("clear", "/clear", "Clear the conversation context", ()),
     ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
     ("schedule", "/schedule [list|add <cron> <task>|remove <index-or-task>]", "Add/list/remove a recurring run of this agent (cron/Task Scheduler)", ()),
+    ("browser", "/browser [status|close|reset]", "Inspect or close the active reusable browser session", ()),
     ("help", "/help", "Show this list", ()),
     ("exit", "/exit, /quit", "Leave", ("quit",)),
 )
@@ -3638,6 +3639,24 @@ def cmd_schedule(rest):
         _cmd_schedule_remove(arg)
     else:
         _print_schedule_usage()
+
+
+def handle_browser_command(args: list[str]) -> str:
+    sub = (args[0] if args else "status").lower()
+    from agent8088.browser_session import cleanup_browser_session, is_browser_session_active
+    if sub in ("close", "reset", "stop"):
+        if is_browser_session_active():
+            cleanup_browser_session()
+            return "Active browser session closed and temporary files cleared."
+        return "No active browser session was running."
+    active = is_browser_session_active()
+    return f"Browser session: {'active' if active else 'idle'}"
+
+
+def cmd_browser(rest: str):
+    parts = (rest or "").strip().split()
+    msg = handle_browser_command(parts)
+    console.print(f"[#237dd7]{msg}[/#237dd7]")
 
 
 def cmd_dump(_rest):
@@ -5271,6 +5290,7 @@ COMMANDS = {
     "memory": cmd_memory,
     "task": cmd_task,
     "schedule": cmd_schedule,
+    "browser": cmd_browser,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 
