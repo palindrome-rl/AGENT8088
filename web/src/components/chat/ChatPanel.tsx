@@ -3,6 +3,7 @@ import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
 import { MessageBubble } from './MessageBubble'
 import { ToolChip } from './ToolChip'
+import { ToolDiffStrip } from './ToolDiffStrip'
 import { ThinkingTrace } from './ThinkingTrace'
 import { ApprovalCard } from './ApprovalCard'
 import { PromptBar } from './PromptBar'
@@ -61,9 +62,18 @@ export function ChatPanel() {
         {isStreaming && (
           <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
             <ThinkingTrace />
-            {toolEvents.map((tool, i) => (
-              <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
-            ))}
+            <div data-testid="tool-rows">
+              {toolEvents.map((tool, i) => (
+                <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
+              ))}
+            </div>
+            {/* The chips summarise the whole run, not one row, so they sit
+                after the rows under a divider. */}
+            <ToolDiffStrip
+              diffs={toolEvents
+                .map((tool) => tool.diff)
+                .filter((d): d is NonNullable<typeof d> => !!d)}
+            />
             {scrubMarkup(streamingText).trim() && <MessageBubble message={{ role: 'assistant', content: scrubMarkup(streamingText) }} />}
           </div>
         )}
