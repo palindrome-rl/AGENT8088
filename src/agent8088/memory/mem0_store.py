@@ -250,7 +250,8 @@ class Mem0MemoryStore:
 
     def add(self, text, *, user_id: str = "owner", embedding=None, embed_model: str = "",
             project: Optional[str] = None, agent_id: Optional[str] = None,
-            run_id: Optional[str] = None, categories=None, source: str = "extracted") -> Optional[str]:
+            run_id: Optional[str] = None, categories=None, source: str = "extracted",
+            metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         mem = self._init_memory()
         if mem is None:
             return None
@@ -258,13 +259,19 @@ class Mem0MemoryStore:
         if not text:
             return None
 
-        metadata = {
+        # mem0's own metadata dict already carries project/agent_id/run_id -- the
+        # caller's extra keys (repo, source_channel) are merged in rather than
+        # replacing it, so both stores end up describing the same memory the
+        # same way even though this is mem0's field, not agent8088's.
+        full_metadata = {
             "project": project,
             "agent_id": agent_id,
             "run_id": run_id,
             "categories": categories or [],
             "source": source,
         }
+        full_metadata.update(metadata or {})
+        metadata = full_metadata
         try:
             try:
                 resp = mem.add(text, user_id=str(user_id), metadata=metadata, infer=False)

@@ -2219,6 +2219,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                 max_turns=C._turn_max_turns(A.PERMISSION_MODE),
                 temperature=S.temperature,
                 memory_run_id=S.name or None,
+                memory_source_channel="web",
                 memory_background=True,
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
                 on_result=on_result, on_escalation=on_escalation,
