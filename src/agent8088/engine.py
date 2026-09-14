@@ -17,8 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import (cli_anything, documents, efficiency, local_models,
-                       memory, providers, routing, tool_output, trajectory, web_search)
+from agent8088 import (cli_anything, diffview, documents, efficiency, local_models,
+                       memory, patching, providers, routing, tool_output,
+                       trajectory, web_search)
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -8193,6 +8194,42 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path instead.")
+            return result
+        if name == "edit_file":
+            # Shares write_text so every guard above already ran. Only the
+            # bytes-on-disk step differs: a located replacement instead of a
+            # whole-file overwrite.
+            if not target.exists():
+                _turn_writes -= 1
+                return (f"Error: {target} does not exist, so there is nothing to edit. "
+                        f"Use write_file to create it.")
+            try:
+                original = _read_text_limited(target)
+            except ValueError as exc:
+                _turn_writes -= 1
+                return (f"Error: {target} could not be read as text for editing ({exc}). "
+                        f"Nothing was written.")
+            edit = patching.apply_edit(original, str(args.get("old_string") or ""), content)
+            if not edit.ok:
+                # A refusal wrote nothing, so it must not spend the turn's write
+                # budget -- otherwise three bad guesses lock out the real edit.
+                _turn_writes -= 1
+                return edit.error
+            target.write_text(edit.text, encoding="utf-8", newline="")
+            _last_write_diff = _make_diff(original, edit.text, str(target))
+            added, removed = diffview.diff_counts(_last_write_diff)
+            result = (f"Updated {target} with {added} addition{'s' if added != 1 else ''} "
+                      f"and {removed} removal{'s' if removed != 1 else ''}")
+            if edit.strategy == "normalized":
+                result += (" — old_string matched after normalising trailing whitespace "
+                           "and tabs; copy the file's exact text next time")
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path if you meant to "
+                           f"edit the project's own file.")
+            hunk = "".join(_last_write_diff[2:])[:2000]
+            if hunk:
+                result += f"\n{hunk}"
             return result
         if args.get("_private") is True:
             _write_private_text(target, content)
