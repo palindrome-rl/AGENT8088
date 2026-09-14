@@ -11342,6 +11342,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "tool is available. If verification is not possible, say that plainly."
                 )})
                 continue
+            if trajectory is not None and trajectory.request_tests():
+                if on_trajectory_state:
+                    on_trajectory_state()
+                messages.append({"role": "user", "content": (
+                    "Controller state says these code files changed this run with no "
+                    f"tests written: {', '.join(trajectory.untested_paths())}. "
+                    "Before your final answer, call generate_tests on each one, or "
+                    "state plainly why tests do not apply to this change."
+                )})
+                continue
             answer = _guard_answer(answer)
             if trajectory is not None and trajectory.needs_verification():
                 answer += ("\n\nVerification note: changes were made, but no fresh automated "
@@ -11483,6 +11493,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     operation, result, failed=_plan_step_failed(result),
                     blocked=result.startswith("ESCALATION_REQUEST\x1f"),
                     mutated=_MUTATION_SEQ != mutation_seq_before, verdict=verdict.status,
+                    # Every write tool in tools.txt uses 'filename' as its
+                    # path_arg; a tool that declares none yields "", which the
+                    # tracker ignores.
+                    path=str(args.get("filename") or ""),
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
