@@ -365,6 +365,31 @@ def test_sh_config_rewrite_is_idempotent_across_reruns(tmp_path):
     assert config.read_text().count("memory_engine") == 1
 
 
+def test_both_installers_prefetch_the_mem0_model_into_the_pinned_cache():
+    """The ~90 MB fastembed model must be fetched at install time, into the same
+    cache the runtime pins.
+
+    Two separate failures are being locked out. Downloading it at all is the
+    first: without this the fetch fires on the user's first /memory call, inside
+    the REPL, behind a wall of progress bars. Pinning FASTEMBED_CACHE_PATH is the
+    second: fastembed otherwise caches under the system temp dir, which macOS and
+    Windows both purge, so a pre-download there would evaporate and the REPL
+    would fetch it all over again anyway.
+    """
+    sh = (ROOT / "install.sh").read_text(encoding="utf-8")
+    ps = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    for source in (sh, ps):
+        assert "from fastembed import TextEmbedding" in source
+        assert "FASTEMBED_CACHE_PATH" in source
+    # Installer and runtime must agree on the directory, or the pre-download
+    # lands somewhere the runtime never looks.
+    assert '"$AGENT8088_HOME/fastembed"' in sh
+    assert 'Join-Path $Agent8088Home "fastembed"' in ps
+    runtime = (ROOT / "src/agent8088/memory/mem0_store.py").read_text(encoding="utf-8")
+    assert "FASTEMBED_CACHE_PATH" in runtime
+    assert '"fastembed"' in runtime
+
+
 def test_sh_memory_flag_is_documented_and_validated():
     source = (ROOT / "install.sh").read_text(encoding="utf-8")
     assert "--memory BACKEND" in source

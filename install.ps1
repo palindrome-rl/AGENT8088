@@ -256,6 +256,7 @@ $TOcrModels   = 600 * $TimeoutScale   # OCR detection + recognition models
 $TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
 $TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
 $TLibreOffice = 1800 * $TimeoutScale  # ~350 MB MSI plus dependency resolution/install
+$TMem0Model   = 600 * $TimeoutScale   # ~90 MB fastembed model, same size as the OCR ones
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
 # premature cut fails the install outright -- but it is still the largest
@@ -1001,6 +1002,27 @@ function Install-Mem0Extra {
         -TimeoutSec $TPip -Activity "Installing the mem0 memory backend"
     if ($result.ExitCode -eq 0) {
         Write-Success "mem0 memory backend installed"
+        # fastembed fetches this on first construction. Doing it here rather than
+        # mid-conversation keeps the first /memory instant -- otherwise the
+        # download fires inside the REPL and floods it with progress bars -- and
+        # lets a machine that is offline later still work.
+        Write-Info "Downloading the mem0 embedding model (~90 MB)..."
+        # Same cache the runtime pins (memory/mem0_store.py). fastembed's own
+        # default is the system temp dir, which Storage Sense clears -- downloading
+        # there would leave the REPL to fetch it all over again. Process-scoped:
+        # the child inherits it, the user's environment is untouched.
+        $env:FASTEMBED_CACHE_PATH = Join-Path $Agent8088Home "fastembed"
+        $modelResult = Invoke-WithTimeout -FilePath $PythonExe `
+            -Arguments @("-c", "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')") `
+            -TimeoutSec $TMem0Model -Activity "Downloading the mem0 embedding model"
+        if ($modelResult.ExitCode -eq 0) {
+            Write-Success "mem0 embedding model installed"
+        } else {
+            Write-StageWarning -Result $modelResult -TimeoutSec $TMem0Model `
+                -What "mem0 embedding model" `
+                -Consequence "the first /memory call will download it instead" `
+                -Fix "`"$PythonExe`" -c `"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')`""
+        }
         return $true
     }
     # Non-fatal on purpose: memory falls back to the native engine, which needs

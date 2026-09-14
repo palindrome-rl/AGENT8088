@@ -455,6 +455,7 @@ T_CHROMIUM=$((600     * TIMEOUT_SCALE))   # ~150 MB browser download
 T_NODE_DL=$((180      * TIMEOUT_SCALE))   # ~30 MB tarball
 T_PIP=$((300          * TIMEOUT_SCALE))   # gateway extras: tens of MB of wheels
 T_LIBREOFFICE=$((1800 * TIMEOUT_SCALE))   # ~350 MB+ plus dependency resolution/install
+T_MEM0_MODEL=$((600  * TIMEOUT_SCALE))    # ~90 MB fastembed model, same size as the OCR ones
 T_GIT=$((600          * TIMEOUT_SCALE))   # shallow clone: small, but a stalled fetch hangs
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
@@ -1193,6 +1194,26 @@ install_deps() {
         if [ "$_mem0_rc" -eq 0 ]; then
             MEM0_INSTALLED=true
             log_success "mem0 memory backend installed"
+            # fastembed fetches this on first construction. Doing it here rather
+            # than mid-conversation keeps the first /memory instant -- otherwise
+            # the download fires inside the REPL and floods it with progress
+            # bars -- and lets a machine that is offline later still work.
+            log_info "Downloading the mem0 embedding model (~90 MB)..."
+            _mem0_model_rc=0
+            # Same cache the runtime pins (memory/mem0_store.py). fastembed's own
+            # default is the system temp dir, which gets purged -- downloading
+            # there would leave the REPL to fetch it all over again.
+            FASTEMBED_CACHE_PATH="$AGENT8088_HOME/fastembed" \
+                run_with_timeout "$T_MEM0_MODEL" "$_py" -c \
+                "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')" \
+                >/dev/null 2>&1 || _mem0_model_rc=$?
+            if [ "$_mem0_model_rc" -eq 0 ]; then
+                log_success "mem0 embedding model installed"
+            else
+                warn_stage "$_mem0_model_rc" "$T_MEM0_MODEL" "mem0 embedding model" \
+                    "the first /memory call will download it instead" \
+                    "$_py -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\""
+            fi
         else
             # Non-fatal: native needs nothing extra, so a wheel that will not
             # build here must not fail the install. Fall back to it honestly.

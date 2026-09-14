@@ -122,6 +122,21 @@ class Mem0MemoryStore:
                 try:
                     import fastembed
                     embed_dims = 384
+                    # fastembed otherwise caches its ~90 MB model under the system
+                    # temp dir (fastembed/common/utils.py: gettempdir() +
+                    # "fastembed_cache"), which macOS and Windows both purge. That
+                    # makes the download fire again mid-conversation, inside the
+                    # REPL, long after the installer already fetched it. Pin it
+                    # under AGENT8088_HOME so it survives, and so the installer's
+                    # pre-download lands in the same place the runtime reads.
+                    # Keyed off AGENT8088_HOME rather than the mem0 dir: the model
+                    # cache is shared, not part of the store, so pointing
+                    # memory_mem0_dir elsewhere must not orphan it.
+                    # An explicit FASTEMBED_CACHE_PATH from the user still wins.
+                    agent_home = os.environ.get(
+                        "AGENT8088_HOME", os.path.expanduser("~/.agent8088"))
+                    os.environ.setdefault(
+                        "FASTEMBED_CACHE_PATH", os.path.join(agent_home, "fastembed"))
                     embedder_section = {
                         "provider": "fastembed",
                         "config": {
