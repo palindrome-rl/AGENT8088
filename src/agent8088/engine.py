@@ -18,7 +18,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088 import (cli_anything, diffview, documents, efficiency, local_models,
-                       memory, patching, providers, routing, tool_output,
+                       memory, patching, providers, routing, testing_support,
+                       tool_output,
                        trajectory, web_search)
 
 APP_DIR = Path(__file__).resolve().parent
@@ -7815,6 +7816,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     path_zone = "default"
     shadowed = None
     if mode == "shell":
+        if name == "run_tests":
+            # Discovery happens here, before the approval prompt and before any
+            # guard runs, so the user is asked about the real command and every
+            # shell protection applies to it unchanged. Same reasoning as
+            # create_document sharing write_text: share the mode, differ only in
+            # the one step that has to differ.
+            found = testing_support.discover_command(
+                str(args.get("path") or "").strip() or str(PROJECT_ROOT))
+            if found.error:
+                return found.error
+            args = {**args, "command": found.command}
         try:
             argv = _structured_tool_argv(name, args)
         except ValueError as exc:
@@ -8278,6 +8290,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             # Ordered before the recording below so this run's own verdict is
             # stamped with the sequence its side effects produced.
             note_mutation(f"{name}: {command[:80]}")
+        if name == "run_tests":
+            text = testing_support.trim_output(text)
         _record_verdict(ledger_command or command, text)
         return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
