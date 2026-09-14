@@ -2957,8 +2957,9 @@ def render_tool_name_index(specs: dict) -> str:
         "All of these exist and are callable. For one you were given no schema "
         "for, call describe_tool(tool_name) to load its parameters, then call it.",
     ]
+    labels = {"cli_anything": "CLI Anything", "general": "General"}
     for head, names in sorted(families.items()):
-        lines.append(f"- {', '.join(names)}")
+        lines.append(f"- {labels.get(head, head.title())}: {', '.join(names)}")
     return "\n".join(lines)
 
 

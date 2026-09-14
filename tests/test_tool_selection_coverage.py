@@ -95,3 +95,11 @@ def test_name_index_lists_every_tool_cheaply(engine):
     for name in engine.TOOL_SPECS:
         assert name in index, f"{name} missing from the name index"
     assert len(index) // 4 < 400, f"name index too expensive: ~{len(index) // 4} tokens"
+
+
+def test_name_index_labels_tool_families(engine):
+    """Families make the names-only index scannable without hiding tools."""
+    index = engine.render_tool_name_index(engine.TOOL_SPECS)
+    assert "- Git: git_branch" in index
+    assert "git_status" in index.split("- Git:", 1)[1].split("\n", 1)[0]
+    assert "- CLI Anything: cli_anything_info" in index
