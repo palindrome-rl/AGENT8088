@@ -223,7 +223,11 @@ def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, 
     if cached and (now - cached["ts"]) < 3600:
         return cached["models"]
     try:
-        fetch_client = client.with_options(timeout=timeout) if hasattr(client, "with_options") else client
+        # max_retries=0: a model listing that fails is a miss the caller
+        # already handles, not something to retry. The SDK default of 2
+        # retries multiplies the timeout by three on a dead endpoint.
+        fetch_client = (client.with_options(timeout=timeout, max_retries=0)
+                        if hasattr(client, "with_options") else client)
         resp = fetch_client.models.list()
         models = sorted(set(_normalize_model_id(provider_name, m.id) for m in resp.data))
         disk[cache_key] = {"ts": now, "models": models}
@@ -307,7 +311,9 @@ def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL
 
     # Strategy 3: OpenAI-compatible /v1/models
     try:
-        fetch_client = (client.with_options(timeout=timeout)
+        # max_retries=0 -- see the docstring: this probe never raises, so a
+        # failure is a miss. Retrying turned one 5s timeout into 16.7s.
+        fetch_client = (client.with_options(timeout=timeout, max_retries=0)
                         if hasattr(client, "with_options") else client)
         resp = fetch_client.models.list()
         norm = _normalize_model_id("", model_id)

@@ -147,6 +147,7 @@ export interface ConfigInfo {
   active_provider: string
   config_path: string
   context_window: number
+  tool_selection: 'full' | 'hybrid' | 'auto'
   max_turns: number
   temperature: number
   tools_file: string

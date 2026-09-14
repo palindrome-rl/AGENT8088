@@ -8,7 +8,11 @@ def test_describes_exact_live_schema(engine, name):
     report = json.loads(engine.describe_tool(name))
     assert report["name"] == name
     assert report["parameters"] == engine.build_tools_def({name: engine.TOOL_SPECS[name]})[0]["function"]["parameters"]
-    assert "not executed" in report["execution"]
+    # The contract is that describing a tool discloses it did not run it. The
+    # exact wording deliberately changed: "the tool was not executed" read to
+    # the model as a prohibition on calling it at all (see
+    # test_describe_tool_reads_as_loaded_not_forbidden).
+    assert "did not run it" in report["execution"]
 
 
 @pytest.mark.parametrize("name", [None, "", " ", [], 42, "x" * 201, "nonexistent_tool"])
@@ -133,3 +137,22 @@ def test_private_execution_fields_are_not_reported(engine, monkeypatch):
     assert len(calls) == 1
     assert "private-command" not in result
     assert "private-value" not in result
+
+
+def test_describe_tool_reads_as_loaded_not_forbidden(engine):
+    """The old note ("the tool was not executed") read as a prohibition: during
+    the reverted two-tier attempt the model responded by passing the tool NAME
+    to execute_shell (sh: not found, exit 127) instead of calling the tool whose
+    schema it had just loaded. describe_tool is the documented schema-on-demand
+    path now, so it has to end with an invitation, not a warning."""
+    execution = json.loads(engine.describe_tool("write_file"))["execution"].lower()
+    assert "callable" in execution or "you can now call" in execution
+    assert "was not executed" not in execution
+
+
+def test_describe_tool_resolves_tools_the_request_did_not_advertise(engine):
+    """Schema-on-demand only works if it ignores the current selection -- the
+    whole point is reaching a tool hybrid selection dropped."""
+    result = json.loads(engine.describe_tool("git_log"))
+    assert result["name"] == "git_log"
+    assert "parameters" in result

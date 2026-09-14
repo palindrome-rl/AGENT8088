@@ -90,6 +90,21 @@ def test_out_of_range_temperature_is_rejected(client, temperature):
     assert "error" in response.json(), response.text
 
 
+def test_tool_selection_is_persisted_and_validated(client, monkeypatch, tmp_path):
+    from agent8088 import engine
+    config_path = tmp_path / "config.txt"
+    monkeypatch.setattr(engine, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(engine, "TOOL_SELECTION", "hybrid")
+    response = client.post("/api/tool-selection", json={"mode": "full"})
+    assert response.status_code == 200, response.text
+    assert response.json()["mode"] == "full"
+    assert config_path.read_text() == "tool_selection=full\n"
+    assert client.get("/api/config").json()["tool_selection"] == "full"
+    response = client.post("/api/tool-selection", json={"mode": "banana"})
+    assert response.status_code == 400, response.text
+    assert "error" in response.json()
+
+
 def test_invalid_sandbox_mode_is_rejected(client):
     response = client.post("/api/sandbox", json={"mode": "banana"})
     assert "error" in response.json(), response.text
