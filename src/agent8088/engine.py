@@ -4688,6 +4688,74 @@ def _exec_create_subagent(args: dict) -> str:
     return write_custom_subagent(args)
 
 
+_AUTOTEST_SOURCE_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".java",
+    ".kt", ".cs", ".php", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
+}
+
+
+def _looks_like_a_test(path: Path) -> bool:
+    stem = path.stem.lower()
+    return (stem.startswith("test_") or stem.endswith("_test")
+            or ".test" in path.name.lower() or ".spec" in path.name.lower()
+            or "tests" in {part.lower() for part in path.parent.parts[-2:]})
+
+
+def _file_fingerprint(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _exec_autotest(args: dict, depth: int = 0) -> str:
+    """Delegate test authoring, then verify the code under test was left alone.
+
+    The integrity check is the point. A sub-agent told to make tests pass has an
+    easy cheat available -- weaken the code until they do -- and a prompt
+    instruction cannot stop it. Hashing the file either side of the run can.
+    """
+    raw = str(args.get("filename") or "").strip()
+    if not raw:
+        return "Error: generate_tests requires 'filename', the source file to be tested."
+    try:
+        source = resolve_write_path(raw)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if not source.is_file():
+        return (f"Error: {source} does not exist, so there is nothing to test. "
+                f"Write the code first, then call generate_tests on it.")
+    if _looks_like_a_test(source):
+        return (f"Error: {source} is already a test file. Pass the source file it "
+                f"tests instead.")
+    if source.suffix.lower() not in _AUTOTEST_SOURCE_SUFFIXES:
+        return (f"Error: {source.suffix or 'that file type'} is not source code that "
+                f"can be unit tested. Pass a source file — one of: "
+                f"{', '.join(sorted(_AUTOTEST_SOURCE_SUFFIXES))}.")
+
+    focus = str(args.get("focus") or "").strip()
+    brief = (f"Write tests for the existing source file {source}.\n"
+             f"Read it first, then read one existing test in this project and match "
+             f"its framework, location and naming. Write the tests, run them with "
+             f"run_tests, and report the test file's path, the number of tests, and "
+             f"whether they pass.\n"
+             f"Do not modify {source} itself under any circumstances.")
+    if focus:
+        brief += f"\nFocus especially on: {focus}"
+
+    before = _file_fingerprint(source)
+    report = _exec_subagent({"agent_type": "test-writer", "task": brief}, depth=depth)
+    after = _file_fingerprint(source)
+
+    if before and after and before != after:
+        # Shown above the report on purpose: the report will claim success.
+        return (f"WARNING: {source} was MODIFIED while its tests were being written. "
+                f"The sub-agent is not allowed to change the code under test, so "
+                f"these tests may pass only because the code was weakened. Review "
+                f"the diff for {source} before trusting this result.\n\n{report}")
+    return report
+
+
 def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
@@ -8055,6 +8123,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "subagent":
         return _exec_subagent(args, depth=depth)
+
+    if mode == "autotest":
+        return _exec_autotest(args, depth=depth)
 
     if mode == "cron":
         return _exec_cron(args)
