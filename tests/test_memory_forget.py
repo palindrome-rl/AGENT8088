@@ -56,6 +56,61 @@ def test_forget_refuses_to_guess_between_several_matches(tmp_path):
     assert "matches" in result.lower()
 
 
+def test_forget_deletes_on_an_exact_quote_even_among_similar_matches(tmp_path):
+    """Real transcript bug: the model was told 'matches 3 memories, not one:
+    "The user's favorite pizza topping is pineapple and apple." ; ...' and
+    then quoted that exact candidate back verbatim -- and forget() still
+    refused, because it only ever counted hits, never checked whether one of
+    them was the literal text the model had just been shown. Reciting the
+    exact wording of a memory back is a lookup, not a guess.
+    """
+    _configure(tmp_path)
+    store = memory.store()
+    store.add("The user's favorite pizza topping is pineapple.", user_id="owner", source="user")
+    store.add("The user's favorite pizza topping is pineapple and apple.",
+             user_id="owner", source="user")
+    store.add("The user's favorite programming language is Python.",
+             user_id="owner", source="user")
+
+    result = memory.forget("The user's favorite pizza topping is pineapple and apple.")
+
+    assert "and apple" in result.lower()
+    assert store.count(user_id="owner") == 2
+    remaining = {row["text"] for row in store.get_all(user_id="owner")}
+    assert "The user's favorite pizza topping is pineapple." in remaining
+    assert "The user's favorite programming language is Python." in remaining
+
+
+def test_forget_exact_quote_ignores_case_and_trailing_period(tmp_path):
+    _configure(tmp_path)
+    store = memory.store()
+    store.add("The user's favorite pizza topping is pineapple and apple.",
+             user_id="owner", source="user")
+    store.add("The user's favorite pizza topping is pineapple.", user_id="owner", source="user")
+
+    result = memory.forget("the user's favorite pizza topping is pineapple and apple")
+
+    assert store.count(user_id="owner") == 1
+    assert "and apple" in result.lower()
+
+
+def test_forget_still_refuses_when_no_candidate_is_an_exact_quote(tmp_path):
+    """A vague query ("apple") that genuinely fuzzy-matches several memories,
+    none of them verbatim, must stay refused -- the exact-match escape hatch
+    is not a general excuse to loosen the ambiguity check."""
+    _configure(tmp_path)
+    store = memory.store()
+    store.add("The user's favorite pizza topping is pineapple and apple.",
+             user_id="owner", source="user")
+    store.add("The user's favorite fruit snack is a sliced apple with honey.",
+             user_id="owner", source="user")
+
+    result = memory.forget("apple")
+
+    assert store.count(user_id="owner") == 2
+    assert "matches" in result.lower()
+
+
 def test_forget_reports_when_memory_is_off(tmp_path):
     _configure(tmp_path, memory="0")
     assert "off" in memory.forget("anything").lower()
