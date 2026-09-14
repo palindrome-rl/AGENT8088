@@ -1131,10 +1131,15 @@ def on_result(name, result):
         # already resolved the argument against the workspace root by then.
         path = _diff_path(A._last_write_diff) or _last_call_paths.get(name, "")
         added, removed = _diff_counts(A._last_write_diff)
-        header = Text(f"  ⎿  {result}", style="dim")
-        if removed:
+        # First line only: edit_file appends the changed hunk to its result for
+        # the model's benefit, and the renderer draws that hunk itself below.
+        headline = result.splitlines()[0] if result else ""
+        header = Text(f"  ⎿  {headline}", style="dim")
+        if removed and not headline.startswith("Updated "):
             # Only for an edit: on a new file every line is an addition, and the
-            # numbered listing below already says how big it is.
+            # numbered listing below already says how big it is. An edit_file
+            # result already reads "Updated X with N additions and M removals",
+            # so appending the counts would state them a second time.
             header.append(f" · +{added} −{removed}", style="dim")
         console.print(header)
         console.print(Padding(_diff_block(A._last_write_diff, path=path), (0, 0, 0, 5)))

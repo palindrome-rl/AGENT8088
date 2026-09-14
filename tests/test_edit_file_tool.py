@@ -94,3 +94,26 @@ def test_normalized_match_says_so_in_the_result(engine, workspace):
         "filename": "repo/app.py", "old_string": "    return x   ", "new_string": "    return y"})
     assert "normalising" in result
     assert (workspace / "app.py").read_text(encoding="utf-8") == "a\n    return y\nc\n"
+
+
+def test_cli_header_does_not_double_report_the_counts(engine, workspace, monkeypatch):
+    """edit_file's result already states the counts; '· +1 −1' says it twice."""
+    from agent8088 import cli
+
+    (workspace / "app.py").write_text("a\nb\nc\n", encoding="utf-8")
+    result = engine.run_tool("edit_file", {
+        "filename": "repo/app.py", "old_string": "b", "new_string": "B"})
+
+    printed = []
+    monkeypatch.setattr(cli.S, "verbose", "on")
+    monkeypatch.setattr(cli.A, "TOOL_SPECS", engine.TOOL_SPECS)
+    monkeypatch.setattr(cli.A, "_last_write_diff", engine._last_write_diff)
+    monkeypatch.setattr(cli.console, "print", lambda *a, **k: printed.append(a[0] if a else ""))
+    cli.on_result("edit_file", result)
+
+    header = next(str(p) for p in printed if "Updated" in str(p))
+    assert "addition" in header and "removal" in header
+    assert "+1" not in header
+    # The hunk the model gets back must not be reprinted as part of the header;
+    # the renderer draws its own diff below it.
+    assert "\n" not in header
