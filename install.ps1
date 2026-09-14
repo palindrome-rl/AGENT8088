@@ -205,6 +205,7 @@ $ChromiumInstalled = $false
 $OcrInstalled = $false
 $Mem0Installed = $false
 $MemoryEngine = ""
+$RepositoryInstalled = $false
 $NodeInstalled = $false
 $WhatsAppBridgeReady = $false
 $SandboxInstalled = $false
@@ -2063,6 +2064,32 @@ function Install-Gateway-Extras {
         }
         $script:MemoryEngine = if ($script:Mem0Installed) { "mem0" } else { "native" }
 
+        # Repository context ([repository] extra). repository_read is registered
+        # unconditionally, so without this the model is told the tool exists and
+        # the first call spends a turn discovering it cannot run. Small (~3.5 MB)
+        # and pure Python, so the usual reason to leave an extra out -- a wheel
+        # that may not build here -- does not apply. Still non-fatal: the tool
+        # reports the exact install command at runtime.
+        if (Test-StageComplete "repository") {
+            $script:RepositoryInstalled = $true
+            Write-Success "Repository context already installed (skipping)"
+        } else {
+            Write-Info "Installing repository context support (optional, for repository_read)..."
+            $repoResult = Invoke-WithTimeout -FilePath $script:UvCmd `
+                -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[repository]") `
+                -TimeoutSec $TPip -Activity "Installing repository context"
+            if ($repoResult.ExitCode -eq 0) {
+                $script:RepositoryInstalled = $true
+                Set-StageComplete "repository"
+                Write-Success "Repository context installed"
+            } else {
+                Write-StageWarning -Result $repoResult -TimeoutSec $TPip `
+                    -What "repository context" `
+                    -Consequence "repository_read will report the install command instead of running" `
+                    -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[repository]`""
+            }
+        }
+
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
         if (Test-StageComplete "chromium") {
@@ -2635,6 +2662,11 @@ function Verify-Install {
         Write-Host "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
     } else {
         Write-Host "  Memory:   native SQLite (rerun with -WithMem0 to add the mem0 engine)"
+    }
+    if ($script:RepositoryInstalled) {
+        Write-Host "  Repos:    repository_read ready (bounded repository overviews)"
+    } else {
+        Write-Host "  Repos:    repository_read unavailable - install the [repository] extra"
     }
     if ($script:WhatsAppBridgeReady) {
         Write-Host "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"

@@ -33,6 +33,30 @@ log = logging.getLogger("agent8088.web")
 _engine = None
 _cli = None
 
+def _result_diff():
+    """The diff the engine just recorded, as a JSON-serializable payload.
+
+    Read here rather than passed in because the engine records it on a module
+    global the same way the CLI renderer reads it -- one source of truth for
+    both front ends.
+    """
+    from agent8088 import diffview
+    from agent8088 import engine as _e
+    return diffview.to_payload(_e._last_write_diff or [])
+
+
+def _tool_result_payload(name: str, result: str) -> dict:
+    payload = {"type": "tool_result", "name": name,
+               "result": scrub_markup(result)[:5000]}
+    try:
+        diff = _result_diff()
+    except Exception:
+        diff = None  # the result event matters more than the diff
+    if diff:
+        payload["diff"] = diff
+    return payload
+
+
 def _eng():
     global _engine
     if _engine is None:
@@ -737,6 +761,7 @@ async def get_config():
         "active_provider": _cl()._active_provider_name() if _cl() else "",
         "config_path": str(A.CONFIG_PATH),
         "context_window": A.CONTEXT_WINDOW,
+        "tool_selection": A.TOOL_SELECTION,
         "max_turns": C.S.max_turns,
         "temperature": C.S.temperature,
         "tools_file": str(A.TOOLS_FILE),
@@ -1714,6 +1739,18 @@ class PrefBody(BaseModel):
     show_reasoning: bool | None = None
     memory_notifications: str | None = None
 
+
+class ToolSelectionBody(BaseModel):
+    mode: str
+
+
+@app.post("/api/tool-selection")
+async def set_tool_selection(body: ToolSelectionBody):
+    try:
+        return {"ok": True, "mode": _eng().set_tool_selection(body.mode)}
+    except ValueError as exc:
+        return _error(str(exc), 400)
+
 @app.post("/api/preferences")
 async def set_preferences(body: PrefBody):
     """Update session preferences (temp, maxturns, verbose, etc.)."""
@@ -2091,8 +2128,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
 
     def on_result(name, result):
         asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "tool_result", "name": name,
-                          "result": scrub_markup(result)[:5000]}),
+            ws.send_json(_tool_result_payload(name, result)),
             loop,
         )
 

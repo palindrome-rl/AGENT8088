@@ -40,6 +40,13 @@ def test_tool_argument_recovery(engine):
     assert 'filename' in missing
 
 
+def test_read_text_rejects_urls_with_a_browser_hint(engine):
+    result = engine.exec_tool('read_text', json.dumps({'filename': 'https://example.com'}))
+    assert 'read_text accepts local file paths' in result
+    assert "Use browse_page" in result
+    assert 'suggested_action' in result
+
+
 def test_stable_tool_order(engine):
     a = {'args': ['filename'], 'description': 'read', 'mode': 'read_text'}
     forward = {'a': a, 'z': a}

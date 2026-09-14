@@ -75,7 +75,7 @@ function wireSocket(ws: WebSocket) {
         break
       case 'tool_result':
         if (interruptRequested) break
-        updateToolEvent(data.name, data.result)
+        updateToolEvent(data.name, data.result, data.diff)
         break
       case 'plan_step':
         if (interruptRequested) break

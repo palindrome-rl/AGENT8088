@@ -147,6 +147,7 @@ export interface ConfigInfo {
   active_provider: string
   config_path: string
   context_window: number
+  tool_selection: 'full' | 'hybrid' | 'auto'
   max_turns: number
   temperature: number
   tools_file: string
@@ -261,6 +262,16 @@ export interface CommandInfo {
 
 // --- WebSocket protocol ---
 
+export type ToolDiffLine = { text: string; tone: 'add' | 'del' | 'ctx' }
+
+export type ToolDiffPayload = {
+  file: string
+  added: number
+  removed: number
+  lines: ToolDiffLine[]
+  truncated: boolean
+}
+
 export type WSClientMessage =
   | { type: 'chat'; text: string; attachments?: string[] }
   | { type: 'command'; command: string; args?: string }
@@ -272,7 +283,7 @@ export type WSEvent =
   | { type: 'status'; data: StatusInfo }
   | { type: 'token'; kind: 'reasoning' | 'content'; delta: string }
   | { type: 'tool_start'; name: string }
-  | { type: 'tool_result'; name: string; result: string }
+  | { type: 'tool_result'; name: string; result: string; diff?: ToolDiffPayload }
   | { type: 'tool_calls'; calls: Array<{ name: string; args: Record<string, unknown> }> }
   | { type: 'spin'; message: string; elapsed: number; tokens: number }
   | { type: 'escalation'; tool_name: string; change_type: string; description: string; id: string }

@@ -197,6 +197,7 @@ CHROMIUM_INSTALLED=false
 OCR_INSTALLED=false
 MEM0_INSTALLED=false
 LIBREOFFICE_INSTALLED=false
+REPOSITORY_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
 SANDBOX_INSTALLED=false
@@ -1240,6 +1241,29 @@ install_deps() {
             "rerun with --with-libreoffice, or install manually from https://www.libreoffice.org/download/"
     fi
 
+    # --- Repository context (optional [repository] extra) ---
+    # repository_read is registered unconditionally, so without this the model is
+    # told the tool exists and the first call spends a turn discovering it cannot
+    # run. The dependency is small (~3.5 MB) and pure Python, so the usual reason
+    # to leave an extra out -- a wheel that may not build here -- does not apply.
+    # Still non-fatal: the tool reports the exact install command at runtime.
+    log_info "Installing repository context support (optional, for repository_read)..."
+    _repo_rc=0
+    if [ "$DISTRO" = "termux" ]; then
+        run_with_timeout "$T_PIP" pip install -e ".[repository]" >/dev/null 2>&1 || _repo_rc=$?
+    else
+        run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+            -e "$INSTALL_DIR[repository]" >/dev/null 2>&1 || _repo_rc=$?
+    fi
+    if [ "$_repo_rc" -eq 0 ]; then
+        REPOSITORY_INSTALLED=true
+        log_success "Repository context installed"
+    else
+        warn_stage "$_repo_rc" "$T_PIP" "repository context" \
+            "repository_read will report the install command instead of running" \
+            "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[repository]\""
+    fi
+
     # --- Playwright (optional [browser] extra) + Chromium binary ---
     # playwright degrades gracefully at runtime (engine.py: _playwright_available()),
     # so it's an optional extra, not a core dep - a platform/Python combo without
@@ -1821,6 +1845,11 @@ verify_install() {
         echo "  Office:   LibreOffice ready (docx/pptx/xlsx conversion)"
     else
         echo "  Office:   LibreOffice not installed (rerun with --with-libreoffice)"
+    fi
+    if [ "$REPOSITORY_INSTALLED" = true ]; then
+        echo "  Repos:    repository_read ready (bounded repository overviews)"
+    else
+        echo "  Repos:    repository_read unavailable - install the [repository] extra"
     fi
     if [ "$WHATSAPP_BRIDGE_READY" = true ]; then
         echo "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"

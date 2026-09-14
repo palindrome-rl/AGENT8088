@@ -202,6 +202,7 @@ class _SubStatusLine:
 # ---------------------------------------------------------------------------
 # Load the real Agent8088 engine
 # ---------------------------------------------------------------------------
+from agent8088 import diffview
 from agent8088 import engine as A
 from agent8088 import fusion
 from agent8088 import searxng_provision
@@ -382,7 +383,7 @@ def _active_tool_specs():
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
     if A.PERMISSION_MODE == "plan-only":
         allowed &= {
-            "present_plan", "read_text", "calculate", "describe_capabilities", "describe_tool",
+            "present_plan", "read_text", "repository_read", "calculate", "describe_capabilities", "describe_tool",
             "git_status", "git_diff", "git_log", "last_output", "web_search",
             "view_skill",
         }
@@ -395,35 +396,7 @@ def _active_provider_name():
 
 def _session_system_prompt():
     specs = _active_tool_specs()
-    prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(specs)
-              + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE)
-              + A.render_runtime_context())
-    # Inject current permission mode so the model knows what it can/can't do right now
-    prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
-    if A.PERMISSION_MODE == "plan-only":
-        prompt += ("You are in plan mode RIGHT NOW. Direct writes and mutations are "
-                   "BLOCKED — do NOT call write_file, execute_shell, git_commit, "
-                   "git_push, run_sandboxed, schedule_task, or browse_page directly. "
-                   "Use read_text and safe shell commands (ls, cat, grep, git status, "
-                   "git diff, git log) to find out what is really there, then call "
-                   "present_plan with the whole plan as markdown text for the user to "
-                   "approve. After the approval lands the permission mode changes and "
-                   "you carry out the steps with ordinary tool calls. Do NOT claim any "
-                   "of it is done before that happens.\n")
-    elif A.PERMISSION_MODE == "full-auto":
-        prompt += ("You are in full-auto mode. Permission-gated tools are allowed without "
-                   "prompts when sandboxed. Code execution is refused when neither the native "
-                   "sandbox nor Docker is available. Catastrophic commands and credential path "
-                   "writes are always blocked.\n")
-    elif A.PERMISSION_MODE == "edit":
-        prompt += ("You are in edit mode. Permission-gated tools are allowed when sandboxed. "
-                   "Use a tool only when necessary; code execution is refused when no sandbox "
-                   "is available. Catastrophic commands and credential path writes are always "
-                   "blocked.\n")
-    else:
-        prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
-                   "Writes and mutations require user approval.\n")
-    return prompt
+    return A.compose_system_prompt(specs=specs, skills=_active_skills())
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +828,15 @@ _NO_HIGHLIGHT = {"", "none", "off", "no", "0", "plain"}
 _DIFF_ADD = "#3fb950"
 _DIFF_DEL = "#f85149"
 
-_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# Diff parsing itself lives in diffview, shared with the web server so both
+# front ends read one implementation. The private aliases keep every call
+# site in this module unchanged.
+_HUNK_RE = diffview.HUNK_RE
+_diff_path = diffview.diff_path
+_diff_counts = diffview.diff_counts
+
+_SEARCH_RESULT_ITEM_RE = re.compile(r"^\d+\. ", re.MULTILINE)
+_SEARCH_PROVIDER_RE = re.compile(r"\(via (\w+)\)|No results from (\w+)")
 _TAB_WIDTH = 4
 _DEFAULT_THEME = "monokai"
 
@@ -980,48 +961,6 @@ def _numbered_lines(text, limit=None, path=""):
     return body, total
 
 
-def _parse_hunks(diff_lines):
-    """A unified diff regrouped into hunks of (marker, old_no, new_no, code) rows.
-
-    Two jobs beyond grouping. It tracks each side's line number so the gutter can
-    show where in the file the change actually landed. And it strips the trailing
-    newline difflib leaves on every body line (`keepends=True`) — appending
-    another one is what made every diff the CLI ever printed come out
-    double-spaced, at half the content per screen.
-    """
-    hunks = []
-    old_no = new_no = 0
-    for raw in diff_lines:
-        line = str(raw).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
-        header = _HUNK_RE.match(line)
-        if header:
-            old_no, new_no = int(header.group(1)), int(header.group(3))
-            hunks.append({
-                "old_count": int(header.group(2)) if header.group(2) else 1,
-                "rows": [],
-            })
-            continue
-        # Everything before the first hunk is preamble. Recognising '--- '/'+++ '
-        # by shape anywhere would swallow real content: deleting a line that opens
-        # with '-- ' — an SQL or Haskell comment — produces exactly '--- ...'.
-        if not hunks:
-            continue
-        prefixed = line[:1] in ("+", "-", " ")
-        marker = line[0] if prefixed else " "
-        code = (line[1:] if prefixed else line).expandtabs(_TAB_WIDTH)
-        rows = hunks[-1]["rows"]
-        if marker == "+":
-            rows.append(("+", None, new_no, code))
-            new_no += 1
-        elif marker == "-":
-            rows.append(("-", old_no, None, code))
-            old_no += 1
-        else:
-            rows.append((" ", old_no, new_no, code))
-            old_no += 1
-            new_no += 1
-    return hunks
-
 
 def _styled_rows(rows, path):
     """`rows` paired with a highlighted Text each, lexing the two sides separately.
@@ -1049,7 +988,7 @@ def _diff_block(diff_lines, limit=None, path=""):
     header has not already said — so it renders as a plain listing of the file
     instead, and the '+' column is saved for edits, where it carries information.
     """
-    hunks = _parse_hunks(diff_lines)
+    hunks = diffview.parse_hunks(diff_lines, _TAB_WIDTH)
     if not hunks:
         return Text()
 
@@ -1095,40 +1034,6 @@ def _diff_block(diff_lines, limit=None, path=""):
     return body
 
 
-def _diff_path(diff_lines):
-    """The file a diff is against, taken from its own '+++' header.
-
-    Only the preamble is searched, for the same reason _parse_hunks stops looking
-    there: an added line reading '++ tally' arrives as '+++ tally'.
-    """
-    for line in diff_lines:
-        text = str(line)
-        if _HUNK_RE.match(text):
-            break
-        if text.startswith("+++ "):
-            return text[4:].strip()
-    return ""
-
-
-def _diff_counts(diff_lines):
-    """(added, removed) — the shape of a change, readable before the change itself."""
-    added = removed = 0
-    in_hunk = False
-    for raw in diff_lines:
-        line = str(raw)
-        if _HUNK_RE.match(line):
-            in_hunk = True
-        elif not in_hunk:
-            continue  # preamble: '--- old' / '+++ new' are not changed lines
-        elif line.startswith("+"):
-            added += 1
-        elif line.startswith("-"):
-            removed += 1
-    return added, removed
-
-
-_SEARCH_RESULT_ITEM_RE = re.compile(r"^\d+\. ", re.MULTILINE)
-_SEARCH_PROVIDER_RE = re.compile(r"\(via (\w+)\)|No results from (\w+)")
 
 
 def on_result(name, result):
@@ -1185,10 +1090,15 @@ def on_result(name, result):
         # already resolved the argument against the workspace root by then.
         path = _diff_path(A._last_write_diff) or _last_call_paths.get(name, "")
         added, removed = _diff_counts(A._last_write_diff)
-        header = Text(f"  ⎿  {result}", style="dim")
-        if removed:
+        # First line only: edit_file appends the changed hunk to its result for
+        # the model's benefit, and the renderer draws that hunk itself below.
+        headline = result.splitlines()[0] if result else ""
+        header = Text(f"  ⎿  {headline}", style="dim")
+        if removed and not headline.startswith("Updated "):
             # Only for an edit: on a new file every line is an addition, and the
-            # numbered listing below already says how big it is.
+            # numbered listing below already says how big it is. An edit_file
+            # result already reads "Updated X with N additions and M removals",
+            # so appending the counts would state them a second time.
             header.append(f" · +{added} −{removed}", style="dim")
         console.print(header)
         console.print(Padding(_diff_block(A._last_write_diff, path=path), (0, 0, 0, 5)))
@@ -1852,12 +1762,9 @@ def _after_turn_plan_state():
 PLAN_MODE_MIN_TURNS = 25
 
 
-# How long the REPL will wait, after printing the answer, for the extraction call
-# to finish so its result can be reported in this turn. Past this the write still
-# completes in the background — only the notification is dropped, because a line
-# arriving after the prompt is drawn would land in the middle of what the user is
-# typing. Generous enough for a local model, short enough not to feel like a hang.
-MEMORY_NOTIFY_WAIT_SECONDS = 10
+# Memory extraction must not delay the input prompt. Completed notifications are
+# emitted by the main thread at turn boundaries, never while the user is typing.
+MEMORY_NOTIFY_WAIT_SECONDS = 0  # Compatibility: capture never blocks the prompt.
 
 
 # Captures that outlasted their report budget: [(thread, stored rows), ...].
@@ -1909,26 +1816,15 @@ def _report_memory_capture(stored, late=False):
 
 
 def _await_memory_capture(stored_ref):
-    """Wait briefly for this turn's capture, then report it.
-
-    Capture is deliberately started after the answer is rendered, so by the time
-    this runs the user has already read the reply; the wait costs them nothing but
-    the prompt returning a moment later.
-    """
+    """Report completed capture or defer it; never wait before accepting input."""
     if S.memory_notifications == "off":
         return
     # Drain anything owed from earlier turns first, so reports stay in order.
     _report_pending_capture()
     thread = A.memory_capture_thread
     if thread is not None and thread.is_alive():
-        with status_cm("remembering..."):
-            thread.join(timeout=MEMORY_NOTIFY_WAIT_SECONDS)
-        if thread.is_alive():
-            # Deferred rather than dropped. A local extraction call measured 17.7s
-            # against qwen3:8b, so exceeding this budget is the normal case, not the
-            # exception -- and silence is exactly what makes memory look broken.
-            _pending_captures.append((thread, stored_ref))
-            return
+        _pending_captures.append((thread, stored_ref))
+        return
     _report_memory_capture(list(stored_ref))
 
 
@@ -2168,6 +2064,7 @@ COMMAND_SPECS = (
     ("reasoning", "/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)", ()),
     ("temp", "/temp <float>", "Set sampling temperature (current: {temperature})", ()),
     ("maxturns", "/maxturns <int>", "Set max agent turns (current: {max_turns})", ()),
+    ("tool-selection", "/tool-selection [hybrid|full|auto]", "Set native tool schemas sent to the model (persists)", ()),
     ("save", "/save <file>", "Save conversation + last trace to a JSON file", ()),
     ("clear", "/clear", "Clear the conversation context", ()),
     ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
@@ -3263,7 +3160,7 @@ def cmd_config(_):
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Key", style="#237dd7")
     t.add_column("Value", style="#237dd7")
-    keys = ["default_provider", "temperature", "max_turns", "show_trace", "show_reasoning",
+    keys = ["default_provider", "tool_selection", "temperature", "max_turns", "show_trace", "show_reasoning",
             "verbose", "usage_mode", "syntax_theme", "disabled_skills",
             "timeout_seconds", "allowed_paths",
             "search_base_url", "ssrf_allow_hosts", "prompt_paths", "blocked_paths"]
@@ -3303,7 +3200,7 @@ def cmd_status(_):
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}; {sandbox['requested']}) · network {sandbox['network']}")
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
-    t.add_row("Detail", f"verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
+    t.add_row("Detail", f"tools {A.TOOL_SELECTION} · verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
     console.print(t)
 
@@ -4700,6 +4597,19 @@ def cmd_maxturns(rest):
     _save_preferences()
 
 
+def cmd_tool_selection(rest):
+    mode = rest.strip().lower()
+    if not mode:
+        console.print(f"tool selection = [#237dd7]{A.TOOL_SELECTION}[/#237dd7] · use /tool-selection [hybrid|full|auto]")
+        return
+    try:
+        selected = A.set_tool_selection(mode)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    console.print(f"tool selection = [#237dd7]{selected}[/#237dd7] [dim](saved)[/dim]")
+
+
 def _fmt_limit(key, value):
     """0 means 'no limit' for most budgets — printing a bare 0 reads as 'off by
     accident' rather than 'deliberately unbounded'."""
@@ -5445,7 +5355,7 @@ COMMANDS = {
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
-    "maxturns": cmd_maxturns, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
+    "maxturns": cmd_maxturns, "tool-selection": cmd_tool_selection, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
     "memory": cmd_memory,
     "task": cmd_task,
     "schedule": cmd_schedule,
@@ -5462,7 +5372,11 @@ def _estimate_context_pct():
     window — good enough for a progress hint, not meant to be exact. Image
     parts count as a flat allowance rather than their (huge) base64 length,
     which would peg the meter at 100%."""
-    chars = A._estimate_context_chars(S.messages, A.SYSTEM_PROMPT)
+    # _session_system_prompt() is what actually goes on the wire; A.SYSTEM_PROMPT
+    # is the module-level build from import time and no longer matches it (it
+    # still carries the prose tool catalogue this session omits), so the meter
+    # was reporting a prompt that is not sent.
+    chars = A._estimate_context_chars(S.messages, _session_system_prompt())
     ctx_window, _ = A._active_model_token_limits()
     if not ctx_window:
         return 0

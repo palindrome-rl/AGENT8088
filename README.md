@@ -186,6 +186,9 @@ The CLI and gateway share the same agent loop, session model, tool registry, and
 
 ## Documentation
 
+Optional [repository ingestion](docs/repository-ingestion.md) provides bounded
+GitIngest-backed repository overviews, search and source reads.
+
 The versioned [documentation wiki](docs/wiki/README.md) is the source of truth for this branch.
 
 | Read this | To learn about |

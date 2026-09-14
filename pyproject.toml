@@ -64,6 +64,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+repository = ["gitingest==0.3.1"]
 gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
 # browser and search are now aliases: both packages are core dependencies above.
 # They are kept so `pip install agent8088[browser]` and the installers' existing

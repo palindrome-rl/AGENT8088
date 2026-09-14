@@ -4,10 +4,7 @@ from agent8088.gateway.session import SessionStore
 
 
 def build_system_prompt(platform: str = "", chat_type: str = "") -> str:
-    """Build the gateway system prompt: base + tool docs + skills + permission
-    mode + channel-aware runtime context, mirroring the CLI's
-    _session_system_prompt() so the model knows what tools exist and whether
-    writes need approval.
+    """Build the shared prompt without leaking the local CLI user's profile.
 
     Deliberately skips render_persona(): USER.md is one local human's profile,
     and the gateway can be serving many different chat users across several
@@ -15,18 +12,9 @@ def build_system_prompt(platform: str = "", chat_type: str = "") -> str:
     details into every other sender's conversation. Skill docs carry no such
     per-user data, so they're included.
     """
-    prompt = (A.BASE_SYSTEM_PROMPT + "\n" + A.render_tool_docs(A.TOOL_SPECS)
-              + A.render_skill_docs(A.SKILL_PACKAGES)
-              + A.render_runtime_context(channel=platform, chat_type=chat_type))
-    prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
-    if A.PERMISSION_MODE in ("edit", "full-auto"):
-        prompt += ("You are in full-auto mode. All tools are allowed without prompts. "
-                   "Catastrophic commands and credential path writes are still blocked.\n")
-    else:
-        prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
-                   "Writes and mutations require user approval — you will be told when "
-                   "a tool is blocked and whether the user approved it.\n")
-    return prompt
+    return A.compose_system_prompt(
+        include_persona=False, channel=platform, chat_type=chat_type,
+    )
 
 
 PLAN_MODE_MIN_TURNS = 25

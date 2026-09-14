@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ChatAttachment, ChatMessage, StatusInfo } from '@/types/api'
+import type { ChatAttachment, ChatMessage, StatusInfo, ToolDiffPayload } from '@/types/api'
 
 export interface QueuedPrompt {
   id: string
@@ -23,6 +23,7 @@ interface SessionState {
     name: string
     status: 'running' | 'done' | 'failed'
     result?: string
+    diff?: ToolDiffPayload
   }>
   planSteps: Array<{
     index: number
@@ -67,7 +68,7 @@ interface SessionState {
   appendStreamingReasoning: (delta: string) => void
   resetStreaming: () => void
   addToolEvent: (name: string) => void
-  updateToolEvent: (name: string, result: string) => void
+  updateToolEvent: (name: string, result: string, diff?: ToolDiffPayload) => void
   updatePlanStep: (step: Partial<SessionState['planSteps'][0]> & { index: number }) => void
   resetToolEvents: () => void
 }
@@ -130,10 +131,10 @@ export const useSessionStore = create<SessionState>((set) => ({
   addToolEvent: (name) => set((s) => ({
     toolEvents: [...s.toolEvents, { name, status: 'running' }],
   })),
-  updateToolEvent: (name, result) => set((s) => ({
+  updateToolEvent: (name, result, diff) => set((s) => ({
     toolEvents: s.toolEvents.map((e) =>
       e.name === name && e.status === 'running'
-        ? { ...e, status: /^(Error:|Invalid JSON|Command timed out)/i.test(result) ? 'failed' : 'done', result }
+        ? { ...e, status: /^(Error:|Invalid JSON|Command timed out)/i.test(result) ? 'failed' : 'done', result, diff }
         : e
     ),
   })),
