@@ -16,6 +16,7 @@ interface ToolChipProps {
 
 export function ToolChip({ name, status, result }: ToolChipProps) {
   const [expanded, setExpanded] = useState(false)
+  const visibleResult = name === 'repository_read' ? repositorySummary(result) : result
 
   return (
     <div className="w-full">
@@ -49,11 +50,11 @@ export function ToolChip({ name, status, result }: ToolChipProps) {
         </span>
 
         {/* Chip — truncated mono text */}
-        {result && (
+        {visibleResult && (
           <span
             className="inline-flex h-5 min-w-0 flex-1 cursor-pointer items-center truncate rounded bg-zinc-100 dark:bg-zinc-800/60 px-1.5 font-mono text-[11px] text-zinc-500 dark:text-zinc-400 shadow-sm transition-colors duration-100 hover:bg-zinc-200 dark:hover:bg-zinc-800"
           >
-            {result.slice(0, 80)}
+            {visibleResult.slice(0, 80)}
           </span>
         )}
       </button>
@@ -69,7 +70,7 @@ export function ToolChip({ name, status, result }: ToolChipProps) {
       >
         <div className="min-h-0 overflow-hidden">
           <div className="mt-0.5 mb-1 ml-2 flex flex-col gap-0.5 border-l border-zinc-200 dark:border-zinc-800 py-0.5 pl-3.5">
-            {result && result.split('\n').slice(0, 10).map((line, i) => (
+            {visibleResult && visibleResult.split('\n').slice(0, 10).map((line, i) => (
               <span
                 key={i}
                 className={cn(
@@ -87,4 +88,23 @@ export function ToolChip({ name, status, result }: ToolChipProps) {
       </div>
     </div>
   )
+}
+
+function repositorySummary(result?: string) {
+  if (!result) return result
+  try {
+    const payload = JSON.parse(result) as Record<string, unknown>
+    if (typeof payload.error === 'string') return payload.error
+    const files = typeof payload.files === 'number' ? `${payload.files} files` : 'repository context'
+    const bytes = typeof payload.bytes === 'number' ? ` · ${formatBytes(payload.bytes)}` : ''
+    return `Loaded ${files}${bytes}`
+  } catch {
+    return 'Repository context loaded'
+  }
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }

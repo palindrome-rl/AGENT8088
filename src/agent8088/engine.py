@@ -7721,6 +7721,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         raw_path = _tool_path(spec, args)
         if not raw_path:
             return _tool_arg_missing_error(name, spec.get("path_arg", "filename"))
+        if isinstance(raw_path, str) and re.match(r"^(?:[a-z][a-z0-9+.-]*:)?//", raw_path, re.IGNORECASE):
+            return efficiency.tool_error(
+                "invalid_input",
+                "read_text accepts local file paths, not web URLs.",
+                "Use browse_page with this URL in its required 'url' argument.",
+                recoverable=True,
+            )
         try:
             read_target = resolve_user_path(raw_path)
         except ValueError as exc:
