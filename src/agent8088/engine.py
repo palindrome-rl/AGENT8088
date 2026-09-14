@@ -7694,15 +7694,23 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 if not check_permission("shell", host=True, approval_key=approval_key):
                     return request_escalation(target_mode="edit", paths=[source],
                         change_type="network", reason="Repository ingestion needs a temporary GitHub checkout.")
-                context = repository_access.checkout(source, str(args.get("revision") or ""), check_repository)
+                selection = str(args.get("include") or (args.get("path") if '/' in str(args.get("path") or '') else '') or "")
+                context = repository_access.checkout(source, str(args.get("revision") or ""), check_repository,
+                    selection=selection)
             else:
                 context = nullcontext(resolve_user_path(source))
             progress = _document_progress("Reading repository…") if _document_progress else nullcontext()
             with progress, context as root:
                 if not permitted_repository(root):
                     return "Error: Repository source is protected or outside this attachment session."
-                return repository_access.inspect(root, args, permitted=permitted_repository,
+                result = repository_access.inspect(root, args, permitted=permitted_repository,
                     redact=lambda text: _redact_secrets(_strip_special_tokens(text)), check=check_repository)
+                if remote:
+                    payload = json.loads(result)
+                    payload['retrieval_scope'] = selection or 'root-level files only'
+                    payload['retrieval_note'] = 'Sparse checkout, not the entire repository. Use include to select a directory/glob or path to read a specific file. Keep include unchanged when using snapshot_id.'
+                    result = json.dumps(payload)
+                return result
         except (OSError, ValueError) as exc:
             return efficiency.tool_error("repository_read_failed", str(exc),
                 "Check source, filters, dependency installation and permissions; retry overview after changes.", recoverable=True)

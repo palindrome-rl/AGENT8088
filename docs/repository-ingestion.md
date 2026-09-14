@@ -39,12 +39,19 @@ non-UTF-8, oversized and very deep paths are omitted with counts. Limits are
 Scans have a 20-second deadline.
 
 Remote acquisition is separately permission-gated and restricted to GitHub HTTPS.
-It uses a temporary shallow clone, no submodules, disabled hooks, noninteractive
+It uses a temporary blob-filtered shallow clone and sparse checkout, no submodules, disabled hooks, noninteractive
 authentication and a 60-second deadline. Existing `gh` credentials can be used;
 never put credentials in a URL. Disk growth is checked periodically against
 128 MiB, not enforced by a filesystem quota. Each remote call reacquires the
 checkout; temporary checkouts are removed afterward. Narrow local checkouts are
 preferable for repeated exploration of large repositories.
+
+Remote retrieval defaults to root-level files (including README), not the whole
+repository. Large nested assets are not downloaded. Use `include=docs/**` for a
+subtree or `path=docs/example.md` for a nested file. Results state retrieval scope;
+keep the same include filter when continuing with a snapshot ID. Broad explicit
+selections can still hit the disk limit. This is a safety bound, not a retryable
+network error: narrow the requested selection instead of repeating it unchanged.
 
 Overview formatting is cached in memory for up to 16 content identities. Files
 are rescanned on each call to detect edits and reapply protection. This deliberately

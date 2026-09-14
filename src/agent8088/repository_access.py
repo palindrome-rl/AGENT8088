@@ -82,9 +82,10 @@ def _digest(files, total, check):
 
 
 @contextlib.contextmanager
-def checkout(source, revision='', check=lambda: None):
+def checkout(source, revision='', check=lambda: None, *, selection=''):
     """Disposable, shallow checkout; never runs repository hooks or submodules."""
     source = remote_url(source)
+    patterns = _sparse_patterns(selection)
     if revision and (revision.startswith('-') or not re.fullmatch(r'[A-Za-z0-9_./-]{1,200}', revision)):
         raise ValueError('revision must be a safe branch or tag name')
     with tempfile.TemporaryDirectory(prefix='agent8088-repository-') as folder:
@@ -97,7 +98,8 @@ def checkout(source, revision='', check=lambda: None):
         argv = ['git', '-c', 'core.hooksPath=' + folder, '-c', 'http.followRedirects=false',
                 '-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential',
                 '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always',
-                'clone', '--depth=1', '--single-branch', '--no-recurse-submodules']
+                'clone', '--depth=1', '--single-branch', '--no-recurse-submodules',
+                '--filter=blob:none', '--no-checkout']
         if revision:
             argv += ['--branch', revision]
         argv += [source, str(root)]
@@ -117,12 +119,38 @@ def checkout(source, revision='', check=lambda: None):
                             entries += 1
                             if entries > MAX_ENTRIES:
                                 raise ValueError('Repository checkout exceeds the entry limit; use a smaller repository.')
-                            total += (Path(parent)/name).lstat().st_size
+                            try:
+                                total += (Path(parent)/name).lstat().st_size
+                            except FileNotFoundError:
+                                continue  # Git atomically renames temporary pack files.
                             if total > 128 * 1024 * 1024:
                                 raise ValueError('Repository checkout exceeds the 128 MiB disk limit')
                     time.sleep(.1)
                 if process.returncode:
                     raise ValueError('Clone failed. Check repository URL, branch/tag, network and GitHub access (gh auth status). Authentication cannot prompt here.')
+                # Configure sparsity before the first checkout. A shallow clone
+                # alone still downloads every media blob in the latest revision.
+                sparse = root / '.git' / 'info' / 'sparse-checkout'
+                sparse.parent.mkdir(parents=True, exist_ok=True)
+                sparse.write_text(patterns, encoding='utf-8')
+                prefix = argv[:argv.index('clone')]
+                try:
+                    subprocess.run(prefix + ['-C', str(root), 'config', 'core.sparseCheckout', 'true'],
+                                   env=env, check=True, stdout=output, stderr=output, timeout=5)
+                except subprocess.SubprocessError:
+                    raise ValueError('Could not configure sparse repository retrieval.') from None
+                process = subprocess.Popen(prefix + ['-C',str(root),'checkout','--force','HEAD'],
+                    env=env, stdout=output, stderr=output,
+                    creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                while process.poll() is None:
+                    check()
+                    if time.monotonic()-started > 60:
+                        raise ValueError('Repository retrieval timed out; request a specific file with path or narrow include.')
+                    _checkout_budget(folder)
+                    time.sleep(.1)
+                _checkout_budget(folder)
+                if process.returncode:
+                    raise ValueError('Selected repository files could not be retrieved; check revision, connectivity and GitHub access.')
                 yield root
             finally:
                 if process.poll() is None:
@@ -131,6 +159,28 @@ def checkout(source, revision='', check=lambda: None):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
                     process.kill()
                     process.wait()
+
+
+def _sparse_patterns(selection):
+    if not selection:
+        return '/*\n!/*/\n'
+    if '\n' in selection or '\r' in selection or '\\' in selection or any(p in ('..','') for p in selection.split('/')) or selection.startswith(('!', '#', '/')):
+        raise ValueError('Use a relative repository path or include glob without parent traversal or newlines.')
+    return '/' + selection + '\n'
+
+
+def _checkout_budget(folder):
+    total = entries = 0
+    for parent, dirs, files in os.walk(folder, followlinks=False):
+        dirs[:] = [d for d in dirs if not _linked(Path(parent)/d)]
+        for name in files:
+            entries += 1
+            try:
+                total += (Path(parent)/name).lstat().st_size
+            except FileNotFoundError:
+                continue  # A pack was renamed between enumeration and stat.
+            if entries > MAX_ENTRIES or total > 128*1024*1024:
+                raise ValueError('Selected checkout exceeds the resource limit; request a specific file with path or narrow include (for example README.md).')
 
 
 def inspect(root, args, *, permitted, redact=lambda s:s, check=lambda:None):
