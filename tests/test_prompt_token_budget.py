@@ -60,12 +60,25 @@ def test_fixed_overhead_within_budget():
     failure at 8 turns / 994 tokens against 4 turns / 513 tokens -- i.e. the
     blind path costs far more than the index it replaces. See
     test_hybrid_request_is_the_path_that_actually_ships for the default mode,
-    which is what the 11,000 target was really about.
+    which is what the 11,100 target was really about.
+
+    Ceiling then moved 14,750 -> 15,300, and that number needs two separate
+    explanations because two separate things moved it:
+
+    1. It had ALREADY drifted past 14,750 before this branch existed. The
+       branch point (development @ e416abcc) measures 14,887 -- this assertion
+       was red on a clean checkout, guarding nothing. Raising it re-arms the
+       guard rather than fixing any regression.
+    2. This branch adds three tools (51 total, from 48), taking it to 15,251:
+       their schemas in this worst case, and their names in the tool index.
+
+    Worth re-measuring the 14,887 separately if the earlier drift is ever
+    investigated -- it is not attributable to this work.
     """
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 14_750, f"fixed overhead regressed to {total} tokens"
+    assert total < 15_300, f"fixed overhead regressed to {total} tokens"
 
 
 def test_hybrid_request_is_the_path_that_actually_ships():
@@ -76,6 +89,20 @@ def test_hybrid_request_is_the_path_that_actually_ships():
     budget work set for this phase. Guarding the realistic path matters more
     than guarding the worst case, because this is the number every default
     request actually pays.
+
+    Ceiling then moved 11,000 -> 11,100 to buy three pinned tools: edit_file,
+    run_tests and generate_tests. Measured 11,027 (from 10,663 on the branch
+    point). That is a deliberate purchase of 364 tokens, ~0.25% of the request:
+    an unpinned edit_file can be ranked away by a prompt like "fix the bug in
+    parser.py", after which the model falls back to write_file and overwrites
+    the whole file -- losing every line it did not retype. The schema costs a
+    rounding error; the miss costs the file. generate_tests is named in the
+    turn-end nudge, so it must be exposed for the same reason the
+    mandatory-routing tools are (see the _TOOL_SELECTION_PINNED comment).
+
+    The three descriptions were trimmed hard before this ceiling moved, which
+    bought back ~220 tokens. Trimming further starts removing guidance the
+    model needs to use edit_file correctly at all.
     """
     prompt = E.current_system_prompt(native_tools=True)
     selected = {name: E.TOOL_SPECS[name]
@@ -83,7 +110,7 @@ def test_hybrid_request_is_the_path_that_actually_ships():
                 if name in E.TOOL_SPECS}
     schema = json.dumps(E.build_tools_def(selected))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 11_000, f"hybrid request overhead regressed to {total} tokens"
+    assert total < 11_100, f"hybrid request overhead regressed to {total} tokens"
 
 
 def test_every_tool_name_is_visible_to_native_providers():
