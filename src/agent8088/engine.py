@@ -2974,6 +2974,7 @@ _TASK_SKILL_RULES = (
     ("shipping-and-launch", r"\b(?:ship|release|launch|rollout)\b"),
     ("api-and-interface-design", r"\b(?:api|endpoint|interface|contract)\b"),
     ("frontend-ui-engineering", r"\b(?:frontend|ui|ux|component|accessibility)\b"),
+    ("archify", r"\b(?:architecture|workflow|sequence|data[- ]flow|lifecycle|state)\s+diagram(?:s|ming)?\b"),
     ("browsing", r"\b(?:browse|browser|website|web page)\b"),
     ("cli-anything", r"\b(?:cli-anything|harness)\b"),
     ("delegation-and-audit", r"\b(?:subagent|delegate|parallelize)\b"),
