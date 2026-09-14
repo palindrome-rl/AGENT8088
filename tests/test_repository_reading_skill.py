@@ -3,6 +3,7 @@ def test_repository_reading_skill_is_progressive_and_requires_the_tool(engine):
     assert skill["progressive"] is True
     assert skill["requires_tools"] == {"repository_read"}
     assert "overview" in engine.read_skill_resource("repository-reading", "SKILL.md")
+    assert "repository-reading" in engine.current_system_prompt(native_tools=True)
 
 
 def test_repository_reading_skill_activates_for_github_investigation(engine):
