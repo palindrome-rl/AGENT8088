@@ -85,3 +85,29 @@ def test_remote_plan_mode_never_clones(monkeypatch):
     monkeypatch.setattr(r, 'checkout', forbidden)
     result = engine.run_tool('repository_read', {'source':'https://github.com/octocat/Hello-World'})
     assert 'plan' in result.lower()
+
+
+@pytest.mark.parametrize('pattern', ['notes.md', '**/notes.md', 'vault/notes.md'])
+def test_an_include_naming_a_protected_file_cannot_restore_it(tmp_path, pattern):
+    """The filter selects among permitted files; it never widens permission.
+
+    GitIngest's own include patterns take precedence over its excludes, so the
+    ordering here is load-bearing: `permitted()` runs during the walk, before
+    the include glob is consulted.
+
+    Deliberately not `.env`: that name is in GitIngest's DEFAULT_IGNORE_PATTERNS
+    and would be withheld even if `permitted()` were bypassed entirely, so a
+    test using it passes whatever the ordering is. `notes.md` is an ordinary
+    name no default rule touches, which makes `permitted()` the only thing
+    standing between the include pattern and the content.
+    """
+    (tmp_path/'vault').mkdir()
+    (tmp_path/'notes.md').write_text('SECRET=hidden', encoding='utf-8')
+    (tmp_path/'vault'/'notes.md').write_text('SECRET=hidden', encoding='utf-8')
+    (tmp_path/'main.py').write_text('one', encoding='utf-8')
+
+    result = json.loads(r.inspect(tmp_path, {'include': pattern},
+                                  permitted=lambda p: p.name != 'notes.md'))
+
+    assert result['paths'] == []
+    assert 'SECRET=hidden' not in json.dumps(result)
