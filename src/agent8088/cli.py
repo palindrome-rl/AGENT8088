@@ -202,6 +202,7 @@ class _SubStatusLine:
 # ---------------------------------------------------------------------------
 # Load the real Agent8088 engine
 # ---------------------------------------------------------------------------
+from agent8088 import diffview
 from agent8088 import engine as A
 from agent8088 import fusion
 from agent8088 import searxng_provision
@@ -868,7 +869,15 @@ _NO_HIGHLIGHT = {"", "none", "off", "no", "0", "plain"}
 _DIFF_ADD = "#3fb950"
 _DIFF_DEL = "#f85149"
 
-_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# Diff parsing itself lives in diffview, shared with the web server so both
+# front ends read one implementation. The private aliases keep every call
+# site in this module unchanged.
+_HUNK_RE = diffview.HUNK_RE
+_diff_path = diffview.diff_path
+_diff_counts = diffview.diff_counts
+
+_SEARCH_RESULT_ITEM_RE = re.compile(r"^\d+\. ", re.MULTILINE)
+_SEARCH_PROVIDER_RE = re.compile(r"\(via (\w+)\)|No results from (\w+)")
 _TAB_WIDTH = 4
 _DEFAULT_THEME = "monokai"
 
@@ -993,48 +1002,6 @@ def _numbered_lines(text, limit=None, path=""):
     return body, total
 
 
-def _parse_hunks(diff_lines):
-    """A unified diff regrouped into hunks of (marker, old_no, new_no, code) rows.
-
-    Two jobs beyond grouping. It tracks each side's line number so the gutter can
-    show where in the file the change actually landed. And it strips the trailing
-    newline difflib leaves on every body line (`keepends=True`) — appending
-    another one is what made every diff the CLI ever printed come out
-    double-spaced, at half the content per screen.
-    """
-    hunks = []
-    old_no = new_no = 0
-    for raw in diff_lines:
-        line = str(raw).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
-        header = _HUNK_RE.match(line)
-        if header:
-            old_no, new_no = int(header.group(1)), int(header.group(3))
-            hunks.append({
-                "old_count": int(header.group(2)) if header.group(2) else 1,
-                "rows": [],
-            })
-            continue
-        # Everything before the first hunk is preamble. Recognising '--- '/'+++ '
-        # by shape anywhere would swallow real content: deleting a line that opens
-        # with '-- ' — an SQL or Haskell comment — produces exactly '--- ...'.
-        if not hunks:
-            continue
-        prefixed = line[:1] in ("+", "-", " ")
-        marker = line[0] if prefixed else " "
-        code = (line[1:] if prefixed else line).expandtabs(_TAB_WIDTH)
-        rows = hunks[-1]["rows"]
-        if marker == "+":
-            rows.append(("+", None, new_no, code))
-            new_no += 1
-        elif marker == "-":
-            rows.append(("-", old_no, None, code))
-            old_no += 1
-        else:
-            rows.append((" ", old_no, new_no, code))
-            old_no += 1
-            new_no += 1
-    return hunks
-
 
 def _styled_rows(rows, path):
     """`rows` paired with a highlighted Text each, lexing the two sides separately.
@@ -1062,7 +1029,7 @@ def _diff_block(diff_lines, limit=None, path=""):
     header has not already said — so it renders as a plain listing of the file
     instead, and the '+' column is saved for edits, where it carries information.
     """
-    hunks = _parse_hunks(diff_lines)
+    hunks = diffview.parse_hunks(diff_lines, _TAB_WIDTH)
     if not hunks:
         return Text()
 
@@ -1108,40 +1075,6 @@ def _diff_block(diff_lines, limit=None, path=""):
     return body
 
 
-def _diff_path(diff_lines):
-    """The file a diff is against, taken from its own '+++' header.
-
-    Only the preamble is searched, for the same reason _parse_hunks stops looking
-    there: an added line reading '++ tally' arrives as '+++ tally'.
-    """
-    for line in diff_lines:
-        text = str(line)
-        if _HUNK_RE.match(text):
-            break
-        if text.startswith("+++ "):
-            return text[4:].strip()
-    return ""
-
-
-def _diff_counts(diff_lines):
-    """(added, removed) — the shape of a change, readable before the change itself."""
-    added = removed = 0
-    in_hunk = False
-    for raw in diff_lines:
-        line = str(raw)
-        if _HUNK_RE.match(line):
-            in_hunk = True
-        elif not in_hunk:
-            continue  # preamble: '--- old' / '+++ new' are not changed lines
-        elif line.startswith("+"):
-            added += 1
-        elif line.startswith("-"):
-            removed += 1
-    return added, removed
-
-
-_SEARCH_RESULT_ITEM_RE = re.compile(r"^\d+\. ", re.MULTILINE)
-_SEARCH_PROVIDER_RE = re.compile(r"\(via (\w+)\)|No results from (\w+)")
 
 
 def on_result(name, result):
