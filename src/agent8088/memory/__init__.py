@@ -46,9 +46,14 @@ def parse_memory_engine_config(config=None):
     if engine_name not in {"native", "mem0"}:
         engine_name = "native"
 
+    # Default follows AGENT8088_HOME so an isolated home (installer -Agent8088Home,
+    # tests, parallel agents) keeps mem0's vectors next to the rest of its data.
+    # An explicit memory_mem0_dir always wins, same precedence as memory_db_path.
+    default_mem0_dir = os.path.join(
+        os.environ.get("AGENT8088_HOME", os.path.expanduser("~/.agent8088")), "mem0")
     mem0_cfg = {
         "vector_store": str(config.get("memory_mem0_vector_store", "qdrant")).strip().lower(),
-        "path": os.path.expanduser(str(config.get("memory_mem0_dir", "~/.agent8088/mem0")).strip()),
+        "path": os.path.expanduser(str(config.get("memory_mem0_dir", default_mem0_dir)).strip()),
         "llm_provider": str(config.get("memory_mem0_llm_provider") or config.get("provider") or "").strip().lower(),
         "llm_model": str(config.get("memory_mem0_llm_model") or config.get("model") or "").strip(),
         "embed_provider": str(config.get("memory_mem0_embed_provider") or config.get("memory_embed_provider") or "").strip().lower(),

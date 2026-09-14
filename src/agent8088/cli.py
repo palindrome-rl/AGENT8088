@@ -3321,6 +3321,60 @@ def _endpoint_probe(endpoint):
         return f"unreachable ({exc})"
 
 
+def _install_mem0_extra():
+    """Install the mem0 optional dependencies into this interpreter.
+
+    Same pip-then-uv fallback as _reinstall_package: a uv venv built without
+    --seed has no pip module, and install.sh populates those venvs via
+    `uv pip install --python` -- so fall back to exactly that command.
+    """
+    packages = "mem0ai>=0.1.40 fastembed>=0.3.0"
+    pip_result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", *packages.split()],
+        capture_output=True, text=True, timeout=600,
+    )
+    if pip_result.returncode == 0:
+        return True, "installed"
+
+    stderr = pip_result.stderr or ""
+    uv = shutil.which("uv")
+    if uv and ("No module named pip" in stderr or pip_result.returncode != 0):
+        uv_result = subprocess.run(
+            [uv, "pip", "install", "--python", sys.executable, *packages.split()],
+            capture_output=True, text=True, timeout=600,
+        )
+        if uv_result.returncode == 0:
+            return True, "installed"
+        stderr = uv_result.stderr or uv_result.stdout or "unknown uv error"
+    return False, (stderr or pip_result.stdout or "unknown pip error")[-300:]
+
+
+def run_memory_setup():
+    """`agent8088 --memory-setup`: add the mem0 engine to an existing install.
+
+    Mirrors --sandbox-setup: one command, installs the missing optional
+    backend, then records the engine choice so the user does not have to
+    find /memory engine afterwards. Config is only flipped after the deps
+    import cleanly -- a failed install must not point config at Qdrant.
+    """
+    print("Installing the mem0 memory backend (mem0ai, fastembed, qdrant)...")
+    ok, detail = _install_mem0_extra()
+    if not ok:
+        print(f"Installation failed: {detail}")
+        print("You can retry, or use the installer: install.ps1 -WithMem0"
+              " / install.sh --memory mem0")
+        return 1
+    from agent8088.memory.mem0_store import _import_mem0
+    if _import_mem0() is None:
+        print("Dependencies installed but mem0 could not be imported.")
+        print("Try rerunning, or: uv pip install -e \".[mem0]\"")
+        return 1
+    A.update_simple_config(A.CONFIG_PATH, {"memory_engine": "mem0"})
+    print("mem0 memory backend installed; memory_engine=mem0 set in config.")
+    print("Switch back any time with: agent8088 -> /memory engine native")
+    return 0
+
+
 def _reinstall_package(package: str) -> tuple[bool, str]:
     """Force-reinstall `package` into the interpreter currently running this
     process. Tries pip first -- it works whether the venv is stdlib-created or a
@@ -4758,7 +4812,13 @@ def _show_memory_status():
     table.add_row("Scope", report["user_id"]
                   + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
     if engine_name == "mem0":
-        table.add_row("Vector DB", "qdrant (~/.agent8088/mem0)")
+        # The configured dir, not a hardcoded one: an AGENT8088_HOME override or a
+        # custom memory_mem0_dir moves this, and pointing the user at the wrong
+        # location on a "where did my memories go" question sends them hunting.
+        active_store = A.memory.store()
+        mem0_where = (f"{active_store.vector_store_type} ({active_store.path})"
+                      if active_store is not None else "qdrant")
+        table.add_row("Vector DB", mem0_where)
         table.add_row("Embedder", _describe_embedder(report.get("embedder_info")))
     else:
         where = report.get("embed_provider") or "active provider"
@@ -4905,7 +4965,11 @@ def cmd_memory(rest):
                           f"[dim]— {report['count']} memories, embedder "
                           f"{_describe_embedder(report.get('embedder_info')) if live == 'mem0' else report['embed_model']}[/dim]")
         # Switching never migrates or deletes; say so, or it reads like data loss.
-        kept = "~/.agent8088/mem0" if live == "native" else A.MEMORY_DB_PATH
+        # mem0's dir comes from runtime config (honors AGENT8088_HOME), not a
+        # hardcoded home -- same reason Vector DB above must not lie.
+        mem0_dir = (A.memory.parse_memory_engine_config(A.APP_CONFIG)[1]["path"]
+                     if hasattr(A.memory, "parse_memory_engine_config") else "~/.agent8088/mem0")
+        kept = mem0_dir if live == "native" else A.MEMORY_DB_PATH
         console.print(f"[dim]The {'mem0' if live == 'native' else 'native'} store is "
                       f"untouched at {kept} — switch back any time.[/dim]")
         return
@@ -7569,6 +7633,8 @@ def main():
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
+    parser.add_argument("--memory-setup", action="store_true",
+                        help="install the mem0 memory backend and make it the default engine")
     parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp/Discord/Email/Telegram) instead of the REPL")
     parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp/Discord/Email/Telegram messaging gateways, then exit")
     parser.add_argument("--web", action="store_true",
@@ -7634,6 +7700,8 @@ def main():
     if args.sandbox_setup:
         print(A.install_native_sandbox())
         return 0 if A.native_sandbox_verified() else 1
+    if args.memory_setup:
+        return run_memory_setup()
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.

@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 
 import pytest
 
@@ -130,3 +131,63 @@ def test_engine_switch_leaves_both_stores_on_disk(tmp_path):
 
     assert native_db.read_text() == "sqlite"
     assert (mem0_dir / "collection").read_text() == "qdrant"
+
+
+# --- agent8088 --memory-setup: install the mem0 backend post-install ---
+
+
+def test_memory_setup_installs_extra_and_sets_engine(capsys):
+    """--memory-setup pip-installs .[mem0], then sets memory_engine=mem0."""
+    from agent8088 import cli
+    with patch("agent8088.cli._install_mem0_extra", return_value=(True, "ok")) as inst, \
+         patch("agent8088.memory.mem0_store._import_mem0",
+               return_value=object()) as imp, \
+         patch("agent8088.engine.update_simple_config") as write:
+        rc = cli.run_memory_setup()
+    assert rc == 0
+    inst.assert_called_once()
+    imp.assert_called_once()
+    write.assert_called_once()
+    assert write.call_args[0][1] == {"memory_engine": "mem0"}
+    out = capsys.readouterr().out.lower()
+    assert "mem0" in out
+
+
+def test_memory_setup_import_failure_leaves_config_untouched(capsys):
+    """Deps claim to install but mem0 still won't import: config must stay
+    on native -- flipping it would point the user at Qdrant that cannot start."""
+    from agent8088 import cli
+    with patch("agent8088.cli._install_mem0_extra", return_value=(True, "ok")), \
+         patch("agent8088.memory.mem0_store._import_mem0",
+               return_value=None) as imp, \
+         patch("agent8088.engine.update_simple_config") as write:
+        rc = cli.run_memory_setup()
+    assert rc == 1
+    imp.assert_called_once()
+    write.assert_not_called()
+    out = capsys.readouterr().out.lower()
+    assert "could not be imported" in out
+
+
+def test_memory_setup_failure_leaves_config_untouched(capsys):
+    """A failed install must not flip memory_engine -- that would point the
+    user at Qdrant while the deps are still missing."""
+    from agent8088 import cli
+    with patch("agent8088.cli._install_mem0_extra",
+                return_value=(False, "pip exploded")) as inst, \
+         patch("agent8088.engine.update_simple_config") as write:
+        rc = cli.run_memory_setup()
+    assert rc == 1
+    inst.assert_called_once()
+    write.assert_not_called()
+    out = capsys.readouterr().out.lower()
+    assert "pip exploded" in out
+
+
+def test_cli_exposes_memory_setup_flag():
+    """The flag must exist in argparse, mirroring --sandbox-setup."""
+    import agent8088.cli as cli_mod
+    src = (Path(cli_mod.__file__).read_text(encoding="utf-8"))
+    assert '"--memory-setup"' in src
+    assert "args.memory_setup" in src
+    assert "run_memory_setup" in src

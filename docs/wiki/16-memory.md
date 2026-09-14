@@ -6,7 +6,9 @@ Agent8088 remembers durable facts across sessions. Close the terminal, come back
 next week, ask from Slack instead — it still knows your project uses `uv`, that
 this repo has no CI, and that you want tests that would fail if the logic broke.
 
-On by default. One SQLite file, no new dependencies, nothing leaves your machine.
+On by default, using the built-in **native** engine: one SQLite file, no new
+dependencies, nothing leaves your machine. An optional **mem0** engine (Mem0 +
+embedded Qdrant, see below) can replace it — same commands, different store.
 
 ## Two habits
 
@@ -143,6 +145,8 @@ silently captures nothing.
 
 ```
 /memory                     status: count, embedder, store size, last call's cost
+/memory engine              show the active memory engine and the switch command
+/memory engine native|mem0  switch the live memory engine; persists, never migrates
 /memory search <query>      run the search and show each leg's rank
 /memory add <text>          store a fact by hand
 /memory forget <id>         delete one (the short id from /memory search works)
@@ -301,7 +305,7 @@ Full reference in [Configuration](02-configuration.md). The keys:
 | `memory` | `1` | Master switch |
 | `memory_engine` | `native` | Memory backend: `native` (built-in SQLite) or `mem0` |
 | `memory_mem0_vector_store` | `qdrant` | Vector store for Mem0 (embedded local Qdrant) |
-| `memory_mem0_dir` | `~/.agent8088/mem0` | Storage directory for Mem0 |
+| `memory_mem0_dir` | `<AGENT8088_HOME>/mem0` | Storage directory for Mem0 (was `~/.agent8088/mem0` regardless of `AGENT8088_HOME`) |
 | `memory_db_path` | `~/.agent8088/memory.db` | Native SQLite store location |
 | `memory_user_id` | `owner` | Whose memories these are |
 | `memory_scope_by_identity` | `0` | Separate namespace per gateway identity |
@@ -316,17 +320,53 @@ Full reference in [Configuration](02-configuration.md). The keys:
 
 ### Mem0 Engine (Optional)
 
-To enable the [Mem0](https://github.com/mem0ai/mem0) backend with automatic entity-relationship tracking and contradiction resolution:
+Two interchangeable engines sit behind the same `/memory` commands:
 
-1. Install the extra:
-   ```sh
-   pip install -e ".[mem0]"
-   ```
-2. In `config.txt`, set:
-   ```ini
-   memory_engine = mem0
-   ```
-3. Mem0 telemetry is disabled by default (`MEM0_TELEMETRY=false`), and data is stored locally in `~/.agent8088/mem0/`. If `mem0ai` is not installed or unavailable, Agent8088 falls back gracefully to the native engine without breaking active turns.
+- **native** *(default)* — the built-in SQLite store described above: BM25 + vector
+  RRF, one file at `memory_db_path`, zero extra dependencies.
+- **mem0** — the [Mem0](https://github.com/mem0ai/mem0) library with an embedded
+  local Qdrant vector store, LLM-driven fact extraction, entity-relationship
+  tracking and contradiction resolution. Adds ~200 MB of dependencies plus a
+  local embedding model (`fastembed`, 384 dims by default).
+
+**When to pick which:** native is the right default — it is dependency-free,
+offline, and its hybrid retrieval is tuned for one-line facts. Reach for mem0
+when you want its automatic entity graph and update/contradiction handling, and
+do not mind the extra disk and a heavier per-fact pipeline.
+
+**Installing mem0:**
+
+```sh
+# any of these installs the backend and sets memory_engine=mem0:
+install.ps1 -WithMem0            # Windows installer flag
+install.sh --memory mem0         # Linux/macOS installer flag
+AGENT8088_INSTALL_MEM0=mem0 ./install.sh   # or the env var, on either installer
+agent8088 --memory-setup         # add it to an existing install, post-install
+uv pip install -e ".[mem0]"      # deps only; then set memory_engine=mem0 yourself
+```
+
+Without any of these, the installer prompts interactively:
+`Which memory backend? [native/mem0]`.
+
+**Switching live:** `/memory engine mem0` or `/memory engine native`, in the REPL.
+The choice persists to `config.txt` and takes effect immediately (or on the next
+`/memory on` if memory is currently off). Switching never migrates, merges or
+deletes anything — each engine keeps its own store on disk:
+
+| Engine | Store |
+|---|---|
+| native | `memory_db_path` (default `~/.agent8088/memory.db`) |
+| mem0 | `memory_mem0_dir` (default `<AGENT8088_HOME>/mem0`) — embedded local Qdrant |
+
+A fact learned under one engine is invisible to the other until you switch back.
+`/memory` always reports which engine is live and where its store lives — if the
+mem0 library is missing or cannot start (e.g. another process holds the Qdrant
+folder lock), it says so and falls back to native for the turn rather than
+failing.
+
+**Notes:** Mem0 telemetry is disabled unconditionally (`MEM0_TELEMETRY=false`);
+nothing leaves the machine. If `mem0ai` is not installed, Agent8088 falls back
+gracefully to the native engine without breaking active turns.
 
 ## Not included
 
