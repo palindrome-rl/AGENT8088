@@ -2635,6 +2635,23 @@ _TOOL_SELECTION_PINNED = frozenset({
     "web_search", "browse_page", "convert_document", "create_document",
 })
 _TOOL_INDEX_CACHE = {}
+_TOOL_SEARCH_DEFAULT_LIMIT = 8
+_TOOL_SEARCH_MAX_LIMIT = 12
+_TOOL_SEARCH_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "search_tools",
+        "description": "Find deferred tools and load their schemas for the next turn.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Capability or tool family to find."},
+                "limit": {"type": "integer", "description": "Maximum schemas to load (1-12)."},
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 
 def set_tool_selection(mode: str) -> str:
@@ -2761,6 +2778,40 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
             scores[index] += 1 / (60 + position)
     picked = {names[index] for index, _ in scores.most_common(TOOL_SELECTION_TOP_K)}
     return (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+
+
+def _search_tool_names(query: str, allowed: set[str], limit: object = _TOOL_SEARCH_DEFAULT_LIMIT) -> list[str]:
+    """Rank catalog metadata for model-initiated schema loading.
+
+    Discovery is advisory: callers still intersect results with the immutable
+    run allowlist before exposing a schema. Unlike initial selection, a missing
+    embedder falls back to BM25 instead of exposing the whole catalog.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _TOOL_SEARCH_DEFAULT_LIMIT
+    limit = min(max(1, limit), _TOOL_SEARCH_MAX_LIMIT)
+    names, texts, vectors = _tool_selection_index(set(allowed))
+    lexical = _bm25_tool_ranking(query, texts)
+    semantic = []
+    try:
+        embedder = memory.embedder()
+        vector = embedder.embed_one(query) if embedder and len(vectors) == len(names) else []
+        semantic = [index for index in sorted(
+            range(len(names)), key=lambda i: _cosine(vector, vectors[i]), reverse=True)
+            if _cosine(vector, vectors[index]) > 0]
+    except Exception as exc:  # noqa: BLE001 - optional ranking signal
+        _log.debug("tool discovery embeddings unavailable: %s", exc)
+    if lexical and semantic:
+        scores = Counter()
+        for ranking in (lexical, semantic):
+            for position, index in enumerate(ranking, 1):
+                scores[index] += 1 / (60 + position)
+        ranking = [index for index, _ in scores.most_common()]
+    else:
+        ranking = lexical or semantic
+    return [names[index] for index in ranking[:limit]]
 
 
 def build_tools_def(tool_specs: dict) -> list:
@@ -2954,8 +3005,10 @@ def render_tool_name_index(specs: dict) -> str:
     lines = [
         "",
         "## Tool index",
-        "All of these exist and are callable. For one you were given no schema "
-        "for, call describe_tool(tool_name) to load its parameters, then call it.",
+        "All of these tools exist. Call a tool only after its schema is loaded and "
+        "permission allows it. If search_tools is available, use it "
+        "to load a family or capability; for one exact known name, call "
+        "describe_tool(tool_name). Then call the loaded tool using its schema.",
     ]
     labels = {"cli_anything": "CLI Anything", "general": "General"}
     for head, names in sorted(families.items()):
@@ -10110,22 +10163,47 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     # tool knowledge.
     configured_tools = kwargs.get("allowed_tools", TOOL_NAMES)
     available_tools = set(configured_tools() if callable(configured_tools) else configured_tools)
+    configured_defs = kwargs.get("tools_def", TOOLS_DEF)
     selection_identity = f"{kwargs.get('provider_name') or ACTIVE_PROVIDER}:{kwargs.get('model_name') or MODEL_NAME}"
     selection_requested = (TOOL_SELECTION == "hybrid" or
                            (TOOL_SELECTION == "auto" and
                             selection_identity in TOOL_SELECTION_MODELS))
     if goal and selection_requested:
-        configured_defs = kwargs.get("tools_def", TOOLS_DEF)
         probe_defs = configured_defs() if callable(configured_defs) else configured_defs
         if not _native_tools_enabled(probe_defs, kwargs.get("provider_name", "")):
             probe_defs = []
     else:
         probe_defs = []
     if probe_defs:
-        kwargs["allowed_tools"] = select_tool_names_for_request(
+        loaded_tools = select_tool_names_for_request(
             goal, available_tools, provider=kwargs.get("provider_name") or ACTIVE_PROVIDER,
             model=kwargs.get("model_name") or MODEL_NAME,
         )
+        loaded_tools |= _TOOL_SELECTION_PINNED & available_tools
+
+        def loaded_definitions():
+            definitions = configured_defs() if callable(configured_defs) else configured_defs
+            return _filter_tool_definitions(definitions, loaded_tools) + [_TOOL_SEARCH_DEFINITION]
+
+        def loaded_names():
+            return set(loaded_tools) | {"search_tools"}
+
+        def load_tools(names):
+            new = (set(names) & available_tools) - loaded_tools
+            loaded_tools.update(new)
+            return sorted(new)
+
+        def search_tools(query, limit):
+            return load_tools(_search_tool_names(query, available_tools - loaded_tools, limit))
+
+        kwargs["tools_def"] = loaded_definitions
+        kwargs["allowed_tools"] = loaded_names
+        kwargs["tool_loader"] = load_tools
+        kwargs["tool_searcher"] = search_tools
+        if isinstance(kwargs.get("trace"), list):
+            kwargs["trace"].append({"turn": 0, "type": "tool_exposure",
+                                    "initial": sorted(loaded_tools),
+                                    "schema_count": len(loaded_tools) + 1})
 
     def trajectory_changed():
         if on_trajectory_state is None:
@@ -10722,7 +10800,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
                     depth=0, budget=None, client=None, provider_name=None,
                     model_name=None, dynamic_turns=True, trajectory=None,
-                    on_trajectory_state=None):
+                    on_trajectory_state=None, tool_loader=None, tool_searcher=None):
     global _last_auto_rung
     """Drive the model until it gives a final answer or hits max_turns.
 
@@ -11072,6 +11150,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     return answer
                 messages.append({"role": "user", "content": _plan_mode_block_message()})
                 continue
+            loaded = tool_loader(_resolve_tool_name(name) for name in attempted) if tool_loader else []
+            if loaded:
+                result = (f"Loaded schemas for: {', '.join(loaded)}. Your previous arguments were "
+                          "discarded; call the tool again using its schema.")
+                if on_result:
+                    on_result("search_tools", result)
+                messages.append({"role": "user", "content":
+                                 f"{_TOOL_RESULT_PREFIX}search_tools):\n{result}"})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "tool_schema_loaded",
+                                  "names": loaded, "source": "direct_unloaded_call"})
+                continue
             unknown = [n for n in attempted
                        if _resolve_tool_name(n) not in round_allowed_tools]
             if unknown and unknown_retries < 2 and not forcing:
@@ -11151,6 +11241,23 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             name = call["name"]
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
+
+            if name == "search_tools":
+                loaded = (tool_searcher(args.get("query", ""),
+                                        args.get("limit", _TOOL_SEARCH_DEFAULT_LIMIT))
+                          if tool_searcher else [])
+                result = (f"Loaded schemas for: {', '.join(loaded)}."
+                          if loaded else "No matching unloaded tools found.")
+                tool_outputs.append(result)
+                executed = True
+                round_fresh |= bool(loaded)
+                if on_result:
+                    on_result(name, result)
+                if turn_tools is not None:
+                    turn_tools.append({"name": name, "arguments": args,
+                                       "result": result, "loaded": loaded})
+                messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                continue
 
             if searched and _is_fetch_followup(messages, name, args):
                 result = ("Follow-up fetch was not run — the search already "

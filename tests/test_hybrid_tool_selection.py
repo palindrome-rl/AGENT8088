@@ -82,4 +82,4 @@ def test_run_agent_filters_native_schemas_before_first_completion(engine, monkey
         [{"role": "user", "content": "what local models can my machine run?"}],
         max_turns=1, system_prompt="", tools_def=lambda: engine.build_tools_def(specs),
         allowed_tools=set(specs), memory_capture=False) == "done"
-    assert captured == ["check_local_hardware"]
+    assert captured == ["check_local_hardware", "search_tools"]

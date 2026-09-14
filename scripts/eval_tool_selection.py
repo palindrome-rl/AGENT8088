@@ -12,6 +12,7 @@ Needs a working embedder (`ollama pull nomic-embed-text` plus
 the full catalogue and the script reports a meaningless 100%.
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -24,9 +25,10 @@ from tool_selection_golden import GOLDEN  # noqa: E402
 
 
 def score(mode):
-    """Return (recall_hits, recall_total, covered, fell_open, rows)."""
+    """Return initial-schema and name-index coverage for the golden set."""
     allowed = set(E.TOOL_SPECS)
-    hits = total = covered = opened = 0
+    index = E.render_tool_name_index(E.TOOL_SPECS)
+    hits = total = covered = discoverable = opened = schema_chars = 0
     rows = []
     for label, prompt, required in GOLDEN:
         E._TOOL_INDEX_CACHE.clear()
@@ -35,9 +37,13 @@ def score(mode):
         hits += len(required) - len(missing)
         total += len(required)
         covered += not missing
+        discoverable += all(name in index for name in required)
         opened += chosen == allowed
+        schema_chars += len(json.dumps(E.build_tools_def(
+            {name: E.TOOL_SPECS[name] for name in chosen}
+        ), separators=(",", ":")))
         rows.append((label, len(required) - len(missing), len(required), sorted(missing)))
-    return hits, total, covered, opened, rows
+    return hits, total, covered, discoverable, opened, schema_chars // len(GOLDEN), rows
 
 
 def main():
@@ -49,16 +55,18 @@ def main():
         print("WARNING: no embedder configured -- every prompt will fail open "
               "to the full catalogue and these numbers will be meaningless.\n")
 
-    hits, total, covered, opened, rows = score(args.mode)
+    hits, total, covered, discoverable, opened, schema_chars, rows = score(args.mode)
     for label, got, want, missing in rows:
         flag = "OK  " if not missing else "MISS"
         print(f"[{flag}] {label}: {got}/{want}"
               + (f"   MISSING {missing}" if missing else ""))
 
     count = len(GOLDEN)
-    print(f"\nRecall@K  {hits}/{total} = {100 * hits / total:.0f}%")
-    print(f"COMP@K    {covered}/{count} = {100 * covered / count:.0f}%"
-          "   <- predicts task success")
+    print(f"\nInitial Recall@K  {hits}/{total} = {100 * hits / total:.0f}%")
+    print(f"Initial COMP@K    {covered}/{count} = {100 * covered / count:.0f}%")
+    print(f"Discoverability   {discoverable}/{count} = {100 * discoverable / count:.0f}%"
+          "   <- every required name is visible")
+    print(f"Initial schemas   ~{schema_chars // 4} tokens/request")
     print(f"fail-open {opened}/{count}")
 
 
