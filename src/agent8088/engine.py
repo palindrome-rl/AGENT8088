@@ -8383,6 +8383,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "last_output":
         return _exec_last_output(args)
 
+    if mode == "memory":
+        return memory.forget(args.get("query"))
+
     if mode == "plan":
         if not allow_plan:
             return "Error: Nested plan tool execution is not allowed."
@@ -9291,6 +9294,22 @@ def _memory_extract_completion(prompt: str):
     }
 
 
+def _resolve_repo_url() -> str:
+    """The project's origin remote, or "" outside a git repo / with none set.
+
+    Called once at configure time, not per captured memory: the remote cannot
+    change mid-session, so shelling out on every write would be wasted work.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def configure_memory() -> None:
     """Wire the memory package to this engine's config, client and redactor.
 
@@ -9306,6 +9325,7 @@ def configure_memory() -> None:
             redact=_redact_secrets,
             db_path=MEMORY_DB_PATH,
             project=str(PROJECT_ROOT),
+            repo=_resolve_repo_url(),
         )
     except Exception as exc:
         _log.debug("memory configuration skipped: %s", exc)
@@ -9351,7 +9371,7 @@ def _recalled_memory_prompt(messages, system_prompt, identity=None):
 
 
 def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
-                         in_background=False) -> None:
+                         source_channel="", in_background=False) -> None:
     global memory_capture_thread
     """Store what this turn taught, after the answer is already the user's.
 
@@ -9374,7 +9394,8 @@ def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
         return
     try:
         result = memory.capture([_message_text(turns[-1])], answer, identity=identity,
-                               run_id=run_id, in_background=in_background,
+                               run_id=run_id, source_channel=source_channel,
+                               in_background=in_background,
                                on_stored=memory_on_capture)
         memory_capture_thread = result if in_background else None
     except Exception as exc:
@@ -10525,7 +10546,7 @@ _document_usage_lock = threading.Lock()
 
 
 def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
-              memory_background=False, memory_capture=True,
+              memory_source_channel="", memory_background=False, memory_capture=True,
               trajectory_state=None, on_trajectory_state=None, **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
@@ -10660,6 +10681,7 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             if memory_capture:
                 _capture_turn_memory(messages, answer, identity=memory_identity,
                                      run_id=memory_run_id,
+                                     source_channel=memory_source_channel,
                                      in_background=memory_background)
         _active_budget = previous
         _document_progress, _document_interrupt, _document_root = old_document_hooks

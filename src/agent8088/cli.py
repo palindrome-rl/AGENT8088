@@ -1948,6 +1948,7 @@ def do_chat(query):
                 # The session names the run so a fact learned here can be told
                 # apart from one learned in another session.
                 memory_run_id=S.name or None,
+                memory_source_channel="cli",
                 # The REPL has already rendered its answer by the time the
                 # extraction call runs, so it goes on a background thread and the
                 # user never waits for it. The gateway and cron stay synchronous.
