@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections import OrderedDict
 from threading import Lock
+from functools import lru_cache
 
 MAX_FILE = 256 * 1024
 MAX_BYTES = 8 * 1024 * 1024
@@ -23,6 +24,31 @@ PAGE = 6000
 MAX_TREE = 4000
 _DIGESTS = OrderedDict()
 _LOCK = Lock()
+
+
+@lru_cache(maxsize=1)
+def _ignore_patterns():
+    """Load upstream data without importing its global logging setup here.
+
+    GitIngest's package initializer force-reconfigures stdlib logging, removes
+    application handlers, and installs a console sink. Import in a disposable
+    interpreter instead; never try to restore global handlers amid other threads.
+    No repository content is passed to this helper.
+    """
+    code = ('import json; from gitingest.utils.ignore_patterns import DEFAULT_IGNORE_PATTERNS; '
+            'print(json.dumps(sorted(DEFAULT_IGNORE_PATTERNS)))')
+    try:
+        result = subprocess.run([sys.executable, '-c', code], capture_output=True,
+            text=True, encoding='utf-8', timeout=10,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if result.returncode:
+            raise ValueError('Repository support requires gitingest; install agent8088[repository] and restart.')
+        patterns = json.loads(result.stdout)
+        if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+            raise ValueError('Invalid repository ignore-pattern data')
+        return tuple(patterns)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        raise ValueError('Could not load repository ignore patterns; check agent8088[repository] installation.') from exc
 
 
 def _linked(path):
@@ -187,7 +213,6 @@ def inspect(root, args, *, permitted, redact=lambda s:s, check=lambda:None):
     """Build the manifest; GitIngest supplies the curated default ignore patterns."""
     try:
         from pathspec import GitIgnoreSpec
-        from gitingest.utils.ignore_patterns import DEFAULT_IGNORE_PATTERNS
     except ImportError:
         raise ValueError('Repository support requires gitingest; install agent8088[repository] and restart.') from None
     root = Path(root)
@@ -202,7 +227,7 @@ def inspect(root, args, *, permitted, redact=lambda s:s, check=lambda:None):
     files, skipped = {}, {}
     total = count = 0
     started = time.monotonic()
-    defaults = GitIgnoreSpec.from_lines(sorted(DEFAULT_IGNORE_PATTERNS))
+    defaults = GitIgnoreSpec.from_lines(_ignore_patterns())
     # The literal head of the include pattern -- everything before the first
     # wildcard. 'pkg/**' -> 'pkg', 'src/a/b.py' -> 'src/a/b.py', '**/*.go' -> ''.
     include_head = re.split(r'[*?\[]', include, 1)[0].strip('/') if include else ''
