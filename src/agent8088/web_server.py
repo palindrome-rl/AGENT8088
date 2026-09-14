@@ -33,6 +33,30 @@ log = logging.getLogger("agent8088.web")
 _engine = None
 _cli = None
 
+def _result_diff():
+    """The diff the engine just recorded, as a JSON-serializable payload.
+
+    Read here rather than passed in because the engine records it on a module
+    global the same way the CLI renderer reads it -- one source of truth for
+    both front ends.
+    """
+    from agent8088 import diffview
+    from agent8088 import engine as _e
+    return diffview.to_payload(_e._last_write_diff or [])
+
+
+def _tool_result_payload(name: str, result: str) -> dict:
+    payload = {"type": "tool_result", "name": name,
+               "result": scrub_markup(result)[:5000]}
+    try:
+        diff = _result_diff()
+    except Exception:
+        diff = None  # the result event matters more than the diff
+    if diff:
+        payload["diff"] = diff
+    return payload
+
+
 def _eng():
     global _engine
     if _engine is None:
@@ -2104,8 +2128,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
 
     def on_result(name, result):
         asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "tool_result", "name": name,
-                          "result": scrub_markup(result)[:5000]}),
+            ws.send_json(_tool_result_payload(name, result)),
             loop,
         )
 

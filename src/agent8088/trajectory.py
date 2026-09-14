@@ -3,12 +3,53 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import PurePath
 
 
 VERSION = 2
 MAX_OPERATIONS = 12
 MAX_TEXT = 240
 MAX_EVIDENCE = 6
+
+
+MAX_UNTESTED = 8
+
+# Suffixes worth a test. Config, data, docs and markup are excluded because a
+# generated test for them asserts that a file parses, which nobody needed.
+CODE_SUFFIXES = frozenset({
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".java",
+    ".kt", ".cs", ".php", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
+})
+
+
+def _is_test_path(path: str) -> bool:
+    p = PurePath(path)
+    stem = p.stem.lower()
+    return (stem.startswith("test_") or stem.endswith("_test")
+            or ".test" in p.name.lower() or ".spec" in p.name.lower()
+            or any(part.lower() in {"tests", "test", "__tests__", "spec"}
+                   for part in p.parts))
+
+
+def _is_code_path(path: str) -> bool:
+    return PurePath(path).suffix.lower() in CODE_SUFFIXES
+
+
+def _module_key(path: str) -> str:
+    """The stem a test file and its source share.
+
+    'src/parser.py' and 'tests/test_parser.py' both reduce to 'parser', which is
+    how a written test clears the source it covers without needing the test to
+    declare what it tests.
+    """
+    stem = PurePath(path).stem.lower()
+    for prefix in ("test_", "test-"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+    for suffix in ("_test", "-test", ".test", ".spec"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    return stem
 
 
 def _text(value) -> str:
@@ -30,6 +71,8 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "mutation_count": 0,
         "verification": "not_needed",
         "verification_requested": False,
+        "untested_changes": [],
+        "tests_requested": False,
         "consecutive_setbacks": 0,
         "stalled": False,
         "replan_requested": False,
@@ -86,7 +129,8 @@ class TrajectoryState:
         return operation
 
     def after_tool(self, operation: dict, result: str, *, failed: bool,
-                   blocked: bool, mutated: bool, verdict: str = "unknown") -> None:
+                   blocked: bool, mutated: bool, verdict: str = "unknown",
+                   path: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
@@ -116,6 +160,59 @@ class TrajectoryState:
             del self.data["evidence"][:-MAX_EVIDENCE]
         if self.data["consecutive_setbacks"] >= 2:
             self.data["stalled"] = True
+        self._track_tests(operation, path, mutated=mutated)
+
+    def _track_tests(self, operation: dict, path: str, *, mutated: bool) -> None:
+        """Maintain the list of code files changed this run with no test written.
+
+        Only successful writes count. A blocked or failed write changed nothing,
+        and nudging about it would send the model to write tests for code that
+        was never saved.
+        """
+        if operation.get("status") != "done":
+            return
+        untested = self.data["untested_changes"]
+        tool = operation.get("tool", "")
+
+        if tool == "run_tests" and operation.get("verdict") == "passed":
+            untested.clear()
+            self.data["tests_requested"] = False
+            return
+
+        if not path:
+            return
+
+        if tool == "generate_tests":
+            key = _module_key(path)
+            untested[:] = [p for p in untested if _module_key(p) != key]
+            return
+
+        if not mutated or not _is_code_path(path):
+            return
+
+        if _is_test_path(path):
+            key = _module_key(path)
+            untested[:] = [p for p in untested if _module_key(p) != key]
+            return
+
+        if path not in untested:
+            untested.append(path)
+            del untested[:-MAX_UNTESTED]
+            # A new untested change re-arms the one-shot: the previous nudge was
+            # about different files.
+            self.data["tests_requested"] = False
+
+    def untested_paths(self) -> list[str]:
+        return list(self.data.get("untested_changes") or [])
+
+    def needs_tests(self) -> bool:
+        return bool(self.data.get("untested_changes"))
+
+    def request_tests(self) -> bool:
+        if not self.needs_tests() or self.data.get("tests_requested"):
+            return False
+        self.data["tests_requested"] = True
+        return True
 
     def _set_step(self, name: str, status: str) -> None:
         for step in self.data["checklist"]:
@@ -142,6 +239,21 @@ class TrajectoryState:
         return True
 
     def review(self) -> str:
+        """The passive end-of-turn note.
+
+        Additive rather than first-match: an untested change and a pending
+        verification are separate facts, and reporting only the first one hides
+        the other from the user for the rest of the run.
+        """
+        notes = [note for note in (self._progress_review(), self._tests_review()) if note]
+        return " ".join(notes)
+
+    def _tests_review(self) -> str:
+        if not self.needs_tests():
+            return ""
+        return f"Code changed with no tests written: {', '.join(self.untested_paths())}."
+
+    def _progress_review(self) -> str:
         if self.needs_verification():
             return "Changed work has no fresh verification evidence."
         if self.data.get("verification") == "inspected":
@@ -182,4 +294,7 @@ class TrajectoryState:
             lines.append("Progress is stalled. Do not repeat the failed approach; state a short revised next step and use a different safe tool or input.")
         if self.needs_verification():
             lines.append("Verification is pending: do not claim the changed work is verified until you inspect or test it.")
+        if self.needs_tests():
+            lines.append("Changed with no tests yet: " + ", ".join(self.untested_paths())
+                         + ". Call generate_tests for each, or say why tests do not apply.")
         return "\n".join(lines)

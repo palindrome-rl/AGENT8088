@@ -17,8 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088 import (cli_anything, documents, efficiency, local_models,
-                       memory, providers, routing, tool_output, trajectory, web_search)
+from agent8088 import (cli_anything, diffview, documents, efficiency, local_models,
+                       memory, patching, providers, routing, testing_support,
+                       tool_output,
+                       trajectory, web_search)
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -2633,6 +2635,12 @@ _TOOL_SELECTION_ALWAYS = frozenset({"last_output", "describe_tool"})
 _TOOL_SELECTION_PINNED = frozenset({
     "write_file", "read_text", "execute_shell",
     "web_search", "browse_page", "convert_document", "create_document",
+    # Third group, same asymmetry as the first. An edit tool ranked away sends
+    # the model back to write_file, which overwrites the whole file -- a worse
+    # outcome than the one the ranking was saving tokens for. generate_tests is
+    # named in the turn-end nudge, so it must be exposed for the same reason the
+    # mandatory-routing tools are.
+    "edit_file", "run_tests", "generate_tests",
 })
 _TOOL_INDEX_CACHE = {}
 _TOOL_SEARCH_DEFAULT_LIMIT = 8
@@ -4758,6 +4766,74 @@ def write_custom_subagent(args: dict, *, allow_existing: bool = False) -> str:
 def _exec_create_subagent(args: dict) -> str:
     """Write a new custom sub-agent profile to USER_AGENTS_DIR/<name>.md."""
     return write_custom_subagent(args)
+
+
+_AUTOTEST_SOURCE_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".java",
+    ".kt", ".cs", ".php", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
+}
+
+
+def _looks_like_a_test(path: Path) -> bool:
+    stem = path.stem.lower()
+    return (stem.startswith("test_") or stem.endswith("_test")
+            or ".test" in path.name.lower() or ".spec" in path.name.lower()
+            or "tests" in {part.lower() for part in path.parent.parts[-2:]})
+
+
+def _file_fingerprint(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _exec_autotest(args: dict, depth: int = 0) -> str:
+    """Delegate test authoring, then verify the code under test was left alone.
+
+    The integrity check is the point. A sub-agent told to make tests pass has an
+    easy cheat available -- weaken the code until they do -- and a prompt
+    instruction cannot stop it. Hashing the file either side of the run can.
+    """
+    raw = str(args.get("filename") or "").strip()
+    if not raw:
+        return "Error: generate_tests requires 'filename', the source file to be tested."
+    try:
+        source = resolve_write_path(raw)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if not source.is_file():
+        return (f"Error: {source} does not exist, so there is nothing to test. "
+                f"Write the code first, then call generate_tests on it.")
+    if _looks_like_a_test(source):
+        return (f"Error: {source} is already a test file. Pass the source file it "
+                f"tests instead.")
+    if source.suffix.lower() not in _AUTOTEST_SOURCE_SUFFIXES:
+        return (f"Error: {source.suffix or 'that file type'} is not source code that "
+                f"can be unit tested. Pass a source file — one of: "
+                f"{', '.join(sorted(_AUTOTEST_SOURCE_SUFFIXES))}.")
+
+    focus = str(args.get("focus") or "").strip()
+    brief = (f"Write tests for the existing source file {source}.\n"
+             f"Read it first, then read one existing test in this project and match "
+             f"its framework, location and naming. Write the tests, run them with "
+             f"run_tests, and report the test file's path, the number of tests, and "
+             f"whether they pass.\n"
+             f"Do not modify {source} itself under any circumstances.")
+    if focus:
+        brief += f"\nFocus especially on: {focus}"
+
+    before = _file_fingerprint(source)
+    report = _exec_subagent({"agent_type": "test-writer", "task": brief}, depth=depth)
+    after = _file_fingerprint(source)
+
+    if before and after and before != after:
+        # Shown above the report on purpose: the report will claim success.
+        return (f"WARNING: {source} was MODIFIED while its tests were being written. "
+                f"The sub-agent is not allowed to change the code under test, so "
+                f"these tests may pass only because the code was weakened. Review "
+                f"the diff for {source} before trusting this result.\n\n{report}")
+    return report
 
 
 def _exec_subagent(args: dict, depth: int = 0) -> str:
@@ -7945,6 +8021,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     path_zone = "default"
     shadowed = None
     if mode == "shell":
+        if name == "run_tests":
+            # Discovery happens here, before the approval prompt and before any
+            # guard runs, so the user is asked about the real command and every
+            # shell protection applies to it unchanged. Same reasoning as
+            # create_document sharing write_text: share the mode, differ only in
+            # the one step that has to differ.
+            found = testing_support.discover_command(
+                str(args.get("path") or "").strip() or str(PROJECT_ROOT))
+            if found.error:
+                return found.error
+            args = {**args, "command": found.command}
         try:
             argv = _structured_tool_argv(name, args)
         except ValueError as exc:
@@ -8174,6 +8261,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     if mode == "subagent":
         return _exec_subagent(args, depth=depth)
 
+    if mode == "autotest":
+        return _exec_autotest(args, depth=depth)
+
     if mode == "cron":
         return _exec_cron(args)
 
@@ -8325,6 +8415,42 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path instead.")
             return result
+        if name == "edit_file":
+            # Shares write_text so every guard above already ran. Only the
+            # bytes-on-disk step differs: a located replacement instead of a
+            # whole-file overwrite.
+            if not target.exists():
+                _turn_writes -= 1
+                return (f"Error: {target} does not exist, so there is nothing to edit. "
+                        f"Use write_file to create it.")
+            try:
+                original = _read_text_limited(target)
+            except ValueError as exc:
+                _turn_writes -= 1
+                return (f"Error: {target} could not be read as text for editing ({exc}). "
+                        f"Nothing was written.")
+            edit = patching.apply_edit(original, str(args.get("old_string") or ""), content)
+            if not edit.ok:
+                # A refusal wrote nothing, so it must not spend the turn's write
+                # budget -- otherwise three bad guesses lock out the real edit.
+                _turn_writes -= 1
+                return edit.error
+            target.write_text(edit.text, encoding="utf-8", newline="")
+            _last_write_diff = _make_diff(original, edit.text, str(target))
+            added, removed = diffview.diff_counts(_last_write_diff)
+            result = (f"Updated {target} with {added} addition{'s' if added != 1 else ''} "
+                      f"and {removed} removal{'s' if removed != 1 else ''}")
+            if edit.strategy == "normalized":
+                result += (" — old_string matched after normalising trailing whitespace "
+                           "and tabs; copy the file's exact text next time")
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path if you meant to "
+                           f"edit the project's own file.")
+            hunk = "".join(_last_write_diff[2:])[:2000]
+            if hunk:
+                result += f"\n{hunk}"
+            return result
         if args.get("_private") is True:
             _write_private_text(target, content)
         else:
@@ -8372,6 +8498,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             # Ordered before the recording below so this run's own verdict is
             # stamped with the sequence its side effects produced.
             note_mutation(f"{name}: {command[:80]}")
+        if name == "run_tests":
+            text = testing_support.trim_output(text)
         _record_verdict(ledger_command or command, text)
         return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
@@ -11351,6 +11479,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "tool is available. If verification is not possible, say that plainly."
                 )})
                 continue
+            if trajectory is not None and trajectory.request_tests():
+                if on_trajectory_state:
+                    on_trajectory_state()
+                messages.append({"role": "user", "content": (
+                    "Controller state says these code files changed this run with no "
+                    f"tests written: {', '.join(trajectory.untested_paths())}. "
+                    "Before your final answer, call generate_tests on each one, or "
+                    "state plainly why tests do not apply to this change."
+                )})
+                continue
             answer = _guard_answer(answer)
             if trajectory is not None and trajectory.needs_verification():
                 answer += ("\n\nVerification note: changes were made, but no fresh automated "
@@ -11492,6 +11630,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     operation, result, failed=_plan_step_failed(result),
                     blocked=result.startswith("ESCALATION_REQUEST\x1f"),
                     mutated=_MUTATION_SEQ != mutation_seq_before, verdict=verdict.status,
+                    # Every write tool in tools.txt uses 'filename' as its
+                    # path_arg; a tool that declares none yields "", which the
+                    # tracker ignores.
+                    path=str(args.get("filename") or ""),
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
