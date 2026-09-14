@@ -2921,9 +2921,45 @@ def current_system_prompt(native_tools: bool | None = None) -> str:
         native_tools = _native_tools_enabled(TOOLS_DEF)
     base = (BASE_SYSTEM_PROMPT + "\n"
             + render_tool_docs(TOOL_SPECS, catalogue=not native_tools)
+            # Native providers get schemas for the SELECTED tools only, so
+            # without this they cannot even tell that a dropped tool exists.
+            # Text-only providers already have every name in the prose
+            # catalogue above; adding the index there would just duplicate it.
+            + (render_tool_name_index(TOOL_SPECS) if native_tools else "")
             + render_skill_docs(SKILL_PACKAGES)
             + render_persona(USER_FILE))
     return base.split(RUNTIME_CONTEXT_HEADING)[0] + render_runtime_context()
+
+
+def render_tool_name_index(specs: dict) -> str:
+    """Every tool name, grouped by family, for the native-tools system prompt.
+
+    Names only, deliberately. The full catalogue costs ~5,600 tokens as JSON
+    schema but ~180 tokens as bare names, so awareness is 3% of the price of
+    availability. Selection decides which SCHEMAS ship; it must never decide
+    what the model knows exists, because a model that does not know a tool
+    exists cannot ask for it -- it guesses, and guessed calls fail.
+    """
+    if not specs:
+        return ""
+    families = {}
+    for name in sorted(specs):
+        if name.startswith("cli_anything_"):
+            head = "cli_anything"
+        else:
+            head, _, rest = name.partition("_")
+            if not rest:
+                head = "general"
+        families.setdefault(head, []).append(name)
+    lines = [
+        "",
+        "## Tool index",
+        "All of these exist and are callable. For one you were given no schema "
+        "for, call describe_tool(tool_name) to load its parameters, then call it.",
+    ]
+    for head, names in sorted(families.items()):
+        lines.append(f"- {', '.join(names)}")
+    return "\n".join(lines)
 
 
 def render_tool_docs(specs: dict, catalogue: bool = True) -> str:

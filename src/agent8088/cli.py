@@ -404,6 +404,11 @@ def _session_system_prompt():
     native = A._native_tools_enabled(A.build_tools_def(specs))
     prompt = (A.BASE_SYSTEM_PROMPT + "\n"
               + A.render_tool_docs(specs, catalogue=not native)
+              # Hybrid selection narrows the schema array to ~17 of 48 tools.
+              # The index (~256 tokens) keeps every name visible so a retrieval
+              # miss is recoverable: the model can see the tool exists and load
+              # its schema, instead of guessing arguments blind.
+              + (A.render_tool_name_index(specs) if native else "")
               + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE)
               + A.render_runtime_context())
     # Inject current permission mode so the model knows what it can/can't do right now

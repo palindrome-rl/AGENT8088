@@ -46,19 +46,52 @@ def test_ollama_still_gets_the_text_tool_catalogue():
 
 
 def test_fixed_overhead_within_budget():
-    """Guard tightened as each phase lands.
+    """Worst case: tool_selection=full, so every schema ships.
 
     Phase 1 (drop the duplicate catalogue) measured 14,403, down from 17,958.
     The saving is 3,555 rather than the full 3,994 of render_tool_docs,
     because the calling convention and the mandatory-routing block are
     deliberately retained -- the schema does not carry them.
 
-    Phase 2 (defer non-core tool schemas) tightens this to 11,000.
+    The ceiling then moved 14,600 -> 14,750 to buy the tool name index (~250
+    tokens, all 48 names). That is a deliberate purchase, not drift: without it
+    a tool dropped by hybrid selection is invisible rather than merely
+    unexpanded, and the model reaches for it blind. A live A/B measured that
+    failure at 8 turns / 994 tokens against 4 turns / 513 tokens -- i.e. the
+    blind path costs far more than the index it replaces. See
+    test_hybrid_request_is_the_path_that_actually_ships for the default mode,
+    which is what the 11,000 target was really about.
     """
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 14_600, f"fixed overhead regressed to {total} tokens"
+    assert total < 14_750, f"fixed overhead regressed to {total} tokens"
+
+
+def test_hybrid_request_is_the_path_that_actually_ships():
+    """The default is tool_selection=hybrid, so a real request carries the
+    prompt plus the SELECTED schemas, not all 48.
+
+    Measured 10,450 with the pinned+always set, against the 11,000 target the
+    budget work set for this phase. Guarding the realistic path matters more
+    than guarding the worst case, because this is the number every default
+    request actually pays.
+    """
+    prompt = E.current_system_prompt(native_tools=True)
+    selected = {name: E.TOOL_SPECS[name]
+                for name in (E._TOOL_SELECTION_PINNED | E._TOOL_SELECTION_ALWAYS)
+                if name in E.TOOL_SPECS}
+    schema = json.dumps(E.build_tools_def(selected))
+    total = approx_tokens(prompt) + approx_tokens(schema)
+    assert total < 11_000, f"hybrid request overhead regressed to {total} tokens"
+
+
+def test_every_tool_name_is_visible_to_native_providers():
+    """Selection narrows schemas; it must never narrow awareness. A model that
+    does not know a tool exists cannot ask for its schema -- it guesses."""
+    prompt = E.current_system_prompt(native_tools=True)
+    for name in E.TOOL_SPECS:
+        assert name in prompt, f"{name} is invisible to native-tool providers"
 
 
 def test_cli_session_prompt_follows_the_provider(monkeypatch):
