@@ -183,6 +183,9 @@ BRANCH="$REPO_BRANCH"
 # Empty until --memory, $AGENT8088_INSTALL_MEM0 or the prompt resolves it.
 MEMORY_CHOICE=""
 MEMORY_ENGINE=""
+# Empty (unset) until --with/--skip-libreoffice or $AGENT8088_INSTALL_LIBREOFFICE
+# resolves it; true/false once decided.
+LIBREOFFICE_CHOICE=""
 IS_INTERACTIVE=true
 FRESH_INSTALL=false
 CONFIG_CREATED=false
@@ -193,6 +196,7 @@ SEARCH_EXTRAS_INSTALLED=false
 CHROMIUM_INSTALLED=false
 OCR_INSTALLED=false
 MEM0_INSTALLED=false
+LIBREOFFICE_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
 SANDBOX_INSTALLED=false
@@ -217,16 +221,20 @@ while [[ $# -gt 0 ]]; do
             esac
             shift 2
             ;;
+        --with-libreoffice) LIBREOFFICE_CHOICE=true; shift ;;
+        --skip-libreoffice) LIBREOFFICE_CHOICE=false; shift ;;
         -h|--help)
             echo "Agent8088 Installer"
             echo ""
             echo "Usage: curl -fsSL <url> | bash -s -- [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --skip-setup       Skip interactive setup wizard"
-            echo "  --branch NAME      Git branch to install (default: $REPO_BRANCH)"
-            echo "  --memory BACKEND   Memory engine: native (default) or mem0"
-            echo "  -h, --help         Show this help"
+            echo "  --skip-setup          Skip interactive setup wizard"
+            echo "  --branch NAME         Git branch to install (default: $REPO_BRANCH)"
+            echo "  --memory BACKEND      Memory engine: native (default) or mem0"
+            echo "  --with-libreoffice    Install LibreOffice (docx/pptx/xlsx conversion)"
+            echo "  --skip-libreoffice    Don't install LibreOffice"
+            echo "  -h, --help            Show this help"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -240,6 +248,32 @@ log_info()    { echo -e "\033[0;36m→\033[0m $1"; }
 log_success() { echo -e "\033[0;32m✓\033[0m $1"; }
 log_warn()    { echo -e "\033[0;33m⚠\033[0m $1"; }
 log_error()   { echo -e "\033[0;31m✗\033[0m $1"; }
+
+# Whether a question can reach a human at all. IS_INTERACTIVE covers the
+# `bash install.sh` case; the documented install method is `curl -fsSL <url> |
+# bash`, which makes stdin the pipe (IS_INTERACTIVE=false) even though a real
+# terminal is sitting right there as /dev/tty -- the same trick prompt_yes_no
+# already uses. Without this, every prompt below silently defaults on the one
+# install path the README tells people to use.
+_can_prompt() {
+    [ "$IS_INTERACTIVE" = true ] && return 0
+    [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+# Print a prompt to the real terminal and read one line of the answer back
+# from it, working whether stdin is a tty (direct install) or a pipe (curl |
+# bash, where /dev/tty is still the terminal). Echoes the raw answer.
+_read_from_terminal() {
+    local prompt="$1" answer=""
+    if [ "$IS_INTERACTIVE" = true ]; then
+        printf "%s" "$prompt" >&2
+        read -r answer || answer=""
+    else
+        printf "%s" "$prompt" > /dev/tty
+        IFS= read -r answer < /dev/tty || answer=""
+    fi
+    echo "$answer"
+}
 
 # Which memory engine to install: echoes "native" or "mem0".
 #
@@ -257,7 +291,7 @@ resolve_memory_choice() {
         1|y|yes|true|mem0)    echo "mem0"; return ;;
         0|n|no|false|native)  echo "native"; return ;;
     esac
-    if [ "$IS_INTERACTIVE" != true ] || [ -n "${CI:-}" ]; then
+    if ! _can_prompt || [ -n "${CI:-}" ]; then
         echo "native"
         return
     fi
@@ -272,11 +306,109 @@ resolve_memory_choice() {
     } >&2
     local answer=""
     while [ "$answer" != "native" ] && [ "$answer" != "mem0" ]; do
-        printf "Which memory backend? [native/mem0]: " >&2
-        read -r answer || { echo "native"; return; }
+        answer="$(_read_from_terminal "Which memory backend? [native/mem0]: ")"
+        [ -z "$answer" ] && { echo "native"; return; }
         answer="$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     done
     echo "$answer"
+}
+
+# Whether to install LibreOffice: echoes "true" or "false".
+#
+# Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading, and
+# Excel formula recalculation (see documents.py's _soffice_executable). It is
+# the slowest optional stage here by a wide margin, so it asks first, same as
+# mem0 above and Install-LibreOffice in install.ps1.
+resolve_libreoffice_choice() {
+    if [ -n "$LIBREOFFICE_CHOICE" ]; then
+        echo "$LIBREOFFICE_CHOICE"
+        return
+    fi
+    case "${AGENT8088_INSTALL_LIBREOFFICE:-}" in
+        1|y|yes|true)  echo "true"; return ;;
+        0|n|no|false)  echo "false"; return ;;
+    esac
+    if [ "$DISTRO" = "termux" ]; then
+        echo "false"  # no LibreOffice build for Android
+        return
+    fi
+    if ! _can_prompt || [ -n "${CI:-}" ]; then
+        echo "false"
+        return
+    fi
+    {
+        echo ""
+        echo "    LibreOffice is optional (~350 MB+) and can take several minutes to"
+        echo "    download and install."
+        echo "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls"
+        echo "    reading, and Excel formula recalculation. Skipping is safe."
+    } >&2
+    local answer=""
+    while [ "$answer" != "yes" ] && [ "$answer" != "no" ]; do
+        answer="$(_read_from_terminal "Install LibreOffice now? [yes/no]: ")"
+        [ -z "$answer" ] && continue
+        answer="$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    done
+    [ "$answer" = "yes" ] && echo "true" || echo "false"
+}
+
+# Best-effort install: macOS via Homebrew cask, Linux via the distro's package
+# manager (apt/dnf/pacman); anything else falls through to record_skip below.
+# Non-fatal at every branch -- LibreOffice-backed conversion degrades to a
+# clear "not available" at runtime (documents.py), so a failed or unsupported
+# install must not fail the whole installer.
+install_libreoffice() {
+    if command -v soffice >/dev/null 2>&1; then
+        log_success "LibreOffice already installed"
+        LIBREOFFICE_INSTALLED=true
+        return
+    fi
+    log_info "Installing LibreOffice; this can take several minutes..."
+    local _rc=0
+    case "$OS" in
+        macos)
+            if command -v brew >/dev/null 2>&1; then
+                run_with_timeout "$T_LIBREOFFICE" brew install --cask libreoffice \
+                    >/dev/null 2>&1 || _rc=$?
+            else
+                _rc=1
+            fi
+            ;;
+        linux)
+            local sudo_cmd=""
+            [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+            case "$DISTRO" in
+                ubuntu|debian)
+                    run_with_timeout "$T_LIBREOFFICE" $sudo_cmd env DEBIAN_FRONTEND=noninteractive \
+                        apt-get install -y -qq libreoffice >/dev/null 2>&1 || _rc=$?
+                    ;;
+                fedora)
+                    run_with_timeout "$T_LIBREOFFICE" $sudo_cmd dnf install -y libreoffice \
+                        >/dev/null 2>&1 || _rc=$?
+                    ;;
+                arch)
+                    run_with_timeout "$T_LIBREOFFICE" $sudo_cmd pacman -S --noconfirm libreoffice-fresh \
+                        >/dev/null 2>&1 || _rc=$?
+                    ;;
+                *) _rc=1 ;;
+            esac
+            ;;
+        *) _rc=1 ;;
+    esac
+    if [ "$_rc" -eq 0 ] && command -v soffice >/dev/null 2>&1; then
+        LIBREOFFICE_INSTALLED=true
+        log_success "LibreOffice installed"
+        return
+    fi
+    if [ "$_rc" -eq 124 ]; then
+        warn_stage 124 "$T_LIBREOFFICE" "LibreOffice" \
+            ".docx/.pptx/.xlsx conversion will be unavailable" \
+            "install LibreOffice manually from https://www.libreoffice.org/download/"
+    else
+        log_warn "LibreOffice install did not complete."
+        record_skip "LibreOffice" "install failed or no supported package manager found" \
+            "install LibreOffice manually from https://www.libreoffice.org/download/"
+    fi
 }
 
 # Rewrite an existing memory_engine line rather than appending, so rerunning the
@@ -322,6 +454,7 @@ T_NPM=$((300          * TIMEOUT_SCALE))   # 142 small packages, mostly round-tri
 T_CHROMIUM=$((600     * TIMEOUT_SCALE))   # ~150 MB browser download
 T_NODE_DL=$((180      * TIMEOUT_SCALE))   # ~30 MB tarball
 T_PIP=$((300          * TIMEOUT_SCALE))   # gateway extras: tens of MB of wheels
+T_LIBREOFFICE=$((1800 * TIMEOUT_SCALE))   # ~350 MB+ plus dependency resolution/install
 T_GIT=$((600          * TIMEOUT_SCALE))   # shallow clone: small, but a stalled fetch hangs
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
@@ -1072,6 +1205,17 @@ install_deps() {
         log_info "Using the native memory backend (SQLite, no extra downloads)."
     fi
 
+    # --- LibreOffice (headless soffice) ---
+    if [ "$(resolve_libreoffice_choice)" = "true" ]; then
+        install_libreoffice
+    elif [ "$DISTRO" = "termux" ]; then
+        log_info "Skipping LibreOffice (no build for Android/Termux)."
+    else
+        log_info "Skipping LibreOffice."
+        record_skip "LibreOffice" "not selected (optional, slow to install)" \
+            "rerun with --with-libreoffice, or install manually from https://www.libreoffice.org/download/"
+    fi
+
     # --- Playwright (optional [browser] extra) + Chromium binary ---
     # playwright degrades gracefully at runtime (engine.py: _playwright_available()),
     # so it's an optional extra, not a core dep - a platform/Python combo without
@@ -1648,6 +1792,11 @@ verify_install() {
         echo "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
     else
         echo "  Memory:   native SQLite (rerun with --memory mem0 to add the mem0 engine)"
+    fi
+    if [ "$LIBREOFFICE_INSTALLED" = true ]; then
+        echo "  Office:   LibreOffice ready (docx/pptx/xlsx conversion)"
+    else
+        echo "  Office:   LibreOffice not installed (rerun with --with-libreoffice)"
     fi
     if [ "$WHATSAPP_BRIDGE_READY" = true ]; then
         echo "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"

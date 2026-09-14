@@ -304,8 +304,14 @@ def _sh_function(name: str) -> str:
 
 
 def _run_sh(body: str, *functions: str) -> str:
-    preamble = 'IS_INTERACTIVE=false\nMEMORY_CHOICE=""\nCI=""\nlog_info() { :; }\n'
-    script = preamble + "\n".join(_sh_function(f) for f in functions) + "\n" + body
+    # _can_prompt/_read_from_terminal back both resolve_*_choice functions now,
+    # so pull them in unconditionally rather than have every call site list them.
+    needed = tuple(dict.fromkeys(("_can_prompt", "_read_from_terminal", *functions)))
+    preamble = ('IS_INTERACTIVE=false\nMEMORY_CHOICE=""\nLIBREOFFICE_CHOICE=""\n'
+                'LIBREOFFICE_INSTALLED=false\nDISTRO="linux"\nCI=""\n'
+                'log_info() { :; }\nlog_warn() { :; }\nlog_success() { :; }\n'
+                'SKIPPED_STAGES=()\n')
+    script = preamble + "\n".join(_sh_function(f) for f in needed) + "\n" + body
     result = subprocess.run([_bash(), "-c", script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     return result.stdout
@@ -364,3 +370,156 @@ def test_sh_memory_flag_is_documented_and_validated():
     assert "--memory BACKEND" in source
     # An unknown backend must be rejected at parse time, not silently ignored.
     assert "Unknown memory backend" in source
+
+
+# ---------------------------------------------------------------------------
+# install.sh -- piped installs must still be able to ask (the actual bug)
+# ---------------------------------------------------------------------------
+# `curl -fsSL <url> | bash` is the documented install method. That pipes
+# stdin, so IS_INTERACTIVE is false even though a real terminal is sitting
+# right there as /dev/tty. Before this fix, resolve_memory_choice checked
+# IS_INTERACTIVE directly and always silently fell back to native on exactly
+# that path -- the prompt never fired on a real Mac/Linux install. It must
+# instead go through _can_prompt, which also tries /dev/tty.
+
+
+def test_sh_memory_prompt_fires_when_can_prompt_says_yes_even_if_piped():
+    out = _run_sh(
+        'IS_INTERACTIVE=false\n'
+        '_can_prompt() { return 0; }\n'
+        '_read_from_terminal() { echo "ASKED" >&2; echo "mem0"; }\n'
+        'resolve_memory_choice',
+        "resolve_memory_choice",
+    )
+    assert out.strip() == "mem0"
+
+
+def test_sh_memory_defaults_to_native_when_no_terminal_is_reachable():
+    out = _run_sh(
+        '_can_prompt() { return 1; }\n'
+        'resolve_memory_choice',
+        "resolve_memory_choice",
+    )
+    assert out.strip() == "native"
+
+
+# ---------------------------------------------------------------------------
+# install.sh -- LibreOffice
+# ---------------------------------------------------------------------------
+
+
+def test_sh_libreoffice_cannot_prompt_defaults_to_false():
+    out = _run_sh(
+        '_can_prompt() { return 1; }\n'
+        'resolve_libreoffice_choice',
+        "resolve_libreoffice_choice",
+    )
+    assert out.strip() == "false"
+
+
+def test_sh_libreoffice_prompt_fires_even_when_piped():
+    """Same bug class as memory: must go through _can_prompt, not IS_INTERACTIVE."""
+    out = _run_sh(
+        'IS_INTERACTIVE=false\n'
+        '_can_prompt() { return 0; }\n'
+        '_read_from_terminal() { echo "yes"; }\n'
+        'resolve_libreoffice_choice',
+        "resolve_libreoffice_choice",
+    )
+    assert out.strip() == "true"
+
+
+def test_sh_libreoffice_reprompts_on_empty_answer():
+    out = _run_sh(
+        '_can_prompt() { return 0; }\n'
+        'echo 0 > /tmp/_lo_idx.$$\n'
+        '_read_from_terminal() {\n'
+        '  n=$(cat /tmp/_lo_idx.$$); n=$((n+1)); echo "$n" > /tmp/_lo_idx.$$\n'
+        '  echo "ASKED-$n" >&2\n'
+        '  if [ "$n" -eq 1 ]; then echo ""; else echo "no"; fi\n'
+        '}\n'
+        'resolve_libreoffice_choice\n'
+        'rm -f /tmp/_lo_idx.$$',
+        "resolve_libreoffice_choice",
+    )
+    assert out.strip().splitlines()[-1] == "false"
+
+
+def test_sh_libreoffice_termux_never_prompts():
+    out = _run_sh(
+        'DISTRO="termux"\n'
+        '_can_prompt() { echo "MUST NOT BE CALLED" >&2; return 0; }\n'
+        'resolve_libreoffice_choice',
+        "resolve_libreoffice_choice",
+    )
+    assert out.strip() == "false"
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("1", "true"), ("yes", "true"), ("true", "true"),
+    ("0", "false"), ("no", "false"), ("false", "false"),
+])
+def test_sh_libreoffice_env_var_decides(value, expected):
+    out = _run_sh(
+        f'AGENT8088_INSTALL_LIBREOFFICE="{value}"\nresolve_libreoffice_choice',
+        "resolve_libreoffice_choice",
+    )
+    assert out.strip() == expected
+
+
+def test_sh_libreoffice_flag_beats_the_env_var():
+    out = _run_sh(
+        'AGENT8088_INSTALL_LIBREOFFICE="true"\nLIBREOFFICE_CHOICE="false"\n'
+        'resolve_libreoffice_choice',
+        "resolve_libreoffice_choice",
+    )
+    assert out.strip() == "false"
+
+
+def test_sh_libreoffice_flags_are_documented():
+    source = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert "--with-libreoffice" in source
+    assert "--skip-libreoffice" in source
+
+
+def test_sh_install_libreoffice_failure_is_non_fatal():
+    """A failed or unsupported install must record a skipped stage, never abort."""
+    out = _run_sh(
+        'OS="freebsd"\n'  # unrecognized -> falls through every branch
+        'run_with_timeout() { shift; "$@"; }\n'
+        'install_libreoffice\n'
+        'echo "STAGES=${#SKIPPED_STAGES[@]}"',
+        "install_libreoffice", "record_skip", "warn_stage",
+    )
+    assert "STAGES=1" in out
+
+
+def test_sh_install_libreoffice_uses_brew_cask_on_macos(tmp_path):
+    # install_libreoffice redirects the install command's own stdout to
+    # /dev/null (matching every other optional-extra block), so the stub
+    # writes its record to a file instead of stdout.
+    marker = tmp_path / "call.txt"
+    out = _run_sh(
+        'OS="macos"\n'
+        'command() { [ "$1" = "-v" ] && [ "$2" = "soffice" ] && return 1; '
+        '[ "$1" = "-v" ] && [ "$2" = "brew" ] && return 0; builtin command "$@"; }\n'
+        f'run_with_timeout() {{ shift; echo "CALL:$*" > "{marker.as_posix()}"; "$@"; }}\n'
+        'brew() { return 0; }\n'
+        'install_libreoffice\n'
+        'echo "INSTALLED=$LIBREOFFICE_INSTALLED"',
+        "install_libreoffice",
+    )
+    assert marker.read_text().strip() == "CALL:brew install --cask libreoffice"
+    # soffice still absent after a "successful" brew run (no real binary in
+    # this stub) -- the function must not claim success it did not verify.
+    assert "INSTALLED=false" in out
+
+
+def test_sh_install_libreoffice_skips_when_already_present():
+    out = _run_sh(
+        'command() { [ "$1" = "-v" ] && [ "$2" = "soffice" ] && return 0; builtin command "$@"; }\n'
+        'install_libreoffice\n'
+        'echo "INSTALLED=$LIBREOFFICE_INSTALLED"',
+        "install_libreoffice",
+    )
+    assert "INSTALLED=true" in out
