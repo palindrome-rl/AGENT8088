@@ -257,6 +257,22 @@ def test_config_rewrite_is_idempotent_across_reruns(tmp_path):
 
 
 @needs_windows
+def test_config_rewrite_writes_no_bom(tmp_path):
+    """Windows PowerShell 5's `Set-Content -Encoding UTF8` prepends a UTF-8 BOM.
+    The BOM glues itself to the first key, so `\\ufeffmemory_engine=mem0` no longer
+    matches `memory_engine` and the engine choice silently falls to native.
+    The rewrite must write BOM-free UTF-8, matching the launcher write."""
+    config = tmp_path / "config.txt"
+    config.write_text("memory=1\n", encoding="utf-8")
+    _run(
+        f'$null = Set-ConfiguredMemoryEngine -ConfigPath "{config}" -Engine "mem0"',
+        "Set-ConfiguredMemoryEngine",
+    )
+    raw = config.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "config.txt starts with a UTF-8 BOM"
+
+
+@needs_windows
 def test_a_missing_config_is_reported_not_created(tmp_path):
     missing = tmp_path / "nope.txt"
     out = _run(

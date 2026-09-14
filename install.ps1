@@ -977,7 +977,12 @@ function Set-ConfiguredMemoryEngine {
             else { $line }
         }
         if (-not $found) { $updated = @($updated) + "memory_engine=$Engine" }
-        Set-Content -LiteralPath $ConfigPath -Value $updated -Encoding UTF8 -ErrorAction Stop
+        # BOM-free UTF-8, same as the launcher write below. Windows PowerShell 5's
+        # `Set-Content -Encoding UTF8` prepends a BOM that glues itself to the
+        # first key (\ufeffmemory_engine), so the parser misses the line and the
+        # engine choice silently falls to native.
+        [System.IO.File]::WriteAllLines($ConfigPath, [string[]]$updated,
+            [System.Text.UTF8Encoding]::new($false))
         return $true
     } catch {
         Write-Warn "Could not set memory_engine in $ConfigPath ($($_.Exception.Message))."

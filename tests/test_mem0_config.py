@@ -8,6 +8,18 @@ def test_parse_memory_engine_default():
     assert mem0_cfg["vector_store"] == "qdrant"
     assert mem0_cfg["disable_telemetry"] is True
 
+def test_load_simple_config_strips_a_utf8_bom(tmp_path):
+    """Windows PowerShell 5 writes config.txt with a UTF-8 BOM; the BOM glues
+    itself to the first key, so \\ufeffmemory_engine stops matching memory_engine
+    and the installer's engine choice silently falls to native. Any Windows
+    editor can re-add a BOM, so the loader must tolerate one."""
+    from agent8088.engine import load_simple_config
+    config = tmp_path / "config.txt"
+    config.write_bytes(b"\xef\xbb\xbfmemory_engine=mem0\nmemory=1\n")
+    parsed = load_simple_config(config)
+    assert parsed.get("memory_engine") == "mem0"
+    assert parsed.get("memory") == "1"
+
 def test_parse_memory_engine_mem0_selected():
     config = {
         "memory_engine": "mem0",

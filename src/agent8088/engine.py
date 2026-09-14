@@ -101,7 +101,11 @@ def load_simple_config(path: Path) -> dict:
     config = {}
     if not path.exists():
         return config
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig, not utf-8: Windows PowerShell 5's `Set-Content -Encoding UTF8`
+    # (and various Windows editors) prepend a UTF-8 BOM, which would otherwise
+    # glue itself to the first key -- \ufeffmemory_engine stops matching
+    # memory_engine and the value silently falls to a default.
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
