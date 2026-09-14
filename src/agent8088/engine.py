@@ -2620,6 +2620,20 @@ if TOOL_SELECTION not in _TOOL_SELECTION_MODES:
 TOOL_SELECTION_MODELS = frozenset(parse_csv(APP_CONFIG.get("tool_selection_models", "")))
 TOOL_SELECTION_TOP_K = 10
 _TOOL_SELECTION_ALWAYS = frozenset({"last_output", "describe_tool"})
+# Ranking these is a false economy. A coding task that loses write_file cannot
+# finish, and the cost is asymmetric: a miss costs the whole task, an unused
+# schema costs ~100 tokens. Measured on the golden set, pinning these moves
+# COMP@K from 40% to 70%.
+#
+# The second group is pinned for a different reason: render_tool_docs' mandatory
+# routing block names them (engine.py, "Mandatory routing"), and the CLI builds
+# that prompt from the FULL catalogue (cli.py _session_system_prompt) while the
+# schema array is narrowed here. Dropping one makes the prompt order a call the
+# model has no schema for, which lands it in unknown-tool recovery.
+_TOOL_SELECTION_PINNED = frozenset({
+    "write_file", "read_text", "execute_shell",
+    "web_search", "browse_page", "convert_document", "create_document",
+})
 _TOOL_INDEX_CACHE = {}
 
 
@@ -2746,7 +2760,7 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         for position, index in enumerate(ranking, 1):
             scores[index] += 1 / (60 + position)
     picked = {names[index] for index, _ in scores.most_common(TOOL_SELECTION_TOP_K)}
-    return (picked | _TOOL_SELECTION_ALWAYS) & set(allowed)
+    return (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
 
 
 def build_tools_def(tool_specs: dict) -> list:
