@@ -1006,14 +1006,14 @@ function Install-Mem0Extra {
         # mid-conversation keeps the first /memory instant -- otherwise the
         # download fires inside the REPL and floods it with progress bars -- and
         # lets a machine that is offline later still work.
-        Write-Info "Downloading the mem0 embedding model (~90 MB)..."
+        Write-Info "Downloading the mem0 embedding models (~90 MB)..."
         # Same cache the runtime pins (memory/mem0_store.py). fastembed's own
         # default is the system temp dir, which Storage Sense clears -- downloading
         # there would leave the REPL to fetch it all over again. Process-scoped:
         # the child inherits it, the user's environment is untouched.
         $env:FASTEMBED_CACHE_PATH = Join-Path $Agent8088Home "fastembed"
         $modelResult = Invoke-WithTimeout -FilePath $PythonExe `
-            -Arguments @("-c", "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')") `
+            -Arguments @("-c", "from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')") `
             -TimeoutSec $TMem0Model -Activity "Downloading the mem0 embedding model"
         if ($modelResult.ExitCode -eq 0) {
             Write-Success "mem0 embedding model installed"
@@ -1021,7 +1021,7 @@ function Install-Mem0Extra {
             Write-StageWarning -Result $modelResult -TimeoutSec $TMem0Model `
                 -What "mem0 embedding model" `
                 -Consequence "the first /memory call will download it instead" `
-                -Fix "`"$PythonExe`" -c `"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')`""
+                -Fix "`"$PythonExe`" -c `"from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')`""
         }
         return $true
     }

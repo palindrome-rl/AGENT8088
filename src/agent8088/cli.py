@@ -4808,6 +4808,10 @@ def _show_memory_status():
         # asked for mem0 and is writing to SQLite instead.
         engine_label += f" [yellow]— {requested} was requested but is unavailable[/yellow]"
     table.add_row("Engine", engine_label)
+    if requested != engine_name and report.get("engine_error"):
+        # The reason, not just the fact. Without this the user is told mem0 did
+        # not start and given nothing to act on.
+        table.add_row("Why", report["engine_error"])
     table.add_row("Memories", str(report["count"]))
     table.add_row("Scope", report["user_id"]
                   + (" (per identity)" if report["scope_by_identity"] else " (shared)"))

@@ -182,10 +182,18 @@ def store():
                     embedder=embedder(),
                 )
                 if mem0_store.available():
+                    _RUNTIME["mem0_error"] = ""
                     _RUNTIME["store"] = mem0_store
                     return mem0_store
-                log.warning("mem0 memory engine requested but unavailable; falling back to native store")
+                # Kept for status() to report. The store object itself is dropped
+                # on the way to the native fallback, and with it the only record
+                # of why mem0 could not start -- which is how an unsupported LLM
+                # provider went on looking exactly like "mem0ai isn't installed".
+                _RUNTIME["mem0_error"] = getattr(mem0_store, "last_error", "") or "unavailable"
+                log.warning("mem0 memory engine requested but unavailable (%s); "
+                            "falling back to native store", _RUNTIME["mem0_error"])
             except Exception as exc:
+                _RUNTIME["mem0_error"] = " ".join(str(exc).split())[:300]
                 log.debug("mem0 store instantiation failed: %s; falling back to native", exc)
 
         try:
@@ -398,6 +406,7 @@ def status() -> dict:
         "engine_configured": _RUNTIME.get("engine_name", "native"),
         "engine": _RUNTIME.get("engine_name", "native"),
         "embedder_info": None,
+        "engine_error": "",
         "db_path": str(_RUNTIME.get("db_path") or ""),
         "user_id": user_id(),
         "embed_model": _RUNTIME.get("embed_model", ""),
@@ -424,6 +433,10 @@ def status() -> dict:
                 log.debug("memory store status failed: %s", exc)
         report["engine"] = store_status.get("engine", "native")
         report["embedder_info"] = store_status.get("embedder")
+        # Why the requested engine is not the live one. Only meaningful when
+        # those two disagree; a healthy native-by-choice setup has no error.
+        if report["engine"] != report["engine_configured"]:
+            report["engine_error"] = _RUNTIME.get("mem0_error", "")
         try:
             report["count"] = active_store.count(user_id=report["user_id"])
             if hasattr(active_store, "stale_vector_count"):

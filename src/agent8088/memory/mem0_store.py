@@ -20,6 +20,18 @@ for _noisy_logger in ("mem0", "mem0.utils.spacy_models", "posthog"):
     logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
 
 
+# mem0's own LLM registry (mem0.utils.factory.LlmFactory). Hardcoded rather than
+# read from mem0 at runtime so an import failure or an internal rename degrades to
+# "map it to openai" -- which is right for every OpenAI-compatible endpoint --
+# instead of raising. Anything agent8088 supports that is missing here is
+# OpenAI-compatible anyway: custom, cerebras, mistral, moonshot, openrouter, qwen.
+_MEM0_LLM_PROVIDERS = frozenset({
+    "anthropic", "aws_bedrock", "azure_openai", "azure_openai_structured",
+    "deepseek", "gemini", "groq", "langchain", "litellm", "lmstudio", "minimax",
+    "ollama", "openai", "openai_structured", "sarvam", "together", "vllm", "xai",
+})
+
+
 def _import_mem0():
     try:
         for _noisy_logger in ("mem0", "mem0.utils.spacy_models", "posthog"):
@@ -53,6 +65,12 @@ class Mem0MemoryStore:
         # reports this instead of guessing, since the chain can land anywhere
         # from Ollama to a local fastembed model depending on what is installed.
         self.embedder_info = None
+        self.llm_info = None
+        # Why initialisation failed, for /memory to show. This used to be a
+        # log.warning nobody ever saw: the engine fell back to native, said
+        # nothing about why, and an unsupported-provider config looked identical
+        # to mem0ai simply not being installed.
+        self.last_error = ""
 
     def _init_memory(self):
         if self._available is False:
@@ -62,6 +80,8 @@ class Mem0MemoryStore:
 
         memory_cls = _import_mem0()
         if memory_cls is None:
+            self.last_error = ("the mem0ai package is not installed "
+                               "(install it with: agent8088 --memory-setup)")
             self._available = False
             return None
 
@@ -83,19 +103,33 @@ class Mem0MemoryStore:
 
             llm_section = None
             if llm_provider:
+                # mem0 validates this name against its own registry and refuses
+                # anything outside it -- so passing agent8088's own provider names
+                # straight through ("custom", "qwen", "moonshot", "cerebras",
+                # "openrouter", "mistral") failed the whole engine with
+                # "Unsupported LLM provider: <name>", and mem0 silently degraded
+                # to the native store. Everything agent8088 speaks to is
+                # OpenAI-compatible unless mem0 knows the name natively, so
+                # anything unrecognised becomes "openai" aimed at that provider's
+                # own base_url rather than at api.openai.com.
+                resolved_provider = (llm_provider if llm_provider in _MEM0_LLM_PROVIDERS
+                                     else "openai")
                 llm_cfg = {
                     "model": str(self.config.get("llm_model") or "gpt-4o-mini"),
                 }
                 if client_api_key:
                     llm_cfg["api_key"] = client_api_key
-                if client_base_url:
-                    llm_cfg["openai_base_url"] = client_base_url
-                if llm_provider == "ollama":
+                if resolved_provider == "ollama":
                     llm_cfg["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+                elif resolved_provider == "openai" and client_base_url:
+                    # Only meaningful for the OpenAI-shaped client; setting it for
+                    # anthropic/gemini/groq would be noise at best.
+                    llm_cfg["openai_base_url"] = client_base_url
                 llm_section = {
-                    "provider": llm_provider,
+                    "provider": resolved_provider,
                     "config": llm_cfg,
                 }
+                self.llm_info = {"requested": llm_provider, "resolved": resolved_provider}
 
             embedder_section = None
             embed_provider = str(self.config.get("embed_provider") or "").strip().lower()
@@ -186,6 +220,10 @@ class Mem0MemoryStore:
             return self._memory
         except Exception as exc:
             log.warning("failed to initialize mem0 memory engine: %s", exc)
+            # Kept so /memory can name the reason. Collapsed to one line because
+            # pydantic's validation errors span several and the status table has
+            # a single cell to say it in.
+            self.last_error = " ".join(str(exc).split())[:300]
             self._available = False
             return None
 
@@ -360,4 +398,6 @@ class Mem0MemoryStore:
             "vector_store": self.vector_store_type,
             "path": str(self.path),
             "embedder": self.embedder_info,
+            "llm": self.llm_info,
+            "error": self.last_error,
         }

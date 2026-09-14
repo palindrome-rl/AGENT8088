@@ -1198,21 +1198,24 @@ install_deps() {
             # than mid-conversation keeps the first /memory instant -- otherwise
             # the download fires inside the REPL and floods it with progress
             # bars -- and lets a machine that is offline later still work.
-            log_info "Downloading the mem0 embedding model (~90 MB)..."
+            log_info "Downloading the mem0 embedding models (~90 MB)..."
             _mem0_model_rc=0
+            # Both models, not just the dense one: qdrant pulls Qdrant/bm25 for
+            # its sparse leg on the first write, so warming only TextEmbedding
+            # leaves an 18-file download to fire on the first captured memory.
             # Same cache the runtime pins (memory/mem0_store.py). fastembed's own
             # default is the system temp dir, which gets purged -- downloading
             # there would leave the REPL to fetch it all over again.
             FASTEMBED_CACHE_PATH="$AGENT8088_HOME/fastembed" \
                 run_with_timeout "$T_MEM0_MODEL" "$_py" -c \
-                "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')" \
+                "from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')" \
                 >/dev/null 2>&1 || _mem0_model_rc=$?
             if [ "$_mem0_model_rc" -eq 0 ]; then
                 log_success "mem0 embedding model installed"
             else
                 warn_stage "$_mem0_model_rc" "$T_MEM0_MODEL" "mem0 embedding model" \
                     "the first /memory call will download it instead" \
-                    "$_py -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\""
+                    "$_py -c \"from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')\""
             fi
         else
             # Non-fatal: native needs nothing extra, so a wheel that will not

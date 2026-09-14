@@ -38,6 +38,38 @@ def test_status_reports_native_when_mem0_falls_back():
         assert st["engine_configured"] == "mem0"
 
 
+def test_status_carries_the_reason_mem0_fell_back(capsys):
+    """/memory must name the reason, not just the fact.
+
+    "mem0 was requested but is unavailable" with no reason is what made the
+    unsupported-provider bug take three machines and a local repro to find.
+    """
+    from agent8088 import cli
+    native = MagicMock()
+    native.count.return_value = 0
+    native.path.exists.return_value = False
+    del native.status
+    with patch.dict(memory._RUNTIME,
+                    {"enabled": True, "engine_name": "mem0", "db_path": "/tmp/x.db",
+                     "store": native, "mem0_error": "Unsupported LLM provider: custom"},
+                    clear=False):
+        report = memory.status()
+        assert report["engine"] == "native"
+        assert report["engine_error"] == "Unsupported LLM provider: custom"
+        cli._show_memory_status()
+    assert "Unsupported LLM provider" in capsys.readouterr().out
+
+
+def test_status_has_no_reason_when_native_is_the_deliberate_choice():
+    native = MagicMock()
+    native.count.return_value = 0
+    del native.status
+    with patch.dict(memory._RUNTIME,
+                    {"enabled": True, "engine_name": "native", "db_path": "/tmp/x.db",
+                     "store": native}, clear=False):
+        assert memory.status()["engine_error"] == ""
+
+
 def test_status_reports_mem0_when_store_is_mem0():
     mem0 = MagicMock()
     mem0.count.return_value = 7
