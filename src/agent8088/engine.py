@@ -7,6 +7,7 @@ A single shared agent loop (run_agent) drives both modes:
   - one-shot / benchmark mode (query as args, optional --trace)
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.parse  # readline enables input history
+from collections import Counter
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -1815,6 +1816,11 @@ def _active_model_token_limits(provider_name: str = "", model_name: str = "") ->
     """
     from agent8088.providers import model_token_limits
 
+    # Lazy probe: this is the accessor every consumer of a token limit goes
+    # through, so probing here keeps /doctor and the context meter accurate
+    # without taxing import. Cached per (provider, model) inside the probe.
+    _maybe_probe_context_window()
+
     active_provider = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
     active_model = model_name or MODEL_NAME
     profile = PROVIDERS.get(active_provider, {})
@@ -1913,10 +1919,12 @@ def _maybe_probe_context_window():
         PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
 
 
-# Probe once at import: without this, a fresh launch shows the conservative
-# 32k/8k defaults in /doctor until the user reconfigures via /model setup,
-# because activate_model is the only other caller.
-_maybe_probe_context_window()
+# NOT probed at import. The probe is a network round-trip, and at import time
+# every CLI invocation paid for it -- `agent8088 --help` and `pytest
+# --collect-only` included -- for 16.7s against an unreachable endpoint
+# (3 SDK retries x a 5s timeout). _active_model_token_limits() probes lazily
+# instead, so the cost lands on the first caller that actually needs a limit.
+# See tests/test_startup_no_network.py.
 
 
 def _native_tools_enabled(tools, provider_name: str = "") -> bool:
@@ -2605,6 +2613,207 @@ def required_params(spec: dict) -> list:
     return [arg for arg in (spec.get("args") or []) if arg not in optional]
 
 
+_TOOL_SELECTION_MODES = frozenset({"full", "hybrid", "auto"})
+TOOL_SELECTION = str(APP_CONFIG.get("tool_selection", "hybrid")).strip().lower()
+if TOOL_SELECTION not in _TOOL_SELECTION_MODES:
+    TOOL_SELECTION = "hybrid"
+TOOL_SELECTION_MODELS = frozenset(parse_csv(APP_CONFIG.get("tool_selection_models", "")))
+TOOL_SELECTION_TOP_K = 10
+_TOOL_SELECTION_ALWAYS = frozenset({"last_output", "describe_tool"})
+# Ranking these is a false economy. A coding task that loses write_file cannot
+# finish, and the cost is asymmetric: a miss costs the whole task, an unused
+# schema costs ~100 tokens. Measured on the golden set, pinning these moves
+# COMP@K from 40% to 70%.
+#
+# The second group is pinned for a different reason: render_tool_docs' mandatory
+# routing block names them (engine.py, "Mandatory routing"), and the CLI builds
+# that prompt from the FULL catalogue (cli.py _session_system_prompt) while the
+# schema array is narrowed here. Dropping one makes the prompt order a call the
+# model has no schema for, which lands it in unknown-tool recovery.
+_TOOL_SELECTION_PINNED = frozenset({
+    "write_file", "read_text", "execute_shell",
+    "web_search", "browse_page", "convert_document", "create_document",
+})
+_TOOL_INDEX_CACHE = {}
+_TOOL_SEARCH_DEFAULT_LIMIT = 8
+_TOOL_SEARCH_MAX_LIMIT = 12
+_TOOL_SEARCH_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "search_tools",
+        "description": "Find deferred tools and load their schemas for the next turn.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Capability or tool family to find."},
+                "limit": {"type": "integer", "description": "Maximum schemas to load (1-12)."},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def set_tool_selection(mode: str) -> str:
+    """Set and persist the native tool-schema selection mode."""
+    selected = str(mode or "").strip().lower()
+    if selected not in _TOOL_SELECTION_MODES:
+        raise ValueError("tool selection must be full, hybrid, or auto")
+    global TOOL_SELECTION
+    TOOL_SELECTION = selected
+    APP_CONFIG["tool_selection"] = selected
+    update_simple_config(CONFIG_PATH, {"tool_selection": selected})
+    return selected
+
+
+def _tool_selection_text(name: str, spec: dict) -> str:
+    """Stable, local search text for one tool. Tool output is never indexed."""
+    return " ".join((
+        name.replace("_", " "),
+        str(spec.get("description") or ""),
+        " ".join(str(arg).replace("_", " ") for arg in spec.get("args") or ()),
+    ))
+
+
+def _tool_selection_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(text or "").lower().replace("_", " "))
+
+
+def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[list[float]]]:
+    """Return a cached catalog snapshot and its vectors, if embeddings work.
+
+    A catalog changes rarely; embed all of it once rather than making every user
+    turn pay for 48 tool descriptions. The existing embedder has its own circuit
+    breaker, so a missing embedding model degrades to full tool exposure.
+    """
+    entries = [(name, _tool_selection_text(name, TOOL_SPECS[name]))
+               for name in sorted(names) if name in TOOL_SPECS]
+    key = tuple(entries)
+    cached = _TOOL_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    vectors = []
+    try:
+        active_embedder = memory.embedder()
+        if active_embedder is not None:
+            vectors = active_embedder.embed([text for _, text in entries])
+    except Exception as exc:  # noqa: BLE001 - optional performance path
+        _log.debug("tool selection embeddings unavailable: %s", exc)
+    result = ([name for name, _ in entries], [text for _, text in entries], vectors)
+    _TOOL_INDEX_CACHE.clear()
+    _TOOL_INDEX_CACHE[key] = result
+    return result
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    product = sum(a * b for a, b in zip(left, right))
+    left_size = math.sqrt(sum(a * a for a in left))
+    right_size = math.sqrt(sum(b * b for b in right))
+    return product / (left_size * right_size) if left_size and right_size else 0.0
+
+
+def _bm25_tool_ranking(query: str, texts: list[str]) -> list[int]:
+    """Small in-memory BM25 ranker for the tiny, static tool catalog."""
+    terms = _tool_selection_tokens(query)
+    documents = [_tool_selection_tokens(text) for text in texts]
+    if not terms or not documents:
+        return []
+    query_terms = set(terms)
+    document_frequency = {term: sum(term in doc for doc in documents)
+                          for term in query_terms}
+    average_length = sum(map(len, documents)) / len(documents)
+    scores = []
+    for index, doc in enumerate(documents):
+        counts = Counter(doc)
+        score = 0.0
+        for term in query_terms:
+            frequency = counts.get(term, 0)
+            if not frequency:
+                continue
+            idf = math.log(1 + (len(documents) - document_frequency[term] + 0.5)
+                           / (document_frequency[term] + 0.5))
+            score += idf * frequency * 2.2 / (frequency + 1.2 * (
+                1 - 0.75 + 0.75 * len(doc) / max(average_length, 1)))
+        scores.append((score, index))
+    return [index for score, index in sorted(scores, reverse=True) if score > 0]
+
+
+def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | None = None,
+                                  provider: str = "", model: str = "") -> set[str]:
+    """Choose direct schemas before the model sees a request, or fail open.
+
+    This is deliberately not a chat-model router. BM25 handles literal tool
+    language and the existing embedding endpoint handles paraphrases; RRF keeps
+    either signal from dominating. If the semantic leg is unavailable or the two
+    rankers have no shared candidate, retain the old full catalog.
+    """
+    selected_mode = (mode or TOOL_SELECTION or "hybrid").lower()
+    if selected_mode == "auto":
+        identity = f"{provider}:{model}" if provider and model else model
+        selected_mode = "hybrid" if identity in TOOL_SELECTION_MODELS else "full"
+    if selected_mode != "hybrid" or len(allowed) <= TOOL_SELECTION_TOP_K:
+        return set(allowed)
+    names, texts, vectors = _tool_selection_index(set(allowed))
+    if len(vectors) != len(names):
+        return set(allowed)
+    try:
+        active_embedder = memory.embedder()
+        query_vector = active_embedder.embed_one(query) if active_embedder else []
+    except Exception as exc:  # noqa: BLE001 - optional performance path
+        _log.debug("tool selection query embedding unavailable: %s", exc)
+        return set(allowed)
+    if not query_vector:
+        return set(allowed)
+    lexical = _bm25_tool_ranking(query, texts)
+    semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
+                      reverse=True)
+    semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
+    if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
+        return set(allowed)
+    scores = Counter()
+    for ranking in (lexical, semantic):
+        for position, index in enumerate(ranking, 1):
+            scores[index] += 1 / (60 + position)
+    picked = {names[index] for index, _ in scores.most_common(TOOL_SELECTION_TOP_K)}
+    return (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+
+
+def _search_tool_names(query: str, allowed: set[str], limit: object = _TOOL_SEARCH_DEFAULT_LIMIT) -> list[str]:
+    """Rank catalog metadata for model-initiated schema loading.
+
+    Discovery is advisory: callers still intersect results with the immutable
+    run allowlist before exposing a schema. Unlike initial selection, a missing
+    embedder falls back to BM25 instead of exposing the whole catalog.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _TOOL_SEARCH_DEFAULT_LIMIT
+    limit = min(max(1, limit), _TOOL_SEARCH_MAX_LIMIT)
+    names, texts, vectors = _tool_selection_index(set(allowed))
+    lexical = _bm25_tool_ranking(query, texts)
+    semantic = []
+    try:
+        embedder = memory.embedder()
+        vector = embedder.embed_one(query) if embedder and len(vectors) == len(names) else []
+        semantic = [index for index in sorted(
+            range(len(names)), key=lambda i: _cosine(vector, vectors[i]), reverse=True)
+            if _cosine(vector, vectors[index]) > 0]
+    except Exception as exc:  # noqa: BLE001 - optional ranking signal
+        _log.debug("tool discovery embeddings unavailable: %s", exc)
+    if lexical and semantic:
+        scores = Counter()
+        for ranking in (lexical, semantic):
+            for position, index in enumerate(ranking, 1):
+                scores[index] += 1 / (60 + position)
+        ranking = [index for index, _ in scores.most_common()]
+    else:
+        ranking = lexical or semantic
+    return [names[index] for index in ranking[:limit]]
+
+
 def build_tools_def(tool_specs: dict) -> list:
     result = []
     for name, spec in sorted(tool_specs.items()):
@@ -2741,23 +2950,85 @@ def render_runtime_context(now=None, channel: str = "", chat_type: str = "") -> 
     return "".join(lines)
 
 
-def current_system_prompt() -> str:
+def current_system_prompt(native_tools: bool | None = None) -> str:
     """The default system prompt, carrying today's date rather than import day's.
 
     SYSTEM_PROMPT is built once at module import. That is fine for a one-shot
     CLI invocation and wrong for the gateway and cron, which stay up long
     enough for the date to move underneath them. Splitting on the heading
     keeps repeated calls from stacking context blocks.
+
+    native_tools=True omits the per-tool catalogue, because the JSON schema
+    array already carries it -- worth ~4,000 tokens per request. False keeps
+    it, which ollama needs: it rejects the tools param, so the prompt is its
+    only source of tool knowledge. None asks the active provider.
+
+    The prompt is assembled per call rather than sliced out of the prebuilt
+    SYSTEM_PROMPT, because the catalogue decision is per-provider. The
+    render_* helpers are pure string builders over already-loaded specs, so
+    this does no I/O.
     """
-    base = SYSTEM_PROMPT.split(RUNTIME_CONTEXT_HEADING)[0]
-    return base + render_runtime_context()
+    if native_tools is None:
+        native_tools = _native_tools_enabled(TOOLS_DEF)
+    base = (BASE_SYSTEM_PROMPT + "\n"
+            + render_tool_docs(TOOL_SPECS, catalogue=not native_tools)
+            # Native providers get schemas for the SELECTED tools only, so
+            # without this they cannot even tell that a dropped tool exists.
+            # Text-only providers already have every name in the prose
+            # catalogue above; adding the index there would just duplicate it.
+            + (render_tool_name_index(TOOL_SPECS) if native_tools else "")
+            + render_skill_docs(SKILL_PACKAGES)
+            + render_persona(USER_FILE))
+    return base.split(RUNTIME_CONTEXT_HEADING)[0] + render_runtime_context()
 
 
-def render_tool_docs(specs: dict) -> str:
+def render_tool_name_index(specs: dict) -> str:
+    """Every tool name, grouped by family, for the native-tools system prompt.
+
+    Names only, deliberately. The full catalogue costs ~5,600 tokens as JSON
+    schema but ~180 tokens as bare names, so awareness is 3% of the price of
+    availability. Selection decides which SCHEMAS ship; it must never decide
+    what the model knows exists, because a model that does not know a tool
+    exists cannot ask for it -- it guesses, and guessed calls fail.
+    """
+    if not specs:
+        return ""
+    families = {}
+    for name in sorted(specs):
+        if name.startswith("cli_anything_"):
+            head = "cli_anything"
+        else:
+            head, _, rest = name.partition("_")
+            if not rest:
+                head = "general"
+        families.setdefault(head, []).append(name)
+    lines = [
+        "",
+        "## Tool index",
+        "All of these tools exist. Call a tool only after its schema is loaded and "
+        "permission allows it. If search_tools is available, use it "
+        "to load a family or capability; for one exact known name, call "
+        "describe_tool(tool_name). Then call the loaded tool using its schema.",
+    ]
+    labels = {"cli_anything": "CLI Anything", "general": "General"}
+    for head, names in sorted(families.items()):
+        lines.append(f"- {labels.get(head, head.title())}: {', '.join(names)}")
+    return "\n".join(lines)
+
+
+def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
     """Generate the tool section of the system prompt from TOOL_SPECS, so the
     prompt can never drift from tools.txt. Required because the Ollama backend
     rejects the OpenAI tools param: the system prompt is the model's ONLY
-    source of tool knowledge."""
+    source of tool knowledge.
+
+    catalogue=False omits the per-tool "- name(args): description" list.
+    Providers with native tool calling already receive that list as the JSON
+    schema array; sending both costs ~4,000 tokens per request and gives the
+    model two descriptions of one tool that can disagree. The calling
+    convention and the mandatory-routing rules are kept in both modes -- they
+    are behavioural instructions, not tool definitions, and the schema does
+    not carry them."""
     if not specs:
         # No tools loaded: do NOT prime tool-calling. Answer directly, and don't
         # announce the (lack of) tools — otherwise every prompt gets "I have no tools".
@@ -2792,13 +3063,14 @@ def render_tool_docs(specs: dict) -> str:
         lines.append("- A request to convert an existing file to another format MUST call convert_document with the path the user gave. Do NOT create_document or write_file first — the file already exists, only its format changes. Do NOT call execute_shell with soffice.")
     if "create_document" in specs:
         lines.append("- A direct request to create a .docx/.xlsx/.pptx file from content MUST call create_document, not write_file or execute_shell.")
-    for name, s in sorted(specs.items()):
-        args = ", ".join(s["args"]) or "no args"
-        lines.append(f"- {name}({args}): {s['description']}")
-        if name == "spawn_subagent":
-            agent_types = sorted(globals().get("SUBAGENT_SPECS") or {})
-            if agent_types:
-                lines.append(f"  Available agent_type values: {', '.join(agent_types)}.")
+    if catalogue:
+        for name, s in sorted(specs.items()):
+            args = ", ".join(s["args"]) or "no args"
+            lines.append(f"- {name}({args}): {s['description']}")
+            if name == "spawn_subagent":
+                agent_types = sorted(globals().get("SUBAGENT_SPECS") or {})
+                if agent_types:
+                    lines.append(f"  Available agent_type values: {', '.join(agent_types)}.")
     return "\n".join(lines)
 
 
@@ -9605,7 +9877,13 @@ def _on_off(value, unit: str = "") -> str:
 
 
 def describe_tool(tool_name, specs=None) -> str:
-    """Return one live tool schema without executing the described tool."""
+    """Return one live tool schema without executing the described tool.
+
+    This is the schema-on-demand half of hybrid tool selection: the prompt's
+    tool index names every tool, and this loads the parameters for one the
+    request did not expand. It resolves against the full catalogue on purpose --
+    narrowing it to the selection would defeat the point.
+    """
     registry = TOOL_SPECS if specs is None else specs
     if not isinstance(tool_name, str) or not tool_name.strip() or len(tool_name) > 200:
         return "Error: Provide one exact tool name, e.g. read_text. Use /tools to list available names."
@@ -9619,7 +9897,12 @@ def describe_tool(tool_name, specs=None) -> str:
         "description": spec.get("description", ""),
         "mode": spec.get("mode", ""),
         "parameters": schema,
-        "execution": "Description only; the tool was not executed. Normal permissions apply when invoking it.",
+        # Phrased as an invitation because the model acts on this line. The
+        # earlier "the tool was not executed" wording read as a prohibition:
+        # the model passed the tool name to execute_shell rather than calling
+        # the tool whose schema it had just loaded.
+        "execution": ("Schema loaded; this tool is callable. Invoke it by name with these "
+                      "parameters. Describing it did not run it; normal permissions apply."),
     }, ensure_ascii=False, indent=2))
 
 
@@ -9873,6 +10156,55 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     run_trajectory = trajectory.TrajectoryState(
         trajectory_state, goal, len(messages), workspace=str(PROJECT_ROOT),
     )
+
+    # Choose a smaller native schema surface once for the human request, before
+    # the model's first completion. Tool-result messages are deliberately not
+    # input: untrusted output must never steer which privileged tool is offered.
+    # Text-only backends keep their full prompt catalog because it is their only
+    # tool knowledge.
+    configured_tools = kwargs.get("allowed_tools", TOOL_NAMES)
+    available_tools = set(configured_tools() if callable(configured_tools) else configured_tools)
+    configured_defs = kwargs.get("tools_def", TOOLS_DEF)
+    selection_identity = f"{kwargs.get('provider_name') or ACTIVE_PROVIDER}:{kwargs.get('model_name') or MODEL_NAME}"
+    selection_requested = (TOOL_SELECTION == "hybrid" or
+                           (TOOL_SELECTION == "auto" and
+                            selection_identity in TOOL_SELECTION_MODELS))
+    if goal and selection_requested:
+        probe_defs = configured_defs() if callable(configured_defs) else configured_defs
+        if not _native_tools_enabled(probe_defs, kwargs.get("provider_name", "")):
+            probe_defs = []
+    else:
+        probe_defs = []
+    if probe_defs:
+        loaded_tools = select_tool_names_for_request(
+            goal, available_tools, provider=kwargs.get("provider_name") or ACTIVE_PROVIDER,
+            model=kwargs.get("model_name") or MODEL_NAME,
+        )
+        loaded_tools |= _TOOL_SELECTION_PINNED & available_tools
+
+        def loaded_definitions():
+            definitions = configured_defs() if callable(configured_defs) else configured_defs
+            return _filter_tool_definitions(definitions, loaded_tools) + [_TOOL_SEARCH_DEFINITION]
+
+        def loaded_names():
+            return set(loaded_tools) | {"search_tools"}
+
+        def load_tools(names):
+            new = (set(names) & available_tools) - loaded_tools
+            loaded_tools.update(new)
+            return sorted(new)
+
+        def search_tools(query, limit):
+            return load_tools(_search_tool_names(query, available_tools - loaded_tools, limit))
+
+        kwargs["tools_def"] = loaded_definitions
+        kwargs["allowed_tools"] = loaded_names
+        kwargs["tool_loader"] = load_tools
+        kwargs["tool_searcher"] = search_tools
+        if isinstance(kwargs.get("trace"), list):
+            kwargs["trace"].append({"turn": 0, "type": "tool_exposure",
+                                    "initial": sorted(loaded_tools),
+                                    "schema_count": len(loaded_tools) + 1})
 
     def trajectory_changed():
         if on_trajectory_state is None:
@@ -10469,7 +10801,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
                     depth=0, budget=None, client=None, provider_name=None,
                     model_name=None, dynamic_turns=True, trajectory=None,
-                    on_trajectory_state=None):
+                    on_trajectory_state=None, tool_loader=None, tool_searcher=None):
     global _last_auto_rung
     """Drive the model until it gives a final answer or hits max_turns.
 
@@ -10819,6 +11151,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     return answer
                 messages.append({"role": "user", "content": _plan_mode_block_message()})
                 continue
+            loaded = tool_loader(_resolve_tool_name(name) for name in attempted) if tool_loader else []
+            if loaded:
+                result = (f"Loaded schemas for: {', '.join(loaded)}. Your previous arguments were "
+                          "discarded; call the tool again using its schema.")
+                if on_result:
+                    on_result("search_tools", result)
+                messages.append({"role": "user", "content":
+                                 f"{_TOOL_RESULT_PREFIX}search_tools):\n{result}"})
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "tool_schema_loaded",
+                                  "names": loaded, "source": "direct_unloaded_call"})
+                continue
             unknown = [n for n in attempted
                        if _resolve_tool_name(n) not in round_allowed_tools]
             if unknown and unknown_retries < 2 and not forcing:
@@ -10898,6 +11242,23 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             name = call["name"]
             args = call.get("arguments", {})
             sig = (name, json.dumps(args, sort_keys=True))
+
+            if name == "search_tools":
+                loaded = (tool_searcher(args.get("query", ""),
+                                        args.get("limit", _TOOL_SEARCH_DEFAULT_LIMIT))
+                          if tool_searcher else [])
+                result = (f"Loaded schemas for: {', '.join(loaded)}."
+                          if loaded else "No matching unloaded tools found.")
+                tool_outputs.append(result)
+                executed = True
+                round_fresh |= bool(loaded)
+                if on_result:
+                    on_result(name, result)
+                if turn_tools is not None:
+                    turn_tools.append({"name": name, "arguments": args,
+                                       "result": result, "loaded": loaded})
+                messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                continue
 
             if searched and _is_fetch_followup(messages, name, args):
                 result = ("Follow-up fetch was not run — the search already "

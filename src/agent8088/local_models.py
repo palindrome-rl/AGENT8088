@@ -355,14 +355,14 @@ def _installed_model_entries() -> list[tuple[str, float, float]]:
         if not name:
             continue
         size_bytes = model.get("size")
-        size_gb = size_bytes / _GIB if isinstance(size_bytes, (int, float)) else None
+        size_gb = round(size_bytes / _GIB, 1) if isinstance(size_bytes, (int, float)) else None
         param_str = (model.get("details") or {}).get("parameter_size") or ""
         match = _PARAM_SIZE_RE.match(param_str.strip())
         # "751.63M" -> 0.75B; Ollama reports sub-billion params with an M suffix
         params_b = float(match.group(1)) / 1000 if (match and match.group(2).upper() == "M") else (float(match.group(1)) if match else None)
-        if size_gb is None or params_b is None:
-            continue  # can't score without both -- skip rather than guess
-        entries.append((name, round(params_b, 2), round(size_gb, 1)))
+        if size_gb is None or size_gb <= 0 or params_b is None:
+            continue  # cloud/unknown-size entries cannot be scored as local models
+        entries.append((name, round(params_b, 2), size_gb))
     return entries
 
 
@@ -461,6 +461,8 @@ def score_models(hw: HardwareBudget) -> list[ModelScore]:
 
     scores = []
     for name, params_b, size_gb in _model_catalog():
+        if size_gb <= 0:
+            continue
         fit_ratio = budget_gb / (size_gb * _HEADROOM_FACTOR)
         raw = min(100.0, 100.0 * fit_ratio) * cpu_cap
         score = max(0, round(raw))

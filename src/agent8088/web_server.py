@@ -737,6 +737,7 @@ async def get_config():
         "active_provider": _cl()._active_provider_name() if _cl() else "",
         "config_path": str(A.CONFIG_PATH),
         "context_window": A.CONTEXT_WINDOW,
+        "tool_selection": A.TOOL_SELECTION,
         "max_turns": C.S.max_turns,
         "temperature": C.S.temperature,
         "tools_file": str(A.TOOLS_FILE),
@@ -1713,6 +1714,18 @@ class PrefBody(BaseModel):
     show_trace: bool | None = None
     show_reasoning: bool | None = None
     memory_notifications: str | None = None
+
+
+class ToolSelectionBody(BaseModel):
+    mode: str
+
+
+@app.post("/api/tool-selection")
+async def set_tool_selection(body: ToolSelectionBody):
+    try:
+        return {"ok": True, "mode": _eng().set_tool_selection(body.mode)}
+    except ValueError as exc:
+        return _error(str(exc), 400)
 
 @app.post("/api/preferences")
 async def set_preferences(body: PrefBody):
