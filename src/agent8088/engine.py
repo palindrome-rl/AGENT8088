@@ -9822,7 +9822,13 @@ def _on_off(value, unit: str = "") -> str:
 
 
 def describe_tool(tool_name, specs=None) -> str:
-    """Return one live tool schema without executing the described tool."""
+    """Return one live tool schema without executing the described tool.
+
+    This is the schema-on-demand half of hybrid tool selection: the prompt's
+    tool index names every tool, and this loads the parameters for one the
+    request did not expand. It resolves against the full catalogue on purpose --
+    narrowing it to the selection would defeat the point.
+    """
     registry = TOOL_SPECS if specs is None else specs
     if not isinstance(tool_name, str) or not tool_name.strip() or len(tool_name) > 200:
         return "Error: Provide one exact tool name, e.g. read_text. Use /tools to list available names."
@@ -9836,7 +9842,12 @@ def describe_tool(tool_name, specs=None) -> str:
         "description": spec.get("description", ""),
         "mode": spec.get("mode", ""),
         "parameters": schema,
-        "execution": "Description only; the tool was not executed. Normal permissions apply when invoking it.",
+        # Phrased as an invitation because the model acts on this line. The
+        # earlier "the tool was not executed" wording read as a prohibition:
+        # the model passed the tool name to execute_shell rather than calling
+        # the tool whose schema it had just loaded.
+        "execution": ("Schema loaded; this tool is callable. Invoke it by name with these "
+                      "parameters. Describing it did not run it; normal permissions apply."),
     }, ensure_ascii=False, indent=2))
 
 
