@@ -20,6 +20,22 @@
   --brand-border-rgb: 0 119 182;
   --ambient-primary-rgb: 35 125 215;
   --ambient-secondary-rgb: 0 237 255;
+
+  /* Semantic surface/text/diff tokens. Light values live on :root; html.dark
+     overrides them below, matching the existing darkMode: 'class' setup.
+     Added alongside the raw zinc-* usage, not replacing it. */
+  --ink: #18181b;
+  --ink-2: #52525b;
+  --ink-3: #a1a1aa;
+  --surface: #ffffff;
+  --field: #f4f4f5;
+  --hover: #f4f4f5;
+  --hover-2: #e4e4e7;
+  --line: #e4e4e7;
+  --green: #1a7f37;
+  --red: #cf222e;
+  --green-tint: rgb(26 127 55 / 0.10);
+  --red-tint: rgb(207 34 46 / 0.10);
 }
 
 html[data-accent='violet'] { --brand-primary: #8b5cf6; --brand-cyan: #d8b4fe; --brand-border: #7c3aed; --brand-primary-rgb: 139 92 246; --brand-cyan-rgb: 216 180 254; --brand-border-rgb: 124 58 237; --ambient-primary-rgb: 139 92 246; --ambient-secondary-rgb: 216 180 254; }
@@ -33,6 +49,21 @@ html[data-accent='gold'] { --brand-primary: #d97706; --brand-cyan: #fcd34d; --br
 /* Dark mode (default) */
 html.dark {
   color-scheme: dark;
+
+  /* Diff green and red match the CLI's _DIFF_ADD/_DIFF_DEL so one change
+     reads the same colour in the terminal and the browser. */
+  --ink: #e4e4e7;
+  --ink-2: #a1a1aa;
+  --ink-3: #71717a;
+  --surface: #18181b;
+  --field: #27272a;
+  --hover: #27272a;
+  --hover-2: rgb(63 63 70 / 0.40);
+  --line: #27272a;
+  --green: #3fb950;
+  --red: #f85149;
+  --green-tint: rgb(63 185 80 / 0.14);
+  --red-tint: rgb(248 81 73 / 0.14);
 }
 html.dark body {
   background: #0a0a0b;
@@ -333,3 +364,22 @@ html:not(.dark) [class~="border-zinc-800/70"],
 html:not(.dark) [class~="border-zinc-800/50"] { border-color: rgb(228 228 231 / 0.85) !important; }
 html:not(.dark) [class~="placeholder:text-zinc-600"]::placeholder { color: #a1a1aa !important; }
 html:not(.dark) [class~="bg-zinc-900"][class~="text-white"] { background-color: #18181b !important; }
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The diff chips animate in on every tool result. At one per write that is a
+     lot of motion for anyone who asked the OS for less of it. */
+  [style*="fade-up"], [style*="pop-in"], [style*="fade-in"] { animation: none !important; }
+}
