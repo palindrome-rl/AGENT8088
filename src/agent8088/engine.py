@@ -3233,6 +3233,7 @@ def read_skill_resource(name: str, resource: str) -> str:
 
 
 _TASK_SKILL_RULES = (
+    ("repository-reading", r"\b(?:repository_read|read|inspect|explore|search|understand)\s+(?:a\s+)?(?:github\s+)?repo(?:sitory)?\b|\bgithub\.com/"),
     ("planning-and-task-breakdown", r"\b(?:plan|break\s+down|roadmap|milestone)\b"),
     ("code-review-and-quality", r"\b(?:review|pull request|\bpr\b|diff)\b"),
     ("debugging-and-error-recovery", r"\b(?:debug|bug|broken|error|failure|regression)\b"),
