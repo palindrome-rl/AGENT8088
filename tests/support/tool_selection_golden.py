@@ -63,4 +63,8 @@ GOLDEN = [
      "List the MCP servers I have connected, then remove any that aren't "
      "responding.",
      {"list_mcp_servers", "remove_mcp_server"}),
+    ("repository_orientation",
+     "I have never seen this codebase before. Survey the repository structure "
+     "and tell me where the authentication code lives.",
+     {"repository_read"}),
 ]

@@ -60,25 +60,35 @@ def test_fixed_overhead_within_budget():
     failure at 8 turns / 994 tokens against 4 turns / 513 tokens -- i.e. the
     blind path costs far more than the index it replaces. See
     test_hybrid_request_is_the_path_that_actually_ships for the default mode,
-    which is what the 11,100 target was really about.
+    which is what the 11,000 target was really about.
 
-    Ceiling then moved 14,750 -> 15,300, and that number needs two separate
-    explanations because two separate things moved it:
+    14,750 -> 16,000. Three things moved it, and they are independent:
 
-    1. It had ALREADY drifted past 14,750 before this branch existed. The
-       branch point (development @ e416abcc) measures 14,887 -- this assertion
-       was red on a clean checkout, guarding nothing. Raising it re-arms the
-       guard rather than fixing any regression.
-    2. This branch adds three tools (51 total, from 48), taking it to 15,251:
-       their schemas in this worst case, and their names in the tool index.
+    1. Drift that predates all of it. development @ e416abcc measures 14,887,
+       so this assertion was already red on a clean checkout and guarding
+       nothing. Most of that is the archify skill: one catalogue entry, ~193,
+       the body staying out because the skill is progressive.
+    2. repository_read, ~375. 7th largest of 49 schemas at the time, in line
+       with document_read which it parallels, and its nine arguments are the
+       API its design note specified.
+    3. The diff-edit and autotest tools here, three more (52 total), with
+       their schemas in this worst case and their names in the tool index.
 
-    Worth re-measuring the 14,887 separately if the earlier drift is ever
-    investigated -- it is not attributable to this work.
+    Measured on the merged tree: 15,713. The ceiling sits at 16,000 rather
+    than snug against that, because a ceiling with no headroom fails on the
+    next one-line description edit and gets raised reflexively, which is how
+    a budget stops being one.
+
+    2 and 3 both carry the evidence the tool index purchase did. For
+    repository_read, a live A/B on glm-5.3 -- an orientation question against
+    docs/ cost 51 tool calls over 872.9s and returned a wrong answer without
+    it, against 4 calls over 154.7s and the correct one with it. Paying fixed
+    tokens to avoid 40 read_text round trips is that same trade one layer up.
     """
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 15_300, f"fixed overhead regressed to {total} tokens"
+    assert total < 16_000, f"fixed overhead regressed to {total} tokens"
 
 
 def test_hybrid_request_is_the_path_that_actually_ships():
@@ -103,6 +113,14 @@ def test_hybrid_request_is_the_path_that_actually_ships():
     The three descriptions were trimmed hard before this ceiling moved, which
     bought back ~220 tokens. Trimming further starts removing guidance the
     model needs to use edit_file correctly at all.
+
+    11,100 -> 11,500 on merging into development. The 11,027 above was measured
+    on a branch point that did not yet carry repository_read or the archify
+    skill; with both, the same pinned+always set measures 11,246. No tool was
+    added by the merge itself -- this is the two prior purchases showing up in
+    the realistic path as well as the worst case, which is what they were
+    always going to do.
+
     """
     prompt = E.current_system_prompt(native_tools=True)
     selected = {name: E.TOOL_SPECS[name]
@@ -110,7 +128,7 @@ def test_hybrid_request_is_the_path_that_actually_ships():
                 if name in E.TOOL_SPECS}
     schema = json.dumps(E.build_tools_def(selected))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 11_100, f"hybrid request overhead regressed to {total} tokens"
+    assert total < 11_500, f"hybrid request overhead regressed to {total} tokens"
 
 
 def test_every_tool_name_is_visible_to_native_providers():

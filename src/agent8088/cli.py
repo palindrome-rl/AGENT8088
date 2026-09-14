@@ -383,7 +383,7 @@ def _active_tool_specs():
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
     if A.PERMISSION_MODE == "plan-only":
         allowed &= {
-            "present_plan", "read_text", "calculate", "describe_capabilities", "describe_tool",
+            "present_plan", "read_text", "repository_read", "calculate", "describe_capabilities", "describe_tool",
             "git_status", "git_diff", "git_log", "last_output", "web_search",
             "view_skill",
         }
@@ -1798,12 +1798,9 @@ def _after_turn_plan_state():
 PLAN_MODE_MIN_TURNS = 25
 
 
-# How long the REPL will wait, after printing the answer, for the extraction call
-# to finish so its result can be reported in this turn. Past this the write still
-# completes in the background — only the notification is dropped, because a line
-# arriving after the prompt is drawn would land in the middle of what the user is
-# typing. Generous enough for a local model, short enough not to feel like a hang.
-MEMORY_NOTIFY_WAIT_SECONDS = 10
+# Memory extraction must not delay the input prompt. Completed notifications are
+# emitted by the main thread at turn boundaries, never while the user is typing.
+MEMORY_NOTIFY_WAIT_SECONDS = 0  # Compatibility: capture never blocks the prompt.
 
 
 # Captures that outlasted their report budget: [(thread, stored rows), ...].
@@ -1855,26 +1852,15 @@ def _report_memory_capture(stored, late=False):
 
 
 def _await_memory_capture(stored_ref):
-    """Wait briefly for this turn's capture, then report it.
-
-    Capture is deliberately started after the answer is rendered, so by the time
-    this runs the user has already read the reply; the wait costs them nothing but
-    the prompt returning a moment later.
-    """
+    """Report completed capture or defer it; never wait before accepting input."""
     if S.memory_notifications == "off":
         return
     # Drain anything owed from earlier turns first, so reports stay in order.
     _report_pending_capture()
     thread = A.memory_capture_thread
     if thread is not None and thread.is_alive():
-        with status_cm("remembering..."):
-            thread.join(timeout=MEMORY_NOTIFY_WAIT_SECONDS)
-        if thread.is_alive():
-            # Deferred rather than dropped. A local extraction call measured 17.7s
-            # against qwen3:8b, so exceeding this budget is the normal case, not the
-            # exception -- and silence is exactly what makes memory look broken.
-            _pending_captures.append((thread, stored_ref))
-            return
+        _pending_captures.append((thread, stored_ref))
+        return
     _report_memory_capture(list(stored_ref))
 
 
