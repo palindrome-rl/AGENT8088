@@ -103,3 +103,42 @@ def test_undiscoverable_project_reports_before_running_anything(engine, tmp_path
                         lambda *a, **k: pytest.fail("must not run a command it could not discover"))
     result = engine.run_tool("run_tests", {"path": str(tmp_path)})
     assert result.startswith("Error:")
+
+
+# --- discovery walks up ------------------------------------------------------
+# Found in live testing: the test-writer sub-agent passed the directory the
+# tests live in (proj/tests), not the project root, and got "no test command
+# could be discovered" even though proj/pyproject.toml was one level up. A
+# caller naming any directory inside the project must reach the project's
+# runner.
+
+def test_discovery_walks_up_to_the_project_root(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+    deep = tmp_path / "pkg" / "tests"
+    deep.mkdir(parents=True)
+    found = testing_support.discover_command(str(deep))
+    assert found.error is None
+    assert found.command == "pytest -q"
+
+
+def test_walking_up_prefers_the_nearest_marker(tmp_path):
+    (tmp_path / "go.mod").write_text("module outer\n", encoding="utf-8")
+    inner = tmp_path / "web"
+    inner.mkdir()
+    (inner / "package.json").write_text('{"scripts":{"test":"vitest run"}}', encoding="utf-8")
+    # Standing in the inner project, the inner project's runner wins.
+    assert testing_support.discover_command(str(inner)).framework == "npm"
+
+
+def test_walking_up_stops_and_reports_when_nothing_is_found(tmp_path):
+    deep = tmp_path / "a" / "b" / "c"
+    deep.mkdir(parents=True)
+    found = testing_support.discover_command(str(deep))
+    assert found.error is not None
+    assert "pyproject.toml" in found.error
+
+
+def test_walk_up_does_not_escape_past_a_filesystem_root():
+    # Must terminate rather than loop at '/'.
+    found = testing_support.discover_command("/")
+    assert found.command or found.error

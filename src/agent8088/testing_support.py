@@ -57,12 +57,43 @@ def _npm_has_test_script(root: Path) -> bool:
     return isinstance(scripts, dict) and bool(scripts.get("test"))
 
 
+MAX_WALK_UP = 8
+
+
 def discover_command(root: str) -> Discovery:
+    """Find the test command for the project containing `root`.
+
+    Walks up from `root` to the nearest directory carrying a marker, because a
+    caller naturally names the directory it cares about rather than the project
+    root. Live testing caught this: the test-writer sub-agent passed the
+    directory the tests live in and was told no test command existed, with
+    pyproject.toml sitting one level above it.
+
+    Nearest wins, so a JS sub-project inside a Go repo runs its own suite.
+    """
     base = Path(root or ".").expanduser()
     if not base.is_dir():
         return Discovery(error=(
             f"Error: {base} is not a directory, so no test command could be found."))
 
+    start = base
+    for _ in range(MAX_WALK_UP):
+        found = _discover_here(base)
+        if found is not None:
+            return found
+        parent = base.parent
+        if parent == base:  # filesystem root: stop rather than loop
+            break
+        base = parent
+
+    return Discovery(error=(
+        f"Error: no test command could be discovered in {start} or its parent "
+        f"directories. Looked for: {', '.join(_MARKERS)}. Run the suite with "
+        f"execute_shell if you know the command, or tell the user which one to use."))
+
+
+def _discover_here(base: Path) -> Discovery | None:
+    """The runner for exactly this directory, or None if it carries no marker."""
     if _has_pytest(base):
         return Discovery(command="pytest -q", framework="pytest")
     if _npm_has_test_script(base):
@@ -78,11 +109,7 @@ def discover_command(root: str) -> Discovery:
         return Discovery(command="./gradlew test", framework="gradle")
     if (base / "mvnw").exists():
         return Discovery(command="./mvnw -q test", framework="maven")
-
-    return Discovery(error=(
-        f"Error: no test command could be discovered in {base}. Looked for: "
-        f"{', '.join(_MARKERS)}. Run the suite with execute_shell if you know "
-        f"the command, or tell the user which one to use."))
+    return None
 
 
 def trim_output(text: str, *, max_chars: int = 4000) -> str:
