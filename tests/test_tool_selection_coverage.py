@@ -103,3 +103,17 @@ def test_name_index_labels_tool_families(engine):
     assert "- Git: git_branch" in index
     assert "git_status" in index.split("- Git:", 1)[1].split("\n", 1)[0]
     assert "- CLI Anything: cli_anything_info" in index
+
+
+@pytest.mark.parametrize("name", ["edit_file", "run_tests", "generate_tests"])
+def test_the_editing_and_testing_tools_survive_selection(engine, name):
+    # hybrid is the default, so an unpinned edit tool can be ranked away and the
+    # model falls back to write_file, overwriting whole files.
+    assert name in engine._TOOL_SELECTION_PINNED
+
+
+def test_the_nudge_only_names_tools_the_model_can_see(engine):
+    # Mandatory prompt text naming an unexposed tool lands the model in
+    # unknown-tool recovery (see the _TOOL_SELECTION_PINNED comment).
+    exposed = engine._TOOL_SELECTION_PINNED | engine._TOOL_SELECTION_ALWAYS
+    assert "generate_tests" in exposed

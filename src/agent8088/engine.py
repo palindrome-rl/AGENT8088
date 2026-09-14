@@ -2635,6 +2635,12 @@ _TOOL_SELECTION_ALWAYS = frozenset({"last_output", "describe_tool"})
 _TOOL_SELECTION_PINNED = frozenset({
     "write_file", "read_text", "execute_shell",
     "web_search", "browse_page", "convert_document", "create_document",
+    # Third group, same asymmetry as the first. An edit tool ranked away sends
+    # the model back to write_file, which overwrites the whole file -- a worse
+    # outcome than the one the ranking was saving tokens for. generate_tests is
+    # named in the turn-end nudge, so it must be exposed for the same reason the
+    # mandatory-routing tools are.
+    "edit_file", "run_tests", "generate_tests",
 })
 _TOOL_INDEX_CACHE = {}
 _TOOL_SEARCH_DEFAULT_LIMIT = 8
