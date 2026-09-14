@@ -62,33 +62,31 @@ def test_fixed_overhead_within_budget():
     test_hybrid_request_is_the_path_that_actually_ships for the default mode,
     which is what the 11,000 target was really about.
 
-    14,750 -> 16,000. Three things moved it, and they are independent:
+    14,750 -> 16,000 -> 11,100. The middle number was measured while merging
+    this branch, before the layered prompt landed; it is recorded here only
+    because the reasoning still holds and the arithmetic does not.
 
-    1. Drift that predates all of it. development @ e416abcc measures 14,887,
-       so this assertion was already red on a clean checkout and guarding
-       nothing. Most of that is the archify skill: one catalogue entry, ~193,
-       the body staying out because the skill is progressive.
-    2. repository_read, ~375. 7th largest of 49 schemas at the time, in line
-       with document_read which it parallels, and its nine arguments are the
-       API its design note specified.
-    3. The diff-edit and autotest tools here, three more (52 total), with
-       their schemas in this worst case and their names in the tool index.
+    Three things had pushed the worst case up: drift predating all of it
+    (development @ e416abcc measured 14,887, mostly the archify catalogue
+    entry, ~193); repository_read, ~375; and the three tools added here.
+    Then the layered system prompt cut the shared half by roughly half again,
+    and the merged tree measures 10,818 at 52 tools.
 
-    Measured on the merged tree: 15,713. The ceiling sits at 16,000 rather
-    than snug against that, because a ceiling with no headroom fails on the
-    next one-line description edit and gets raised reflexively, which is how
-    a budget stops being one.
+    So the ceiling comes DOWN rather than up. Leaving it at 16,000 would have
+    left 48% slack -- the prompt could nearly double and this would still
+    pass, which is not a budget. 11,100 keeps ~2.6% headroom: enough that a
+    one-line description edit does not fail it, little enough that a real
+    regression does.
 
-    2 and 3 both carry the evidence the tool index purchase did. For
-    repository_read, a live A/B on glm-5.3 -- an orientation question against
-    docs/ cost 51 tool calls over 872.9s and returned a wrong answer without
-    it, against 4 calls over 154.7s and the correct one with it. Paying fixed
-    tokens to avoid 40 read_text round trips is that same trade one layer up.
+    The repository_read purchase still carries its evidence: a live A/B on
+    glm-5.3, orientation question against docs/, cost 51 tool calls over
+    872.9s and a wrong answer without it, against 4 calls over 154.7s and the
+    correct one with it.
     """
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 16_000, f"fixed overhead regressed to {total} tokens"
+    assert total < 11_100, f"fixed overhead regressed to {total} tokens"
 
 
 def test_hybrid_request_is_the_path_that_actually_ships():
@@ -114,12 +112,15 @@ def test_hybrid_request_is_the_path_that_actually_ships():
     bought back ~220 tokens. Trimming further starts removing guidance the
     model needs to use edit_file correctly at all.
 
-    11,100 -> 11,500 on merging into development. The 11,027 above was measured
-    on a branch point that did not yet carry repository_read or the archify
-    skill; with both, the same pinned+always set measures 11,246. No tool was
-    added by the merge itself -- this is the two prior purchases showing up in
-    the realistic path as well as the worst case, which is what they were
-    always going to do.
+    11,100 -> 6,600 on merging into development. The realistic path was
+    always the one worth guarding, and the layered prompt is felt here most:
+    the same pinned+always set now measures 6,351, against 11,027 on this
+    branch's original base. repository_read and archify are both in that
+    figure; they cost what they cost, and the shared prompt around them got
+    much smaller.
+
+    6,600 rather than 11,500 for the same reason as above: a ceiling with 81%
+    slack is decoration.
 
     """
     prompt = E.current_system_prompt(native_tools=True)
@@ -128,7 +129,7 @@ def test_hybrid_request_is_the_path_that_actually_ships():
                 if name in E.TOOL_SPECS}
     schema = json.dumps(E.build_tools_def(selected))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 11_500, f"hybrid request overhead regressed to {total} tokens"
+    assert total < 6_600, f"hybrid request overhead regressed to {total} tokens"
 
 
 def test_every_tool_name_is_visible_to_native_providers():

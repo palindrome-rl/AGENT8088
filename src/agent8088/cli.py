@@ -396,48 +396,7 @@ def _active_provider_name():
 
 def _session_system_prompt():
     specs = _active_tool_specs()
-    # catalogue=False when the provider takes native tool calls: the JSON
-    # schema array already describes every tool, and sending the prose
-    # catalogue as well costs ~3,500 tokens on every request. This prompt is
-    # passed as system_prompt=, which outranks engine.current_system_prompt(),
-    # so the decision has to be made here too -- patching only the engine
-    # saves nothing on the CLI path.
-    native = A._native_tools_enabled(A.build_tools_def(specs))
-    prompt = (A.BASE_SYSTEM_PROMPT + "\n"
-              + A.render_tool_docs(specs, catalogue=not native)
-              # Hybrid selection narrows the schema array to ~17 of 48 tools.
-              # The index (~256 tokens) keeps every name visible so a retrieval
-              # miss is recoverable: the model can see the tool exists and load
-              # its schema, instead of guessing arguments blind.
-              + (A.render_tool_name_index(specs) if native else "")
-              + A.render_skill_docs(_active_skills()) + A.render_persona(A.USER_FILE)
-              + A.render_runtime_context())
-    # Inject current permission mode so the model knows what it can/can't do right now
-    prompt += f"\n\n## Current Permission Mode: {A.PERMISSION_MODE}\n"
-    if A.PERMISSION_MODE == "plan-only":
-        prompt += ("You are in plan mode RIGHT NOW. Direct writes and mutations are "
-                   "BLOCKED — do NOT call write_file, execute_shell, git_commit, "
-                   "git_push, run_sandboxed, schedule_task, or browse_page directly. "
-                   "Use read_text and safe shell commands (ls, cat, grep, git status, "
-                   "git diff, git log) to find out what is really there, then call "
-                   "present_plan with the whole plan as markdown text for the user to "
-                   "approve. After the approval lands the permission mode changes and "
-                   "you carry out the steps with ordinary tool calls. Do NOT claim any "
-                   "of it is done before that happens.\n")
-    elif A.PERMISSION_MODE == "full-auto":
-        prompt += ("You are in full-auto mode. Permission-gated tools are allowed without "
-                   "prompts when sandboxed. Code execution is refused when neither the native "
-                   "sandbox nor Docker is available. Catastrophic commands and credential path "
-                   "writes are always blocked.\n")
-    elif A.PERMISSION_MODE == "edit":
-        prompt += ("You are in edit mode. Permission-gated tools are allowed when sandboxed. "
-                   "Use a tool only when necessary; code execution is refused when no sandbox "
-                   "is available. Catastrophic commands and credential path writes are always "
-                   "blocked.\n")
-    else:
-        prompt += ("You are in readonly mode. Reads and safe shell commands are allowed. "
-                   "Writes and mutations require user approval.\n")
-    return prompt
+    return A.compose_system_prompt(specs=specs, skills=_active_skills())
 
 
 # ---------------------------------------------------------------------------
