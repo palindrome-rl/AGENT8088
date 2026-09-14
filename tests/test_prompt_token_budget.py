@@ -61,11 +61,24 @@ def test_fixed_overhead_within_budget():
     blind path costs far more than the index it replaces. See
     test_hybrid_request_is_the_path_that_actually_ships for the default mode,
     which is what the 11,000 target was really about.
+
+    14,750 -> 15,500 buys two capabilities, on the same "deliberate purchase"
+    terms. The archify skill costs ~193: one catalogue entry, the body stays
+    out because the skill is progressive. repository_read costs ~375 -- 7th
+    largest of 49 schemas, in line with document_read which it parallels, and
+    its nine arguments are the API the design note specified.
+
+    The repository_read purchase carries the same kind of evidence the tool
+    index did. Live A/B on glm-5.3, orientation question against docs/:
+    without it, 51 tool calls over 872.9s and a wrong answer -- 18 files, two
+    subtrees missed; with it, 4 calls over 154.7s and the correct 36. Paying
+    375 fixed tokens to avoid 40 read_text round trips is that same trade one
+    layer up.
     """
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 14_750, f"fixed overhead regressed to {total} tokens"
+    assert total < 15_500, f"fixed overhead regressed to {total} tokens"
 
 
 def test_hybrid_request_is_the_path_that_actually_ships():

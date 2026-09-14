@@ -382,7 +382,7 @@ def _active_tool_specs():
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
     if A.PERMISSION_MODE == "plan-only":
         allowed &= {
-            "present_plan", "read_text", "calculate", "describe_capabilities", "describe_tool",
+            "present_plan", "read_text", "repository_read", "calculate", "describe_capabilities", "describe_tool",
             "git_status", "git_diff", "git_log", "last_output", "web_search",
             "view_skill",
         }

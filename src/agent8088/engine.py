@@ -7665,6 +7665,48 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                detail=target)
         return _exec_create_subagent(args)
 
+    if name == "repository_read":
+        from . import repository_access
+        from contextlib import nullcontext
+        source = str(args.get("source") or "").strip()
+        if not source:
+            return _tool_arg_missing_error(name, "source")
+        def check_repository():
+            _raise_if_interrupted(_document_interrupt)
+            if _active_budget is not None and _active_budget.exceeded():
+                raise ValueError("Repository access reached the active turn budget.")
+        def permitted_repository(path):
+            resolved = path.resolve()
+            if _is_sensitive_path(str(resolved)):
+                return False
+            if ".web-attachments" in [p.lower() for p in resolved.parts]:
+                return _document_root is not None and resolved.is_relative_to(_document_root)
+            return True
+        try:
+            remote = "://" in source
+            if remote:
+                source = repository_access.remote_url(source)
+                blocked = _egress_check(source) or _ssrf_check(source)
+                if blocked:
+                    return blocked
+                if PERMISSION_MODE == "plan-only" and allow_plan:
+                    return _plan_mode_block_message()
+                if not check_permission("shell", host=True, approval_key=approval_key):
+                    return request_escalation(target_mode="edit", paths=[source],
+                        change_type="network", reason="Repository ingestion needs a temporary GitHub checkout.")
+                context = repository_access.checkout(source, str(args.get("revision") or ""), check_repository)
+            else:
+                context = nullcontext(resolve_user_path(source))
+            progress = _document_progress("Reading repository…") if _document_progress else nullcontext()
+            with progress, context as root:
+                if not permitted_repository(root):
+                    return "Error: Repository source is protected or outside this attachment session."
+                return repository_access.inspect(root, args, permitted=permitted_repository,
+                    redact=lambda text: _redact_secrets(_strip_special_tokens(text)), check=check_repository)
+        except (OSError, ValueError) as exc:
+            return efficiency.tool_error("repository_read_failed", str(exc),
+                "Check source, filters, dependency installation and permissions; retry overview after changes.", recoverable=True)
+
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
     if mode == "read_text":
@@ -10433,7 +10475,7 @@ def _tool_result_for_model(name: str, result: str) -> str:
          spotting a summary line.
       3. Cut the middle, not the tail, and say where the full text went.
     """
-    if name == "document_read":
+    if name in {"document_read", "repository_read"}:
         # document_access bounds its own payload and supplies an exact cursor.
         # Truncation here would invalidate that continuation contract.
         return result
