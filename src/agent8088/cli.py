@@ -2158,7 +2158,7 @@ COMMAND_SPECS = (
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
     ("cost", "/cost [task-id]", "Summarize recorded model-call telemetry — estimates only; unknown costs stay unknown", ()),
-    ("memory", "/memory [on|off|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
+    ("memory", "/memory [on|off|engine|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
     ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
     ("history", "/history", "Show the current conversation", ()),
     ("trace", "/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace", ()),
@@ -4715,6 +4715,26 @@ def _memory_set_enabled(want: bool) -> None:
     A.configure_memory()
 
 
+MEMORY_ENGINES = ("native", "mem0")
+
+
+def _memory_set_engine(name: str) -> None:
+    """Point memory at a different engine. Neither store's data is touched."""
+    name = str(name).strip().lower()
+    if name not in MEMORY_ENGINES:
+        raise ValueError(f"unknown memory engine: {name}")
+    A.update_simple_config(A.CONFIG_PATH, {"memory_engine": name})
+    A.APP_CONFIG["memory_engine"] = name
+    A.configure_memory()
+
+
+def _describe_embedder(info) -> str:
+    if not info:
+        return "—"
+    dims = f", {info['dims']}d" if info.get("dims") else ""
+    return f"{info.get('model') or '?'} ({info.get('provider') or '?'}{dims})"
+
+
 def _show_memory_status():
     report = A.memory.status()
     if not report["enabled"]:
@@ -4727,13 +4747,19 @@ def _show_memory_status():
     table.add_column("Setting", style="#237dd7")
     table.add_column("Value", style="#237dd7")
     engine_name = report.get("engine", "native")
-    table.add_row("Engine", f"{engine_name} ({'Mem0 graph/vector' if engine_name == 'mem0' else 'SQLite BM25+vector'})")
+    requested = report.get("engine_configured", engine_name)
+    engine_label = f"{engine_name} ({'Mem0 graph/vector' if engine_name == 'mem0' else 'SQLite BM25+vector'})"
+    if requested != engine_name:
+        # Silent degradation is the failure mode worth shouting about: the user
+        # asked for mem0 and is writing to SQLite instead.
+        engine_label += f" [yellow]— {requested} was requested but is unavailable[/yellow]"
+    table.add_row("Engine", engine_label)
     table.add_row("Memories", str(report["count"]))
     table.add_row("Scope", report["user_id"]
                   + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
     if engine_name == "mem0":
         table.add_row("Vector DB", "qdrant (~/.agent8088/mem0)")
-        table.add_row("Embedder", "sentence-transformers/all-MiniLM-L6-v2 (fastembed local)")
+        table.add_row("Embedder", _describe_embedder(report.get("embedder_info")))
     else:
         where = report.get("embed_provider") or "active provider"
         if report["embedder_ok"]:
@@ -4765,7 +4791,8 @@ def _show_memory_status():
         table.add_row("Error", report["error"])
     console.print(table)
     console.print("[dim]/memory search <query> · /memory add <text> · "
-                  "/memory forget <id> · /memory notify off|on|verbose · "
+                  "/memory forget <id> · /memory engine native|mem0 · "
+                  "/memory notify off|on|verbose · "
                   "/memory test · /memory clear · /memory off[/dim]")
 
 
@@ -4843,6 +4870,44 @@ def cmd_memory(rest):
                       f"[dim]— {report['count']} memories at {report['db_path']}[/dim]")
         if not report["embedder_ok"]:
             _report_embedder_unavailable(report)
+        return
+
+    if action == "engine":
+        report = A.memory.status()
+        if not argument:
+            other = [n for n in MEMORY_ENGINES if n != report.get("engine_configured")]
+            console.print(f"[green]memory engine: {report.get('engine_configured')}[/green]")
+            console.print(f"[dim]/memory engine {other[0]} to switch[/dim]")
+            return
+        try:
+            _memory_set_engine(argument)
+        except ValueError:
+            console.print(f"[red]usage:[/red] /memory engine {'|'.join(MEMORY_ENGINES)}")
+            return
+        report = A.memory.status()
+        if not report["enabled"]:
+            # No store is open while memory is off, so there is no live engine to
+            # verify against -- claiming the requested one is unavailable would be
+            # wrong. Record the choice and let /memory on resolve it.
+            console.print(f"[green]memory engine: {argument}[/green] "
+                          "[dim]— takes effect when you /memory on[/dim]")
+            return
+        live = report.get("engine", "native")
+        if live != argument:
+            console.print(f"[yellow]{argument} is unavailable — still using "
+                          f"{live}.[/yellow]")
+            if argument == "mem0":
+                flag = ("install.ps1 -WithMem0" if os.name == "nt"
+                        else "install.sh --memory mem0")
+                console.print(f"[dim]  install it by rerunning the installer: {flag}[/dim]")
+        else:
+            console.print(f"[green]memory engine: {live}[/green] "
+                          f"[dim]— {report['count']} memories, embedder "
+                          f"{_describe_embedder(report.get('embedder_info')) if live == 'mem0' else report['embed_model']}[/dim]")
+        # Switching never migrates or deletes; say so, or it reads like data loss.
+        kept = "~/.agent8088/mem0" if live == "native" else A.MEMORY_DB_PATH
+        console.print(f"[dim]The {'mem0' if live == 'native' else 'native'} store is "
+                      f"untouched at {kept} — switch back any time.[/dim]")
         return
 
     if not A.memory.enabled():

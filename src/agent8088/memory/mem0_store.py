@@ -49,6 +49,10 @@ class Mem0MemoryStore:
         self.vector_store_type = str(self.config.get("vector_store", "qdrant")).strip().lower()
         self._memory = None
         self._available = None
+        # Which embedder the fallback chain below actually settled on. /memory
+        # reports this instead of guessing, since the chain can land anywhere
+        # from Ollama to a local fastembed model depending on what is installed.
+        self.embedder_info = None
 
     def _init_memory(self):
         if self._available is False:
@@ -153,6 +157,11 @@ class Mem0MemoryStore:
                 cfg["llm"] = llm_section
             if embedder_section:
                 cfg["embedder"] = embedder_section
+                self.embedder_info = {
+                    "provider": embedder_section["provider"],
+                    "model": embedder_section["config"].get("model", ""),
+                    "dims": embed_dims,
+                }
 
             if hasattr(memory_cls, "from_config"):
                 self._memory = memory_cls.from_config(cfg)
@@ -335,4 +344,5 @@ class Mem0MemoryStore:
             "available": self.available(),
             "vector_store": self.vector_store_type,
             "path": str(self.path),
+            "embedder": self.embedder_info,
         }

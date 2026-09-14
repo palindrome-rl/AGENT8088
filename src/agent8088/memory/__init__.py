@@ -387,7 +387,12 @@ def status() -> dict:
     """Live state for `/memory` and describe_capabilities."""
     report = {
         "enabled": enabled(),
+        # What config asked for. `engine` below is corrected to whatever the
+        # store actually opened, since store() degrades mem0 -> native silently
+        # and reporting the request would point the user at the wrong database.
+        "engine_configured": _RUNTIME.get("engine_name", "native"),
         "engine": _RUNTIME.get("engine_name", "native"),
+        "embedder_info": None,
         "db_path": str(_RUNTIME.get("db_path") or ""),
         "user_id": user_id(),
         "embed_model": _RUNTIME.get("embed_model", ""),
@@ -406,6 +411,14 @@ def status() -> dict:
     }
     active_store = store()
     if active_store is not None:
+        store_status = {}
+        if hasattr(active_store, "status"):
+            try:
+                store_status = active_store.status() or {}
+            except Exception as exc:
+                log.debug("memory store status failed: %s", exc)
+        report["engine"] = store_status.get("engine", "native")
+        report["embedder_info"] = store_status.get("embedder")
         try:
             report["count"] = active_store.count(user_id=report["user_id"])
             if hasattr(active_store, "stale_vector_count"):

@@ -180,6 +180,9 @@ NODE_VERSION="22.11.0"
 # Options
 SKIP_SETUP=false
 BRANCH="$REPO_BRANCH"
+# Empty until --memory, $AGENT8088_INSTALL_MEM0 or the prompt resolves it.
+MEMORY_CHOICE=""
+MEMORY_ENGINE=""
 IS_INTERACTIVE=true
 FRESH_INSTALL=false
 CONFIG_CREATED=false
@@ -189,6 +192,7 @@ GATEWAY_EXTRAS_INSTALLED=false
 SEARCH_EXTRAS_INSTALLED=false
 CHROMIUM_INSTALLED=false
 OCR_INSTALLED=false
+MEM0_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
 SANDBOX_INSTALLED=false
@@ -206,15 +210,23 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-setup) SKIP_SETUP=true; shift ;;
         --branch)     BRANCH="$2"; shift 2 ;;
+        --memory)
+            case "$2" in
+                native|mem0) MEMORY_CHOICE="$2" ;;
+                *) echo "Unknown memory backend: $2 (expected native or mem0)"; exit 1 ;;
+            esac
+            shift 2
+            ;;
         -h|--help)
             echo "Agent8088 Installer"
             echo ""
             echo "Usage: curl -fsSL <url> | bash -s -- [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --skip-setup   Skip interactive setup wizard"
-            echo "  --branch NAME  Git branch to install (default: $REPO_BRANCH)"
-            echo "  -h, --help      Show this help"
+            echo "  --skip-setup       Skip interactive setup wizard"
+            echo "  --branch NAME      Git branch to install (default: $REPO_BRANCH)"
+            echo "  --memory BACKEND   Memory engine: native (default) or mem0"
+            echo "  -h, --help         Show this help"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -228,6 +240,58 @@ log_info()    { echo -e "\033[0;36m→\033[0m $1"; }
 log_success() { echo -e "\033[0;32m✓\033[0m $1"; }
 log_warn()    { echo -e "\033[0;33m⚠\033[0m $1"; }
 log_error()   { echo -e "\033[0;31m✗\033[0m $1"; }
+
+# Which memory engine to install: echoes "native" or "mem0".
+#
+# native needs nothing beyond the core install (SQLite plus the embedder). mem0
+# pulls mem0ai, fastembed, qdrant-client, grpcio and sqlalchemy and downloads an
+# embedding model on first use, so it is opt-in. The non-interactive default is
+# native for the same reason every other heavy optional stage skips unattended:
+# a piped `curl | bash` must not spend minutes on something nobody asked for.
+resolve_memory_choice() {
+    if [ -n "$MEMORY_CHOICE" ]; then
+        echo "$MEMORY_CHOICE"
+        return
+    fi
+    case "${AGENT8088_INSTALL_MEM0:-}" in
+        1|y|yes|true|mem0)    echo "mem0"; return ;;
+        0|n|no|false|native)  echo "native"; return ;;
+    esac
+    if [ "$IS_INTERACTIVE" != true ] || [ -n "${CI:-}" ]; then
+        echo "native"
+        return
+    fi
+    # Prompt on the terminal, not stdout: this function's stdout is the answer.
+    {
+        echo ""
+        echo "    Agent8088 remembers facts across sessions. Pick the backend:"
+        echo "      native - SQLite with keyword + semantic search. No extra downloads."
+        echo "      mem0   - Mem0 with a Qdrant vector store and LLM fact extraction."
+        echo "               Adds ~200 MB of dependencies plus an embedding model."
+        echo "    Either can be changed later with /memory engine <name>."
+    } >&2
+    local answer=""
+    while [ "$answer" != "native" ] && [ "$answer" != "mem0" ]; do
+        printf "Which memory backend? [native/mem0]: " >&2
+        read -r answer || { echo "native"; return; }
+        answer="$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    done
+    echo "$answer"
+}
+
+# Rewrite an existing memory_engine line rather than appending, so rerunning the
+# installer cannot stack duplicates for the config parser to resolve.
+set_configured_memory_engine() {
+    local config_file="$1" engine="$2"
+    [ -f "$config_file" ] || return 1
+    if grep -q '^[[:space:]]*memory_engine[[:space:]]*=' "$config_file"; then
+        # -i differs between GNU and BSD sed, so write a temp file and move it.
+        sed "s|^[[:space:]]*memory_engine[[:space:]]*=.*|memory_engine=$engine|" \
+            "$config_file" > "$config_file.tmp" && mv "$config_file.tmp" "$config_file"
+    else
+        echo "memory_engine=$engine" >> "$config_file"
+    fi
+}
 
 # ----------------------------------------------------------------------------
 # Timeouts for the network stages
@@ -979,6 +1043,35 @@ install_deps() {
     fi
     [ "$OCR_INSTALLED" = true ] && log_success "OCR engine and models installed"
 
+    # --- Memory backend (optional [mem0] extra) ---
+    # The engine is recorded in config.txt either way, so a config asking for
+    # mem0 can never outlive the extra that makes it work: without it memory
+    # degrades to native silently at runtime, which is what the choice prevents.
+    MEMORY_ENGINE="$(resolve_memory_choice)"
+    if [ "$MEMORY_ENGINE" = "mem0" ]; then
+        log_info "Installing the mem0 memory backend (mem0ai, fastembed, qdrant)..."
+        _mem0_rc=0
+        if [ "$DISTRO" = "termux" ]; then
+            run_with_timeout "$T_PIP" pip install -e ".[mem0]" >/dev/null 2>&1 || _mem0_rc=$?
+        else
+            run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+                -e "$INSTALL_DIR[mem0]" >/dev/null 2>&1 || _mem0_rc=$?
+        fi
+        if [ "$_mem0_rc" -eq 0 ]; then
+            MEM0_INSTALLED=true
+            log_success "mem0 memory backend installed"
+        else
+            # Non-fatal: native needs nothing extra, so a wheel that will not
+            # build here must not fail the install. Fall back to it honestly.
+            MEMORY_ENGINE="native"
+            warn_stage "$_mem0_rc" "$T_PIP" "mem0 memory backend" \
+                "memory will use the native engine instead" \
+                "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[mem0]\""
+        fi
+    else
+        log_info "Using the native memory backend (SQLite, no extra downloads)."
+    fi
+
     # --- Playwright (optional [browser] extra) + Chromium binary ---
     # playwright degrades gracefully at runtime (engine.py: _playwright_available()),
     # so it's an optional extra, not a core dep - a platform/Python combo without
@@ -1494,6 +1587,18 @@ drop_config() {
         chmod 600 "$AGENT8088_HOME/config.txt"
     fi
 
+    # Point the config at whichever engine actually got installed, including in
+    # the preserved-config branch: a stale memory_engine=mem0 with the extra
+    # missing degrades to native silently at runtime, which is the one outcome
+    # this choice exists to prevent.
+    if [ -n "$MEMORY_ENGINE" ]; then
+        if set_configured_memory_engine "$AGENT8088_HOME/config.txt" "$MEMORY_ENGINE"; then
+            log_success "Memory engine set to $MEMORY_ENGINE"
+        else
+            log_warn "Could not set memory_engine in $AGENT8088_HOME/config.txt"
+        fi
+    fi
+
     # Set AGENT8088_CONFIG env var so the engine finds the user config.
     # Persist to shell rc files.
     local config_line="export AGENT8088_CONFIG=\"$AGENT8088_HOME/config.txt\""
@@ -1538,6 +1643,11 @@ verify_install() {
         echo "  OCR:      ready (models without vision can read attached images)"
     else
         echo "  OCR:      unavailable - attached images need a vision-capable model"
+    fi
+    if [ "$MEM0_INSTALLED" = true ]; then
+        echo "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
+    else
+        echo "  Memory:   native SQLite (rerun with --memory mem0 to add the mem0 engine)"
     fi
     if [ "$WHATSAPP_BRIDGE_READY" = true ]; then
         echo "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"

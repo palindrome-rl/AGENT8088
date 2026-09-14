@@ -14,6 +14,8 @@ param(
     [switch]$TerminalBootstrap,
     [switch]$WithLibreOffice,
     [switch]$SkipLibreOffice,
+    [switch]$WithMem0,
+    [switch]$SkipMem0,
     [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = "",
@@ -201,6 +203,8 @@ $GatewayExtrasInstalled = $false
 $SearchExtrasInstalled = $false
 $ChromiumInstalled = $false
 $OcrInstalled = $false
+$Mem0Installed = $false
+$MemoryEngine = ""
 $NodeInstalled = $false
 $WhatsAppBridgeReady = $false
 $SandboxInstalled = $false
@@ -913,6 +917,96 @@ function Install-LibreOffice {
     return $false
 }
 
+# ----------------------------------------------------------------------------
+# Memory backend - which engine `memory_engine` in config.txt points at.
+#
+# native needs nothing extra: it is SQLite plus the embedder the core install
+# already provides. mem0 pulls mem0ai, fastembed, qdrant-client, grpcio and
+# sqlalchemy, then downloads an embedding model on first use, so it is opt-in
+# for the same reason LibreOffice is.
+#
+# Both paths write memory_engine to config.txt, so what is installed and what is
+# configured cannot disagree -- a config asking for mem0 with the extra missing
+# degrades to native silently at runtime, which is exactly the confusion this
+# choice exists to prevent.
+# ----------------------------------------------------------------------------
+# Kept out of Install-Mem0Extra so the tests can stub the console read, and
+# guarded on $NonInteractive for the same reason as LibreOffice: Read-Host
+# returns empty immediately on a headless host and the loop would never end.
+function Read-Mem0Consent {
+    if ($WithMem0 -and $SkipMem0) {
+        throw "-WithMem0 and -SkipMem0 cannot be used together."
+    }
+    if ($WithMem0) { return $true }
+    if ($SkipMem0) { return $false }
+    if ($env:AGENT8088_INSTALL_MEM0 -match '^(1|y|yes|true|mem0)$') { return $true }
+    if ($env:AGENT8088_INSTALL_MEM0 -match '^(0|n|no|false|native)$') { return $false }
+    $runningInCI = $env:CI -match '^(1|y|yes|true)$'
+    if ($NonInteractive -or $runningInCI) {
+        Write-Info "Non-interactive - using the native memory backend."
+        return $false
+    }
+
+    Write-Host ""
+    Write-Host "    Agent8088 remembers facts across sessions. Pick the backend:"
+    Write-Host "      native - SQLite with keyword + semantic search. No extra downloads." -ForegroundColor Gray
+    Write-Host "      mem0   - Mem0 with a Qdrant vector store and LLM fact extraction." -ForegroundColor Gray
+    Write-Host "               Adds ~200 MB of dependencies plus an embedding model."
+    Write-Host "    Either can be changed later with /memory engine <name>."
+    do {
+        $rawAnswer = Read-Host "Which memory backend? [native/mem0]"
+        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
+    } while ($answer -notin @("native", "mem0"))
+    return ($answer -eq "mem0")
+}
+
+# Records the engine choice in config.txt. Rewrites an existing memory_engine
+# line rather than appending, so rerunning the installer cannot stack duplicates
+# that the config parser would resolve last-one-wins.
+function Set-ConfiguredMemoryEngine {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$Engine
+    )
+    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
+    try {
+        $lines = @(Get-Content -LiteralPath $ConfigPath -ErrorAction Stop)
+        $found = $false
+        $updated = foreach ($line in $lines) {
+            if ($line -match '^\s*memory_engine\s*=') { $found = $true; "memory_engine=$Engine" }
+            else { $line }
+        }
+        if (-not $found) { $updated = @($updated) + "memory_engine=$Engine" }
+        Set-Content -LiteralPath $ConfigPath -Value $updated -Encoding UTF8 -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Warn "Could not set memory_engine in $ConfigPath ($($_.Exception.Message))."
+        return $false
+    }
+}
+
+function Install-Mem0Extra {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonExe,
+        [Parameter(Mandatory = $true)][string]$SourceDir
+    )
+    Write-Info "Installing the mem0 memory backend (mem0ai, fastembed, qdrant)..."
+    $result = Invoke-WithTimeout -FilePath $script:UvCmd `
+        -Arguments @("pip", "install", "--python", $PythonExe, "-e", "$SourceDir[mem0]") `
+        -TimeoutSec $TPip -Activity "Installing the mem0 memory backend"
+    if ($result.ExitCode -eq 0) {
+        Write-Success "mem0 memory backend installed"
+        return $true
+    }
+    # Non-fatal on purpose: memory falls back to the native engine, which needs
+    # nothing extra, so a wheel that will not build here must not fail the install.
+    Write-StageWarning -Result $result -TimeoutSec $TPip `
+        -What "mem0 memory backend" `
+        -Consequence "memory will use the native engine instead" `
+        -Fix "rerun the installer with -WithMem0, or: $script:UvCmd pip install --python `"$PythonExe`" -e `"$SourceDir[mem0]`""
+    return $false
+}
+
 function ConvertTo-PowerShellLiteral {
     param([AllowNull()][string]$Value)
     return "'" + ([string]$Value).Replace("'", "''") + "'"
@@ -938,6 +1032,8 @@ function Get-InstallerInvocation {
     # An env var needs no plumbing here; Start-Process inherits the environment.
     if ($WithLibreOffice) { $arguments += " -WithLibreOffice" }
     if ($SkipLibreOffice) { $arguments += " -SkipLibreOffice" }
+    if ($WithMem0) { $arguments += " -WithMem0" }
+    if ($SkipMem0) { $arguments += " -SkipMem0" }
     if ($ForTerminalBootstrap) { $arguments += " -TerminalBootstrap" }
 
     if ($PreferLocalScript -and -not $InstallerSourceUrl -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
@@ -1925,6 +2021,21 @@ function Install-Gateway-Extras {
             }
         }
 
+        # Memory backend. The engine is recorded in config.txt either way, so a
+        # config asking for mem0 can never outlive the extra that makes it work.
+        if (Read-Mem0Consent) {
+            if (Test-StageComplete "mem0") {
+                $script:Mem0Installed = $true
+                Write-Success "mem0 memory backend already installed (skipping)"
+            } elseif (Install-Mem0Extra -PythonExe $py -SourceDir $InstallDir) {
+                $script:Mem0Installed = $true
+                Set-StageComplete "mem0"
+            }
+        } else {
+            Write-Info "Using the native memory backend (SQLite, no extra downloads)."
+        }
+        $script:MemoryEngine = if ($script:Mem0Installed) { "mem0" } else { "native" }
+
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
         if (Test-StageComplete "chromium") {
@@ -2445,6 +2556,16 @@ function Drop-Config {
         Protect-ConfigFile $configPath
     }
 
+    # Point the config at whichever engine actually got installed, including in
+    # the preserved-config branch: a stale memory_engine=mem0 with the extra
+    # missing degrades to native silently at runtime, which is the one outcome
+    # this choice exists to prevent.
+    if ($script:MemoryEngine) {
+        if (Set-ConfiguredMemoryEngine -ConfigPath $configPath -Engine $script:MemoryEngine) {
+            Write-Success "Memory engine set to $($script:MemoryEngine)"
+        }
+    }
+
     # Set AGENT8088_CONFIG env var
     [Environment]::SetEnvironmentVariable("AGENT8088_CONFIG", $configPath, "User")
     $env:AGENT8088_CONFIG = $configPath
@@ -2482,6 +2603,11 @@ function Verify-Install {
         Write-Host "  OCR:      ready (models without vision can read attached images)"
     } else {
         Write-Host "  OCR:      unavailable - attached images need a vision-capable model"
+    }
+    if ($script:Mem0Installed) {
+        Write-Host "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
+    } else {
+        Write-Host "  Memory:   native SQLite (rerun with -WithMem0 to add the mem0 engine)"
     }
     if ($script:WhatsAppBridgeReady) {
         Write-Host "  WhatsApp: Node bridge ready (run 'node bridge.js --pair' to pair)"
@@ -2577,6 +2703,11 @@ Write-Banner
 Set-InstallerExitStatus -ExitCode 0
 if ($WithLibreOffice -and $SkipLibreOffice) {
     Write-Err "-WithLibreOffice and -SkipLibreOffice cannot be used together."
+    Set-InstallerExitStatus -ExitCode 1
+    return
+}
+if ($WithMem0 -and $SkipMem0) {
+    Write-Err "-WithMem0 and -SkipMem0 cannot be used together."
     Set-InstallerExitStatus -ExitCode 1
     return
 }
