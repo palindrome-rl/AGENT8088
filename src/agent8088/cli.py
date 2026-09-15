@@ -938,20 +938,22 @@ def _highlighted_lines(lines, path):
     return highlighted
 
 
-def _numbered_lines(text, limit=None, path=""):
+def _numbered_lines(text, limit=None, path="", start=1):
     """An editor-style listing: dim right-aligned line numbers, highlighted source.
 
     Returns (renderable, total_lines) — the total counts the whole file, not just
-    the rows shown, so the caller can report "Read 108 lines" honestly.
+    the rows shown, so the caller can report "Read 108 lines" honestly. `start`
+    is the real line number of the first row, for a page that begins partway
+    into a file rather than at its top.
     """
     lines = _source_lines(text)
     if limit is None:
         limit = 200 if S.verbose == "full" else 40
     total = len(lines)
     shown = lines[:limit]
-    width = max(len(str(len(shown))), 2)
+    width = max(len(str(start + len(shown) - 1)), 2)
     body = Text()
-    for number, line in enumerate(_highlighted_lines(shown, path), 1):
+    for number, line in enumerate(_highlighted_lines(shown, path), start):
         body.append(f"{number:>{width}}  ", style="dim")
         body.append_text(line)
         body.append("\n")
@@ -1036,6 +1038,78 @@ def _diff_block(diff_lines, limit=None, path=""):
 
 
 
+def _repository_summary(payload):
+    """The headline for a repository_read payload — what the call found."""
+    files = payload.get("files")
+    size = payload.get("bytes")
+    scope = payload.get("retrieval_scope")
+    parts = []
+    if isinstance(files, int):
+        parts.append(f"{files} file{'s' if files != 1 else ''}")
+    if isinstance(size, int):
+        parts.append(_human_size(size))
+    if isinstance(scope, str) and scope:
+        parts.append(scope)
+    return " · ".join(parts) or "repository context"
+
+
+def _repository_result(result):
+    """repository_read's JSON envelope as something worth looking at.
+
+    Returns a list of renderables, or None to fall through to the generic
+    preview — the payload is a single line of JSON carrying snapshot_id,
+    guidance and skipped counts alongside the evidence, and numbering that as
+    if it were source filled the terminal with one unreadable row per call.
+    """
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("error"), str):
+        return [Text(f"  ⎿  {payload['error']}", style="red")]
+
+    summary = _repository_summary(payload)
+
+    if isinstance(payload.get("text"), str):
+        # An actual file page: show the file, numbered from where the page
+        # starts, which is the one part of the payload a reader wants.
+        path = str(payload.get("path") or "")
+        start = payload.get("line_start")
+        start = start if isinstance(start, int) and start > 0 else 1
+        body, total = _numbered_lines(payload["text"], path=path, start=start)
+        head = f"{path} — {total} line{'s' if total != 1 else ''}" if path else summary
+        return [Text(f"  ⎿  Read {head}", style="dim"), Padding(body, (0, 0, 0, 5))]
+
+    matches = payload.get("matches")
+    if isinstance(matches, list):
+        body = Text()
+        for match in matches[:12]:
+            if not isinstance(match, dict):
+                continue
+            body.append(f"{match.get('path', '?')}:{match.get('line', '?')}\n", style="dim")
+        head = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {summary}"
+        out = [Text(f"  ⎿  {head}", style="dim")]
+        if body.plain:
+            out.append(Padding(body, (0, 0, 0, 5)))
+        return out
+
+    paths = payload.get("paths")
+    out = [Text(f"  ⎿  Surveyed {summary}", style="dim")]
+    if isinstance(paths, list) and paths:
+        body = Text()
+        limit = 40 if S.verbose == "full" else 12
+        for entry in paths[:limit]:
+            body.append(f"{entry}\n", style="dim")
+        hidden = len(paths) - min(len(paths), limit)
+        if hidden > 0:
+            body.append(f"… {hidden} more path{'s' if hidden != 1 else ''}",
+                        style="dim italic")
+        out.append(Padding(body, (0, 0, 0, 5)))
+    return out
+
+
 def on_result(name, result):
     if S.verbose == "off":
         return
@@ -1078,6 +1152,13 @@ def on_result(name, result):
         console.print(Panel(Text(result), title="[#237dd7]subagent result[/#237dd7]",
                             box=box.ROUNDED, border_style="#0077B6"))
         return
+
+    if name == "repository_read":
+        rendered = _repository_result(result)
+        if rendered is not None:
+            for item in rendered:
+                console.print(item)
+            return
 
     if mode == "read_text":
         body, total = _numbered_lines(result, path=_last_call_paths.get(name, ""))
