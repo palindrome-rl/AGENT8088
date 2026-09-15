@@ -46,6 +46,24 @@ def _result_diff():
 
 
 def _tool_result_payload(name: str, result: str) -> dict:
+    if name == "review_code":
+        try:
+            review = json.loads(result)
+            if isinstance(review, dict) and review.get("engine") == "open-code-review":
+                lines = [f"Code review: {review.get('status', 'unknown')}"]
+                if review.get("status") == "prepared":
+                    lines.append("Scope prepared only; code has not yet been reviewed.")
+                for finding in (review.get("findings") or [])[:8]:
+                    lines.append(f"{finding.get('severity', 'info')}: {finding.get('path', '?')}:{finding.get('start_line', '?')} — {str(finding.get('message', ''))[:300]}")
+                if len(review.get("findings") or []) > 8:
+                    lines.append("More findings available in the stored review.")
+                if review.get("review_id"):
+                    lines.append(f"Stored review: {review['review_id']} (reopen with /review --resume)")
+                if (review.get("coverage") or {}).get("partial"):
+                    lines.append("Warning: review coverage is partial.")
+                result = "\n".join(lines)
+        except (ValueError, TypeError, AttributeError):
+            pass
     payload = {"type": "tool_result", "name": name,
                "result": scrub_markup(result)[:5000]}
     try:

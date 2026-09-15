@@ -37,3 +37,16 @@ def test_one_review_is_re_checked_not_replayed(monkeypatch):
 def test_unknown_review_is_404(monkeypatch):
     monkeypatch.setattr(W._eng(), "reopen_review", lambda review_id, root=None: None)
     assert TestClient(W.app).get("/api/reviews/rev-nope").status_code == 404
+
+
+def test_review_result_is_readable_and_bounded():
+    import json
+    result = W._tool_result_payload("review_code", json.dumps({
+        "engine": "open-code-review", "status": "complete", "review_id": "rev-test",
+        "coverage": {"partial": True}, "findings": [
+            {"path": "a.py", "start_line": 3, "severity": "high", "message": "wrong percentage"}
+        ]}))
+    assert "a.py:3" in result["result"]
+    assert "rev-test" in result["result"]
+    assert "partial" in result["result"]
+    assert "{\"engine\"" not in result["result"]

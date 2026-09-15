@@ -196,6 +196,7 @@ SEARCH_EXTRAS_INSTALLED=false
 CHROMIUM_INSTALLED=false
 OCR_INSTALLED=false
 REVIEW_INSTALLED=false
+REVIEW_EXECUTABLE=""
 # Pinned: the delegation JSON contract is version-specific.
 OPEN_CODE_REVIEW_VERSION="1.12.1"
 MEM0_INSTALLED=false
@@ -427,6 +428,26 @@ set_configured_memory_engine() {
     else
         echo "memory_engine=$engine" >> "$config_file"
     fi
+}
+
+set_configured_code_review() {
+    local config_file="$1" executable="$2" tmp_file="${1}.review.$$"
+    [ -f "$config_file" ] || return 1
+    local saw_enabled=false saw_executable=false line trimmed
+    : > "$tmp_file" || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        case "$trimmed" in
+            open_code_review_enabled=*)
+                printf '%s\n' 'open_code_review_enabled=1' >> "$tmp_file"; saw_enabled=true ;;
+            open_code_review_executable=*)
+                printf 'open_code_review_executable=%s\n' "$executable" >> "$tmp_file"; saw_executable=true ;;
+            *) printf '%s\n' "$line" >> "$tmp_file" ;;
+        esac
+    done < "$config_file"
+    [ "$saw_enabled" = true ] || printf '%s\n' 'open_code_review_enabled=1' >> "$tmp_file"
+    [ "$saw_executable" = true ] || printf 'open_code_review_executable=%s\n' "$executable" >> "$tmp_file"
+    mv "$tmp_file" "$config_file"
 }
 
 # ----------------------------------------------------------------------------
@@ -1181,38 +1202,6 @@ install_deps() {
     fi
     [ "$OCR_INSTALLED" = true ] && log_success "OCR engine and models installed"
 
-    # --- Code review engine (optional, OpenCodeReview) ---
-    # Not the document OCR above: that is optical character recognition and
-    # this is a code reviewer that happens to share the letters. Installed
-    # into an isolated npm prefix under the install directory rather than
-    # globally, and the config points at the platform binary the package
-    # ships -- never the .cmd/.sh shim, which would route every review
-    # through a shell. Non-fatal: review_code reports what to install.
-    log_info "Installing code review engine (optional, for /review)..."
-    _ocrrev_rc=0
-    _ocrrev_prefix="$INSTALL_DIR/code-review"
-    if ! command -v npm >/dev/null 2>&1; then
-        record_skip "code review engine" "npm not found" "install Node.js, then rerun the installer"
-    else
-        run_with_timeout "$T_PIP" npm install --silent --no-fund --no-audit \
-            --prefix "$_ocrrev_prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" \
-            >/dev/null 2>&1 || _ocrrev_rc=$?
-        _ocrrev_bin=""
-        for _candidate in "$_ocrrev_prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
-            [ -f "$_candidate" ] && _ocrrev_bin="$_candidate" && break
-        done
-        if [ "$_ocrrev_rc" -eq 0 ] && [ -n "$_ocrrev_bin" ]; then
-            REVIEW_INSTALLED=true
-            printf "open_code_review_executable=%s\n" "$_ocrrev_bin" >> "$CONFIG_FILE"
-            log_success "Code review engine installed"
-        else
-            warn_stage "$_ocrrev_rc" "$T_PIP" "code review engine" \
-                "/review and review_code will report the install command instead of running" \
-                "npm install --prefix \"$_ocrrev_prefix\" @alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION"
-        fi
-    fi
-
-
     # --- Memory backend (optional [mem0] extra) ---
     # The engine is recorded in config.txt either way, so a config asking for
     # mem0 can never outlive the extra that makes it work: without it memory
@@ -1579,6 +1568,45 @@ install_node_bridge() {
 # until the model is there. The message names the exact command to fix it.
 EMBED_MODEL="nomic-embed-text"
 
+install_code_review() {
+    # Run after install_node_bridge so a fresh machine can use managed Node.
+    local prefix="$INSTALL_DIR/code-review" candidate rc=0
+    for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
+        [ -f "$candidate" ] || continue
+        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
+        REVIEW_EXECUTABLE="$candidate"
+        break
+    done
+    if [ -n "$REVIEW_EXECUTABLE" ]; then
+        REVIEW_INSTALLED=true
+        log_success "Code review engine already installed (skipping)"
+        return
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        record_skip "code review engine" "npm not found" "install Node.js, then rerun the installer"
+        return
+    fi
+    log_info "Installing code review engine (optional, for /review)..."
+    run_with_timeout "$T_PIP" npm install --silent --no-fund --no-audit \
+        --prefix "$prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" \
+        >/dev/null 2>&1 || rc=$?
+    REVIEW_EXECUTABLE=""
+    for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
+        [ -f "$candidate" ] || continue
+        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
+        REVIEW_EXECUTABLE="$candidate"
+        break
+    done
+    if [ "$rc" -eq 0 ] && [ -n "$REVIEW_EXECUTABLE" ]; then
+        REVIEW_INSTALLED=true
+        log_success "Code review engine installed"
+    else
+        warn_stage "$rc" "$T_PIP" "code review engine" \
+            "/review and review_code will report the install command instead of running" \
+            "npm install --prefix \"$prefix\" @alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION"
+    fi
+}
+
 install_embedding_model() {
     if ! command -v ollama >/dev/null 2>&1; then
         # A cloud provider (OpenAI, Gemini, Cerebras...) serves /embeddings itself,
@@ -1825,6 +1853,11 @@ drop_config() {
             log_warn "Could not set memory_engine in $AGENT8088_HOME/config.txt"
         fi
     fi
+    if [ "$REVIEW_INSTALLED" = true ] && [ -n "$REVIEW_EXECUTABLE" ]; then
+        if set_configured_code_review "$AGENT8088_HOME/config.txt" "$REVIEW_EXECUTABLE"; then
+            log_success "Code review enabled with the managed executable"
+        fi
+    fi
 
     # Set AGENT8088_CONFIG env var so the engine finds the user config.
     # Persist to shell rc files.
@@ -1998,6 +2031,7 @@ main() {
     clone_repo
     install_deps
     install_node_bridge
+    install_code_review
     install_embedding_model
     install_native_sandbox
     setup_path

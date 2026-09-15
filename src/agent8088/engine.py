@@ -7981,9 +7981,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if not check_permission("shell", host=True, approval_key=approval_key):
             return request_escalation(target_mode="edit", paths=[str(args.get("repo") or PROJECT_ROOT)],
                 change_type="inspection", reason="OpenCodeReview needs to inspect the local Git repository.")
+        pr_workspace = None
+        def review_check():
+            _raise_if_interrupted(_document_interrupt)
+            if _active_budget is not None and _active_budget.exceeded():
+                raise ValueError("Review reached the active turn budget.")
         try:
             pr_url = str(args.get("pull_request") or "").strip()
-            pr_workspace = None
             if pr_url:
                 # A separate grant from reading a local repository: this one
                 # reaches the network and lands somebody else's code on disk.
@@ -8001,14 +8005,10 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 root = resolve_user_path(str(args.get("repo") or PROJECT_ROOT))
             if _is_sensitive_path(str(root)):
                 raise ValueError("Protected repository path.")
-            def review_check():
-                _raise_if_interrupted(_document_interrupt)
-                if _active_budget is not None and _active_budget.exceeded():
-                    raise ValueError("Review preparation reached the active turn budget.")
-            permitted = lambda path: _path_is_allowed(path) and not _is_sensitive_path(str(path))
+            permitted = lambda path: (path.is_relative_to(root) if pr_workspace else _path_is_allowed(path)) and not _is_sensitive_path(str(path))
             runner = lambda argv, cwd, env=None: open_code_review.run_process(
                 argv, cwd, check=review_check, kill=_kill_detached_process,
-                timeout=_review_timeout(args, timeout), extra_env=env)
+                timeout=_review_timeout(args, timeout) if env else 30, extra_env=env)
             mode_choice = str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower()
             if mode_choice not in ("native", "delegated", "auto"):
                 raise ValueError("mode must be native, delegated, or auto.")
@@ -8018,35 +8018,34 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                     "Native review needs an OpenAI-compatible provider with a key. "
                     "Configure one, or set mode=delegated to review with this agent instead.")
             if credentials:
-                # auto falls back rather than failing: the design note asks for
-                # delegated mode to cover providers native mode cannot reach, but
-                # only when the caller did not name a mode explicitly.
-                try:
-                    result = open_code_review.review(root, args, APP_CONFIG,
-                        credentials=credentials, permitted=permitted, run=runner)
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    if mode_choice == "native":
-                        raise
-                    result = open_code_review.prepare(root, args, APP_CONFIG,
-                        permitted=permitted, run=lambda argv, cwd: runner(argv, cwd))
+                result = open_code_review.review(root, args, APP_CONFIG,
+                    credentials=credentials, permitted=permitted, run=runner)
             else:
                 result = open_code_review.prepare(root, args, APP_CONFIG,
                     permitted=permitted, run=lambda argv, cwd: runner(argv, cwd))
             if isinstance(result.get("usage"), dict) and result["usage"].get("total_tokens"):
                 record_review_usage(result["usage"])
-            if result.get("findings") is not None:
+            # Redact once, before anything keeps a copy. A review quotes source
+            # lines, so a repository holding the user's own key produces a finding
+            # containing it -- and the store outlives the turn the returned string
+            # belongs to. Redacting only on the way out left the durable artifact
+            # less protected than the ephemeral one.
+            safe = json.loads(_redact_secrets(_strip_special_tokens(
+                json.dumps(result, ensure_ascii=False))))
+            if safe.get("findings") is not None:
                 from . import review_store
                 # A failed save costs the history, never the review: the
                 # result is in hand and the caller is waiting for it.
-                stored = review_store.save(REVIEW_STORE_PATH, root, result)
+                stored = review_store.save(REVIEW_STORE_PATH, root, safe)
                 if stored:
-                    result["review_id"] = stored
+                    safe["review_id"] = stored
+            return json.dumps(safe, ensure_ascii=False)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return efficiency.tool_error("code_review_failed", _redact_secrets(str(exc)),
+                "Check the pinned executable, repository and revisions. Review did not complete; retry explicitly with mode=delegated if desired.", recoverable=True)
+        finally:
             if pr_workspace:
                 shutil.rmtree(pr_workspace, ignore_errors=True)
-            return _redact_secrets(_strip_special_tokens(json.dumps(result, ensure_ascii=False)))
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            return efficiency.tool_error("code_review_prepare_failed", _redact_secrets(str(exc)),
-                "Check the pinned executable, repository and revisions; preparation did not complete.", recoverable=True)
 
     if mode == "cli_anything":
         return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
@@ -9918,15 +9917,25 @@ REVIEW_STORE_PATH = _agent_data_dir() / "reviews.db"
 
 def review_history(limit: int = 20) -> list:
     from . import review_store
-    return review_store.recent(REVIEW_STORE_PATH, limit)
+    return [row for row in review_store.recent(REVIEW_STORE_PATH, limit)
+            if _path_is_allowed(Path(row["repo"])) and not _is_sensitive_path(row["repo"])]
 
 
 def reopen_review(review_id: str, root=None):
     """A stored review with every finding re-checked against the files now."""
     from . import open_code_review, review_store
-    base = Path(root) if root else PROJECT_ROOT
+    stored = review_store.load(REVIEW_STORE_PATH, review_id)
+    if stored is None:
+        return None
+    base = Path(stored["repository"]).resolve()
+    if root is not None and Path(root).resolve() != base:
+        return None
+    if not _path_is_allowed(base) or _is_sensitive_path(str(base)):
+        return None
     return review_store.reopen(REVIEW_STORE_PATH, review_id, base,
-                               recheck=open_code_review.recheck_finding)
+        recheck=lambda root, finding: (
+            not _is_sensitive_path(str(root / str(finding.get("path") or "")))
+            and open_code_review.recheck_finding(root, finding)))
 
 
 def _review_timeout(args, tool_timeout: int) -> int:
@@ -9957,7 +9966,7 @@ def _review_credentials():
     provider = PROVIDERS.get(name) or {}
     base = str(provider.get("base_url") or "").strip()
     key = _provider_api_key(provider) if provider else ""
-    model = provider.get("model") or MODEL_NAME
+    model = MODEL_NAME or provider.get("model")
     if not base or not key or not model:
         return None
     if str(provider.get("api_mode", "openai")).lower() != "openai":

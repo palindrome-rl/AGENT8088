@@ -1,6 +1,7 @@
 import json
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +86,7 @@ def test_prepared_scope_carries_the_diff_it_selected(tmp_path, monkeypatch):
     about; withholding it is what turns preparation into a scavenger hunt.
     """
     import json as _json
+
     from agent8088 import open_code_review as R
     monkeypatch.setattr(R, "executable", lambda config: "ocr")
 
@@ -114,6 +116,7 @@ def test_prepared_scope_carries_the_diff_it_selected(tmp_path, monkeypatch):
 def test_attached_diffs_are_bounded(tmp_path, monkeypatch):
     """A whole-repository review must not paste the repository into the turn."""
     import json as _json
+
     from agent8088 import open_code_review as R
     monkeypatch.setattr(R, "executable", lambda config: "ocr")
 
@@ -165,6 +168,7 @@ def test_native_findings_are_normalised_and_positions_validated(tmp_path, monkey
     later fix at an arbitrary file. Keep it as a warning, never as a finding.
     """
     import json as _json
+
     from agent8088 import open_code_review as R
     monkeypatch.setattr(R, "executable", lambda config: "ocr")
     (tmp_path / "billing.py").write_text("x\n" * 40, encoding="utf-8")
@@ -189,6 +193,7 @@ def test_native_findings_are_normalised_and_positions_validated(tmp_path, monkey
 def test_native_credentials_never_reach_argv_or_output(tmp_path, monkeypatch):
     """The token goes through a transient environment, never the command line."""
     import json as _json
+
     from agent8088 import open_code_review as R
     monkeypatch.setattr(R, "executable", lambda config: "ocr")
     seen = {}
@@ -198,6 +203,8 @@ def test_native_credentials_never_reach_argv_or_output(tmp_path, monkeypatch):
         seen["env"] = dict(env or {})
         if argv[1:2] == ["version"]:
             return f"open-code-review v{R.PINNED_VERSION} (a) windows/amd64"
+        tools = argv[argv.index("--tools") + 1]
+        seen["tools"] = _json.loads(Path(tools).read_text(encoding="utf-8"))
         return _json.dumps({"status": "complete", "comments": [], "summary": {}})
 
     result = R.review(tmp_path, {"scope": "workspace"}, {},
@@ -207,6 +214,8 @@ def test_native_credentials_never_reach_argv_or_output(tmp_path, monkeypatch):
     assert all("SUPERSECRET" not in " ".join(a) for a in seen["argv"])
     assert seen["env"]["OCR_LLM_TOKEN"] == "SUPERSECRET"
     assert seen["env"]["OCR_CONFIG_PATH"], "config must be redirected away from the user's own"
+    assert {item["name"] for item in seen["tools"]} == {
+        "task_done", "code_comment", "file_read_diff"}
     assert "SUPERSECRET" not in _json.dumps(result)
 
 
@@ -271,11 +280,119 @@ def test_a_well_formed_pull_request_url_parses():
 def test_pull_request_checkout_never_runs_hooks_or_submodules(tmp_path):
     """The fetch is the moment a hostile repository would get to execute."""
     calls = []
+    def run(argv, cwd):
+        calls.append(argv)
+        if argv[0] == "gh":
+            return json.dumps({"base": {"sha": "a" * 40}, "head": {"sha": "a" * 40}})
+        return "a" * 40 + "\n"
     review.checkout_pr("https://github.com/o/r/pull/7", tmp_path / "wt",
-                       run=lambda argv, cwd: calls.append(argv) or "abc123\n")
+                       run=run)
 
     flat = [" ".join(argv) for argv in calls]
     assert any("core.hooksPath=" in line for line in flat)
     assert any("--no-recurse-submodules" in line for line in flat)
     assert any("protocol.allow=never" in line for line in flat)
-    assert all("pull/7/head:ocr-pr-head" in line or "pull/" not in line for line in flat)
+    assert any("gh api repos/o/r/pulls/7" in line for line in flat)
+    assert any("merge-base " + "a" * 40 + " ocr-pr-head" in line for line in flat)
+    assert any("checkout --quiet --detach ocr-pr-head" in line for line in flat)
+
+
+def test_stderr_progress_does_not_corrupt_json(tmp_path):
+    output = review.run_process(
+        [sys.executable, "-c", "import sys; print('progress', file=sys.stderr); print('{}')"],
+        tmp_path, check=lambda: None, kill=lambda p: p.kill())
+    assert json.loads(output) == {}
+
+
+@pytest.mark.parametrize("args", [
+    {"scope": "range", "base": "main", "commit": "HEAD"},
+    {"scope": "commit", "commit": "HEAD", "head": "main"},
+])
+def test_incompatible_scope_arguments(tmp_path, args):
+    with pytest.raises(ValueError):
+        review._scope_flags(tmp_path, args)
+
+
+def test_end_line_must_exist(tmp_path):
+    (tmp_path / "x.py").write_text("x = 1\n", encoding="utf-8")
+    findings, _ = review.normalise({"comments": [
+        {"path": "x.py", "start_line": 1, "end_line": 99}]}, tmp_path, permitted=lambda p: True)
+    assert findings[0]["position_valid"] is False
+
+
+def test_pr_failure_cleans_workspace_and_callback_exists(engine, monkeypatch, tmp_path):
+    engine.APP_CONFIG["open_code_review_enabled"] = "1"
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "check_permission", lambda *a, **k: True)
+    workspace = tmp_path / "pr-checkout"
+    workspace.mkdir()
+    monkeypatch.setattr(engine.tempfile, "mkdtemp", lambda **k: str(workspace))
+    def checkout(url, destination, *, run):
+        run(["git", "version"], workspace)
+        raise ValueError("fetch failed")
+    monkeypatch.setattr(review, "checkout_pr", checkout)
+    output = engine.run_tool("review_code", {"pull_request": "https://github.com/o/r/pull/1"})
+    assert "code_review_failed" in output
+    assert not workspace.exists()
+
+
+def test_reopen_does_not_use_unrelated_project(engine, monkeypatch, tmp_path):
+    from agent8088 import review_store
+    repo = tmp_path / "reviewed"
+    repo.mkdir()
+    (repo / "a.py").write_text("bad()\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "REVIEW_STORE_PATH", tmp_path / "reviews.db")
+    monkeypatch.setattr(engine, "_path_is_allowed", lambda p: p == repo)
+    monkeypatch.setattr(engine, "_is_sensitive_path", lambda p: False)
+    key = review_store.save(engine.REVIEW_STORE_PATH, repo, {"findings": [
+        {"path": "a.py", "start_line": 1, "existing_code": "bad()", "position_valid": True}]})
+    assert engine.reopen_review(key)["findings"][0]["position_valid"]
+    assert engine.reopen_review(key, root=tmp_path) is None
+
+
+def test_a_stored_review_is_redacted_before_it_is_written(tmp_path, engine, monkeypatch):
+    """The durable copy must not be less protected than the ephemeral one.
+
+    A review deliberately quotes source lines, so a repository holding the
+    user's own key in a config file produces a finding containing it. The tool
+    result was redacted on the way out but the store was written first, so the
+    secret persisted in reviews.db in plaintext while the model saw
+    [redacted] -- backwards, and the durable artifact is the one that lasts.
+    """
+    secret = "sk-live-canary-9f3a1b7c-should-never-persist"
+    monkeypatch.setattr(engine, "_SECRET_VALUES", [secret])
+    monkeypatch.setattr(engine, "REVIEW_STORE_PATH", tmp_path / "reviews.db")
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setitem(engine.APP_CONFIG, "open_code_review_enabled", "1")
+
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+
+    captured = {}
+
+    def fake_review(root, args, config, *, credentials, permitted, run):
+        return {"schema_version": 1, "status": "complete", "mode": "native",
+                "engine": "open-code-review", "engine_version": review.PINNED_VERSION,
+                "coverage": {"reviewed": 1, "findings": 1, "partial": False},
+                "usage": {}, "findings": [
+                    {"id": "a.py:1:0", "path": "a.py", "start_line": 1, "end_line": 1,
+                     "severity": "high", "category": "security",
+                     "message": "hard-coded credential " + secret,
+                     "existing_code": 'KEY = "' + secret + '"',
+                     "suggested_code": "", "position_valid": True,
+                     "verification": "unverified"}],
+                "warnings": []}
+
+    monkeypatch.setattr(review, "review", fake_review)
+    monkeypatch.setattr(engine, "_review_credentials",
+                        lambda: {"url": "http://x/v1", "token": "t", "model": "m"})
+    (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
+
+    returned = engine.run_tool("review_code", {"repo": str(tmp_path), "mode": "native"})
+    assert secret not in returned, "the returned result leaked the secret"
+
+    from agent8088 import review_store
+    rows = review_store.recent(tmp_path / "reviews.db")
+    assert rows, "the review was not stored at all"
+    stored = review_store.load(tmp_path / "reviews.db", rows[0]["id"])
+    captured["blob"] = __import__("json").dumps(stored)
+    assert secret not in captured["blob"], "the STORED review kept the secret in plaintext"

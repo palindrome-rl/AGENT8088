@@ -90,3 +90,12 @@ def test_a_broken_store_never_breaks_the_review(tmp_path):
     assert review_store.save(blocked, tmp_path, _result()) == ""
     assert review_store.load(blocked, "rev-abc") is None
     assert review_store.recent(blocked) == []
+
+
+def test_connections_release_the_database_file(tmp_path):
+    store = tmp_path / "reviews.db"
+    review_id = review_store.save(store, tmp_path, _result())
+    review_store.load(store, review_id)
+    review_store.recent(store)
+    store.unlink()  # Windows refuses this if any sqlite connection remains open.
+    assert not store.exists()

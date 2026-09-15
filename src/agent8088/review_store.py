@@ -17,6 +17,7 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -50,7 +51,7 @@ def save(store_path, repo, result: dict) -> str:
     review_id = "rev-" + uuid.uuid4().hex[:12]
     path = Path(store_path)
     try:
-        with _connect(path) as connection:
+        with closing(_connect(path)) as connection, connection:
             connection.execute(
                 "INSERT INTO reviews (id, created, repo, mode, engine_version, status,"
                 " findings, payload) VALUES (?,?,?,?,?,?,?,?)",
@@ -72,9 +73,9 @@ def load(store_path, review_id: str) -> dict | None:
     if not isinstance(review_id, str) or not review_id.startswith("rev-"):
         return None
     try:
-        with _connect(Path(store_path)) as connection:
+        with closing(_connect(Path(store_path))) as connection:
             row = connection.execute(
-                "SELECT payload FROM reviews WHERE id = ?", (review_id,)).fetchone()
+                "SELECT payload, repo FROM reviews WHERE id = ?", (review_id,)).fetchone()
     except (sqlite3.Error, OSError):
         return None
     if not row:
@@ -83,12 +84,16 @@ def load(store_path, review_id: str) -> dict | None:
         payload = json.loads(row[0])
     except ValueError:
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    payload["repository"] = row[1]
+    payload["review_id"] = review_id
+    return payload
 
 
 def recent(store_path, limit: int = 20) -> list:
     try:
-        with _connect(Path(store_path)) as connection:
+        with closing(_connect(Path(store_path))) as connection:
             rows = connection.execute(
                 "SELECT id, created, repo, mode, engine_version, status, findings"
                 " FROM reviews ORDER BY created DESC LIMIT ?", (max(1, min(limit, 200)),)).fetchall()

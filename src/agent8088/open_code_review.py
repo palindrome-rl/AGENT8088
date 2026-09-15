@@ -29,6 +29,10 @@ def run_process(argv, root, *, check, kill, timeout=30, extra_env=None):
     allowed = {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR",
                "PATHEXT", "LANG", "LC_ALL", "USERPROFILE", "HOME"}
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    if Path(argv[0]).stem.lower() in {"gh", "git"}:
+        for key in ("APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
+            if key in os.environ:
+                env[key] = os.environ[key]
     env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
                GIT_CONFIG_GLOBAL=os.devnull, OCR_ENABLE_TELEMETRY="0")
     # Native mode passes the endpoint, model and token here rather than on the
@@ -40,18 +44,23 @@ def run_process(argv, root, *, check, kill, timeout=30, extra_env=None):
     output = bytearray()
     overflow = threading.Event()
     with subprocess.Popen(argv, cwd=root, env=env, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **options) as process:
-        def drain():
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options) as process:
+        def drain(stream, destination):
+            consumed = 0
             while True:
-                chunk = process.stdout.read(65536)
+                chunk = stream.read(65536)
                 if not chunk:
                     return
-                remaining = MAX_OUTPUT_BYTES - len(output)
-                output.extend(chunk[:max(0, remaining)])
+                remaining = MAX_OUTPUT_BYTES - consumed
+                if destination is not None:
+                    destination.extend(chunk[:max(0, remaining)])
+                consumed += len(chunk)
                 if len(chunk) > remaining:
                     overflow.set()
-        reader = threading.Thread(target=drain, daemon=True)
+        reader = threading.Thread(target=drain, args=(process.stdout, output), daemon=True)
+        errors = threading.Thread(target=drain, args=(process.stderr, None), daemon=True)
         reader.start()
+        errors.start()
         deadline = time.monotonic() + timeout
         try:
             while process.poll() is None:
@@ -59,17 +68,19 @@ def run_process(argv, root, *, check, kill, timeout=30, extra_env=None):
                 if overflow.is_set():
                     raise ValueError("OpenCodeReview output exceeded 4 MiB; narrow the review scope.")
                 if time.monotonic() >= deadline:
-                    raise ValueError("OpenCodeReview preparation timed out; narrow the review scope.")
+                    raise ValueError("OpenCodeReview timed out; narrow the review scope or increase the configured timeout.")
                 time.sleep(0.05)
             reader.join(timeout=2)
+            errors.join(timeout=2)
             check()
-            if reader.is_alive() or overflow.is_set():
+            if reader.is_alive() or errors.is_alive() or overflow.is_set():
                 raise ValueError("OpenCodeReview returned excessive or incomplete output.")
             if process.returncode:
                 raise ValueError(f"OpenCodeReview exited with status {process.returncode}; check the selected revisions and repository.")
         except BaseException:
             kill(process)
             reader.join(timeout=2)
+            errors.join(timeout=2)
             raise
     return output.decode("utf-8", errors="strict")
 
@@ -111,17 +122,8 @@ def prepare(root: Path, args: dict, config: dict, *, permitted, run) -> dict:
     version = run([binary, "version"], root)
     if not re.search(r"\bv" + re.escape(PINNED_VERSION) + r"\b", version):
         raise ValueError(f"OpenCodeReview {PINNED_VERSION} is required; installed version differs.")
-    scope = args.get("scope") or "workspace"
-    flags = ["--repo", str(root), "--format", "json"]
-    if scope == "range":
-        flags += ["--from", validate_ref(args.get("base", "")),
-                  "--to", validate_ref(args.get("head") or "HEAD")]
-    elif scope == "commit":
-        flags += ["--commit", validate_ref(args.get("commit", ""))]
-    elif scope != "workspace":
-        raise ValueError("scope must be workspace, range, or commit.")
-    elif any(args.get(key) for key in ("base", "head", "commit")):
-        raise ValueError("Workspace scope does not accept commit or range arguments.")
+    scope, flags = _scope_flags(root, args)
+    flags += ["--format", "json"]
     preview = json.loads(run([binary, "delegate", "preview", *flags], root))
     if not isinstance(preview, dict) or preview.get("schema_version") != "1":
         raise ValueError("Unsupported OpenCodeReview preview schema.")
@@ -148,7 +150,7 @@ def prepare(root: Path, args: dict, config: dict, *, permitted, run) -> dict:
         if budget <= 0:
             truncated = True
             break
-        argv = ["git", "-c", "core.quotepath=false", "--no-pager", "diff", "--no-color", "--unified=3"]
+        argv = ["git", "-c", "core.quotepath=false", "--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3"]
         if scope == "range":
             argv += [f"{args.get('base')}...{args.get('head') or 'HEAD'}"]
         elif scope == "commit":
@@ -164,11 +166,11 @@ def prepare(root: Path, args: dict, config: dict, *, permitted, run) -> dict:
             item["diff_error"] = "diff unavailable; inspect this file directly"
             continue
         allowance = min(MAX_FILE_DIFF_BYTES, budget)
-        if len(patch) > allowance:
+        if len(patch.encode("utf-8")) > allowance:
             marker = chr(10) + "[diff truncated]"
-            patch = patch[:max(0, allowance - len(marker))] + marker
+            patch = patch.encode("utf-8")[:max(0, allowance - len(marker))].decode("utf-8", errors="ignore") + marker
             truncated = True
-        budget -= len(patch)
+        budget -= len(patch.encode("utf-8"))
         item["diff"] = patch
     preview["diff_truncated"] = truncated
 
@@ -190,15 +192,41 @@ CATEGORIES = ("bug", "security", "performance", "maintainability", "style", "tes
 MAX_FINDINGS = 500
 MAX_FIELD = 4000
 
+# Native OpenCodeReview normally exposes repository-wide search/read tools to
+# its model. Agent8088's permission gate is path-aware, so that would let the
+# child bypass protected-file rules after the initial diff selection. The
+# restricted registry keeps the upstream reflection/positioning pipeline while
+# exposing only the selected diff and the two result tools.
+RESTRICTED_TOOLS = json.loads(r'''[
+  {"name":"task_done","plan_task":false,"main_task":true,"definition":{
+    "name":"task_done","description":"Finish after every selected diff is assessed.",
+    "parameters":{"type":"object","properties":{"state":{"type":"string","enum":["DONE","FAILED"]}},"required":["state"]}}},
+  {"name":"code_comment","plan_task":false,"main_task":true,"definition":{
+    "name":"code_comment","description":"Report concrete issues in newly added diff lines.",
+    "parameters":{"type":"object","properties":{"comments":{"type":"array","items":{
+      "type":"object","properties":{"content":{"type":"string"},"existing_code":{"type":"string"},
+      "suggestion_code":{"type":"string"},"path":{"type":"string"},
+      "category":{"type":"string","enum":["bug","security","performance","maintainability","style","test","other"]},
+      "severity":{"type":"string","enum":["critical","high","medium","low"]}},
+      "required":["content","existing_code","category","severity","path"]}}},"required":["comments"]}}},
+  {"name":"file_read_diff","plan_task":true,"main_task":true,"definition":{
+    "name":"file_read_diff","description":"Read changes for selected review files only.",
+    "parameters":{"type":"object","properties":{"path_array":{"type":"array","items":{"type":"string"}}},"required":["path_array"]}}}
+]''')
+
 
 def _scope_flags(root, args):
     """Shared by both modes so a range means the same thing in each."""
     scope = args.get("scope") or "workspace"
     flags = ["--repo", str(root)]
     if scope == "range":
+        if args.get("commit"):
+            raise ValueError("Range scope does not accept commit.")
         flags += ["--from", validate_ref(args.get("base", "")),
                   "--to", validate_ref(args.get("head") or "HEAD")]
     elif scope == "commit":
+        if args.get("base") or args.get("head"):
+            raise ValueError("Commit scope does not accept base or head.")
         flags += ["--commit", validate_ref(args.get("commit", ""))]
     elif scope != "workspace":
         raise ValueError("scope must be workspace, range, or commit.")
@@ -225,7 +253,7 @@ def normalise(payload, root, *, permitted):
     if comments is None:
         comments = payload.get("findings") or []
     if not isinstance(comments, list):
-        raise ValueError("OpenCodeReview returned no usable comment list.")
+        raise ValueError("OpenCodeReview returned no usable comment list.")  # noqa: TRY004 -- external schema
     if len(comments) > MAX_FINDINGS:
         warnings.append(str(len(comments)) + " findings returned; only the first "
                         + str(MAX_FINDINGS) + " were kept.")
@@ -265,8 +293,8 @@ def normalise(payload, root, *, permitted):
         valid = start > 0
         if valid:
             try:
-                lines = target.read_text(encoding="utf-8", errors="replace").count(chr(10)) + 1
-                valid = start <= lines and end >= start
+                lines = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+                valid = start <= end <= lines
             except OSError:
                 valid = False
         findings.append({
@@ -298,11 +326,16 @@ def review(root, args, config, *, credentials, permitted, run):
         raise ValueError("OpenCodeReview " + PINNED_VERSION
                          + " is required; installed version differs.")
     scope, flags = _scope_flags(root, args)
-    argv = [binary, "review", "--format", "json", "--audience", "agent", *flags]
-    if args.get("background"):
-        argv += ["--background", _clip(args["background"], 2000)]
     with tempfile.TemporaryDirectory(prefix="agent8088-ocr-") as transient:
+        tools_path = Path(transient) / "tools.json"
+        tools_path.write_text(json.dumps(RESTRICTED_TOOLS), encoding="utf-8")
+        argv = [binary, "review", "--format", "json", "--audience", "agent",
+                "--tools", str(tools_path), *flags]
+        if args.get("background"):
+            argv += ["--background", _clip(args["background"], 2000)]
         env = {
+            "HOME": transient,
+            "USERPROFILE": transient,
             "OCR_CONFIG_PATH": str(Path(transient) / "config.json"),
             "OCR_LLM_URL": credentials["url"],
             "OCR_LLM_TOKEN": credentials["token"],
@@ -318,10 +351,15 @@ def review(root, args, config, *, credentials, permitted, run):
     except ValueError as exc:
         raise ValueError("OpenCodeReview did not return usable JSON.") from exc
     if not isinstance(payload, dict):
-        raise ValueError("OpenCodeReview returned an unexpected result shape.")
+        raise ValueError("OpenCodeReview returned an unexpected result shape.")  # noqa: TRY004 -- external schema
     findings, warnings = normalise(payload, root, permitted=permitted)
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    warnings.extend(_clip(w) for w in (payload.get("warnings") or []) if isinstance(w, str))
     status = str(payload.get("status") or "unknown")
+    if status == "success":
+        status = "complete"
+    if summary.get("budget_exceeded"):
+        warnings.append("Review stopped at its token budget; coverage is incomplete.")
     return {
         "schema_version": 1, "status": status,
         "engine": "open-code-review", "engine_version": PINNED_VERSION,
@@ -462,6 +500,21 @@ def checkout_pr(url: str, destination, *, run):
     run(["git", *hardened, "-C", str(target), "fetch", "--quiet", "--depth", "50",
          "--no-recurse-submodules", "origin",
          "pull/" + str(number) + "/head:ocr-pr-head"], target)
-    base = run(["git", "-C", str(target), "rev-parse", "ocr-pr-head^"], target).strip()
-    return {"root": target, "base": base or "ocr-pr-head^", "head": "ocr-pr-head",
+    # PR metadata identifies the base even when a test-merge ref is unavailable
+    # (closed or conflicted PR). Validate SHAs before using them as Git arguments.
+    metadata = json.loads(run(["gh", "api", f"repos/{owner}/{repo}/pulls/{number}"], target))
+    base_tip = str((metadata.get("base") or {}).get("sha") or "")
+    expected_head = str((metadata.get("head") or {}).get("sha") or "")
+    if not all(re.fullmatch(r"[0-9a-f]{40,64}", sha) for sha in (base_tip, expected_head)):
+        raise ValueError("GitHub returned invalid PR revision metadata.")
+    run(["git", *hardened, "-C", str(target), "fetch", "--quiet", "--depth", "50",
+         "--no-recurse-submodules", "origin", base_tip], target)
+    head = run(["git", "-C", str(target), "rev-parse", "ocr-pr-head"], target).strip()
+    if expected_head != head:
+        raise ValueError("Pull request changed during fetch; retry the review.")
+    base = run(["git", "-C", str(target), "merge-base", base_tip, "ocr-pr-head"], target).strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base):
+        raise ValueError("Cannot establish PR merge base within shallow history; review a local checkout instead.")
+    run(["git", *hardened, "-C", str(target), "checkout", "--quiet", "--detach", "ocr-pr-head"], target)
+    return {"root": target, "base": base, "head": "ocr-pr-head",
             "owner": owner, "repo": repo, "number": number}

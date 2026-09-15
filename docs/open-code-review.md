@@ -50,6 +50,13 @@ credentials. This is preparation, not a review, and says so.
 **auto** — native when the active provider can be mapped, otherwise delegated.
 Naming a mode explicitly never falls back silently.
 
+Native execution failures are reported in `auto` mode too; a failed review is
+never silently replaced with preparation. Retry with `mode=delegated` explicitly.
+
+PR checkout uses the authenticated GitHub CLI to obtain validated base/head
+commit IDs, computes their merge base, and checks out the PR head. Merge bases
+outside the shallow history fail explicitly; use a local checkout in that case.
+
 Delegation mode does not inherit OpenCodeReview's own agent, reflection and
 positioning pipeline, so its published benchmark results should not be
 attributed to it.

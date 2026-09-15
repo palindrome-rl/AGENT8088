@@ -88,6 +88,17 @@ test('a tool that wrote nothing shows no strip', async ({ page }) => {
   await expect(page.getByTestId('tool-diff-strip')).toHaveCount(0)
 })
 
+test('review progress and readable findings do not create a write diff', async ({ page }) => {
+  await streaming(page)
+  await push(page, { type: 'tool_start', name: 'review_code' })
+  await expect(page.getByTestId('tool-rows')).toContainText('review_code')
+  await push(page, { type: 'tool_result', name: 'review_code', result:
+    'Code review: complete\nhigh: discount.py:3 — Incorrect percentage\nStored review: rev-test' })
+  const rows = page.getByTestId('tool-rows')
+  await expect(rows).toContainText('Code review: complete')
+  await expect(page.getByTestId('tool-diff-strip')).toHaveCount(0)
+})
+
 test('two writes to the same file collapse into one chip with combined counts', async ({ page }) => {
   await streaming(page)
   for (const [added, removed] of [[1, 1], [3, 2]]) {
