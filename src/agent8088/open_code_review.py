@@ -123,6 +123,7 @@ def prepare(root: Path, args: dict, config: dict, *, permitted, run) -> dict:
     if not re.search(r"\bv" + re.escape(PINNED_VERSION) + r"\b", version):
         raise ValueError(f"OpenCodeReview {PINNED_VERSION} is required; installed version differs.")
     scope, flags = _scope_flags(root, args)
+    resolve_refs(root, scope, args, run)
     flags += ["--format", "json"]
     preview = json.loads(run([binary, "delegate", "preview", *flags], root))
     if not isinstance(preview, dict) or preview.get("schema_version") != "1":
@@ -310,6 +311,43 @@ def normalise(payload, root, *, permitted):
     return findings, warnings
 
 
+def resolve_refs(root, scope, args, run):
+    """Fail on a ref that does not resolve, naming it.
+
+    OpenCodeReview reports an unknown ref as "exited with status 1", which
+    says neither which of --from and --to was wrong nor why. The common case
+    is a checkout holding origin/main but no local main, so what the caller
+    needs is the ref name and the likely fix, not the exit code.
+    """
+    if scope == "range":
+        names = [("base", args.get("base", "")), ("head", args.get("head") or "HEAD")]
+    elif scope == "commit":
+        names = [("commit", args.get("commit", ""))]
+    else:
+        return
+
+    def resolves(ref):
+        try:
+            run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet",
+                 str(ref) + "^{commit}"], root)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    for label, ref in names:
+        if not ref or resolves(ref):
+            continue
+        # Suggest only a ref that actually resolves. Guessing origin/<ref>
+        # unconditionally produced "origin/origin/main" in a live run and sent
+        # the caller down a second dead end.
+        ref = str(ref)
+        alternate = ref[len("origin/"):] if ref.startswith("origin/") else "origin/" + ref
+        hint = (" Did you mean " + repr(alternate) + "?") if resolves(alternate) else (
+            " Check the refs this checkout actually has; a commit id or tag also works.")
+        raise ValueError(
+            label + " " + repr(ref) + " does not resolve in this repository." + hint)
+
+
 def review(root, args, config, *, credentials, permitted, run):
     """Native mode: OpenCodeReview's own pipeline, on a transient environment.
 
@@ -326,6 +364,7 @@ def review(root, args, config, *, credentials, permitted, run):
         raise ValueError("OpenCodeReview " + PINNED_VERSION
                          + " is required; installed version differs.")
     scope, flags = _scope_flags(root, args)
+    resolve_refs(root, scope, args, run)
     with tempfile.TemporaryDirectory(prefix="agent8088-ocr-") as transient:
         tools_path = Path(transient) / "tools.json"
         tools_path.write_text(json.dumps(RESTRICTED_TOOLS), encoding="utf-8")

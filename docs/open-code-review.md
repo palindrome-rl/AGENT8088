@@ -131,7 +131,7 @@ it is as sensitive as the code. History is bounded to the most recent 200 and is
 a working history, not an audit log. A failed save costs the history, never the
 review.
 
-The Web UI reads `/api/reviews` for the listing (metadata only) and
+The web server exposes `/api/reviews` for the listing (metadata only) and
 `/api/reviews/{id}` for one review with positions re-checked.
 
 ## Limits

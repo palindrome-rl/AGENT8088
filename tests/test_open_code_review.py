@@ -396,3 +396,64 @@ def test_a_stored_review_is_redacted_before_it_is_written(tmp_path, engine, monk
     stored = review_store.load(tmp_path / "reviews.db", rows[0]["id"])
     captured["blob"] = __import__("json").dumps(stored)
     assert secret not in captured["blob"], "the STORED review kept the secret in plaintext"
+
+
+def test_an_unresolvable_ref_is_named_before_the_engine_runs(tmp_path, monkeypatch):
+    """"exited with status 1" does not tell the user which ref was wrong.
+
+    A checkout commonly has origin/main but no local main, and that is the most
+    likely thing a caller gets wrong. Resolving each ref first turns an opaque
+    subprocess failure into the name of the ref that does not exist.
+    """
+    from agent8088 import open_code_review as R
+    monkeypatch.setattr(R, "executable", lambda config: "ocr")
+
+    def fake_run(argv, cwd, env=None):
+        if argv[1:2] == ["version"]:
+            return f"open-code-review v{R.PINNED_VERSION} (a) windows/amd64"
+        if argv[0] == "git" and "rev-parse" in argv:
+            raise ValueError("fatal: Needed a single revision")
+        raise AssertionError("the engine must not be reached: " + " ".join(argv))
+
+    with pytest.raises(ValueError, match="main"):
+        R.review(tmp_path, {"scope": "range", "base": "main", "head": "HEAD"}, {},
+                 credentials={"url": "u", "token": "t", "model": "m"},
+                 permitted=lambda p: True, run=fake_run)
+
+
+def test_the_suggested_ref_is_one_that_actually_resolves(tmp_path, monkeypatch):
+    """The hint has to be usable, or it is a second dead end.
+
+    Prefixing origin/ unconditionally told a live run that 'origin/main' should
+    have been 'origin/origin/main'. It then burned a turn on that. Suggest an
+    alternative only when it resolves, and otherwise say nothing specific.
+    """
+    from agent8088 import open_code_review as R
+    monkeypatch.setattr(R, "executable", lambda config: "ocr")
+
+    def run_with(existing):
+        def fake_run(argv, cwd, env=None):
+            if argv[1:2] == ["version"]:
+                return f"open-code-review v{R.PINNED_VERSION} (a) windows/amd64"
+            if argv[0] == "git" and "rev-parse" in argv:
+                if argv[-1].removesuffix("^{commit}") in existing:
+                    return "deadbeef"
+                raise ValueError("fatal: Needed a single revision")
+            raise AssertionError("the engine must not be reached")
+        return fake_run
+
+    def review(base, existing):
+        return R.review(tmp_path, {"scope": "range", "base": base, "head": "HEAD"}, {},
+                        credentials={"url": "u", "token": "t", "model": "m"},
+                        permitted=lambda p: True, run=run_with(existing | {"HEAD"}))
+
+    # origin/main is wrong and plain main exists -- strip, never double the prefix.
+    with pytest.raises(ValueError) as wrong_way:
+        review("origin/main", {"main"})
+    assert "'main'" in str(wrong_way.value)
+    assert "origin/origin/" not in str(wrong_way.value)
+
+    # Nothing plausible resolves, so offer no specific ref at all.
+    with pytest.raises(ValueError) as neither:
+        review("nope", set())
+    assert "Did you mean" not in str(neither.value)

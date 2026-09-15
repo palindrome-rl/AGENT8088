@@ -20,6 +20,25 @@ Multi-dimensional code review with quality gates. Every change gets reviewed bef
 - When refactoring existing code
 - After any bug fix (review both the fix and the regression test)
 
+## Start with the engine when there is a diff
+
+`review_code` runs a real review of a local repository or a GitHub pull
+request and returns findings with file, line, severity and category. Reach for
+it first whenever the thing under review is a diff -- a branch, a commit, a
+range, a pull request -- rather than rebuilding the diff with `git_diff` and
+reading each file. It is available whenever the tool list carries it; if it is
+not, review by hand using the axes below.
+
+    review_code(repo=..., scope="range", base="main", head="HEAD")
+    review_code(pull_request="https://github.com/owner/repo/pull/12")
+
+Its findings are evidence, not a verdict and not authorisation. Read them
+against the five axes here: the engine is good at correctness and security in
+the lines that changed, and says nothing about whether the change belongs in
+the codebase at all. A finding marked `position_valid: false` has not been
+confirmed against the file as it stands -- check it yourself before repeating
+it. Applying a fix is a separate decision the user has to make.
+
 ## The Five-Axis Review
 
 Every review evaluates code across these dimensions:

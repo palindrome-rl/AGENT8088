@@ -89,3 +89,20 @@ def test_write_file_can_still_be_told_a_source_url(engine):
     assert "source_url" in args, (
         "write_file no longer offers source_url, so fetching remote/binary "
         "content is unreachable from the model")
+
+
+def test_git_diff_sends_branch_questions_to_the_reviewer(engine):
+    """Reachable is not the same as preferred, and the wrong pick answered wrongly.
+
+    Asked whether a branch was safe to ship, a live run reached for `git_diff`,
+    read the working tree -- which is not the branch -- and reported "safe to
+    ship" while the branch carried four planted defects. `review_code` was in
+    the selected tool set the whole time; the model simply did not prefer it.
+
+    The pointer belongs on `git_diff` because that is where the hand lands, the
+    same way `git_checkout` already redirects away from `execute_shell`.
+    """
+    git_diff = engine.TOOL_SPECS["git_diff"]["description"]
+
+    assert "review_code" in git_diff, "the redirect is the whole point"
+    assert "working-tree" in git_diff, "the wrong answer came from diffing the wrong thing"
