@@ -67,6 +67,19 @@ TYPE_SYMBOLS = frozenset({
     "class", "struct", "interface", "type", "enum", "trait", "protocol", "module",
 })
 
+# Tree-sitter tag queries distinguish these reference kinds. PageRank's damping
+# already decays rank over successive hops; these weights say which direct link
+# is stronger.
+REFERENCE_WEIGHTS = {
+    "call": 1.0,
+    "send": 1.0,
+    "method": 1.0,
+    "inherit": 0.9,
+    "implementation": 0.9,
+    "module": 0.5,
+}
+DETAIL_LEVELS = frozenset({"minimal", "standard"})
+
 MAX_SOURCE_BYTES = 1024 * 1024
 MAX_FILES = 5000
 LINE_WIDTH = 100
@@ -79,6 +92,7 @@ class Tag:
     name: str
     kind: str  # "def" or "ref"
     symbol: str = ""  # for definitions: "class", "function", "constant", ...
+    relation: str = ""  # for references: "call", "module", "inherit", ...
 
 
 class RepoMapUnavailable(RuntimeError):
@@ -132,14 +146,16 @@ def extract_tags(rel, source):
             kind = "ref"
         else:
             continue
-        symbol = label.rpartition(".")[2] if kind == "def" else ""
+        label_kind = label.rpartition(".")[2]
+        symbol = label_kind if kind == "def" else ""
+        relation = label_kind if kind == "ref" else ""
         for node in nodes:
             try:
                 name = node.text.decode("utf-8", errors="replace")
             except AttributeError:
                 continue
             if name:
-                tags.append(Tag(rel, node.start_point[0] + 1, name, kind, symbol))
+                tags.append(Tag(rel, node.start_point[0] + 1, name, kind, symbol, relation))
     tags.sort(key=lambda t: (t.line, t.kind, t.name))
     return tags
 
@@ -331,7 +347,7 @@ def rank_symbols(tags, focus=(), mentioned=()):
     focus = {str(f) for f in focus}
     mentioned = {str(m) for m in mentioned}
     definers = defaultdict(set)
-    referencers = defaultdict(lambda: defaultdict(int))
+    referencers = defaultdict(lambda: defaultdict(float))
     symbol_kinds = {}
     files = set()
     for tag in tags:
@@ -340,7 +356,7 @@ def rank_symbols(tags, focus=(), mentioned=()):
             definers[tag.name].add(tag.rel)
             symbol_kinds.setdefault((tag.rel, tag.name), tag.symbol)
         else:
-            referencers[tag.name][tag.rel] += 1
+            referencers[tag.name][tag.rel] += REFERENCE_WEIGHTS.get(tag.relation, 1.0)
     if not files:
         return []
 
@@ -365,8 +381,8 @@ def rank_symbols(tags, focus=(), mentioned=()):
             # file matters -- `run`, `get`, `handler`.
             multiplier *= 0.1
         uses = referencers.get(name, {})
-        for referencer, count in uses.items():
-            weight = multiplier * (count ** 0.5)
+        for referencer, reference_weight in uses.items():
+            weight = multiplier * (reference_weight ** 0.5)
             if referencer in focus:
                 weight *= 50.0
             for definer in defining:
@@ -403,11 +419,14 @@ def rank_symbols(tags, focus=(), mentioned=()):
     return ranked + rest
 
 
-def build_map(root, budget_tokens=1024, focus=(), mentioned=()):
+def build_map(root, budget_tokens=1024, focus=(), mentioned=(), detail_level="standard"):
     """A budget-fitting outline of the repository, most important symbols first."""
     root = Path(root)
     if not root.is_dir():
         raise ValueError(f"{root} is not a directory")
+    detail_level = str(detail_level).strip().lower()
+    if detail_level not in DETAIL_LEVELS:
+        raise ValueError("detail_level must be 'minimal' or 'standard'")
     tags = collect_tags(root)
     ranked = rank_symbols(tags, focus=focus, mentioned=mentioned)
     if not ranked:
@@ -436,6 +455,8 @@ def build_map(root, budget_tokens=1024, focus=(), mentioned=()):
     chosen = defaultdict(list)
     rendered = ""
     for rel, name in ranked:
+        if detail_level == "minimal" and rel in chosen:
+            continue
         line = definition_lines.get(rel, {}).get(name)
         if line is None:
             continue

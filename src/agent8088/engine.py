@@ -7636,13 +7636,19 @@ def _run_repo_map_tool(args: dict) -> str:
         budget = REPO_MAP_DEFAULT_TOKENS
 
     focus = [part.strip() for part in str(args.get("focus") or "").split(",") if part.strip()]
+    detail_level = str(args.get("detail_level") or "standard").strip().lower()
+    if detail_level not in repomap.DETAIL_LEVELS:
+        return efficiency.tool_error(
+            "bad_argument", "detail_level must be 'minimal' or 'standard'",
+            "Call repo_map with detail_level omitted, 'minimal', or 'standard'.")
     header = (f"Repository map of {PROJECT_ROOT} (ranked by how much other code depends on each "
               f"symbol; definition lines only, not full source):\n\n")
     # The caller asked for a total, so the header comes out of the budget rather
     # than being added on top of it.
     try:
         rendered = repomap.build_map(
-            PROJECT_ROOT, budget_tokens=max(1, budget - len(header) // 4), focus=focus)
+            PROJECT_ROOT, budget_tokens=max(1, budget - len(header) // 4), focus=focus,
+            detail_level=detail_level)
     except repomap.RepoMapUnavailable as exc:
         return efficiency.tool_error(
             "unavailable", str(exc),

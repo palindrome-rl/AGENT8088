@@ -40,6 +40,15 @@ def test_repo_map_focus_accepts_a_comma_separated_list(engine, tmp_path, monkeyp
     assert "b.py" in result
 
 
+def test_repo_map_accepts_minimal_detail_level_and_rejects_other_values(engine, tmp_path, monkeypatch):
+    (tmp_path / "core.py").write_text("def alpha():\n    pass\n\n\ndef beta():\n    pass\n", encoding="utf-8")
+    (tmp_path / "user.py").write_text("alpha()\nbeta()\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    result = engine.run_tool("repo_map", {"detail_level": "minimal"})
+    assert sum(name in result for name in ("def alpha", "def beta")) == 1
+    assert "detail_level" in engine.run_tool("repo_map", {"detail_level": "verbose"}).lower()
+
+
 def test_repo_map_reports_missing_tree_sitter_instead_of_raising(engine, tmp_path, monkeypatch):
     from agent8088 import repomap
 

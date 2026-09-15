@@ -3,11 +3,11 @@
 
 (class_declaration name: (identifier) @name.definition.class) @definition.class
 
-(class_declaration (base_list (_) @name.reference.class)) @reference.class
+(class_declaration (base_list (_) @name.reference.inherit)) @reference.inherit
 
 (interface_declaration name: (identifier) @name.definition.interface) @definition.interface
 
-(interface_declaration (base_list (_) @name.reference.interface)) @reference.interface
+(interface_declaration (base_list (_) @name.reference.inherit)) @reference.inherit
 
 (method_declaration name: (identifier) @name.definition.method) @definition.method
 

@@ -17,4 +17,4 @@
 (object_creation_expression
   type: (type_identifier) @name.reference.class) @reference.class
 
-(superclass (type_identifier) @name.reference.class) @reference.class
+(superclass (type_identifier) @name.reference.inherit) @reference.inherit

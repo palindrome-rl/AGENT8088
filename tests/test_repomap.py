@@ -28,6 +28,17 @@ def test_extract_tags_finds_definitions_and_references():
     assert "helper" in refs
 
 
+@pytest.mark.parametrize(("path", "source", "relation"), [
+    ("a.py", "def helper():\n    pass\n\nhelper()\n", "call"),
+    ("Child.java", "class Child extends Parent {}\n", "inherit"),
+    ("Child.cs", "class Child : Parent {}\n", "inherit"),
+    ("main.go", 'package main\nimport "core"\nfunc main() {}\n', "module"),
+])
+def test_extract_tags_records_reference_relation(path, source, relation):
+    tags = repomap.extract_tags(path, source)
+    assert any(tag.kind == "ref" and tag.relation == relation for tag in tags)
+
+
 def test_extract_tags_records_the_definition_line():
     source = "x = 1\n\n\ndef target():\n    pass\n"
     tags = repomap.extract_tags("a.py", source)
@@ -107,6 +118,17 @@ def test_rank_symbols_prefers_a_class_over_an_equally_referenced_function(tmp_pa
     assert names.index("SettlementRecord") < names.index("format_amount")
 
 
+def test_rank_symbols_prefers_calls_to_imports():
+    tags = [
+        repomap.Tag("core.py", 1, "call_target", "def", "function"),
+        repomap.Tag("core.py", 2, "import_target", "def", "function"),
+        repomap.Tag("user.py", 1, "call_target", "ref", relation="call"),
+        repomap.Tag("user.py", 2, "import_target", "ref", relation="module"),
+    ]
+    names = [name for _, name in repomap.rank_symbols(tags)]
+    assert names.index("call_target") < names.index("import_target")
+
+
 def test_a_long_snake_case_name_is_not_distinctive_when_many_files_define_it(tmp_path):
     # Aider treats any long snake_case name as distinctive. In Python that is
     # simply the naming convention, so it must not outrank a genuinely unique
@@ -175,6 +197,15 @@ def test_build_map_respects_the_token_budget(tmp_path):
                "".join(f"def function_number_{index}_{n}():\n    return {n}\n\n" for n in range(20)))
     rendered = repomap.build_map(tmp_path, budget_tokens=200)
     assert len(rendered) // 4 <= 200
+
+
+def test_build_map_minimal_shows_one_symbol_per_file(tmp_path):
+    _write(tmp_path, "core.py", "def alpha():\n    pass\n\n\ndef beta():\n    pass\n")
+    _write(tmp_path, "user.py", "alpha()\nbeta()\n")
+    standard = repomap.build_map(tmp_path, budget_tokens=500)
+    minimal = repomap.build_map(tmp_path, budget_tokens=500, detail_level="minimal")
+    assert "def alpha" in standard and "def beta" in standard
+    assert sum(name in minimal for name in ("def alpha", "def beta")) == 1
 
 
 def test_build_map_of_an_empty_repository_says_so(tmp_path):
