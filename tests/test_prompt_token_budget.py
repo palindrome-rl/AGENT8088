@@ -83,10 +83,15 @@ def test_fixed_overhead_within_budget():
     872.9s and a wrong answer without it, against 4 calls over 154.7s and the
     correct one with it.
 
-    11,100 -> 12,000 for review_code, and part of that is not this tool: the
-    repository-map work landed alongside it, so the 10,818 measured when this
-    ceiling was last set is now 11,656 at 55 tools. review_code's own schema
-    is 233 of that.
+    11,100 -> 12,000, and most of that is not review_code. Measured on a clean
+    development checkout: 11,444 at 54 tools, already over the 11,100 ceiling
+    before this branch adds anything -- the repository-map work took it there
+    and left this assertion red. review_code's own schema is 212 on top, to
+    11,656 at 55 tools.
+
+    Worth separating if the repo-map drift is ever revisited: it is not
+    attributable to this work, and raising the ceiling here re-arms a guard
+    that was already failing rather than covering a regression.
 
     What it buys, same repository and same model: a review through
     OpenCodeReview's own engine took 4 turns and 614 prompt tokens, against 12
@@ -133,10 +138,10 @@ def test_hybrid_request_is_the_path_that_actually_ships():
     6,600 rather than 11,500 for the same reason as above: a ceiling with 81%
     slack is decoration.
 
-    6,600 -> 7,000 for review_code, with the same caveat that the repo-map
-    tools are part of the move: 6,351 -> 6,655 at 55 tools. review_code is not
-    pinned, so this is the tool index entry and the shared prompt growing, not
-    its schema shipping on every request.
+    6,600 -> 7,000, and the same applies: clean development already measures
+    6,677 here, over the ceiling on its own. review_code takes it to 6,655 --
+    lower, because it is not pinned, so what moves this number is the tool
+    index entry and the shared prompt, not its schema shipping every request.
 
     """
     prompt = E.current_system_prompt(native_tools=True)

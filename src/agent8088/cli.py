@@ -2044,6 +2044,7 @@ COMMAND_SPECS = (
     ("sandbox", "/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation", ()),
     ("status", "/status", "Show model, context, tool, skill, and session status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
+    ("review", "/review [--from REF] [--to REF] [--commit SHA] [--mode native|delegated|auto] [--repo PATH]", "Review local Git changes and print findings with file, line and severity; read-only, a fix is a separate request", ()),
     ("local", "/local [check|list|available [query]|pull <name>|remove <name>]", "Probe hardware, show installed Ollama models or browse pullable ones", ()),
     ("dump", "/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report", ()),
     ("search", "/search [status|use|setup|stop]", "Inspect and configure web-search backends", ()),
@@ -2092,6 +2093,14 @@ def cmd_help(_):
     t.add_column("What it does", style="#237dd7")
     for command in command_catalog():
         t.add_row(command["usage"], command["description"])
+    # Code review is a separate subsystem from document OCR; say so in the
+    # label so a reader never has to work out which "OCR" this row means.
+    try:
+        from agent8088 import open_code_review as _ocr_review
+        _review = _ocr_review.health(A.APP_CONFIG)
+        t.add_row("Code review", _review["detail"])
+    except Exception as _exc:  # a health probe must never break /doctor
+        t.add_row("Code review", f"unavailable ({_exc})")
     console.print(t)
 
 
@@ -5341,8 +5350,78 @@ def cmd_cost(args):
         console.print(f"Partial history: tail-only={report['truncated']}; skipped malformed records={report['malformed_records']}", markup=False)
 
 
+_REVIEW_SEVERITY_STYLE = {"critical": "bold #ff5f56", "high": "#ff5f56",
+                          "medium": "#e8b260", "low": "#237dd7", "info": "dim"}
+
+
+def cmd_review(rest):
+    """Review local changes and print findings, without changing anything.
+
+    Deliberately read-only. The design note is explicit that a review must
+    never implicitly authorise a fix, so this prints findings and stops; asking
+    for a fix is a separate turn the user has to take.
+    """
+    args, parts = {"scope": "workspace"}, rest.split()
+    index = 0
+    while index < len(parts):
+        token = parts[index]
+        if token in ("--from", "--to", "--commit", "--mode", "--repo") and index + 1 < len(parts):
+            key = {"--from": "base", "--to": "head", "--commit": "commit",
+                   "--mode": "mode", "--repo": "repo"}[token]
+            args[key] = parts[index + 1]
+            index += 2
+            continue
+        console.print("[red]usage:[/red] /review [--from REF] [--to REF] [--commit SHA] "
+                      "[--mode native|delegated|auto] [--repo PATH]")
+        return
+    if args.get("commit"):
+        args["scope"] = "commit"
+    elif args.get("base"):
+        args["scope"] = "range"
+
+    with console.status("[#237dd7]Reviewing...[/#237dd7]", spinner="dots"):
+        raw = A.run_tool("review_code", args)
+    try:
+        result = json.loads(A._unwrap_untrusted(raw) if hasattr(A, "_unwrap_untrusted") else raw)
+    except (TypeError, ValueError):
+        console.print(raw if isinstance(raw, str) else str(raw))
+        return
+    if not isinstance(result, dict) or "findings" not in result:
+        # delegated preparation, or a structured tool error: show it as-is
+        console.print(json.dumps(result, indent=2)[:4000] if isinstance(result, dict) else str(raw))
+        return
+
+    coverage = result.get("coverage") or {}
+    head = (f"{result.get('engine', 'review')} {result.get('engine_version', '')} "
+            f"· mode {result.get('mode', '?')} · {coverage.get('reviewed', 0)} file(s) "
+            f"· {len(result['findings'])} finding(s)")
+    if coverage.get("partial"):
+        head += " · PARTIAL"
+    console.print(Text(head, style="bold #00edff"))
+
+    if not result["findings"]:
+        console.print("[#237dd7]No findings.[/#237dd7]")
+    for finding in result["findings"]:
+        severity = str(finding.get("severity", "info"))
+        where = f"{finding.get('path')}:{finding.get('start_line')}"
+        mark = "" if finding.get("position_valid") else "  [dim](position not verified)[/dim]"
+        console.print(Text(f"{severity.upper():8} {where}",
+                           style=_REVIEW_SEVERITY_STYLE.get(severity, "#237dd7")), end="")
+        console.print(mark)
+        console.print(Text("         " + str(finding.get("message", ""))[:400], style="#237dd7"))
+    for warning in (result.get("warnings") or [])[:10]:
+        console.print(Text("warning: " + str(warning)[:200], style="#e8b260"))
+    usage = result.get("usage") or {}
+    if usage.get("total_tokens"):
+        console.print(Text(f"[{usage['total_tokens']:,} tokens spent by the review engine]",
+                           style="dim"))
+    console.print(Text("Findings are evidence, not authorisation. Ask for a fix separately.",
+                       style="dim"))
+
+
 COMMANDS = {
     "cost": cmd_cost,
+    "review": cmd_review,
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,

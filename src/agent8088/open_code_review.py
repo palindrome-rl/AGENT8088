@@ -341,3 +341,41 @@ def review(root, args, config, *, credentials, permitted, run):
                        "reads as described before changing anything, and change only what the "
                        "user asked to have fixed.",
     }
+
+
+def health(config: dict, *, run=None) -> dict:
+    """What /doctor needs to say about code review, without running one.
+
+    Reports the three things that actually stop a review: the feature being
+    off, the executable being absent or a shim rather than the native binary,
+    and an installed version other than the pinned one. Named "Code review" by
+    the caller, never "OCR" -- that abbreviation already means optical
+    character recognition here, and the two are unrelated subsystems.
+    """
+    state = {"enabled": config.get("open_code_review_enabled", "0") == "1",
+             "pinned": PINNED_VERSION, "executable": "", "version": "", "ready": False,
+             "detail": ""}
+    if not state["enabled"]:
+        state["detail"] = "disabled (set open_code_review_enabled=1)"
+        return state
+    try:
+        state["executable"] = executable(config)
+    except ValueError as exc:
+        state["detail"] = str(exc)
+        return state
+    if run is None:
+        state["detail"] = "executable found; version not probed"
+        return state
+    try:
+        reported = run([state["executable"], "version"], Path(state["executable"]).parent)
+    except (OSError, ValueError) as exc:
+        state["detail"] = "executable did not run: " + str(exc)[:120]
+        return state
+    match = re.search(r"\bv(\d+\.\d+\.\d+)\b", reported or "")
+    state["version"] = match.group(1) if match else "unknown"
+    if state["version"] != PINNED_VERSION:
+        state["detail"] = "installed " + state["version"] + ", pinned " + PINNED_VERSION
+        return state
+    state["ready"] = True
+    state["detail"] = "ready (v" + PINNED_VERSION + ")"
+    return state

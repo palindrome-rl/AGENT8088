@@ -451,3 +451,16 @@ web_search_no_prompt=1
 # llmrouter_url=http://127.0.0.1:8191/route
 # llmrouter_token_env=AGENT8088_ROUTER_TOKEN
 # llmrouter_timeout_seconds=2
+
+# Code review (OpenCodeReview). Unrelated to document OCR above, which is
+# optical character recognition -- both upstreams use the letters 'OCR'.
+# Off by default: it needs a separate pinned binary on this machine.
+#   native     OpenCodeReview's own reviewer runs the pass, using this
+#              session's provider through a transient environment.
+#   delegated  scope, rules and the diff only; this agent reviews it.
+#   auto       native when the provider is OpenAI-compatible, else delegated.
+open_code_review_enabled=0
+open_code_review_mode=auto
+# open_code_review_executable=C:/path/to/opencodereview.exe
+# open_code_review_timeout_seconds=900
+
