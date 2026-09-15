@@ -96,6 +96,53 @@ def test_normalized_match_says_so_in_the_result(engine, workspace):
     assert (workspace / "app.py").read_text(encoding="utf-8") == "a\n    return y\nc\n"
 
 
+def test_failed_test_requires_reading_its_cited_file_before_edit(engine, workspace):
+    target = workspace / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    engine._PENDING_LOCALIZATION.clear()
+    engine._record_localization_requirement(
+        "run_tests", "pytest", "repo/app.py:1: error: wrong value\n1 failed\nCommand exited with status 1.")
+
+    blocked = engine.run_tool("edit_file", {
+        "filename": "repo/app.py", "old_string": "value = 1", "new_string": "value = 2"})
+    assert '"code": "localization_required"' in blocked
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+    engine.run_tool("read_text", {"filename": "repo/app.py"})
+    result = engine.run_tool("edit_file", {
+        "filename": "repo/app.py", "old_string": "value = 1", "new_string": "value = 2"})
+    assert "Updated" in result
+    engine._PENDING_LOCALIZATION.clear()
+
+
+def test_localization_gate_leaves_other_and_new_files_available(engine, workspace):
+    (workspace / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (workspace / "other.py").write_text("other = 1\n", encoding="utf-8")
+    engine._PENDING_LOCALIZATION.clear()
+    engine._record_localization_requirement(
+        "run_tests", "pytest", "repo/app.py:1: error: wrong value\n1 failed\nCommand exited with status 1.")
+
+    other = engine.run_tool("edit_file", {
+        "filename": "repo/other.py", "old_string": "other = 1", "new_string": "other = 2"})
+    new = engine.run_tool("write_file", {"filename": "repo/new.py", "content": "new = 1\n"})
+    assert "Updated" in other
+    assert "Wrote" in new
+    engine._PENDING_LOCALIZATION.clear()
+
+
+def test_passing_rerun_clears_pending_localization(engine, workspace):
+    target = workspace / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    engine._PENDING_LOCALIZATION.clear()
+    engine._record_localization_requirement(
+        "run_tests", "pytest", "repo/app.py:1: error: wrong value\n1 failed\nCommand exited with status 1.")
+    engine._record_localization_requirement("run_tests", "pytest", "1 passed in 0.01s")
+
+    result = engine.run_tool("edit_file", {
+        "filename": "repo/app.py", "old_string": "value = 1", "new_string": "value = 2"})
+    assert "Updated" in result
+
+
 def test_cli_header_does_not_double_report_the_counts(engine, workspace, monkeypatch):
     """edit_file's result already states the counts; '· +1 −1' says it twice."""
     from agent8088 import cli

@@ -152,6 +152,30 @@ def test_verdict_survives_being_read_from_denoised_coloured_output():
     assert tool_output.detect_verdict(tool_output.denoise(coloured)).status == "failed"
 
 
+def test_compiler_diagnostic_is_structured_in_the_failed_verdict():
+    output = "src/app.py:12:3: error: expected expression\nCommand exited with status 1."
+    verdict = tool_output.detect_verdict(output)
+
+    assert verdict.status == "failed"
+    assert verdict.diagnostics[0].as_dict() == {
+        "path": "src/app.py", "line": 12, "column": 3,
+        "severity": "error", "message": "expected expression",
+    }
+    assert '"diagnostics"' in verdict.banner()
+
+
+def test_python_traceback_uses_its_final_source_frame():
+    output = ('Traceback (most recent call last):\n'
+              '  File "src/service.py", line 9, in run\n'
+              'ValueError: invalid input\nCommand exited with status 1.')
+    verdict = tool_output.detect_verdict(output)
+
+    assert verdict.status == "failed"
+    assert verdict.diagnostics[0].path == "src/service.py"
+    assert verdict.diagnostics[0].line == 9
+    assert verdict.diagnostics[0].message == "invalid input"
+
+
 # --------------------------------------------------------------------------
 # Step 5: the full text is kept and the middle is retrievable
 # --------------------------------------------------------------------------

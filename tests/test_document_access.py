@@ -45,7 +45,10 @@ def test_repeated_reads_extract_once(tmp_path, monkeypatch):
 
 def test_model_receives_complete_document_chunk(engine):
     payload = 'x' * 25000
-    assert engine._tool_result_for_model('document_read', payload) == payload
+    shown = engine._tool_result_for_model('document_read', payload)
+    ref = shown.partition('ref=')[2].split(';', 1)[0]
+    assert payload in shown
+    assert ref and engine._OUTPUT_STORE.get(ref) == payload
 
 
 def test_process_covers_all_ranges_and_resumes(tmp_path):

@@ -2638,7 +2638,7 @@ if TOOL_SELECTION not in _TOOL_SELECTION_MODES:
     TOOL_SELECTION = "hybrid"
 TOOL_SELECTION_MODELS = frozenset(parse_csv(APP_CONFIG.get("tool_selection_models", "")))
 TOOL_SELECTION_TOP_K = 10
-_TOOL_SELECTION_ALWAYS = frozenset({"last_output", "describe_tool"})
+_TOOL_SELECTION_ALWAYS = frozenset({"last_output", "read_content", "describe_tool"})
 # Ranking these is a false economy. A coding task that loses write_file cannot
 # finish, and the cost is asymmetric: a miss costs the whole task, an unused
 # schema costs ~100 tokens. Measured on the golden set, pinning these moves
@@ -8455,7 +8455,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return describe_capabilities()
 
     if mode == "last_output":
-        return _exec_last_output(args)
+        return _exec_read_content(args) if name == "read_content" else _exec_last_output(args)
 
     if mode == "memory":
         return memory.forget(args.get("query"))
@@ -8566,10 +8566,17 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         text = documents.extract_text(read_target, MAX_DOCUMENT_BYTES)
         if text is None:  # not a document — read it as ordinary text
             text = _read_text_limited(read_target)
-        return _strip_special_tokens(_paginate_read(text, args, read_target))
+        result = _strip_special_tokens(_paginate_read(text, args, read_target))
+        if name == "read_text":
+            _PENDING_LOCALIZATION.discard(read_target.resolve())
+        return result
 
     if mode == "write_text":
         global _last_write_diff
+        if name == "edit_file":
+            blocked = _localization_required(target)
+            if blocked:
+                return blocked
         content_arg = spec.get("content_arg") or "content"
         if args.get("source_url") and not args.get(content_arg):
             source_url = str(args.get("source_url")).strip()
@@ -8711,6 +8718,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         if name == "run_tests":
             text = testing_support.trim_output(text)
         _record_verdict(ledger_command or command, text)
+        _record_localization_requirement(name, command, text)
         return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
@@ -10802,6 +10810,16 @@ _OUTPUT_STORE = tool_output.OutputStore()
 # passed" survives the turn that learned it.
 _VERDICT_LEDGER: dict = {}
 
+# Paths cited by failed test/build output. This is session-only, like the
+# output store; no project state or external data is changed.
+_PENDING_LOCALIZATION: set[Path] = set()
+_REPAIR_COMMAND = re.compile(
+    r"\b(?:pytest|unittest|nose|jest|vitest|mocha|cargo\s+test|go\s+test|"
+    r"(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:test|build|compile)|tsc|"
+    r"(?:mvn|gradle|make|dotnet)\s+(?:test|build|compile)|gcc|clang|javac)\b",
+    re.I,
+)
+
 # Bumped by anything that could change what a command would now report. A
 # recorded pass describes a tree, and stops meaning anything once that tree
 # moves.
@@ -10813,6 +10831,37 @@ REUSE_KNOWN_VERDICTS = APP_CONFIG.get("reuse_known_verdicts", "1") != "0"
 # Wide enough to be worth a turn, small enough that the window itself is not
 # then clamped — retrieval that gets truncated would just re-create the bug.
 _OUTPUT_WINDOW = 2_400
+
+
+def _content_length(args: dict) -> int:
+    try:
+        return max(1, int(args.get("length") or _OUTPUT_WINDOW))
+    except (TypeError, ValueError):
+        return _OUTPUT_WINDOW
+
+
+def _exec_read_content(args: dict) -> str:
+    """Read one window from a session-scoped content handle."""
+    ref = str(args.get("ref") or "").strip()
+    if not ref:
+        return efficiency.tool_error(
+            "bad_argument", "read_content requires a content ref.",
+            "Pass the ref advertised with the large result, plus offset and length when needed.",
+            recoverable=True,
+        )
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    window = _OUTPUT_STORE.window(ref, offset=offset, length=_content_length(args))
+    if window is None:
+        return (f"No stored content for ref '{ref}'. Content handles expire when the session store "
+                f"evicts them. Available: {', '.join(_OUTPUT_STORE.refs()[-5:]) or 'none'}.")
+    more = (f"Call read_content with ref={ref} and offset={window['next_offset']} to continue."
+            if window["next_offset"] is not None else "End of content.")
+    return (f"Content ref {ref} — characters {window['offset']}-"
+            f"{window['offset'] + len(window['text'])} of {window['total']}. {more}\n\n"
+            f"{window['text']}")
 
 
 def _exec_last_output(args: dict) -> str:
@@ -10900,6 +10949,43 @@ def _record_verdict(command: str, output: str) -> None:
                                 "at": time.time()}
 
 
+def _diagnostic_project_path(path: str) -> Path | None:
+    """Resolve only diagnostic paths that stay inside the current project."""
+    try:
+        candidate = Path(path).expanduser()
+        resolved = (candidate if candidate.is_absolute() else PROJECT_ROOT / candidate).resolve()
+    except (OSError, ValueError):
+        return None
+    return resolved if resolved == PROJECT_ROOT or PROJECT_ROOT in resolved.parents else None
+
+
+def _record_localization_requirement(name: str, command: str, output: str) -> None:
+    """Record source files that must be inspected before a repair edit."""
+    if name != "run_tests" and not _REPAIR_COMMAND.search(command or ""):
+        return
+    verdict = tool_output.detect_verdict(output)
+    if verdict.status == tool_output.PASSED:
+        _PENDING_LOCALIZATION.clear()
+        return
+    if verdict.status != tool_output.FAILED:
+        return
+    for diagnostic in verdict.diagnostics:
+        path = _diagnostic_project_path(diagnostic.path)
+        if path is not None:
+            _PENDING_LOCALIZATION.add(path)
+
+
+def _localization_required(target: Path) -> str:
+    if target.resolve() not in _PENDING_LOCALIZATION:
+        return ""
+    return efficiency.tool_error(
+        "localization_required",
+        f"Read {target} before editing it; a failed test or build cited this file.",
+        f"Call read_text with filename={target}, then retry the exact edit.",
+        recoverable=True,
+    )
+
+
 def _reuse_known_verdict(command: str) -> str:
     """Answer from the ledger instead of re-running a command already answered.
 
@@ -10956,6 +11042,10 @@ def _tool_result_for_model(name: str, result: str) -> str:
     if name in {"document_read", "repository_read"}:
         # document_access bounds its own payload and supplies an exact cursor.
         # Truncation here would invalidate that continuation contract.
+        if len(result) > _OUTPUT_WINDOW:
+            ref = _OUTPUT_STORE.put(name, result)
+            return (f"{result}\n\n[content ref={ref}; use read_content with ref={ref} "
+                    "and offset=N to retrieve a window]")
         return result
     if name == "cli_anything_skill":
         limit = 32_000
@@ -10975,7 +11065,7 @@ def _tool_result_for_model(name: str, result: str) -> str:
     # an absent banner is honest, a guessed one is the original bug.
     banner = tool_output.detect_verdict(body).banner() if streamed else ""
     ref = _OUTPUT_STORE.put(name, result)
-    hint = f"last_output with ref={ref} and offset=N returns the middle"
+    hint = f"read_content with ref={ref} and offset=N returns the middle"
     shown = tool_output.clamp(
         body, limit - len(banner) - 1 if banner else limit,
         keep="head" if mode in _HEAD_FIRST_MODES else "tail", hint=hint)
