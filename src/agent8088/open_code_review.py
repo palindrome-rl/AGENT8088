@@ -270,7 +270,7 @@ INJECTION_PATTERNS = (
     r"(?:note|instructions?|message)\s+(?:for|to)\s+(?:the\s+)?(?:automated\s+)?(?:code\s+)?(?:review(?:er)?|ai|assistant|agent|llm|model)\s*:",
     r"report\s+that\s+the\s+(?:repository|repo|code|branch|file|diff)\s+is\s+clean",
     r"do\s+not\s+(?:report|flag|raise)\s+any\s+(?:findings|issues|problems|bugs)",
-    r"(?:ai|llm|language\s+model|assistant|agent|reviewer).{0,60}?(?:must|should|do\s+not|ignore)",
+    r"\b(?:ai|llm|language\s+model|assistant|agent|reviewer)\b.{0,40}?\b(?:must|should)\s+(?:ignore|omit|hide|not\s+(?:report|flag|raise))\b",
 )
 
 
@@ -307,12 +307,44 @@ def scan_injection(root, scope, args, run):
             continue
         text = line[1:]
         for pattern in INJECTION_PATTERNS:
-            if re.search(pattern, text, re.I):
+            if re.search(pattern, text, re.IGNORECASE):
                 hits.append((path or "?", _clip(text.strip(), 160)))
                 break
         if len(hits) >= 10:
             break
     return hits
+
+
+def unreviewed_commits(root, scope, args, run):
+    """Say so when a workspace review left the branch's own commits out.
+
+    A workspace review covers uncommitted work only. Asked whether a branch
+    was safe, the model picked workspace, got two findings from a stray
+    untracked directory, and told a first-time user "your branch looks clean"
+    while four planted defects sat in the branch's commit, unread. The scope
+    was in the result all along as target.mode; it just was not something the
+    answer had to account for.
+
+    This is that fact in a form the answer cannot skip: how many commits were
+    not looked at, and what to pass instead.
+    """
+    if scope != "workspace":
+        return ""
+    try:
+        base = infer_base(root, {"head": "HEAD"}, run)
+    except (OSError, ValueError):
+        return ""
+    try:
+        count = run(["git", "-C", str(root), "rev-list", "--count",
+                     base + "..HEAD"], root).strip()
+    except (OSError, ValueError):
+        return ""
+    if not count.isdigit() or int(count) == 0:
+        return ""
+    return ("Scope was workspace: uncommitted changes only. This branch also has "
+            + count + " commit(s) not in its base, and none of that was reviewed. "
+            "For the branch itself pass scope=range with head set to it.")
+
 
 def _scope_flags(root, args):
     """Shared by both modes so a range means the same thing in each."""
@@ -543,6 +575,9 @@ def review(root, args, config, *, credentials, permitted, run):
         status = "complete"
     if summary.get("budget_exceeded"):
         warnings.append("Review stopped at its token budget; coverage is incomplete.")
+    left_out = unreviewed_commits(root, scope, args, run)
+    if left_out:
+        warnings.append(left_out)
     for path, text in scan_injection(root, scope, args, run):
         warnings.append(
             "Prompt injection attempt in " + path + ": " + repr(text)

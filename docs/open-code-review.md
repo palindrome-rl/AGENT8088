@@ -53,6 +53,12 @@ Naming a mode explicitly never falls back silently.
 Native execution failures are reported in `auto` mode too; a failed review is
 never silently replaced with preparation. Retry with `mode=delegated` explicitly.
 
+A workspace review covers uncommitted changes. If the current branch also has
+commits beyond its inferred base, the result warns that those commits were not
+reviewed and tells the agent to retry as a range. This prevents a novice request
+such as "check my branch" from being presented as complete after reviewing only
+an unrelated untracked file.
+
 PR checkout uses the authenticated GitHub CLI to obtain validated base/head
 commit IDs, computes their merge base, and checks out the PR head. Merge bases
 outside the shallow history fail explicitly; use a local checkout in that case.
