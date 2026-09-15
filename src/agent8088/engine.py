@@ -2517,6 +2517,18 @@ def default_tool_description(name: str) -> str:
     return name.replace("_", " ").strip().capitalize()
 
 
+def summarize_tool_description(description: str) -> str:
+    """Return a concise one-line summary of a tool description.
+
+    Extracts the first sentence or clause, avoiding long multi-sentence instructions.
+    """
+    if not description:
+        return ""
+    cleaned = description.strip().replace("\r\n", " ").replace("\n", " ")
+    m = re.match(r'^(.*?(?:(?<!e\.g)(?<!i\.e)(?<!etc)[.!?]))(?:\s+|$)', cleaned, re.IGNORECASE)
+    return m.group(1).strip() if m else cleaned
+
+
 def parse_csv(raw: str) -> list:
     return [x.strip() for x in (raw or "").split(",") if x.strip()]
 
@@ -2544,6 +2556,7 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
     return {
         "name": name,
         "description": description,
+        "summary": extra.get("summary") or summarize_tool_description(description),
         "mode": (extra.get("mode") or config.get(f"tool_mode.{name}") or "shell").strip().lower(),
         "args": args,
         "optional": optional,

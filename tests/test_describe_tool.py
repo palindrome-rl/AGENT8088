@@ -156,3 +156,36 @@ def test_describe_tool_resolves_tools_the_request_did_not_advertise(engine):
     result = json.loads(engine.describe_tool("git_log"))
     assert result["name"] == "git_log"
     assert "parameters" in result
+
+
+def test_summarize_tool_description(engine):
+    assert engine.summarize_tool_description("") == ""
+    assert engine.summarize_tool_description("Single sentence.") == "Single sentence."
+    assert engine.summarize_tool_description("Single sentence without period") == "Single sentence without period"
+    multi = "Execute a command. Never use it for web research. Run carefully."
+    assert engine.summarize_tool_description(multi) == "Execute a command."
+    with_abbrev = "Write file or pass source_url (images, PDFs, etc.) directly from a URL. Extra instructions."
+    assert engine.summarize_tool_description(with_abbrev) == "Write file or pass source_url (images, PDFs, etc.) directly from a URL."
+
+
+def test_cmd_tools_summarized_and_full(engine, monkeypatch):
+    from io import StringIO
+    from rich.console import Console
+    from agent8088 import cli
+    output = StringIO()
+    monkeypatch.setattr(cli, "A", engine)
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    monkeypatch.setattr(cli, "_active_tool_specs", lambda: engine.TOOL_SPECS)
+
+    cli.cmd_tools("")
+    summary_out = output.getvalue()
+    assert "Execute a necessary local shell command and return its real output." in summary_out
+    assert "Never use it for web research" not in summary_out
+
+    output.seek(0)
+    output.truncate()
+    cli.cmd_tools("--full")
+    full_out = output.getvalue()
+    assert "Execute a necessary local shell command and return its real output." in full_out
+    assert "Never use it for web research" in full_out
+

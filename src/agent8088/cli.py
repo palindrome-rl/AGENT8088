@@ -2025,7 +2025,7 @@ def parse_tool_args(raw):
 
 COMMAND_SPECS = (
     ("", "<text>", "Chat — run the full agent loop on your message", ()),
-    ("tools", "/tools [name]", "List tools, or describe one exact tool without executing it", ()),
+    ("tools", "/tools [name|--full]", "List tools with summarized descriptions, or inspect one tool's schema", ()),
     ("capabilities", "/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails", ()),
     ("tool", "/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)", ()),
     ("agents", "/agents [new|edit|delete|models]", "Manage sub-agent profiles and model routing", ()),
@@ -2095,20 +2095,46 @@ def cmd_help(_):
     console.print(t)
 
 
+def _summarize_tool_description(description: str) -> str:
+    fn = getattr(A, "summarize_tool_description", None)
+    if callable(fn):
+        return fn(description)
+    if not description:
+        return ""
+    cleaned = description.strip().replace("\r\n", " ").replace("\n", " ")
+    m = re.match(r'^(.*?(?:(?<!e\.g)(?<!i\.e)(?<!etc)[.!?]))(?:\s+|$)', cleaned, re.IGNORECASE)
+    return m.group(1).strip() if m else cleaned
+
+
 def cmd_tools(rest):
-    if rest.strip():
-        console.print(Text(A.describe_tool(rest.strip(), _active_tool_specs())))
+    arg = rest.strip()
+    if arg in ("--full", "--all", "-v", "full", "all"):
+        _render_tools_table(show_full=True)
         return
+    if arg:
+        console.print(Text(A.describe_tool(arg, _active_tool_specs())))
+        return
+    _render_tools_table(show_full=False)
+
+
+def _render_tools_table(show_full: bool = False):
+    caption = "Run  /tools <name>  to inspect full schema and arguments  ·  /tools --full  for complete descriptions"
     t = Table(title="Tools", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
-              header_style="bold #00edff", border_style="#0077B6")
+              header_style="bold #00edff", border_style="#0077B6",
+              caption=caption, caption_style="dim")
     t.add_column("Name", style="#237dd7")
     t.add_column("Args", style="#237dd7")
     t.add_column("Mode", style="#237dd7")
     t.add_column("Description", style="#237dd7")
-    for name in sorted(_active_tool_specs()):
-        spec = _active_tool_specs()[name]
+    specs = _active_tool_specs()
+    for name in sorted(specs):
+        spec = specs[name]
         args = ", ".join(spec.get("args") or []) or "—"
-        t.add_row(name, args, spec.get("mode", "?"), spec.get("description", ""))
+        if show_full:
+            desc = spec.get("description", "")
+        else:
+            desc = spec.get("summary") or _summarize_tool_description(spec.get("description", ""))
+        t.add_row(name, args, spec.get("mode", "?"), desc)
     console.print(t)
 
 
