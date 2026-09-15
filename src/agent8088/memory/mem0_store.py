@@ -4,6 +4,7 @@ Implements the MemoryStore contract against the Mem0 library (https://github.com
 All calls are non-raising and fail gracefully if mem0ai is not installed or errors.
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -250,7 +251,8 @@ class Mem0MemoryStore:
 
     def add(self, text, *, user_id: str = "owner", embedding=None, embed_model: str = "",
             project: Optional[str] = None, agent_id: Optional[str] = None,
-            run_id: Optional[str] = None, categories=None, source: str = "extracted") -> Optional[str]:
+            run_id: Optional[str] = None, categories=None, source: str = "extracted",
+            metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         mem = self._init_memory()
         if mem is None:
             return None
@@ -258,13 +260,19 @@ class Mem0MemoryStore:
         if not text:
             return None
 
-        metadata = {
+        # mem0's own metadata dict already carries project/agent_id/run_id -- the
+        # caller's extra keys (repo, source_channel) are merged in rather than
+        # replacing it, so both stores end up describing the same memory the
+        # same way even though this is mem0's field, not agent8088's.
+        full_metadata = {
             "project": project,
             "agent_id": agent_id,
             "run_id": run_id,
             "categories": categories or [],
             "source": source,
         }
+        full_metadata.update(metadata or {})
+        metadata = full_metadata
         try:
             try:
                 resp = mem.add(text, user_id=str(user_id), metadata=metadata, infer=False)
@@ -346,6 +354,12 @@ class Mem0MemoryStore:
                     "text": str(fact),
                     "score": score,
                     "categories": item.get("categories") or [],
+                    # JSON text, matching native's row["metadata"] shape (a raw
+                    # sqlite TEXT column, parsed by the caller) -- until now this
+                    # dict was written to mem0 at add() but nothing ever read it
+                    # back, so repo/author/source_channel/files_touched were
+                    # genuinely stored yet invisible through this adapter.
+                    "metadata": json.dumps(item.get("metadata")) if item.get("metadata") else None,
                 })
             return results
         except Exception as exc:
@@ -376,6 +390,7 @@ class Mem0MemoryStore:
                     "id": str(item.get("id") or ""),
                     "text": str(fact),
                     "created_at": item.get("created_at"),
+                    "metadata": json.dumps(item.get("metadata")) if item.get("metadata") else None,
                 })
             return out
         except Exception as exc:

@@ -8374,6 +8374,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # changes the tree, and a crash mid-write must not leave a verdict
         # looking current.
         note_mutation(f"write {target}")
+        target_str = str(target)
+        if target_str and target_str not in _TURN_FILES_TOUCHED:
+            _TURN_FILES_TOUCHED.append(target_str)
 
     if mode == "introspect":
         if name == "describe_tool":
@@ -8382,6 +8385,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "last_output":
         return _exec_last_output(args)
+
+    if mode == "memory":
+        return memory.forget(args.get("query"))
 
     if mode == "plan":
         if not allow_plan:
@@ -9264,6 +9270,13 @@ memory_on_capture = None
 # before reporting. None when capture ran synchronously or did not run.
 memory_capture_thread = None
 
+# Files written/edited so far in the current outermost turn (write_text mode:
+# write_file, edit_file, create_document, convert_document). Reset only at the
+# start of the outermost run_agent call, same as the blast-radius counters --
+# a subagent's writes are still work the outer turn accomplished, so they
+# accumulate here too rather than being invisible to the memory it captures.
+_TURN_FILES_TOUCHED: list = []
+
 
 def _memory_extract_completion(prompt: str):
     """One model call for fact extraction. Returns (text, usage).
@@ -9291,6 +9304,44 @@ def _memory_extract_completion(prompt: str):
     }
 
 
+def _resolve_repo_url() -> str:
+    """The project's origin remote, or "" outside a git repo / with none set.
+
+    Called once at configure time, not per captured memory: the remote cannot
+    change mid-session, so shelling out on every write would be wasted work.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _resolve_author() -> str:
+    """Who is running this agent, for the memory metadata -- git's user.name
+    scoped to this repo, falling back to the OS account name.
+
+    Called once at configure time, same reasoning as _resolve_repo_url: this
+    cannot change mid-session, so it must not be a subprocess call per memory.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "config", "user.name"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    try:
+        return os.getlogin()
+    except Exception:
+        return os.environ.get("USERNAME") or os.environ.get("USER") or ""
+
+
 def configure_memory() -> None:
     """Wire the memory package to this engine's config, client and redactor.
 
@@ -9306,6 +9357,8 @@ def configure_memory() -> None:
             redact=_redact_secrets,
             db_path=MEMORY_DB_PATH,
             project=str(PROJECT_ROOT),
+            repo=_resolve_repo_url(),
+            author=_resolve_author(),
         )
     except Exception as exc:
         _log.debug("memory configuration skipped: %s", exc)
@@ -9351,7 +9404,7 @@ def _recalled_memory_prompt(messages, system_prompt, identity=None):
 
 
 def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
-                         in_background=False) -> None:
+                         source_channel="", in_background=False) -> None:
     global memory_capture_thread
     """Store what this turn taught, after the answer is already the user's.
 
@@ -9374,7 +9427,9 @@ def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
         return
     try:
         result = memory.capture([_message_text(turns[-1])], answer, identity=identity,
-                               run_id=run_id, in_background=in_background,
+                               run_id=run_id, source_channel=source_channel,
+                               files_touched=list(_TURN_FILES_TOUCHED),
+                               in_background=in_background,
                                on_stored=memory_on_capture)
         memory_capture_thread = result if in_background else None
     except Exception as exc:
@@ -10525,7 +10580,7 @@ _document_usage_lock = threading.Lock()
 
 
 def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None,
-              memory_background=False, memory_capture=True,
+              memory_source_channel="", memory_background=False, memory_capture=True,
               trajectory_state=None, on_trajectory_state=None, **kwargs):
     """Run one agent turn under a resource budget. See _run_agent_loop for the
     full hook documentation — every keyword is forwarded to it unchanged.
@@ -10628,8 +10683,9 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         reset_turn_counters()
         reset_approval_state()
         reset_turn_approval_state()
-        global memory_capture_thread
+        global memory_capture_thread, _TURN_FILES_TOUCHED
         memory_capture_thread = None
+        _TURN_FILES_TOUCHED = []
         # Paint before recall, not after. Recall does a network round trip, and
         # the loop's own first spin("thinking...") is on the far side of it --
         # so without this the terminal stays blank for the whole call and the
@@ -10660,6 +10716,7 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             if memory_capture:
                 _capture_turn_memory(messages, answer, identity=memory_identity,
                                      run_id=memory_run_id,
+                                     source_channel=memory_source_channel,
                                      in_background=memory_background)
         _active_budget = previous
         _document_progress, _document_interrupt, _document_root = old_document_hooks
