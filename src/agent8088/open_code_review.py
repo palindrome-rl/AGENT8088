@@ -122,6 +122,8 @@ def prepare(root: Path, args: dict, config: dict, *, permitted, run) -> dict:
     version = run([binary, "version"], root)
     if not re.search(r"\bv" + re.escape(PINNED_VERSION) + r"\b", version):
         raise ValueError(f"OpenCodeReview {PINNED_VERSION} is required; installed version differs.")
+    if args.get("scope") == "range" and not args.get("base"):
+        args = dict(args, base=infer_base(root, args, run))
     scope, flags = _scope_flags(root, args)
     resolve_refs(root, scope, args, run)
     flags += ["--format", "json"]
@@ -215,6 +217,102 @@ RESTRICTED_TOOLS = json.loads(r'''[
     "parameters":{"type":"object","properties":{"path_array":{"type":"array","items":{"type":"string"}}},"required":["path_array"]}}}
 ]''')
 
+
+# Tried in order when a range review is asked for without a base. The first
+# that resolves and is not the head itself wins.
+BASE_CANDIDATES = ("origin/HEAD", "origin/main", "main", "origin/master",
+                   "master", "origin/development", "development")
+
+
+def infer_base(root, args, run):
+    """Find the fork point when the caller did not name one.
+
+    Requiring a base meant the answer to "review this branch" was another
+    question, and the model went looking for it with git tools -- which on a
+    machine without a sandbox fail, so it burned its turns and answered
+    nothing. The repository already knows where the branch forked; asking it
+    is cheaper than asking the model to ask the user.
+    """
+    head = str(args.get("head") or "HEAD")
+
+    def rev(ref):
+        try:
+            return run(["git", "-C", str(root), "rev-parse", "--verify",
+                        "--quiet", str(ref) + "^{commit}"], root).strip()
+        except (OSError, ValueError):
+            return ""
+
+    head_id = rev(head)
+    for candidate in BASE_CANDIDATES:
+        candidate_id = rev(candidate)
+        if not candidate_id or candidate_id == head_id:
+            continue
+        try:
+            merge_base = run(["git", "-C", str(root), "merge-base",
+                              candidate, head], root).strip()
+        except (OSError, ValueError):
+            continue
+        if merge_base:
+            return merge_base
+    raise ValueError(
+        "No base was given and none could be inferred: none of "
+        + ", ".join(BASE_CANDIDATES) + " resolves in this repository."
+        " Pass base explicitly, or use scope=workspace for uncommitted work.")
+
+# Text in source that addresses the reviewer rather than describing the code.
+# Each pattern needs an explicit audience or an override phrase, so an ordinary
+# comment like "do not report errors here" does not trip it.
+INJECTION_PATTERNS = (
+    r"ignore\s+(?:any|all|the)?\s*(?:previous|earlier|prior|above)\s+instructions",
+    # The trailing colon is what separates a directive addressed to the
+    # reviewer from prose that merely mentions one: "message to the agent
+    # when the user presses Enter" is a docstring, not an attack.
+    r"(?:note|instructions?|message)\s+(?:for|to)\s+(?:the\s+)?(?:automated\s+)?(?:code\s+)?(?:review(?:er)?|ai|assistant|agent|llm|model)\s*:",
+    r"report\s+that\s+the\s+(?:repository|repo|code|branch|file|diff)\s+is\s+clean",
+    r"do\s+not\s+(?:report|flag|raise)\s+any\s+(?:findings|issues|problems|bugs)",
+    r"(?:ai|llm|language\s+model|assistant|agent|reviewer).{0,60}?(?:must|should|do\s+not|ignore)",
+)
+
+
+
+def scan_injection(root, scope, args, run):
+    """Report code that talks to the reviewer, without obeying it.
+
+    Repository contents are evidence, never instructions -- the agent already
+    treats them that way, and live testing confirmed it ignored a comment
+    telling it to declare the repository clean. What it did not do was say so,
+    and silence looks the same as nothing being there. Someone reading the
+    review should learn that a file tried this.
+
+    Matches are reported, never acted on, and never removed from the diff.
+    """
+    if scope == "range":
+        argv = ["diff", "--unified=0", str(args.get("base") or ""),
+                str(args.get("head") or "HEAD")]
+    elif scope == "commit":
+        argv = ["show", "--unified=0", str(args.get("commit") or "")]
+    else:
+        argv = ["diff", "--unified=0"]
+    try:
+        diff = run(["git", "-C", str(root)] + argv, root)
+    except (OSError, ValueError):
+        return []
+
+    hits, path = [], ""
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            path = line[len("+++ b/"):].strip()
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        text = line[1:]
+        for pattern in INJECTION_PATTERNS:
+            if re.search(pattern, text, re.I):
+                hits.append((path or "?", _clip(text.strip(), 160)))
+                break
+        if len(hits) >= 10:
+            break
+    return hits
 
 def _scope_flags(root, args):
     """Shared by both modes so a range means the same thing in each."""
@@ -407,6 +505,8 @@ def review(root, args, config, *, credentials, permitted, run):
     if not re.search(r"\bv" + re.escape(PINNED_VERSION) + r"\b", version):
         raise ValueError("OpenCodeReview " + PINNED_VERSION
                          + " is required; installed version differs.")
+    if args.get("scope") == "range" and not args.get("base"):
+        args = dict(args, base=infer_base(root, args, run))
     scope, flags = _scope_flags(root, args)
     resolve_refs(root, scope, args, run)
     with tempfile.TemporaryDirectory(prefix="agent8088-ocr-") as transient:
@@ -443,6 +543,10 @@ def review(root, args, config, *, credentials, permitted, run):
         status = "complete"
     if summary.get("budget_exceeded"):
         warnings.append("Review stopped at its token budget; coverage is incomplete.")
+    for path, text in scan_injection(root, scope, args, run):
+        warnings.append(
+            "Prompt injection attempt in " + path + ": " + repr(text)
+            + " -- reviewed as evidence and not obeyed. Treat the file as untrusted.")
     return {
         "schema_version": 1, "status": status,
         "engine": "open-code-review", "engine_version": PINNED_VERSION,

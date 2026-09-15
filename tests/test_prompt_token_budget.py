@@ -83,15 +83,29 @@ def test_fixed_overhead_within_budget():
     872.9s and a wrong answer without it, against 4 calls over 154.7s and the
     correct one with it.
 
-    11,100 -> 12,000, and most of that is not review_code. Measured on a clean
-    development checkout: 11,444 at 54 tools, already over the 11,100 ceiling
-    before this branch adds anything -- the repository-map work took it there
-    and left this assertion red. review_code's own schema is 212 on top, to
-    11,656 at 55 tools.
+    11,100 -> 12,200, and most of that is not review_code. Both numbers here
+    were re-measured with the same estimator on both trees rather than
+    carried forward:
 
-    Worth separating if the repo-map drift is ever revisited: it is not
-    attributable to this work, and raising the ceiling here re-arms a guard
-    that was already failing rather than covering a regression.
+        origin/development  worst 11,550  hybrid 6,783  (55 tools)
+        this branch         worst 11,895  hybrid 6,761  (56 tools)
+
+    Development is already over the old 11,100 and 6,600 ceilings on its own
+    -- the repository-map work took it there and left both assertions red
+    before this branch adds anything. review_code's schema is the +345 on
+    the worst case and nothing else here moves it.
+
+    That drift is not this branch's to absorb, so it is named rather than
+    buried: if the repo-map cost is ever revisited, these two rows say
+    exactly how much of the ceiling belongs to which change.
+
+    12,200 leaves ~2.5% over the measured 11,895. An earlier pass set 12,000,
+    which cleared the measurement by 24 tokens -- a ceiling a one-line
+    description edit would break is a tripwire, not a budget. The review_code
+    description was cut from 287 tokens to 206 in the same pass; the guidance
+    that survived is the routing, the PR argument and the scope default,
+    because those are the three things live testing caught the model getting
+    wrong.
 
     What it buys, same repository and same model: a review through
     OpenCodeReview's own engine took 4 turns and 614 prompt tokens, against 12
@@ -102,7 +116,7 @@ def test_fixed_overhead_within_budget():
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 12_000, f"fixed overhead regressed to {total} tokens"
+    assert total < 12_200, f"fixed overhead regressed to {total} tokens"
 
 
 def test_hybrid_request_is_the_path_that_actually_ships():
@@ -138,10 +152,16 @@ def test_hybrid_request_is_the_path_that_actually_ships():
     6,600 rather than 11,500 for the same reason as above: a ceiling with 81%
     slack is decoration.
 
-    6,600 -> 7,000, and the same applies: clean development already measures
-    6,677 here, over the ceiling on its own. review_code takes it to 6,655 --
-    lower, because it is not pinned, so what moves this number is the tool
-    index entry and the shared prompt, not its schema shipping every request.
+    6,600 -> 6,900, and the same applies: clean development measures 6,783
+    here, over the old ceiling on its own. This branch measures 6,761 --
+    twenty-two tokens LOWER than development, because review_code is not
+    pinned, so its schema never ships on this path. What moves this number is
+    the tool index entry and the shared prompt, not the new tool's schema.
+
+    Worth stating plainly, because it is the number that bills: on the path
+    that actually ships, adding code review costs nothing. The worst case in
+    the test above is the one that grew, and only a provider asked for every
+    schema at once pays it.
 
     """
     prompt = E.current_system_prompt(native_tools=True)
@@ -150,7 +170,7 @@ def test_hybrid_request_is_the_path_that_actually_ships():
                 if name in E.TOOL_SPECS}
     schema = json.dumps(E.build_tools_def(selected))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 7_000, f"hybrid request overhead regressed to {total} tokens"
+    assert total < 6_900, f"hybrid request overhead regressed to {total} tokens"
 
 
 def test_every_tool_name_is_visible_to_native_providers():
