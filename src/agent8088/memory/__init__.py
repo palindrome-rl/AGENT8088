@@ -280,22 +280,14 @@ def recall_block(query, *, identity=None, limit=None) -> str:
 
 # -- forget ------------------------------------------------------------------
 
-def _normalize_for_match(text: str) -> str:
-    return " ".join(str(text).lower().split()).rstrip(".")
-
-
 def forget(query, *, identity=None, limit=5) -> str:
     """Delete the one memory `query` clearly names. For the model-facing
     memory_forget tool -- a human still has /memory clear for a full wipe.
 
     Conservative by design: zero hits and multiple hits both leave the store
-    untouched, UNLESS one of the several fuzzy hits is a verbatim (normalized)
-    match for the query -- reciting a memory's exact wording back is a lookup,
-    not a guess, and the model is often quoting exactly that after a prior
-    "matches N memories, not one: ..." response handed it the wording. Without
-    this, a query that pulls in near-duplicate or loosely related hits could
-    never resolve even when the model already knows precisely which memory it
-    means.
+    untouched. A vague query ("username") that matches several memories is
+    reported back rather than guessed at, so the model narrows it instead of
+    this function picking one on its behalf.
     """
     query = str(query or "").strip()
     if not enabled():
@@ -306,15 +298,9 @@ def forget(query, *, identity=None, limit=5) -> str:
     if not matches:
         return f'No memory found matching "{query}".'
     if len(matches) > 1:
-        normalized_query = _normalize_for_match(query)
-        exact = [row for row in matches
-                if _normalize_for_match(row["text"]) == normalized_query]
-        if len(exact) == 1:
-            matches = exact
-        else:
-            candidates = "; ".join(f'"{row["text"][:80]}"' for row in matches)
-            return (f'"{query}" matches {len(matches)} memories, not one: {candidates}. '
-                    "Be more specific and try again.")
+        candidates = "; ".join(f'"{row["text"][:80]}"' for row in matches)
+        return (f'"{query}" matches {len(matches)} memories, not one: {candidates}. '
+                "Be more specific and try again.")
     active_store = store()
     if active_store is None:
         return "Memory store is unavailable."
