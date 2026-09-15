@@ -5354,43 +5354,8 @@ _REVIEW_SEVERITY_STYLE = {"critical": "bold #ff5f56", "high": "#ff5f56",
                           "medium": "#e8b260", "low": "#237dd7", "info": "dim"}
 
 
-def cmd_review(rest):
-    """Review local changes and print findings, without changing anything.
-
-    Deliberately read-only. The design note is explicit that a review must
-    never implicitly authorise a fix, so this prints findings and stops; asking
-    for a fix is a separate turn the user has to take.
-    """
-    args, parts = {"scope": "workspace"}, rest.split()
-    index = 0
-    while index < len(parts):
-        token = parts[index]
-        if token in ("--from", "--to", "--commit", "--mode", "--repo") and index + 1 < len(parts):
-            key = {"--from": "base", "--to": "head", "--commit": "commit",
-                   "--mode": "mode", "--repo": "repo"}[token]
-            args[key] = parts[index + 1]
-            index += 2
-            continue
-        console.print("[red]usage:[/red] /review [--from REF] [--to REF] [--commit SHA] "
-                      "[--mode native|delegated|auto] [--repo PATH]")
-        return
-    if args.get("commit"):
-        args["scope"] = "commit"
-    elif args.get("base"):
-        args["scope"] = "range"
-
-    with console.status("[#237dd7]Reviewing...[/#237dd7]", spinner="dots"):
-        raw = A.run_tool("review_code", args)
-    try:
-        result = json.loads(A._unwrap_untrusted(raw) if hasattr(A, "_unwrap_untrusted") else raw)
-    except (TypeError, ValueError):
-        console.print(raw if isinstance(raw, str) else str(raw))
-        return
-    if not isinstance(result, dict) or "findings" not in result:
-        # delegated preparation, or a structured tool error: show it as-is
-        console.print(json.dumps(result, indent=2)[:4000] if isinstance(result, dict) else str(raw))
-        return
-
+def _print_review(result):
+    """One renderer for a fresh review and a reopened one alike."""
     coverage = result.get("coverage") or {}
     head = (f"{result.get('engine', 'review')} {result.get('engine_version', '')} "
             f"· mode {result.get('mode', '?')} · {coverage.get('reviewed', 0)} file(s) "
@@ -5417,6 +5382,92 @@ def cmd_review(rest):
                            style="dim"))
     console.print(Text("Findings are evidence, not authorisation. Ask for a fix separately.",
                        style="dim"))
+
+
+def _print_review_history():
+    rows = A.review_history()
+    if not rows:
+        console.print("[#237dd7]No stored reviews.[/#237dd7]")
+        return
+    t = Table(title="Reviews", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    for column in ("ID", "When", "Mode", "Findings", "Repository"):
+        t.add_column(column, style="#237dd7", no_wrap=(column != "Repository"))
+    for row in rows:
+        when = datetime.fromtimestamp(row["created"]).strftime("%Y-%m-%d %H:%M")
+        t.add_row(row["id"], when, row["mode"], str(row["findings"]), row["repo"])
+    console.print(t)
+    console.print(Text("Reopen one with /review --resume ID; positions are re-checked then.",
+                       style="dim"))
+
+def cmd_review(rest):
+    """Review local changes and print findings, without changing anything.
+
+    Deliberately read-only. The design note is explicit that a review must
+    never implicitly authorise a fix, so this prints findings and stops; asking
+    for a fix is a separate turn the user has to take.
+    """
+    args, parts = {"scope": "workspace"}, rest.split()
+    index = 0
+    while index < len(parts):
+        token = parts[index]
+        if token == "--list":
+            _print_review_history()
+            return
+        if token == "--resume" and index + 1 < len(parts):
+            reopened = A.reopen_review(parts[index + 1], args.get("repo"))
+            if reopened is None:
+                console.print("[red]no such review[/red] (try /review --list)")
+            else:
+                _print_review(reopened)
+            return
+        if token in ("--from", "--to", "--commit", "--mode", "--repo") and index + 1 < len(parts):
+            key = {"--from": "base", "--to": "head", "--commit": "commit",
+                   "--mode": "mode", "--repo": "repo"}[token]
+            args[key] = parts[index + 1]
+            index += 2
+            continue
+        console.print("[red]usage:[/red] /review [--from REF] [--to REF] [--commit SHA] "
+                      "[--mode native|delegated|auto] [--repo PATH] [--resume ID] [--list]")
+        return
+    if args.get("commit"):
+        args["scope"] = "commit"
+    elif args.get("base"):
+        args["scope"] = "range"
+
+    with console.status("[#237dd7]Reviewing...[/#237dd7]", spinner="dots"):
+        raw = A.run_tool("review_code", args)
+    try:
+        result = json.loads(A._unwrap_untrusted(raw) if hasattr(A, "_unwrap_untrusted") else raw)
+    except (TypeError, ValueError):
+        console.print(raw if isinstance(raw, str) else str(raw))
+        return
+    if not isinstance(result, dict):
+        console.print(str(raw)[:4000])
+        return
+    if "findings" not in result:
+        # Preparation is not a review, and printing it like one is exactly the
+        # confusion the tool description exists to prevent.
+        scope = result.get("scope") or {}
+        if result.get("status") in ("prepared", "empty"):
+            files = scope.get("reviewable_files") or []
+            excluded = scope.get("excluded_count") or 0
+            groups = len(result.get("rule_groups") or [])
+            console.print(Text(
+                f"prepared {len(files)} file(s), {excluded} excluded - {groups} rule group(s)",
+                style="bold #00edff"))
+            for item in files[:20]:
+                console.print(Text(
+                    f"  {item.get('path')}  +{item.get('insertions', 0)}/-{item.get('deletions', 0)}",
+                    style="#237dd7"))
+            console.print(Text(
+                "This is preparation, not a review: no code has been read yet. "
+                "Ask the agent to review it, or rerun with --mode native.", style="dim"))
+        else:
+            console.print(json.dumps(result, indent=2)[:3000])
+        return
+
+    _print_review(result)
 
 
 COMMANDS = {

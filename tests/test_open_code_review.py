@@ -208,3 +208,74 @@ def test_native_credentials_never_reach_argv_or_output(tmp_path, monkeypatch):
     assert seen["env"]["OCR_LLM_TOKEN"] == "SUPERSECRET"
     assert seen["env"]["OCR_CONFIG_PATH"], "config must be redirected away from the user's own"
     assert "SUPERSECRET" not in _json.dumps(result)
+
+
+def test_a_finding_survives_an_edit_above_it_but_not_one_on_it(tmp_path):
+    """Re-validation compares the quoted code, not the line number.
+
+    An edit higher in the file shifts every line below it without making any
+    finding wrong; an edit on the cited line makes it wrong while the number
+    still looks intact. Checking the number alone gets both cases backwards,
+    and this is the gate a fix has to pass.
+    """
+    from agent8088 import open_code_review as R
+    source = tmp_path / "billing.py"
+    source.write_text("a = 1\nb = 2\nreturn (amount * percent) // 100\n", encoding="utf-8")
+    finding = {"path": "billing.py", "start_line": 3,
+               "existing_code": "return (amount * percent) // 100"}
+
+    assert R.recheck_finding(tmp_path, finding) is True
+
+    source.write_text("a = 1\nINSERTED = 0\nb = 2\nreturn (amount * percent) // 100\n",
+                      encoding="utf-8")
+    assert R.recheck_finding(tmp_path, finding) is True, "an edit above it must not invalidate it"
+
+    source.write_text("a = 1\nb = 2\nreturn round(amount * percent / 100, 2)\n", encoding="utf-8")
+    assert R.recheck_finding(tmp_path, finding) is False, "the cited line no longer reads that way"
+
+
+def test_recheck_refuses_what_it_cannot_establish(tmp_path):
+    """No quoted code, no file, no line -- all must be False, never optimistic."""
+    from agent8088 import open_code_review as R
+    (tmp_path / "x.py").write_text("a = 1\n", encoding="utf-8")
+    assert R.recheck_finding(tmp_path, {"path": "x.py", "start_line": 1}) is False
+    assert R.recheck_finding(tmp_path, {"path": "gone.py", "start_line": 1,
+                                        "existing_code": "a = 1"}) is False
+    assert R.recheck_finding(tmp_path, {"path": "../escape.py", "start_line": 1,
+                                        "existing_code": "a = 1"}) is False
+    assert R.recheck_finding(tmp_path, {"path": "x.py", "start_line": 99,
+                                        "existing_code": "a = 1"}) is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/o/r/pull/1?x=1",
+    "https://user:token@github.com/o/r/pull/1",
+    "https://evil.example/o/r/pull/1",
+    "https://github.com/o/r/pull/1#frag",
+    "https://github.com/../r/pull/1",
+    "https://github.com/o/r/pulls/1",
+    "",
+])
+def test_pull_request_urls_are_one_exact_shape(url):
+    """A review clones and then runs a full pass over whatever comes back, so the
+    URL is where a hostile value is cheapest to refuse."""
+    with pytest.raises(ValueError):
+        review.parse_pr(url)
+
+
+def test_a_well_formed_pull_request_url_parses():
+    assert review.parse_pr("https://github.com/palindrome-rl/Agent8088/pull/173") == (
+        "palindrome-rl", "Agent8088", 173)
+
+
+def test_pull_request_checkout_never_runs_hooks_or_submodules(tmp_path):
+    """The fetch is the moment a hostile repository would get to execute."""
+    calls = []
+    review.checkout_pr("https://github.com/o/r/pull/7", tmp_path / "wt",
+                       run=lambda argv, cwd: calls.append(argv) or "abc123\n")
+
+    flat = [" ".join(argv) for argv in calls]
+    assert any("core.hooksPath=" in line for line in flat)
+    assert any("--no-recurse-submodules" in line for line in flat)
+    assert any("protocol.allow=never" in line for line in flat)
+    assert all("pull/7/head:ocr-pr-head" in line or "pull/" not in line for line in flat)

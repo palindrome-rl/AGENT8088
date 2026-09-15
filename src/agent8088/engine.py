@@ -7960,7 +7960,23 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return request_escalation(target_mode="edit", paths=[str(args.get("repo") or PROJECT_ROOT)],
                 change_type="inspection", reason="OpenCodeReview needs to inspect the local Git repository.")
         try:
-            root = resolve_user_path(str(args.get("repo") or PROJECT_ROOT))
+            pr_url = str(args.get("pull_request") or "").strip()
+            pr_workspace = None
+            if pr_url:
+                # A separate grant from reading a local repository: this one
+                # reaches the network and lands somebody else's code on disk.
+                if not check_permission("shell", host=True, approval_key=approval_key + "|pr"):
+                    return request_escalation(target_mode="edit", paths=[pr_url],
+                        change_type="network",
+                        reason="Reviewing a pull request needs a temporary local checkout of it.")
+                pr_workspace = tempfile.mkdtemp(prefix="agent8088-pr-")
+                details = open_code_review.checkout_pr(pr_url, pr_workspace,
+                    run=lambda argv, cwd: open_code_review.run_process(argv, cwd,
+                        check=review_check, kill=_kill_detached_process, timeout=120))
+                root = Path(details["root"])
+                args = dict(args, scope="range", base=details["base"], head=details["head"])
+            else:
+                root = resolve_user_path(str(args.get("repo") or PROJECT_ROOT))
             if _is_sensitive_path(str(root)):
                 raise ValueError("Protected repository path.")
             def review_check():
@@ -7996,6 +8012,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                     permitted=permitted, run=lambda argv, cwd: runner(argv, cwd))
             if isinstance(result.get("usage"), dict) and result["usage"].get("total_tokens"):
                 record_review_usage(result["usage"])
+            if result.get("findings") is not None:
+                from . import review_store
+                # A failed save costs the history, never the review: the
+                # result is in hand and the caller is waiting for it.
+                stored = review_store.save(REVIEW_STORE_PATH, root, result)
+                if stored:
+                    result["review_id"] = stored
+            if pr_workspace:
+                shutil.rmtree(pr_workspace, ignore_errors=True)
             return _redact_secrets(_strip_special_tokens(json.dumps(result, ensure_ascii=False)))
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return efficiency.tool_error("code_review_prepare_failed", _redact_secrets(str(exc)),
@@ -9854,6 +9879,24 @@ SSRF_ALLOW_PRIVATE = APP_CONFIG.get("ssrf_allow_private", "0") == "1"
 SSRF_ALLOW_HOSTS = {h.strip().lower()
                     for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
                     if h.strip()}
+
+
+# A review quotes source lines, so this file is as sensitive as the code it
+# describes; it lives in the agent data directory beside the telemetry log.
+REVIEW_STORE_PATH = _agent_data_dir() / "reviews.db"
+
+
+def review_history(limit: int = 20) -> list:
+    from . import review_store
+    return review_store.recent(REVIEW_STORE_PATH, limit)
+
+
+def reopen_review(review_id: str, root=None):
+    """A stored review with every finding re-checked against the files now."""
+    from . import open_code_review, review_store
+    base = Path(root) if root else PROJECT_ROOT
+    return review_store.reopen(REVIEW_STORE_PATH, review_id, base,
+                               recheck=open_code_review.recheck_finding)
 
 
 def _review_timeout(args, tool_timeout: int) -> int:

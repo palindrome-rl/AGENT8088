@@ -379,3 +379,89 @@ def health(config: dict, *, run=None) -> dict:
     state["ready"] = True
     state["detail"] = "ready (v" + PINNED_VERSION + ")"
     return state
+
+
+def recheck_finding(root, finding: dict) -> bool:
+    """Does this finding still describe the file as it is right now?
+
+    The check is the quoted code, not the line number. A finding whose line has
+    shifted by an edit above it is still true; one whose line now reads
+    something else is not, however intact the number looks. Comparing the
+    stored `existing_code` against the file is the only version of this that
+    survives an intervening edit, and it is what stands between a review from
+    ten minutes ago and a fix applied to the wrong line.
+
+    Returns False on anything it cannot establish -- a missing file, an
+    unreadable one, a finding with no quoted code. A fix must never proceed on
+    "probably".
+    """
+    try:
+        target = checked_path(Path(root).resolve(), str(finding.get("path") or ""))
+    except (ValueError, OSError):
+        return False
+    quoted = str(finding.get("existing_code") or "").strip()
+    if not quoted:
+        return False
+    try:
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    try:
+        start = int(finding.get("start_line") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not 1 <= start <= len(lines):
+        return False
+    wanted = [piece.strip() for piece in quoted.splitlines() if piece.strip()]
+    if not wanted:
+        return False
+    window = [piece.strip() for piece in lines[max(0, start - 1):start - 1 + len(wanted) + 2]]
+    return all(piece in window for piece in wanted)
+
+
+PR_URL = re.compile(
+    r"^https://github\.com/([A-Za-z0-9_.-]{1,100})/([A-Za-z0-9_.-]{1,100})/pull/([0-9]{1,12})/?$")
+
+
+def parse_pr(url: str):
+    """(owner, repo, number) from a GitHub pull-request URL, or a refusal.
+
+    Deliberately one exact shape. A review runs a clone and then a full LLM pass
+    over whatever comes back, so the URL is the point where a hostile value is
+    cheapest to reject -- anything with credentials, a query, a fragment or a
+    different host never becomes a git argument.
+    """
+    match = PR_URL.match(str(url or "").strip())
+    if not match:
+        raise ValueError("Use an https://github.com/owner/repo/pull/N URL, "
+                         "without credentials, query or fragment.")
+    owner, repo, number = match.groups()
+    if owner in (".", "..") or repo in (".", ".."):
+        raise ValueError("Repository owner and name must not be dot path segments.")
+    return owner, repo, int(number)
+
+
+def checkout_pr(url: str, destination, *, run):
+    """Fetch one pull request into a fresh directory and report its refs.
+
+    Shallow, single-ref, no submodules, no hooks, and the head lands on a local
+    ref rather than a detached FETCH_HEAD so the range review can name it. The
+    merge base is computed here rather than trusted from the API, because the
+    review's scope depends on it and an API answer is one more thing to have to
+    validate.
+    """
+    owner, repo, number = parse_pr(url)
+    target = Path(destination)
+    target.mkdir(parents=True, exist_ok=True)
+    remote = "https://github.com/" + owner + "/" + repo + ".git"
+    hardened = ["-c", "core.hooksPath=" + str(target), "-c", "http.followRedirects=false",
+                "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+                "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
+    run(["git", *hardened, "init", "--quiet", str(target)], target)
+    run(["git", *hardened, "-C", str(target), "remote", "add", "origin", remote], target)
+    run(["git", *hardened, "-C", str(target), "fetch", "--quiet", "--depth", "50",
+         "--no-recurse-submodules", "origin",
+         "pull/" + str(number) + "/head:ocr-pr-head"], target)
+    base = run(["git", "-C", str(target), "rev-parse", "ocr-pr-head^"], target).strip()
+    return {"root": target, "base": base or "ocr-pr-head^", "head": "ocr-pr-head",
+            "owner": owner, "repo": repo, "number": number}

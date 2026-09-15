@@ -195,6 +195,9 @@ GATEWAY_EXTRAS_INSTALLED=false
 SEARCH_EXTRAS_INSTALLED=false
 CHROMIUM_INSTALLED=false
 OCR_INSTALLED=false
+REVIEW_INSTALLED=false
+# Pinned: the delegation JSON contract is version-specific.
+OPEN_CODE_REVIEW_VERSION="1.12.1"
 MEM0_INSTALLED=false
 LIBREOFFICE_INSTALLED=false
 REPOSITORY_INSTALLED=false
@@ -1178,6 +1181,38 @@ install_deps() {
     fi
     [ "$OCR_INSTALLED" = true ] && log_success "OCR engine and models installed"
 
+    # --- Code review engine (optional, OpenCodeReview) ---
+    # Not the document OCR above: that is optical character recognition and
+    # this is a code reviewer that happens to share the letters. Installed
+    # into an isolated npm prefix under the install directory rather than
+    # globally, and the config points at the platform binary the package
+    # ships -- never the .cmd/.sh shim, which would route every review
+    # through a shell. Non-fatal: review_code reports what to install.
+    log_info "Installing code review engine (optional, for /review)..."
+    _ocrrev_rc=0
+    _ocrrev_prefix="$INSTALL_DIR/code-review"
+    if ! command -v npm >/dev/null 2>&1; then
+        record_skip "code review engine" "npm not found" "install Node.js, then rerun the installer"
+    else
+        run_with_timeout "$T_PIP" npm install --silent --no-fund --no-audit \
+            --prefix "$_ocrrev_prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" \
+            >/dev/null 2>&1 || _ocrrev_rc=$?
+        _ocrrev_bin=""
+        for _candidate in "$_ocrrev_prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
+            [ -f "$_candidate" ] && _ocrrev_bin="$_candidate" && break
+        done
+        if [ "$_ocrrev_rc" -eq 0 ] && [ -n "$_ocrrev_bin" ]; then
+            REVIEW_INSTALLED=true
+            printf "open_code_review_executable=%s\n" "$_ocrrev_bin" >> "$CONFIG_FILE"
+            log_success "Code review engine installed"
+        else
+            warn_stage "$_ocrrev_rc" "$T_PIP" "code review engine" \
+                "/review and review_code will report the install command instead of running" \
+                "npm install --prefix \"$_ocrrev_prefix\" @alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION"
+        fi
+    fi
+
+
     # --- Memory backend (optional [mem0] extra) ---
     # The engine is recorded in config.txt either way, so a config asking for
     # mem0 can never outlive the extra that makes it work: without it memory
@@ -1836,6 +1871,12 @@ verify_install() {
     else
         echo "  OCR:      unavailable - attached images need a vision-capable model"
     fi
+    if [ "$REVIEW_INSTALLED" = true ]; then
+        echo "  Review:   code review engine ready (/review)"
+    else
+        echo "  Review:   code review engine not installed (/review will say how)"
+    fi
+
     if [ "$MEM0_INSTALLED" = true ]; then
         echo "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
     else

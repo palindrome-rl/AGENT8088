@@ -203,6 +203,9 @@ $GatewayExtrasInstalled = $false
 $SearchExtrasInstalled = $false
 $ChromiumInstalled = $false
 $OcrInstalled = $false
+$ReviewInstalled = $false
+# Pinned: the delegation JSON contract is version-specific.
+$OpenCodeReviewVersion = "1.12.1"
 $Mem0Installed = $false
 $MemoryEngine = ""
 $RepositoryInstalled = $false
@@ -2049,6 +2052,45 @@ function Install-Gateway-Extras {
             }
         }
 
+        # Code review engine (OpenCodeReview). Not the document OCR above --
+        # that is optical character recognition; this shares only the letters.
+        # Isolated npm prefix, and the config points at the platform binary the
+        # package ships rather than the .cmd shim, which would route every
+        # review through cmd.exe. Non-fatal by design.
+        if (Test-StageComplete "codereview") {
+            $script:ReviewInstalled = $true
+            Write-Success "Code review engine already installed (skipping)"
+        } elseif (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+            Write-StageWarning -Result @{ ExitCode = 1 } -TimeoutSec $TPip `
+                -What "code review engine" `
+                -Consequence "/review will report the install command instead of running" `
+                -Fix "install Node.js, then rerun the installer"
+        } else {
+            Write-Info "Installing code review engine (optional, for /review)..."
+            $reviewPrefix = Join-Path $InstallDir "code-review"
+            $reviewResult = Invoke-WithTimeout -FilePath "npm" `
+                -Arguments @("install", "--silent", "--no-fund", "--no-audit", "--prefix",
+                             $reviewPrefix,
+                             "@alibaba-group/open-code-review@$script:OpenCodeReviewVersion") `
+                -TimeoutSec $TPip -Activity "Installing code review engine"
+            $reviewBin = Get-ChildItem -Path $reviewPrefix -Recurse -Filter "opencodereview*" `
+                -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } |
+                Select-Object -First 1
+            if ($reviewResult.ExitCode -eq 0 -and $reviewBin) {
+                $script:ReviewInstalled = $true
+                Add-Content -Path $script:ConfigFile -Encoding utf8 `
+                    -Value "open_code_review_executable=$($reviewBin.FullName)"
+                Set-StageComplete "codereview"
+                Write-Success "Code review engine installed"
+            } else {
+                Write-StageWarning -Result $reviewResult -TimeoutSec $TPip `
+                    -What "code review engine" `
+                    -Consequence "/review will report the install command instead of running" `
+                    -Fix "npm install --prefix " + $reviewPrefix + " @alibaba-group/open-code-review"
+            }
+        }
+
+
         # Memory backend. The engine is recorded in config.txt either way, so a
         # config asking for mem0 can never outlive the extra that makes it work.
         if (Read-Mem0Consent) {
@@ -2658,6 +2700,12 @@ function Verify-Install {
     } else {
         Write-Host "  OCR:      unavailable - attached images need a vision-capable model"
     }
+    if ($script:ReviewInstalled) {
+        Write-Host "  Review:   code review engine ready (/review)"
+    } else {
+        Write-Host "  Review:   code review engine not installed (/review will say how)"
+    }
+
     if ($script:Mem0Installed) {
         Write-Host "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
     } else {
