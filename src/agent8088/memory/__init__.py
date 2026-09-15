@@ -81,7 +81,8 @@ _LAST_CAPTURE = {}
 
 
 def configure(*, config=None, client_factory=None, completion=None, redact=None,
-              db_path=None, project=None, user_id=None, embed_provider="", repo=""):
+              db_path=None, project=None, user_id=None, embed_provider="", repo="",
+              author=""):
     """Wire the package to its host. Idempotent and safe to call again after a
     config reload; the store and embedder are rebuilt only when their inputs
     change, so a reload does not drop a warm connection for nothing."""
@@ -134,6 +135,7 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             # configure time), not per-memory: it cannot change mid-session, and
             # shelling out on every captured fact would be wasted work.
             repo=str(repo or ""),
+            author=str(author or ""),
             completion=completion,
             redact=redact or (lambda text: text),
             client_factory=client_factory,
@@ -327,7 +329,7 @@ def forget(query, *, identity=None, limit=5) -> str:
 # -- capture ---------------------------------------------------------------
 
 def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-            source_channel="", in_background=False, on_stored=None):
+            source_channel="", files_touched=None, in_background=False, on_stored=None):
     """Distil and store durable facts from a finished exchange.
 
     Returns the number stored, or 0. `user_turns` must already be narrowed to the
@@ -339,7 +341,7 @@ def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
             target=_capture_guarded,
             args=(user_turns, answer),
             kwargs={"identity": identity, "run_id": run_id, "agent_id": agent_id,
-                    "source_channel": source_channel,
+                    "source_channel": source_channel, "files_touched": files_touched,
                     "on_stored": on_stored, "close_connection": True},
             name="agent8088-memory-capture",
             daemon=True,
@@ -348,15 +350,16 @@ def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
         return thread
     return _capture_guarded(user_turns, answer, identity=identity, run_id=run_id,
                             agent_id=agent_id, source_channel=source_channel,
-                            on_stored=on_stored)
+                            files_touched=files_touched, on_stored=on_stored)
 
 
 def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-                     source_channel="", on_stored=None, close_connection=False):
+                     source_channel="", files_touched=None, on_stored=None,
+                     close_connection=False):
     try:
         return _capture(user_turns, answer, identity=identity, run_id=run_id,
                         agent_id=agent_id, source_channel=source_channel,
-                        on_stored=on_stored)
+                        files_touched=files_touched, on_stored=on_stored)
     except Exception as exc:
         log.debug("memory capture failed: %s", exc)
         return 0
@@ -373,7 +376,7 @@ def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id
 
 
 def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-             source_channel="", on_stored=None):
+             source_channel="", files_touched=None, on_stored=None):
     if not enabled() or not _RUNTIME.get("capture_enabled"):
         return 0
     completion = _RUNTIME.get("completion")
@@ -419,14 +422,19 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
         # them, and /memory status reports what needs re-embedding.
         vectors = [None] * len(texts)
 
-    # repo comes from configure() (resolved once, cannot change mid-session);
-    # source_channel is per-call, since the same process can serve more than
-    # one front end (the CLI and a gateway session in the same run).
+    # repo/author come from configure() (resolved once, cannot change
+    # mid-session); source_channel and files_touched are per-call, since the
+    # same process can serve more than one front end (the CLI and a gateway
+    # session in the same run) and a turn's file writes are specific to it.
     metadata = {}
     if _RUNTIME.get("repo"):
         metadata["repo"] = _RUNTIME["repo"]
+    if _RUNTIME.get("author"):
+        metadata["author"] = _RUNTIME["author"]
     if source_channel:
         metadata["source_channel"] = source_channel
+    if files_touched:
+        metadata["files_touched"] = list(files_touched)
 
     stored, stored_rows = 0, []
     for item, text, vector in zip(candidates, texts, vectors):
