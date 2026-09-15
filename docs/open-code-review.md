@@ -108,6 +108,12 @@ permission gate is kept as a warning and never as a finding. Unknown severities
 and categories become `info` and `other` with a warning, rather than being
 trusted or dropped.
 
+The engine reports a defect twice, once against the enclosing function and
+once against the offending line. Those collapse into one finding, keeping the
+higher severity and, on a tie, the tighter quote. Two findings quoted on the
+same lines are left alone -- they are more likely two defects than one.
+Without this, four defects were reported as seven.
+
 This matters in practice: on the first live run the engine described a file as
 empty when it was 104 bytes, and the agent caught it because the position had
 already been marked invalid.

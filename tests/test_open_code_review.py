@@ -457,3 +457,65 @@ def test_the_suggested_ref_is_one_that_actually_resolves(tmp_path, monkeypatch):
     with pytest.raises(ValueError) as neither:
         review("nope", set())
     assert "Did you mean" not in str(neither.value)
+
+
+def _finding(path, start, end, severity, message, code):
+    return {"id": f"{path}:{start}:0", "path": path, "start_line": start,
+            "end_line": end, "severity": severity, "category": "security",
+            "message": message, "existing_code": code, "suggested_code": "",
+            "position_valid": True, "verification": "unverified"}
+
+
+def test_one_defect_reported_at_two_granularities_collapses():
+    """Seven findings for four defects is not seven defects.
+
+    OpenCodeReview reports a defect once against the enclosing function and
+    once against the offending line. Live, four planted defects came back as
+    seven findings, and summarising seven near-identical items pushed the
+    model into inventing two functions the file does not contain.
+
+    The quoted code is the discriminator, not the message: the two MD5
+    findings scored 0.56 on message similarity while the pricing pairs scored
+    0.93, so a text threshold separates neither reliably.
+    """
+    from agent8088.open_code_review import _dedupe
+
+    wide = _finding("app/auth.py", 15, 17, "critical", "MD5 is cryptographically weak.",
+                    "def reset_token(user_id):\n    return hashlib.md5(x).hexdigest()")
+    narrow = _finding("app/auth.py", 17, 17, "high", "MD5 is cryptographically broken.",
+                      "    return hashlib.md5(x).hexdigest()")
+    separate = _finding("app/auth.py", 12, 12, "high", "`==` is not constant time.",
+                        "    return sha256(token) == stored_hash")
+
+    kept = _dedupe([wide, narrow, separate])
+
+    assert len(kept) == 2, "the pair is one defect; the timing bug is another"
+    assert kept[0]["severity"] == "critical", "never silently downgrade the louder one"
+    assert separate in kept, "a genuinely different defect must survive"
+
+
+def test_a_tie_on_severity_keeps_the_tighter_quote():
+    """The narrow quote survives an edit elsewhere in the same function."""
+    from agent8088.open_code_review import _dedupe
+
+    wide = _finding("app/pricing.py", 20, 22, "high", "Floor division drops cents.",
+                    "def loyalty_credit(a, p):\n    return (a * p) // 100")
+    narrow = _finding("app/pricing.py", 22, 22, "high", "Floor division drops cents.",
+                      "    return (a * p) // 100")
+
+    kept = _dedupe([wide, narrow])
+
+    assert len(kept) == 1
+    assert kept[0]["start_line"] == 22
+
+
+def test_two_defects_quoted_on_the_same_line_both_survive():
+    """Identical ranges are left alone -- merging them would drop a real finding."""
+    from agent8088.open_code_review import _dedupe
+
+    injection = _finding("app/db.py", 8, 8, "critical", "SQL is built by concatenation.",
+                         '    db.run("SELECT * FROM u WHERE t=" + tok)')
+    secret = _finding("app/db.py", 8, 8, "high", "A token is interpolated into a log.",
+                      '    db.run("SELECT * FROM u WHERE t=" + tok)')
+
+    assert len(_dedupe([injection, secret])) == 2

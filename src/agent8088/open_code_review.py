@@ -241,6 +241,50 @@ def _clip(value, limit=MAX_FIELD):
     return text[:limit]
 
 
+def _dedupe(findings):
+    """Collapse one defect reported at two granularities.
+
+    OpenCodeReview reports a defect twice -- once scoped to the enclosing
+    function, once to the offending line -- and the wide quote contains the
+    narrow one. Live that turned four planted defects into seven findings,
+    which both overstates the count and, asked to summarise seven
+    near-identical items, pushed the model into inventing two functions that
+    do not exist in the file.
+
+    Message similarity cannot separate them: the two MD5 findings scored
+    0.56 while the pricing pairs scored 0.93. The quoted code can, exactly.
+    It is already the key re-validation compares, and containment held for
+    all three duplicate pairs and none of the six genuine ones.
+
+    Identical ranges are left alone: two different defects can be quoted on
+    the same line, and merging those would drop a real finding.
+    """
+    rank = {name: index for index, name in enumerate(SEVERITIES)}
+    kept = []
+    for finding in findings:
+        code = "".join((finding.get("existing_code") or "").split())
+        span = (finding["start_line"], finding["end_line"])
+        for position, other in enumerate(kept):
+            if other["path"] != finding["path"]:
+                continue
+            other_code = "".join((other.get("existing_code") or "").split())
+            other_span = (other["start_line"], other["end_line"])
+            if not code or not other_code or span == other_span:
+                continue
+            if code not in other_code and other_code not in code:
+                continue
+            # Same defect. Keep the louder one, and on a tie the tighter
+            # quote, which survives an edit elsewhere in the function.
+            mine = (rank.get(finding["severity"], 99), span[1] - span[0])
+            theirs = (rank.get(other["severity"], 99),
+                      other_span[1] - other_span[0])
+            if mine < theirs:
+                kept[position] = finding
+            break
+        else:
+            kept.append(finding)
+    return kept
+
 def normalise(payload, root, *, permitted):
     """Agent8088's own result shape, so nothing downstream binds to OCR's schema.
 
@@ -308,7 +352,7 @@ def normalise(payload, root, *, permitted):
             "position_valid": bool(valid),
             "verification": "unverified",
         })
-    return findings, warnings
+    return _dedupe(findings), warnings
 
 
 def resolve_refs(root, scope, args, run):
