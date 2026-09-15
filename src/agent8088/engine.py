@@ -7949,6 +7949,58 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         except (OSError, UnicodeError, ValueError) as exc:
             return f"Error: {exc}"
 
+    if mode == "code_review":
+        from . import open_code_review
+        if APP_CONFIG.get("open_code_review_enabled", "0") != "1":
+            return efficiency.tool_error("code_review_disabled", "OpenCodeReview is disabled.",
+                "Enable open_code_review_enabled=1 and configure its native executable.")
+        if PERMISSION_MODE == "plan-only":
+            return _plan_mode_block_message()
+        if not check_permission("shell", host=True, approval_key=approval_key):
+            return request_escalation(target_mode="edit", paths=[str(args.get("repo") or PROJECT_ROOT)],
+                change_type="inspection", reason="OpenCodeReview needs to inspect the local Git repository.")
+        try:
+            root = resolve_user_path(str(args.get("repo") or PROJECT_ROOT))
+            if _is_sensitive_path(str(root)):
+                raise ValueError("Protected repository path.")
+            def review_check():
+                _raise_if_interrupted(_document_interrupt)
+                if _active_budget is not None and _active_budget.exceeded():
+                    raise ValueError("Review preparation reached the active turn budget.")
+            permitted = lambda path: _path_is_allowed(path) and not _is_sensitive_path(str(path))
+            runner = lambda argv, cwd, env=None: open_code_review.run_process(
+                argv, cwd, check=review_check, kill=_kill_detached_process,
+                timeout=_review_timeout(args, timeout), extra_env=env)
+            mode_choice = str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower()
+            if mode_choice not in ("native", "delegated", "auto"):
+                raise ValueError("mode must be native, delegated, or auto.")
+            credentials = _review_credentials() if mode_choice in ("native", "auto") else None
+            if mode_choice == "native" and not credentials:
+                raise ValueError(
+                    "Native review needs an OpenAI-compatible provider with a key. "
+                    "Configure one, or set mode=delegated to review with this agent instead.")
+            if credentials:
+                # auto falls back rather than failing: the design note asks for
+                # delegated mode to cover providers native mode cannot reach, but
+                # only when the caller did not name a mode explicitly.
+                try:
+                    result = open_code_review.review(root, args, APP_CONFIG,
+                        credentials=credentials, permitted=permitted, run=runner)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    if mode_choice == "native":
+                        raise
+                    result = open_code_review.prepare(root, args, APP_CONFIG,
+                        permitted=permitted, run=lambda argv, cwd: runner(argv, cwd))
+            else:
+                result = open_code_review.prepare(root, args, APP_CONFIG,
+                    permitted=permitted, run=lambda argv, cwd: runner(argv, cwd))
+            if isinstance(result.get("usage"), dict) and result["usage"].get("total_tokens"):
+                record_review_usage(result["usage"])
+            return _redact_secrets(_strip_special_tokens(json.dumps(result, ensure_ascii=False)))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return efficiency.tool_error("code_review_prepare_failed", _redact_secrets(str(exc)),
+                "Check the pinned executable, repository and revisions; preparation did not complete.", recoverable=True)
+
     if mode == "cli_anything":
         return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
 
@@ -9802,6 +9854,63 @@ SSRF_ALLOW_PRIVATE = APP_CONFIG.get("ssrf_allow_private", "0") == "1"
 SSRF_ALLOW_HOSTS = {h.strip().lower()
                     for h in APP_CONFIG.get("ssrf_allow_hosts", "").split(",")
                     if h.strip()}
+
+
+def _review_timeout(args, tool_timeout: int) -> int:
+    """Preparation is quick; a native review is a full LLM pass over a diff.
+
+    The 30s that bounded preparation would kill every real review -- the first
+    live one against glm-5.3 took 8m35s -- so native gets the configured review
+    budget instead, still bounded and still cancellable on every poll.
+    """
+    if str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower() == "delegated":
+        return min(tool_timeout, 30)
+    try:
+        configured = int(APP_CONFIG.get("open_code_review_timeout_seconds", "900"))
+    except ValueError:
+        configured = 900
+    return max(30, min(configured, 3600))
+
+
+def _review_credentials():
+    """Map the ACTIVE provider onto OpenCodeReview's transient environment.
+
+    Only OpenAI-protocol providers are mapped. Anything else returns None so the
+    caller can fall back rather than silently sending a key to an endpoint that
+    speaks a different protocol -- the design note's rule that an unsupported
+    provider must produce an actionable outcome, not a quiet mode switch.
+    """
+    name = ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    provider = PROVIDERS.get(name) or {}
+    base = str(provider.get("base_url") or "").strip()
+    key = _provider_api_key(provider) if provider else ""
+    model = provider.get("model") or MODEL_NAME
+    if not base or not key or not model:
+        return None
+    if str(provider.get("api_mode", "openai")).lower() != "openai":
+        return None
+    return {"url": base, "token": key, "model": str(model), "protocol": "openai"}
+
+
+def record_review_usage(usage: dict) -> None:
+    """Fold OpenCodeReview's own token spend into this session's telemetry.
+
+    Tagged with its source because it is not an Agent8088 model call: it was
+    billed to the same key by a different process, and a cost report that hides
+    that is wrong in the direction that matters.
+    """
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "review_usage", "source": "open_code_review",
+            "task_id": getattr(_active_budget, "task_id", None),
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0)})
+    except Exception as exc:  # telemetry must never break a review
+        _log.warning("could not record review usage: %s", exc)
 
 
 def _local_search_allowance(base_url: str) -> set:

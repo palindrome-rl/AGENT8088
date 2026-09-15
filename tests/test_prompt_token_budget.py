@@ -82,11 +82,22 @@ def test_fixed_overhead_within_budget():
     glm-5.3, orientation question against docs/, cost 51 tool calls over
     872.9s and a wrong answer without it, against 4 calls over 154.7s and the
     correct one with it.
+
+    11,100 -> 12,000 for review_code, and part of that is not this tool: the
+    repository-map work landed alongside it, so the 10,818 measured when this
+    ceiling was last set is now 11,656 at 55 tools. review_code's own schema
+    is 233 of that.
+
+    What it buys, same repository and same model: a review through
+    OpenCodeReview's own engine took 4 turns and 614 prompt tokens, against 12
+    turns and 1,031 for the delegated path that reviews the diff in this
+    agent's own context, and 19 calls / 4,098 tokens before the diff was
+    attached at all.
     """
     prompt = E.current_system_prompt(native_tools=True)
     schema = json.dumps(E.build_tools_def(E.TOOL_SPECS))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 11_100, f"fixed overhead regressed to {total} tokens"
+    assert total < 12_000, f"fixed overhead regressed to {total} tokens"
 
 
 def test_hybrid_request_is_the_path_that_actually_ships():
@@ -122,6 +133,11 @@ def test_hybrid_request_is_the_path_that_actually_ships():
     6,600 rather than 11,500 for the same reason as above: a ceiling with 81%
     slack is decoration.
 
+    6,600 -> 7,000 for review_code, with the same caveat that the repo-map
+    tools are part of the move: 6,351 -> 6,655 at 55 tools. review_code is not
+    pinned, so this is the tool index entry and the shared prompt growing, not
+    its schema shipping on every request.
+
     """
     prompt = E.current_system_prompt(native_tools=True)
     selected = {name: E.TOOL_SPECS[name]
@@ -129,7 +145,7 @@ def test_hybrid_request_is_the_path_that_actually_ships():
                 if name in E.TOOL_SPECS}
     schema = json.dumps(E.build_tools_def(selected))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 6_600, f"hybrid request overhead regressed to {total} tokens"
+    assert total < 7_000, f"hybrid request overhead regressed to {total} tokens"
 
 
 def test_every_tool_name_is_visible_to_native_providers():
