@@ -519,3 +519,49 @@ def test_two_defects_quoted_on_the_same_line_both_survive():
                       '    db.run("SELECT * FROM u WHERE t=" + tok)')
 
     assert len(_dedupe([injection, secret])) == 2
+
+
+def test_a_pr_workspace_spelled_differently_still_permits_its_own_files(
+        engine, monkeypatch, tmp_path):
+    """The permission gate and the adapter have to agree on what root is.
+
+    mkdtemp inherits %TMP%, which on Windows is commonly the 8.3 short form
+    of the user directory, while the adapter resolves root to the long form
+    form before building finding paths. is_relative_to then failed for every
+    file in the checkout, so each finding was dropped as "a protected path"
+    and the PR review reported complete with nothing in it -- the agent, given
+    an empty review, went off to fetch the diff by hand and ran out of turns.
+
+    Two spellings of one directory stand in for the short/long pair here,
+    because 8.3 names cannot be created portably.
+    """
+    engine.APP_CONFIG["open_code_review_enabled"] = "1"
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "check_permission", lambda *a, **k: True)
+    monkeypatch.setattr(engine, "REVIEW_STORE_PATH", tmp_path / "reviews.db")
+
+    workspace = tmp_path / "pr-checkout"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(engine.tempfile, "mkdtemp", lambda **k: str(workspace))
+
+    unresolved = str(workspace / "src" / "..")
+    monkeypatch.setattr(review, "checkout_pr",
+                        lambda url, destination, *, run: {
+                            "root": unresolved, "base": "b", "head": "h"})
+
+    seen = {}
+
+    def fake_review(root, args, config, *, credentials, permitted, run):
+        seen["permitted"] = permitted
+        return {"status": "complete", "findings": [], "warnings": [],
+                "coverage": {"reviewed": 1, "findings": 0, "partial": False}}
+
+    monkeypatch.setattr(review, "review", fake_review)
+    monkeypatch.setattr(engine, "_review_credentials",
+                        lambda: {"url": "u", "token": "t", "model": "m"})
+
+    engine.run_tool("review_code", {"pull_request": "https://github.com/o/r/pull/1"})
+
+    assert seen["permitted"](workspace / "src" / "a.py"), \
+        "a file inside the PR checkout must not read as a protected path"

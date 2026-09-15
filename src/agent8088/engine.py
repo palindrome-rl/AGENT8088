@@ -8003,6 +8003,12 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 args = dict(args, scope="range", base=details["base"], head=details["head"])
             else:
                 root = resolve_user_path(str(args.get("repo") or PROJECT_ROOT))
+            # Resolve before anything compares against it. mkdtemp inherits
+            # %TMP%, which on Windows is often the 8.3 short form, while the
+            # adapter resolves root to the long form -- so every PR finding
+            # failed is_relative_to and was dropped as "a protected path",
+            # leaving a review that reported complete with nothing in it.
+            root = Path(root).resolve()
             if _is_sensitive_path(str(root)):
                 raise ValueError("Protected repository path.")
             permitted = lambda path: (path.is_relative_to(root) if pr_workspace else _path_is_allowed(path)) and not _is_sensitive_path(str(path))
