@@ -2093,14 +2093,6 @@ def cmd_help(_):
     t.add_column("What it does", style="#237dd7")
     for command in command_catalog():
         t.add_row(command["usage"], command["description"])
-    # Code review is a separate subsystem from document OCR; say so in the
-    # label so a reader never has to work out which "OCR" this row means.
-    try:
-        from agent8088 import open_code_review as _ocr_review
-        _review = _ocr_review.health(A.APP_CONFIG)
-        t.add_row("Code review", _review["detail"])
-    except Exception as _exc:  # a health probe must never break /doctor
-        t.add_row("Code review", f"unavailable ({_exc})")
     console.print(t)
 
 
@@ -3348,6 +3340,18 @@ def cmd_doctor(rest):
     cli_label = (f"ready (CLI-Hub {cli_state['version']})" if cli_state["available"]
                  else "available on demand")
     t.add_row("CLI-Anything", cli_label)
+    # Code review is a separate subsystem from document OCR; say so in the
+    # label so a reader never has to work out which "OCR" this row means.
+    try:
+        from agent8088 import open_code_review as _ocr_review
+        # Probe the version rather than only finding the file: a wrong
+        # version fails at review time, which is the worst place to learn it.
+        _review = _ocr_review.health(A.APP_CONFIG, run=lambda argv, cwd:
+            _ocr_review.run_process(argv, cwd, check=lambda: None,
+                                    kill=lambda proc: proc.kill(), timeout=15))
+        t.add_row("Code review", _review["detail"])
+    except Exception as _exc:  # a health probe must never break /doctor
+        t.add_row("Code review", f"unavailable ({_exc})")
     console.print(t)
 
     if fix:
