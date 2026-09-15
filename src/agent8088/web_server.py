@@ -324,6 +324,7 @@ async def get_tools():
         tools.append({
             "name": name,
             "description": spec.get("description") or A.default_tool_description(name),
+            "summary": spec.get("summary") or getattr(A, "summarize_tool_description", lambda d: d)(spec.get("description", "")),
             "mode": spec.get("mode", ""),
             "args": spec.get("args", []),
             "optional": spec.get("optional", []),
