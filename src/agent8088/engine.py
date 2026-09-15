@@ -7607,6 +7607,59 @@ def _plan_mode_block_message() -> str:
             "call normally. Do not claim any of it is done before that happens.")
 
 
+REPO_MAP_DEFAULT_TOKENS = 1000
+REPO_MAP_MAX_TOKENS = 8000
+
+
+def _run_repo_map_tool(args: dict) -> str:
+    """Read-only outline of PROJECT_ROOT; no permission gate.
+
+    It reads the files read_text already reads without approval and returns only
+    definition lines, so it discloses strictly less than the reads it saves.
+    """
+    from agent8088 import repomap
+
+    raw_budget = str(args.get("budget") or "").strip()
+    if raw_budget:
+        try:
+            budget = int(raw_budget)
+        except ValueError:
+            return efficiency.tool_error(
+                "bad_argument", f"budget must be a whole number of tokens, not {raw_budget!r}",
+                "Call repo_map again with budget omitted or set to a number such as 1000.")
+        if budget < 1:
+            return efficiency.tool_error(
+                "bad_argument", "budget must be at least 1 token",
+                "Call repo_map again with a budget such as 1000.")
+        budget = min(budget, REPO_MAP_MAX_TOKENS)
+    else:
+        budget = REPO_MAP_DEFAULT_TOKENS
+
+    focus = [part.strip() for part in str(args.get("focus") or "").split(",") if part.strip()]
+    detail_level = str(args.get("detail_level") or "standard").strip().lower()
+    if detail_level not in repomap.DETAIL_LEVELS:
+        return efficiency.tool_error(
+            "bad_argument", "detail_level must be 'minimal' or 'standard'",
+            "Call repo_map with detail_level omitted, 'minimal', or 'standard'.")
+    header = (f"Repository map of {PROJECT_ROOT} (ranked by how much other code depends on each "
+              f"symbol; definition lines only, not full source):\n\n")
+    # The caller asked for a total, so the header comes out of the budget rather
+    # than being added on top of it.
+    try:
+        rendered = repomap.build_map(
+            PROJECT_ROOT, budget_tokens=max(1, budget - len(header) // 4), focus=focus,
+            detail_level=detail_level)
+    except repomap.RepoMapUnavailable as exc:
+        return efficiency.tool_error(
+            "unavailable", str(exc),
+            "Install agent8088[repomap] and restart, or read files directly with read_text.")
+    except (OSError, ValueError) as exc:
+        return efficiency.tool_error(
+            "failed", f"Could not map the repository: {exc}",
+            "Check that the working directory is a readable project directory.")
+    return header + rendered
+
+
 def _run_local_models_tool(name: str, args: dict, timeout: int, approval_key: str) -> str:
     """Dispatch for the four local_models tools. Hardware probe and listing
     are read-only, loopback-only calls -- no permission gate, same as
@@ -7898,6 +7951,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     if mode == "cli_anything":
         return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
+
+    if mode == "repomap":
+        return _run_repo_map_tool(args)
 
     if mode == "local_models":
         missing = next(

@@ -65,6 +65,15 @@ dependencies = [
 
 [project.optional-dependencies]
 repository = ["gitingest==0.3.1"]
+# repo_map's parser. Optional rather than core, unlike playwright and the
+# document libraries above, because this is the one dependency here that cannot
+# install everywhere: the wheels are manylinux_2_34 (glibc >= 2.34, so not
+# Ubuntu 20.04 and not a manylinux2014 image) with no musl build, so Alpine
+# falls back to compiling from sdist. Making it core would trade installability
+# the product already has for a tool nobody has yet. What made playwright and
+# ddgs core was that their absence degraded silently; this one does not --
+# repo_map names the extra and says to install it.
+repomap = ["tree-sitter-language-pack>=1.20,<2", "tree-sitter>=0.25,<0.27"]
 gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
 # browser and search are now aliases: both packages are core dependencies above.
 # They are kept so `pip install agent8088[browser]` and the installers' existing
