@@ -6096,6 +6096,15 @@ def _exec_browser(args: dict) -> str:
                 "skipped on a Python 3.10 install. Reinstall Agent8088 on "
                 "Python 3.11+, or use web_search or get_page_title instead.")
     try:
+        # Before the first Playwright connection: the Chromium path probe
+        # below opens one, and Playwright's teardown abandons the
+        # connection's init task (it cancels but never awaits it,
+        # playwright/_impl/_connection.py:343). The task's later GC prints
+        # "Task was destroyed but it is pending!" through the asyncio
+        # logger - the logger this call pins - so the pin must be in place
+        # before the probe creates the connection, not only inside
+        # _run_browser_agent where it previously lived.
+        _set_browser_use_log_verbosity(SHOW_REASONING)
         executable_path = _playwright_chromium_executable()
     except Exception as e:
         return f"Browser error: {e}"
