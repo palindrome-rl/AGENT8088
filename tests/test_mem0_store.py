@@ -82,22 +82,6 @@ def test_missing_package_is_distinguishable_from_a_failed_init():
     assert "not installed" in store.last_error
 
 
-def test_add_merges_caller_metadata_into_mem0s_own_dict():
-    """repo/source_channel must ride alongside project/agent_id/run_id/source,
-    not replace them -- mem0's own bookkeeping fields still need to reach mem0."""
-    fake = _fake_mem0()
-    store = Mem0MemoryStore({"path": "/tmp/test_mem0"})
-    with patch("agent8088.memory.mem0_store._import_mem0", return_value=fake):
-        store.add("fact", user_id="owner", project="/repo", run_id="s1",
-                  metadata={"repo": "git@github.com:org/repo.git", "source_channel": "cli"})
-    call_kwargs = fake.from_config.return_value.add.call_args.kwargs
-    sent = call_kwargs["metadata"]
-    assert sent["project"] == "/repo"
-    assert sent["run_id"] == "s1"
-    assert sent["repo"] == "git@github.com:org/repo.git"
-    assert sent["source_channel"] == "cli"
-
-
 def test_mem0_store_unavailable_when_uninstalled():
     with patch.dict("sys.modules", {"mem0": None}):
         store = Mem0MemoryStore({"path": "/tmp/test_mem0"})

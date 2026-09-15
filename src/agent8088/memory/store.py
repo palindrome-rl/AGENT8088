@@ -53,7 +53,6 @@ CREATE TABLE IF NOT EXISTS memories (
   text             TEXT NOT NULL,
   hash             TEXT NOT NULL,
   categories       TEXT,
-  metadata         TEXT,
   source           TEXT NOT NULL,
   created_at       REAL NOT NULL,
   updated_at       REAL NOT NULL,
@@ -216,12 +215,6 @@ class MemoryStore:
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.executescript(_SCHEMA)
-        # CREATE TABLE IF NOT EXISTS above is a no-op on a database from before
-        # this column existed; add it explicitly for anyone upgrading in place.
-        existing_columns = {row["name"] for row in
-                           connection.execute("PRAGMA table_info(memories)").fetchall()}
-        if "metadata" not in existing_columns:
-            connection.execute("ALTER TABLE memories ADD COLUMN metadata TEXT")
         connection.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -249,16 +242,11 @@ class MemoryStore:
     # -- writes ------------------------------------------------------------
 
     def add(self, text, *, user_id, embedding=None, embed_model="", project=None,
-            agent_id=None, run_id=None, categories=None, source="extracted",
-            metadata=None):
+            agent_id=None, run_id=None, categories=None, source="extracted"):
         """Insert one memory. Returns its id, or None when it is a duplicate.
 
         Dedup is the UNIQUE(user_id, hash) constraint rather than a prior SELECT,
         so two concurrent captures of the same fact cannot both win a race.
-
-        `metadata` is a free-form dict (repo URL, source channel, ...) stored as
-        JSON and handed back verbatim by get_all/search -- same convention as
-        `categories`, not queried against, just carried.
         """
         text = " ".join(str(text).split())
         if not text:
@@ -269,12 +257,10 @@ class MemoryStore:
         try:
             connection.execute(
                 "INSERT INTO memories (id, user_id, agent_id, run_id, project, text,"
-                " hash, categories, metadata, source, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " hash, categories, source, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (memory_id, user_id, agent_id, run_id, project, text, text_hash(text),
-                 json.dumps(categories or []),
-                 json.dumps(metadata) if metadata else None,
-                 source, now, now),
+                 json.dumps(categories or []), source, now, now),
             )
         except sqlite3.IntegrityError:
             connection.rollback()

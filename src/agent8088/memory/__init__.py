@@ -81,7 +81,7 @@ _LAST_CAPTURE = {}
 
 
 def configure(*, config=None, client_factory=None, completion=None, redact=None,
-              db_path=None, project=None, user_id=None, embed_provider="", repo=""):
+              db_path=None, project=None, user_id=None, embed_provider=""):
     """Wire the package to its host. Idempotent and safe to call again after a
     config reload; the store and embedder are rebuilt only when their inputs
     change, so a reload does not drop a warm connection for nothing."""
@@ -130,10 +130,6 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             min_score=_number("memory_min_score", 0.0, float),
             max_per_turn=max(1, _number("memory_max_per_turn", DEFAULT_MAX_PER_TURN)),
             project=project,
-            # Resolved once by the caller (a `git remote get-url origin` at
-            # configure time), not per-memory: it cannot change mid-session, and
-            # shelling out on every captured fact would be wasted work.
-            repo=str(repo or ""),
             completion=completion,
             redact=redact or (lambda text: text),
             client_factory=client_factory,
@@ -278,42 +274,10 @@ def recall_block(query, *, identity=None, limit=None) -> str:
     return _BLOCK_HEADER + "\n" + "\n".join(lines) + "\n"
 
 
-# -- forget ------------------------------------------------------------------
-
-def forget(query, *, identity=None, limit=5) -> str:
-    """Delete the one memory `query` clearly names. For the model-facing
-    memory_forget tool -- a human still has /memory clear for a full wipe.
-
-    Conservative by design: zero hits and multiple hits both leave the store
-    untouched. A vague query ("username") that matches several memories is
-    reported back rather than guessed at, so the model narrows it instead of
-    this function picking one on its behalf.
-    """
-    query = str(query or "").strip()
-    if not enabled():
-        return "Memory is off."
-    if not query:
-        return "No query given -- describe what to forget."
-    matches = recall(query, identity=identity, limit=limit)
-    if not matches:
-        return f'No memory found matching "{query}".'
-    if len(matches) > 1:
-        candidates = "; ".join(f'"{row["text"][:80]}"' for row in matches)
-        return (f'"{query}" matches {len(matches)} memories, not one: {candidates}. '
-                "Be more specific and try again.")
-    active_store = store()
-    if active_store is None:
-        return "Memory store is unavailable."
-    match = matches[0]
-    if active_store.delete(match["id"]):
-        return f'Forgot: "{match["text"][:100]}"'
-    return "Could not delete that memory."
-
-
 # -- capture ---------------------------------------------------------------
 
 def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-            source_channel="", in_background=False, on_stored=None):
+            in_background=False, on_stored=None):
     """Distil and store durable facts from a finished exchange.
 
     Returns the number stored, or 0. `user_turns` must already be narrowed to the
@@ -325,7 +289,6 @@ def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
             target=_capture_guarded,
             args=(user_turns, answer),
             kwargs={"identity": identity, "run_id": run_id, "agent_id": agent_id,
-                    "source_channel": source_channel,
                     "on_stored": on_stored, "close_connection": True},
             name="agent8088-memory-capture",
             daemon=True,
@@ -333,16 +296,14 @@ def capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
         thread.start()
         return thread
     return _capture_guarded(user_turns, answer, identity=identity, run_id=run_id,
-                            agent_id=agent_id, source_channel=source_channel,
-                            on_stored=on_stored)
+                            agent_id=agent_id, on_stored=on_stored)
 
 
 def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-                     source_channel="", on_stored=None, close_connection=False):
+                     on_stored=None, close_connection=False):
     try:
         return _capture(user_turns, answer, identity=identity, run_id=run_id,
-                        agent_id=agent_id, source_channel=source_channel,
-                        on_stored=on_stored)
+                        agent_id=agent_id, on_stored=on_stored)
     except Exception as exc:
         log.debug("memory capture failed: %s", exc)
         return 0
@@ -359,7 +320,7 @@ def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id
 
 
 def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
-             source_channel="", on_stored=None):
+             on_stored=None):
     if not enabled() or not _RUNTIME.get("capture_enabled"):
         return 0
     completion = _RUNTIME.get("completion")
@@ -405,15 +366,6 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
         # them, and /memory status reports what needs re-embedding.
         vectors = [None] * len(texts)
 
-    # repo comes from configure() (resolved once, cannot change mid-session);
-    # source_channel is per-call, since the same process can serve more than
-    # one front end (the CLI and a gateway session in the same run).
-    metadata = {}
-    if _RUNTIME.get("repo"):
-        metadata["repo"] = _RUNTIME["repo"]
-    if source_channel:
-        metadata["source_channel"] = source_channel
-
     stored, stored_rows = 0, []
     for item, text, vector in zip(candidates, texts, vectors):
         if not text.strip():
@@ -428,7 +380,6 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
             run_id=run_id,
             categories=item.get("categories"),
             source="extracted",
-            metadata=metadata or None,
         )
         if memory_id:
             stored += 1
