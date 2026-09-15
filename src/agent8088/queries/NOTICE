@@ -1,0 +1,19 @@
+The tag query files in this directory are vendored from two upstream projects,
+both licensed under the Apache License, Version 2.0.
+
+  python, javascript, go, rust, java, c, cpp, csharp, ruby, bash
+    from Aider (https://github.com/Aider-AI/aider)
+    aider/queries/tree-sitter-language-pack/*-tags.scm
+    Copyright the Aider contributors.
+
+  typescript, php
+    from Continue (https://github.com/continuedev/continue)
+    core/tag-qry/tree-sitter-*-tags.scm
+    Copyright the Continue contributors.
+
+A copy of the Apache License, Version 2.0 is available at
+http://www.apache.org/licenses/LICENSE-2.0
+
+The queries are used unmodified. They name the tree-sitter nodes that count as
+a definition or a reference in each grammar; src/agent8088/repomap.py reads
+them and does its own extraction, ranking and rendering.
