@@ -13,6 +13,13 @@ def test_skill_index_stays_lightweight(engine):
     assert "view_skill" in prompt
 
 
+def test_tool_protocol_keeps_names_and_arguments_separate(engine):
+    prompt = engine.render_tool_docs({"git_status": engine.TOOL_SPECS["git_status"]})
+    assert "must be exactly one schema name" in prompt
+    assert "no parentheses, arguments, or extra text" in prompt
+    assert "every argument only in the JSON object after ✿ARGS✿" in prompt
+
+
 def test_capability_guidance_is_conditional(engine, monkeypatch):
     monkeypatch.setattr(engine.memory, "enabled", lambda: False)
     minimal = {"describe_tool": engine.TOOL_SPECS["describe_tool"]}

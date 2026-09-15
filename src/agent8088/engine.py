@@ -3040,6 +3040,8 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
         "## Tools",
         "When a tool genuinely helps, call it by emitting exactly:",
         '✿' + 'FUNCTION' + '✿' + ': tool_name ' + '✿' + 'ARGS' + '✿' + ': {"arg": "value"}',
+        "The name after ✿FUNCTION✿ must be exactly one schema name: no parentheses, "
+        "arguments, or extra text. Put every argument only in the JSON object after ✿ARGS✿.",
         "Use a tool ONLY when it helps complete the task. Not every message needs a tool — "
         "for greetings, small talk, opinions, general knowledge, or unclear/garbled input, "
         "just answer directly in plain text. Never mention your tools or their availability "
