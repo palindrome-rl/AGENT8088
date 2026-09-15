@@ -23,6 +23,7 @@ in a source file would corrupt text the model then edits from.
 from __future__ import annotations
 
 import re
+import json
 import uuid
 from dataclasses import dataclass, field
 
@@ -122,11 +123,29 @@ PASSED, FAILED, UNKNOWN = "passed", "failed", "unknown"
 
 
 @dataclass(frozen=True)
+class Diagnostic:
+    """One source location reported by a test runner or compiler."""
+    path: str
+    line: int
+    message: str
+    column: int | None = None
+    severity: str = "error"
+
+    def as_dict(self) -> dict:
+        item = {"path": self.path, "line": self.line, "severity": self.severity,
+                "message": self.message}
+        if self.column is not None:
+            item["column"] = self.column
+        return item
+
+
+@dataclass(frozen=True)
 class Verdict:
     """What a command actually reported. `unknown` is a real answer, not a gap."""
     status: str = UNKNOWN
     summary: str = ""
     source: str = ""
+    diagnostics: tuple[Diagnostic, ...] = ()
 
     @property
     def known(self) -> bool:
@@ -135,13 +154,58 @@ class Verdict:
     def banner(self) -> str:
         if not self.known:
             return ""
-        return f"[verdict: {self.status.upper()}] {self.summary}".rstrip()
+        banner = f"[verdict: {self.status.upper()}] {self.summary}".rstrip()
+        if self.diagnostics:
+            banner += "\n" + json.dumps(
+                {"diagnostics": [item.as_dict() for item in self.diagnostics]},
+                ensure_ascii=False, separators=(",", ":"),
+            )
+        return banner
 
 
 _EXIT_STATUS = re.compile(r"Command exited with status (\d+)")
 # "no tests ran" / "collected 0 items" is neither a pass nor a failure, and
 # reading it as a pass is exactly the mistake this module is here to stop.
 _NO_TESTS = re.compile(r"no tests ran|collected 0 items|Ran 0 tests", re.I)
+_DIAGNOSTIC = re.compile(
+    r"^\s*(?P<path>.+?):(?P<line>\d+)(?::(?P<column>\d+))?:\s*"
+    r"(?:(?P<severity>fatal error|error|warning|note)\s*:\s*)?(?P<message>.+?)\s*$",
+    re.I,
+)
+_TRACEBACK_FRAME = re.compile(r'^\s*File "(?P<path>.+)", line (?P<line>\d+)')
+_EXCEPTION = re.compile(r"^(?P<name>[A-Za-z_][\w.]*(?:Error|Exception|Failure))(?::\s*(?P<message>.*))?$")
+_MAX_DIAGNOSTICS = 20
+
+
+def parse_diagnostics(text: str) -> tuple[Diagnostic, ...]:
+    """Extract common source diagnostics without guessing at unfamiliar output."""
+    found: list[Diagnostic] = []
+    traceback_frame: tuple[str, int] | None = None
+
+    def add(path: str, line: int, message: str, column: int | None = None,
+            severity: str = "error") -> None:
+        item = Diagnostic(path.strip(), line, message.strip(), column, severity.lower())
+        if item.path and item.message and item not in found and len(found) < _MAX_DIAGNOSTICS:
+            found.append(item)
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        frame = _TRACEBACK_FRAME.match(raw)
+        if frame:
+            traceback_frame = (frame.group("path"), int(frame.group("line")))
+            continue
+        match = _DIAGNOSTIC.match(raw)
+        if match:
+            severity = (match.group("severity") or "error").lower()
+            add(match.group("path"), int(match.group("line")), match.group("message"),
+                int(match.group("column")) if match.group("column") else None, severity)
+            continue
+        exception = _EXCEPTION.match(line)
+        if exception and traceback_frame:
+            add(traceback_frame[0], traceback_frame[1],
+                exception.group("message") or exception.group("name"))
+            traceback_frame = None
+    return tuple(found)
 
 
 def _counted(pattern: str, line: str):
@@ -185,13 +249,14 @@ def detect_verdict(text: str) -> Verdict:
     if not text:
         return Verdict()
 
+    diagnostics = parse_diagnostics(text)
     exit_match = _EXIT_STATUS.search(text)
     exit_failed = bool(exit_match) and int(exit_match.group(1)) != 0
 
     if _NO_TESTS.search(text):
         # A nonzero exit still means the command failed, even with no tests.
         if exit_failed:
-            return Verdict(FAILED, exit_match.group(0), source="exit status")
+            return Verdict(FAILED, exit_match.group(0), source="exit status", diagnostics=diagnostics)
         return Verdict(UNKNOWN, source="no tests ran")
 
     # unittest prints a bare "OK" with no counts. On its own that is far too
@@ -213,11 +278,12 @@ def detect_verdict(text: str) -> Verdict:
         # would hide it.
         if status == PASSED and exit_failed:
             return Verdict(FAILED, f"{line} (but {exit_match.group(0)})",
-                           source="summary + exit status")
-        return Verdict(status, line, source="summary line")
+                           source="summary + exit status", diagnostics=diagnostics)
+        return Verdict(status, line, source="summary line",
+                       diagnostics=diagnostics if status == FAILED else ())
 
     if exit_failed:
-        return Verdict(FAILED, exit_match.group(0), source="exit status")
+        return Verdict(FAILED, exit_match.group(0), source="exit status", diagnostics=diagnostics)
     return Verdict()
 
 

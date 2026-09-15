@@ -117,6 +117,35 @@ def test_a_successful_lookup_is_memoized_and_reused_without_reprobing(
     assert engine._playwright_chromium_executable() is None
 
 
+def test_exec_browser_pins_asyncio_logger_before_the_chromium_probe(monkeypatch):
+    """The Chromium path probe opens a real Playwright connection whose
+    teardown abandons its init task; the task's later GC prints "Task was
+    destroyed but it is pending!" through the asyncio logger
+    (playwright/_impl/_connection.py:343 - upstream cancels but never
+    awaits it). _set_browser_use_log_verbosity is the pin for that logger,
+    and it must run BEFORE the probe creates the connection - running it
+    only inside _run_browser_agent leaves the window between the probe and
+    the agent un-silenced, so a first-in-process browse_page prints the
+    GC noise into an otherwise clean run."""
+    calls = []
+    monkeypatch.setattr(engine, "_egress_check", lambda url: None)
+    monkeypatch.setattr(engine, "_ssrf_check", lambda url: None)
+    monkeypatch.setattr(engine, "_playwright_available", lambda: True)
+    monkeypatch.setattr(engine, "_browser_use_available", lambda: True)
+    monkeypatch.setattr(
+        engine, "_set_browser_use_log_verbosity",
+        lambda verbose: calls.append(("verbosity", verbose)))
+    monkeypatch.setattr(
+        engine, "_playwright_chromium_executable",
+        lambda: calls.append(("probe", None)) or None)
+
+    result = engine._exec_browser(
+        {"url": "https://example.com", "task": "read the heading"})
+
+    assert "not installed" in result  # early return, browser never launched
+    assert calls == [("verbosity", engine.SHOW_REASONING), ("probe", None)]
+
+
 def test_exec_browser_respects_existing_override(monkeypatch, tmp_path):
     monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "/custom/path")
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "agent8088")

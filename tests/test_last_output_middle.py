@@ -25,6 +25,13 @@ def test_the_middle_can_be_fetched_back_by_reference(engine):
     assert run[5_000:5_300] in got
 
 
+def test_content_handle_uses_the_same_store_without_changing_last_output(engine):
+    run, _, ref = _clamped(engine)
+    got = engine.run_tool("read_content", {"ref": ref, "offset": 5_000, "length": 300})
+    assert run[5_000:5_300] in got
+    assert "offset=5300" in got
+
+
 def test_the_window_says_where_it_sits_and_what_comes_next(engine):
     _, _, ref = _clamped(engine)
     got = engine.run_tool("last_output", {"ref": ref, "offset": 1_000, "length": 200})
