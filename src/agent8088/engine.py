@@ -8374,9 +8374,6 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         # changes the tree, and a crash mid-write must not leave a verdict
         # looking current.
         note_mutation(f"write {target}")
-        target_str = str(target)
-        if target_str and target_str not in _TURN_FILES_TOUCHED:
-            _TURN_FILES_TOUCHED.append(target_str)
 
     if mode == "introspect":
         if name == "describe_tool":
@@ -9270,13 +9267,6 @@ memory_on_capture = None
 # before reporting. None when capture ran synchronously or did not run.
 memory_capture_thread = None
 
-# Files written/edited so far in the current outermost turn (write_text mode:
-# write_file, edit_file, create_document, convert_document). Reset only at the
-# start of the outermost run_agent call, same as the blast-radius counters --
-# a subagent's writes are still work the outer turn accomplished, so they
-# accumulate here too rather than being invisible to the memory it captures.
-_TURN_FILES_TOUCHED: list = []
-
 
 def _memory_extract_completion(prompt: str):
     """One model call for fact extraction. Returns (text, usage).
@@ -9320,28 +9310,6 @@ def _resolve_repo_url() -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _resolve_author() -> str:
-    """Who is running this agent, for the memory metadata -- git's user.name
-    scoped to this repo, falling back to the OS account name.
-
-    Called once at configure time, same reasoning as _resolve_repo_url: this
-    cannot change mid-session, so it must not be a subprocess call per memory.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "config", "user.name"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    try:
-        return os.getlogin()
-    except Exception:
-        return os.environ.get("USERNAME") or os.environ.get("USER") or ""
-
-
 def configure_memory() -> None:
     """Wire the memory package to this engine's config, client and redactor.
 
@@ -9358,7 +9326,6 @@ def configure_memory() -> None:
             db_path=MEMORY_DB_PATH,
             project=str(PROJECT_ROOT),
             repo=_resolve_repo_url(),
-            author=_resolve_author(),
         )
     except Exception as exc:
         _log.debug("memory configuration skipped: %s", exc)
@@ -9428,7 +9395,6 @@ def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
     try:
         result = memory.capture([_message_text(turns[-1])], answer, identity=identity,
                                run_id=run_id, source_channel=source_channel,
-                               files_touched=list(_TURN_FILES_TOUCHED),
                                in_background=in_background,
                                on_stored=memory_on_capture)
         memory_capture_thread = result if in_background else None
@@ -10683,9 +10649,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         reset_turn_counters()
         reset_approval_state()
         reset_turn_approval_state()
-        global memory_capture_thread, _TURN_FILES_TOUCHED
+        global memory_capture_thread
         memory_capture_thread = None
-        _TURN_FILES_TOUCHED = []
         # Paint before recall, not after. Recall does a network round trip, and
         # the loop's own first spin("thinking...") is on the far side of it --
         # so without this the terminal stays blank for the whole call and the

@@ -4,7 +4,6 @@ Implements the MemoryStore contract against the Mem0 library (https://github.com
 All calls are non-raising and fail gracefully if mem0ai is not installed or errors.
 """
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -354,12 +353,6 @@ class Mem0MemoryStore:
                     "text": str(fact),
                     "score": score,
                     "categories": item.get("categories") or [],
-                    # JSON text, matching native's row["metadata"] shape (a raw
-                    # sqlite TEXT column, parsed by the caller) -- until now this
-                    # dict was written to mem0 at add() but nothing ever read it
-                    # back, so repo/author/source_channel/files_touched were
-                    # genuinely stored yet invisible through this adapter.
-                    "metadata": json.dumps(item.get("metadata")) if item.get("metadata") else None,
                 })
             return results
         except Exception as exc:
@@ -390,7 +383,6 @@ class Mem0MemoryStore:
                     "id": str(item.get("id") or ""),
                     "text": str(fact),
                     "created_at": item.get("created_at"),
-                    "metadata": json.dumps(item.get("metadata")) if item.get("metadata") else None,
                 })
             return out
         except Exception as exc:
