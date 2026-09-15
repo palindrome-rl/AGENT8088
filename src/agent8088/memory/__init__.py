@@ -20,6 +20,7 @@ Two invariants hold across this whole package:
 """
 
 import logging
+import os
 import threading
 
 from .embed import Embedder
@@ -35,7 +36,31 @@ from .store import MemoryStore, MemoryStoreError
 log = logging.getLogger("agent8088.memory")
 
 __all__ = ["MemoryStore", "MemoryStoreError", "capture", "configure", "embedder",
-           "enabled", "recall", "recall_block", "reset", "status", "store"]
+           "enabled", "parse_memory_engine_config", "recall", "recall_block",
+           "reset", "status", "store"]
+
+def parse_memory_engine_config(config=None):
+    """Extract memory engine selection and Mem0 settings from configuration dict."""
+    config = config or {}
+    engine_name = str(config.get("memory_engine", "native")).strip().lower()
+    if engine_name not in {"native", "mem0"}:
+        engine_name = "native"
+
+    # Default follows AGENT8088_HOME so an isolated home (installer -Agent8088Home,
+    # tests, parallel agents) keeps mem0's vectors next to the rest of its data.
+    # An explicit memory_mem0_dir always wins, same precedence as memory_db_path.
+    default_mem0_dir = os.path.join(
+        os.environ.get("AGENT8088_HOME", os.path.expanduser("~/.agent8088")), "mem0")
+    mem0_cfg = {
+        "vector_store": str(config.get("memory_mem0_vector_store", "qdrant")).strip().lower(),
+        "path": os.path.expanduser(str(config.get("memory_mem0_dir", default_mem0_dir)).strip()),
+        "llm_provider": str(config.get("memory_mem0_llm_provider") or config.get("provider") or "").strip().lower(),
+        "llm_model": str(config.get("memory_mem0_llm_model") or config.get("model") or "").strip(),
+        "embed_provider": str(config.get("memory_mem0_embed_provider") or config.get("memory_embed_provider") or "").strip().lower(),
+        "embed_model": str(config.get("memory_mem0_embed_model") or config.get("memory_embed_model") or "").strip(),
+        "disable_telemetry": True,
+    }
+    return engine_name, mem0_cfg
 
 # The header the recalled block carries into the system prompt. The framing is
 # load-bearing rather than decorative: memory poisoning to privilege escalation
@@ -51,7 +76,7 @@ _BLOCK_HEADER = (
 )
 
 _RUNTIME = {}
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 _LAST_CAPTURE = {}
 
 
@@ -74,7 +99,9 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
     with _LOCK:
         previous_path = _RUNTIME.get("db_path")
         previous_model = _RUNTIME.get("embed_model")
+        previous_engine = _RUNTIME.get("engine_name")
         embed_model = str(config.get("memory_embed_model") or "nomic-embed-text").strip()
+        engine_name, mem0_cfg = parse_memory_engine_config(config)
 
         _RUNTIME.update(
             # On for every install, off for a bare import with no config at all.
@@ -85,8 +112,10 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             # a test, a library use, a script -- must not start spending it
             # unasked. `memory=1` in config.txt is the switch, not this line.
             enabled=_flag("memory"),
+            engine_name=engine_name,
+            mem0_cfg=mem0_cfg,
             capture_enabled=_flag("memory_capture", "1"),
-            db_path=db_path,
+            db_path=db_path or os.path.expanduser("~/.agent8088/memory.db"),
             user_id=user_id or str(config.get("memory_user_id") or "owner").strip(),
             scope_by_identity=_flag("memory_scope_by_identity"),
             embed_model=embed_model,
@@ -105,7 +134,7 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             redact=redact or (lambda text: text),
             client_factory=client_factory,
         )
-        if previous_path != db_path:
+        if previous_path != db_path or previous_engine != engine_name:
             existing = _RUNTIME.pop("store", None)
             if existing is not None:
                 try:
@@ -130,7 +159,7 @@ def reset():
 
 
 def enabled() -> bool:
-    return bool(_RUNTIME.get("enabled") and _RUNTIME.get("db_path"))
+    return bool(_RUNTIME.get("enabled") and (_RUNTIME.get("db_path") or _RUNTIME.get("engine_name") == "mem0"))
 
 
 def store():
@@ -141,8 +170,35 @@ def store():
         existing = _RUNTIME.get("store")
         if existing is not None:
             return existing
+
+        engine_name = _RUNTIME.get("engine_name", "native")
+        if engine_name == "mem0":
+            try:
+                from .mem0_store import Mem0MemoryStore
+                mem0_cfg = _RUNTIME.get("mem0_cfg") or {}
+                mem0_store = Mem0MemoryStore(
+                    mem0_cfg,
+                    client_factory=_RUNTIME.get("client_factory"),
+                    embedder=embedder(),
+                )
+                if mem0_store.available():
+                    _RUNTIME["mem0_error"] = ""
+                    _RUNTIME["store"] = mem0_store
+                    return mem0_store
+                # Kept for status() to report. The store object itself is dropped
+                # on the way to the native fallback, and with it the only record
+                # of why mem0 could not start -- which is how an unsupported LLM
+                # provider went on looking exactly like "mem0ai isn't installed".
+                _RUNTIME["mem0_error"] = getattr(mem0_store, "last_error", "") or "unavailable"
+                log.warning("mem0 memory engine requested but unavailable (%s); "
+                            "falling back to native store", _RUNTIME["mem0_error"])
+            except Exception as exc:
+                _RUNTIME["mem0_error"] = " ".join(str(exc).split())[:300]
+                log.debug("mem0 store instantiation failed: %s; falling back to native", exc)
+
         try:
-            opened = MemoryStore(_RUNTIME["db_path"])
+            db_path = _RUNTIME.get("db_path") or os.path.expanduser("~/.agent8088/memory.db")
+            opened = MemoryStore(db_path)
             opened.connect()
         except Exception as exc:
             log.debug("memory store unavailable: %s", exc)
@@ -186,8 +242,11 @@ def recall(query, *, identity=None, limit=None):
         active_store = store()
         if active_store is None:
             return []
-        active_embedder = embedder()
-        vector = active_embedder.embed_one(query) if active_embedder else []
+        engine_name = _RUNTIME.get("engine_name", "native")
+        vector = []
+        if engine_name != "mem0":
+            active_embedder = embedder()
+            vector = active_embedder.embed_one(query) if active_embedder else []
         return active_store.search(
             str(query),
             user_id=user_id(identity),
@@ -341,6 +400,13 @@ def status() -> dict:
     """Live state for `/memory` and describe_capabilities."""
     report = {
         "enabled": enabled(),
+        # What config asked for. `engine` below is corrected to whatever the
+        # store actually opened, since store() degrades mem0 -> native silently
+        # and reporting the request would point the user at the wrong database.
+        "engine_configured": _RUNTIME.get("engine_name", "native"),
+        "engine": _RUNTIME.get("engine_name", "native"),
+        "embedder_info": None,
+        "engine_error": "",
         "db_path": str(_RUNTIME.get("db_path") or ""),
         "user_id": user_id(),
         "embed_model": _RUNTIME.get("embed_model", ""),
@@ -359,11 +425,25 @@ def status() -> dict:
     }
     active_store = store()
     if active_store is not None:
+        store_status = {}
+        if hasattr(active_store, "status"):
+            try:
+                store_status = active_store.status() or {}
+            except Exception as exc:
+                log.debug("memory store status failed: %s", exc)
+        report["engine"] = store_status.get("engine", "native")
+        report["embedder_info"] = store_status.get("embedder")
+        # Why the requested engine is not the live one. Only meaningful when
+        # those two disagree; a healthy native-by-choice setup has no error.
+        if report["engine"] != report["engine_configured"]:
+            report["engine_error"] = _RUNTIME.get("mem0_error", "")
         try:
             report["count"] = active_store.count(user_id=report["user_id"])
-            report["stale_vectors"] = active_store.stale_vector_count(
-                model=report["embed_model"])
-            report["db_bytes"] = active_store.path.stat().st_size
+            if hasattr(active_store, "stale_vector_count"):
+                report["stale_vectors"] = active_store.stale_vector_count(
+                    model=report["embed_model"])
+            if hasattr(active_store, "path") and active_store.path.exists() and active_store.path.is_file():
+                report["db_bytes"] = active_store.path.stat().st_size
         except Exception as exc:
             report["error"] = str(exc)[:200]
     active_embedder = embedder()

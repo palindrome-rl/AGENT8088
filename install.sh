@@ -180,6 +180,12 @@ NODE_VERSION="22.11.0"
 # Options
 SKIP_SETUP=false
 BRANCH="$REPO_BRANCH"
+# Empty until --memory, $AGENT8088_INSTALL_MEM0 or the prompt resolves it.
+MEMORY_CHOICE=""
+MEMORY_ENGINE=""
+# Empty (unset) until --with/--skip-libreoffice or $AGENT8088_INSTALL_LIBREOFFICE
+# resolves it; true/false once decided.
+LIBREOFFICE_CHOICE=""
 IS_INTERACTIVE=true
 FRESH_INSTALL=false
 CONFIG_CREATED=false
@@ -189,6 +195,8 @@ GATEWAY_EXTRAS_INSTALLED=false
 SEARCH_EXTRAS_INSTALLED=false
 CHROMIUM_INSTALLED=false
 OCR_INSTALLED=false
+MEM0_INSTALLED=false
+LIBREOFFICE_INSTALLED=false
 REPOSITORY_INSTALLED=false
 NODE_INSTALLED=false
 WHATSAPP_BRIDGE_READY=false
@@ -207,15 +215,27 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-setup) SKIP_SETUP=true; shift ;;
         --branch)     BRANCH="$2"; shift 2 ;;
+        --memory)
+            case "$2" in
+                native|mem0) MEMORY_CHOICE="$2" ;;
+                *) echo "Unknown memory backend: $2 (expected native or mem0)"; exit 1 ;;
+            esac
+            shift 2
+            ;;
+        --with-libreoffice) LIBREOFFICE_CHOICE=true; shift ;;
+        --skip-libreoffice) LIBREOFFICE_CHOICE=false; shift ;;
         -h|--help)
             echo "Agent8088 Installer"
             echo ""
             echo "Usage: curl -fsSL <url> | bash -s -- [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --skip-setup   Skip interactive setup wizard"
-            echo "  --branch NAME  Git branch to install (default: $REPO_BRANCH)"
-            echo "  -h, --help      Show this help"
+            echo "  --skip-setup          Skip interactive setup wizard"
+            echo "  --branch NAME         Git branch to install (default: $REPO_BRANCH)"
+            echo "  --memory BACKEND      Memory engine: native (default) or mem0"
+            echo "  --with-libreoffice    Install LibreOffice (docx/pptx/xlsx conversion)"
+            echo "  --skip-libreoffice    Don't install LibreOffice"
+            echo "  -h, --help            Show this help"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -229,6 +249,182 @@ log_info()    { echo -e "\033[0;36m→\033[0m $1"; }
 log_success() { echo -e "\033[0;32m✓\033[0m $1"; }
 log_warn()    { echo -e "\033[0;33m⚠\033[0m $1"; }
 log_error()   { echo -e "\033[0;31m✗\033[0m $1"; }
+
+# Whether a question can reach a human at all. IS_INTERACTIVE covers the
+# `bash install.sh` case; the documented install method is `curl -fsSL <url> |
+# bash`, which makes stdin the pipe (IS_INTERACTIVE=false) even though a real
+# terminal is sitting right there as /dev/tty -- the same trick prompt_yes_no
+# already uses. Without this, every prompt below silently defaults on the one
+# install path the README tells people to use.
+_can_prompt() {
+    [ "$IS_INTERACTIVE" = true ] && return 0
+    [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+# Print a prompt to the real terminal and read one line of the answer back
+# from it, working whether stdin is a tty (direct install) or a pipe (curl |
+# bash, where /dev/tty is still the terminal). Echoes the raw answer.
+_read_from_terminal() {
+    local prompt="$1" answer=""
+    if [ "$IS_INTERACTIVE" = true ]; then
+        printf "%s" "$prompt" >&2
+        read -r answer || answer=""
+    else
+        printf "%s" "$prompt" > /dev/tty
+        IFS= read -r answer < /dev/tty || answer=""
+    fi
+    echo "$answer"
+}
+
+# Which memory engine to install: echoes "native" or "mem0".
+#
+# native needs nothing beyond the core install (SQLite plus the embedder). mem0
+# pulls mem0ai, fastembed, qdrant-client, grpcio and sqlalchemy and downloads an
+# embedding model on first use, so it is opt-in. The non-interactive default is
+# native for the same reason every other heavy optional stage skips unattended:
+# a piped `curl | bash` must not spend minutes on something nobody asked for.
+resolve_memory_choice() {
+    if [ -n "$MEMORY_CHOICE" ]; then
+        echo "$MEMORY_CHOICE"
+        return
+    fi
+    case "${AGENT8088_INSTALL_MEM0:-}" in
+        1|y|yes|true|mem0)    echo "mem0"; return ;;
+        0|n|no|false|native)  echo "native"; return ;;
+    esac
+    if ! _can_prompt || [ -n "${CI:-}" ]; then
+        echo "native"
+        return
+    fi
+    # Prompt on the terminal, not stdout: this function's stdout is the answer.
+    {
+        echo ""
+        echo "    Agent8088 remembers facts across sessions. Pick the backend:"
+        echo "      native - SQLite with keyword + semantic search. No extra downloads."
+        echo "      mem0   - Mem0 with a Qdrant vector store and LLM fact extraction."
+        echo "               Adds ~200 MB of dependencies plus an embedding model."
+        echo "    Either can be changed later with /memory engine <name>."
+    } >&2
+    local answer=""
+    while [ "$answer" != "native" ] && [ "$answer" != "mem0" ]; do
+        answer="$(_read_from_terminal "Which memory backend? [native/mem0]: ")"
+        [ -z "$answer" ] && { echo "native"; return; }
+        answer="$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    done
+    echo "$answer"
+}
+
+# Whether to install LibreOffice: echoes "true" or "false".
+#
+# Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading, and
+# Excel formula recalculation (see documents.py's _soffice_executable). It is
+# the slowest optional stage here by a wide margin, so it asks first, same as
+# mem0 above and Install-LibreOffice in install.ps1.
+resolve_libreoffice_choice() {
+    if [ -n "$LIBREOFFICE_CHOICE" ]; then
+        echo "$LIBREOFFICE_CHOICE"
+        return
+    fi
+    case "${AGENT8088_INSTALL_LIBREOFFICE:-}" in
+        1|y|yes|true)  echo "true"; return ;;
+        0|n|no|false)  echo "false"; return ;;
+    esac
+    if [ "$DISTRO" = "termux" ]; then
+        echo "false"  # no LibreOffice build for Android
+        return
+    fi
+    if ! _can_prompt || [ -n "${CI:-}" ]; then
+        echo "false"
+        return
+    fi
+    {
+        echo ""
+        echo "    LibreOffice is optional (~350 MB+) and can take several minutes to"
+        echo "    download and install."
+        echo "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls"
+        echo "    reading, and Excel formula recalculation. Skipping is safe."
+    } >&2
+    local answer=""
+    while [ "$answer" != "yes" ] && [ "$answer" != "no" ]; do
+        answer="$(_read_from_terminal "Install LibreOffice now? [yes/no]: ")"
+        [ -z "$answer" ] && continue
+        answer="$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    done
+    [ "$answer" = "yes" ] && echo "true" || echo "false"
+}
+
+# Best-effort install: macOS via Homebrew cask, Linux via the distro's package
+# manager (apt/dnf/pacman); anything else falls through to record_skip below.
+# Non-fatal at every branch -- LibreOffice-backed conversion degrades to a
+# clear "not available" at runtime (documents.py), so a failed or unsupported
+# install must not fail the whole installer.
+install_libreoffice() {
+    if command -v soffice >/dev/null 2>&1; then
+        log_success "LibreOffice already installed"
+        LIBREOFFICE_INSTALLED=true
+        return
+    fi
+    log_info "Installing LibreOffice; this can take several minutes..."
+    local _rc=0
+    case "$OS" in
+        macos)
+            if command -v brew >/dev/null 2>&1; then
+                run_with_timeout "$T_LIBREOFFICE" brew install --cask libreoffice \
+                    >/dev/null 2>&1 || _rc=$?
+            else
+                _rc=1
+            fi
+            ;;
+        linux)
+            local sudo_cmd=""
+            [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+            case "$DISTRO" in
+                ubuntu|debian)
+                    run_with_timeout "$T_LIBREOFFICE" $sudo_cmd env DEBIAN_FRONTEND=noninteractive \
+                        apt-get install -y -qq libreoffice >/dev/null 2>&1 || _rc=$?
+                    ;;
+                fedora)
+                    run_with_timeout "$T_LIBREOFFICE" $sudo_cmd dnf install -y libreoffice \
+                        >/dev/null 2>&1 || _rc=$?
+                    ;;
+                arch)
+                    run_with_timeout "$T_LIBREOFFICE" $sudo_cmd pacman -S --noconfirm libreoffice-fresh \
+                        >/dev/null 2>&1 || _rc=$?
+                    ;;
+                *) _rc=1 ;;
+            esac
+            ;;
+        *) _rc=1 ;;
+    esac
+    if [ "$_rc" -eq 0 ] && command -v soffice >/dev/null 2>&1; then
+        LIBREOFFICE_INSTALLED=true
+        log_success "LibreOffice installed"
+        return
+    fi
+    if [ "$_rc" -eq 124 ]; then
+        warn_stage 124 "$T_LIBREOFFICE" "LibreOffice" \
+            ".docx/.pptx/.xlsx conversion will be unavailable" \
+            "install LibreOffice manually from https://www.libreoffice.org/download/"
+    else
+        log_warn "LibreOffice install did not complete."
+        record_skip "LibreOffice" "install failed or no supported package manager found" \
+            "install LibreOffice manually from https://www.libreoffice.org/download/"
+    fi
+}
+
+# Rewrite an existing memory_engine line rather than appending, so rerunning the
+# installer cannot stack duplicates for the config parser to resolve.
+set_configured_memory_engine() {
+    local config_file="$1" engine="$2"
+    [ -f "$config_file" ] || return 1
+    if grep -q '^[[:space:]]*memory_engine[[:space:]]*=' "$config_file"; then
+        # -i differs between GNU and BSD sed, so write a temp file and move it.
+        sed "s|^[[:space:]]*memory_engine[[:space:]]*=.*|memory_engine=$engine|" \
+            "$config_file" > "$config_file.tmp" && mv "$config_file.tmp" "$config_file"
+    else
+        echo "memory_engine=$engine" >> "$config_file"
+    fi
+}
 
 # ----------------------------------------------------------------------------
 # Timeouts for the network stages
@@ -259,6 +455,8 @@ T_NPM=$((300          * TIMEOUT_SCALE))   # 142 small packages, mostly round-tri
 T_CHROMIUM=$((600     * TIMEOUT_SCALE))   # ~150 MB browser download
 T_NODE_DL=$((180      * TIMEOUT_SCALE))   # ~30 MB tarball
 T_PIP=$((300          * TIMEOUT_SCALE))   # gateway extras: tens of MB of wheels
+T_LIBREOFFICE=$((1800 * TIMEOUT_SCALE))   # ~350 MB+ plus dependency resolution/install
+T_MEM0_MODEL=$((600  * TIMEOUT_SCALE))    # ~90 MB fastembed model, same size as the OCR ones
 T_GIT=$((600          * TIMEOUT_SCALE))   # shallow clone: small, but a stalled fetch hangs
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
@@ -980,6 +1178,69 @@ install_deps() {
     fi
     [ "$OCR_INSTALLED" = true ] && log_success "OCR engine and models installed"
 
+    # --- Memory backend (optional [mem0] extra) ---
+    # The engine is recorded in config.txt either way, so a config asking for
+    # mem0 can never outlive the extra that makes it work: without it memory
+    # degrades to native silently at runtime, which is what the choice prevents.
+    MEMORY_ENGINE="$(resolve_memory_choice)"
+    if [ "$MEMORY_ENGINE" = "mem0" ]; then
+        log_info "Installing the mem0 memory backend (mem0ai, fastembed, qdrant)..."
+        _mem0_rc=0
+        if [ "$DISTRO" = "termux" ]; then
+            run_with_timeout "$T_PIP" pip install -e ".[mem0]" >/dev/null 2>&1 || _mem0_rc=$?
+        else
+            run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
+                -e "$INSTALL_DIR[mem0]" >/dev/null 2>&1 || _mem0_rc=$?
+        fi
+        if [ "$_mem0_rc" -eq 0 ]; then
+            MEM0_INSTALLED=true
+            log_success "mem0 memory backend installed"
+            # fastembed fetches this on first construction. Doing it here rather
+            # than mid-conversation keeps the first /memory instant -- otherwise
+            # the download fires inside the REPL and floods it with progress
+            # bars -- and lets a machine that is offline later still work.
+            log_info "Downloading the mem0 embedding models (~90 MB)..."
+            _mem0_model_rc=0
+            # Both models, not just the dense one: qdrant pulls Qdrant/bm25 for
+            # its sparse leg on the first write, so warming only TextEmbedding
+            # leaves an 18-file download to fire on the first captured memory.
+            # Same cache the runtime pins (memory/mem0_store.py). fastembed's own
+            # default is the system temp dir, which gets purged -- downloading
+            # there would leave the REPL to fetch it all over again.
+            FASTEMBED_CACHE_PATH="$AGENT8088_HOME/fastembed" \
+                run_with_timeout "$T_MEM0_MODEL" "$_py" -c \
+                "from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')" \
+                >/dev/null 2>&1 || _mem0_model_rc=$?
+            if [ "$_mem0_model_rc" -eq 0 ]; then
+                log_success "mem0 embedding model installed"
+            else
+                warn_stage "$_mem0_model_rc" "$T_MEM0_MODEL" "mem0 embedding model" \
+                    "the first /memory call will download it instead" \
+                    "$_py -c \"from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')\""
+            fi
+        else
+            # Non-fatal: native needs nothing extra, so a wheel that will not
+            # build here must not fail the install. Fall back to it honestly.
+            MEMORY_ENGINE="native"
+            warn_stage "$_mem0_rc" "$T_PIP" "mem0 memory backend" \
+                "memory will use the native engine instead" \
+                "$UV_CMD pip install --python $_py -e \"$INSTALL_DIR[mem0]\""
+        fi
+    else
+        log_info "Using the native memory backend (SQLite, no extra downloads)."
+    fi
+
+    # --- LibreOffice (headless soffice) ---
+    if [ "$(resolve_libreoffice_choice)" = "true" ]; then
+        install_libreoffice
+    elif [ "$DISTRO" = "termux" ]; then
+        log_info "Skipping LibreOffice (no build for Android/Termux)."
+    else
+        log_info "Skipping LibreOffice."
+        record_skip "LibreOffice" "not selected (optional, slow to install)" \
+            "rerun with --with-libreoffice, or install manually from https://www.libreoffice.org/download/"
+    fi
+
     # --- Repository context (optional [repository] extra) ---
     # repository_read is registered unconditionally, so without this the model is
     # told the tool exists and the first call spends a turn discovering it cannot
@@ -1518,6 +1779,18 @@ drop_config() {
         chmod 600 "$AGENT8088_HOME/config.txt"
     fi
 
+    # Point the config at whichever engine actually got installed, including in
+    # the preserved-config branch: a stale memory_engine=mem0 with the extra
+    # missing degrades to native silently at runtime, which is the one outcome
+    # this choice exists to prevent.
+    if [ -n "$MEMORY_ENGINE" ]; then
+        if set_configured_memory_engine "$AGENT8088_HOME/config.txt" "$MEMORY_ENGINE"; then
+            log_success "Memory engine set to $MEMORY_ENGINE"
+        else
+            log_warn "Could not set memory_engine in $AGENT8088_HOME/config.txt"
+        fi
+    fi
+
     # Set AGENT8088_CONFIG env var so the engine finds the user config.
     # Persist to shell rc files.
     local config_line="export AGENT8088_CONFIG=\"$AGENT8088_HOME/config.txt\""
@@ -1562,6 +1835,16 @@ verify_install() {
         echo "  OCR:      ready (models without vision can read attached images)"
     else
         echo "  OCR:      unavailable - attached images need a vision-capable model"
+    fi
+    if [ "$MEM0_INSTALLED" = true ]; then
+        echo "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
+    else
+        echo "  Memory:   native SQLite (rerun with --memory mem0 to add the mem0 engine)"
+    fi
+    if [ "$LIBREOFFICE_INSTALLED" = true ]; then
+        echo "  Office:   LibreOffice ready (docx/pptx/xlsx conversion)"
+    else
+        echo "  Office:   LibreOffice not installed (rerun with --with-libreoffice)"
     fi
     if [ "$REPOSITORY_INSTALLED" = true ]; then
         echo "  Repos:    repository_read ready (bounded repository overviews)"

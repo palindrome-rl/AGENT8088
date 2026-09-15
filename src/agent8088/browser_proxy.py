@@ -129,12 +129,14 @@ class _SSRFFilteringHandler(http.server.BaseHTTPRequestHandler):
         self.server.record_visit(self.path)
         target = urllib.parse.urlunparse(
             ("", "", parsed.path or "/", parsed.params, parsed.query, ""))
-        upstream.sendall(f"{method} {target} HTTP/1.1\r\n".encode())
+        header_lines = [f"{method} {target} HTTP/1.1"]
         for key, value in self.headers.items():
             if key.lower() == "proxy-connection":
                 continue
-            upstream.sendall(f"{key}: {value}\r\n".encode())
-        upstream.sendall(b"\r\n")
+            header_lines.append(f"{key}: {value}")
+        header_lines.append("")
+        header_lines.append("")
+        upstream.sendall("\r\n".join(header_lines).encode())
         content_length = int(self.headers.get("Content-Length", 0) or 0)
         if content_length:
             upstream.sendall(self.rfile.read(content_length))

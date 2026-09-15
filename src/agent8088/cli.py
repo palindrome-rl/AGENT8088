@@ -1559,6 +1559,11 @@ def _drain_queued_keys():
     """
     if sys.platform == "win32":
         try:
+            import ctypes
+            ctypes.windll.kernel32.FlushConsoleInputBuffer(ctypes.windll.kernel32.GetStdHandle(-10))
+        except Exception:
+            pass
+        try:
             import msvcrt
             while msvcrt.kbhit():
                 msvcrt.getch()
@@ -1889,6 +1894,27 @@ def do_chat(query):
         def _on_escalation(_name, result):
             return _handle_escalation(result, live, esc)
 
+        def _on_human_input(question: str, reason: str = "") -> str:
+            if live is not None:
+                live.stop()
+            with (esc.paused() if esc is not None else nullcontext()):
+                from agent8088.browser_hitl import format_hitl_prompt
+                console.print(format_hitl_prompt(question, reason))
+                time.sleep(0.05)
+                _drain_queued_keys()
+                try:
+                    ans = console.input("[bold cyan]8088 [Human input] › [/bold cyan]").strip()
+                except (EOFError, KeyboardInterrupt):
+                    ans = ""
+            if live is not None:
+                live.start()
+            if not ans:
+                from agent8088.browser_hitl import _format_empty_human_response
+                return _format_empty_human_response()
+            return ans
+
+        A.human_input_handler = _on_human_input
+
         # Wire plan execution callbacks so execute_plan tool calls render the
         # checklist and route write-step escalations to the approval menu.
         _plan_steps_state = {}
@@ -1939,6 +1965,7 @@ def do_chat(query):
         except A.AgentInterrupted:
             answer = None
         finally:
+            A.human_input_handler = None
             A.memory_on_capture = None
             A.subagent_ui = None
             A._plan_on_step = None
@@ -2027,7 +2054,7 @@ COMMAND_SPECS = (
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
     ("cost", "/cost [task-id]", "Summarize recorded model-call telemetry — estimates only; unknown costs stay unknown", ()),
-    ("memory", "/memory [on|off|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
+    ("memory", "/memory [on|off|engine|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
     ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
     ("history", "/history", "Show the current conversation", ()),
     ("trace", "/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace", ()),
@@ -2042,6 +2069,7 @@ COMMAND_SPECS = (
     ("clear", "/clear", "Clear the conversation context", ()),
     ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
     ("schedule", "/schedule [list|add <cron> <task>|remove <index-or-task>]", "Add/list/remove a recurring run of this agent (cron/Task Scheduler)", ()),
+    ("browser", "/browser [status|close|reset]", "Inspect or close the active reusable browser session", ()),
     ("help", "/help", "Show this list", ()),
     ("exit", "/exit, /quit", "Leave", ("quit",)),
 )
@@ -3190,6 +3218,60 @@ def _endpoint_probe(endpoint):
         return f"unreachable ({exc})"
 
 
+def _install_mem0_extra():
+    """Install the mem0 optional dependencies into this interpreter.
+
+    Same pip-then-uv fallback as _reinstall_package: a uv venv built without
+    --seed has no pip module, and install.sh populates those venvs via
+    `uv pip install --python` -- so fall back to exactly that command.
+    """
+    packages = "mem0ai>=0.1.40 fastembed>=0.3.0"
+    pip_result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", *packages.split()],
+        capture_output=True, text=True, timeout=600,
+    )
+    if pip_result.returncode == 0:
+        return True, "installed"
+
+    stderr = pip_result.stderr or ""
+    uv = shutil.which("uv")
+    if uv and ("No module named pip" in stderr or pip_result.returncode != 0):
+        uv_result = subprocess.run(
+            [uv, "pip", "install", "--python", sys.executable, *packages.split()],
+            capture_output=True, text=True, timeout=600,
+        )
+        if uv_result.returncode == 0:
+            return True, "installed"
+        stderr = uv_result.stderr or uv_result.stdout or "unknown uv error"
+    return False, (stderr or pip_result.stdout or "unknown pip error")[-300:]
+
+
+def run_memory_setup():
+    """`agent8088 --memory-setup`: add the mem0 engine to an existing install.
+
+    Mirrors --sandbox-setup: one command, installs the missing optional
+    backend, then records the engine choice so the user does not have to
+    find /memory engine afterwards. Config is only flipped after the deps
+    import cleanly -- a failed install must not point config at Qdrant.
+    """
+    print("Installing the mem0 memory backend (mem0ai, fastembed, qdrant)...")
+    ok, detail = _install_mem0_extra()
+    if not ok:
+        print(f"Installation failed: {detail}")
+        print("You can retry, or use the installer: install.ps1 -WithMem0"
+              " / install.sh --memory mem0")
+        return 1
+    from agent8088.memory.mem0_store import _import_mem0
+    if _import_mem0() is None:
+        print("Dependencies installed but mem0 could not be imported.")
+        print("Try rerunning, or: uv pip install -e \".[mem0]\"")
+        return 1
+    A.update_simple_config(A.CONFIG_PATH, {"memory_engine": "mem0"})
+    print("mem0 memory backend installed; memory_engine=mem0 set in config.")
+    print("Switch back any time with: agent8088 -> /memory engine native")
+    return 0
+
+
 def _reinstall_package(package: str) -> tuple[bool, str]:
     """Force-reinstall `package` into the interpreter currently running this
     process. Tries pip first -- it works whether the venv is stdlib-created or a
@@ -3535,6 +3617,24 @@ def cmd_schedule(rest):
         _cmd_schedule_remove(arg)
     else:
         _print_schedule_usage()
+
+
+def handle_browser_command(args: list[str]) -> str:
+    sub = (args[0] if args else "status").lower()
+    from agent8088.browser_session import cleanup_browser_session, is_browser_session_active
+    if sub in ("close", "reset", "stop"):
+        if is_browser_session_active():
+            cleanup_browser_session()
+            return "Active browser session closed and temporary files cleared."
+        return "No active browser session was running."
+    active = is_browser_session_active()
+    return f"Browser session: {'active' if active else 'idle'}"
+
+
+def cmd_browser(rest: str):
+    parts = (rest or "").strip().split()
+    msg = handle_browser_command(parts)
+    console.print(f"[#237dd7]{msg}[/#237dd7]")
 
 
 def cmd_dump(_rest):
@@ -4579,6 +4679,26 @@ def _memory_set_enabled(want: bool) -> None:
     A.configure_memory()
 
 
+MEMORY_ENGINES = ("native", "mem0")
+
+
+def _memory_set_engine(name: str) -> None:
+    """Point memory at a different engine. Neither store's data is touched."""
+    name = str(name).strip().lower()
+    if name not in MEMORY_ENGINES:
+        raise ValueError(f"unknown memory engine: {name}")
+    A.update_simple_config(A.CONFIG_PATH, {"memory_engine": name})
+    A.APP_CONFIG["memory_engine"] = name
+    A.configure_memory()
+
+
+def _describe_embedder(info) -> str:
+    if not info:
+        return "—"
+    dims = f", {info['dims']}d" if info.get("dims") else ""
+    return f"{info.get('model') or '?'} ({info.get('provider') or '?'}{dims})"
+
+
 def _show_memory_status():
     report = A.memory.status()
     if not report["enabled"]:
@@ -4590,27 +4710,49 @@ def _show_memory_status():
     table = Table(box=box.SIMPLE, header_style="bold #00edff", border_style="#0077B6")
     table.add_column("Setting", style="#237dd7")
     table.add_column("Value", style="#237dd7")
+    engine_name = report.get("engine", "native")
+    requested = report.get("engine_configured", engine_name)
+    engine_label = f"{engine_name} ({'Mem0 graph/vector' if engine_name == 'mem0' else 'SQLite BM25+vector'})"
+    if requested != engine_name:
+        # Silent degradation is the failure mode worth shouting about: the user
+        # asked for mem0 and is writing to SQLite instead.
+        engine_label += f" [yellow]— {requested} was requested but is unavailable[/yellow]"
+    table.add_row("Engine", engine_label)
+    if requested != engine_name and report.get("engine_error"):
+        # The reason, not just the fact. Without this the user is told mem0 did
+        # not start and given nothing to act on.
+        table.add_row("Why", report["engine_error"])
     table.add_row("Memories", str(report["count"]))
     table.add_row("Scope", report["user_id"]
                   + (" (per identity)" if report["scope_by_identity"] else " (shared)"))
-    where = report.get("embed_provider") or "active provider"
-    if report["embedder_ok"]:
-        retrieval = f"keyword + semantic ({report['embed_model']} on {where})"
+    if engine_name == "mem0":
+        # The configured dir, not a hardcoded one: an AGENT8088_HOME override or a
+        # custom memory_mem0_dir moves this, and pointing the user at the wrong
+        # location on a "where did my memories go" question sends them hunting.
+        active_store = A.memory.store()
+        mem0_where = (f"{active_store.vector_store_type} ({active_store.path})"
+                      if active_store is not None else "qdrant")
+        table.add_row("Vector DB", mem0_where)
+        table.add_row("Embedder", _describe_embedder(report.get("embedder_info")))
     else:
-        # Naming both the reason and the endpoint: recall still works on keywords
-        # alone, so a user who thinks memory is broken will switch it off instead
-        # of fixing it -- and the fix depends on *which* host was asked, since
-        # "pull the model" cannot help a host that never had the request.
-        reason = report["embedder_error"] or "not reachable"
-        retrieval = f"keyword only — {report['embed_model']} on {where}: {reason}"
-    table.add_row("Retrieval", retrieval)
+        where = report.get("embed_provider") or "active provider"
+        if report["embedder_ok"]:
+            retrieval = f"keyword + semantic ({report['embed_model']} on {where})"
+        else:
+            # Naming both the reason and the endpoint: recall still works on keywords
+            # alone, so a user who thinks memory is broken will switch it off instead
+            # of fixing it -- and the fix depends on *which* host was asked, since
+            # "pull the model" cannot help a host that never had the request.
+            reason = report["embedder_error"] or "not reachable"
+            retrieval = f"keyword only — {report['embed_model']} on {where}: {reason}"
+        table.add_row("Retrieval", retrieval)
+        table.add_row("Store", f"{report['db_path']}"
+                      + (f" ({report.get('db_bytes', 0) / 1024:.0f} KB)"
+                         if report.get("db_bytes") else ""))
     table.add_row("Learning", "on" if report["capture_enabled"] else "off (recall only)")
     table.add_row("Notifications", S.memory_notifications)
     table.add_row("Extractor", report["extract_model"])
     table.add_row("Injected per turn", str(report["recall_limit"]))
-    table.add_row("Store", f"{report['db_path']}"
-                  + (f" ({report.get('db_bytes', 0) / 1024:.0f} KB)"
-                     if report.get("db_bytes") else ""))
     if report["stale_vectors"]:
         table.add_row("Needs re-embedding", f"{report['stale_vectors']} "
                       "(embedding model changed)")
@@ -4623,7 +4765,8 @@ def _show_memory_status():
         table.add_row("Error", report["error"])
     console.print(table)
     console.print("[dim]/memory search <query> · /memory add <text> · "
-                  "/memory forget <id> · /memory notify off|on|verbose · "
+                  "/memory forget <id> · /memory engine native|mem0 · "
+                  "/memory notify off|on|verbose · "
                   "/memory test · /memory clear · /memory off[/dim]")
 
 
@@ -4641,10 +4784,10 @@ def _show_memory_search(query):
     for row in results:
         table.add_row(
             f"{row['score']:.4f}",
-            str(row["bm25_rank"] or "—"),
-            str(row["vector_rank"] or "—"),
-            row["text"][:80],
-            row["id"][:8],
+            str(row.get("bm25_rank") or "—"),
+            str(row.get("vector_rank") or "—"),
+            str(row.get("text", ""))[:80],
+            str(row.get("id", ""))[:8],
         )
     console.print(table)
     # The per-leg ranks are the point of this view: they show whether a hit came
@@ -4701,6 +4844,48 @@ def cmd_memory(rest):
                       f"[dim]— {report['count']} memories at {report['db_path']}[/dim]")
         if not report["embedder_ok"]:
             _report_embedder_unavailable(report)
+        return
+
+    if action == "engine":
+        report = A.memory.status()
+        if not argument:
+            other = [n for n in MEMORY_ENGINES if n != report.get("engine_configured")]
+            console.print(f"[green]memory engine: {report.get('engine_configured')}[/green]")
+            console.print(f"[dim]/memory engine {other[0]} to switch[/dim]")
+            return
+        try:
+            _memory_set_engine(argument)
+        except ValueError:
+            console.print(f"[red]usage:[/red] /memory engine {'|'.join(MEMORY_ENGINES)}")
+            return
+        report = A.memory.status()
+        if not report["enabled"]:
+            # No store is open while memory is off, so there is no live engine to
+            # verify against -- claiming the requested one is unavailable would be
+            # wrong. Record the choice and let /memory on resolve it.
+            console.print(f"[green]memory engine: {argument}[/green] "
+                          "[dim]— takes effect when you /memory on[/dim]")
+            return
+        live = report.get("engine", "native")
+        if live != argument:
+            console.print(f"[yellow]{argument} is unavailable — still using "
+                          f"{live}.[/yellow]")
+            if argument == "mem0":
+                flag = ("install.ps1 -WithMem0" if os.name == "nt"
+                        else "install.sh --memory mem0")
+                console.print(f"[dim]  install it by rerunning the installer: {flag}[/dim]")
+        else:
+            console.print(f"[green]memory engine: {live}[/green] "
+                          f"[dim]— {report['count']} memories, embedder "
+                          f"{_describe_embedder(report.get('embedder_info')) if live == 'mem0' else report['embed_model']}[/dim]")
+        # Switching never migrates or deletes; say so, or it reads like data loss.
+        # mem0's dir comes from runtime config (honors AGENT8088_HOME), not a
+        # hardcoded home -- same reason Vector DB above must not lie.
+        mem0_dir = (A.memory.parse_memory_engine_config(A.APP_CONFIG)[1]["path"]
+                     if hasattr(A.memory, "parse_memory_engine_config") else "~/.agent8088/mem0")
+        kept = mem0_dir if live == "native" else A.MEMORY_DB_PATH
+        console.print(f"[dim]The {'mem0' if live == 'native' else 'native'} store is "
+                      f"untouched at {kept} — switch back any time.[/dim]")
         return
 
     if not A.memory.enabled():
@@ -5174,6 +5359,7 @@ COMMANDS = {
     "memory": cmd_memory,
     "task": cmd_task,
     "schedule": cmd_schedule,
+    "browser": cmd_browser,
 }
 _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
 
@@ -7365,6 +7551,8 @@ def main():
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
+    parser.add_argument("--memory-setup", action="store_true",
+                        help="install the mem0 memory backend and make it the default engine")
     parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp/Discord/Email/Telegram) instead of the REPL")
     parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp/Discord/Email/Telegram messaging gateways, then exit")
     parser.add_argument("--web", action="store_true",
@@ -7430,6 +7618,8 @@ def main():
     if args.sandbox_setup:
         print(A.install_native_sandbox())
         return 0 if A.native_sandbox_verified() else 1
+    if args.memory_setup:
+        return run_memory_setup()
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.

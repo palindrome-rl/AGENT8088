@@ -11,7 +11,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
                  [--mode {readonly,full-auto}]
                  [--uninstall] [--workspace] [--all] [--yes]
                  [--non-interactive] [--dry-run]
-                 [--update] [--force] [--setup] [--model-setup] [--sandbox-setup]
+                 [--update] [--force] [--setup] [--model-setup] [--sandbox-setup] [--memory-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
                  [--web] [--web-port PORT] [--web-host HOST] [--web-dev]
@@ -26,6 +26,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--setup` | Interactive config wizard, then exit |
 | `--model-setup` | Configure a model provider profile |
 | `--sandbox-setup` | Install the native sandbox runtime |
+| `--memory-setup` | Install the mem0 memory backend deps and set `memory_engine=mem0`; switch back with `/memory engine native` |
 | `--gateway` | Run the messaging gateway instead of the REPL |
 | `--gateway-setup` | Configure gateway channels, then exit |
 | `--mcp-serve` | Run as an MCP server |
@@ -217,6 +218,7 @@ sensitive-file floor still applies unconditionally.
 | Command | Does |
 |---|---|
 | `/memory` | Status: count, embedder, store size, last call's cost |
+| `/memory engine [native\|mem0]` | Show the active memory engine, or switch it live — persists to `config.txt`, never migrates or deletes either store |
 | `/memory search <query>` | Run the search and show each leg's rank (words vs meaning) |
 | `/memory add <text>` | Store a fact by hand |
 | `/memory forget <id>` | Delete one (the short id from `/memory search` works) |

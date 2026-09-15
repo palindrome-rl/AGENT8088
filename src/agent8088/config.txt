@@ -140,7 +140,7 @@ tool_selection=hybrid
 # work in a real window — useful for demos and for debugging a stuck selector.
 # Visibility only: the SSRF proxy and every other guard are unaffected.
 # Override for one run with AGENT8088_BROWSER_HEADLESS=0.
-# browser_headless=1
+browser_headless=1
 # Where the visible window opens, as "W,H" and "X,Y". Ignored when headless.
 # Handy for a side-by-side screen recording: keep the terminal on the left and
 # put the browser on the right.
@@ -150,6 +150,11 @@ tool_selection=hybrid
 # Screenshots stay off for text-only models. Enable this, or set
 # AGENT8088_BROWSER_SCREENSHOTS=1 for one run, only with a vision-capable model.
 # browser_screenshots=0
+# Keep the browser window alive across consecutive tasks in the current CLI session,
+# preserving cookies and in-memory tabs without persisting credentials permanently to disk.
+# browser_reuse_session=1
+# Enable human-in-the-loop interactive interrupts (ask_human) for captchas, passwords, and user input.
+# browser_hitl=1
 
 # Global fallbacks when no per-provider value is set:
 # context_window=32768
@@ -233,8 +238,17 @@ sandbox_runtime_version=0.0.73
 # never authorise a tool call: check_permission does not read them.
 memory=1
 #
-# Where memories live. One SQLite file, mode 0600. Delete it and memory is gone;
-# nothing else is affected.
+# Memory engine backend: `native` (default built-in SQLite with BM25 + vector RRF)
+# or `mem0` (uses Mem0 library with graph/vector entity management).
+memory_engine=mem0
+
+# Mem0 vector store backend (defaults to embedded local qdrant)
+memory_mem0_vector_store=qdrant
+
+# Mem0 local data directory
+memory_mem0_dir=~/.agent8088/mem0
+#
+# Where memories live for the native engine. One SQLite file, mode 0600.
 # memory_db_path=~/.agent8088/memory.db
 #
 # Who owns the memories. One identity by default, so a fact learned in the

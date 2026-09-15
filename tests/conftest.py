@@ -1,6 +1,9 @@
 """Shared fixtures: load the agent8088 engine as a module."""
 import importlib
 import os
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["BROWSER_USE_CLOUD_SYNC"] = "false"
+os.environ["POSTHOG_DISABLED"] = "1"
 import sys
 from pathlib import Path
 
