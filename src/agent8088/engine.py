@@ -2789,6 +2789,16 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
         r"\blook\s+over\b.*\b(?:code|changes?|branch|commit|repo(?:sitory)?|pull\s+request|pr)\b",
         low,
     ))
+    # A novice rambles, and proximity is the first thing that goes. "i have
+    # some code in <120 characters of path> ... i should get it checked" states
+    # both halves and matches none of the windows above, so the live run
+    # hand-read eleven files instead of calling the reviewer. Fall back to
+    # asking whether the query names a review verb and a code subject at all.
+    if not review_intent:
+        review_intent = bool(
+            re.search(r"\b(?:review(?:ed|ing)?|audit|check(?:ed|ing)?|"
+                      r"look(?:ed|ing)?\s+over|go\s+(?:over|through))\b", low)
+            and re.search(r"\b" + code_subject + r"\b", low))
     if review_intent and "review_code" in allowed:
         selected.add("review_code")
         selected.discard("git_diff")

@@ -127,3 +127,45 @@ def test_run_agent_filters_native_schemas_before_first_completion(engine, monkey
         max_turns=1, system_prompt="", tools_def=lambda: engine.build_tools_def(specs),
         allowed_tools=set(specs), memory_capture=False) == "done"
     assert captured == ["check_local_hardware", "search_tools"]
+
+
+def test_a_rambling_novice_still_reaches_the_reviewer(engine):
+    """Proximity is the first thing a real user's phrasing loses.
+
+    "i have some code in <120 characters of Windows path> ... my colleague
+    said i should get it checked" states both halves of a review request and
+    matched none of the proximity windows, so a live first-contact run
+    hand-read eleven files and burned a turn on the unavailable shell instead
+    of calling the reviewer once.
+    """
+    allowed = set(engine.TOOL_SPECS)
+    rambling = ("ok so um i just installed this thing and im not really sure what it "
+                "does. i have some code in C:/Users/x/AppData/Local/Temp/scratch/shopapi "
+                "that i was working on yesterday, something about coupons i think? my "
+                "colleague said i should get it checked before friday")
+
+    guarded = engine._apply_tool_intent_guards(rambling, {"git_diff"}, allowed)
+
+    assert "review_code" in guarded
+    assert "git_diff" not in guarded, "the working tree is not the branch"
+
+
+def test_the_guard_leaves_diff_and_document_requests_alone(engine):
+    """Widening it for ramblers must not make it a net that catches everything.
+
+    git_diff has its own job and document work is a separate subsystem that
+    merely shares the word "review".
+    """
+    allowed = set(engine.TOOL_SPECS)
+    untouched = [
+        "show me the diff",
+        "git diff please",
+        "what have I changed so far",
+        "extract the text from this scanned invoice",
+        "review this attached PDF contract for me",
+        "read agreement.pdf and summarise the payment terms",
+        "write me a python script that sorts a list",
+    ]
+    for query in untouched:
+        guarded = engine._apply_tool_intent_guards(query, {"git_diff"}, allowed)
+        assert "git_diff" in guarded, query
