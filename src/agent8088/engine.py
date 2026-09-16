@@ -8120,11 +8120,29 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                     safe["review_id"] = stored
             return json.dumps(safe, ensure_ascii=False)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            return efficiency.tool_error("code_review_failed", _redact_secrets(str(exc)),
-                "Confirm the repository path is a Git checkout (the folder containing .git), "
-                "check the pinned executable and revision names, and follow the specific error "
-                "above. Review did not complete; retry explicitly with mode=delegated if the "
-                "native reviewer was the failing part.", recoverable=True)
+            detail = _redact_secrets(str(exc))
+            # A refused path is a permission answer, not a broken checkout.
+            # The catch-all text below sent a live run hunting for missing
+            # .git directories and executables for ten turns when the real
+            # answer was that the folder sat outside the allowed workspace.
+            if "Path not allowed" in detail:
+                advice = ("That folder is outside this session's allowed workspace, so it was "
+                          "never read. Nothing is wrong with the repository. Say so plainly and "
+                          "offer the two ways forward: start Agent8088 in that folder, or add it "
+                          "to allowed_paths. Do not retry the same path and do not ask for the "
+                          "code to be pasted.")
+            else:
+                advice = ("Confirm the repository path is a Git checkout (the folder containing "
+                          ".git), check the pinned executable and revision names, and follow the "
+                          "specific error above. Review did not complete; retry explicitly with "
+                          "mode=delegated if the native reviewer was the failing part.")
+            # Retrying a path the workspace does not contain cannot ever
+            # succeed, and marking it recoverable invited exactly that: a live
+            # run hit the same wall three times before giving up and asking the
+            # user to paste their source into the chat.
+            denied = "Path not allowed" in detail
+            return efficiency.tool_error("code_review_failed", detail, advice,
+                                         recoverable=not denied)
         finally:
             if pr_workspace:
                 shutil.rmtree(pr_workspace, ignore_errors=True)

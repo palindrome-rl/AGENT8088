@@ -994,3 +994,25 @@ def test_workspace_review_warns_when_branch_commits_were_not_reviewed(tmp_path):
     assert "2 commit(s)" in warning
     assert "none of that was reviewed" in warning
     assert unreviewed_commits(tmp_path, "range", {}, fake_run) == ""
+
+
+def test_a_refused_path_is_answered_as_permission_not_as_a_broken_repo(engine, monkeypatch):
+    """The catch-all advice sent a live novice run chasing the wrong problem.
+
+    Asked about a project outside the workspace, the tool failed with "Path not
+    allowed" and guidance about missing .git directories and pinned
+    executables. The run hit the same wall three times, then asked the user to
+    paste their source into the chat. A refused path is an answer, not a fault,
+    and retrying it can never change it.
+    """
+    engine.APP_CONFIG["open_code_review_enabled"] = "1"
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "check_permission", lambda *a, **k: True)
+    monkeypatch.setattr(engine, "_path_is_allowed", lambda p: False)
+
+    output = engine.run_tool("review_code", {"repo": ".", "scope": "workspace"})
+
+    assert "Path not allowed" in output
+    assert '"recoverable": false' in output, "retrying a refused path cannot succeed"
+    assert "allowed_paths" in output, "the way out has to be in the answer"
+    assert ".git" not in output, "do not send the caller after a checkout that is fine"
