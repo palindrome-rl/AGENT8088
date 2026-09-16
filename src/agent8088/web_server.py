@@ -46,6 +46,29 @@ def _result_diff():
 
 
 def _tool_result_payload(name: str, result: str) -> dict:
+    if name == "review_code":
+        try:
+            review = json.loads(result)
+            if isinstance(review, dict) and review.get("engine") == "open-code-review":
+                lines = [f"Code review: {review.get('status', 'unknown')}"]
+                if review.get("status") == "prepared":
+                    lines.append("Scope prepared only; code has not yet been reviewed.")
+                for finding in (review.get("findings") or [])[:8]:
+                    lines.append(f"{finding.get('severity', 'info')}: {finding.get('path', '?')}:{finding.get('start_line', '?')} — {str(finding.get('message', ''))[:300]}")
+                if len(review.get("findings") or []) > 8:
+                    lines.append("More findings available in the stored review.")
+                if review.get("review_id"):
+                    lines.append(f"Stored review: {review['review_id']} (reopen with /review --resume)")
+                # An injection attempt and an unreviewed branch are the two
+                # things a reader most needs, and a summary that drops them
+                # reports silence as though it were an all-clear.
+                for warning in (review.get("warnings") or [])[:10]:
+                    lines.append(f"warning: {str(warning)[:300]}")
+                if (review.get("coverage") or {}).get("partial"):
+                    lines.append("Warning: review coverage is partial.")
+                result = "\n".join(lines)
+        except (ValueError, TypeError, AttributeError):
+            pass
     payload = {"type": "tool_result", "name": name,
                "result": scrub_markup(result)[:5000]}
     try:
@@ -863,6 +886,35 @@ async def list_models(provider: str):
     except Exception:
         models = FALLBACK_MODELS.get(provider, [])
     return {"provider": provider, "models": models}
+
+
+@app.get("/api/reviews")
+async def list_reviews():
+    """Review history for the Web UI. Metadata only -- the findings quote source
+    lines, and a listing has no business carrying them."""
+    A = _eng()
+    try:
+        return {"reviews": A.review_history(50)}
+    except Exception as exc:
+        return _error(f"could not read review history: {exc}", 500)
+
+
+@app.get("/api/reviews/{review_id}")
+async def get_review(review_id: str):
+    """One stored review, with every finding re-checked against the files now.
+
+    Never returns the stored position verdict as-is: it was true when the review
+    ran, and the Web UI is exactly where someone clicks "apply" against a file
+    that has moved on since. position_valid here means now.
+    """
+    A = _eng()
+    try:
+        payload = A.reopen_review(review_id)
+    except Exception as exc:
+        return _error(f"could not read review: {exc}", 500)
+    if payload is None:
+        return _error("no such review", 404)
+    return payload
 
 
 @app.get("/api/sessions")

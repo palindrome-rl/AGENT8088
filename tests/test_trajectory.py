@@ -146,6 +146,18 @@ def test_read_back_is_inspection_evidence_not_an_automated_pass():
     assert "no automated verification" in trajectory.review()
 
 
+def test_successful_retry_clears_the_same_tools_unresolved_note():
+    trajectory = TrajectoryState({}, "review a pull request", 1)
+    failed = trajectory.before_tool("review_code")
+    trajectory.after_tool(failed, "Error: malformed URL", failed=True, blocked=False,
+                          mutated=False)
+    retry = trajectory.before_tool("review_code")
+    trajectory.after_tool(retry, '{"status":"complete"}', failed=False, blocked=False,
+                          mutated=False)
+
+    assert trajectory.review() == ""
+
+
 def test_main_loop_requests_one_different_approach_after_repeated_failures(monkeypatch, engine):
     replies = iter([
         '✿FUNCTION✿: read_text ✿ARGS✿: {"filename":"missing-a.txt"}',

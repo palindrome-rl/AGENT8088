@@ -203,6 +203,10 @@ $GatewayExtrasInstalled = $false
 $SearchExtrasInstalled = $false
 $ChromiumInstalled = $false
 $OcrInstalled = $false
+$ReviewInstalled = $false
+$ReviewExecutable = ""
+# Pinned: the delegation JSON contract is version-specific.
+$OpenCodeReviewVersion = "1.12.1"
 $Mem0Installed = $false
 $MemoryEngine = ""
 $RepositoryInstalled = $false
@@ -988,6 +992,36 @@ function Set-ConfiguredMemoryEngine {
         return $true
     } catch {
         Write-Warn "Could not set memory_engine in $ConfigPath ($($_.Exception.Message))."
+        return $false
+    }
+}
+
+function Set-ConfiguredCodeReview {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$Executable
+    )
+    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
+    try {
+        $values = @{ open_code_review_enabled = "1"; open_code_review_executable = $Executable }
+        $seen = @{}
+        $updated = foreach ($line in @(Get-Content -LiteralPath $ConfigPath -ErrorAction Stop)) {
+            $replacement = $null
+            foreach ($key in $values.Keys) {
+                if ($line -match "^\s*$([regex]::Escape($key))\s*=") {
+                    $replacement = "$key=$($values[$key])"; $seen[$key] = $true; break
+                }
+            }
+            if ($null -ne $replacement) { $replacement } else { $line }
+        }
+        foreach ($key in $values.Keys) {
+            if (-not $seen[$key]) { $updated = @($updated) + "$key=$($values[$key])" }
+        }
+        [System.IO.File]::WriteAllLines($ConfigPath, [string[]]$updated,
+            [System.Text.UTF8Encoding]::new($false))
+        return $true
+    } catch {
+        Write-Warn "Could not configure code review in $ConfigPath ($($_.Exception.Message))."
         return $false
     }
 }
@@ -2356,6 +2390,51 @@ function Install-Node-Bridge {
 # the model is there. The message names the exact command to fix it.
 $EmbedModel = "nomic-embed-text"
 
+function Install-CodeReview {
+    # Run after Install-Node-Bridge: a fresh machine gets portable Node there.
+    $reviewPrefix = Join-Path $InstallDir "code-review"
+    $reviewBin = Get-ChildItem -Path $reviewPrefix -Recurse -Filter "opencodereview*" `
+        -ErrorAction SilentlyContinue | Where-Object {
+            -not $_.PSIsContainer -and $_.Extension -notin @(".cmd", ".ps1", ".bat")
+        } | Select-Object -First 1
+    if ((Test-StageComplete "codereview") -and $reviewBin) {
+        $script:ReviewInstalled = $true
+        $script:ReviewExecutable = $reviewBin.FullName
+        Write-Success "Code review engine already installed (skipping)"
+        return
+    }
+    $npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $npm) {
+        Write-StageWarning -Result @{ ExitCode = 1 } -TimeoutSec $TPip `
+            -What "code review engine" `
+            -Consequence "/review will report the install command instead of running" `
+            -Fix "install Node.js, then rerun the installer"
+        return
+    }
+    Write-Info "Installing code review engine (optional, for /review)..."
+    $reviewResult = Invoke-WithTimeout -FilePath $npm.Source `
+        -Arguments @("install", "--silent", "--no-fund", "--no-audit", "--prefix",
+                     $reviewPrefix,
+                     "@alibaba-group/open-code-review@$script:OpenCodeReviewVersion") `
+        -TimeoutSec $TPip -Activity "Installing code review engine"
+    $reviewBin = Get-ChildItem -Path $reviewPrefix -Recurse -Filter "opencodereview*" `
+        -ErrorAction SilentlyContinue | Where-Object {
+            -not $_.PSIsContainer -and $_.Extension -notin @(".cmd", ".ps1", ".bat")
+        } | Select-Object -First 1
+    if ($reviewResult.ExitCode -eq 0 -and $reviewBin) {
+        $script:ReviewInstalled = $true
+        $script:ReviewExecutable = $reviewBin.FullName
+        Set-StageComplete "codereview"
+        Write-Success "Code review engine installed"
+    } else {
+        Write-StageWarning -Result $reviewResult -TimeoutSec $TPip `
+            -What "code review engine" `
+            -Consequence "/review will report the install command instead of running" `
+            -Fix "npm install --prefix `"$reviewPrefix`" @alibaba-group/open-code-review@$script:OpenCodeReviewVersion"
+    }
+}
+
 function Install-Embedding-Model {
     $ollama = Get-Command ollama -ErrorAction SilentlyContinue
     if (-not $ollama) {
@@ -2619,6 +2698,11 @@ function Drop-Config {
             Write-Success "Memory engine set to $($script:MemoryEngine)"
         }
     }
+    if ($script:ReviewInstalled -and $script:ReviewExecutable) {
+        if (Set-ConfiguredCodeReview -ConfigPath $configPath -Executable $script:ReviewExecutable) {
+            Write-Success "Code review enabled with the managed executable"
+        }
+    }
 
     # Set AGENT8088_CONFIG env var
     [Environment]::SetEnvironmentVariable("AGENT8088_CONFIG", $configPath, "User")
@@ -2658,6 +2742,12 @@ function Verify-Install {
     } else {
         Write-Host "  OCR:      unavailable - attached images need a vision-capable model"
     }
+    if ($script:ReviewInstalled) {
+        Write-Host "  Review:   code review engine ready (/review)"
+    } else {
+        Write-Host "  Review:   code review engine not installed (/review will say how)"
+    }
+
     if ($script:Mem0Installed) {
         Write-Host "  Memory:   mem0 (Qdrant vector store; /memory engine native to switch)"
     } else {
@@ -2821,6 +2911,7 @@ try {
     Install-Deps
     Install-Gateway-Extras
     Install-Node-Bridge
+    Install-CodeReview
     # Alone among the bare-called optional stages, this one returns $true/$false
     # (the tests assert on it), so an unassigned call prints True/False into the
     # install log. Discard it here rather than dropping the return value.

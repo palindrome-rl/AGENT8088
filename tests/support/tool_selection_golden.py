@@ -67,4 +67,7 @@ GOLDEN = [
      "I have never seen this codebase before. Survey the repository structure "
      "and tell me where the authentication code lives.",
      {"repository_read"}),
+    ("code_review_then_fix",
+     "Review the changes on this branch for bugs, then fix the worst one and prove the fix works.",
+     {"review_code", "edit_file", "run_tests"}),
 ]

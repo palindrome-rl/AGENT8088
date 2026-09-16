@@ -2765,6 +2765,46 @@ def _bm25_tool_ranking(query: str, texts: list[str]) -> list[int]:
     return [index for score, index in sorted(scores, reverse=True) if score > 0]
 
 
+def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str]) -> set[str]:
+    """Resolve known, harmful overlaps after lexical/semantic retrieval.
+
+    Retrieval quite reasonably ranks both ``git_diff`` and ``review_code`` for
+    a branch review. They are not interchangeable: git_diff only shows the
+    uncommitted working tree. A live novice prompt therefore made two calls and
+    mixed evidence from different scopes. Keep retrieval broad everywhere else,
+    but make the purpose-built reviewer the only diff-inspection schema for an
+    unmistakable review request.
+    """
+    low = str(query or "").lower()
+    code_subject = (
+        r"(?:code|source|changes?|branch|commit|diff|repo(?:sitory)?|"
+        r"pull\s+request|pr)"
+    )
+    review_intent = bool(re.search(
+        r"\bcode\s+review\b|"
+        rf"\b(?:review|audit|look\s+over|check)\b.{{0,80}}\b{code_subject}\b|"
+        rf"\b{code_subject}\b.{{0,40}}\b(?:review|audit)\b|"
+        r"\b(?:safe|ready)\s+to\s+(?:ship|merge|deploy)\b|"
+        r"\bfind\s+(?:bugs?|defects?|security\s+(?:issues?|flaws?))\b|"
+        r"\blook\s+over\b.*\b(?:code|changes?|branch|commit|repo(?:sitory)?|pull\s+request|pr)\b",
+        low,
+    ))
+    # A novice rambles, and proximity is the first thing that goes. "i have
+    # some code in <120 characters of path> ... i should get it checked" states
+    # both halves and matches none of the windows above, so the live run
+    # hand-read eleven files instead of calling the reviewer. Fall back to
+    # asking whether the query names a review verb and a code subject at all.
+    if not review_intent:
+        review_intent = bool(
+            re.search(r"\b(?:review(?:ed|ing)?|audit|check(?:ed|ing)?|"
+                      r"look(?:ed|ing)?\s+over|go\s+(?:over|through))\b", low)
+            and re.search(r"\b" + code_subject + r"\b", low))
+    if review_intent and "review_code" in allowed:
+        selected.add("review_code")
+        selected.discard("git_diff")
+    return selected
+
+
 def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | None = None,
                                   provider: str = "", model: str = "") -> set[str]:
     """Choose direct schemas before the model sees a request, or fail open.
@@ -2782,27 +2822,28 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         return set(allowed)
     names, texts, vectors = _tool_selection_index(set(allowed))
     if len(vectors) != len(names):
-        return set(allowed)
+        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
     try:
         active_embedder = memory.embedder()
         query_vector = active_embedder.embed_one(query) if active_embedder else []
     except Exception as exc:  # noqa: BLE001 - optional performance path
         _log.debug("tool selection query embedding unavailable: %s", exc)
-        return set(allowed)
+        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
     if not query_vector:
-        return set(allowed)
+        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
     lexical = _bm25_tool_ranking(query, texts)
     semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
                       reverse=True)
     semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
     if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
-        return set(allowed)
+        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
     scores = Counter()
     for ranking in (lexical, semantic):
         for position, index in enumerate(ranking, 1):
             scores[index] += 1 / (60 + position)
     picked = {names[index] for index, _ in scores.most_common(TOOL_SELECTION_TOP_K)}
-    return (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    return _apply_tool_intent_guards(query, selected, set(allowed))
 
 
 def _search_tool_names(query: str, allowed: set[str], limit: object = _TOOL_SEARCH_DEFAULT_LIMIT) -> list[str]:
@@ -3066,10 +3107,20 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
         "",
     ]
     lines.append("Mandatory routing — call the matching tool before writing an answer:")
+    lines.append(
+        "- When a tool error has suggested_action, relay it exactly; never invent admin rights, "
+        "paths, executables, or setup commands.")
     if "read_text" in specs:
         lines.append("- A direct request to read a file MUST call read_text.")
     if "execute_shell" in specs:
         lines.append("- A direct request to run a command MUST call execute_shell.")
+    if "review_code" in specs:
+        lines.append(
+            "- Any code, branch, commit, range, or PR review MUST call review_code. On disabled "
+            "or unavailable setup, relay its recovery steps and stop; never substitute an ad-hoc "
+            "review. Cross-check findings against diff_evidence: contradicted or unverifiable "
+            "findings are not confirmed blockers. For zero findings, state only reviewed_files "
+            "and coverage; never invent changes, tests, dependencies, or implementation.")
     if "web_search" in specs:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
     if "browse_page" in specs:
@@ -7971,6 +8022,131 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         except (OSError, UnicodeError, ValueError) as exc:
             return f"Error: {exc}"
 
+    if mode == "code_review":
+        from . import open_code_review
+        if APP_CONFIG.get("open_code_review_enabled", "0") != "1":
+            return efficiency.tool_error("code_review_disabled", "OpenCodeReview is disabled.",
+                "Re-run the Agent8088 installer to install the pinned review engine, then "
+                "set open_code_review_enabled=1 and its native executable in config.txt. "
+                "Run /doctor to confirm Code review is ready, then retry /review.")
+        if PERMISSION_MODE == "plan-only":
+            return _plan_mode_block_message()
+        if not check_permission("shell", host=True, approval_key=approval_key):
+            return request_escalation(target_mode="edit", paths=[str(args.get("repo") or PROJECT_ROOT)],
+                change_type="inspection", reason="OpenCodeReview needs to inspect the local Git repository.")
+        pr_workspace = None
+        def review_check():
+            _raise_if_interrupted(_document_interrupt)
+            if _active_budget is not None and _active_budget.exceeded():
+                raise ValueError("Review reached the active turn budget.")
+        try:
+            pr_url = str(args.get("pull_request") or "").strip()
+            if pr_url:
+                pr_url = open_code_review.canonical_pr_url(pr_url)
+                # A separate grant from reading a local repository: this one
+                # reaches the network and lands somebody else's code on disk.
+                if not check_permission("shell", host=True, approval_key=approval_key + "|pr"):
+                    return request_escalation(target_mode="edit", paths=[pr_url],
+                        change_type="network",
+                        reason="Reviewing a pull request needs a temporary local checkout of it.")
+                pr_workspace = tempfile.mkdtemp(prefix="agent8088-pr-")
+                details = open_code_review.checkout_pr(pr_url, pr_workspace,
+                    run=lambda argv, cwd: open_code_review.run_process(argv, cwd,
+                        check=review_check, kill=_kill_detached_process, timeout=120))
+                root = Path(details["root"])
+                args = dict(args, scope="range", base=details["base"], head=details["head"])
+            else:
+                root = resolve_user_path(str(args.get("repo") or PROJECT_ROOT))
+            # Resolve before anything compares against it. mkdtemp inherits
+            # %TMP%, which on Windows is often the 8.3 short form, while the
+            # adapter resolves root to the long form -- so every PR finding
+            # failed is_relative_to and was dropped as "a protected path",
+            # leaving a review that reported complete with nothing in it.
+            root = Path(root).resolve()
+            if _is_sensitive_path(str(root)):
+                raise ValueError("Protected repository path.")
+            permitted = lambda path: (path.is_relative_to(root) if pr_workspace else _path_is_allowed(path)) and not _is_sensitive_path(str(path))
+            runner = lambda argv, cwd, env=None: open_code_review.run_process(
+                argv, cwd, check=review_check, kill=_kill_detached_process,
+                timeout=_review_timeout(args, timeout) if env else 30, extra_env=env)
+            mode_choice = str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower()
+            if mode_choice not in ("native", "delegated", "auto"):
+                raise ValueError("mode must be native, delegated, or auto.")
+            credentials = _review_credentials() if mode_choice in ("native", "auto") else None
+            if mode_choice == "native" and not credentials:
+                raise ValueError(
+                    "Native review needs an OpenAI-compatible provider with a key. "
+                    "Configure one, or set mode=delegated to review with this agent instead.")
+            if credentials:
+                result = open_code_review.review(root, args, APP_CONFIG,
+                    credentials=credentials, permitted=permitted, run=runner)
+            else:
+                result = open_code_review.prepare(root, args, APP_CONFIG,
+                    permitted=permitted, run=lambda argv, cwd: runner(argv, cwd))
+            # Range and commit findings refer to the selected revision, not
+            # necessarily the checked-out working tree. Persist the immutable
+            # object id so history can revalidate against the same code later.
+            scope = str(args.get("scope") or "workspace")
+            if result.get("findings") is not None and scope in {"range", "commit"}:
+                selected_ref = str(args.get("commit") if scope == "commit"
+                                   else args.get("head") or "HEAD")
+                try:
+                    resolved = runner(["git", "-C", str(root), "rev-parse", "--verify",
+                                       "--quiet", selected_ref + "^{commit}"], root).strip()
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    resolved = ""
+                    result.setdefault("warnings", []).append(
+                        "The review completed, but its selected revision could not be pinned "
+                        "for history. Rerun the review before applying a stored finding.")
+                if re.fullmatch(r"[0-9a-fA-F]{40}", resolved):
+                    result.setdefault("target", {})["resolved_head"] = resolved.lower()
+            if isinstance(result.get("usage"), dict) and result["usage"].get("total_tokens"):
+                record_review_usage(result["usage"])
+            # Redact once, before anything keeps a copy. A review quotes source
+            # lines, so a repository holding the user's own key produces a finding
+            # containing it -- and the store outlives the turn the returned string
+            # belongs to. Redacting only on the way out left the durable artifact
+            # less protected than the ephemeral one.
+            safe = json.loads(_redact_secrets(_strip_special_tokens(
+                json.dumps(result, ensure_ascii=False))))
+            if safe.get("findings") is not None:
+                from . import review_store
+                # A failed save costs the history, never the review: the
+                # result is in hand and the caller is waiting for it.
+                # A PR checkout is intentionally deleted below. Keep the stable
+                # public source label rather than a dead temporary path.
+                stored = review_store.save(REVIEW_STORE_PATH, pr_url or root, safe)
+                if stored:
+                    safe["review_id"] = stored
+            return json.dumps(safe, ensure_ascii=False)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            detail = _redact_secrets(str(exc))
+            # A refused path is a permission answer, not a broken checkout.
+            # The catch-all text below sent a live run hunting for missing
+            # .git directories and executables for ten turns when the real
+            # answer was that the folder sat outside the allowed workspace.
+            if "Path not allowed" in detail:
+                advice = ("That folder is outside this session's allowed workspace, so it was "
+                          "never read. Nothing is wrong with the repository. Say so plainly and "
+                          "offer the two ways forward: start Agent8088 in that folder, or add it "
+                          "to allowed_paths. Do not retry the same path and do not ask for the "
+                          "code to be pasted.")
+            else:
+                advice = ("Confirm the repository path is a Git checkout (the folder containing "
+                          ".git), check the pinned executable and revision names, and follow the "
+                          "specific error above. Review did not complete; retry explicitly with "
+                          "mode=delegated if the native reviewer was the failing part.")
+            # Retrying a path the workspace does not contain cannot ever
+            # succeed, and marking it recoverable invited exactly that: a live
+            # run hit the same wall three times before giving up and asking the
+            # user to paste their source into the chat.
+            denied = "Path not allowed" in detail
+            return efficiency.tool_error("code_review_failed", detail, advice,
+                                         recoverable=not denied)
+        finally:
+            if pr_workspace:
+                shutil.rmtree(pr_workspace, ignore_errors=True)
+
     if mode == "cli_anything":
         return _run_cli_anything_tool(name, args, timeout, approval_key, allow_plan)
 
@@ -9834,6 +10010,129 @@ SSRF_ALLOW_HOSTS = {h.strip().lower()
                     if h.strip()}
 
 
+# A review quotes source lines, so this file is as sensitive as the code it
+# describes; it lives in the agent data directory beside the telemetry log.
+REVIEW_STORE_PATH = _agent_data_dir() / "reviews.db"
+
+
+def _review_source_allowed(source: str) -> bool:
+    """History may point at an allowed local checkout or an exact GitHub PR."""
+    from . import open_code_review
+    if str(source).startswith("https://"):
+        try:
+            open_code_review.parse_pr(str(source))
+            return True
+        except ValueError:
+            return False
+    return (_path_is_allowed(Path(source)) and not _is_sensitive_path(str(source)))
+
+
+def review_history(limit: int = 20) -> list:
+    from . import review_store
+    return [row for row in review_store.recent(REVIEW_STORE_PATH, limit)
+            if _review_source_allowed(row["repo"])]
+
+
+def reopen_review(review_id: str, root=None):
+    """A stored review with every finding re-checked against the files now."""
+    from . import open_code_review, review_store
+    stored = review_store.load(REVIEW_STORE_PATH, review_id)
+    if stored is None:
+        return None
+    source = str(stored["repository"])
+    if source.startswith("https://"):
+        if root is not None or not _review_source_allowed(source):
+            return None
+        # The temporary PR checkout is deleted after review, but its resolved
+        # head is immutable. Preserve the original position result and say
+        # exactly what was (and was not) refreshed instead of falsely marking
+        # every finding stale against a missing directory.
+        reopened = review_store.reopen(
+            REVIEW_STORE_PATH, review_id, source,
+            recheck=lambda _root, finding: bool(finding.get("position_valid")))
+        if reopened is not None:
+            for finding in reopened.get("findings") or []:
+                if finding.get("position_valid"):
+                    finding["verification"] = "snapshot"
+            reopened.setdefault("warnings", []).append(
+                "This pull-request review refers to its recorded immutable head commit; "
+                "rerun the review to inspect a newer PR head.")
+        return reopened
+    base = Path(source).resolve()
+    if root is not None and Path(root).resolve() != base:
+        return None
+    if not _path_is_allowed(base) or _is_sensitive_path(str(base)):
+        return None
+    snapshot = str((stored.get("target") or {}).get("resolved_head") or "")
+    def recheck(review_root, finding):
+        if _is_sensitive_path(str(review_root / str(finding.get("path") or ""))):
+            return False
+        if snapshot:
+            return open_code_review.recheck_finding_at_ref(
+                review_root, finding, snapshot,
+                run=lambda argv, cwd: open_code_review.run_process(
+                    argv, cwd, check=lambda: None, kill=_kill_detached_process, timeout=30))
+        return open_code_review.recheck_finding(review_root, finding)
+    return review_store.reopen(REVIEW_STORE_PATH, review_id, base, recheck=recheck)
+
+
+def _review_timeout(args, tool_timeout: int) -> int:
+    """Preparation is quick; a native review is a full LLM pass over a diff.
+
+    The 30s that bounded preparation would kill every real review -- the first
+    live one against glm-5.3 took 8m35s -- so native gets the configured review
+    budget instead, still bounded and still cancellable on every poll.
+    """
+    if str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower() == "delegated":
+        return min(tool_timeout, 30)
+    try:
+        configured = int(APP_CONFIG.get("open_code_review_timeout_seconds", "900"))
+    except ValueError:
+        configured = 900
+    return max(30, min(configured, 3600))
+
+
+def _review_credentials():
+    """Map the ACTIVE provider onto OpenCodeReview's transient environment.
+
+    Only OpenAI-protocol providers are mapped. Anything else returns None so the
+    caller can fall back rather than silently sending a key to an endpoint that
+    speaks a different protocol -- the design note's rule that an unsupported
+    provider must produce an actionable outcome, not a quiet mode switch.
+    """
+    name = ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    provider = PROVIDERS.get(name) or {}
+    base = str(provider.get("base_url") or "").strip()
+    key = _provider_api_key(provider) if provider else ""
+    model = MODEL_NAME or provider.get("model")
+    if not base or not key or not model:
+        return None
+    if str(provider.get("api_mode", "openai")).lower() != "openai":
+        return None
+    return {"url": base, "token": key, "model": str(model), "protocol": "openai"}
+
+
+def record_review_usage(usage: dict) -> None:
+    """Fold OpenCodeReview's own token spend into this session's telemetry.
+
+    Tagged with its source because it is not an Agent8088 model call: it was
+    billed to the same key by a different process, and a cost report that hides
+    that is wrong in the direction that matters.
+    """
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "review_usage", "source": "open_code_review",
+            "task_id": getattr(_active_budget, "task_id", None),
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0)})
+    except Exception as exc:  # telemetry must never break a review
+        _log.warning("could not record review usage: %s", exc)
+
+
 def _local_search_allowance(base_url: str) -> set:
     """{"host:port"} for a self-hosted search endpoint on loopback, else {}.
 
@@ -11058,6 +11357,13 @@ def _tool_result_for_model(name: str, result: str) -> str:
         return result
     if name == "cli_anything_skill":
         limit = 32_000
+    elif name == "review_code":
+        # A delegated review payload carries selected diffs plus applicable
+        # rules. The generic 3K clamp hid half of even a two-file PR and made
+        # the agent spend its whole turn paging through content handles. Keep
+        # an ordinary review together; large reviews remain addressable via a
+        # handle and the adapter's own 120 KiB diff budget.
+        limit = 16_000
     elif _active_role == "subagent:auditor" and name in {"read_text", "last_output"}:
         limit = 12_000
     else:

@@ -258,8 +258,15 @@ class TrajectoryState:
             return "Changed work has no fresh verification evidence."
         if self.data.get("verification") == "inspected":
             return "Changed work was inspected, but no automated verification passed."
-        unresolved = [op.get("tool", "tool") for op in self.data["operations"]
-                      if op.get("status") in {"blocked", "failed", "unknown"}]
+        # A successful retry resolves the earlier failure for that tool. The
+        # operation ledger keeps both attempts for diagnostics, but warning a
+        # novice that review_code is unresolved after its second call completed
+        # contradicts the answer they just received.
+        latest_by_tool = {}
+        for operation in self.data["operations"]:
+            latest_by_tool[operation.get("tool", "tool")] = operation
+        unresolved = [tool for tool, operation in latest_by_tool.items()
+                      if operation.get("status") in {"blocked", "failed", "unknown"}]
         if unresolved:
             return f"Unresolved tool work remains: {', '.join(dict.fromkeys(unresolved))}."
         if self.needs_replan():

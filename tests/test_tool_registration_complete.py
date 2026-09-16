@@ -89,3 +89,32 @@ def test_write_file_can_still_be_told_a_source_url(engine):
     assert "source_url" in args, (
         "write_file no longer offers source_url, so fetching remote/binary "
         "content is unreachable from the model")
+
+
+def test_git_diff_sends_branch_questions_to_the_reviewer(engine):
+    """Reachable is not the same as preferred, and the wrong pick answered wrongly.
+
+    Asked whether a branch was safe to ship, a live run reached for `git_diff`,
+    read the working tree -- which is not the branch -- and reported "safe to
+    ship" while the branch carried four planted defects. `review_code` was in
+    the selected tool set the whole time; the model simply did not prefer it.
+
+    The pointer belongs on `git_diff` because that is where the hand lands, the
+    same way `git_checkout` already redirects away from `execute_shell`.
+    """
+    git_diff = engine.TOOL_SPECS["git_diff"]["description"]
+
+    assert "review_code" in git_diff, "the redirect is the whole point"
+    assert "working-tree" in git_diff, "the wrong answer came from diffing the wrong thing"
+
+
+def test_system_prompt_makes_review_routing_and_recovery_unambiguous(engine):
+    prompt = engine.current_system_prompt(native_tools=True)
+
+    assert "MUST call review_code" in prompt
+    assert "suggested_action" in prompt
+    assert "never substitute an ad-hoc review" in prompt
+    assert "never invent admin rights" in prompt
+    assert "For zero findings" in prompt
+    assert "never invent changes" in prompt
+    assert "Cross-check findings against diff_evidence" in prompt

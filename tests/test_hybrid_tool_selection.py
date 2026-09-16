@@ -36,6 +36,50 @@ def test_hybrid_selection_fails_open_without_embeddings(engine, monkeypatch):
         "what local models can my machine run?", allowed, mode="hybrid") == allowed
 
 
+def test_novice_branch_review_does_not_expose_worktree_diff(engine, monkeypatch):
+    """The two tools inspect different scopes; offering both caused a live
+    model to review the branch and then contaminate that result with git diff.
+    The guard must also work when embeddings fail and selection fails open.
+    """
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+    chosen = engine.select_tool_names_for_request(
+        "I barely know git. Please look over this branch and tell me if it is safe to ship.",
+        allowed, mode="hybrid")
+
+    assert "review_code" in chosen
+    assert "git_diff" not in chosen
+
+
+def test_plain_diff_request_still_exposes_git_diff(engine, monkeypatch):
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request(
+        "Show me my current uncommitted git diff.", allowed, mode="hybrid")
+
+    assert "git_diff" in chosen
+
+
+def test_document_review_does_not_get_misrouted_to_code_review(engine, monkeypatch):
+    """"Review" alone also describes contracts, PDFs and uploaded reports."""
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request(
+        "I am new here. Please review this attached PDF contract and explain it simply.",
+        allowed, mode="hybrid")
+
+    # Selection fails open here, so the guard must not give review_code
+    # exclusive control of a document task or remove its ordinary tools.
+    assert chosen == allowed
+    assert "document_read" in chosen
+    assert "git_diff" in chosen
+
+
 def test_auto_mode_only_enables_measured_models(engine, monkeypatch):
     monkeypatch.setattr(engine.memory, "embedder", lambda: _Embedder())
     monkeypatch.setattr(engine, "TOOL_SELECTION_MODELS",
@@ -83,3 +127,45 @@ def test_run_agent_filters_native_schemas_before_first_completion(engine, monkey
         max_turns=1, system_prompt="", tools_def=lambda: engine.build_tools_def(specs),
         allowed_tools=set(specs), memory_capture=False) == "done"
     assert captured == ["check_local_hardware", "search_tools"]
+
+
+def test_a_rambling_novice_still_reaches_the_reviewer(engine):
+    """Proximity is the first thing a real user's phrasing loses.
+
+    "i have some code in <120 characters of Windows path> ... my colleague
+    said i should get it checked" states both halves of a review request and
+    matched none of the proximity windows, so a live first-contact run
+    hand-read eleven files and burned a turn on the unavailable shell instead
+    of calling the reviewer once.
+    """
+    allowed = set(engine.TOOL_SPECS)
+    rambling = ("ok so um i just installed this thing and im not really sure what it "
+                "does. i have some code in C:/Users/x/AppData/Local/Temp/scratch/shopapi "
+                "that i was working on yesterday, something about coupons i think? my "
+                "colleague said i should get it checked before friday")
+
+    guarded = engine._apply_tool_intent_guards(rambling, {"git_diff"}, allowed)
+
+    assert "review_code" in guarded
+    assert "git_diff" not in guarded, "the working tree is not the branch"
+
+
+def test_the_guard_leaves_diff_and_document_requests_alone(engine):
+    """Widening it for ramblers must not make it a net that catches everything.
+
+    git_diff has its own job and document work is a separate subsystem that
+    merely shares the word "review".
+    """
+    allowed = set(engine.TOOL_SPECS)
+    untouched = [
+        "show me the diff",
+        "git diff please",
+        "what have I changed so far",
+        "extract the text from this scanned invoice",
+        "review this attached PDF contract for me",
+        "read agreement.pdf and summarise the payment terms",
+        "write me a python script that sorts a list",
+    ]
+    for query in untouched:
+        guarded = engine._apply_tool_intent_guards(query, {"git_diff"}, allowed)
+        assert "git_diff" in guarded, query
