@@ -59,6 +59,11 @@ def _tool_result_payload(name: str, result: str) -> dict:
                     lines.append("More findings available in the stored review.")
                 if review.get("review_id"):
                     lines.append(f"Stored review: {review['review_id']} (reopen with /review --resume)")
+                # An injection attempt and an unreviewed branch are the two
+                # things a reader most needs, and a summary that drops them
+                # reports silence as though it were an all-clear.
+                for warning in (review.get("warnings") or [])[:10]:
+                    lines.append(f"warning: {str(warning)[:300]}")
                 if (review.get("coverage") or {}).get("partial"):
                     lines.append("Warning: review coverage is partial.")
                 result = "\n".join(lines)

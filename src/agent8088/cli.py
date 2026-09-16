@@ -5465,6 +5465,18 @@ _REVIEW_SEVERITY_STYLE = {"critical": "bold #ff5f56", "high": "#ff5f56",
                           "medium": "#e8b260", "low": "#237dd7", "info": "dim"}
 
 
+def _print_review_warnings(result):
+    """Shared by a finished review and a prepared one.
+
+    Preparation carries the two warnings a user most needs: that a workspace
+    scope left the branch's own commits unread, and that a file tried to
+    address the reviewer. Printing them only for a finished review meant
+    `/review` answered a planted injection with silence.
+    """
+    for warning in (result.get("warnings") or [])[:10]:
+        console.print(Text("warning: " + str(warning)[:200], style="#e8b260"))
+
+
 def _print_review(result):
     """One renderer for a fresh review and a reopened one alike."""
     coverage = result.get("coverage") or {}
@@ -5485,8 +5497,7 @@ def _print_review(result):
                            style=_REVIEW_SEVERITY_STYLE.get(severity, "#237dd7")), end="")
         console.print(mark)
         console.print(Text("         " + str(finding.get("message", ""))[:400], style="#237dd7"))
-    for warning in (result.get("warnings") or [])[:10]:
-        console.print(Text("warning: " + str(warning)[:200], style="#e8b260"))
+    _print_review_warnings(result)
     usage = result.get("usage") or {}
     if usage.get("total_tokens"):
         console.print(Text(f"[{usage['total_tokens']:,} tokens spent by the review engine]",
@@ -5581,6 +5592,7 @@ def cmd_review(rest):
                 console.print(Text(
                     f"  {item.get('path')}  +{item.get('insertions', 0)}/-{item.get('deletions', 0)}",
                     style="#237dd7"))
+            _print_review_warnings(result)
             console.print(Text(
                 "This is preparation, not a review: no code has been read yet. "
                 "Ask the agent to review it, or rerun with --mode native.", style="dim"))
