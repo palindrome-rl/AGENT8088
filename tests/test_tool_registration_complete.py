@@ -106,3 +106,15 @@ def test_git_diff_sends_branch_questions_to_the_reviewer(engine):
 
     assert "review_code" in git_diff, "the redirect is the whole point"
     assert "working-tree" in git_diff, "the wrong answer came from diffing the wrong thing"
+
+
+def test_system_prompt_makes_review_routing_and_recovery_unambiguous(engine):
+    prompt = engine.current_system_prompt(native_tools=True)
+
+    assert "MUST call review_code" in prompt
+    assert "suggested_action" in prompt
+    assert "never substitute an ad-hoc review" in prompt
+    assert "never invent admin rights" in prompt
+    assert "For zero findings" in prompt
+    assert "never invent changes" in prompt
+    assert "Cross-check findings against diff_evidence" in prompt

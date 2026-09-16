@@ -1,9 +1,14 @@
 @config "../tailwind.config.ts";
 @import "tailwindcss";
 .chat-markdown p { margin: 0.8em 0; }
-.chat-markdown table { border-collapse: collapse; margin: 1em 0; }
-.chat-markdown th, .chat-markdown td { padding: 0.5em 0.9em; border-bottom: 1px solid #8885; text-align: left; }
+.chat-markdown table { border-collapse: collapse; margin: 1em 0; table-layout: auto; width: 100%; }
+.chat-markdown th, .chat-markdown td { min-width: 0; overflow-wrap: break-word; padding: 0.5em 0.9em; border-bottom: 1px solid #8885; text-align: left; vertical-align: top; }
+.chat-markdown td code { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
 .chat-markdown th { background: #8881; font-weight: 600; }
+@media (min-width: 640px) {
+  .chat-markdown th:first-child, .chat-markdown td:first-child { min-width: 7.5rem; }
+  .chat-markdown th:nth-child(3), .chat-markdown td:nth-child(3) { min-width: 6.5rem; }
+}
 .chat-markdown ul { list-style: disc; padding-left: 1.5em; margin: 0.8em 0; }
 .chat-markdown ol { list-style: decimal; padding-left: 1.5em; margin: 0.8em 0; }
 .chat-markdown li { margin: 0.3em 0; }

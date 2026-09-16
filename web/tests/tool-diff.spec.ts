@@ -12,7 +12,10 @@ const STUB = () => {
     onerror: ((e: unknown) => void) | null = null
     readyState = 1
     constructor(public url: string) {
-      ;(window as any).__fake = this
+      // Vite also opens an HMR socket. Keep the application socket rather
+      // than whichever WebSocket happened to be constructed last, otherwise
+      // injected answer frames disappear into Vite after a live audit run.
+      if (url.includes('/ws')) (window as any).__fake = this
       setTimeout(() => this.onopen?.({}), 0)
     }
     send() {}
@@ -97,6 +100,23 @@ test('review progress and readable findings do not create a write diff', async (
   const rows = page.getByTestId('tool-rows')
   await expect(rows).toContainText('Code review: complete')
   await expect(page.getByTestId('tool-diff-strip')).toHaveCount(0)
+})
+
+test('long review names stay contained without crushing short columns', async ({ page }) => {
+  await streaming(page)
+  await push(page, {
+    type: 'answer',
+    text: '| File | Change |\n|---|---|\n| `tests/test_engine_playwright_browsers_path.py` | New `test_exec_browser_pins_asyncio_logger_before_the_chromium_probe` verifies the call order |',
+  })
+  await push(page, { type: 'turn_complete' })
+
+  const markdown = page.locator('.chat-markdown').last()
+  await expect(markdown.getByRole('table')).toBeVisible()
+  const clipped = await markdown.evaluate((element) => element.scrollWidth > element.clientWidth)
+  expect(clipped).toBe(false)
+  await expect(markdown.locator('td code').last()).toHaveCSS('overflow-wrap', 'anywhere')
+  const firstCell = markdown.locator('td').first()
+  expect(await firstCell.evaluate((element) => element.getBoundingClientRect().width)).toBeGreaterThan(100)
 })
 
 test('two writes to the same file collapse into one chip with combined counts', async ({ page }) => {

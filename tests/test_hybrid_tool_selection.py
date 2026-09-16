@@ -36,6 +36,50 @@ def test_hybrid_selection_fails_open_without_embeddings(engine, monkeypatch):
         "what local models can my machine run?", allowed, mode="hybrid") == allowed
 
 
+def test_novice_branch_review_does_not_expose_worktree_diff(engine, monkeypatch):
+    """The two tools inspect different scopes; offering both caused a live
+    model to review the branch and then contaminate that result with git diff.
+    The guard must also work when embeddings fail and selection fails open.
+    """
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+    chosen = engine.select_tool_names_for_request(
+        "I barely know git. Please look over this branch and tell me if it is safe to ship.",
+        allowed, mode="hybrid")
+
+    assert "review_code" in chosen
+    assert "git_diff" not in chosen
+
+
+def test_plain_diff_request_still_exposes_git_diff(engine, monkeypatch):
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request(
+        "Show me my current uncommitted git diff.", allowed, mode="hybrid")
+
+    assert "git_diff" in chosen
+
+
+def test_document_review_does_not_get_misrouted_to_code_review(engine, monkeypatch):
+    """"Review" alone also describes contracts, PDFs and uploaded reports."""
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request(
+        "I am new here. Please review this attached PDF contract and explain it simply.",
+        allowed, mode="hybrid")
+
+    # Selection fails open here, so the guard must not give review_code
+    # exclusive control of a document task or remove its ordinary tools.
+    assert chosen == allowed
+    assert "document_read" in chosen
+    assert "git_diff" in chosen
+
+
 def test_auto_mode_only_enables_measured_models(engine, monkeypatch):
     monkeypatch.setattr(engine.memory, "embedder", lambda: _Embedder())
     monkeypatch.setattr(engine, "TOOL_SELECTION_MODELS",

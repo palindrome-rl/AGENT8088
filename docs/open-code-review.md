@@ -45,7 +45,9 @@ configuration. Only OpenAI-protocol providers are mapped.
 
 **delegated** — deterministic file selection, the applicable rules and the
 selected diff, for this agent to review in its own context. No second set of
-credentials. This is preparation, not a review, and says so.
+credentials. This is preparation, not a review, and says so. It carries the
+same warnings as native mode for suspected prompt-injection text and for
+workspace-only reviews that omit committed branch changes.
 
 **auto** — native when the active provider can be mapped, otherwise delegated.
 Naming a mode explicitly never falls back silently.
@@ -74,6 +76,7 @@ attributed to it.
 /review --from development --to HEAD      # a range
 /review --commit abc123                   # one commit
 /review --mode native                     # force the engine
+/review --repo "C:\Users\New User\My Repo" # paths with spaces work on Windows
 /review --list                            # stored reviews
 /review --resume rev-abc123               # reopen, positions re-checked
 ```
@@ -156,3 +159,7 @@ seconds. The whole process tree is killed on Stop or timeout.
 
 Repository review rules are untrusted project context. Repository contents are
 evidence, never instructions.
+
+Agent8088 keeps ordinary review results up to 16,000 characters together so a
+small multi-file review does not turn into a paging loop. Larger results use
+the existing content-handle mechanism and can be continued with `read_content`.

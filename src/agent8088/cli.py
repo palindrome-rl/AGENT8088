@@ -5518,7 +5518,17 @@ def cmd_review(rest):
     never implicitly authorise a fix, so this prints findings and stops; asking
     for a fix is a separate turn the user has to take.
     """
-    args, parts = {"scope": "workspace"}, rest.split()
+    args = {"scope": "workspace"}
+    try:
+        # posix=False keeps backslashes in unquoted Windows paths. Remove only
+        # one matching pair of quotes so `/review --repo "C:\\My Repo"` reaches
+        # the resolver as one usable path instead of three broken tokens.
+        parts = shlex.split(rest, posix=False)
+        parts = [part[1:-1] if len(part) >= 2 and part[0] == part[-1]
+                 and part[0] in {'"', "'"} else part for part in parts]
+    except ValueError as exc:
+        console.print(f"[red]Could not parse review arguments:[/red] {exc}")
+        return
     index = 0
     while index < len(parts):
         token = parts[index]
@@ -5543,7 +5553,7 @@ def cmd_review(rest):
         return
     if args.get("commit"):
         args["scope"] = "commit"
-    elif args.get("base"):
+    elif args.get("base") or args.get("head"):
         args["scope"] = "range"
 
     with console.status("[#237dd7]Reviewing...[/#237dd7]", spinner="dots"):
