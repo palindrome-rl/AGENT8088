@@ -233,6 +233,15 @@ sandbox_runtime_version=0.0.73
 #                               checks.
 # plan_audit_max_per_turn=12
 # plan_audit_timeout_seconds=120
+#
+# Every OTHER sub-agent (coder, researcher, test-writer, explore) gets the same
+# kind of ceiling, just a wider one — doing the work reasonably takes longer
+# than checking it. A sub-agent is handed the parent's REMAINING tokens and
+# cost, so delegating still cannot restart the turn's allowance, and its clock
+# is capped by whatever the turn itself has left. Before this it inherited
+# max_seconds=0 and a test-writer ran `find / -maxdepth 5` until the process
+# was killed.
+# subagent_timeout_seconds=300
 
 # --- persistent memory ---
 # On by default. With memory=1 the agent does two extra things per turn:

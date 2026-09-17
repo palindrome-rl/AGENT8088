@@ -4337,6 +4337,10 @@ PLAN_AUDIT_MAX_PER_TURN = max(0, int(APP_CONFIG.get("plan_audit_max_per_turn", "
 # must never be able to outlast the work it verifies.
 PLAN_AUDIT_TIMEOUT_SECONDS = max(
     1, int(APP_CONFIG.get("plan_audit_timeout_seconds", "120")))
+# The same ceiling for every other sub-agent. Wider than the auditor's, because
+# a coder or researcher is doing the work rather than checking it — but finite,
+# which is what it was not.
+SUBAGENT_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("subagent_timeout_seconds", "300")))
 # Modes whose effect leaves something durable to inspect afterwards. `browser` is
 # deliberately absent: a rendered page closes over nothing, so auditing it buys an
 # inconclusive verdict at the price of a model call. Reads are absent for the
@@ -4509,40 +4513,67 @@ def _revert_plan_write(snapshot) -> str:
         return f"REVERT FAILED for {path.name} ({exc}) — inspect this file by hand"
 
 
-def _run_audit_subagent(task: str, depth: int) -> str:
-    """Spawn the auditor under a wall clock of its own, then bill the parent.
+def _subagent_budget(parent, max_seconds: int, seconds_setting: str):
+    """A sub-run's budget: its own wall clock, the parent's REMAINING everything
+    else.
 
-    `_exec_subagent` reads `_active_budget` to share the caller's ceiling, so
-    substituting a child budget for the duration is how one is imposed without
-    changing what every other sub-agent inherits.
+    `_exec_subagent` used to hand the parent's budget straight down, so that a
+    sub-agent could not restart the turn's allowance. That is the right
+    instinct and it left one hole: on a default install the parent's
+    max_seconds is 0, so what a sub-agent inherited was no clock at all, and it
+    could run until the process was killed.
 
-    The child's tokens are folded back into the parent afterwards, by role.
-    Without that, `/audit`'s "last turn spent N% of its tokens on verification"
-    would read 0% — the cost would have moved, not disappeared, which is the
-    worse of the two failures.
+    So the clock is the child's own, and every other ceiling is what the parent
+    has LEFT — not what it started with, which would be exactly the bypass the
+    sharing existed to prevent. The clock is also capped by the parent's own
+    remaining time, so a 300s sub-agent cannot extend a turn with 60s on it.
     """
-    global _active_budget
-    parent = _active_budget
-    child = _TurnBudget(
-        max_seconds=PLAN_AUDIT_TIMEOUT_SECONDS,
-        max_tokens=getattr(parent, "max_tokens", 0) or 0,
-        max_cost=getattr(parent, "max_cost", 0.0) or 0.0,
+    remaining_tokens = remaining_cost = 0
+    if parent is not None:
+        if parent.max_tokens:
+            remaining_tokens = max(1, parent.max_tokens - parent.total_tokens)
+        if parent.max_cost:
+            remaining_cost = max(0.0001, parent.max_cost - parent.cost_usd)
+        if parent.max_seconds:
+            left = parent.max_seconds - (time.monotonic() - parent.started
+                                         - parent.idle_seconds)
+            max_seconds = max(1, min(max_seconds, int(left))) if left > 0 else 1
+    return _TurnBudget(
+        max_seconds=max_seconds,
+        max_tokens=remaining_tokens,
+        max_cost=remaining_cost,
         cost_in=getattr(parent, "cost_in", 0.0) or 0.0,
         cost_out=getattr(parent, "cost_out", 0.0) or 0.0,
-        seconds_setting="plan_audit_timeout_seconds",
+        seconds_setting=seconds_setting,
     )
-    _active_budget = child
-    try:
-        return _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
-    finally:
-        _active_budget = parent
-        if parent is not None:
-            parent.input_tokens += child.input_tokens
-            parent.output_tokens += child.output_tokens
-            for role, spent in child.role_tokens.items():
-                slot = parent.role_tokens.setdefault(role, [0, 0])
-                slot[0] += spent[0]
-                slot[1] += spent[1]
+
+
+def _bill_parent(parent, child) -> None:
+    """Fold a finished sub-run's tokens back into the turn, by role.
+
+    Without this the cost moves rather than disappearing: `/audit`'s "last turn
+    spent N% of its tokens on verification" would read 0%, and the turn summary
+    would under-report what it actually spent.
+    """
+    if parent is None or child is None:
+        return
+    parent.input_tokens += child.input_tokens
+    parent.output_tokens += child.output_tokens
+    for role, spent in child.role_tokens.items():
+        slot = parent.role_tokens.setdefault(role, [0, 0])
+        slot[0] += spent[0]
+        slot[1] += spent[1]
+
+
+def _subagent_ceiling(type_name: str) -> tuple:
+    """(wall clock, the config key it came from) for this kind of sub-agent.
+
+    Chosen by profile name rather than passed in, so `_exec_subagent` keeps the
+    signature every caller and test stub already uses.
+    """
+    if type_name == "auditor":
+        return PLAN_AUDIT_TIMEOUT_SECONDS, "plan_audit_timeout_seconds"
+    return SUBAGENT_TIMEOUT_SECONDS, "subagent_timeout_seconds"
 
 
 def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
@@ -4643,7 +4674,7 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
              "and never answer 'fail' from a path you have not confirmed is the "
              "one the step wrote.\n"
              "\nReply with a single VERDICT line as instructed.")
-    answer = _run_audit_subagent(task, depth)
+    answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
     verdict = _VERDICT_RE.search(answer or "")
     if verdict is None:
         return "", f"audit inconclusive — no verdict returned ({(answer or '')[:120]})"
@@ -5125,8 +5156,10 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
 
 def _exec_subagent(args: dict, depth: int = 0) -> str:
     """Run a delegated task in a fresh, tool-restricted sub-agent loop.
-    Bounded by SUBAGENT_MAX_DEPTH. Returns the sub-agent's final answer."""
+    Bounded by SUBAGENT_MAX_DEPTH and by a wall clock. Returns the sub-agent's
+    final answer."""
     global _last_tool_output, _last_tool_name, _last_write_diff
+    global _active_budget
     global PERMISSION_MODE, _plan_execution_grant
     global _local_fallback_grant, _remote_git_grant, _active_role
     global _sandbox_readonly, SUBAGENT_SPECS
@@ -5206,6 +5239,14 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # Isolate the parent's "last output" store from the sub-agent's tool calls.
     saved = (_last_tool_output, _last_tool_name, _last_write_diff)
     saved_role, _active_role = _active_role, f"subagent:{type_name}"
+    # Its own clock, the parent's remaining everything else. Passing the
+    # parent's budget straight down stopped a sub-agent restarting the turn's
+    # allowance, but on a default install max_seconds is 0, so what it actually
+    # inherited was no clock: a `test-writer` went hunting for a JS runtime
+    # with `find / -maxdepth 5` and the turn sat there until it was killed.
+    parent_budget = _active_budget
+    child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
+    _active_budget = child_budget
     try:
         answer = run_agent(
             [{"role": "user", "content": task}],
@@ -5215,9 +5256,7 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
             spin=ui.get("spin"), on_calls=ui.get("on_calls"),
             on_tool=ui.get("on_tool"), on_result=ui.get("on_result"),
             on_escalation=ui.get("on_escalation"),
-            # Share the parent's ceiling. A fresh budget here would be a free
-            # bypass: delegate to a subagent and the limit starts over.
-            budget=_active_budget,
+            budget=child_budget,
             client=client,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
             model_name=target_model,
@@ -5225,6 +5264,8 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
     finally:
+        _active_budget = parent_budget
+        _bill_parent(parent_budget, child_budget)
         _last_tool_output, _last_tool_name, _last_write_diff = saved
         _active_role = saved_role
         if saved_permission is not None:

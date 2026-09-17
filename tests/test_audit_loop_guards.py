@@ -249,21 +249,28 @@ def test_the_auditor_runs_under_its_own_wall_clock(engine, monkeypatch):
     """
     monkeypatch.setattr(engine, "PLAN_AUDIT", True)
     monkeypatch.setattr(engine, "PLAN_AUDIT_TIMEOUT_SECONDS", 90)
+    monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 300)
     engine.reset_audit_budget()
     parent = engine._TurnBudget()  # exactly what a default install builds
     monkeypatch.setattr(engine, "_active_budget", parent)
     seen = {}
+    monkeypatch.setattr(engine, "run_agent",
+                        lambda *a, **k: seen.update(budget=k.get("budget")) or "VERDICT: pass")
 
-    def fake_subagent(args, depth=0):
-        seen["max_seconds"] = engine._active_budget.max_seconds
-        engine._active_budget.add_tokens(300, 200)
-        return "VERDICT: pass"
-
-    monkeypatch.setattr(engine, "_exec_subagent", fake_subagent)
     engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
 
-    assert seen["max_seconds"] == 90, "the auditor inherited an unbounded budget"
+    assert seen["budget"].max_seconds == 90, "the auditor inherited an unbounded budget"
     assert engine._active_budget is parent, "the parent's budget must be restored"
+
+
+def test_the_auditor_s_clock_is_tighter_than_an_ordinary_subagent_s(engine, monkeypatch):
+    """Checking work should be quicker than doing it, and the profile name is
+    what picks the ceiling — so no caller or stub has to pass one."""
+    monkeypatch.setattr(engine, "PLAN_AUDIT_TIMEOUT_SECONDS", 120)
+    monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 300)
+
+    assert engine._subagent_ceiling("auditor") == (120, "plan_audit_timeout_seconds")
+    assert engine._subagent_ceiling("coder") == (300, "subagent_timeout_seconds")
 
 
 def test_the_auditor_s_own_ceiling_names_its_own_knob(engine, monkeypatch):
@@ -274,15 +281,14 @@ def test_the_auditor_s_own_ceiling_names_its_own_knob(engine, monkeypatch):
     monkeypatch.setattr(engine, "PLAN_AUDIT", True)
     monkeypatch.setattr(engine, "PLAN_AUDIT_TIMEOUT_SECONDS", 1)
     engine.reset_audit_budget()
-    budget = engine._TurnBudget()
-    monkeypatch.setattr(engine, "_active_budget", budget)
+    monkeypatch.setattr(engine, "_active_budget", engine._TurnBudget())
     captured = {}
 
-    def fake_subagent(args, depth=0):
-        captured["reason"] = engine._active_budget.exceeded()
+    def fake_run(*a, **k):
+        captured["reason"] = k["budget"].exceeded()
         return "VERDICT: pass"
 
-    monkeypatch.setattr(engine, "_exec_subagent", fake_subagent)
+    monkeypatch.setattr(engine, "run_agent", fake_run)
     # The child budget stamps `started` from the first reading; everything after
     # it is far past a 1s ceiling.
     clock = iter([0.0] + [10_000.0] * 50)
@@ -315,6 +321,81 @@ def test_what_the_audit_spent_still_shows_up_in_the_turn_s_own_total(engine, mon
     assert parent.total_tokens == 500
     assert parent.role_total("subagent:auditor") == 500
     assert parent.audit_share() == 1.0
+
+
+# -- the ceiling belongs to every sub-agent, not just the auditor ------------
+
+def test_every_subagent_gets_a_wall_clock(engine, monkeypatch):
+    """Bounding only the auditor left the same hole open next door.
+
+    Live, with `/audit on` and the portfolio prompt: the three auditors came
+    back in 10.5s, 17.9s and 14.0s, and then a `test-writer` sub-agent went
+    looking for a JS runtime -- `find / -maxdepth 5`, pip downloads -- and the
+    run sat there until its outer timeout killed it. A sub-agent inherits
+    max_seconds=0 on a default install, which is no ceiling at all.
+    """
+    monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 240)
+    parent = engine._TurnBudget()  # the default install's budget: no limits
+    monkeypatch.setattr(engine, "_active_budget", parent)
+    seen = {}
+    monkeypatch.setattr(engine, "run_agent",
+                        lambda *a, **k: seen.update(budget=k.get("budget")) or "done")
+
+    engine._exec_subagent({"agent_type": "test-writer", "task": "write tests"})
+
+    assert seen["budget"].max_seconds == 240
+    assert seen["budget"] is not parent
+
+
+def test_a_subagent_cannot_restart_the_turn_s_token_budget(engine, monkeypatch):
+    """The reason `_exec_subagent` shared the parent's budget in the first place.
+
+    A child budget that starts its token count at zero would mean: delegate, and
+    the ceiling begins again. The child has to inherit what is LEFT.
+    """
+    monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 240)
+    parent = engine._TurnBudget(max_tokens=1000, max_cost=1.0)
+    parent.add_tokens(600, 100)  # 700 of 1000 already gone
+    monkeypatch.setattr(engine, "_active_budget", parent)
+    seen = {}
+    monkeypatch.setattr(engine, "run_agent",
+                        lambda *a, **k: seen.update(budget=k.get("budget")) or "done")
+
+    engine._exec_subagent({"agent_type": "test-writer", "task": "write tests"})
+
+    assert seen["budget"].max_tokens == 300, "the sub-agent got a fresh allowance"
+
+
+def test_a_subagent_cannot_outlive_the_turn_that_spawned_it(engine, monkeypatch):
+    """A 300s sub-agent ceiling must not extend a turn with 60s left on it."""
+    monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 300)
+    parent = engine._TurnBudget(max_seconds=100)
+    parent.started -= 40  # 60 seconds left
+    monkeypatch.setattr(engine, "_active_budget", parent)
+    seen = {}
+    monkeypatch.setattr(engine, "run_agent",
+                        lambda *a, **k: seen.update(budget=k.get("budget")) or "done")
+
+    engine._exec_subagent({"agent_type": "test-writer", "task": "write tests"})
+
+    assert 0 < seen["budget"].max_seconds <= 60
+
+
+def test_what_a_subagent_spent_is_billed_to_the_turn(engine, monkeypatch):
+    """A child budget that keeps its tokens hides the cost rather than bounding it."""
+    monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 240)
+    parent = engine._TurnBudget()
+    monkeypatch.setattr(engine, "_active_budget", parent)
+
+    def fake_run(*a, **k):
+        k["budget"].add_tokens(120, 80)
+        return "done"
+
+    monkeypatch.setattr(engine, "run_agent", fake_run)
+    engine._exec_subagent({"agent_type": "test-writer", "task": "write tests"})
+
+    assert parent.total_tokens == 200
+    assert parent.role_total("subagent:test-writer") == 200
 
 
 # -- the auditor reads tool output as data, never as instructions ------------
