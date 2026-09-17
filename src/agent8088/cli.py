@@ -2117,7 +2117,6 @@ COMMAND_SPECS = (
     ("audit", "/audit [on|off]", "Verify each step against the real files after it runs", ()),
     ("fusion", "/fusion [setup|--panel provider:model,… --judge provider:model] <query>", "Ask a model panel and have a blind judge select the winner", ()),
     ("image", "/image <path-or-url> [question]", "Analyze a screenshot/diagram with a vision model", ()),
-    ("paste", "/paste [question]", "Analyze an image from the OS clipboard (Windows/macOS)", ()),
     ("raw", "/raw <text>", "One raw model call — shows content, reasoning, tool_calls", ()),
     ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
@@ -2877,37 +2876,6 @@ def cmd_image(rest, resolver=None):
     S.messages.append({"role": "assistant", "content": answer})
     render_answer(answer)
     _save_active_session()
-
-
-def cmd_paste(rest):
-    try:
-        from PIL import ImageGrab
-    except ImportError:
-        console.print("[red]error:[/red] Pillow is not installed")
-        return
-    try:
-        img = ImageGrab.grabclipboard()
-    except NotImplementedError:
-        # ImageGrab.grabclipboard() only implements clipboard access on
-        # Windows/macOS; Linux needs xclip/wl-clipboard and Pillow raises this
-        # instead of silently returning None there.
-        console.print("[red]error:[/red] clipboard image paste isn't supported on this platform")
-        return
-    if img is None:
-        console.print("[red]error:[/red] clipboard has no image")
-        return
-    import tempfile
-    fd, tmp_name = tempfile.mkstemp(suffix=".png")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    img.save(tmp_path, "PNG")
-    try:
-        # A temp file, not something the user pasted a path to — resolve_pasted_path
-        # is right here too: it's the agent's own trusted output, not a model-chosen
-        # read, so the same "bypass ALLOWED_PATHS, keep the sensitive floor" rule fits.
-        cmd_image(f"{tmp_path} {rest}".strip(), resolver=A.resolve_pasted_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4149,8 +4117,14 @@ def _parse_fusion_flags(rest):
 
 
 def _fusion_available_providers():
-    """Provider names with a working API key, for the setup picker."""
-    return sorted(name for name, info in A.PROVIDERS.items() if A._provider_api_key(info))
+    """Provider names with a working API key, for the setup picker.
+
+    Mirrors fusion.working_provider_names() so the picker and the panel agree.
+    "Working" = a key the user actually configured (the .env store or a
+    non-placeholder config literal) — ambient os.environ exports for other
+    tools don't count.
+    """
+    return sorted(fusion.working_provider_names())
 
 
 def _cmd_fusion_setup(_rest):
@@ -5471,7 +5445,7 @@ COMMANDS = {
     "cost": cmd_cost,
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
-    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,
+    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "audit": cmd_audit, "fusion": cmd_fusion,
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
