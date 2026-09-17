@@ -4383,12 +4383,17 @@ def reset_audit_budget() -> None:
     _audit_calls_this_turn = 0
 
 
-# Discards stderr and writes nothing. Everything else after a redirection
-# operator is a file this predicate must refuse to call read-only.
-_STDERR_TO_NULL = re.compile(r"2>\s*(?:/dev/null|nul|NUL)(?=\s|$)")
-# What separates one command from the next. `|` is absent: `_readonly_shell`
-# already decomposes pipelines itself, under its own stricter rules.
-_SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|\n")
+# Discards stderr and writes nothing. `nul` is deliberately NOT accepted: the
+# shell here is sh, not cmd, so `2>nul` names an ordinary file. An auditor was
+# handed `dir /b 2>nul & echo --- & dir` and the listing came back containing an
+# entry called `nul`, which then broke the sandbox copy with [WinError 87].
+# Everything else after a redirection operator is a file, so this predicate
+# refuses to call it read-only.
+_STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$)")
+# What separates one command from the next. Ordered so `&&` and `||` match
+# before the single-character forms. `|` is absent: `_readonly_shell` already
+# decomposes pipelines itself, under its own stricter rules.
+_SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|&|\n")
 
 
 def _shell_call_is_read_only(command: str) -> bool:
@@ -4524,6 +4529,7 @@ def _run_audit_subagent(task: str, depth: int) -> str:
         max_cost=getattr(parent, "max_cost", 0.0) or 0.0,
         cost_in=getattr(parent, "cost_in", 0.0) or 0.0,
         cost_out=getattr(parent, "cost_out", 0.0) or 0.0,
+        seconds_setting="plan_audit_timeout_seconds",
     )
     _active_budget = child
     try:
@@ -11071,8 +11077,13 @@ class _TurnBudget:
     """
 
     def __init__(self, max_seconds=0, max_tokens=0, max_cost=0.0,
-                 cost_in=0.0, cost_out=0.0):
+                 cost_in=0.0, cost_out=0.0, seconds_setting="max_turn_seconds"):
         self.task_id = uuid.uuid4().hex
+        # Which config key the wall clock came from. The auditor runs on its own
+        # budget, and telling a user to "raise max_turn_seconds" when the ceiling
+        # they actually hit was plan_audit_timeout_seconds sends them to a
+        # setting that would not have changed anything.
+        self.seconds_setting = seconds_setting
         self.max_seconds = max_seconds
         self.max_tokens = max_tokens
         self.max_cost = max_cost
@@ -11145,7 +11156,7 @@ class _TurnBudget:
             elapsed = time.monotonic() - self.started - self.idle_seconds
             if elapsed > self.max_seconds:
                 return (f"Turn budget exceeded: {elapsed:.0f} seconds elapsed "
-                        f"(limit {self.max_seconds}). Raise max_turn_seconds in "
+                        f"(limit {self.max_seconds}). Raise {self.seconds_setting} in "
                         f"config.txt or split the task into smaller requests.")
         if self.max_tokens and self.total_tokens >= self.max_tokens:
             return (f"Turn budget exceeded: {self.total_tokens} tokens used "

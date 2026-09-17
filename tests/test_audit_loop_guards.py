@@ -63,12 +63,26 @@ def test_a_read_only_probe_built_from_several_commands_is_not_audited(engine, tm
     """
     _audit(engine, tmp_path)
 
-    for command in ("dir /b 2>nul || ls -la",
-                    "pwd; ls -la; git status",
+    for command in ("pwd; ls -la; git status",
                     "ls -la && cat README.md",
                     "ls 2>/dev/null",
+                    "ls -la & pwd",
                     "git log --oneline | head -5 && git status"):
         assert not engine._tool_call_mutates("execute_shell", {"command": command}), command
+
+
+def test_2_to_nul_is_a_file_on_this_platform_not_a_discard(engine, tmp_path):
+    """`2>nul` is not the Windows NUL device once the shell is sh.
+
+    An auditor was handed `dir /b 2>nul & echo --- & dir`, and the listing came
+    back containing an entry named `nul` — which then broke the sandbox copy
+    with `[WinError 87]`. Only `/dev/null`, which sh actually understands,
+    discards; treating `nul` as a discard would call a write read-only.
+    """
+    _audit(engine, tmp_path)
+
+    assert engine._tool_call_mutates("execute_shell", {"command": "dir /b 2>nul"})
+    assert not engine._tool_call_mutates("execute_shell", {"command": "dir /b 2>/dev/null"})
 
 
 def test_an_interpreter_probe_is_still_audited(engine, tmp_path):
@@ -211,6 +225,33 @@ def test_the_auditor_runs_under_its_own_wall_clock(engine, monkeypatch):
 
     assert seen["max_seconds"] == 90, "the auditor inherited an unbounded budget"
     assert engine._active_budget is parent, "the parent's budget must be restored"
+
+
+def test_the_auditor_s_own_ceiling_names_its_own_knob(engine, monkeypatch):
+    """Live, the auditor stopped at 152s and told the user to "raise
+    max_turn_seconds" -- a setting that had nothing to do with it and which,
+    raised, would not have changed anything.
+    """
+    monkeypatch.setattr(engine, "PLAN_AUDIT", True)
+    monkeypatch.setattr(engine, "PLAN_AUDIT_TIMEOUT_SECONDS", 1)
+    engine.reset_audit_budget()
+    budget = engine._TurnBudget()
+    monkeypatch.setattr(engine, "_active_budget", budget)
+    captured = {}
+
+    def fake_subagent(args, depth=0):
+        captured["reason"] = engine._active_budget.exceeded()
+        return "VERDICT: pass"
+
+    monkeypatch.setattr(engine, "_exec_subagent", fake_subagent)
+    # The child budget stamps `started` from the first reading; everything after
+    # it is far past a 1s ceiling.
+    clock = iter([0.0] + [10_000.0] * 50)
+    monkeypatch.setattr(engine.time, "monotonic", lambda: next(clock))
+    engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
+
+    assert "plan_audit_timeout_seconds" in captured["reason"]
+    assert "max_turn_seconds" not in captured["reason"]
 
 
 def test_what_the_audit_spent_still_shows_up_in_the_turn_s_own_total(engine, monkeypatch):
