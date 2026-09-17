@@ -211,6 +211,28 @@ sandbox_runtime_version=0.0.73
 # Files larger than this are not snapshotted, so they are not reverted — the plan
 # output says so rather than implying otherwise.
 # plan_audit_revert_max_bytes=1048576
+#
+# What gets verified: calls that CHANGE something. A tool's permission mode is
+# not the test — `shell` is the gate 13 read-only tools go through, so
+# git_status, git_log, git_diff and every `ls` used to buy a full auditor run
+# each, one of them 111 seconds and 100% of that turn's tokens to confirm that a
+# read had read. Reads are skipped now, and an execute_shell is judged on the
+# command it was actually given.
+#
+# Two ceilings, because `/audit on` multiplies a turn's model calls and neither
+# max_turn_seconds nor max_turn_tokens is set on a default install:
+#
+#   plan_audit_max_per_turn     verification calls one top-level turn may spend.
+#                               Reaching it says so in the tool result rather
+#                               than failing the step — running out of audit
+#                               budget is not evidence a write was wrong, so
+#                               nothing is reverted. There is no "unlimited"
+#                               value: to stop verifying, set plan_audit=0.
+#   plan_audit_timeout_seconds  wall clock for ONE auditor sub-run, so a
+#                               verification can never outlast the work it
+#                               checks.
+# plan_audit_max_per_turn=12
+# plan_audit_timeout_seconds=120
 
 # --- persistent memory ---
 # On by default. With memory=1 the agent does two extra things per turn:
