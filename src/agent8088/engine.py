@@ -4383,6 +4383,41 @@ def reset_audit_budget() -> None:
     _audit_calls_this_turn = 0
 
 
+# Discards stderr and writes nothing. Everything else after a redirection
+# operator is a file this predicate must refuse to call read-only.
+_STDERR_TO_NULL = re.compile(r"2>\s*(?:/dev/null|nul|NUL)(?=\s|$)")
+# What separates one command from the next. `|` is absent: `_readonly_shell`
+# already decomposes pipelines itself, under its own stricter rules.
+_SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|\n")
+
+
+def _shell_call_is_read_only(command: str) -> bool:
+    """Read-only for the purposes of AUDITING, which is not the same question
+    `_readonly_shell` answers.
+
+    `_readonly_shell` gates approval prompts, so it is deliberately blunt about
+    anything it cannot fully parse and calls a compound command not-read-only
+    outright. That is right for permissions and wrong here: a probe like
+    `which node; node --version` changes nothing, and auditing it cost a
+    six-turn sub-agent. One such call — `dir /b 2>nul || ls -la` — spawned an
+    auditor that was still running when the session was killed half an hour
+    later.
+
+    Relaxing `_readonly_shell` itself is not an option: it would let
+    `ls && rm -rf /` run without a prompt. So this splits on the sequencers and
+    requires EVERY segment to satisfy the strict predicate independently — a
+    conjunction that can only ever be stricter than the whole-string answer,
+    never a way to smuggle a write past the auditor.
+    """
+    if re.search(r"[`]|\$\(", command):
+        return False           # substitution can run anything, anywhere
+    probe = _STDERR_TO_NULL.sub("", command)
+    if re.search(r"[<>]", probe):
+        return False           # a redirection writes a file
+    segments = [part.strip() for part in _SHELL_SEQUENCERS.split(probe)]
+    return bool(segments) and all(part and _readonly_shell(part) for part in segments)
+
+
 def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
     """Whether this exact call can change durable state.
 
@@ -4390,12 +4425,12 @@ def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
     effect has nothing to audit. `mode` cannot answer this on its own: it names
     the permission gate, and `shell` gates both `rm -rf` and `ls`.
 
-    For shell tools the answer comes from `_readonly_shell`, which the
-    permission layer and the mutation counter already trust for exactly this
-    judgement — so a tool cannot be read-only enough to skip a confirmation
-    prompt yet mutating enough to need an auditor. A command that will not
-    format is treated as mutating: the conservative direction is to verify
-    something harmless, never to skip verifying a write.
+    For shell tools the answer comes from `_shell_call_is_read_only`, which is
+    built on the same `_readonly_shell` the permission layer trusts — so a tool
+    cannot be read-only enough to skip a confirmation prompt yet mutating enough
+    to need an auditor. A command that will not format is treated as mutating:
+    the conservative direction is to verify something harmless, never to skip
+    verifying a write.
     """
     spec = TOOL_SPECS.get(tool_name, {})
     mode = spec.get("mode")
@@ -4407,7 +4442,7 @@ def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
         command = _format_with_args(spec.get("command") or "{command}", tool_args or {})
     except Exception:
         return True
-    return not _readonly_shell(command)
+    return not _shell_call_is_read_only(command)
 
 
 def _plan_step_is_auditable(tool_name: str, acceptance: str = "",

@@ -54,6 +54,60 @@ def test_a_read_only_git_tool_is_not_audited(engine, tmp_path):
         assert not engine._audit_applies(name, {}, 0), name
 
 
+def test_a_read_only_probe_built_from_several_commands_is_not_audited(engine, tmp_path):
+    """`_readonly_shell` only decomposes `|`, so anything joined with && || or ;
+    came back "not read-only" and bought an auditor.
+
+    These are the exact commands two live runs actually issued. The first spawned
+    the auditor that was still thrashing when the run was killed at 30 minutes.
+    """
+    _audit(engine, tmp_path)
+
+    for command in ("dir /b 2>nul || ls -la",
+                    "pwd; ls -la; git status",
+                    "ls -la && cat README.md",
+                    "ls 2>/dev/null",
+                    "git log --oneline | head -5 && git status"):
+        assert not engine._tool_call_mutates("execute_shell", {"command": command}), command
+
+
+def test_an_interpreter_probe_is_still_audited(engine, tmp_path):
+    """`node --version` launches an interpreter, so it is not read-only.
+
+    The relaxation is about SEQUENCING, not about widening what counts as a
+    safe executable: every segment still has to clear the same strict list the
+    approval prompt uses, and `node`, `which` and `echo` are not on it.
+    """
+    _audit(engine, tmp_path)
+
+    assert engine._tool_call_mutates(
+        "execute_shell", {"command": "which node; node --version"})
+
+
+def test_one_mutating_segment_condemns_the_whole_command(engine, tmp_path):
+    """Decomposing must never be a way to smuggle a write past the auditor."""
+    _audit(engine, tmp_path)
+
+    for command in ("ls && rm -rf /tmp/x",
+                    "cat a.txt > b.txt",
+                    "ls; npm install",
+                    "ls -la && echo hi > out.txt",
+                    "echo $(rm -rf /tmp/x)",
+                    "ls `rm -rf /tmp/x`",
+                    "ls 2>errors.log"):
+        assert engine._tool_call_mutates("execute_shell", {"command": command}), command
+
+
+def test_the_permission_gate_itself_is_untouched(engine):
+    """`_readonly_shell` decides whether a command skips an approval prompt.
+
+    Loosening IT to fix auditing would let `ls && rm -rf /` run unprompted, so
+    the audit-only relaxation lives in its own predicate and this stays strict.
+    """
+    assert not engine._readonly_shell("ls -la && cat README.md")
+    assert not engine._readonly_shell("ls && rm -rf /tmp/x")
+
+
 def test_a_mutating_shell_command_is_still_audited(engine, tmp_path):
     """The fix must not turn the auditor off for the calls it exists for."""
     _audit(engine, tmp_path)
