@@ -312,7 +312,7 @@ async def get_status():
 async def get_commands():
     """The CLI command catalog that drives web autocomplete and help."""
     return [item for item in _cl().command_catalog()
-            if item["name"] not in {"exit", "quit"}]
+            if item["name"] not in {"exit"}]
 
 
 @app.get("/api/tools")
@@ -2288,7 +2288,7 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
                                 "result": "plan mode — reads only. Agent8088 will research, propose a "
                                           "plan, and wait for your approval before anything is written or run."})
         return
-    if command.lower() in {"exit", "quit"}:
+    if command.lower() in {"exit"}:
         await ws.send_json({"type": "command_result", "command": command,
                             "result": f"/{command} is CLI-only and does nothing in the browser."})
         return

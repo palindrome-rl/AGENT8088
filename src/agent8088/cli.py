@@ -12,7 +12,7 @@ feature is reachable here:
   • /plan           — enter plan mode: propose a plan, approve it, then it runs.
   • /raw            — one raw model call, showing reasoning + tool_calls fields.
   • /model          — switch backend (Ornith  <->  Gemma fallback).
-  • /config /tools /history /trace /temp /maxturns /save /clear ...
+  • /config /tools /history /trace /temp /maxturns /save /reset ...
 
 Run:  python agent8088_cli.py
 """
@@ -2139,7 +2139,6 @@ COMMAND_SPECS = (
     ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
     ("history", "/history", "Show the current conversation", ()),
     ("trace", "/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace", ()),
-    ("think", "/think [on|off]", "Alias for /reasoning", ()),
     ("verbose", "/verbose [on|off|full]", "Control tool activity detail", ()),
     ("usage", "/usage [off|tokens|full]", "Control post-turn usage summaries", ()),
     ("reasoning", "/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)", ()),
@@ -2147,12 +2146,11 @@ COMMAND_SPECS = (
     ("maxturns", "/maxturns <int>", "Set max agent turns (current: {max_turns})", ()),
     ("tool-selection", "/tool-selection [hybrid|full|auto]", "Set native tool schemas sent to the model (persists)", ()),
     ("save", "/save <file>", "Save conversation + last trace to a JSON file", ()),
-    ("clear", "/clear", "Clear the conversation context", ()),
     ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
     ("schedule", "/schedule [list|add <cron> <task>|remove <index-or-task>]", "Add/list/remove a recurring run of this agent (cron/Task Scheduler)", ()),
     ("browser", "/browser [status|close|reset]", "Inspect or close the active reusable browser session", ()),
     ("help", "/help", "Show this list", ()),
-    ("exit", "/exit, /quit", "Leave", ("quit",)),
+    ("exit", "/exit", "Leave", ()),
 )
 
 
@@ -3593,7 +3591,7 @@ def cmd_local(rest):
         _cmd_local_available(arg)
     elif sub == "pull":
         _cmd_local_pull(arg)
-    elif sub in ("remove", "rm", "delete"):
+    elif sub == "remove":
         _cmd_local_remove(arg)
     else:
         _print_local_usage()
@@ -3689,7 +3687,7 @@ def cmd_schedule(rest):
         _cmd_schedule_list()
     elif sub == "add":
         _cmd_schedule_add(arg)
-    elif sub in ("remove", "rm", "delete"):
+    elif sub == "remove":
         _cmd_schedule_remove(arg)
     else:
         _print_schedule_usage()
@@ -4620,11 +4618,6 @@ def cmd_reasoning(rest):
     _save_preferences()
 
 
-def cmd_think(rest):
-    """OpenClaw-style name for the existing safe reasoning display control."""
-    cmd_reasoning(rest)
-
-
 def cmd_verbose(rest):
     mode = (rest or "").strip().lower() or "on"
     if mode not in {"on", "off", "full"}:
@@ -5172,10 +5165,6 @@ def cmd_save(rest):
         console.print(f"[#237dd7]saved[/#237dd7] -> {destination}")
 
 
-def cmd_clear(_):
-    cmd_reset("")
-
-
 def _openai_base_url(endpoint):
     endpoint = endpoint.strip().rstrip("/")
     suffix = "/chat/completions"
@@ -5406,15 +5395,15 @@ COMMANDS = {
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
-    "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
+    "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
-    "maxturns": cmd_maxturns, "tool-selection": cmd_tool_selection, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
+    "maxturns": cmd_maxturns, "tool-selection": cmd_tool_selection, "limits": cmd_limits, "save": cmd_save,
     "memory": cmd_memory,
     "task": cmd_task,
     "schedule": cmd_schedule,
     "browser": cmd_browser,
 }
-_COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
+_COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit")))
 
 
 # ---------------------------------------------------------------------------
@@ -7727,12 +7716,12 @@ def main():
             break
         if not line:
             continue
-        if line in ("/exit", "/quit", "exit", "quit"):
+        if line in ("/exit", "exit"):
             console.print("[dim]bye[/dim]")
             break
         # Bare command parity with the classic REPL: a single word that exactly
-        # names a command (clear, help, tools, agents, config, …) runs it rather
-        # than being sent to the model — so typing 'clear' clears the context
+        # names a command (reset, help, tools, agents, config, …) runs it rather
+        # than being sent to the model — so typing 'reset' clears the context
         # instead of making the model ramble about "confirming the clearing".
         if " " not in line and not line.startswith("/") and line.lower() in COMMANDS:
             try:

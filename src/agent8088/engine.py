@@ -663,7 +663,7 @@ if CRON_MODE not in ("deny", "approve"):
 # closes by freezing HERMES_YOLO_MODE at import.
 UNATTENDED = os.environ.get("AGENT8088_UNATTENDED", "").strip().lower() in (
     "1", "true", "yes", "on")
-# Confirm before a slash command discards conversation state (/reset, /clear,
+# Confirm before a slash command discards conversation state (/reset,
 # /new, /compact) or invalidates the MCP tool cache (/mcp reload).
 DESTRUCTIVE_CONFIRM = APP_CONFIG.get("destructive_slash_confirm", "1") != "0"
 MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
@@ -5352,7 +5352,7 @@ def _record_browse_visit(url: str) -> None:
         if host not in _browse_visited_hosts:
             _browse_visited_hosts.append(host)
 
-# Mirrors cli.py's S.show_reasoning (toggled by /reasoning, aliased /think) -
+# Mirrors cli.py's S.show_reasoning (toggled by /reasoning) -
 # see cmd_reasoning and Session.__init__. Kept as a plain engine.py global
 # rather than imported from cli.py so this module has no dependency on the
 # CLI (it must also work under --mcp-serve/--gateway, which don't use cli.py).
@@ -5401,7 +5401,7 @@ def _set_browser_use_log_verbosity(verbose: bool) -> None:
     bypassing agent8088's own tool-result display entirely - the actual
     answer already reaches the user through _run_browser_agent's return
     value, shown properly in the browse_page result. Quiet by default, same
-    as the main loop's own chain-of-thought; /reasoning on (or /think on)
+    as the main loop's own chain-of-thought; /reasoning on
     restores it.
 
     Sets logger *levels* directly rather than calling browser-use's own

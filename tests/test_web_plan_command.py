@@ -84,6 +84,7 @@ class _PlanSession:
         self.temperature = 0.0
         self.name = ""
         self.last_usage = {}
+        self.trajectory_state = {}
 
 
 class _PlanCli:

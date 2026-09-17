@@ -52,7 +52,6 @@ Complete inventory of slash commands across all three Agent8088 surfaces.
 | `/reset` | Clear the active session, keep its name |
 | `/compact [keep]` | Summarize older turns, retain newest (default 6) |
 | `/save <file>` | Save conversation + last trace to JSON |
-| `/clear` | Clear conversation context |
 | `/memory [on\|off\|search\|add\|forget\|notify\|test\|clear]` | Persistent memory across sessions |
 
 ### Diagnostics & Output
@@ -66,14 +65,13 @@ Complete inventory of slash commands across all three Agent8088 surfaces.
 | `/history` | Show current conversation |
 | `/trace [on\|off]` | Toggle step-by-step JSON trace |
 | `/reasoning [on\|off]` | Show/hide model thinking (masked when shown) |
-| `/think [on\|off]` | Alias for `/reasoning` |
 | `/verbose [on\|off\|full]` | Control tool activity detail |
 | `/usage [off\|tokens\|full]` | Control post-turn usage summaries |
 
 ### REPL-only
 | Command | What it does |
 |---|---|
-| `/exit`, `/quit` | Leave the REPL |
+| `/exit` | Leave the REPL |
 
 ---
 
