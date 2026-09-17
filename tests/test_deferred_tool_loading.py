@@ -140,3 +140,57 @@ def test_nonexistent_tool_remains_an_error(engine, monkeypatch):
         }), allowed_tools={"read_text"}, memory_capture=False, trace=trace,
     ) == "done"
     assert any(event["type"] == "unknown_tool" for event in trace)
+
+
+def test_plan_approval_widens_tools_within_same_run(engine, monkeypatch):
+    """A tool the initial (plan-only) selection excluded must become callable
+    the moment a mid-run present_plan approval grants it, without waiting for
+    a fresh run_agent call. Regression for the frozen `available_tools`/
+    `loaded_tools` snapshot taken once at the top of the turn: write_file
+    used to stay unreachable for the rest of the run even after permission
+    mode widened past plan-only, because the hybrid-selection closures never
+    re-read the live `allowed_tools()` grant."""
+    state = {"mode": "plan-only"}
+
+    def allowed():
+        base = {"present_plan", "read_text"}
+        return base | ({"write_file"} if state["mode"] != "plan-only" else set())
+
+    seen_schemas = []
+    trace = []
+    responses = iter([
+        _response('✿FUNCTION✿: present_plan ✿ARGS✿: {"plan": "write a file"}'),
+        _response('✿FUNCTION✿: write_file ✿ARGS✿: {"filename": "x.txt", "content": "hi"}'),
+        _response("done"),
+    ])
+    monkeypatch.setattr(engine, "TOOL_SELECTION", "hybrid")
+    monkeypatch.setattr(engine, "_native_tools_enabled", lambda *_a, **_k: True)
+    # present_plan must be pre-loaded (not merely deferred-loadable) so the
+    # model's first call actually executes it instead of only triggering a
+    # schema-load retry -- that retry semantics is a separate mechanism from
+    # the one under test here.
+    monkeypatch.setattr(engine, "select_tool_names_for_request",
+                        lambda *_a, **_k: {"read_text", "present_plan"})
+
+    def run_tool(name, args, **_k):
+        if name == "present_plan":
+            state["mode"] = "full-auto"
+            return "Plan approved. Permission mode is now full-auto. Carry out the plan."
+        return "ok"
+
+    monkeypatch.setattr(engine, "run_tool", run_tool)
+
+    def completion(_messages, tools, **_kwargs):
+        seen_schemas.append({tool["function"]["name"] for tool in tools})
+        return next(responses)
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", completion)
+    answer = engine.run_agent(
+        [{"role": "user", "content": "plan to write a file, then do it"}], max_turns=4,
+        system_prompt="", tools_def=lambda: engine.build_tools_def({
+            name: engine.TOOL_SPECS[name] for name in {"present_plan", "read_text", "write_file"}}),
+        allowed_tools=allowed, memory_capture=False, trace=trace,
+    )
+    assert answer == "done"
+    assert "write_file" not in seen_schemas[0]
+    assert "write_file" in seen_schemas[1]

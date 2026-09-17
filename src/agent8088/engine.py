@@ -10717,11 +10717,28 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         )
         loaded_tools |= _TOOL_SELECTION_PINNED & available_tools
 
+        def _resync_available_tools():
+            # available_tools/loaded_tools were narrowed once, before the model's
+            # first completion. A present_plan approval changes PERMISSION_MODE
+            # for the REST of this same run_agent call -- re-reading the live
+            # grant here (every round) picks up tools it newly allows (e.g.
+            # write_file leaving plan-only) and drops any it has since revoked,
+            # instead of staying locked to whatever plan-only permitted at the
+            # top of the turn.
+            nonlocal available_tools, loaded_tools
+            current = set(configured_tools() if callable(configured_tools) else configured_tools)
+            if current != available_tools:
+                gained = current - available_tools
+                loaded_tools = (loaded_tools & current) | (_TOOL_SELECTION_PINNED & gained) | gained
+                available_tools = current
+
         def loaded_definitions():
+            _resync_available_tools()
             definitions = configured_defs() if callable(configured_defs) else configured_defs
             return _filter_tool_definitions(definitions, loaded_tools) + [_TOOL_SEARCH_DEFINITION]
 
         def loaded_names():
+            _resync_available_tools()
             return set(loaded_tools) | {"search_tools"}
 
         def load_tools(names):
