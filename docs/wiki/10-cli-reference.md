@@ -132,7 +132,6 @@ sensitive-file floor still applies unconditionally.
 | `/sessions` | List saved named sessions |
 | `/resume <name>` | Reload a named session (restores skill state too) |
 | `/reset` | Clear the current conversation |
-| `/clear` | Clear context |
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
 | `/save <file>` | Export conversation + trace to JSON (mode `0600`) |
@@ -150,7 +149,6 @@ sensitive-file floor still applies unconditionally.
 | `/temp <float>` | Sampling temperature |
 | `/maxturns <int>` | Max agent turns per prompt (same as `/limits max_turns`) |
 | `/reasoning` | Toggle reasoning display |
-| `/think` | Extended thinking mode |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
 | `/fusion setup` | Interactively pick a default panel and judge (checkbox pickers), saved to `config.txt` |
 | `/fusion <query>` | Ask the panel in parallel; a blind judge picks the best answer. `--panel p:m,...`/`--judge p:m` flags override the saved config for one call |
@@ -165,7 +163,6 @@ sensitive-file floor still applies unconditionally.
 | `/plan [task]` | Enter plan mode: propose a plan, approve it, then it runs |
 | `/audit [on\|off]` | Show or change step verification; no argument reports the current setting and the last turn's cost |
 | `/image <path> [question]` | Analyze an image with a vision-capable model |
-| `/paste [question]` | Analyze an image from the OS clipboard (Windows/macOS; Pillow's `ImageGrab`) |
 | `/agents` | List sub-agent profiles, with source, model, and the active provider's models |
 | `/agents models` | List every model the active provider offers |
 | `/agents new [name]` | Create a custom sub-agent profile interactively |
@@ -180,7 +177,7 @@ sensitive-file floor still applies unconditionally.
 | Command | Does |
 |---|---|
 | `/mode [readonly\|full-auto]` | Show or switch permission mode. Use `/plan` to enter plan mode |
-| `/reset`, `/clear` | Discard the conversation — asks first unless `destructive_slash_confirm=0` |
+| `/reset` | Discard the conversation — asks first unless `destructive_slash_confirm=0` |
 | `/sandbox [auto\|native\|docker\|local\|setup]` | Show, select or install isolation |
 | `/search [status\|setup\|stop\|doctor\|use <backend>]` | Show, provision, or pin a web search backend |
 

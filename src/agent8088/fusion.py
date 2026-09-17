@@ -230,20 +230,49 @@ class FusionResult:
     total_cost_usd: Optional[float] = None
 
 
+def working_provider_names() -> list[str]:
+    """Provider names with a key the user actually configured — the fusion
+    picker's definition of "working".
+
+    _provider_api_key resolves os.environ as a last resort, which is fine when
+    the model is actively being called through that provider but wrong for a
+    setup picker: a GEMINI_API_KEY exported for another tool used to make
+    gemini/anthropic appear as "working" here (reported by a user whose fusion
+    picker offered providers they never configured), and ollama's config sets
+    api_key='ollama' as a placeholder rather than a key. The picker's "working"
+    means: present in the .env key store, or a non-placeholder literal in
+    config.txt — never ambient.
+    """
+    env_store = A.load_env_file()
+    names = []
+    for name, info in A.PROVIDERS.items():
+        if not isinstance(info, dict):
+            continue
+        env_name = info.get("api_key_env", "").strip()
+        if env_name and env_store.get(env_name):
+            names.append(name)
+            continue
+        direct = info.get("api_key", "").strip()
+        if direct and direct.lower() not in ("ollama",):
+            names.append(name)
+    return names
+
+
 def discover_panel(max_panel_size: int = 6) -> list:
-    """Walk engine.PROVIDERS in dict order, keeping providers with a working
-    key and a configured model, deduped by backend, up to max_panel_size."""
+    """Walk providers with a working key, keeping each with a configured model,
+    deduped by backend, up to max_panel_size."""
     seen = set()
     panel: list[PanelMember] = []
+    working = set(working_provider_names())
     for name, info in A.PROVIDERS.items():
         if len(panel) >= max_panel_size:
             break
+        if name not in working:
+            continue
         if not isinstance(info, dict):
             continue
         model = info.get("model") or ""
         if not model:
-            continue
-        if not A._provider_api_key(info):
             continue
         base_url = info.get("base_url") or ""
         if info.get("api_mode") == "litellm":

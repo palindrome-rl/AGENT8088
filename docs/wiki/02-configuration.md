@@ -105,7 +105,7 @@ Flat keys rather than a nested block, so every approval setting is greppable.
 |---|---|---|
 | `denial_breaker_threshold` | `3` | Consecutive denials before the request stops and reports instead of retrying. `0` disables. |
 | `cron_mode` | `deny` | What an **unattended** run does at an approval gate. `deny` refuses and tells the model to report it; `approve` treats the gate as granted. Neither touches the always-on floor. |
-| `destructive_slash_confirm` | `1` | `/reset` and `/clear` ask before discarding a conversation. |
+| `destructive_slash_confirm` | `1` | `/reset` asks before discarding a conversation. |
 | `mcp_reload_confirm` | `1` | `/mcp reload` asks before dropping the tool cache. |
 
 There is deliberately no separate "approval mode" setting.

@@ -157,34 +157,84 @@ class MCPRuntime:
         return headers
 
     async def _connect(self, name, config, transport):
-        from mcp import ClientSession, StdioServerParameters
-        if transport == "stdio":
-            from mcp.client.stdio import stdio_client
-            context = stdio_client(StdioServerParameters(
-                command=config["command"], args=config.get("args", []),
-                env=self._stdio_env(config), cwd=config.get("cwd"),
-            ))
-        else:
-            import httpx
-            from mcp.client.streamable_http import streamable_http_client
-            client = httpx.AsyncClient(headers=self._http_headers(config), timeout=config.get("timeout", 30))
-            context = streamable_http_client(config["url"], http_client=client)
-        streams = await context.__aenter__()
-        read_stream, write_stream = streams[0], streams[1]
-        session_context = ClientSession(read_stream, write_stream)
-        session = await session_context.__aenter__()
-        await session.initialize()
-        listed = await session.list_tools()
-        self._sessions[name] = (context, session_context, session, client if transport == "http" else None)
-        return listed.tools
+        """Open one MCP server session.
+
+        The MCP SDK's streamable_http_client enters an anyio task group on
+        __aenter__, and anyio refuses __aexit__ from a different asyncio task
+        ('Attempted to exit cancel scope in a different task than it was
+        entered in'). The old flow entered the SDK's context managers here on
+        a short-lived task and exited them later from _close_all on a
+        different task — surfacing as 'Task exception was never retrieved'
+        whenever a streamable-http server was removed (context7 repro).
+
+        The fix is structural: one long-lived task per server owns the whole
+        'enter → ready → wait → close' CM lifecycle, so entry and exit pair on
+        the same asyncio task. This coroutine just spawns that task on the
+        loop and hands back the discovered tools once the server is ready.
+        """
+        ready = asyncio.get_running_loop().create_future()
+        stop = asyncio.Event()
+        holder = {}
+
+        async def _host():
+            """Own this server's CM stack; runs on the loop for its lifetime."""
+            import contextlib
+            stack = contextlib.AsyncExitStack()
+            client = None
+            try:
+                from mcp import ClientSession, StdioServerParameters
+                if transport == "stdio":
+                    from mcp.client.stdio import stdio_client
+                    context = stdio_client(StdioServerParameters(
+                        command=config["command"], args=config.get("args", []),
+                        env=self._stdio_env(config), cwd=config.get("cwd"),
+                    ))
+                else:
+                    import httpx
+                    from mcp.client.streamable_http import streamable_http_client
+                    client = httpx.AsyncClient(
+                        headers=self._http_headers(config),
+                        timeout=config.get("timeout", 30))
+                    context = streamable_http_client(config["url"], http_client=client)
+                streams = await stack.enter_async_context(context)
+                read_stream, write_stream = streams[0], streams[1]
+                session_context = ClientSession(read_stream, write_stream)
+                session = await stack.enter_async_context(session_context)
+                await session.initialize()
+                listed = await session.list_tools()
+                holder["session"] = session
+                holder["tools"] = list(listed.tools)
+                holder["client"] = client
+                if not ready.done():
+                    ready.set_result(list(listed.tools))
+                await stop.wait()
+            except BaseException as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+            finally:
+                try:
+                    await stack.aclose()  # closed on this task, so the scope pairs
+                except BaseException:
+                    pass
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except BaseException:
+                        pass
+
+        task = asyncio.get_running_loop().create_task(_host())
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        tools = await asyncio.wait_for(asyncio.shield(ready), timeout=config.get("connect_timeout", 15))
+        self._sessions[name] = (holder.get("session"), holder.get("tools", []), stop, task, holder.get("client"))
+        return tools
 
     async def _close_all(self):
         sessions, self._sessions = self._sessions, {}
-        for context, session_context, _session, client in sessions.values():
+        for session, _tools, stop, task, client in sessions.values():
             try:
-                await session_context.__aexit__(None, None, None)
-                await context.__aexit__(None, None, None)
-                if client:
+                stop.set()
+                await asyncio.wait_for(task, timeout=10)
+                if client is not None:
                     await client.aclose()
             except Exception:
                 pass
@@ -241,7 +291,7 @@ class MCPRuntime:
 
     async def _call(self, registered, arguments):
         spec = self._tools[registered]
-        session = self._sessions[spec["mcp_server"]][2]
+        session = self._sessions[spec["mcp_server"]][0]
         return await session.call_tool(spec["mcp_tool"], arguments=arguments)
 
     def call(self, registered, arguments):

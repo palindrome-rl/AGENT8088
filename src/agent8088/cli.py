@@ -12,7 +12,7 @@ feature is reachable here:
   • /plan           — enter plan mode: propose a plan, approve it, then it runs.
   • /raw            — one raw model call, showing reasoning + tool_calls fields.
   • /model          — switch backend (Ornith  <->  Gemma fallback).
-  • /config /tools /history /trace /temp /maxturns /save /clear ...
+  • /config /tools /history /trace /temp /maxturns /save /reset ...
 
 Run:  python agent8088_cli.py
 """
@@ -2117,7 +2117,6 @@ COMMAND_SPECS = (
     ("audit", "/audit [on|off]", "Verify each step against the real files after it runs", ()),
     ("fusion", "/fusion [setup|--panel provider:model,… --judge provider:model] <query>", "Ask a model panel and have a blind judge select the winner", ()),
     ("image", "/image <path-or-url> [question]", "Analyze a screenshot/diagram with a vision model", ()),
-    ("paste", "/paste [question]", "Analyze an image from the OS clipboard (Windows/macOS)", ()),
     ("raw", "/raw <text>", "One raw model call — shows content, reasoning, tool_calls", ()),
     ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
@@ -2136,12 +2135,11 @@ COMMAND_SPECS = (
     ("reset", "/reset", "Clear the active session while retaining its name", ()),
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
-    ("cost", "/cost [task-id]", "Summarize recorded model-call telemetry — estimates only; unknown costs stay unknown", ()),
+    ("cost", "/cost [on|off|task-id]", "Summarize recorded model-call telemetry; on/off toggles recording live — estimates only; unknown costs stay unknown", ()),
     ("memory", "/memory [on|off|engine|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
     ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
     ("history", "/history", "Show the current conversation", ()),
     ("trace", "/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace", ()),
-    ("think", "/think [on|off]", "Alias for /reasoning", ()),
     ("verbose", "/verbose [on|off|full]", "Control tool activity detail", ()),
     ("usage", "/usage [off|tokens|full]", "Control post-turn usage summaries", ()),
     ("reasoning", "/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)", ()),
@@ -2149,12 +2147,11 @@ COMMAND_SPECS = (
     ("maxturns", "/maxturns <int>", "Set max agent turns (current: {max_turns})", ()),
     ("tool-selection", "/tool-selection [hybrid|full|auto]", "Set native tool schemas sent to the model (persists)", ()),
     ("save", "/save <file>", "Save conversation + last trace to a JSON file", ()),
-    ("clear", "/clear", "Clear the conversation context", ()),
     ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
     ("schedule", "/schedule [list|add <cron> <task>|remove <index-or-task>]", "Add/list/remove a recurring run of this agent (cron/Task Scheduler)", ()),
     ("browser", "/browser [status|close|reset]", "Inspect or close the active reusable browser session", ()),
     ("help", "/help", "Show this list", ()),
-    ("exit", "/exit, /quit", "Leave", ("quit",)),
+    ("exit", "/exit", "Leave", ()),
 )
 
 
@@ -2878,37 +2875,6 @@ def cmd_image(rest, resolver=None):
     S.messages.append({"role": "assistant", "content": answer})
     render_answer(answer)
     _save_active_session()
-
-
-def cmd_paste(rest):
-    try:
-        from PIL import ImageGrab
-    except ImportError:
-        console.print("[red]error:[/red] Pillow is not installed")
-        return
-    try:
-        img = ImageGrab.grabclipboard()
-    except NotImplementedError:
-        # ImageGrab.grabclipboard() only implements clipboard access on
-        # Windows/macOS; Linux needs xclip/wl-clipboard and Pillow raises this
-        # instead of silently returning None there.
-        console.print("[red]error:[/red] clipboard image paste isn't supported on this platform")
-        return
-    if img is None:
-        console.print("[red]error:[/red] clipboard has no image")
-        return
-    import tempfile
-    fd, tmp_name = tempfile.mkstemp(suffix=".png")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    img.save(tmp_path, "PNG")
-    try:
-        # A temp file, not something the user pasted a path to — resolve_pasted_path
-        # is right here too: it's the agent's own trusted output, not a model-chosen
-        # read, so the same "bypass ALLOWED_PATHS, keep the sensitive floor" rule fits.
-        cmd_image(f"{tmp_path} {rest}".strip(), resolver=A.resolve_pasted_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3638,7 +3604,7 @@ def cmd_local(rest):
         _cmd_local_available(arg)
     elif sub == "pull":
         _cmd_local_pull(arg)
-    elif sub in ("remove", "rm", "delete"):
+    elif sub == "remove":
         _cmd_local_remove(arg)
     else:
         _print_local_usage()
@@ -3734,7 +3700,7 @@ def cmd_schedule(rest):
         _cmd_schedule_list()
     elif sub == "add":
         _cmd_schedule_add(arg)
-    elif sub in ("remove", "rm", "delete"):
+    elif sub == "remove":
         _cmd_schedule_remove(arg)
     else:
         _print_schedule_usage()
@@ -4162,8 +4128,14 @@ def _parse_fusion_flags(rest):
 
 
 def _fusion_available_providers():
-    """Provider names with a working API key, for the setup picker."""
-    return sorted(name for name, info in A.PROVIDERS.items() if A._provider_api_key(info))
+    """Provider names with a working API key, for the setup picker.
+
+    Mirrors fusion.working_provider_names() so the picker and the panel agree.
+    "Working" = a key the user actually configured (the .env store or a
+    non-placeholder config literal) — ambient os.environ exports for other
+    tools don't count.
+    """
+    return sorted(fusion.working_provider_names())
 
 
 def _cmd_fusion_setup(_rest):
@@ -4185,36 +4157,40 @@ def _cmd_fusion_setup(_rest):
         max_panel = max(1, int(current_max) if current_max.isdigit() else 6)
 
     console.print(f"[dim]Providers with a working key: {', '.join(available)}[/dim]")
-    # Count per provider, picked inline in one list: a provider left at 0 is
-    # simply not on the panel, and `ollama-cloud(2)` fills two slots with the
-    # same model. The cap is enforced during selection (max_total) so the count
-    # can't be pushed past it, rather than silently truncating afterwards.
-    counted = _counted_choice_prompt(
-        "Panel providers (leave all at 0 to keep auto-discovering):",
-        available, max_total=max_panel)
 
+    # Panel members via the same dropdown widget as the judge picker below -
+    # the checkbox variant proved unreliable across terminals (it silently
+    # registered nothing, so setup saved auto-discover). One pass per slot:
+    # pick a provider (same provider again = an extra vote for its model),
+    # then its model dropdown - the exact widget the judge prompt uses and
+    # the user reported working.
     panel_specs = []
-    for provider, count in counted:
+    while len(panel_specs) < max_panel:
+        # No auto-discover escape hatch: the first pick is always a real
+        # provider, "(done)" only appears once at least one member is chosen.
+        options = available
+        if panel_specs:
+            options = ["(done) finish selecting"] + options
+        pick = _choice_prompt(
+            f"Panel member {len(panel_specs) + 1}/{max_panel} - pick a provider:",
+            options, available[0])
+        if pick == "(done) finish selecting":
+            break
+        provider = pick
         models = _fetch_models_for_provider(provider)
-        default_model = A.PROVIDERS[provider].get("model", "")
-        for seat in range(1, count + 1):
-            label = f"Model for {provider}"
-            if count > 1:
-                label += f" (seat {seat}/{count})"
-            if models:
-                choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
-                choice = _choice_prompt(label + ":", choices, choices[0])
-                model = default_model if choice.startswith("(default)") else choice
+        configured = A.PROVIDERS[provider].get("model", "")
+        if models:
+            known = [m for m in models if m != configured]
+            options = ([f"(default) {configured}"] if configured else []) + known
+            if options:
+                choice = _choice_prompt(f"Model for {provider}:", options, options[0])
+                model = configured if choice.startswith("(default)") else choice
             else:
-                model = _custom_prompt(label + ":", default=default_model)
-            spec = f"{provider}:{model}" if model else provider
-            panel_specs.append(spec)
-
-    if len(panel_specs) > max_panel:
-        console.print(f"[yellow]picked {len(panel_specs)} panel member(s), keeping only the "
-                       f"first {max_panel} (max panel size) — "
-                       f"{', '.join(panel_specs[max_panel:])} dropped.[/yellow]")
-        panel_specs = panel_specs[:max_panel]
+                model = ""
+        else:
+            model = _custom_prompt(f"Model for {provider}:", default=configured)
+        spec = f"{provider}:{model}" if model else provider
+        panel_specs.append(spec)
 
     judge_choices = ["(auto) session's current model"] + available
     judge_choice = _choice_prompt("Judge:", judge_choices, judge_choices[0])
@@ -4227,7 +4203,7 @@ def _cmd_fusion_setup(_rest):
         if models:
             choices = [f"(default) {default_model}"] + [m for m in models if m != default_model]
             choice = _choice_prompt(f"Model for judge ({judge_provider}):", choices, choices[0])
-            judge_model = "" if choice.startswith("(default)") else choice
+            judge_model = default_model if choice.startswith("(default)") else choice
         else:
             judge_model = ""
 
@@ -4240,10 +4216,7 @@ def _cmd_fusion_setup(_rest):
     A.update_simple_config(A.CONFIG_PATH, values)
     A.APP_CONFIG.update({k: str(v) for k, v in values.items()})
 
-    if panel_specs:
-        console.print(f"[#237dd7]fusion panel set:[/#237dd7] {', '.join(panel_specs)}")
-    else:
-        console.print(f"[#237dd7]fusion panel:[/#237dd7] auto-discover, up to {max_panel} providers")
+    console.print(f"[#237dd7]fusion panel set:[/#237dd7] {', '.join(panel_specs)}")
     console.print(f"[#237dd7]fusion judge:[/#237dd7] "
                    f"{judge_provider + ':' + judge_model if judge_provider else 'auto (session model)'}")
     console.print("[dim]Saved. Plain /fusion <question> will use this now — "
@@ -4658,11 +4631,6 @@ def cmd_reasoning(rest):
     _save_preferences()
 
 
-def cmd_think(rest):
-    """OpenClaw-style name for the existing safe reasoning display control."""
-    cmd_reasoning(rest)
-
-
 def cmd_verbose(rest):
     mode = (rest or "").strip().lower() or "on"
     if mode not in {"on", "off", "full"}:
@@ -4691,6 +4659,8 @@ def cmd_usage(rest):
         _save_preferences()
     last = S.last_usage or {}
     state = f"usage summary: [#237dd7]{S.usage_mode}[/#237dd7]"
+    state += (" [dim]· options: off (silent) | tokens (one line) | full (+ctx/provider)"
+              " — set with /usage <mode>[/dim]")
     if last:
         state += f" · last {last.get('seconds', 0):.1f}s · ↑{last.get('tokens', 0)} tokens"
     console.print(state)
@@ -4721,7 +4691,9 @@ def cmd_maxturns(rest):
 def cmd_tool_selection(rest):
     mode = rest.strip().lower()
     if not mode:
-        console.print(f"tool selection = [#237dd7]{A.TOOL_SELECTION}[/#237dd7] · use /tool-selection [hybrid|full|auto]")
+        console.print(
+            f"tool selection = [#237dd7]{A.TOOL_SELECTION}[/#237dd7] · "
+            f"[dim]options: hybrid | full | auto — set with /tool-selection <mode>[/dim]")
         return
     try:
         selected = A.set_tool_selection(mode)
@@ -5206,10 +5178,6 @@ def cmd_save(rest):
         console.print(f"[#237dd7]saved[/#237dd7] -> {destination}")
 
 
-def cmd_clear(_):
-    cmd_reset("")
-
-
 def _openai_base_url(endpoint):
     endpoint = endpoint.strip().rstrip("/")
     suffix = "/chat/completions"
@@ -5320,90 +5288,39 @@ def _multi_choice_prompt(message, choices, checked=()):
         return picked
 
 
-def _counted_choice_prompt(message, choices, max_total=None):
-    """One list where each row carries its own count: up/down moves between
-    rows, RIGHT increases that row's count, LEFT decreases it, enter confirms.
-    A row at 0 is simply not selected, so this replaces a checkbox instead of
-    sitting next to one -- `ollama-cloud(2)` means that provider fills two
-    panel slots.
-
-    InquirerPy has no widget for this (its checkbox is a boolean toggle and its
-    number prompt is a standalone single field), so this is a small
-    prompt_toolkit Application. Returns [(choice, count), ...] for count >= 1,
-    in list order.
-    """
-    counts = {c: 0 for c in choices}
+def _count_prompt(message, default=1, min_allowed=1):
+    """Numeric spinner - left/right (and up/down) arrows adjust the value,
+    enter confirms. Falls back to a plain numeric text prompt on a
+    non-interactive terminal, same convention as _choice_prompt/_multi_choice_prompt."""
     try:
-        from prompt_toolkit.application import Application
-        from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.layout import Layout, HSplit, Window
-        from prompt_toolkit.layout.controls import FormattedTextControl
-
-        state = {"cursor": 0}
-
-        def render():
-            total = sum(counts.values())
-            head = f"? {message}"
-            if max_total:
-                head += f"  [{total}/{max_total}]"
-            lines = [("bold", head + "\n"),
-                     ("", "  (↑↓ move  → more  ← fewer  enter confirm)\n")]
-            for index, choice in enumerate(choices):
-                count = counts[choice]
-                pointer = "❯ " if index == state["cursor"] else "  "
-                label = f"{choice}({count})" if count else choice
-                style = "class:sel" if index == state["cursor"] else ("bold" if count else "")
-                lines.append((style, f"{pointer}{label}\n"))
-            return lines
-
-        kb = KeyBindings()
-
-        @kb.add("up")
-        def _(event):
-            state["cursor"] = (state["cursor"] - 1) % len(choices)
-
-        @kb.add("down")
-        def _(event):
-            state["cursor"] = (state["cursor"] + 1) % len(choices)
-
-        @kb.add("right")
-        def _(event):
-            choice = choices[state["cursor"]]
-            if max_total and sum(counts.values()) >= max_total:
-                return
-            counts[choice] += 1
-
-        @kb.add("left")
-        def _(event):
-            choice = choices[state["cursor"]]
-            if counts[choice] > 0:
-                counts[choice] -= 1
-
-        @kb.add("enter")
-        def _(event):
-            event.app.exit()
-
-        @kb.add("c-c")
-        def _(event):
-            event.app.exit(exception=KeyboardInterrupt)
-
-        Application(
-            layout=Layout(HSplit([Window(FormattedTextControl(render), always_hide_cursor=True)])),
-            key_bindings=kb, full_screen=False,
-        ).run()
-        return [(c, counts[c]) for c in choices if counts[c] > 0]
+        from InquirerPy import inquirer
+        # InquirerPy's number prompt binds left/right to CURSOR MOVEMENT within
+        # the digit field, not increment/decrement -- only up/down change the
+        # value out of the box. Confirmed live with simulated keypresses (not
+        # assumed): left/right alone left the value unchanged. Remapping left
+        # onto the "up" (increment) action and right onto "down" (decrement),
+        # and clearing the original left/right entries so the physical key
+        # isn't claimed by two actions at once -- verified with real simulated
+        # arrow presses that this produces exactly the left=increase,
+        # right=decrease behavior asked for, while up/down still work too.
+        return int(inquirer.number(
+            message=message, default=default, min_allowed=min_allowed,
+            max_allowed=None, float_allowed=False,
+            keybindings={
+                "up": [{"key": "up"}, {"key": "left"}],
+                "down": [{"key": "down"}, {"key": "right"}],
+                "left": [],
+                "right": [],
+            },
+        ).execute())
     except (ImportError, EOFError, OSError, KeyboardInterrupt):
-        print(message)
-        for index, choice in enumerate(choices, 1):
-            print(f"  {index}. {choice}")
-        value = input("Numbers, comma-separated (repeat for extra slots, blank = none): ").strip()
+        value = input(f"{message} [{default}]: ").strip()
         if not value:
-            return []
-        for part in value.split(","):
-            part = part.strip()
-            if part.isdigit() and 1 <= int(part) <= len(choices):
-                counts[choices[int(part) - 1]] += 1
-        return [(c, counts[c]) for c in choices if counts[c] > 0]
+            return default
+        try:
+            return max(min_allowed, int(value))
+        except ValueError:
+            return default
 
 
 def _configure_custom_models_endpoint():
@@ -5431,8 +5348,22 @@ def _configure_custom_models_endpoint():
 
 
 def cmd_cost(args):
-    """Read existing local telemetry; never invent missing usage or pricing."""
+    """Read existing local telemetry; never invent missing usage or pricing.
+
+    Bare /cost prints the summary. /cost on|off flips recording live and
+    persists the setting so the next run starts with it - the old flow made
+    the user edit config.txt and restart."""
     from agent8088.efficiency import telemetry_summary
+    arg = args.strip().lower()
+    if arg in {"on", "off"}:
+        want = arg == "on"
+        A.MODEL_TELEMETRY_ENABLED = want
+        A.update_simple_config(A.CONFIG_PATH, {"model_telemetry": int(want)})
+        A.APP_CONFIG["model_telemetry"] = str(int(want))
+        console.print(
+            f"model telemetry = {'on' if want else 'off'} (saved to {A.CONFIG_PATH})",
+            markup=False)
+        return
     task_id = args.strip() or None
     try:
         report = telemetry_summary(A.MODEL_TELEMETRY_PATH, task_id=task_id)
@@ -5440,7 +5371,10 @@ def cmd_cost(args):
         console.print(f"Could not read telemetry: {exc}", markup=False)
         return
     if not report['available']:
-        console.print('No telemetry file yet. Set model_telemetry=1 in config and restart to record future calls.', markup=False)
+        console.print(
+            "No telemetry file yet. /cost on enables recording for this run and saves it; "
+            "/cost off disables it.",
+            markup=False)
         return
     console.print(f"Calls: {report['calls']} | Errors: {report['errors']} | Summed call latency: {report['latency_ms']/1000:.1f}s", markup=False)
     cost_label = f"${report['known_cost_usd']:.6f}" if report['estimated_cost_calls'] else 'unknown (no complete priced calls)'
@@ -5608,7 +5542,7 @@ COMMANDS = {
     "review": cmd_review,
     "help": cmd_help, "tools": cmd_tools, "tool": cmd_tool,
     "capabilities": cmd_capabilities,
-    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image, "paste": cmd_paste,
+    "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "audit": cmd_audit, "fusion": cmd_fusion,
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
@@ -5617,15 +5551,15 @@ COMMANDS = {
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
-    "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "think": cmd_think,
+    "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
-    "maxturns": cmd_maxturns, "tool-selection": cmd_tool_selection, "limits": cmd_limits, "save": cmd_save, "clear": cmd_clear,
+    "maxturns": cmd_maxturns, "tool-selection": cmd_tool_selection, "limits": cmd_limits, "save": cmd_save,
     "memory": cmd_memory,
     "task": cmd_task,
     "schedule": cmd_schedule,
     "browser": cmd_browser,
 }
-_COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit", "quit")))
+_COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit")))
 
 
 # ---------------------------------------------------------------------------
@@ -7938,12 +7872,12 @@ def main():
             break
         if not line:
             continue
-        if line in ("/exit", "/quit", "exit", "quit"):
+        if line in ("/exit", "exit"):
             console.print("[dim]bye[/dim]")
             break
         # Bare command parity with the classic REPL: a single word that exactly
-        # names a command (clear, help, tools, agents, config, …) runs it rather
-        # than being sent to the model — so typing 'clear' clears the context
+        # names a command (reset, help, tools, agents, config, …) runs it rather
+        # than being sent to the model — so typing 'reset' clears the context
         # instead of making the model ramble about "confirming the clearing".
         if " " not in line and not line.startswith("/") and line.lower() in COMMANDS:
             try:

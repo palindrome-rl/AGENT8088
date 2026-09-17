@@ -362,7 +362,7 @@ into a permission escalation.
 ## Destructive command confirmation
 
 ```ini
-destructive_slash_confirm=1     # /reset, /clear
+destructive_slash_confirm=1     # /reset
 mcp_reload_confirm=1            # /mcp reload
 ```
 

@@ -276,7 +276,7 @@ def test_browser_use_logging_defaults_to_quiet(fake_browser_use, monkeypatch):
 
 
 def test_browser_use_logging_follows_the_reasoning_toggle(fake_browser_use, monkeypatch):
-    """/reasoning on (aliased /think on) restores it - same toggle that
+    """/reasoning on restores it - same toggle that
     controls the main loop's own thinking display."""
     calls = []
     monkeypatch.setattr(A, "_set_browser_use_log_verbosity", lambda verbose: calls.append(verbose))

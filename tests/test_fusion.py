@@ -395,3 +395,23 @@ def test_judge_blinding_actually_randomizes_order():
         winners.add(result.winner_index)
 
     assert len(winners) > 1, "winner_index for label A never changed across 20 seeds"
+# --- working-key detection (what /fusion setup and discover_panel must agree on) --
+
+def test_working_provider_names_excludes_ambient_environ_and_placeholders(monkeypatch, engine):
+    """`gemini`/`anthropic` had keys only in os.environ set for something
+    else; an ollama placeholder literal api_key=ollama is not a real key
+    either. Neither must appear as 'a provider with a working key' to the
+    fusion picker, even though plain _provider_api_key resolves both."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    engine.PROVIDERS = {
+        "ambient": {"model": "m", "base_url": "http://b", "api_key_env": "AMBIENT_API_KEY"},
+        "placeholder": {"model": "m", "base_url": "http://b", "api_key": "ollama"},
+        "real": {"model": "m", "base_url": "http://b", "api_key_env": "REAL_API_KEY"},
+    }
+    monkeypatch.setenv("AMBIENT_API_KEY", "not-for-this-agent")
+    monkeypatch.setattr(engine, "load_env_file", lambda: {"REAL_API_KEY": "sk-real", "AMBIENT_API_KEY": ""})
+    monkeypatch.setattr(
+        engine, "get_client",
+        lambda name: (SimpleNamespace(name=name), engine.PROVIDERS[name]["model"]),
+    )
+    assert fusion.working_provider_names() == ["real"]

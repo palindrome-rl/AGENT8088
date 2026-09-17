@@ -663,7 +663,7 @@ if CRON_MODE not in ("deny", "approve"):
 # closes by freezing HERMES_YOLO_MODE at import.
 UNATTENDED = os.environ.get("AGENT8088_UNATTENDED", "").strip().lower() in (
     "1", "true", "yes", "on")
-# Confirm before a slash command discards conversation state (/reset, /clear,
+# Confirm before a slash command discards conversation state (/reset,
 # /new, /compact) or invalidates the MCP tool cache (/mcp reload).
 DESTRUCTIVE_CONFIRM = APP_CONFIG.get("destructive_slash_confirm", "1") != "0"
 MCP_RELOAD_CONFIRM = APP_CONFIG.get("mcp_reload_confirm", "1") != "0"
@@ -5403,7 +5403,7 @@ def _record_browse_visit(url: str) -> None:
         if host not in _browse_visited_hosts:
             _browse_visited_hosts.append(host)
 
-# Mirrors cli.py's S.show_reasoning (toggled by /reasoning, aliased /think) -
+# Mirrors cli.py's S.show_reasoning (toggled by /reasoning) -
 # see cmd_reasoning and Session.__init__. Kept as a plain engine.py global
 # rather than imported from cli.py so this module has no dependency on the
 # CLI (it must also work under --mcp-serve/--gateway, which don't use cli.py).
@@ -5452,7 +5452,7 @@ def _set_browser_use_log_verbosity(verbose: bool) -> None:
     bypassing agent8088's own tool-result display entirely - the actual
     answer already reaches the user through _run_browser_agent's return
     value, shown properly in the browse_page result. Quiet by default, same
-    as the main loop's own chain-of-thought; /reasoning on (or /think on)
+    as the main loop's own chain-of-thought; /reasoning on
     restores it.
 
     Sets logger *levels* directly rather than calling browser-use's own
@@ -11016,11 +11016,28 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         )
         loaded_tools |= _TOOL_SELECTION_PINNED & available_tools
 
+        def _resync_available_tools():
+            # available_tools/loaded_tools were narrowed once, before the model's
+            # first completion. A present_plan approval changes PERMISSION_MODE
+            # for the REST of this same run_agent call -- re-reading the live
+            # grant here (every round) picks up tools it newly allows (e.g.
+            # write_file leaving plan-only) and drops any it has since revoked,
+            # instead of staying locked to whatever plan-only permitted at the
+            # top of the turn.
+            nonlocal available_tools, loaded_tools
+            current = set(configured_tools() if callable(configured_tools) else configured_tools)
+            if current != available_tools:
+                gained = current - available_tools
+                loaded_tools = (loaded_tools & current) | (_TOOL_SELECTION_PINNED & gained) | gained
+                available_tools = current
+
         def loaded_definitions():
+            _resync_available_tools()
             definitions = configured_defs() if callable(configured_defs) else configured_defs
             return _filter_tool_definitions(definitions, loaded_tools) + [_TOOL_SEARCH_DEFINITION]
 
         def loaded_names():
+            _resync_available_tools()
             return set(loaded_tools) | {"search_tools"}
 
         def load_tools(names):

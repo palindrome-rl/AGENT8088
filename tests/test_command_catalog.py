@@ -9,8 +9,8 @@ def test_command_catalog_covers_cli_commands_and_aliases():
     assert catalog["mcp"]["usage"] == "/mcp [reload|add|remove]"
     assert catalog["mode"]["usage"] == "/mode [readonly|full-auto]"
     assert catalog["image"]["usage"] == "/image <path-or-url> [question]"
-    assert catalog["think"]["description"] == "Alias for /reasoning"
+    assert not {"think", "clear"} & set(catalog)
     assert catalog["agents"]["usage"] == "/agents [new|edit|delete|models]"
     assert catalog["fusion"]["usage"].startswith("/fusion [setup|")
     assert catalog["task"]["usage"] == "/task [start|resume|end|output|list] <value>"
-    assert catalog["exit"]["aliases"] == ["quit"]
+    assert catalog["exit"]["aliases"] == []
