@@ -5245,6 +5245,14 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # inherited was no clock: a `test-writer` went hunting for a JS runtime
     # with `find / -maxdepth 5` and the turn sat there until it was killed.
     parent_budget = _active_budget
+    # A child budget starts at zero tokens, so an already-spent turn would sit
+    # inside the child's ceiling for one more model call — one more than the
+    # turn could afford. Sharing the parent's budget used to stop that on the
+    # sub-run's first check; refusing here keeps the same guarantee.
+    if parent_budget is not None:
+        spent = parent_budget.exceeded()
+        if spent:
+            return f"Error: {spent} The sub-agent was not started."
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
     try:

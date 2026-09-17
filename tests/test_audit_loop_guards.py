@@ -381,6 +381,25 @@ def test_a_subagent_cannot_outlive_the_turn_that_spawned_it(engine, monkeypatch)
     assert 0 < seen["budget"].max_seconds <= 60
 
 
+def test_a_spent_turn_does_not_get_to_spawn_one_more_subagent(engine, monkeypatch):
+    """Sharing the parent's budget meant an exhausted turn stopped a sub-run on
+    its first check. Deriving a child budget has to keep that: a child that
+    starts at zero tokens is inside its own ceiling for exactly one more model
+    call, which is one more than the turn could afford.
+    """
+    monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 300)
+    parent = engine._TurnBudget(max_tokens=1000)
+    parent.add_tokens(999, 5)  # over
+    monkeypatch.setattr(engine, "_active_budget", parent)
+    called = []
+    monkeypatch.setattr(engine, "run_agent", lambda *a, **k: called.append(1) or "done")
+
+    result = engine._exec_subagent({"agent_type": "test-writer", "task": "x"})
+
+    assert called == [], "spawned a sub-agent the turn had no budget for"
+    assert "budget" in result.lower()
+
+
 def test_what_a_subagent_spent_is_billed_to_the_turn(engine, monkeypatch):
     """A child budget that keeps its tokens hides the cost rather than bounding it."""
     monkeypatch.setattr(engine, "SUBAGENT_TIMEOUT_SECONDS", 240)
