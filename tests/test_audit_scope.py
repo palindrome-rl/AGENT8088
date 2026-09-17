@@ -93,3 +93,74 @@ def test_non_mutating_calls_are_not_audited(engine, tmp_path):
 
     assert "4" in result
     assert seen == []
+
+
+def test_a_passing_audit_says_so(engine, monkeypatch):
+    """A silent pass is indistinguishable from no audit at all.
+
+    The auditor ran, read the file, confirmed it -- and returned ("", ""), so
+    nothing reached the tool result. The turn then reported "Changed work was
+    inspected, but no automated verification passed" directly underneath a
+    verification that had passed.
+    """
+    monkeypatch.setattr(engine, "PLAN_AUDIT", True)
+    monkeypatch.setattr(engine, "_exec_subagent",
+                        lambda args, depth=0: "Checked the file.\nVERDICT: pass")
+
+    reason, note = engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
+
+    assert reason == "", "a pass must not halt anything"
+    assert engine.AUDIT_PASSED_NOTE in note, "the pass has to be visible"
+
+
+def test_an_inconclusive_audit_is_not_reported_as_a_pass(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PLAN_AUDIT", True)
+    monkeypatch.setattr(engine, "_exec_subagent",
+                        lambda args, depth=0: "Could not find it.\nVERDICT: unknown")
+
+    reason, note = engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
+
+    assert reason == "", "an auditor that could not look must not halt work"
+    assert engine.AUDIT_UNKNOWN_NOTE in note
+    assert engine.AUDIT_PASSED_NOTE not in note
+
+
+def test_a_failing_audit_still_halts(engine, monkeypatch):
+    """The fix must not make every verdict look like a pass."""
+    monkeypatch.setattr(engine, "PLAN_AUDIT", True)
+    monkeypatch.setattr(engine, "_exec_subagent",
+                        lambda args, depth=0: "File is empty.\nVERDICT: fail")
+
+    reason, note = engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
+
+    assert "failed verification" in reason
+    assert engine.AUDIT_PASSED_NOTE not in note
+
+
+def test_a_passing_audit_counts_as_the_turn_s_verification():
+    """detect_verdict reads test output and cannot recognise an auditor.
+
+    Without the mapping the turn stayed on "inspected", which prints as "no
+    automated verification passed" -- underneath a passed verification.
+    """
+    from agent8088.trajectory import TrajectoryState
+
+    tracker = TrajectoryState({})
+    op = tracker.before_tool("write_file")
+    tracker.after_tool(op, "wrote 11 bytes", failed=False, blocked=False,
+                       mutated=True, verdict="passed")
+
+    assert "no automated verification passed" not in tracker.review()
+    assert not tracker.needs_verification()
+
+
+def test_without_a_verdict_the_turn_still_admits_it_is_unverified():
+    """The fix must not silence the warning for work nothing checked."""
+    from agent8088.trajectory import TrajectoryState
+
+    tracker = TrajectoryState({})
+    op = tracker.before_tool("write_file")
+    tracker.after_tool(op, "wrote 11 bytes", failed=False, blocked=False,
+                       mutated=True, verdict="unknown")
+
+    assert tracker.needs_verification()

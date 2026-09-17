@@ -3124,6 +3124,7 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
     if "web_search" in specs:
         lines.append("- Current facts and every recommendation, including products, MUST call web_search.")
     if "browse_page" in specs:
+        lines.append("- Do not use browse_page just because web_search found a URL or the user wants to visit a physical place. Browser use requires a user-supplied page URL, an explicit request to use/open a web page or browser, or a clearly interactive website workflow. For ordinary current-information research, use web_search and mark details you could not verify.")
         lines.append("- A multi-step website workflow MUST use one browse_page call whose task contains the entire end-to-end workflow. Do not split login, cart, checkout, or navigation across browse_page calls: each call starts a fresh browser session.")
         lines.append("- browse_page has interactive Human-in-the-Loop built in: when user intervention, clarification, credentials, CAPTCHA, 2FA, or choices are requested on the page, browse_page directly prompts the user in the console during execution. When browse_page completes and reports that the user chose or confirmed an option, that interaction already happened with the real human user. Accept that result and complete your final answer; do NOT re-ask the user in chat, and do NOT claim the tool acted without asking.")
         lines.append("- A request to save/download a file, image, or document from the web MUST call write_file with source_url when the URL is known. Do NOT use browse_page or execute_shell for a plain download: browse_page burns a full browser session on one file, and shell curl guesses a wrong interpreter/path. Only use browse_page when the asset is behind interaction or login, or execute_shell when write_file's fetch failed and the shell can do better.")
@@ -3332,6 +3333,16 @@ def select_task_skills(messages: list[dict], available_tools=None) -> list[str]:
         selected.append("planning-and-task-breakdown")
     for name, pattern in _TASK_SKILL_RULES:
         if re.search(pattern, user_text):
+            # This installed skill tells the agent to inspect source code and
+            # write tasks/plan.md. A trip request also says "plan", but must
+            # not inherit a software-implementation workflow.
+            if (name == "planning-and-task-breakdown"
+                    and PERMISSION_MODE != "plan-only"
+                    and not re.search(
+                        r"\b(?:software|code|app|api|database|repo(?:sitory)?|"
+                        r"feature|implement|migration|refactor|deploy|architecture|"
+                        r"tests?|bugs?)\b", user_text)):
+                continue
             selected.append(name)
             break
     if re.search(r"\b(?:tool|harness|automation)\b", user_text):
@@ -3424,6 +3435,12 @@ def render_permission_context(mode: str | None = None) -> str:
     lines = [f"\n\n## Current Permission Mode: {mode}"]
     if mode == "plan-only":
         lines.append(
+            # Restored from the "## Plan Mode" section that the layered-prompt
+            # change removed from system.md without relocating it. What went
+            # missing was the once-ness, what a decline means, and the rule
+            # against narrating a plan as though it had been carried out.
+            # It lives here rather than in system.md so only plan mode pays
+            # for it.
             "You are in plan mode. Direct writes and mutations are blocked. Inspect safely, "
             "then call present_plan with the complete plan. Do not claim work is complete "
             "until the user approves and the actions succeed."
@@ -4314,6 +4331,11 @@ _CLOSURE_MODES = ("write_text", "shell", "docker", "cron")
 # noise that costs a model call and tokens, and on a `fail` verdict can revert
 # correct work. Excluded here: convert_document checks output_path.exists() and
 # the byte count itself; there is no model-authored logic to second-guess.
+# The exact wording a passing audit puts into the tool result. The turn
+# summary reads its verdict out of that text, so these are a contract between
+# the auditor and the trajectory, not decoration.
+AUDIT_PASSED_NOTE = "verification passed"
+AUDIT_UNKNOWN_NOTE = "verification inconclusive"
 _NON_AUDITABLE_TOOLS = {
     "convert_document",
 }
@@ -4458,9 +4480,19 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     verdict = _VERDICT_RE.search(answer or "")
     if verdict is None:
         return "", f"audit inconclusive — no verdict returned ({(answer or '')[:120]})"
-    if verdict.group(1).lower() == "fail":
+    status = verdict.group(1).lower()
+    if status == "fail":
         return f"{tool_name} failed verification", answer.strip()[:300]
-    return "", ""
+    # A pass used to return nothing at all. The auditor ran, read the file and
+    # confirmed it, then said so to no one -- the note is both what the user
+    # sees and what the turn summary reads a verdict from, so a silent pass
+    # left the run reporting "Changed work was inspected, but no automated
+    # verification passed" directly underneath a verification that had passed.
+    # `unknown` was silent for the same reason, and is the verdict most worth
+    # saying out loud.
+    if status == "unknown":
+        return "", f"{AUDIT_UNKNOWN_NOTE} - {answer.strip()[:200]}"
+    return "", f"{AUDIT_PASSED_NOTE} - {answer.strip()[:200]}"
 
 
 def _audit_applies(tool_name: str, depth: int) -> bool:
@@ -11042,6 +11074,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
 
         def load_tools(names):
             new = (set(names) & available_tools) - loaded_tools
+            if not (_plan_approved or _browser_request_is_explicit(messages)):
+                new.discard("browse_page")
             loaded_tools.update(new)
             return sorted(new)
 
@@ -11430,13 +11464,60 @@ def _user_supplied_url(messages, url: object) -> bool:
     ))
 
 
+_EXPLICIT_BROWSER_REQUEST = re.compile(
+    r"\b(?:browse|browser)\b|"
+    r"\b(?:open|inspect|visit|navigate\s+to|go\s+to)\s+(?:(?:the|this|a)\s+)?"
+    r"(?:(?:web|hotel)\s+)?(?:page|site|website|url|link)\b|"
+    r"\b(?:log\s?in|sign\s?in|add\s+.{0,50}\s+to\s+(?:the\s+)?cart|"
+    r"(?:complete|proceed\s+to)\s+checkout|fill\s+(?:out\s+)?(?:the\s+)?form|"
+    r"submit\s+(?:the\s+)?form)\b",
+    re.IGNORECASE,
+)
+_STATEFUL_BROWSER_REQUEST = re.compile(
+    r"\b(?:log\s?in|sign\s?in|add\s+.{0,50}\s+to\s+(?:the\s+)?cart|"
+    r"(?:complete|proceed\s+to)\s+checkout|fill\s+(?:out\s+)?(?:the\s+)?form|"
+    r"submit\s+(?:the\s+)?form)\b",
+    re.IGNORECASE,
+)
+_BROWSER_REFUSAL = re.compile(
+    r"\b(?:do\s+not|don't|without|no)\s+(?:browse|browsing\b|"
+    r"(?:(?:use|open)\s+)?(?:the\s+)?browser\b)", re.IGNORECASE,
+)
+
+
+def _browser_request_text(messages) -> str:
+    """Latest human request, or the original goal of a durable continuation."""
+    turns = _genuine_user_turns(messages)
+    if not turns:
+        return ""
+    latest = str(turns[-1].get("content") or "")
+    if latest.startswith("Continue this durable task"):
+        original = next((str(turn.get("content") or "") for turn in turns
+                         if str(turn.get("content") or "").startswith(
+                             "This is a durable task.")), "")
+        return original.split("\n\n", 1)[-1] if original else latest
+    return latest
+
+
+def _browser_request_is_explicit(messages, url: object = None) -> bool:
+    """A physical visit or a search-result link is not browser authorisation."""
+    request = _browser_request_text(messages)
+    if not request or _BROWSER_REFUSAL.search(request):
+        return False
+    if _EXPLICIT_BROWSER_REQUEST.search(request):
+        return True
+    if url is None:
+        return bool(re.search(r"https?://[^\s<>]+", request, re.IGNORECASE))
+    return (isinstance(url, str) and bool(url) and url in request)
+
+
 # Phrases that mean the user asked for this class of tool themselves. Kept
 # literal on purpose: the gates below only fire on tools the model reached for
 # unprompted, and wrongly reading "the user asked" is far safer than refusing
 # something they explicitly requested.
 _EXPLICIT_TOOL_PHRASES = {
     "execute_shell": ("run ", "execute ", "shell", "command", "terminal", "`"),
-    "browse_page": ("browse", "open the page", "visit", "inspect the page"),
+    "browse_page": ("browse", "open the page", "inspect the page"),
     "get_page_title": ("title of", "browse", "visit"),
 }
 
@@ -11823,6 +11904,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         )
         if no_execute_shell:
             round_allowed_tools.discard("execute_shell")
+        if not (_plan_approved or _browser_request_is_explicit(messages)):
+            round_allowed_tools.discard("browse_page")
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if trajectory is not None:
@@ -12016,7 +12099,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
         calls = find_tool_calls(content, round_allowed_tools)
         for call in calls:
-            if call["name"] == "browse_page" and browser_goal:
+            if (call["name"] == "browse_page" and browser_goal
+                    and _STATEFUL_BROWSER_REQUEST.search(browser_goal)):
                 call["arguments"] = dict(call.get("arguments") or {})
                 if durable_start:
                     call["arguments"]["url"] = durable_start.group(0).rstrip(".,")
@@ -12114,10 +12198,24 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if unknown and unknown_retries < 2 and not forcing:
                 unknown_retries += 1
                 available = ", ".join(sorted(round_allowed_tools)) or "(none)"
+                # A gated tool is not an unknown one. browse_page is withheld
+                # until the request actually asks for a browser, and telling
+                # the model it "does not exist" sent it to search_tools and
+                # describe_tool first -- three turns to be told a fourth time.
+                # Name the real reason so the next move is the right one.
+                name = unknown[0]
+                gated = _resolve_tool_name(name) in TOOL_SPECS
+                headline = (f"{name} is not available for this request."
+                            if gated else f"Unknown tool '{name}' — not available.")
                 if on_result:
-                    on_result("error", f"Unknown tool '{unknown[0]}' — not available.")
+                    on_result("error", headline)
                 messages.append({"role": "user", "content":
-                    f"Error: the tool '{unknown[0]}' does not exist. "
+                    (f"Error: {name} exists but is not enabled for this request, "
+                     "so do not look it up again. Use one of the available tools "
+                     "instead -- for current facts that is web_search -- and say "
+                     "what you could not verify. "
+                     if gated else
+                     f"Error: the tool '{name}' does not exist. ") +
                     f"Available tools are: {available}. "
                     "Either call one of those with the exact format "
                     '`✿FUNCTION✿: name ✿ARGS✿: {\"arg\": \"value\"}`, '
@@ -12214,6 +12312,19 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     turn_tools.append({"name": name, "arguments": args,
                                        "result": result, "loaded": loaded})
                 messages.append({"role": "user", "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                continue
+
+            if (name == "browse_page" and not _plan_approved
+                    and not _browser_request_is_explicit(messages, args.get("url"))):
+                result = ("Browser session not started: the user did not ask to open "
+                          "this web page or run an interactive website workflow. "
+                          "Use web_search for research and identify any unverified "
+                          "availability or prices instead.")
+                tool_outputs.append(result)
+                if on_result:
+                    on_result(name, result)
+                messages.append({"role": "user", "content":
+                                 f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                 continue
 
             if searched and _is_fetch_followup(messages, name, args):
@@ -12313,10 +12424,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 result = exec_tool(name, json.dumps(args), depth=depth)
             if trajectory is not None and operation is not None:
                 verdict = tool_output.detect_verdict(result)
+                # detect_verdict reads test output; it has no idea what an
+                # auditor's pass looks like. When step verification ran and
+                # confirmed the write, that IS the fresh evidence the turn was
+                # waiting for, so say so rather than letting the summary fall
+                # through to "no automated verification passed".
+                status = verdict.status
+                if f"audit: {AUDIT_PASSED_NOTE}" in result:
+                    status = "passed"
                 trajectory.after_tool(
                     operation, result, failed=_plan_step_failed(result),
                     blocked=result.startswith("ESCALATION_REQUEST\x1f"),
-                    mutated=_MUTATION_SEQ != mutation_seq_before, verdict=verdict.status,
+                    mutated=_MUTATION_SEQ != mutation_seq_before, verdict=status,
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
@@ -12383,6 +12502,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             if on_result:
                 on_result(name, result)
+
+            # A human declining the plan is a turn boundary, not feedback for
+            # the model to retry the same approval prompt. The old loop kept
+            # asking until max_turns, making /plan look stuck and spending
+            # several unnecessary model calls after a clear "not yet".
+            if name == "present_plan" and result.startswith("Plan not approved"):
+                if "non-interactive" in result:
+                    plan_text = str(args.get("plan") or args.get("text")
+                                    or args.get("steps") or "").strip()
+                    answer = _guard_answer(
+                        f"Proposed plan:\n\n{plan_text}\n\n"
+                        "This session cannot request approval, so nothing was run.")
+                else:
+                    answer = _guard_answer(
+                        "Plan not approved. Nothing was written or run. "
+                        "I will wait for your changes or approval before proceeding.")
+                if on_answer:
+                    on_answer(answer)
+                return answer
 
             if blocked and on_escalation:
                 with _human_wait():

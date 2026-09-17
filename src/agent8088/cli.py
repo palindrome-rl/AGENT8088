@@ -4051,6 +4051,9 @@ def cmd_audit(rest):
                           f"on verification[/dim]")
         console.print("[dim]change it with[/dim] [#237dd7]/audit on[/#237dd7][dim] or "
                       "[/dim][#237dd7]/audit off[/#237dd7]")
+        console.print("[dim]Scope: top-level writes and other mutating tool calls. "
+                      "Read-only research, web searches, browser reads, and final "
+                      "answers are not independently audited.[/dim]")
         return
     if arg in _AUDIT_ON:
         want = True
@@ -4071,6 +4074,9 @@ def cmd_audit(rest):
         reason = exc
 
     if want:
+        console.print("[dim]Research-only answers and travel itineraries are not "
+                      "fact-checked by this switch; request source-backed validation "
+                      "in the task itself.[/dim]")
         console.print("step verification: [green]on[/green] — after every mutating step a "
                       "read-only auditor checks the result in the real environment, "
                       "and a step that fails is put back.")

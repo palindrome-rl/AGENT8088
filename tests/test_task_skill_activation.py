@@ -8,6 +8,17 @@ def test_plan_mode_injects_the_planning_workflow(engine):
     assert "### workspace-engineering" not in prompt
 
 
+def test_trip_planning_does_not_inject_software_plan_file_instructions(engine):
+    prompt = engine.render_task_skill_docs([
+        {"role": "user", "content": (
+            "Plan a business trip and visit two attractions in Abu Dhabi."
+        )},
+    ])
+
+    assert "### planning-and-task-breakdown" not in prompt
+    assert "tasks/plan.md" not in prompt
+
+
 def test_code_task_injects_a_workspace_workflow(engine):
     prompt = engine.render_task_skill_docs(
         [{"role": "user", "content": "Implement the queue behavior."}]
