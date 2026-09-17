@@ -289,10 +289,16 @@ def test_the_auditor_s_own_ceiling_names_its_own_knob(engine, monkeypatch):
         return "VERDICT: pass"
 
     monkeypatch.setattr(engine, "run_agent", fake_run)
-    # The child budget stamps `started` from the first reading; everything after
-    # it is far past a 1s ceiling.
-    clock = iter([0.0] + [10_000.0] * 50)
-    monkeypatch.setattr(engine.time, "monotonic", lambda: next(clock))
+    # Readings before the sub-run starts (the credit-back stopwatch, then the
+    # child budget stamping `started`) are at zero; everything after is far
+    # past a 1s ceiling.
+    readings = {"n": 0}
+
+    def clock():
+        readings["n"] += 1
+        return 0.0 if readings["n"] <= 2 else 10_000.0
+
+    monkeypatch.setattr(engine.time, "monotonic", clock)
     engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
 
     assert "plan_audit_timeout_seconds" in captured["reason"]
@@ -415,6 +421,49 @@ def test_what_a_subagent_spent_is_billed_to_the_turn(engine, monkeypatch):
 
     assert parent.total_tokens == 200
     assert parent.role_total("subagent:test-writer") == 200
+
+
+# -- verification must not consume the budget it is verifying against --------
+
+def test_time_spent_verifying_does_not_count_against_the_turn(engine, monkeypatch):
+    """`/audit on` plus `/plan` produced ZERO audits.
+
+    Plan mode's wall clock is 300s. Researching and proposing the plan spent
+    it, so every write after approval came back `audit skipped — turn budget
+    spent` and five files landed unverified — the user asked for verification
+    and silently got none.
+
+    The turn's clock bounds the WORK. Verification is bounded separately, by
+    plan_audit_max_per_turn and its own per-run clock, so its elapsed time is
+    credited back the same way time blocked on a human already is.
+    """
+    monkeypatch.setattr(engine, "PLAN_AUDIT", True)
+    engine.reset_audit_budget()
+    budget = engine._TurnBudget(max_seconds=300)
+    monkeypatch.setattr(engine, "_active_budget", budget)
+    clock = iter([1000.0, 1000.0, 1000.0, 1090.0] + [1090.0] * 50)
+    monkeypatch.setattr(engine.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(engine, "run_agent", lambda *a, **k: "VERDICT: pass")
+
+    engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
+
+    assert budget.idle_seconds >= 90, "the audit spent the work's clock"
+
+
+def test_an_audit_still_counts_against_the_turn_s_tokens(engine, monkeypatch):
+    """Only the CLOCK is credited back. Tokens are a real cost and `/audit`
+    reports them; crediting those too would make verification look free."""
+    monkeypatch.setattr(engine, "PLAN_AUDIT", True)
+    engine.reset_audit_budget()
+    budget = engine._TurnBudget()
+    monkeypatch.setattr(engine, "_active_budget", budget)
+    monkeypatch.setattr(engine, "run_agent",
+                        lambda *a, **k: k["budget"].add_tokens(300, 200) or "VERDICT: pass")
+
+    engine._audit_plan_step("write_file x", "write_file", {}, "ok", 0)
+
+    assert budget.total_tokens == 500
+    assert budget.audit_share() == 1.0
 
 
 # -- the auditor reads tool output as data, never as instructions ------------

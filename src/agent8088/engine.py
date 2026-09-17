@@ -4674,7 +4674,20 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
              "and never answer 'fail' from a path you have not confirmed is the "
              "one the step wrote.\n"
              "\nReply with a single VERDICT line as instructed.")
-    answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
+    # The turn's wall clock bounds the WORK; verification is bounded separately,
+    # by plan_audit_max_per_turn and the auditor's own per-run clock. Charging
+    # it to the turn as well is what made `/audit on` plus `/plan` produce ZERO
+    # audits: researching and proposing the plan spent plan mode's 300s, so
+    # every write after approval came back "audit skipped — turn budget spent"
+    # and landed unverified. Credited the same way time blocked on a human is —
+    # tokens are NOT credited, because those are a real cost and `/audit`
+    # reports them.
+    started = time.monotonic()
+    try:
+        answer = _exec_subagent({"agent_type": "auditor", "task": task}, depth=depth)
+    finally:
+        if _active_budget is not None:
+            _active_budget.credit_idle(time.monotonic() - started)
     verdict = _VERDICT_RE.search(answer or "")
     if verdict is None:
         return "", f"audit inconclusive — no verdict returned ({(answer or '')[:120]})"
