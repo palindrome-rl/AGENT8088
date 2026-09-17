@@ -2135,7 +2135,7 @@ COMMAND_SPECS = (
     ("reset", "/reset", "Clear the active session while retaining its name", ()),
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
-    ("cost", "/cost [task-id]", "Summarize recorded model-call telemetry — estimates only; unknown costs stay unknown", ()),
+    ("cost", "/cost [on|off|task-id]", "Summarize recorded model-call telemetry; on/off toggles recording live — estimates only; unknown costs stay unknown", ()),
     ("memory", "/memory [on|off|engine|search|add|forget|notify|test|clear]", "Persistent memory across sessions — recalls facts each turn, learns from finished turns", ()),
     ("config", "/config", "Show the active configuration (model, endpoint, paths)", ()),
     ("history", "/history", "Show the current conversation", ()),
@@ -4708,7 +4708,9 @@ def cmd_maxturns(rest):
 def cmd_tool_selection(rest):
     mode = rest.strip().lower()
     if not mode:
-        console.print(f"tool selection = [#237dd7]{A.TOOL_SELECTION}[/#237dd7] · use /tool-selection [hybrid|full|auto]")
+        console.print(
+            f"tool selection = [#237dd7]{A.TOOL_SELECTION}[/#237dd7] · "
+            f"[dim]options: hybrid | full | auto — set with /tool-selection <mode>[/dim]")
         return
     try:
         selected = A.set_tool_selection(mode)
@@ -5418,8 +5420,22 @@ def _configure_custom_models_endpoint():
 
 
 def cmd_cost(args):
-    """Read existing local telemetry; never invent missing usage or pricing."""
+    """Read existing local telemetry; never invent missing usage or pricing.
+
+    Bare /cost prints the summary. /cost on|off flips recording live and
+    persists the setting so the next run starts with it - the old flow made
+    the user edit config.txt and restart."""
     from agent8088.efficiency import telemetry_summary
+    arg = args.strip().lower()
+    if arg in {"on", "off"}:
+        want = arg == "on"
+        A.MODEL_TELEMETRY_ENABLED = want
+        A.update_simple_config(A.CONFIG_PATH, {"model_telemetry": int(want)})
+        A.APP_CONFIG["model_telemetry"] = str(int(want))
+        console.print(
+            f"model telemetry = {'on' if want else 'off'} (saved to {A.CONFIG_PATH})",
+            markup=False)
+        return
     task_id = args.strip() or None
     try:
         report = telemetry_summary(A.MODEL_TELEMETRY_PATH, task_id=task_id)
@@ -5427,7 +5443,10 @@ def cmd_cost(args):
         console.print(f"Could not read telemetry: {exc}", markup=False)
         return
     if not report['available']:
-        console.print('No telemetry file yet. Set model_telemetry=1 in config and restart to record future calls.', markup=False)
+        console.print(
+            "No telemetry file yet. /cost on enables recording for this run and saves it; "
+            "/cost off disables it.",
+            markup=False)
         return
     console.print(f"Calls: {report['calls']} | Errors: {report['errors']} | Summed call latency: {report['latency_ms']/1000:.1f}s", markup=False)
     cost_label = f"${report['known_cost_usd']:.6f}" if report['estimated_cost_calls'] else 'unknown (no complete priced calls)'
