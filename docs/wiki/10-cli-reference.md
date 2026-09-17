@@ -165,7 +165,6 @@ sensitive-file floor still applies unconditionally.
 | `/plan [task]` | Enter plan mode: propose a plan, approve it, then it runs |
 | `/audit [on\|off]` | Show or change step verification; no argument reports the current setting and the last turn's cost |
 | `/image <path> [question]` | Analyze an image with a vision-capable model |
-| `/paste [question]` | Analyze an image from the OS clipboard (Windows/macOS; Pillow's `ImageGrab`) |
 | `/agents` | List sub-agent profiles, with source, model, and the active provider's models |
 | `/agents models` | List every model the active provider offers |
 | `/agents new [name]` | Create a custom sub-agent profile interactively |

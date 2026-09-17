@@ -40,7 +40,6 @@ Complete inventory of slash commands across all three Agent8088 surfaces.
 | `/model [provider[:model]\|provider model\|setup]` | Show/switch providers or add one |
 | `/models [provider\|custom]` | Pick provider/model or connect a custom endpoint |
 | `/image <path> [q]` | Analyze a screenshot/diagram with a vision model |
-| `/paste [q]` | Analyze an image from the OS clipboard |
 | `/temp <float>` | Set sampling temperature |
 | `/maxturns <int>` | Set max agent turns |
 
