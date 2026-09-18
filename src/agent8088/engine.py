@@ -11628,6 +11628,19 @@ def _reuse_known_verdict(command: str) -> str:
 # Every tool result the loop feeds back starts with this. It is the marker that
 # separates "the human said it" from "a web page said it".
 _TOOL_RESULT_PREFIX = "Tool result ("
+# Everything the LOOP says to the model wears this. Tool results already had a
+# marker; the loop's own nudges -- plan-mode blocks, repeat warnings, permission
+# outcomes, "give your final answer now" -- did not, so `_genuine_user_turns`
+# returned them as things the human typed. Two of them carry tool OUTPUT: the
+# repeat-suppression path re-shows a previous result, and a missing-argument
+# error is the tool's own text. That is the exact hole `_genuine_user_turns`
+# exists to close, reopened for any tool called twice.
+_HARNESS_PREFIX = "[agent8088] "
+
+
+def _harness_turn(text: str) -> dict:
+    """A message from the loop to the model. Never mistaken for the person."""
+    return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
 
 
 # Output that is a stream of events — a command's stdout, a page's text — is
@@ -11712,7 +11725,8 @@ def _genuine_user_turns(messages) -> list:
     """
     return [m for m in messages
             if m.get("role") == "user"
-            and not str(m.get("content", "")).startswith(_TOOL_RESULT_PREFIX)]
+            and not str(m.get("content", "")).startswith(
+                (_TOOL_RESULT_PREFIX, _HARNESS_PREFIX))]
 
 
 def _user_supplied_url(messages, url: object) -> bool:
@@ -12401,12 +12415,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
             if length_retries < 2:
                 length_retries += 1
-                messages.append({"role": "user", "content": (
+                messages.append(_harness_turn((
                     retry_instruction if length_retries == 1 else
                     "Your last two responses reached the output limit. Reply within 200 tokens "
                     "with exactly one complete tool call or a final answer. Do not include analysis "
                     "or thinking."
-                )})
+                )))
                 continue
             answer = _guard_answer(warning)
             if on_answer:
@@ -12438,7 +12452,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     if on_answer:
                         on_answer(answer)
                     return answer
-                messages.append({"role": "user", "content": _plan_mode_block_message()})
+                messages.append(_harness_turn(_plan_mode_block_message()))
                 continue
             loaded = tool_loader(_resolve_tool_name(name) for name in attempted) if tool_loader else []
             if loaded:
@@ -12468,8 +12482,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                             if gated else f"Unknown tool '{name}' — not available.")
                 if on_result:
                     on_result("error", headline)
-                messages.append({"role": "user", "content":
-                    (f"Error: {name} exists but is not enabled for this request, "
+                messages.append(_harness_turn((f"Error: {name} exists but is not enabled for this request, "
                      "so do not look it up again. Use one of the available tools "
                      "instead -- for current facts that is web_search -- and say "
                      "what you could not verify. "
@@ -12479,7 +12492,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Either call one of those with the exact format "
                     '`✿FUNCTION✿: name ✿ARGS✿: {\"arg\": \"value\"}`, '
                     "or, if no tool fits, answer the user directly in plain text "
-                    "without mentioning tools."})
+                    "without mentioning tools."))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
                 continue
@@ -12491,9 +12504,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 empty_retries += 1
                 if on_result:
                     on_result("error", "No answer produced — asking the model to respond.")
-                messages.append({"role": "user", "content":
-                    "You did not provide an answer. Reply now with your final answer in "
-                    "plain text. Do not think out loud and do not call any tools."})
+                messages.append(_harness_turn("You did not provide an answer. Reply now with your final answer in "
+                    "plain text. Do not think out loud and do not call any tools."))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "empty_answer"})
                 continue
@@ -12508,30 +12520,30 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()
-                messages.append({"role": "user", "content": (
+                messages.append(_harness_turn((
                     "Controller state says two recent actions failed or were blocked. "
                     "Do not repeat them. State a short revised approach, then take one "
                     "different safe next action; if blocked by missing access, say so plainly."
-                )})
+                )))
                 continue
             if trajectory is not None and trajectory.request_verification():
                 if on_trajectory_state:
                     on_trajectory_state()
-                messages.append({"role": "user", "content": (
+                messages.append(_harness_turn((
                     "Controller state says a changed result has no fresh verification evidence. "
                     "Before your final answer, inspect or test the changed result if a suitable "
                     "tool is available. If verification is not possible, say that plainly."
-                )})
+                )))
                 continue
             if trajectory is not None and trajectory.request_tests():
                 if on_trajectory_state:
                     on_trajectory_state()
-                messages.append({"role": "user", "content": (
+                messages.append(_harness_turn((
                     "Controller state says these code files changed this run with no "
                     f"tests written: {', '.join(trajectory.untested_paths())}. "
                     "Before your final answer, call generate_tests on each one, or "
                     "state plainly why tests do not apply to this change."
-                )})
+                )))
                 continue
             answer = _guard_answer(answer)
             if trajectory is not None and trajectory.needs_verification():
@@ -12658,7 +12670,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if repeated:
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
                           if previous_output else f"Already tried {name} with no output. Give your final answer now.")
-                messages.append({"role": "user", "content": cached})
+                messages.append(_harness_turn(cached))
                 if turn_tools is not None:
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
@@ -12715,7 +12727,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 if on_result:
                     on_result(name, result)
                 missing_args_retries += 1
-                messages.append({"role": "user", "content": result})
+                messages.append(_harness_turn(result))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "missing_tool_args",
                                   "tool": name})
@@ -12732,12 +12744,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 if on_result:
                     on_result(name, result)
                 parse_error_retries += 1
-                messages.append({"role": "user", "content": (
+                messages.append(_harness_turn((
                     f"The arguments for '{name}' could not be parsed as JSON. Do "
                     "not re-send the same payload unchanged. Send a smaller, "
                     "simpler one instead: drop every optional argument, keep the "
                     "JSON on a single line, and include only the required arguments."
-                )})
+                )))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",
                                   "tool": name, "count": parse_error_retries})
@@ -12786,9 +12798,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     granted = on_escalation(name, result)
                 if granted:
                     note_approval()
-                    messages.append({"role": "user", "content":
-                        "Permission granted. Retry the EXACT same tool call that was blocked. "
-                        "Do not ask for permission again. Do not explain. Just call the tool again now."})
+                    messages.append(_harness_turn("Permission granted. Retry the EXACT same tool call that was blocked. "
+                        "Do not ask for permission again. Do not explain. Just call the tool again now."))
                     continue
                 # Denied. The breaker stops a model that would otherwise re-propose
                 # the same blocked action until max_turns — which reads to the user
@@ -12801,9 +12812,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         trace.append({"turn": turn, "type": "denial_breaker",
                                       "content": answer})
                     return answer
-                messages.append({"role": "user", "content":
-                    "Permission denied by the user. You remain in readonly mode. "
-                    "Tell the user what you could not do and why the task cannot be completed."})
+                messages.append(_harness_turn("Permission denied by the user. You remain in readonly mode. "
+                    "Tell the user what you could not do and why the task cannot be completed."))
                 continue
 
             usable = (not _plan_step_failed(result)
@@ -12876,8 +12886,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             break
         else:
             forcing = True
-            messages.append({"role": "user", "content":
-                "You keep repeating tool calls without progress. Stop using tools and give your final answer now."})
+            messages.append(_harness_turn("You keep repeating tool calls without progress. Stop using tools and give your final answer now."))
 
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).
