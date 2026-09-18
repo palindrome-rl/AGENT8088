@@ -315,6 +315,15 @@ memory_mem0_dir=~/.agent8088/mem0
 # something small if one extra call per turn on your main model is too slow.
 # memory_extract_model=
 #
+# Output budget for that one extraction call. It was fixed at 800, which is less
+# than a single reasoning preamble: on a reasoning chat model the call returned
+# finish_reason=length with `{"memories": [{"text` -- truncated mid-key -- so a
+# turn that explicitly said "remember this" stored nothing and reported
+# "nothing new to remember", indistinguishable from a turn with nothing to
+# learn. Raise it for a chattier extractor; a truncated call now logs a warning
+# naming this setting instead of failing silently.
+# memory_extract_max_tokens=4000
+#
 # Set to 0 to recall existing memories but stop learning new ones.
 # memory_capture=1
 # Memories injected into a turn's prompt (default 5):

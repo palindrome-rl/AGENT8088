@@ -460,6 +460,8 @@ LIMIT_SPECS = {
     "denial_breaker_threshold":  ("DENIAL_BREAKER_THRESHOLD", int, "Repeated denials before the breaker trips"),
     "context_window":            ("CONTEXT_WINDOW", int, "Global fallback context window"),
     "max_completion_tokens":     ("MAX_COMPLETION_TOKENS", int, "Global fallback completion ceiling"),
+    "memory_extract_max_tokens": ("MEMORY_EXTRACT_MAX_TOKENS", int,
+                                  "Output budget for one memory-extraction call"),
 }
 
 # For most of these 0 means "no limit", so the numeric direction of a change is
@@ -9769,6 +9771,14 @@ MODEL_TELEMETRY_PATH = Path(APP_CONFIG.get(
 MEMORY_DB_PATH = Path(APP_CONFIG.get(
     "memory_db_path", str(_agent_data_dir() / "memory.db"))).expanduser()
 MEMORY_EXTRACT_MODEL = APP_CONFIG.get("memory_extract_model", "").strip()
+# Output budget for one extraction call. It was 800, which is under a single
+# reasoning preamble: on glm-5.3 the call came back finish_reason=length with
+# `{"memories": [{"text` — twenty characters, truncated mid-key — so a turn that
+# explicitly said "remember this" stored nothing and reported "nothing new to
+# remember". The extractor is the chat model unless memory_extract_model says
+# otherwise, and most current chat models reason before answering.
+MEMORY_EXTRACT_MAX_TOKENS = max(
+    256, int(APP_CONFIG.get("memory_extract_max_tokens", "4000")))
 
 # Embeddings resolve independently of whatever serves chat. Chat models and
 # embedding models are separate services in almost every real setup -- a 35B chat
@@ -9818,18 +9828,31 @@ def _memory_extract_completion(prompt: str):
     model = MEMORY_EXTRACT_MODEL or MODEL_NAME
     response = create_completion(
         client, [{"role": "user", "content": prompt}], [],
-        max_tokens=800,
+        max_tokens=MEMORY_EXTRACT_MAX_TOKENS,
         system_prompt="You extract durable facts for long-term memory. "
                       "You reply with JSON only.",
         temperature=0.0, model_name=model,
         telemetry_attempt="memory_extract",
     )
-    text = _strip_reasoning(response.choices[0].message.content or "")
+    choice = response.choices[0]
+    text = _strip_reasoning(choice.message.content or "")
     usage, _source = _model_usage(response)
+    # A reply cut off mid-JSON parses to nothing, and nothing is reported as
+    # "nothing new to remember" — identical to a turn that genuinely taught
+    # nothing. That is how an entire session can learn zero facts in silence,
+    # so the two are told apart here rather than left to look alike.
+    truncated = getattr(choice, "finish_reason", "") == "length"
+    if truncated:
+        _log.warning(
+            "memory extraction was truncated at %d output tokens and stored "
+            "nothing; raise memory_extract_max_tokens, or point "
+            "memory_extract_model at a model that does not reason before "
+            "answering", MEMORY_EXTRACT_MAX_TOKENS)
     return text, {
         "model": model,
         "input_tokens": usage.get("input_tokens") or 0,
         "output_tokens": usage.get("output_tokens") or 0,
+        "truncated": truncated,
     }
 
 
