@@ -2175,7 +2175,7 @@ COMMAND_SPECS = (
     ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
-    ("sandbox", "/sandbox [auto|native|docker|local|setup]", "Show or configure command isolation", ()),
+    ("sandbox", "/sandbox [auto|native|docker|setup]", "Show or configure command isolation", ()),
     ("status", "/status", "Show model, context, tool, skill, and session status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
     ("review", "/review [--from REF] [--to REF] [--commit SHA] [--mode native|delegated|auto] [--repo PATH]", "Review local Git changes and print findings with file, line and severity; read-only, a fix is a separate request", ()),
@@ -4732,6 +4732,12 @@ def cmd_temp(rest):
     except ValueError:
         console.print("[red]usage:[/red] /temp <float>")
         return
+    if not 0.0 <= value <= 2.0:
+        # Out-of-range values persist via _save_preferences, so reject rather
+        # than clamp: a silently-clamped value would keep re-saving a number
+        # the user never chose.
+        console.print(f"[red]temperature out of range:[/red] {value}  (valid: 0.0 to 2.0)")
+        return
     S.temperature = value
     console.print(f"temperature = [#237dd7]{S.temperature}[/#237dd7]")
     _save_preferences()
@@ -4742,6 +4748,9 @@ def cmd_maxturns(rest):
         value = int(rest.strip())
     except ValueError:
         console.print("[red]usage:[/red] /maxturns <int>")
+        return
+    if value < 1:
+        console.print(f"[red]max_turns out of range:[/red] {value}  (must be at least 1)")
         return
     S.max_turns = value
     console.print(f"max_turns = [#237dd7]{S.max_turns}[/#237dd7]")
