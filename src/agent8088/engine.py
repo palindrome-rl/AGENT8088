@@ -3324,9 +3324,8 @@ _TASK_SKILL_RULES = (
 def select_task_skills(messages: list[dict], available_tools=None) -> list[str]:
     """Return the small set of workflows that apply to the current user task."""
     user_text = "\n".join(
-        str(message.get("content") or "") for message in messages
-        if message.get("role") == "user"
-        and not str(message.get("content") or "").startswith(_TOOL_RESULT_PREFIX)
+        str(message.get("content") or "")
+        for message in _genuine_user_turns(messages)
     ).casefold()
     if not user_text:
         return []
@@ -4616,7 +4615,8 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     # arrives in cannot be truncated mid-marker by the 500-char cut, and the
     # closing fence is neutralised so output cannot end its own quote.
     quoted = _unwrap_untrusted(result)[:500].replace(
-        AUDIT_RESULT_FENCE_END, "<<<END_STEP_RESULT (quoted)>>>")
+        AUDIT_RESULT_FENCE_END, "<<<END_STEP_RESULT (quoted)>>>").replace(
+        AUDIT_RESULT_FENCE, "<<<STEP_RESULT (quoted)>>>")
     task = (
         "Verify that the following step actually took effect. Inspect the real "
         "environment; do not trust the reported output.\n\n"
@@ -5219,6 +5219,24 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # Optional live presentation hooks for the sub-agent's own loop.
     ui = subagent_ui(type_name, task, depth) if callable(subagent_ui) else {}
 
+    # Refused before anything global is touched, and that ordering is the whole
+    # point. A child budget starts at zero tokens, so an already-spent turn
+    # would sit inside the child's ceiling for one more model call — one more
+    # than the turn could afford. Sharing the parent's budget used to stop that
+    # on the sub-run's first check; refusing here keeps the same guarantee.
+    #
+    # This check ran below the permission floor once, and returned past the
+    # `finally` that undoes it: a refused auditor left PERMISSION_MODE at
+    # "readonly" and `_permission_floor_readonly` set for the rest of the
+    # PROCESS, so every later write was refused outright by check_permission and
+    # `/mode full-auto` reported success while changing nothing. Nothing global
+    # may be mutated before this returns.
+    parent_budget = _active_budget
+    if parent_budget is not None:
+        spent = parent_budget.exceeded()
+        if spent:
+            return f"Error: {spent} The sub-agent was not started."
+
     # Permission floor. A profile declaring `permission: readonly` is pinned to
     # readonly for the whole sub-run, whatever the caller was running as. This is
     # a floor, not a mode switch: it can only restrict, never widen — there is no
@@ -5259,15 +5277,6 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # allowance, but on a default install max_seconds is 0, so what it actually
     # inherited was no clock: a `test-writer` went hunting for a JS runtime
     # with `find / -maxdepth 5` and the turn sat there until it was killed.
-    parent_budget = _active_budget
-    # A child budget starts at zero tokens, so an already-spent turn would sit
-    # inside the child's ceiling for one more model call — one more than the
-    # turn could afford. Sharing the parent's budget used to stop that on the
-    # sub-run's first check; refusing here keeps the same guarantee.
-    if parent_budget is not None:
-        spent = parent_budget.exceeded()
-        if spent:
-            return f"Error: {spent} The sub-agent was not started."
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
     try:
@@ -11659,6 +11668,11 @@ _TOOL_RESULT_PREFIX = "Tool result ("
 # error is the tool's own text. That is the exact hole `_genuine_user_turns`
 # exists to close, reopened for any tool called twice.
 _HARNESS_PREFIX = "[agent8088] "
+# Both markers together: what a `role="user"` message must NOT start with to
+# count as something the person typed. Every scan of the trusted set uses this
+# rather than one prefix, because a scan that checks only the tool-result marker
+# is the bug `_HARNESS_PREFIX` was added to fix, one function away.
+_LOOP_PREFIXES = (_TOOL_RESULT_PREFIX, _HARNESS_PREFIX)
 
 
 def _harness_turn(text: str) -> dict:
@@ -11748,8 +11762,7 @@ def _genuine_user_turns(messages) -> list:
     """
     return [m for m in messages
             if m.get("role") == "user"
-            and not str(m.get("content", "")).startswith(
-                (_TOOL_RESULT_PREFIX, _HARNESS_PREFIX))]
+            and not str(m.get("content", "")).startswith(_LOOP_PREFIXES)]
 
 
 def _user_supplied_url(messages, url: object) -> bool:
@@ -11947,9 +11960,7 @@ def _execute_shell_forbidden(messages: list[dict]) -> bool:
     return any(
         re.search(r"\b(?:do not|don't|never)\s+(?:use|call)\s+execute_shell\b",
                   str(message.get("content") or ""), re.IGNORECASE)
-        for message in messages
-        if message.get("role") == "user"
-        and not str(message.get("content") or "").startswith(_TOOL_RESULT_PREFIX)
+        for message in _genuine_user_turns(messages)
     )
 
 

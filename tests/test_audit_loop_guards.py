@@ -20,6 +20,8 @@ with no ceiling at all.
 
 import json
 
+import pytest
+
 
 def _audit(engine, tmp_path, verdict="VERDICT: pass"):
     """Arm `/audit on` and record every sub-agent it spawns."""
@@ -501,3 +503,45 @@ def test_the_fence_survives_a_result_that_forges_its_closing_marker(engine, monk
     body = seen["task"].split(engine.AUDIT_RESULT_FENCE, 1)[1]
     assert body.count(engine.AUDIT_RESULT_FENCE_END) == 1, (
         "the step's output closed the fence itself")
+
+
+def test_a_refused_subagent_leaves_no_permission_state_behind(engine, monkeypatch):
+    """Refusing a sub-agent the turn cannot pay for must cost nothing else.
+
+    The refusal was added below the permission floor and returned past the
+    `finally` that undoes it. A profile pinned `permission: readonly` -- which
+    the auditor is -- therefore left PERMISSION_MODE at "readonly" and
+    `_permission_floor_readonly` set for the rest of the PROCESS: every later
+    write was refused outright by check_permission, the user's one-shot grants
+    were gone, an in-flight plan lost its execution grant, and `/mode full-auto`
+    reported success while changing nothing, because cmd_mode never clears the
+    floor. The turn's own budget check is now above every global it used to
+    strand.
+    """
+    import agent8088.providers as providers
+    monkeypatch.setattr(providers, "resolve_subagent_model",
+                        lambda *a, **k: ("m", ""))
+    monkeypatch.setattr(engine, "run_agent",
+                        lambda *a, **k: pytest.fail("spawned a sub-agent the turn "
+                                                    "could not pay for"))
+    budget = engine._TurnBudget(max_tokens=10)
+    budget.add_tokens(100, 100)
+    monkeypatch.setattr(engine, "_active_budget", budget)
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "_permission_floor_readonly", False)
+    monkeypatch.setattr(engine, "_sandbox_readonly", False)
+    monkeypatch.setattr(engine, "_plan_execution_grant", True)
+    monkeypatch.setattr(engine, "_active_role", "assistant")
+    monkeypatch.setattr(engine, "_one_shot_grants", {"already_approved"})
+
+    result = engine._exec_subagent({"agent_type": "auditor", "task": "check it"})
+
+    assert "was not started" in result
+    assert engine.PERMISSION_MODE == "full-auto", "the session was stranded readonly"
+    assert engine._permission_floor_readonly is False, (
+        "every later write is now refused outright, for the life of the process")
+    assert engine._sandbox_readonly is False
+    assert engine._plan_execution_grant is True, "an approved plan lost its grant"
+    assert engine._one_shot_grants == {"already_approved"}
+    assert engine._active_role == "assistant", (
+        "later tokens are billed to the auditor, so /audit over-reports")
