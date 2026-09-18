@@ -128,7 +128,8 @@ def create_mcp_server(host=None, port=None):
         description = spec.get("description", f"Agent8088 tool: {tool_name}")
         args_list = spec.get("args", [])
 
-        handler = _make_handler(tool_name, args_list, A)
+        handler = _make_handler(tool_name, args_list, A,
+                                optional=spec.get("optional", []))
         handler.__name__ = tool_name
         handler.__doc__ = description
 
@@ -137,18 +138,28 @@ def create_mcp_server(host=None, port=None):
     return mcp
 
 
-def _make_handler(tool_name: str, args_list: list, engine_module):
+def _make_handler(tool_name: str, args_list: list, engine_module, optional=()):
     """Create an async handler that dispatches to engine.run_tool.
 
     Synthesizes a proper inspect.Signature from the tool's args list so
     FastMCP can generate correct MCP input schemas. Without this, **kwargs
     produces an empty schema and external clients can't pass arguments.
+
+    `optional` carries tools.txt's `optional=` set. Those arguments get a
+    default of None so FastMCP leaves them out of the schema's `required`
+    list; without it every argument is mandatory and a tool whose arguments
+    are genuinely optional becomes uncallable over MCP (read_text demanding
+    offset and limit, last_output demanding all three). None is then dropped
+    below, so an omitted argument reaches the engine as absent rather than
+    empty — which the write tools distinguish.
     """
+    optional = set(optional or ())
     params = []
     annotations = {"return": str}
     for arg in args_list:
         params.append(inspect.Parameter(
-            arg, inspect.Parameter.KEYWORD_ONLY, annotation=str
+            arg, inspect.Parameter.KEYWORD_ONLY, annotation=str,
+            **({"default": None} if arg in optional else {})
         ))
         annotations[arg] = str
 

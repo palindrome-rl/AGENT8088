@@ -5156,16 +5156,40 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
     if focus:
         brief += f"\nFocus especially on: {focus}"
 
+    # Detecting the overwrite is not enough to undo it: by the time the hashes
+    # differ the write has landed, and a sub-agent that replaced the file cannot
+    # be assumed to have written a correct revision of it. Hold the original
+    # bytes so the warning can be a repair. Bounded like plan_audit_revert --
+    # past the cap, decline to snapshot and say so rather than holding an
+    # arbitrarily large file in memory.
     before = _file_fingerprint(source)
+    snapshot = None
+    try:
+        if source.stat().st_size <= PLAN_REVERT_MAX_BYTES:
+            snapshot = source.read_bytes()
+    except OSError:
+        snapshot = None
+
     report = _exec_subagent({"agent_type": "test-writer", "task": brief}, depth=depth)
     after = _file_fingerprint(source)
 
-    if before and after and before != after:
+    # `after` is "" when the file was deleted outright, which is a modification
+    # too -- requiring it to be truthy would let the worst case through silently.
+    if before and before != after:
+        repair = ""
+        if snapshot is not None:
+            try:
+                source.write_bytes(snapshot)
+                repair = (f" It has been restored to its exact contents from before "
+                          f"the run, so the code under test is intact; the tests the "
+                          f"sub-agent wrote may not match it.")
+            except OSError as exc:
+                repair = (f" Restoring it FAILED ({exc}) -- inspect this file by hand.")
         # Shown above the report on purpose: the report will claim success.
         return (f"WARNING: {source} was MODIFIED while its tests were being written. "
                 f"The sub-agent is not allowed to change the code under test, so "
-                f"these tests may pass only because the code was weakened. Review "
-                f"the diff for {source} before trusting this result.\n\n{report}")
+                f"these tests may pass only because the code was weakened.{repair} "
+                f"Review the diff for {source} before trusting this result.\n\n{report}")
     return report
 
 
@@ -9129,6 +9153,19 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             if hunk:
                 result += f"\n{hunk}"
             return result
+        # Everything above returned; reaching here is a whole-file overwrite.
+        # write_file marks both content and source_url optional so either can
+        # carry the bytes, which makes a call supplying NEITHER schema-valid.
+        # Treating that as "" overwrites the file with nothing, so a model that
+        # drops its content key destroys the file it meant to write. An absent
+        # key has nothing to write and is refused; an explicit content="" is a
+        # real request to empty the file and still goes through below.
+        if content_arg not in args and not args.get("source_url"):
+            _turn_writes -= 1  # refused before writing; must not spend the budget
+            return (f"Error: {name} needs content or source_url, and neither was "
+                    f"given, so {target} was left unchanged. Pass content to write "
+                    f"text, or source_url to fetch the bytes. To empty the file on "
+                    f"purpose, pass content as an explicit empty string.")
         if args.get("_private") is True:
             _write_private_text(target, content)
         else:
