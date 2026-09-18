@@ -209,9 +209,11 @@ function wireSocket(ws: WebSocket) {
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** (reconnectAttempts - 1), RECONNECT_MAX_MS)
     const store = useSessionStore.getState()
     store.setConnection('reconnecting')
-    // A turn cannot still be streaming over a socket that just closed; leaving
-    // isStreaming set is what used to lock the composer for good.
-    store.setStreaming(false)
+    // A turn cannot still be streaming over a socket that just closed. Route
+    // through the same cleanup as an explicit Stop, so a dropped connection
+    // doesn't silently lose partial streamed text or leave stale streaming
+    // state / a stuck queue behind (only setStreaming(false) used to run here).
+    if (store.isStreaming) stopLocally()
     reconnectTimer = setTimeout(() => ensureConnection(), delay)
   }
 }

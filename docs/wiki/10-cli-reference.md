@@ -178,7 +178,7 @@ sensitive-file floor still applies unconditionally.
 |---|---|
 | `/mode [readonly\|full-auto]` | Show or switch permission mode. Use `/plan` to enter plan mode |
 | `/reset` | Discard the conversation — asks first unless `destructive_slash_confirm=0` |
-| `/sandbox [auto\|native\|docker\|local\|setup]` | Show, select or install isolation |
+| `/sandbox [auto\|native\|docker\|setup]` | Show, select or install isolation |
 | `/search [status\|setup\|stop\|doctor\|use <backend>]` | Show, provision, or pin a web search backend |
 
 ### MCP

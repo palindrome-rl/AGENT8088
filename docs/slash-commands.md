@@ -2,11 +2,11 @@
 
 Complete inventory of slash commands across all three Agent8088 surfaces.
 
-**Totals: 40 CLI + 8 Gateway + 39 Web UI** (Web UI = CLI minus `exit`/`quit`, which terminate the REPL).
+**Totals: 45 CLI + 8 Gateway + 44 Web UI** (Web UI = CLI minus `exit`, which terminates the REPL; there is no separate `quit` command).
 
 ---
 
-## 1. CLI REPL (`src/agent8088/cli.py` — `COMMANDS` dict, line 3972) — 40 commands
+## 1. CLI REPL (`src/agent8088/cli.py` — `COMMANDS`, line 5609) — 45 commands
 
 ### Chat & Agent
 | Command | What it does |
@@ -32,7 +32,7 @@ Complete inventory of slash commands across all three Agent8088 surfaces.
 | `/mcp add <name> stdio <command> [args...] [--project]` | Add a local MCP server |
 | `/mcp add <name> http <url> [--project]` | Add a Streamable HTTP MCP server |
 | `/mcp remove <name> [--project]` | Remove an MCP server |
-| `/sandbox [auto\|native\|docker\|local\|setup]` | Show/configure command isolation |
+| `/sandbox [auto\|native\|docker\|setup]` | Show/configure command isolation |
 
 ### Model & Vision
 | Command | What it does |
@@ -92,8 +92,8 @@ For Slack / Discord / WhatsApp / Telegram / Email chats.
 
 ---
 
-## 3. Web UI (`web/src/components/chat/PromptBar.tsx`) — 39 commands
+## 3. Web UI (`web/src/components/chat/PromptBar.tsx`) — 44 commands
 
-Mirrors the backend `COMMANDS` (typing `/` in the prompt bar autocompletes them), minus REPL-only commands (`exit`, `quit`, `stop`, `approve`, `deny`) — they either terminate the REPL or expect stdin the web UI doesn't have.
+Mirrors the backend command list (typing `/` in the prompt bar autocompletes them), minus REPL-only commands (`exit`, `stop`, `approve`, `deny`) — they either terminate the REPL or expect stdin the web UI doesn't have.
 
 See the CLI table above for the full list.

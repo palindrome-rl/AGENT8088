@@ -7730,6 +7730,18 @@ def _windows_task_script(identifier: str, task: str) -> Path:
     return script
 
 
+def _schedule_isolation_active() -> bool:
+    """True when the caller asked for an isolated home.
+
+    AGENT8088_HOME is the documented way to point every side-effectful store
+    at a scratch directory. A global scheduler registration (schtasks,
+    crontab) leaks outside that scratch space by construction, so isolation
+    means: record the schedule in the home-local registry and say plainly
+    that nothing was registered with the OS.
+    """
+    return bool(os.environ.get("AGENT8088_HOME"))
+
+
 def _exec_windows_cron(action: str, schedule: str = "", task: str = "",
                        fields: list = None) -> str:
     import hashlib
@@ -7757,6 +7769,20 @@ def _exec_windows_cron(action: str, schedule: str = "", task: str = "",
             script = _windows_task_script(identifier, task)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return f"Windows scheduler error: {exc}"
+        if _schedule_isolation_active():
+            # Scratch home: register in the home-local store only. A real
+            # schtasks entry would fire outside the isolated environment.
+            updated = [entry for entry in entries if entry.get("id") != identifier]
+            updated.append({"id": identifier, "schedule": schedule, "task": task,
+                            "isolated": True})
+            try:
+                _save_windows_schedules(updated)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                script.unlink(missing_ok=True)
+                return f"Windows scheduler error: {exc}"
+            return (f"Scheduled: {schedule} (isolated home: recorded in "
+                    f"{_windows_schedule_registry_path()}, not registered with "
+                    f"Windows Task Scheduler)")
         powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or "powershell.exe"
         task_command = (
             f'"{powershell}" -NoProfile -NonInteractive '
@@ -7827,6 +7853,54 @@ def _exec_windows_cron(action: str, schedule: str = "", task: str = "",
     return "Removed."
 
 
+def _home_crontab_path() -> Path:
+    return _agent_data_dir() / "crontab"
+
+
+def _exec_home_cron(action: str, schedule: str = "", task: str = "") -> str:
+    """Crontab-style scheduler backed by a local file inside the home dir.
+
+    Used only when AGENT8088_HOME is set (isolation mode) so the agent
+    never touches the user's real crontab.
+    """
+    path = _home_crontab_path()
+
+    def read_entries() -> list[str]:
+        try:
+            return path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+
+    def write_entries(lines: list[str]) -> None:
+        _write_private_text(path, "\n".join(lines) + "\n" if lines else "")
+
+    lines = read_entries()
+
+    if action == "list":
+        matches = [l for l in lines if _CRON_MARKER in l]
+        return "\n".join(matches) or "No scheduled tasks."
+
+    if action == "add":
+        if len(schedule.split()) != 5:
+            return ("Invalid schedule. Use 5 cron fields, e.g. '0 9 * * *' "
+                    "(minute hour day month weekday).")
+        if not task:
+            return "Error: cron 'add' requires a task."
+        entry = f"{schedule} {task} {_CRON_MARKER}"
+        lines.append(entry)
+        write_entries(lines)
+        return f"Scheduled: {schedule} (isolated home: {path})"
+
+    if action == "remove":
+        filtered = [l for l in lines if not (_CRON_MARKER in l and task in l)]
+        if len(filtered) == len(lines):
+            return "No matching entry found."
+        write_entries(filtered)
+        return "Removed."
+
+    return f"Unknown cron action '{action}'."
+
+
 def _exec_cron(args: dict) -> str:
     """Manage scheduled runs of this agent via the user's crontab.
     actions: list | add (schedule, task) | remove (task)."""
@@ -7856,6 +7930,9 @@ def _exec_cron(args: dict) -> str:
 
     if sys.platform == "win32":
         return _exec_windows_cron(action, schedule, task, fields)
+
+    if _schedule_isolation_active():
+        return _exec_home_cron(action, schedule, task)
 
     def read_crontab():
         try:
