@@ -45,6 +45,32 @@ from rich.live import Live
 from rich import box
 
 APP_DIR = Path(__file__).resolve().parent
+
+
+def _force_utf8_streams(*streams) -> None:
+    """Make the output streams carry the characters this UI is written in.
+
+    A tty on Windows is fine; a REDIRECTED one is not. `agent8088 > run.log`
+    gives stdout the locale encoding — cp1252 on an English install — and the
+    first status line the REPL prints carries ↑ (U+2191), which cp1252 cannot
+    encode. Rich raised UnicodeEncodeError from inside console.print and took
+    the whole session with it, so piping the output to a file was enough to
+    kill the run. The same applies to every ⏺ ⎿ ╭ · → the UI uses; encoding
+    the streams once is the fix for all of them rather than for one glyph.
+
+    errors="replace" is the backstop: a stream that cannot be moved to UTF-8
+    still must never be able to end a session over a character.
+    """
+    for stream in streams:
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            continue
+
+
+# Before Console(), which captures sys.stdout as it is at construction time.
+_force_utf8_streams(sys.stdout, sys.stderr)
+
 console = Console()
 
 # Model discovery is a convenience in an interactive wizard, not a prerequisite
@@ -1894,6 +1920,34 @@ def _report_memory_capture(stored, late=False):
     if level == "verbose":
         for row in stored:
             console.print(f"[dim]    • {row['text'][:100]}[/dim]")
+
+
+MEMORY_FLUSH_SECONDS = 15.0
+
+
+def _flush_memory_capture(timeout=MEMORY_FLUSH_SECONDS):
+    """Let the turn's capture finish before the process goes away.
+
+    Capture runs on a DAEMON thread so the prompt returns the instant the
+    answer does — and a daemon thread is killed outright at interpreter
+    shutdown. State a preference, type /exit, and the extraction call in flight
+    was simply discarded: the store came out of the session with zero rows,
+    which to the user is memory that silently does not work.
+
+    Bounded, and it says what it is waiting for: a wedged extraction call must
+    not turn /exit into something you have to kill. A capture that outlives the
+    timeout is still lost, but the user is told rather than left guessing.
+    """
+    thread = getattr(A, "memory_capture_thread", None)
+    if thread is None or not thread.is_alive():
+        return
+    console.print("[dim]saving memory…[/dim]")
+    thread.join(timeout)
+    if thread.is_alive():
+        console.print("[yellow]memory is still saving — leaving it unfinished; "
+                      "this turn's facts may not have been stored.[/yellow]")
+        return
+    _report_pending_capture()
 
 
 def _await_memory_capture(stored_ref):
@@ -4051,9 +4105,9 @@ def cmd_audit(rest):
                           f"on verification[/dim]")
         console.print("[dim]change it with[/dim] [#237dd7]/audit on[/#237dd7][dim] or "
                       "[/dim][#237dd7]/audit off[/#237dd7]")
-        console.print("[dim]Scope: top-level writes and other mutating tool calls. "
-                      "Read-only research, web searches, browser reads, and final "
-                      "answers are not independently audited.[/dim]")
+        console.print("[dim]Scope: top-level tool calls that change something. "
+                      "Reads, web searches, browser reads and final answers are "
+                      "not independently audited.[/dim]")
         return
     if arg in _AUDIT_ON:
         want = True
@@ -7915,6 +7969,9 @@ def main():
             break
         except Exception as e:
             console.print(f"[red]error:[/red] {e}")
+    # Every way out of the REPL — /exit, EOF, Ctrl+C — lands here, which is why
+    # the flush is after the loop rather than beside each `break`.
+    _flush_memory_capture()
 
 
 if __name__ == "__main__":

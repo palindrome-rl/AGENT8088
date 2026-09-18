@@ -104,6 +104,19 @@ A step that reports success has only told you the tool did not raise. Setting
 which inspects the real environment before the plan continues. A `fail` verdict
 halts the plan on the same path as any other failure.
 
+*Mutating* is decided per call, not per tool. A tool's `mode` names the
+permission gate it goes through, and `shell` is the gate thirteen read-only
+tools share — so testing the mode sent `git_status`, `git_log`, `git_diff` and
+every `ls` to the auditor. Measured on glm-5.3, one `git status` bought a
+thirteen-call auditor run, 111 seconds and 100% of that turn's tokens to
+confirm that a read had read. `_tool_call_mutates` asks the question an audit
+actually answers, and for a shell call it asks `_shell_call_is_read_only`,
+which requires every `&&`/`||`/`;`/`&`-separated segment to clear the same
+`_readonly_shell` the approval prompt uses. That relaxes *sequencing* only: a
+command cannot be read-only enough to skip a confirmation prompt yet mutating
+enough to need an auditor, and one write anywhere in the sequence condemns the
+whole call.
+
 This covers two paths, because a plan's work now happens on both. Steps inside
 `execute_plan` are audited there. The tool calls an approved `/plan` makes are
 audited in `exec_tool`, at depth 0 only — a sub-agent's writes are not the plan,
@@ -174,6 +187,30 @@ After an audited plan the result reports the share, e.g.
 This exists so the decision to run auditing is made from your own numbers.
 Published figures put auditors at roughly a fifth to a third of harness tokens;
 whether that holds for your workload is measurable rather than assumed.
+
+### What bounds it
+
+Turning verification on multiplies a turn's model calls, so it brings its own
+ceilings rather than relying on ones nobody set. `max_turn_seconds`,
+`max_turn_tokens` and `max_turn_cost_usd` all default to `0`, which means
+*disabled* — on a default install `_TurnBudget.exceeded()` returns `None` after
+two billion tokens, so "skip the audit if the turn budget is spent" never
+fired. Three things bound it now:
+
+- **`plan_audit_max_per_turn`** (12) — verification calls one top-level turn may
+  spend. Running out is not evidence a write was wrong, so it halts nothing and
+  reverts nothing; it says so in the tool result. There is no unlimited value:
+  to stop verifying, set `plan_audit=0`.
+- **`plan_audit_timeout_seconds`** (120) — one auditor sub-run.
+- **`subagent_timeout_seconds`** (300) — every other sub-agent. `_exec_subagent`
+  shares the parent's *remaining* tokens and cost, so delegating still cannot
+  restart the turn's allowance, and a sub-run's clock is capped by whatever the
+  turn itself has left — a 300s sub-agent cannot extend a turn with 60s on it.
+  Before this a `test-writer` inherited `max_seconds=0` and ran `find / -maxdepth
+  5` until the process was killed.
+
+A sub-run's tokens are billed back to the parent by role when it finishes, so
+giving it its own budget bounds the cost without hiding it from the line above.
 
 ## Tools are data
 
