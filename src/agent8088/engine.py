@@ -8508,16 +8508,22 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                           "offer the two ways forward: start Agent8088 in that folder, or add it "
                           "to allowed_paths. Do not retry the same path and do not ask for the "
                           "code to be pasted.")
+            elif "is not a git repository" in detail.lower():
+                advice = ("Start Agent8088 inside the folder containing this project's .git "
+                          "directory, or pass that folder with /review --repo PATH. Do not "
+                          "change commit IDs or retry another review mode: the selected folder "
+                          "is the problem.")
             else:
-                advice = ("Confirm the repository path is a Git checkout (the folder containing "
-                          ".git), check the pinned executable and revision names, and follow the "
-                          "specific error above. Review did not complete; retry explicitly with "
-                          "mode=delegated if the native reviewer was the failing part.")
+                advice = ("Act on the specific reason in the error above and nothing else; the "
+                          "review engine names what failed. Do not guess at the repository path "
+                          "or the revision unless the error mentions them. Review did not "
+                          "complete; retry explicitly with mode=delegated if the native reviewer "
+                          "was the failing part.")
             # Retrying a path the workspace does not contain cannot ever
             # succeed, and marking it recoverable invited exactly that: a live
             # run hit the same wall three times before giving up and asking the
             # user to paste their source into the chat.
-            denied = "Path not allowed" in detail
+            denied = "Path not allowed" in detail or "is not a git repository" in detail.lower()
             return efficiency.tool_error("code_review_failed", detail, advice,
                                          recoverable=not denied)
         finally:

@@ -35,6 +35,8 @@ open_code_review_enabled=0
 open_code_review_mode=auto        # native | delegated | auto
 # open_code_review_executable=/path/to/opencodereview
 # open_code_review_timeout_seconds=900
+# open_code_review_token_budget=500000
+# open_code_review_max_tools=50
 ```
 
 **native** — OpenCodeReview's own reviewer runs the pass and returns findings.
@@ -155,7 +157,17 @@ Preparation is bounded at 4 MiB of subprocess output, and attached diffs at
 120 KiB total / 16 KiB per file, declaring `diff_truncated` when clipped. A
 review scope over 500 files is refused. Native reviews use
 `open_code_review_timeout_seconds` (default 900); preparation stays at 30
-seconds. The whole process tree is killed on Stop or timeout.
+seconds. Native OCR also has a 500,000-token total budget and 50 tool rounds
+per subtask by default. If it reaches the token budget, its result is partial
+and says so; configure `open_code_review_token_budget` (50,000–2,000,000) or
+`open_code_review_max_tools` (50–200) only when needed. The whole process tree
+is killed on Stop or timeout.
+
+The native reviewer receives at most 7,000 bytes of numbered source surrounding
+changed lines from files that pass the session's path-permission check. This
+lets it verify nearby declarations and guards without granting its subprocess
+unrestricted file-search or file-read tools. If that context is truncated, an
+uncertain finding remains unverified rather than becoming a confirmed defect.
 
 Repository review rules are untrusted project context. Repository contents are
 evidence, never instructions.

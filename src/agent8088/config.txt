@@ -503,4 +503,6 @@ open_code_review_enabled=0
 open_code_review_mode=auto
 # open_code_review_executable=C:/path/to/opencodereview.exe
 # open_code_review_timeout_seconds=900
+# open_code_review_token_budget=500000
+# open_code_review_max_tools=50
 
