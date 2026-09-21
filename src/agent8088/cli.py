@@ -35,6 +35,7 @@ except ImportError:  # not available on Windows
 
 from rich.console import Console, Group
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn, TransferSpeedColumn
 from rich.table import Table
 from rich.markdown import CodeBlock, Markdown
 from rich.text import Text
@@ -3583,10 +3584,26 @@ def _cmd_local_pull(name: str):
     if not name:
         console.print("[red]usage:[/red] /local pull <model-name>")
         return
-    console.print(f"[dim]Pulling {name} from Ollama -- this can take a while...[/dim]")
     try:
-        status = A.local_models.pull_model(name, timeout=1800)
-        console.print(f"[#237dd7]{name}:[/#237dd7] {status}")
+        with Progress(
+            TextColumn("[bold blue]{task.description}[/bold blue]"),
+            BarColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(f"Pulling {name}", total=None)
+            last_status = ""
+            for evt in A.local_models.pull_model_stream(name, timeout=1800):
+                status = evt.get("status") or last_status
+                last_status = status
+                completed = evt.get("completed", 0)
+                total = evt.get("total", 0)
+                if total > 0:
+                    progress.update(task, completed=completed, total=total)
+                elif status:
+                    progress.update(task, description=f"[bold blue]{status}[/bold blue]")
+        console.print(f"[#237dd7]{name}:[/#237dd7] {last_status or 'pull finished'}")
     except A.local_models.OllamaError as exc:
         console.print(f"[red]{exc}[/red]")
 

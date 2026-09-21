@@ -586,6 +586,33 @@ def pull_model(name: str, host: str = DEFAULT_OLLAMA_HOST, timeout: int = 600) -
     return last_status or "pull finished"
 
 
+def pull_model_stream(name: str, host: str = DEFAULT_OLLAMA_HOST, timeout: int = 600):
+    """Yield each NDJSON event from /api/pull as it arrives.
+
+    Each event is a dict with at least a ``status`` key; download events
+    also contain ``completed`` (int, bytes so far) and ``total`` (int,
+    bytes for the current layer).  Raises ``OllamaError`` on failure."""
+    name = _validate_model_name(name)
+    url = f"{host.rstrip('/')}/api/pull"
+    req = urllib.request.Request(
+        url, data=json.dumps({"model": name}).encode("utf-8"),
+        method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                if not raw_line.strip():
+                    continue
+                try:
+                    evt = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("error"):
+                    raise OllamaError(evt["error"])
+                yield evt
+    except urllib.error.URLError as exc:
+        raise OllamaError(_daemon_unreachable_message(host, exc)) from exc
+
+
 def remove_model(name: str, host: str = DEFAULT_OLLAMA_HOST) -> str:
     name = _validate_model_name(name)
     _ollama_request("/api/delete", method="DELETE", body={"model": name}, host=host)
