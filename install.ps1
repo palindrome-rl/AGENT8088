@@ -2311,6 +2311,9 @@ function Install-Node-Bridge {
     }
 
     $script:NodeInstalled = $true
+    # Publish npm to script scope so Install-WebUI can reuse the exact binary
+    # this stage found/installed instead of re-resolving it.
+    $script:NpmExe = $npmExe
 
     # --- 2. npm install in the WhatsApp bridge dir ------------------------
     $bridgeDir = Join-Path $InstallDir "src\agent8088\gateway\platforms\whatsapp_bridge"
@@ -2366,6 +2369,85 @@ function Install-Node-Bridge {
                 -What "WhatsApp bridge npm dependencies" `
                 -Consequence "WhatsApp adapter unavailable" `
                 -Fix "cd `"$bridgeDir`"; npm install"
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Stage 5c1: Build the web UI frontend (web/dist)
+# ----------------------------------------------------------------------------
+# `agent8088 --web` serves the built React app from web/dist. Without this
+# stage the installed copy has no dist and --web dies in _build_frontend with
+# a raw traceback. Node is guaranteed here: this runs right after
+# Install-Node-Bridge, which either found Node 20.11+ or installed portable
+# Node (and set $script:NpmExe). Same contract as every optional component:
+# failure registers a skipped stage and names the fix; it never aborts.
+$WebUIReady = $false
+
+function Install-WebUI {
+    $webDir = Join-Path $InstallDir "web"
+    if (-not (Test-Path (Join-Path $webDir "package.json"))) {
+        Write-Warn "Web UI source not found at $webDir - skipping frontend build"
+        Register-SkippedStage -Label "Web UI" `
+            -Reason "web/package.json not found in the installation" `
+            -Fix "rerun the installer from a complete checkout"
+        return
+    }
+
+    $distDir = Join-Path $webDir "dist"
+    $distIndex = Join-Path $distDir "index.html"
+    if (Test-Path $distIndex) {
+        Write-Success "Web UI frontend already built ($distDir)"
+        $script:WebUIReady = $true
+        return
+    }
+
+    if (-not $script:NpmExe -or -not (Test-Path $script:NpmExe)) {
+        Write-Warn "npm not available - cannot build the web UI"
+        Register-SkippedStage -Label "Web UI" `
+            -Reason "npm not found (Node 20.11+ required)" `
+            -Fix "install Node 20.11+ from https://nodejs.org/, then rerun the installer"
+        return
+    }
+
+    $nodeModules = Join-Path $webDir "node_modules"
+    if (-not (Test-Path $nodeModules)) {
+        Write-Info "Installing web UI npm dependencies..."
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $npmInstall = Invoke-WithTimeout -FilePath $script:NpmExe `
+                -Arguments @("install", "--prefix", $webDir, "--no-audit", "--no-fund") `
+                -TimeoutSec $TNpm -Activity "Installing web UI dependencies"
+            if ($npmInstall.ExitCode -ne 0) {
+                Write-StageWarning -Result $npmInstall -TimeoutSec $TNpm `
+                    -What "Web UI npm dependencies" `
+                    -Consequence "agent8088 --web unavailable" `
+                    -Fix "cd `"$webDir`"; npm install"
+                return
+            }
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
+    }
+
+    Write-Info "Building web UI frontend..."
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $buildResult = Invoke-WithTimeout -FilePath $script:NpmExe `
+            -Arguments @("run", "build", "--prefix", $webDir) `
+            -TimeoutSec $TNpm -Activity "Building web UI frontend"
+        if ($buildResult.ExitCode -eq 0 -and (Test-Path $distIndex)) {
+            $script:WebUIReady = $true
+            Write-Success "Web UI frontend built ($distDir)"
+        } else {
+            Write-StageWarning -Result $buildResult -TimeoutSec $TNpm `
+                -What "Web UI build" `
+                -Consequence "agent8088 --web unavailable" `
+                -Fix "cd `"$webDir`"; npm install; npm run build"
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -2765,6 +2847,11 @@ function Verify-Install {
     } else {
         Write-Host "  WhatsApp: needs Node 20.11+ (install from https://nodejs.org/)"
     }
+    if ($script:WebUIReady) {
+        Write-Host "  Web UI:   built - run 'agent8088 --web' and open http://127.0.0.1:8180"
+    } else {
+        Write-Host "  Web UI:   not built - agent8088 --web unavailable (see skipped stages)"
+    }
     if ($script:SandboxInstalled) {
         Write-Host "  Sandbox:  native runtime installed"
     } else {
@@ -2911,6 +2998,7 @@ try {
     Install-Deps
     Install-Gateway-Extras
     Install-Node-Bridge
+    Install-WebUI
     Install-CodeReview
     # Alone among the bare-called optional stages, this one returns $true/$false
     # (the tests assert on it), so an unassigned call prints True/False into the

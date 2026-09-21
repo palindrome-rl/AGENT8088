@@ -2423,7 +2423,16 @@ def _mount_static(app: FastAPI, dist_dir: Path):
 
 
 def _frontend_root() -> Path | None:
-    """Return the source checkout's frontend when this is a development install."""
+    """Return the web frontend root for this installation.
+
+    Two layouts exist. A source checkout has web/ at the repo root (found
+    by walking up from CWD, which is where the user launched from). The
+    global install clones the whole repo next to the package, so web/ also
+    sits two parents above this file. Check the checkout first — a developer
+    testing an installed copy from inside a checkout wants the local tree —
+    then fall back to the installed location, which is what
+    `agent8088 --web` from C:\\Windows\\System32 resolves.
+    """
     for root in (Path.cwd(), *Path.cwd().parents, Path(__file__).resolve().parents[2]):
         candidate = root / "web"
         if (candidate / "package.json").exists():
@@ -2467,8 +2476,21 @@ def run_web_server(host: str = "127.0.0.1", port: int = 8180, dev: bool = False)
         print("Agent8088 web UI on http://127.0.0.1:5180", flush=True)
     else:
         if web_root is None:
-            raise RuntimeError("web frontend files are unavailable in this installation")
-        _mount_static(app, _build_frontend(web_root))
+            raise RuntimeError(
+                "the web UI frontend is missing from this installation.\n"
+                "Re-run the Agent8088 installer to build it, or build it manually:\n"
+                "  cd <install-dir>/web\n"
+                "  npm install\n"
+                "  npm run build")
+        try:
+            _mount_static(app, _build_frontend(web_root))
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"the web UI frontend could not be built: {exc}\n"
+                "Build it manually and retry:\n"
+                f"  cd {web_root}\n"
+                "  npm install\n"
+                "  npm run build") from exc
         print(f"Agent8088 web UI on http://{host}:{port}", flush=True)
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
