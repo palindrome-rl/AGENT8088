@@ -1008,10 +1008,14 @@ async def delete_session(name: str):
     except OSError as exc:
         return {"error": f"could not delete session: {exc}"}
     if active:
-        C.S.messages.clear()
-        C.S.trajectory_state.clear()
+        # Replace references, never clear in place: a turn running in another
+        # WebSocket still holds the old objects (run_agent captured them at
+        # turn start); in-place clear yanked the checklist out from under it
+        # and crashed after_tool with KeyError: 'checklist'.
+        C.S.messages = []
+        C.S.trajectory_state = {}
         C.S.last_trace = None
-        C.S.conversation_trace.clear()
+        C.S.conversation_trace = []
         C.S.trace_path = ""
         C.S.last_usage = None
         C.S.name = ""
@@ -1023,8 +1027,10 @@ async def new_session(body: SessionActionBody):
     C = _cl()
     if not body.name.strip():
         C._save_active_session()
-        C.S.messages.clear()
-        C.S.trajectory_state.clear()
+        # Replace, not clear in place — a running turn in another WebSocket
+        # still holds these objects (KeyError: 'checklist' otherwise).
+        C.S.messages = []
+        C.S.trajectory_state = {}
         C.S.last_trace = None
         C.S.last_usage = None
         C.S.name = ""
@@ -1037,8 +1043,8 @@ async def new_session(body: SessionActionBody):
     if path.exists():
         return _error(f"session exists: {safe_name} (use /resume)", 409)
     C._save_active_session()
-    C.S.messages.clear()
-    C.S.trajectory_state.clear()
+    C.S.messages = []
+    C.S.trajectory_state = {}
     C.S.last_trace = None
     C.S.last_usage = None
     C.S.name = safe_name
@@ -1063,7 +1069,9 @@ async def resume_session(body: SessionActionBody):
         return _exc_error(exc)
     C._save_active_session()
     messages = data.get("messages", [])
-    C.S.messages[:] = messages
+    # Replace, not mutate in place — a running turn in another WebSocket still
+    # holds the old objects (KeyError: 'checklist' / torn context otherwise).
+    C.S.messages = list(messages) if isinstance(messages, list) else []
     C.S.trajectory_state = (data.get("trajectory_state", {})
                             if isinstance(data.get("trajectory_state", {}), dict) else {})
     C.S.name = safe_name
@@ -1081,10 +1089,12 @@ async def resume_session(body: SessionActionBody):
 async def reset_session():
     """Clear active session, retain name."""
     C = _cl()
-    C.S.messages.clear()
-    C.S.trajectory_state.clear()
+    # Replace, not clear in place — a running turn in another WebSocket still
+    # holds these objects (KeyError: 'checklist' otherwise).
+    C.S.messages = []
+    C.S.trajectory_state = {}
     C.S.last_trace = None
-    C.S.conversation_trace.clear()
+    C.S.conversation_trace = []
     C.S.trace_path = ""
     C.S.last_usage = None
     C._save_active_session()

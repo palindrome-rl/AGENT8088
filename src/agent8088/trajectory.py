@@ -215,7 +215,7 @@ class TrajectoryState:
         return True
 
     def _set_step(self, name: str, status: str) -> None:
-        for step in self.data["checklist"]:
+        for step in self.data.get("checklist", []):
             if step.get("name") == name:
                 step["status"] = status
                 return
@@ -290,7 +290,7 @@ class TrajectoryState:
         if self.data.get("workspace"):
             lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
         lines.append("Checklist: " + "; ".join(
-            f"{step.get('name')}: {step.get('status')}" for step in self.data["checklist"]
+            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
         ))
         for operation in operations[-6:]:
             line = f"- {operation.get('status', 'unknown')}: {operation.get('tool', 'tool')}"
