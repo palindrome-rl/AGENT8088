@@ -1065,6 +1065,77 @@ def test_the_cap_keeps_the_loudest_and_never_fires_on_an_ordinary_line():
     assert pair[0] in kept and pair[1] in kept, "severity, not arrival order, decides"
 
 
+def test_the_reviewers_verified_capabilities_are_recorded_against_the_pinned_version():
+    """Pin what the reviewer was proven able to do, so an upgrade re-opens the question.
+
+    The subprocess is handed no tool list, so its capabilities come from the
+    engine rather than from us. For 1.12.1 they were enumerated by standing in
+    for the LLM endpoint and recording the schemas it advertised: six tools,
+    every one read-only -- no shell, no process execution, no network, no
+    write. That plus the scoped checkout is the whole boundary.
+
+    review() refuses to run against any other version, so the set cannot drift
+    silently. This test exists so that raising PINNED_VERSION fails here first
+    and someone re-captures rather than assuming.
+    """
+    assert review.PINNED_VERSION == "1.12.1", (
+        "Re-capture the advertised tool set before raising the pin: point "
+        "OCR_LLM_URL at a recording endpoint and read the 'tools' array of the "
+        "first request. Confirm every tool is still read-only, then update this test."
+    )
+
+
+def test_categories_cover_what_the_engine_can_emit():
+    """A category we do not list is recorded as "other" and warned about as unknown."""
+    assert set(review.CATEGORIES) >= {
+        "bug", "security", "performance", "maintainability",
+        "test", "style", "documentation", "other"}
+
+
+def test_the_same_finding_reworded_collapses_at_one_location():
+    """A model rewording itself is still reporting one defect.
+
+    Live against ornith-1.0-35b, a five-file review returned five findings of
+    which two were this pair at the same line -- the second opening "Same
+    state-leak concern as the fixture". They scored 0.96 on message
+    similarity, while two genuinely different defects quoted on one line score
+    0.40, so a high threshold separates them with room to spare.
+
+    The threshold is deliberately near-identical rather than merely similar:
+    another pair in the same run scored 0.53 and, though it reads as the same
+    concern, 0.53 is too close to 0.40 to act on without risking a real
+    finding. That pair is left alone.
+    """
+    from agent8088.open_code_review import _collapse_repeats
+
+    first = _finding("tests/test_autotest_revert.py", 125, 125, "low",
+                     "Same state-leak concern as the fixture: "
+                     "`engine.PLAN_REVERT_MAX_BYTES = 128` mutates the engine object "
+                     "without restoring the prior value. Safe as long as the engine is "
+                     "fresh per test, but fragile if fixture scope changes.",
+                     "    engine.PLAN_REVERT_MAX_BYTES = 128")
+    second = _finding("tests/test_autotest_revert.py", 125, 125, "low",
+                      "Same state-leak concern: `engine.PLAN_REVERT_MAX_BYTES = 128` "
+                      "mutates the engine object without restoring the prior value. Safe "
+                      "as long as the engine is fresh per test, but fragile if fixture "
+                      "scope changes.",
+                      "    engine.PLAN_REVERT_MAX_BYTES = 128")
+
+    assert len(_collapse_repeats([first, second])) == 1
+
+
+def test_two_real_defects_on_one_line_survive_the_similarity_rule():
+    """0.40 is nowhere near the threshold, and must stay that way."""
+    from agent8088.open_code_review import _collapse_repeats
+
+    injection = _finding("app/db.py", 8, 8, "critical", "SQL is built by concatenation.",
+                         '    db.run("SELECT * FROM u WHERE t=" + tok)')
+    secret = _finding("app/db.py", 8, 8, "high", "A token is interpolated into a log.",
+                      '    db.run("SELECT * FROM u WHERE t=" + tok)')
+
+    assert len(_collapse_repeats([injection, secret])) == 2
+
+
 def test_a_repeat_collapses_even_without_a_quoted_line():
     """The chatter findings carried no code, so containment could not reach them."""
     from agent8088.open_code_review import _dedupe

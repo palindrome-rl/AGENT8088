@@ -10519,13 +10519,23 @@ def _review_timeout(args, tool_timeout: int) -> int:
     The 30s that bounded preparation would kill every real review -- the first
     live one against glm-5.3 took 8m35s -- so native gets the configured review
     budget instead, still bounded and still cancellable on every poll.
+
+    900s was sized against that 8m35s run and predates the token budget. Those
+    two bounds then contradicted each other: a review is allowed 500,000 tokens,
+    and on a local 35B endpoint spending them takes longer than 900s, so the
+    wall clock always fired first and a budget-shaped partial result was never
+    reachable. Measured on ornith-1.0-35b, one five-file review finished just
+    inside 900s and the same review timed out at 909s on an idle machine -- the
+    default sat exactly on the boundary. The token budget is the bound that
+    should bind, because it is the one that tracks cost; the clock is a backstop
+    for a wedged process, so it is set clear of a full-budget run.
     """
     if str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower() == "delegated":
         return min(tool_timeout, 30)
     try:
-        configured = int(APP_CONFIG.get("open_code_review_timeout_seconds", "900"))
+        configured = int(APP_CONFIG.get("open_code_review_timeout_seconds", "1800"))
     except ValueError:
-        configured = 900
+        configured = 1800
     return max(30, min(configured, 3600))
 
 

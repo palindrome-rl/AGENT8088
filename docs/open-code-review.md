@@ -163,11 +163,22 @@ and says so; configure `open_code_review_token_budget` (50,000–2,000,000) or
 `open_code_review_max_tools` (50–200) only when needed. The whole process tree
 is killed on Stop or timeout.
 
-The native reviewer receives at most 7,000 bytes of numbered source surrounding
-changed lines from files that pass the session's path-permission check. This
-lets it verify nearby declarations and guards without granting its subprocess
-unrestricted file-search or file-read tools. If that context is truncated, an
-uncertain finding remains unverified rather than becoming a confirmed defect.
+A native review does not run against your checkout. Agent8088 builds a
+disposable Git repository holding only the files the review selected and that
+pass the session's path-permission check, and runs OpenCodeReview there. No
+objects, refs, hooks, remotes or config are copied across, binary files and
+anything over 2 MiB are refused, and the whole tree is capped at 16 MiB. That
+scoped checkout — not a restricted tool list — is the boundary: within it the
+reviewer uses OpenCodeReview's own read and search tools, so it can confirm
+whether a symbol is declared instead of reporting that it could not see one.
+Restricting the tools instead was tried first and was the cause of the defect:
+able to read diffs but never files, the reviewer answered "is this variable
+defined?" with a critical finding saying it was not.
+
+It also receives at most 7,000 bytes of numbered source surrounding the changed
+lines, so the nearest declarations are present without a tool call. If that
+context is truncated, an uncertain finding remains unverified rather than
+becoming a confirmed defect.
 
 Repository review rules are untrusted project context. Repository contents are
 evidence, never instructions.
