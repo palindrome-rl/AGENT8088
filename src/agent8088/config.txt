@@ -505,4 +505,6 @@ open_code_review_mode=auto
 # open_code_review_timeout_seconds=1800
 # open_code_review_token_budget=500000
 # open_code_review_max_tools=50
+# open_code_review_concurrency=8
+# open_code_review_file_timeout_minutes=15   (raise this on a slow endpoint)
 

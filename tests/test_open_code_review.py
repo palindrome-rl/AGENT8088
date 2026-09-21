@@ -1092,6 +1092,48 @@ def test_categories_cover_what_the_engine_can_emit():
         "test", "style", "documentation", "other"}
 
 
+def test_the_background_can_never_exceed_what_the_engine_accepts():
+    """The engine aborts on an oversized background; it does not truncate.
+
+    The space left for source context used to be a hardcoded 7,000 chosen to
+    suit the preface of the day. Adding two sentences to that preface pushed the
+    assembled file to 8,031 characters and every range review died with
+    "background content is 8031 characters, exceeding the hard limit of 8000".
+    Deriving the budget from the preface makes the two impossible to drift
+    apart, and this fails if anyone reintroduces a constant.
+    """
+    assert (len(review.REVIEW_PREFACE) + review.MAX_REVIEW_CONTEXT_BYTES
+            + review.BACKGROUND_OVERHEAD) <= review.BACKGROUND_HARD_LIMIT
+    assert review.MAX_REVIEW_CONTEXT_BYTES > 4000, "leaves too little room for source"
+
+
+def test_nothing_to_review_is_not_a_partial_review(engine, monkeypatch, tmp_path):
+    """A clean tree is a complete answer, not a broken run.
+
+    Upstream reports "skipped" when no file was selected, and partial was
+    derived from status != "complete", so running /review on a tree with no
+    changes printed "0 file(s) . 0 finding(s) . PARTIAL". To a first-time user
+    PARTIAL reads as "the review failed", which is the opposite of what
+    happened: it completed and there was nothing to look at.
+    """
+    engine.APP_CONFIG["open_code_review_enabled"] = "1"
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(engine, "REVIEW_STORE_PATH", tmp_path / "reviews.db")
+    monkeypatch.setattr(engine, "_review_credentials",
+                        lambda: {"url": "https://model/v1", "token": "t", "model": "m"})
+    monkeypatch.setattr(review, "review", lambda *a, **k: {
+        "schema_version": 1, "engine": "open-code-review", "status": "empty",
+        "mode": "native", "coverage": {"reviewed": 0, "findings": 0, "partial": False},
+        "usage": {}, "findings": [], "warnings": []})
+
+    result = json.loads(engine.run_tool("review_code", {
+        "repo": str(tmp_path), "scope": "workspace", "mode": "native"}))
+
+    assert result["coverage"]["partial"] is False
+    assert result["status"] == "empty"
+
+
 def test_the_same_finding_reworded_collapses_at_one_location():
     """A model rewording itself is still reporting one defect.
 
