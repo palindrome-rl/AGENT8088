@@ -1568,6 +1568,48 @@ install_node_bridge() {
 # until the model is there. The message names the exact command to fix it.
 EMBED_MODEL="nomic-embed-text"
 
+install_webui() {
+    local _web_dir="$INSTALL_DIR/web"
+    if [ ! -f "$_web_dir/package.json" ]; then
+        record_skip "Web UI" "web/package.json not found" \
+            "rerun the installer from a complete checkout"
+        return
+    fi
+    local _dist_index="$_web_dir/dist/index.html"
+    if [ -f "$_dist_index" ]; then
+        log_success "Web UI frontend already built ($_web_dir/dist)"
+        return
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        record_skip "Web UI" "npm not found (Node 20.11+ required)" \
+            "install Node 20.11+ from https://nodejs.org/, then rerun the installer"
+        return
+    fi
+    local _rc=0
+    if [ ! -d "$_web_dir/node_modules" ]; then
+        log_info "Installing Web UI npm dependencies..."
+        run_with_timeout "$T_NPM" npm install --prefix "$_web_dir" \
+            --no-audit --no-fund >/dev/null 2>&1 || _rc=$?
+        if [ "$_rc" -ne 0 ]; then
+            warn_stage "$_rc" "$T_NPM" "Web UI npm dependencies" \
+                "agent8088 --web unavailable" \
+                "cd \"$_web_dir\"; npm install"
+            return
+        fi
+    fi
+    log_info "Building Web UI frontend..."
+    _rc=0
+    run_with_timeout "$T_NPM" npm run build --prefix "$_web_dir" \
+        >/dev/null 2>&1 || _rc=$?
+    if [ "$_rc" -eq 0 ] && [ -f "$_dist_index" ]; then
+        log_success "Web UI frontend built ($_web_dir/dist)"
+    else
+        warn_stage "$_rc" "$T_NPM" "Web UI build" \
+            "agent8088 --web unavailable" \
+            "cd \"$_web_dir\"; npm install; npm run build"
+    fi
+}
+
 install_code_review() {
     # Run after install_node_bridge so a fresh machine can use managed Node.
     local prefix="$INSTALL_DIR/code-review" candidate rc=0
@@ -2031,6 +2073,7 @@ main() {
     clone_repo
     install_deps
     install_node_bridge
+    install_webui
     install_code_review
     install_embedding_model
     install_native_sandbox
