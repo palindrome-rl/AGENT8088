@@ -16,7 +16,7 @@ param(
     [switch]$SkipLibreOffice,
     [switch]$WithMem0,
     [switch]$SkipMem0,
-    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
+    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "staging-1.2" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = "",
     [string]$InstallerSourceUrl = ""
@@ -1105,7 +1105,7 @@ function Get-InstallerInvocation {
 
     $sourceUrl = $InstallerSourceUrl
     if (-not $sourceUrl) {
-        $sourceUrl = "https://agent8088-installer.pages.dev/install.ps1"
+        $sourceUrl = "https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$Branch/install.ps1"
     }
     $urlLiteral = ConvertTo-PowerShellLiteral $sourceUrl
     $tlsCommand = "try { [Net.ServicePointManager]::SecurityProtocol = " +
@@ -1351,7 +1351,7 @@ function Test-SlowConnection {
     $tmp = $null
     try {
         $tmp = [System.IO.Path]::GetTempFileName()
-        $probeUrl = "https://agent8088-installer.pages.dev/install.ps1"
+        $probeUrl = "https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$Branch/install.ps1"
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $dl = Invoke-BoundedDownload -Uri $probeUrl -OutFile $tmp -TimeoutSec 8 -Proxy $script:ResolvedProxy
         $sw.Stop()
@@ -2859,7 +2859,7 @@ function Verify-Install {
         Write-Host "            Native is not set up on Windows yet (optional, may fail):"
         Write-Host "            elevated agent8088 --sandbox-setup"
     }
-    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://agent8088-installer.pages.dev/install.ps1)"
+    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$Branch/install.ps1)"
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of

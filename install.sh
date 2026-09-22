@@ -170,7 +170,7 @@ fi
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/palindrome-rl/AGENT8088.git"
-REPO_BRANCH="${AGENT8088_BRANCH:-development}"
+REPO_BRANCH="${AGENT8088_BRANCH:-staging-1.2}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
@@ -1980,7 +1980,7 @@ verify_install() {
         echo "  Sandbox:  Docker fallback is automatic when available"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: AGENT8088_BRANCH=$BRANCH curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | bash"
+    echo "  Update: curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh | AGENT8088_BRANCH=$BRANCH bash"
     echo ""
     echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
