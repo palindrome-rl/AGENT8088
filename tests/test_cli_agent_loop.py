@@ -18,7 +18,7 @@ def test_agent_loop_stays_until_quit_and_reuses_history(cli, monkeypatch, capsys
     monkeypatch.setattr(cli.A, "SUBAGENT_SPECS", profiles)
     seen = []
 
-    def fake_exec(args, depth=0, history=None):
+    def fake_exec(args, depth=0, history=None, from_user=False):
         seen.append((args["task"], history))
         if history is not None:
             history.append({"role": "user", "content": args["task"]})
@@ -45,7 +45,7 @@ def test_agent_loop_multiple_tasks_share_one_history(cli, monkeypatch):
     monkeypatch.setattr(cli.A, "SUBAGENT_SPECS", profiles)
     seen = []
 
-    def fake_exec(args, depth=0, history=None):
+    def fake_exec(args, depth=0, history=None, from_user=False):
         seen.append((args["task"], history))
         if history is not None:
             history.append({"role": "user", "content": args["task"]})
