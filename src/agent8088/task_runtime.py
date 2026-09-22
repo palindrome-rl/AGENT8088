@@ -89,10 +89,17 @@ class TaskStore:
         return [dict(row) for row in self.db.execute(query).fetchall()]
 
     def resolve(self, task_ref: str) -> dict:
-        """Find one task by its full id or the short id shown by `/task list`."""
+        """Find one task by its full id or the short id shown by `/task list`.
+
+        Ids are hex, so anything else cannot be a prefix of one. Checked rather
+        than escaped because `%` and `_` are LIKE wildcards: a ref of `%` made
+        every task a match, and `_` matched on length alone.
+        """
         task = self.get(task_ref)
         if task:
             return task
+        if not task_ref or any(char not in "0123456789abcdefABCDEF" for char in task_ref):
+            raise KeyError(task_ref)
         rows = self.db.execute("SELECT * FROM tasks WHERE id LIKE ?", (f"{task_ref}%",)).fetchall()
         if len(rows) != 1:
             raise KeyError(task_ref)

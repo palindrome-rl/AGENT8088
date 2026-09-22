@@ -41,9 +41,14 @@ Browser (React/Vite)  ←──WebSocket──→  FastAPI (web_server.py)  ─�
 ```bash
 agent8088 --web              # Launch web UI (production, serves built files)
 agent8088 --web --web-port 3000   # Custom port
-agent8088 --web --web-host 0.0.0.0  # Bind to all interfaces
+agent8088 --web --web-host 127.0.0.2  # Another loopback address
 uv run agent8088 --web         # Dev mode (FastAPI + Vite)
 ```
+
+The server binds to loopback only; a non-loopback `--web-host` is refused.
+Nothing here is authenticated and `POST /api/tool/{name}` runs any tool,
+`execute_shell` included. For access from another machine, forward the port:
+`ssh -N -L 8180:127.0.0.1:8180 <host>`.
 
 ## 1:1 CLI Surface Mapping
 

@@ -285,6 +285,31 @@ def _error(message: str, status: int = 400, **extra) -> JSONResponse:
 # and a negative value silently disabled the loop entirely.
 _MAX_TURNS_CEILING = 200
 
+# The port this server was started on. Set by run_web_server; the default is
+# the documented one so a TestClient-hosted app (which never calls it) still
+# has a coherent same-origin answer. Read by _websocket_origin_allowed.
+_BIND_PORT = 8180
+
+# Hostnames a browser can legitimately use to reach a loopback-bound server.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    """True for 'localhost' or any address in a loopback range (127.0.0.0/8,
+    ::1). Checked with ipaddress rather than string equality so 127.0.0.2 --
+    a perfectly ordinary loopback bind -- is not mistaken for a public one."""
+    import ipaddress
+
+    hostname = (hostname or "").strip().strip("[]").lower()
+    if not hostname:
+        return False
+    if hostname in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
 
 def _active_base_url(A) -> str:
     """Base URL of the provider actually in use, falling back to the module default."""
@@ -964,17 +989,20 @@ class SessionRenameBody(BaseModel):
 async def rename_session(name: str, body: SessionRenameBody):
     """Rename a saved session without changing its transcript."""
     C = _cl()
+    # Real statuses, not a 200 with an {"error": ...} body: the UI's apiFetch
+    # only rejects on !res.ok, so a 200 ran onSuccess and the rename dialog
+    # closed as though the rename had happened.
     try:
         old_name = C._session_name(name)
         new_name = C._session_name(body.new_name)
     except ValueError as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     old_path = C._session_path(old_name)
     new_path = C._session_path(new_name)
     if not old_path.exists():
-        return {"error": f"session not found: {old_name}"}
+        return _error(f"session not found: {old_name}", 404)
     if old_name != new_name and new_path.exists():
-        return {"error": f"session exists: {new_name} (use another name)"}
+        return _error(f"session exists: {new_name} (use another name)", 409)
     if old_name == new_name:
         return {"ok": True, "name": new_name}
     active = C.S.name == old_name
@@ -988,7 +1016,7 @@ async def rename_session(name: str, body: SessionRenameBody):
             data["name"] = new_name
             C._write_private_text(new_path, json.dumps(data, indent=2))
     except (OSError, json.JSONDecodeError) as exc:
-        return {"error": f"could not rename session: {exc}"}
+        return _error(f"could not rename session: {exc}", 500)
     return {"ok": True, "name": new_name}
 
 @app.delete("/api/sessions/{name}")
@@ -998,15 +1026,15 @@ async def delete_session(name: str):
     try:
         safe_name = C._session_name(name)
     except ValueError as exc:
-        return {"error": str(exc)}
+        return _exc_error(exc)
     path = C._session_path(safe_name)
     if not path.exists():
-        return {"error": f"session not found: {safe_name}"}
+        return _error(f"session not found: {safe_name}", 404)
     active = C.S.name == safe_name
     try:
         path.unlink()
     except OSError as exc:
-        return {"error": f"could not delete session: {exc}"}
+        return _error(f"could not delete session: {exc}", 500)
     if active:
         # Replace references, never clear in place: a turn running in another
         # WebSocket still holds the old objects (run_agent captured them at
@@ -1972,18 +2000,26 @@ manager = _ConnectionManager()
 def _websocket_origin_allowed(ws: WebSocket) -> bool:
     """Reject a cross-origin WebSocket handshake (CSWSH): a page on another
     site cannot open a WS to this local server and ride the browser's
-    same-origin cookies/session. Allowed: same-origin as this server's own
-    Host header (correct regardless of --web-host/--web-port), plus the
-    fixed Vite dev-proxy origins already trusted by CORS above. A request
-    with no Origin header at all (non-browser clients: curl, native tools)
-    is let through -- Origin checks are a browser-enforced mechanism and
-    cannot meaningfully gate non-browser callers anyway."""
+    same-origin cookies/session. Allowed: this server's own loopback origin on
+    the port it was started with, plus the fixed Vite dev-proxy origins already
+    trusted by CORS above. A request with no Origin header at all (non-browser
+    clients: curl, native tools) is let through -- Origin checks are a
+    browser-enforced mechanism and cannot meaningfully gate non-browser callers
+    anyway.
+
+    Compared against the server's own bind, NOT against the request's Host
+    header. Host-reflective comparison is self-referential and so no defence at
+    all against DNS rebinding: a page served from http://evil.example:8180,
+    with evil.example rebound to 127.0.0.1, sends an Origin and a Host that
+    agree with each other, and every handshake from it was accepted. Since the
+    server refuses any non-loopback bind (see run_web_server), the set of
+    legitimate origins is exactly the loopback names on _BIND_PORT.
+    """
     origin = ws.headers.get("origin", "")
     if not origin:
         return True
-    host = ws.headers.get("host", "")
-    origin_host = urllib.parse.urlparse(origin).netloc
-    if host and origin_host == host:
+    parsed = urllib.parse.urlparse(origin)
+    if _is_loopback_host(parsed.hostname or "") and (parsed.port or 80) == _BIND_PORT:
         return True
     return origin in {"http://127.0.0.1:5180", "http://localhost:5180"}
 
@@ -2412,6 +2448,26 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
 
 # === Static file serving (production mode) ===
 
+def _safe_frontend_path(dist_dir: Path, rel: str) -> Path | None:
+    """Resolve `rel` under the built frontend, or None if it escapes.
+
+    uvicorn percent-decodes the request path before routing, so the catch-all
+    below receives `../../etc/hosts` for a request to `/%2e%2e/%2e%2e/etc/hosts`.
+    Joining that onto dist_dir and serving whatever came out was an
+    unauthenticated read of any file the user can read -- ~/.agent8088/config.txt
+    and its provider keys included. Same containment rule as
+    _safe_artifact_path, which the artifacts browser has always applied.
+    """
+    base = dist_dir.resolve()
+    try:
+        target = (base / rel).resolve() if rel else base
+    except OSError:
+        return None
+    if target != base and base not in target.parents:
+        return None
+    return target
+
+
 def _mount_static(app: FastAPI, dist_dir: Path):
     """Mount the built frontend for production mode (no separate dev server)."""
     from fastapi.staticfiles import StaticFiles
@@ -2426,9 +2482,11 @@ def _mount_static(app: FastAPI, dist_dir: Path):
             # a renamed endpoint got HTML and a JSON parse error instead of a 404.
             if full_path == "api" or full_path.startswith("api/"):
                 return _error(f"no such endpoint: /{full_path}", 404)
-            file_path = dist_dir / full_path
-            if file_path.exists() and file_path.is_file():
+            file_path = _safe_frontend_path(dist_dir, full_path)
+            if file_path is not None and file_path.is_file():
                 return FileResponse(file_path)
+            # Anything else -- including a path that tried to escape -- is a
+            # deep link into the single-page app.
             return FileResponse(dist_dir / "index.html")
 
 
@@ -2475,8 +2533,24 @@ def _build_frontend(web_root: Path) -> Path:
 
 
 def run_web_server(host: str = "127.0.0.1", port: int = 8180, dev: bool = False):
-    """Launch the API server and, in development, its Vite frontend."""
+    """Launch the API server and, in development, its Vite frontend.
+
+    Loopback only. Every endpoint here is unauthenticated, and
+    POST /api/tool/{name} runs any tool in the registry -- execute_shell
+    included -- so a non-loopback bind hands remote code execution to anyone
+    who can reach the port. mcp_server.run_mcp_server refuses a non-loopback
+    bind for exactly this reason, and this server exposes strictly more.
+    """
     import uvicorn
+    global _BIND_PORT
+    if not _is_loopback_host(host):
+        raise ValueError(
+            f"the web UI cannot bind to {host}: it must bind to localhost. "
+            "Every endpoint is unauthenticated and /api/tool runs any tool, "
+            "so remote access requires authentication, which is not "
+            "configured. To reach it from another machine, forward the port "
+            f"over SSH: ssh -N -L {port}:127.0.0.1:{port} <this-host>")
+    _BIND_PORT = port
     web_root = _frontend_root()
     vite: subprocess.Popen[str] | None = None
     if dev:

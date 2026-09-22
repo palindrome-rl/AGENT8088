@@ -35,7 +35,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mcp-host HOST` | MCP bind host (default `127.0.0.1`) |
 | `--web` | Launch the web UI instead of the terminal REPL |
 | `--web-port PORT` | Web UI server port (default `8180`) |
-| `--web-host HOST` | Web UI bind host (default `127.0.0.1`) |
+| `--web-host HOST` | Web UI bind host (default `127.0.0.1`); loopback only |
 | `--web-dev` | Run the web backend without serving built frontend files; use with Vite |
 | `--update` | Pull latest code + reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
@@ -67,7 +67,15 @@ Use the web flags to change the server settings:
 
 ```sh
 agent8088 --web --web-port 3000
-agent8088 --web --web-host 0.0.0.0
+```
+
+The web UI binds to loopback only, and a non-loopback `--web-host` is refused.
+Every endpoint is unauthenticated and `POST /api/tool/{name}` runs any tool in
+the registry, so exposing the port is equivalent to handing out a shell. To
+reach it from another machine, forward the port over SSH:
+
+```sh
+ssh -N -L 8180:127.0.0.1:8180 <the-machine-running-agent8088>
 ```
 
 ### Development

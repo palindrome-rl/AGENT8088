@@ -1,8 +1,17 @@
 """Cross-Site WebSocket Hijacking guard: a page on another origin must not be
 able to open a WS connection to this local server and ride the browser's
 same-origin session. See _websocket_origin_allowed in web_server.py.
+
+The check used to compare Origin against the request's own Host header, which
+is self-referential and so useless against DNS rebinding: a page served from
+http://evil.example:8180, with evil.example rebound to 127.0.0.1, sends an
+Origin and a Host that agree with each other, and the handshake was accepted.
+The allowed origins are now derived from the server's own loopback bind
+instead -- which is also the only bind it will accept (see test_web_bind_host).
 """
 from types import SimpleNamespace
+
+import pytest
 
 from agent8088 import web_server as W
 
@@ -16,14 +25,24 @@ def _fake_ws(origin=None, host=None):
     return SimpleNamespace(headers=headers)
 
 
-def test_same_origin_as_server_host_allowed():
-    assert W._websocket_origin_allowed(_fake_ws(origin="http://127.0.0.1:8180", host="127.0.0.1:8180"))
+@pytest.fixture(autouse=True)
+def default_port(monkeypatch):
+    monkeypatch.setattr(W, "_BIND_PORT", 8180)
 
 
-def test_same_origin_with_custom_bind_host_allowed():
-    """Same-origin check must work for any --web-host/--web-port the user
-    configured, not just the default 127.0.0.1:8180."""
-    assert W._websocket_origin_allowed(_fake_ws(origin="http://192.168.1.50:9000", host="192.168.1.50:9000"))
+@pytest.mark.parametrize("origin", [
+    "http://127.0.0.1:8180",
+    "http://localhost:8180",
+    "http://[::1]:8180",
+])
+def test_loopback_origin_on_the_server_port_is_allowed(origin):
+    assert W._websocket_origin_allowed(_fake_ws(origin=origin, host="127.0.0.1:8180"))
+
+
+def test_origin_follows_a_custom_port(monkeypatch):
+    """The allowed origin tracks --web-port, not a hardcoded 8180."""
+    monkeypatch.setattr(W, "_BIND_PORT", 9000)
+    assert W._websocket_origin_allowed(_fake_ws(origin="http://127.0.0.1:9000", host="127.0.0.1:9000"))
 
 
 def test_vite_dev_proxy_origin_allowed():
@@ -33,6 +52,14 @@ def test_vite_dev_proxy_origin_allowed():
 
 def test_cross_origin_rejected():
     assert not W._websocket_origin_allowed(_fake_ws(origin="https://evil.example", host="127.0.0.1:8180"))
+
+
+def test_rebound_origin_matching_the_host_header_is_rejected():
+    """The DNS-rebinding case the old Host-reflective check let through:
+    evil.example resolves to 127.0.0.1, so the browser's Origin and Host agree
+    with each other while naming a host that is not this server."""
+    assert not W._websocket_origin_allowed(
+        _fake_ws(origin="http://evil.example:8180", host="evil.example:8180"))
 
 
 def test_mismatched_port_rejected():
