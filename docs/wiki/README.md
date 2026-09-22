@@ -1,5 +1,9 @@
 # Agent8088 Wiki
 
+> **Staging 1.2 documentation.** These pages describe the `staging-1.2`
+> channel. The hosted GitHub Wiki publishes them under `Staging-1.2-*` page
+> names so they can coexist with documentation for other release channels.
+
 Complete reference for Agent8088 — a local-first AI agent with fine-tuned tool
 calling, an enforced permission layer, OS-level sandboxing, MCP in both
 directions, and messaging gateways.

@@ -3,7 +3,7 @@
 # Agent8088 Installer — Linux, macOS, WSL2, Termux
 # ============================================================================
 # Usage:
-#   curl -fsSL --proto '=https' --tlsv1.2 https://<YOUR-URL>/install.sh | bash
+#   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.sh | bash
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, git install, repo clone, venv,
@@ -737,7 +737,7 @@ detect_os() {
         CYGWIN*|MINGW*|MSYS*)
             OS="windows"; DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  iex (irm https://<YOUR-URL>/install.ps1)"
+            log_info "  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)"
             exit 1
             ;;
         *)

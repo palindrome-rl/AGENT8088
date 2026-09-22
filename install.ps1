@@ -2,7 +2,7 @@
 # Agent8088 Installer - Windows (native PowerShell)
 # ============================================================================
 # Usage:
-#   iex (irm https://<YOUR-URL>/install.ps1)
+#   $env:AGENT8088_BRANCH = "staging-1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, PortableGit install, repo clone,

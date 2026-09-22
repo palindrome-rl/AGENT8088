@@ -201,6 +201,7 @@ Optional [repository ingestion](docs/repository-ingestion.md) provides bounded
 GitIngest-backed repository overviews, search and source reads.
 
 The versioned [documentation wiki](docs/wiki/README.md) is the source of truth for this branch.
+The hosted wiki also has a dedicated [Staging 1.2 section](https://github.com/palindrome-rl/AGENT8088/wiki/Staging-1.2-Home), so staging instructions do not overwrite the repository's shared documentation.
 
 | Read this | To learn about |
 | --- | --- |

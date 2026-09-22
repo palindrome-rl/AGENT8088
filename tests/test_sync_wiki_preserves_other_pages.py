@@ -6,10 +6,19 @@ pages belonging to another channel -- silently, and only visible to whoever went
 looking for them afterwards.
 """
 import re
+import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "sync_wiki.py"
+
+
+def _module():
+    spec = importlib.util.spec_from_file_location("sync_wiki_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_the_publish_step_only_removes_pages_it_regenerates():
@@ -40,3 +49,23 @@ def test_pages_are_sourced_from_the_branch_that_generated_them():
 
     assert 'REPO = "palindrome-rl/AGENT8088"' in text, (
         "sync_wiki publishes to, and links at, a repository that is not this one")
+
+
+def test_staging_pages_are_namespaced_instead_of_replacing_shared_pages():
+    module = _module()
+    assert module.WIKI_PREFIX == "Staging-1.2-"
+    link_map = {source: f"{module.WIKI_PREFIX}{page}" for source, page in module.PAGES}
+    converted = module.convert("[Start](01-getting-started.md)", link_map)
+    assert converted == "[Start](Staging-1.2-Getting-Started)"
+
+
+def test_sidebar_update_preserves_existing_content_and_is_idempotent():
+    module = _module()
+    original = "### Existing wiki\n\n- [Home](Home)\n"
+    once = module.update_sidebar(original)
+    twice = module.update_sidebar(once)
+    assert once == twice
+    assert original.rstrip() in once
+    assert "[Home](Staging-1.2-Home)" in once
+    assert once.count(module.SIDEBAR_START) == 1
+    assert once.count(module.SIDEBAR_END) == 1

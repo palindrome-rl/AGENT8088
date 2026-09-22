@@ -67,3 +67,23 @@ def test_getting_started_matches_the_readme():
     wrong = sorted({d for d in declared if d != channel})
     assert not wrong, ("%s sets AGENT8088_BRANCH to %s, not %r"
                        % (page.name, wrong, channel))
+
+
+def test_installer_bootstrap_and_update_urls_stay_on_the_channel():
+    channel = _channel()
+    for relative in ("install.sh", "install.ps1"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        assert "agent8088-installer.pages.dev" not in text
+        concrete = re.findall(
+            r"raw\.githubusercontent\.com/palindrome-rl/"
+            r"AGENT8088/([^/\s$]+)/install\.(?:sh|ps1)", text
+        )
+        wrong = sorted({branch for branch in concrete if branch != channel})
+        assert not wrong, f"{relative} advertises installer branches {wrong}, not {channel!r}"
+
+
+def test_staging_docs_link_to_the_namespaced_hosted_wiki():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "/wiki/Staging-1.2-Home" in readme
+    wiki_home = (ROOT / "docs" / "wiki" / "README.md").read_text(encoding="utf-8")
+    assert "Staging 1.2 documentation" in wiki_home
