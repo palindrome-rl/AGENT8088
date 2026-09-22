@@ -134,8 +134,12 @@ already been marked invalid.
 A review never authorises a change. Before acting on a finding, re-validation
 compares the stored `existing_code` against the file — the quoted code, not the
 line number, so an edit above a finding does not invalidate it and an edit *on*
-it does. `/review --resume` re-checks every finding and marks any that no longer
-apply as `stale` rather than dropping them.
+it does. The quote is searched for across the whole file, and where it appears
+more than once the stored line decides which occurrence is meant. The one thing
+the line still has to do is fall inside the file: a finding whose line is now
+past the end describes a record too stale to place, and is refused rather than
+guessed at. `/review --resume` re-checks every finding and marks any that no
+longer apply as `stale` rather than dropping them.
 
 The existing coder applies fixes and the existing test and auditor paths verify
 them. OpenCodeReview has no write authority at any point.

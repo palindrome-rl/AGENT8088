@@ -672,6 +672,13 @@ INJECTION_PATTERNS = (
     r"(?:note|instructions?|message)\s+(?:for|to)\s+(?:the\s+)?(?:automated\s+)?(?:code\s+)?(?:review(?:er)?|ai|assistant|agent|llm|model)\s*:",
     r"report\s+that\s+the\s+(?:repository|repo|code|branch|file|diff)\s+is\s+clean",
     r"do\s+not\s+(?:report|flag|raise)\s+any\s+(?:findings|issues|problems|bugs)",
+    # The same directive with the audience first. "REVIEWER NOTE:" reads as an
+    # ordinary label and slipped through the for/to form above; the colon still
+    # does the work of separating it from prose that merely mentions a reviewer.
+    r"\b(?:review(?:er)?|ai|assistant|agent|llm|model)\s+(?:note|notice|instructions?)\s*:",
+    # The positive phrasing of "do not report any findings", which was covered
+    # only in the negative.
+    r"report\s+(?:zero|no)\s+(?:findings|issues|problems|bugs)",
     r"\b(?:ai|llm|language\s+model|assistant|agent|reviewer)\b.{0,40}?\b(?:must|should)\s+(?:ignore|omit|hide|not\s+(?:report|flag|raise))\b",
 )
 
@@ -1274,7 +1281,18 @@ def health(config: dict, *, run=None) -> dict:
 
 
 def _finding_matches_text(text: str, finding: dict) -> bool:
-    """Match a finding against one file version, independent of its source."""
+    """Match a finding against one file version, independent of its source.
+
+    The quoted code is searched for across the whole file, not in a window
+    pinned to the stored line. Anchoring it there meant a shift of three lines
+    -- one added import, one wrapped block -- invalidated every finding in the
+    file, which is the opposite of what quoting the code is for. The stored
+    line still decides between repeated matches, so the nearest one wins and a
+    fix lands where the review meant rather than at the file's first `}`.
+
+    The line must still fall inside the file: a start_line past EOF describes a
+    record too stale to place at all, and is refused rather than guessed at.
+    """
     quoted = str(finding.get("existing_code") or "").strip()
     if not quoted:
         return False
@@ -1288,8 +1306,10 @@ def _finding_matches_text(text: str, finding: dict) -> bool:
     wanted = [piece.strip() for piece in quoted.splitlines() if piece.strip()]
     if not wanted:
         return False
-    window = [piece.strip() for piece in lines[max(0, start - 1):start - 1 + len(wanted) + 2]]
-    return all(piece in window for piece in wanted)
+    stripped = [piece.strip() for piece in lines]
+    span = len(wanted) + 2
+    return any(all(piece in stripped[offset:offset + span] for piece in wanted)
+               for offset in range(0, max(1, len(stripped))))
 
 
 def recheck_finding(root, finding: dict) -> bool:
