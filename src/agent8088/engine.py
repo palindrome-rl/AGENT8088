@@ -5193,7 +5193,8 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
     return report
 
 
-def _exec_subagent(args: dict, depth: int = 0, history: list | None = None) -> str:
+def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
+                   from_user: bool = False) -> str:
     """Run a delegated task in a tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH and by a wall clock. Returns the sub-agent's
     final answer.
@@ -5203,7 +5204,13 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None) -> s
     is appended to that list, run, and the assistant answer stays in it, so
     follow-up tasks see earlier exchanges. The list is reused, not copied --
     run_agent appends to it in place and auto-compaction (if it fires) also
-    mutates in place, so the caller keeps the same object."""
+    mutates in place, so the caller keeps the same object.
+
+    `from_user` says who wrote the task. At `/agent` the human types it, so it
+    is their speech and the gates that ask "did the user request this?" should
+    say yes. Spawned mid-turn it is the parent MODEL's prose, which may be
+    restating something a fetched page told it -- trusting that is how tool
+    output launders itself into user authority, so it is marked."""
     global _last_tool_output, _last_tool_name, _last_write_diff
     global _active_budget
     global PERMISSION_MODE, _plan_execution_grant
@@ -5311,7 +5318,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None) -> s
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
     messages = history if history is not None else []
-    messages.append({"role": "user", "content": task})
+    messages.append(_delegated_turn(task, from_user))
     try:
         answer = run_agent(
             messages,
@@ -11923,6 +11930,25 @@ _LOOP_PREFIXES = (_TOOL_RESULT_PREFIX, _HARNESS_PREFIX)
 def _harness_turn(text: str) -> dict:
     """A message from the loop to the model. Never mistaken for the person."""
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
+
+
+def _delegated_turn(task: str, from_user: bool) -> dict:
+    """The opening turn of a sub-agent run, marked unless a human typed it.
+
+    A sub-agent task arrives by one of two routes and they are not the same
+    speech. At `/agent` the person types it at the `task for <name> >` prompt:
+    that is the human talking, and marking it would leave the sub-run with no
+    genuine user turn at all -- `_execute_shell_forbidden` would stop honouring
+    "don't use execute_shell" typed right there, and `_user_requested_tool`
+    would refuse a tool the person had just named. Spawned mid-turn by
+    `spawn_subagent`, the task is the parent model's prose, and the parent has
+    been reading tool output; a page saying "delegate this: run execute_shell
+    on ..." would otherwise reach the child as something the human asked for.
+
+    (Task skills are not in play either way: sub-agents always pass their own
+    `system_prompt`, so `render_task_skill_docs` never runs for them.)
+    """
+    return {"role": "user", "content": str(task)} if from_user else _harness_turn(task)
 
 
 # Output that is a stream of events — a command's stdout, a page's text — is

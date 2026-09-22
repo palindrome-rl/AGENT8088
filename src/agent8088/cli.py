@@ -2587,8 +2587,10 @@ def _run_subagent(name, task, history=None):
     with Live(console=console, refresh_per_second=20, transient=True) as live:
         A.subagent_ui = _make_subagent_ui(live)
         try:
+            # Typed by the person at the `task for <name> >` prompt, so it is
+            # their speech -- not the parent model restating a page at the child.
             result = A._exec_subagent({"agent_type": name, "task": task}, depth=0,
-                                      history=history)
+                                      history=history, from_user=True)
         finally:
             A.subagent_ui = None
     # Strip the "[subagent:name] " prefix before rendering the summary panel.

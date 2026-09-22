@@ -275,9 +275,13 @@ def test_exec_subagent_history_is_reused_and_carries_the_conversation():
         eng._exec_subagent({"agent_type": "fast_agent", "task": "again"})
         assert lists[0] is not lists[1]  # fresh call: a new list each time
 
+        # from_user=True: this is the /agent path, where the person types each
+        # task, so the turns land unmarked as their own speech.
         history = []
-        eng._exec_subagent({"agent_type": "fast_agent", "task": "task one"}, history=history)
-        eng._exec_subagent({"agent_type": "fast_agent", "task": "task two"}, history=history)
+        eng._exec_subagent({"agent_type": "fast_agent", "task": "task one"},
+                           history=history, from_user=True)
+        eng._exec_subagent({"agent_type": "fast_agent", "task": "task two"},
+                           history=history, from_user=True)
         assert [m["content"] for m in history] == [
             "task one", "first answer", "task two", "first answer"]
         assert mock_run.call_args.args[0] is history  # reused, not copied
