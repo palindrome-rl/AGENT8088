@@ -5546,7 +5546,8 @@ def _print_review_history():
         when = datetime.fromtimestamp(row["created"]).strftime("%Y-%m-%d %H:%M")
         t.add_row(row["id"], when, row["mode"], str(row["findings"]), row["repo"])
     console.print(t)
-    console.print(Text("Reopen one with /review --resume ID; positions are re-checked then.",
+    console.print(Text("Reopen one with /review --resume ID; positions are re-checked "
+                       "then. Start one with --commit, --from/--to, or --repo.",
                        style="dim"))
 
 def cmd_review(rest):
@@ -5567,16 +5568,19 @@ def cmd_review(rest):
     except ValueError as exc:
         console.print(f"[red]Could not parse review arguments:[/red] {exc}")
         return
+    if not parts:
+        # Bare /review lists stored reviews. It used to start a workspace
+        # review, which is a minutes-long LLM pass behind a bare command that
+        # read as a hang; a review now always names the scope it runs on.
+        _print_review_history()
+        return
     index = 0
     while index < len(parts):
         token = parts[index]
-        if token == "--list":
-            _print_review_history()
-            return
         if token == "--resume" and index + 1 < len(parts):
             reopened = A.reopen_review(parts[index + 1], args.get("repo"))
             if reopened is None:
-                console.print("[red]no such review[/red] (try /review --list)")
+                console.print("[red]no such review[/red] (run /review to list them)")
             else:
                 _print_review(reopened)
             return
@@ -5587,7 +5591,8 @@ def cmd_review(rest):
             index += 2
             continue
         console.print("[red]usage:[/red] /review [--from REF] [--to REF] [--commit SHA] "
-                      "[--mode native|delegated|auto] [--repo PATH] [--resume ID] [--list]")
+                      "[--mode native|delegated|auto] [--repo PATH] [--resume ID]")
+        console.print("[dim]Bare /review lists stored reviews.[/dim]")
         return
     if args.get("commit"):
         args["scope"] = "commit"

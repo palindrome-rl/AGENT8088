@@ -74,12 +74,12 @@ attributed to it.
 ## Using it
 
 ```text
-/review                                   # workspace changes
+/review                                   # stored reviews (bare form)
+/review --repo .                          # workspace changes
 /review --from development --to HEAD      # a range
 /review --commit abc123                   # one commit
 /review --mode native                     # force the engine
 /review --repo "C:\Users\New User\My Repo" # paths with spaces work on Windows
-/review --list                            # stored reviews
 /review --resume rev-abc123               # reopen, positions re-checked
 ```
 
