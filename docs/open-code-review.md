@@ -35,6 +35,8 @@ open_code_review_enabled=0
 open_code_review_mode=auto        # native | delegated | auto
 # open_code_review_executable=/path/to/opencodereview
 # open_code_review_timeout_seconds=900
+# open_code_review_token_budget=500000
+# open_code_review_max_tools=50
 ```
 
 **native** — OpenCodeReview's own reviewer runs the pass and returns findings.
@@ -155,7 +157,28 @@ Preparation is bounded at 4 MiB of subprocess output, and attached diffs at
 120 KiB total / 16 KiB per file, declaring `diff_truncated` when clipped. A
 review scope over 500 files is refused. Native reviews use
 `open_code_review_timeout_seconds` (default 900); preparation stays at 30
-seconds. The whole process tree is killed on Stop or timeout.
+seconds. Native OCR also has a 500,000-token total budget and 50 tool rounds
+per subtask by default. If it reaches the token budget, its result is partial
+and says so; configure `open_code_review_token_budget` (50,000–2,000,000) or
+`open_code_review_max_tools` (50–200) only when needed. The whole process tree
+is killed on Stop or timeout.
+
+A native review does not run against your checkout. Agent8088 builds a
+disposable Git repository holding only the files the review selected and that
+pass the session's path-permission check, and runs OpenCodeReview there. No
+objects, refs, hooks, remotes or config are copied across, binary files and
+anything over 2 MiB are refused, and the whole tree is capped at 16 MiB. That
+scoped checkout — not a restricted tool list — is the boundary: within it the
+reviewer uses OpenCodeReview's own read and search tools, so it can confirm
+whether a symbol is declared instead of reporting that it could not see one.
+Restricting the tools instead was tried first and was the cause of the defect:
+able to read diffs but never files, the reviewer answered "is this variable
+defined?" with a critical finding saying it was not.
+
+It also receives at most 7,000 bytes of numbered source surrounding the changed
+lines, so the nearest declarations are present without a tool call. If that
+context is truncated, an uncertain finding remains unverified rather than
+becoming a confirmed defect.
 
 Repository review rules are untrusted project context. Repository contents are
 evidence, never instructions.

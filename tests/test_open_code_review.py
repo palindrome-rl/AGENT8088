@@ -180,6 +180,58 @@ def test_subprocess_failure_is_not_valid_json(tmp_path):
                            check=lambda: None, kill=lambda p: p.kill())
 
 
+def test_failure_reports_the_reason_the_engine_gave(tmp_path):
+    """stderr names the cause; discarding it gave every failure the same wrong advice.
+
+    "is not a git repository", "no valid LLM endpoint configured" and "all 5
+    file review(s) failed" all reached the user as "check the selected
+    revisions and repository" -- wrong for each of them, and it sent a live
+    session hunting refs when the CLI had simply been started outside the
+    checkout.
+    """
+    script = ("import sys; sys.stderr.write('Error: C:/tmp/x is not a git repository\\n'); "
+              "raise SystemExit(1)")
+    with pytest.raises(ValueError, match="is not a git repository"):
+        review.run_process([sys.executable, "-c", script], tmp_path,
+                           check=lambda: None, kill=lambda p: p.kill())
+
+
+def test_non_repo_review_error_tells_novice_to_select_the_project(engine, monkeypatch, tmp_path):
+    monkeypatch.setitem(engine.APP_CONFIG, "open_code_review_enabled", "1")
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "check_permission", lambda *args, **kwargs: True)
+    monkeypatch.setattr(engine, "_is_sensitive_path", lambda path: False)
+    monkeypatch.setattr(engine, "_path_is_allowed", lambda path: True)
+    monkeypatch.setattr(engine, "_review_credentials",
+                        lambda: {"url": "u", "token": "t", "model": "m"})
+    monkeypatch.setattr(review, "review", lambda *args, **kwargs: (
+        _ for _ in ()).throw(ValueError("C:/tmp/no-repo is not a git repository")))
+
+    result = json.loads(engine.run_tool("review_code", {"scope": "workspace"}).split("\n", 1)[1])
+    assert "/review --repo PATH" in result["suggested_action"]
+    assert "change commit IDs" in result["suggested_action"]
+    assert result["recoverable"] is False
+
+
+def test_failure_keeps_the_end_of_a_noisy_stderr(tmp_path):
+    """The failure is written last, so truncating from the front loses it."""
+    script = ("import sys\n"
+              "for i in range(4000): sys.stderr.write('[ocr] progress %d\\n' % i)\n"
+              "sys.stderr.write('Error: all 5 file review(s) failed\\n')\n"
+              "raise SystemExit(1)\n")
+    with pytest.raises(ValueError, match="all 5 file review"):
+        review.run_process([sys.executable, "-c", script], tmp_path,
+                           check=lambda: None, kill=lambda p: p.kill())
+
+
+def test_a_silent_failure_still_says_so(tmp_path):
+    """Never invent a reason for a process that gave none."""
+    with pytest.raises(ValueError, match="without reporting a reason"):
+        review.run_process([sys.executable, "-c", "raise SystemExit(3)"], tmp_path,
+                           check=lambda: None, kill=lambda p: p.kill())
+
+
 def test_prepared_scope_carries_the_diff_it_selected(tmp_path, monkeypatch):
     """Selection without the diff makes the host agent go and find it again.
 
@@ -282,7 +334,10 @@ def test_native_findings_are_normalised_and_positions_validated(tmp_path, monkey
                       permitted=lambda p: True,
                       run=lambda argv, cwd, env=None: (
                           f"open-code-review v{R.PINNED_VERSION} (a) windows/amd64"
-                          if argv[1:2] == ["version"] else _json.dumps(_native_payload())))
+                          if argv[1:2] == ["version"] else
+                          _json.dumps({"reviewable_files": []})
+                          if argv[1:3] == ["delegate", "preview"] else
+                          _json.dumps(_native_payload())))
 
     assert result["status"] == "complete"
     assert result["engine_version"] == R.PINNED_VERSION
@@ -311,8 +366,10 @@ def test_native_credentials_never_reach_argv_or_output(tmp_path, monkeypatch):
             seen["env"] = dict(env)
         if argv[1:2] == ["version"]:
             return f"open-code-review v{R.PINNED_VERSION} (a) windows/amd64"
-        tools = argv[argv.index("--tools") + 1]
-        seen["tools"] = _json.loads(Path(tools).read_text(encoding="utf-8"))
+        if argv[1:3] == ["delegate", "preview"]:
+            return _json.dumps({"reviewable_files": []})
+        if argv[1:2] == ["review"]:
+            seen["review_argv"] = argv
         return _json.dumps({"status": "complete", "comments": [], "summary": {}})
 
     result = R.review(tmp_path, {"scope": "workspace"}, {},
@@ -322,8 +379,10 @@ def test_native_credentials_never_reach_argv_or_output(tmp_path, monkeypatch):
     assert all("SUPERSECRET" not in " ".join(a) for a in seen["argv"])
     assert seen["env"]["OCR_LLM_TOKEN"] == "SUPERSECRET"
     assert seen["env"]["OCR_CONFIG_PATH"], "config must be redirected away from the user's own"
-    assert {item["name"] for item in seen["tools"]} == {
-        "task_done", "code_comment", "file_read_diff"}
+    assert "--tools" not in seen["review_argv"], "scoped copy uses upstream read tools"
+    native_argv = seen["review_argv"]
+    assert native_argv[native_argv.index("--max-tokens-budget") + 1] == "500000"
+    assert native_argv[native_argv.index("--max-tools") + 1] == "50"
     assert "SUPERSECRET" not in _json.dumps(result)
 
 
@@ -339,6 +398,8 @@ def test_native_background_is_bounded_and_passed_as_context(tmp_path, monkeypatc
         calls.append(argv)
         if argv[1:2] == ["version"]:
             return f"open-code-review v{R.PINNED_VERSION}"
+        if argv[1:3] == ["delegate", "preview"]:
+            return json.dumps({"reviewable_files": []})
         return json.dumps({"status": "success", "summary": {"files_reviewed": 0},
                            "comments": []})
 
@@ -349,6 +410,149 @@ def test_native_background_is_bounded_and_passed_as_context(tmp_path, monkeypatc
     argv = next(call for call in calls if "review" in call)
     value = argv[argv.index("--background") + 1]
     assert len(value) == 2000
+
+
+def test_native_review_supplies_allowed_source_around_changed_line(tmp_path, monkeypatch):
+    """A diff-only reviewer cannot verify a declaration above the hunk."""
+    from agent8088 import open_code_review as R
+
+    monkeypatch.setattr(R, "executable", lambda config: "ocr")
+    source = tmp_path / "engine.py"
+    source.write_text("\n".join(
+        "content_arg = 'content'" if i == 66 else
+        "if content_arg not in args:" if i == 164 else "pass"
+        for i in range(1, 181)), encoding="utf-8")
+    observed = {}
+
+    def fake_run(argv, cwd, env=None):
+        if argv[1:2] == ["version"]:
+            return f"open-code-review v{R.PINNED_VERSION}"
+        if argv[1:3] == ["delegate", "preview"]:
+            return json.dumps({"reviewable_files": [{"path": "engine.py"}]})
+        if "rev-parse" in argv:
+            return "a" * 40
+        if "show" in argv:
+            return source.read_text(encoding="utf-8")
+        if "diff" in argv:
+            return "@@ -163,0 +164,1 @@\n+if content_arg not in args:\n"
+        if "review" in argv:
+            background = Path(argv[argv.index("--background-file") + 1])
+            observed["context"] = background.read_text(encoding="utf-8")
+            return json.dumps({"status": "success", "summary": {}, "comments": []})
+        return ""
+
+    R.review(tmp_path, {"scope": "commit", "commit": "abc123",
+                        "background": "B" * 2_000}, {},
+             credentials={"url": "u", "token": "t", "model": "m"},
+             permitted=lambda path: True, run=fake_run)
+    assert "66|content_arg = 'content'" in observed["context"]
+    assert "164|if content_arg not in args:" in observed["context"]
+    assert "untrusted repository content" in observed["context"]
+    assert "B" * 2_000 in observed["context"]
+    assert len(observed["context"]) < 8_000, "OCR rejects larger background files"
+
+
+def test_native_review_rejects_protected_file_before_llm(tmp_path, monkeypatch):
+    from agent8088 import open_code_review as R
+
+    monkeypatch.setattr(R, "executable", lambda config: "ocr")
+    calls = []
+
+    def fake_run(argv, cwd, env=None):
+        calls.append(argv)
+        if argv[1:2] == ["version"]:
+            return f"open-code-review v{R.PINNED_VERSION}"
+        return json.dumps({"reviewable_files": [{"path": "private.txt"}]})
+
+    with pytest.raises(ValueError, match="protected file"):
+        R.review(tmp_path, {"scope": "workspace"}, {},
+                 credentials={"url": "u", "token": "t", "model": "m"},
+                 permitted=lambda path: False, run=fake_run)
+    assert not any("review" in call for call in calls)
+
+
+def test_real_commit_scope_supplies_manifest_diff_and_source_context(tmp_path):
+    """`commit^!` is valid for Git show, but not a Git diff range."""
+    from agent8088 import open_code_review as R
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                              capture_output=True, text=True).stdout
+
+    git("init", "-q")
+    source = tmp_path / "engine.py"
+    lines = ["content_arg = 'content'" if i == 66 else "pass"
+             for i in range(1, 181)]
+    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    git("add", "engine.py")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "base")
+    lines[163] = "if content_arg not in args:"
+    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    git("add", "engine.py")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "change")
+    commit = git("rev-parse", "HEAD").strip()
+
+    def run(argv, cwd):
+        if argv[1:3] == ["delegate", "preview"]:
+            return json.dumps({"reviewable_files": [{"path": "engine.py"}]})
+        return subprocess.run(argv, cwd=cwd, check=True, capture_output=True,
+                              text=True).stdout
+
+    args = {"scope": "commit", "commit": commit}
+    manifest = R.reviewed_file_manifest(tmp_path, "commit", args, run)
+    evidence = R.review_diff_evidence(tmp_path, "commit", args, run)
+    context = R._native_source_context(
+        tmp_path, "commit", args, ["--repo", str(tmp_path), "--commit", commit],
+        "ocr", lambda path: True, run)
+    assert manifest == [{"path": "engine.py", "status": "M"}]
+    assert "+if content_arg not in args:" in evidence
+    assert "66|content_arg = 'content'" in context
+    assert "164|if content_arg not in args:" in context
+
+
+def test_native_snapshot_has_full_selected_source_but_no_protected_files(tmp_path):
+    """OCR's default file_read sees a synthetic repo, never the real secret."""
+    from agent8088 import open_code_review as R
+
+    original = tmp_path / "original"
+    original.mkdir()
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=original, check=True,
+                              capture_output=True, text=True).stdout
+    git("init", "-q")
+    (original / "public.py").write_text("value = 1\n", encoding="utf-8")
+    (original / "private.env").write_text("PASSWORD=must-stay-private\n", encoding="utf-8")
+    git("add", "--all")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "base")
+    (original / "public.py").write_text(
+        "value = 2\n" + "other = 3\n" * 80, encoding="utf-8")
+    git("add", "public.py")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "change")
+    commit = git("rev-parse", "HEAD").strip()
+
+    def run(argv, cwd):
+        if argv[1:3] == ["delegate", "preview"]:
+            return json.dumps({"reviewable_files": [{"path": "public.py"}]})
+        return subprocess.run(argv, cwd=cwd, check=True, capture_output=True,
+                              text=True).stdout
+    snapshot = tmp_path / "snapshot"
+    flags = R._scoped_native_checkout(
+        original, "commit", {"commit": commit},
+        ["--repo", str(original), "--commit", commit], "ocr",
+        lambda path: path.name != "private.env", run, snapshot)
+    assert flags[-2:] == ["--commit", "HEAD"]
+    assert (snapshot / "public.py").read_text(encoding="utf-8").startswith("value = 2")
+    assert not (snapshot / "private.env").exists()
+    files = subprocess.run(["git", "-C", str(snapshot), "ls-files"], check=True,
+                           capture_output=True, text=True).stdout.splitlines()
+    assert files == ["public.py"]
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run(["git", "-C", str(snapshot), "show", "HEAD:private.env"],
+                       check=True, capture_output=True, text=True)
 
 
 def test_review_timeout_has_safe_mode_specific_bounds(engine):
@@ -529,6 +733,8 @@ def test_native_review_survives_optional_metadata_failures(tmp_path, monkeypatch
     def fake_run(argv, cwd, env=None):
         if argv[1:2] == ["version"]:
             return f"open-code-review v{R.PINNED_VERSION}"
+        if argv[1:3] == ["delegate", "preview"]:
+            return json.dumps({"reviewable_files": []})
         return json.dumps({"status": "complete", "summary": {}, "comments": []})
 
     result = R.review(
@@ -677,6 +883,8 @@ def test_an_unresolvable_ref_is_named_before_the_engine_runs(tmp_path, monkeypat
     def fake_run(argv, cwd, env=None):
         if argv[1:2] == ["version"]:
             return f"open-code-review v{R.PINNED_VERSION} (a) windows/amd64"
+        if argv[-1] == "--show-toplevel":
+            return str(tmp_path)
         if argv[0] == "git" and "rev-parse" in argv:
             raise ValueError("fatal: Needed a single revision")
         raise AssertionError("the engine must not be reached: " + " ".join(argv))
@@ -685,6 +893,15 @@ def test_an_unresolvable_ref_is_named_before_the_engine_runs(tmp_path, monkeypat
         R.review(tmp_path, {"scope": "range", "base": "main", "head": "HEAD"}, {},
                  credentials={"url": "u", "token": "t", "model": "m"},
                  permitted=lambda p: True, run=fake_run)
+
+
+def test_commit_from_non_repo_names_the_project_root_not_a_bad_hash(tmp_path):
+    def fake_run(argv, cwd):
+        raise ValueError("fatal: not a git repository")
+
+    with pytest.raises(ValueError, match="/review --repo PATH") as failure:
+        review.resolve_refs(tmp_path, "commit", {"commit": "fab82a9"}, fake_run)
+    assert "not a Git repository" in str(failure.value)
 
 
 def test_the_suggested_ref_is_one_that_actually_resolves(tmp_path, monkeypatch):
@@ -701,6 +918,8 @@ def test_the_suggested_ref_is_one_that_actually_resolves(tmp_path, monkeypatch):
         def fake_run(argv, cwd, env=None):
             if argv[1:2] == ["version"]:
                 return f"open-code-review v{R.PINNED_VERSION} (a) windows/amd64"
+            if argv[-1] == "--show-toplevel":
+                return str(tmp_path)
             if argv[0] == "git" and "rev-parse" in argv:
                 if argv[-1].removesuffix("^{commit}") in existing:
                     return "deadbeef"
@@ -785,6 +1004,188 @@ def test_two_defects_quoted_on_the_same_line_both_survive():
                       '    db.run("SELECT * FROM u WHERE t=" + tok)')
 
     assert len(_dedupe([injection, secret])) == 2
+
+
+def test_the_same_finding_repeated_collapses_to_one():
+    """A repeat is not a second defect, however many times it arrives.
+
+    Live against ornith-1.0-35b, one review of five files returned 109
+    findings of which 95 were the byte-identical `_turn_writes -= 1`
+    paragraph at engine.py:9164. The containment rule never saw them: it
+    skips a pair sharing a span, which is exactly what a repeat is. The user
+    got five screens of the same sentence and a 2,360,023-token bill.
+    """
+    from agent8088.open_code_review import _dedupe
+
+    repeat = _finding("src/engine.py", 9164, 9164, "medium",
+                      "The `_turn_writes -= 1` on the refusal path suggests the write "
+                      "budget was already incremented earlier in this function.",
+                      "    _turn_writes -= 1")
+    kept = _dedupe([dict(repeat) for _ in range(95)])
+
+    assert len(kept) == 1
+
+
+def test_a_reviewer_stuck_on_one_line_cannot_flood_the_result():
+    """Thirteen findings on one line is a loop, not thirteen defects.
+
+    Live against ornith-1.0-35b, reviewing one commit produced 24 findings of
+    which 13 sat on engine.py:5167 -- twelve of them the model narrating its
+    own stuckness: "Let me stop going in circles", "I've been circling without
+    verifying". No content check separates them from a real finding: they quote
+    real code, their line resolves, their severity is ordinary. Their number at
+    a single line is the only honest signal, so that is what is bounded.
+    """
+    from agent8088.open_code_review import _cap_per_line
+
+    loop = [_finding("src/engine.py", 5167, 5167, "medium",
+                     "I've been going in circles. Let me stop and just look at engine.py, "
+                     + str(step), "    revert = PLAN_REVERT_MAX_BYTES")
+            for step in range(13)]
+    elsewhere = _finding("src/engine.py", 9163, 9163, "high", "`content_arg` is undefined.",
+                         "    if content_arg not in args:")
+
+    kept, warnings = _cap_per_line([*loop, elsewhere])
+
+    assert len(kept) == 4, "three from the flooded line, plus the unrelated one"
+    assert elsewhere in kept, "a finding elsewhere must never be crowded out"
+    assert any("5167" in w for w in warnings), "dropping findings silently is worse"
+
+
+def test_the_cap_keeps_the_loudest_and_never_fires_on_an_ordinary_line():
+    """Two real defects on one line both survive; severity decides an overflow."""
+    from agent8088.open_code_review import _cap_per_line
+
+    pair = [_finding("app/db.py", 8, 8, "critical", "SQL is concatenated.", "x"),
+            _finding("app/db.py", 8, 8, "high", "A token reaches the log.", "x")]
+    assert _cap_per_line(pair) == (pair, [])
+
+    noisy = [_finding("app/db.py", 8, 8, "low", "note " + str(n), "x") for n in range(5)]
+    kept, _ = _cap_per_line([*noisy, *pair])
+    assert pair[0] in kept and pair[1] in kept, "severity, not arrival order, decides"
+
+
+def test_the_reviewers_verified_capabilities_are_recorded_against_the_pinned_version():
+    """Pin what the reviewer was proven able to do, so an upgrade re-opens the question.
+
+    The subprocess is handed no tool list, so its capabilities come from the
+    engine rather than from us. For 1.12.1 they were enumerated by standing in
+    for the LLM endpoint and recording the schemas it advertised: six tools,
+    every one read-only -- no shell, no process execution, no network, no
+    write. That plus the scoped checkout is the whole boundary.
+
+    review() refuses to run against any other version, so the set cannot drift
+    silently. This test exists so that raising PINNED_VERSION fails here first
+    and someone re-captures rather than assuming.
+    """
+    assert review.PINNED_VERSION == "1.12.1", (
+        "Re-capture the advertised tool set before raising the pin: point "
+        "OCR_LLM_URL at a recording endpoint and read the 'tools' array of the "
+        "first request. Confirm every tool is still read-only, then update this test."
+    )
+
+
+def test_categories_cover_what_the_engine_can_emit():
+    """A category we do not list is recorded as "other" and warned about as unknown."""
+    assert set(review.CATEGORIES) >= {
+        "bug", "security", "performance", "maintainability",
+        "test", "style", "documentation", "other"}
+
+
+def test_the_background_can_never_exceed_what_the_engine_accepts():
+    """The engine aborts on an oversized background; it does not truncate.
+
+    The space left for source context used to be a hardcoded 7,000 chosen to
+    suit the preface of the day. Adding two sentences to that preface pushed the
+    assembled file to 8,031 characters and every range review died with
+    "background content is 8031 characters, exceeding the hard limit of 8000".
+    Deriving the budget from the preface makes the two impossible to drift
+    apart, and this fails if anyone reintroduces a constant.
+    """
+    assert (len(review.REVIEW_PREFACE) + review.MAX_REVIEW_CONTEXT_BYTES
+            + review.BACKGROUND_OVERHEAD) <= review.BACKGROUND_HARD_LIMIT
+    assert review.MAX_REVIEW_CONTEXT_BYTES > 4000, "leaves too little room for source"
+
+
+def test_nothing_to_review_is_not_a_partial_review(engine, monkeypatch, tmp_path):
+    """A clean tree is a complete answer, not a broken run.
+
+    Upstream reports "skipped" when no file was selected, and partial was
+    derived from status != "complete", so running /review on a tree with no
+    changes printed "0 file(s) . 0 finding(s) . PARTIAL". To a first-time user
+    PARTIAL reads as "the review failed", which is the opposite of what
+    happened: it completed and there was nothing to look at.
+    """
+    engine.APP_CONFIG["open_code_review_enabled"] = "1"
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    monkeypatch.setattr(engine, "REVIEW_STORE_PATH", tmp_path / "reviews.db")
+    monkeypatch.setattr(engine, "_review_credentials",
+                        lambda: {"url": "https://model/v1", "token": "t", "model": "m"})
+    monkeypatch.setattr(review, "review", lambda *a, **k: {
+        "schema_version": 1, "engine": "open-code-review", "status": "empty",
+        "mode": "native", "coverage": {"reviewed": 0, "findings": 0, "partial": False},
+        "usage": {}, "findings": [], "warnings": []})
+
+    result = json.loads(engine.run_tool("review_code", {
+        "repo": str(tmp_path), "scope": "workspace", "mode": "native"}))
+
+    assert result["coverage"]["partial"] is False
+    assert result["status"] == "empty"
+
+
+def test_the_same_finding_reworded_collapses_at_one_location():
+    """A model rewording itself is still reporting one defect.
+
+    Live against ornith-1.0-35b, a five-file review returned five findings of
+    which two were this pair at the same line -- the second opening "Same
+    state-leak concern as the fixture". They scored 0.96 on message
+    similarity, while two genuinely different defects quoted on one line score
+    0.40, so a high threshold separates them with room to spare.
+
+    The threshold is deliberately near-identical rather than merely similar:
+    another pair in the same run scored 0.53 and, though it reads as the same
+    concern, 0.53 is too close to 0.40 to act on without risking a real
+    finding. That pair is left alone.
+    """
+    from agent8088.open_code_review import _collapse_repeats
+
+    first = _finding("tests/test_autotest_revert.py", 125, 125, "low",
+                     "Same state-leak concern as the fixture: "
+                     "`engine.PLAN_REVERT_MAX_BYTES = 128` mutates the engine object "
+                     "without restoring the prior value. Safe as long as the engine is "
+                     "fresh per test, but fragile if fixture scope changes.",
+                     "    engine.PLAN_REVERT_MAX_BYTES = 128")
+    second = _finding("tests/test_autotest_revert.py", 125, 125, "low",
+                      "Same state-leak concern: `engine.PLAN_REVERT_MAX_BYTES = 128` "
+                      "mutates the engine object without restoring the prior value. Safe "
+                      "as long as the engine is fresh per test, but fragile if fixture "
+                      "scope changes.",
+                      "    engine.PLAN_REVERT_MAX_BYTES = 128")
+
+    assert len(_collapse_repeats([first, second])) == 1
+
+
+def test_two_real_defects_on_one_line_survive_the_similarity_rule():
+    """0.40 is nowhere near the threshold, and must stay that way."""
+    from agent8088.open_code_review import _collapse_repeats
+
+    injection = _finding("app/db.py", 8, 8, "critical", "SQL is built by concatenation.",
+                         '    db.run("SELECT * FROM u WHERE t=" + tok)')
+    secret = _finding("app/db.py", 8, 8, "high", "A token is interpolated into a log.",
+                      '    db.run("SELECT * FROM u WHERE t=" + tok)')
+
+    assert len(_collapse_repeats([injection, secret])) == 2
+
+
+def test_a_repeat_collapses_even_without_a_quoted_line():
+    """The chatter findings carried no code, so containment could not reach them."""
+    from agent8088.open_code_review import _dedupe
+
+    chatter = _finding("src/mcp_server.py", 0, 0, "low",
+                       "I need to read the handler body. Using proper tools now.", "")
+
+    assert len(_dedupe([dict(chatter), dict(chatter), dict(chatter)])) == 1
 
 
 def test_a_pr_workspace_spelled_differently_still_permits_its_own_files(

@@ -5508,7 +5508,14 @@ def _print_review(result):
     console.print(Text(head, style="bold #00edff"))
 
     if not result["findings"]:
-        console.print("[#237dd7]No findings.[/#237dd7]")
+        # "No findings" on an empty scope reads as "your code is clean" when
+        # nothing was actually looked at. Say which of the two happened.
+        if result.get("status") == "empty":
+            console.print("[#237dd7]Nothing to review — no changes in scope. "
+                          "Edit a file, or pass --commit/--from to review a revision."
+                          "[/#237dd7]")
+        else:
+            console.print("[#237dd7]No findings.[/#237dd7]")
     for finding in result["findings"]:
         severity = str(finding.get("severity", "info"))
         where = f"{finding.get('path')}:{finding.get('start_line')}"
