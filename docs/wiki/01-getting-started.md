@@ -20,8 +20,8 @@
 
   ```powershell
   $env:AGENT8088_INSTALL_LIBREOFFICE = 'yes'   # or 'no' to skip
-  $env:AGENT8088_BRANCH = 'development'
-  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+  $env:AGENT8088_BRANCH = 'staging-1.2'
+  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
   ```
 
 No admin rights are needed for the base install. WinGet may prompt for
@@ -30,27 +30,31 @@ WinGet's own prompt, not something this installer requests.
 
 ## Install
 
+These commands install the **staging-1.2** channel and keep it there:
+`agent8088 --update` follows `staging-1.2`, not `development`.
+
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.sh | AGENT8088_BRANCH=staging-1.2 bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = 'development'
-iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+$env:AGENT8088_BRANCH = 'staging-1.2'
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
 ```
 
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the
 repo into an isolated venv, exposes a global `agent8088` command, and writes a
 default `config.txt` pointing at localhost Ollama.
 
-**From a clone, for development:**
+**From a clone, to work on the code.** Contributions are branched from
+`development`, so this deliberately clones that rather than `staging-1.2`:
 
 ```sh
-git clone https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch development https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"

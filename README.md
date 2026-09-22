@@ -18,7 +18,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
-  <a href="https://github.com/palindrome-rl/AGENT8088/tree/development"><img src="https://img.shields.io/badge/branch-development-18a0fb" alt="Development branch"></a>
+  <a href="https://github.com/palindrome-rl/AGENT8088/tree/staging-1.2"><img src="https://img.shields.io/badge/branch-staging--1.2-f59e0b" alt="Staging 1.2 branch"></a>
 </p>
 
 Agent8088 is a local-first agent for real work: it reads files, runs tools, researches the web, and can make changes only within a permission system you control. Run it against local Ollama or a hosted OpenAI-compatible model, use it from the terminal or a messaging gateway, and extend it with MCP servers, skills, and focused sub-agents.
@@ -44,18 +44,22 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 
 ## Quick start
 
-### Install the development branch
+### Install the staging-1.2 branch
+
+This is the v2 staging channel. The commands below install it and keep it
+on it: `agent8088 --update` stays on `staging-1.2` rather than moving you
+to `development`.
 
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.sh | AGENT8088_BRANCH=staging-1.2 bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+$env:AGENT8088_BRANCH = "staging-1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
 ```
 
 > **Correction.** This previously pointed at `agent8088-installer.pages.dev`, a
