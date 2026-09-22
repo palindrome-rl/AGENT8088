@@ -25,7 +25,7 @@ Secrets do **not** belong here — see [API keys](#api-keys-and-the-env-store).
 | `project_root` | cwd | Base for relative paths. |
 | `shell_cwd` | cwd | Working directory for shell commands. |
 | `no_prompt_paths` | (empty) | Writes here are auto-approved, no prompt. |
-| `prompt_paths` | `.` | Writes here require per-action approval. |
+| `prompt_paths` | `~` | Writes here require per-action approval. Code's own fallback if the key is absent entirely is `.`, but the shipped `config.txt` sets it to `~` explicitly, so that's the real default for anyone running the packaged config. |
 | `blocked_paths` | (empty) | Writes here are **always** refused, even in full-auto. |
 | `read_paths` | (empty) | If set, reads outside these escalate. |
 
@@ -118,6 +118,8 @@ Flat keys rather than a nested block, so every approval setting is greppable.
 | `cron_mode` | `deny` | What an **unattended** run does at an approval gate. `deny` refuses and tells the model to report it; `approve` treats the gate as granted. Neither touches the always-on floor. |
 | `destructive_slash_confirm` | `1` | `/reset` asks before discarding a conversation. |
 | `mcp_reload_confirm` | `1` | `/mcp reload` asks before dropping the tool cache. |
+
+| `default_permission_mode` | `full-auto` | Startup permission mode when neither `--mode` nor `AGENT8088_PERMISSION` is set. **This key does not appear in the shipped `config.txt` at all** — it exists only as a code-level fallback in `engine.py` (`APP_CONFIG.get("default_permission_mode", "full-auto")`), verified by importing the engine with a nonexistent config and reading `PERMISSION_MODE`, which comes back `full-auto`. An earlier version of this page (and of [Permissions & Security](03-permissions-and-security.md)) stated the default is `readonly`; that is wrong for an out-of-the-box install — set `default_permission_mode=readonly` in `config.txt`, or launch with `--mode readonly`, to get that behavior. |
 
 There is deliberately no separate "approval mode" setting.
 [`--mode` / `permission_mode`](03-permissions-and-security.md#the-three-permission-modes)

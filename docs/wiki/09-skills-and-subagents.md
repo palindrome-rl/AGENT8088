@@ -19,15 +19,16 @@ Two different extension mechanisms that are easy to confuse:
 conversation, its own turn budget, and a **restricted tool set**. The parent
 gets back only the final answer — intermediate steps never enter its context.
 
-### The 5 bundled profiles
+### The 6 bundled profiles
 
 | Profile | Tools | Max turns | For |
 |---|---|---|---|
-| `explore` | `execute_shell`, `read_text`, `web_search`, `get_page_title`, `last_output` | 6 | Read-only codebase search. No write tool at all. |
+| `explore` | `execute_shell`, `read_text`, `repository_read`, `web_search`, `get_page_title`, `last_output` | 6 | Read-only codebase search. No write tool at all. |
 | `researcher` | `web_search`, `get_page_title`, `read_text`, `last_output` | 8 | Web research with citations. No shell. |
 | `coder` | `execute_shell`, `read_text`, `write_file`, `last_output` | 10 | Write code and verify it runs. |
 | `auditor` | `read_text`, `execute_shell`, `last_output` | 6 | Verify a completed step against the environment. Pinned readonly. |
-| `general-purpose` | the above plus `calculate` | 8 | Mixed multi-step work. |
+| `test-writer` | `read_text`, `run_tests`, `write_file`, `edit_file`, `execute_shell`, `last_output` | 12 | Write and run tests for an existing file, via `generate_tests`. Refuses to change the code under test — the file is hashed and checked. |
+| `general-purpose` | `execute_shell`, `read_text`, `write_file`, `web_search`, `get_page_title`, `calculate`, `last_output` | 8 | Mixed multi-step work. |
 
 Note the tool restriction is real isolation, not advice: `explore` has no
 `write_file`, so an explore sub-agent physically cannot write, whatever the
@@ -161,31 +162,37 @@ readonly mode it escalates for approval like any other.
 A skill package bundles instructions, and optionally extra tool definitions,
 that get merged into the agent's context.
 
-### The 13 bundled skills
+### The 39 bundled skills
+
+Verified by counting `src/agent8088/skills_installed/*/` (excluding
+`_references/`). A representative slice — see the directory for the rest,
+covering everything from `api-and-interface-design` to `workspace-engineering`:
 
 | Skill | Category |
 |---|---|
-| `plan` | workflow |
-| `systematic-debugging` | workflow |
-| `test-driven-development` | workflow |
-| `github-code-review` | software-development |
-| `documentation-writing` | workflow |
 | `documents` | software-development |
 | `github-pr-workflow` | software-development |
-| `grounded-citations` | research |
-| `document-to-action-items` | software-development |
-| `spike` | workflow |
-| `humanizer` | creative |
 | `simplify-code` | software-development |
+| `document-to-action-items` | software-development |
+| `grounded-citations` | research |
+| `humanizer` | creative |
+| `spike` | workflow |
+| `browsing` | workflow |
+| `cli-anything` | application-automation |
+| `delegation-and-audit` | harness |
+| `tool-orchestration` | harness |
+| `workspace-engineering` | harness |
+| `test-driven-development` | (uncategorized) |
+| `repository-reading` | (uncategorized) |
 
 Loaded skills appear in the system prompt under `## Installed skills`, and in
 `/status`.
 
-Large skills may declare `progressive: true`. Agent8088 initially advertises
-only their metadata and loads `SKILL.md` or a referenced text resource through
-the path-confined `view_skill` tool when the skill is relevant. This prevents a
-large methodology from consuming context on unrelated turns. Disabled skills
-cannot be loaded through that tool.
+Nearly every bundled skill declares `progressive: true` in its frontmatter.
+Agent8088 initially advertises only their metadata and loads `SKILL.md` or a
+referenced text resource through the path-confined `view_skill` tool when the
+skill is relevant. This prevents a large methodology from consuming context on
+unrelated turns. Disabled skills cannot be loaded through that tool.
 
 ### Managing them
 

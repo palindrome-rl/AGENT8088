@@ -11,27 +11,47 @@ Verified from `BUILTIN_PROVIDERS` in `src/agent8088/providers.py`:
 
 | Provider | Base URL | Key env var |
 |---|---|---|
-| `ollama` | `http://localhost:11434/v1` | — (local) |
+| `ollama` | `http://localhost:11434/v1` | — (local; ships a placeholder key) |
 | `ollama-cloud` | `https://ollama.com/v1` | `OLLAMA_API_KEY` |
 | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
-| `gemini` | `https://generativelanguage.googleapis.com/v1beta/...` | `GEMINI_API_KEY` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai/` | `GEMINI_API_KEY` |
 | `cerebras` | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` |
 | `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
 | `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
 | `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
 | `moonshot` | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
-| `qwen` | `https://dashscope.aliyuncs.com/compatible-mode/...` | `QWEN_API_KEY` |
-| `copilot` | `https://api.githubcopilot.com` | `GH_TOKEN` |
+| `qwen` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| `anthropic` | `https://api.anthropic.com/v1/` | `ANTHROPIC_API_KEY` |
 
-> **Correction to the README.** It advertises "13 model providers" and lists
-> **Anthropic** among them. There is no `anthropic` built-in. Claude is still
-> reachable — two supported ways, below — but not as a built-in profile.
+Each profile also carries a **label** (shown in the `/model` and `--setup`
+pickers) and a **default model** — `qwen14b-tooluse-v3` for `ollama`,
+`anthropic/claude-sonnet-4` for `openrouter`, `claude-sonnet-4-6` for
+`anthropic`, and so on. The built-in `base_url` is seeded even when only
+`api_key` + `model` are set, so a built-in needs nothing else to load.
+
+> The comment header at the top of the shipped `config.txt` still lists
+> `copilot` and omits `anthropic`. `providers.py` is authoritative — the 12
+> above are what actually exists.
+
+**Native tool-calling** is on for every provider except `ollama`, which is set
+`native_tools=False` because local Ollama models use the prompt-based tool
+convention. Any provider can be flipped with `provider.<name>.native_tools=0`
+or `=1`.
 
 ## Reaching Anthropic / Claude
 
-**Via OpenRouter** (simplest — it's already built in, and its default model is
-`anthropic/claude-sonnet-4`):
+Claude has a built-in `anthropic` profile now, so the direct route needs no
+`litellm`:
+
+```ini
+default_provider=anthropic
+provider.anthropic.model=claude-sonnet-4-6
+provider.anthropic.api_key_env=ANTHROPIC_API_KEY
+```
+
+**Via OpenRouter** is still useful when you want one key covering many vendors
+(its default model is `anthropic/claude-sonnet-4`):
 
 ```ini
 default_provider=openrouter
@@ -39,7 +59,8 @@ provider.openrouter.model=anthropic/claude-sonnet-4
 provider.openrouter.api_key_env=OPENROUTER_API_KEY
 ```
 
-**Direct, via litellm mode:**
+**Direct, via litellm mode** remains available for any provider litellm knows
+but Agent8088 does not:
 
 ```ini
 default_provider=claude
@@ -80,14 +101,31 @@ At runtime:
 
 ```
 /model cerebras:gpt-oss-120b     # switch provider + model
-/models                          # fuzzy picker over the active provider
+/model                           # table of every configured provider
+/models                          # picker over the active provider
 /models groq                     # ...or a named one
 /model setup                     # add/update a provider profile
 ```
 
-`/models` fetches the live list from the provider's `/v1/models`. If that call
-fails, it falls back to asking you to type the model name rather than showing a
-stale hardcoded list.
+`/models` fetches the live list from the provider's `/v1/models` (disk-cached
+for an hour). When that request fails it falls back to the provider's bundled
+`FALLBACK_MODELS` entry rather than asking you to type a name; only a provider
+with neither reaches the free-text prompt.
+
+### The `auto` ladder
+
+`/model auto`, `auto:fast` and `auto:smart` select a **strength ladder** built
+from `auto_chain=provider:model,provider:model,...` — cheapest rung first.
+Escalation is evidence-driven: a truncated response, repeated invalid tool
+calls, or no progress on a turn climbs one rung, and the rung resets at the
+start of each turn. `auto` and `auto:fast` start at the bottom; `auto:smart`
+starts at the top. Build a chain from your keyed providers with `/model auto
+setup`, which probes reachability and orders candidates weakest-first.
+
+The ladder is deliberately **not** `fallback_models`: fallback answers "what to
+try when this model is unreachable" (ordered by preference), the ladder answers
+"what is stronger" (ordered by capability). With any explicit model selected,
+`auto_chain` is never read.
 
 ## Fallback chains
 
@@ -96,8 +134,10 @@ fallback_models=groq:llama-3.3-70b-versatile,gemini:gemini-2.0-flash
 ```
 
 Tried in order when the primary fails with a **retryable** error — HTTP 429,
-503, or a connection error. Deterministic failures (401, 400) do not trigger
-fallback, because retrying a bad key on a different provider just wastes a call.
+5xx, or a timeout/connection error. Deterministic failures (401, 400) do not
+trigger fallback, because retrying a bad key on a different provider just wastes
+a call. Before moving on, the same provider is retried with exponential backoff
+(`api_max_retries`, default 3; `0` means immediate failover).
 
 ## API keys
 
@@ -120,9 +160,19 @@ are in [Configuration](02-configuration.md#api-keys-and-the-env-store).
 |---|---|
 | temperature | `/temp <float>` at runtime |
 | max agent turns | `/maxturns <int>` |
-| `context_window` | `config.txt` — history trim budget |
-| `frequency_penalty`, `presence_penalty` | `config.txt` |
+| `context_window` | `config.txt` — global fallback when the active model has no better value |
+| `max_completion_tokens` | `config.txt` — global output ceiling, sized for long chat answers |
+| `frequency_penalty`, `presence_penalty` | `config.txt` (0 by default; sent only when non-zero) |
 | `timeout_seconds` | `config.txt` (default 120) |
+
+`provider.<name>.context_window` and `provider.<name>.max_completion_tokens`
+override the globals for one provider, and are auto-applied on `/model switch`.
+When neither is set, Agent8088 probes the endpoint for the model's own limits —
+Ollama's `/api/show`, Gemini's native model endpoint, Anthropic's Models API, or
+the non-standard fields some OpenAI-compatible `/v1/models` responses carry —
+and falls back to the globals only when the probe finds nothing. The active
+pair is re-read by every token-limit consumer, so `/doctor` and the context
+meter agree with the wire.
 
 ## Tool-calling compatibility
 
@@ -134,6 +184,11 @@ recover, bounded to avoid infinite retries.
 
 This is why a small local model still works: correctness doesn't depend on the
 provider implementing tool-calling perfectly.
+
+With `native_tools` enabled the full tool schemas go on the wire; with it off
+(`ollama` by default) the prompt carries the tool index and `describe_tool` can
+load one schema on demand. `tool_selection=hybrid` narrows the native schema set
+to the most relevant tools per request.
 
 ## Fusion — cross-provider panel + judge
 

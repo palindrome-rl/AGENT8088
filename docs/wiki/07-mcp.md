@@ -124,16 +124,17 @@ Client config:
 
 ### What's exposed
 
-Read-only by default — 6 tools (`EXPOSED_TOOLS` in `src/agent8088/mcp_server.py`):
+Read-only by default — 7 tools (`EXPOSED_TOOLS` in `src/agent8088/mcp_server.py`):
 
 | Tool | |
 |---|---|
 | `read_text` | read a file |
 | `calculate` | evaluate an expression |
-| `web_search` | SearXNG search |
+| `web_search` | routes to whichever backend is configured (SearXNG / Tavily / Exa / ddgs) |
 | `get_page_title` | fetch a page title |
 | `last_output` | previous tool output |
 | `describe_capabilities` | what this server can do, and its active limits and guardrails |
+| `describe_tool` | describe one named tool's live schema |
 
 `describe_capabilities` lets a host agent ask what this server actually offers
 instead of hardcoding assumptions about it. It reads only Agent8088's own

@@ -278,6 +278,6 @@ than blanking it.
 Every adapter implements one `BaseChannelAdapter` interface and the gateway
 reuses `run_agent()` — the same engine core as the CLI and MCP server. Adapters
 translate transport details; they do **not** re-implement permissions. That's
-why a fix to the permission layer applies to all three platforms at once.
+why a fix to the permission layer applies to all five platforms at once.
 
 See [Architecture](11-architecture.md).

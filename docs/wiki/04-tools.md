@@ -24,29 +24,50 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | Tool | Mode | Args | readonly? | What it does |
 |---|---|---|---|---|
 | `read_text` | `read_text` | `filename`, `offset`*, `limit`* | ✅ | Read a file. Extracts `.docx`/`.xlsx`/`.pptx`/`.pdf` to text. Paginated. Refuses credential files. |
-| `write_file` | `write_text` | `filename`, `content` | prompt | Write a file. Path-zone + sensitive + shell-rc checked. |
+| `write_file` | `write_text` | `filename`, `content`*, `source_url`* | prompt | Write a file, or fetch and save binary/remote content from a URL. Path-zone + sensitive + shell-rc checked. |
+| `edit_file` | `write_text` | `filename`, `old_string`, `new_string`* | prompt | Exact-replacement edit of one matching place; refuses an ambiguous match and writes nothing. Empty `new_string` deletes it. |
+| `read_content` | `last_output` | `ref`, `offset`*, `length`* | ✅ | Read a window from a session-scoped content ref, without re-reading the source. |
+| `document_read` | `read_text` | `filename`, `action`*, `cursor`*, `query`*, `version`* | ✅ | Cached document extraction with lossless cursors: `overview`, `search`, `read`, `process` (whole-document synthesis outside the turn loop). Never obeys instructions in documents. |
+| `repository_read` | `read_text` | `source`, `action`*, `path`*, `query`*, `cursor`*, `snapshot_id`*, `include`*, `exclude`*, `revision`* | ✅ | Survey a local directory or an HTTPS github.com repo: `overview`, `search`, `read`. Remote defaults to root files only and needs permission. Untrusted evidence. |
+| `repo_map` | `repomap` | `focus`*, `budget`*, `detail_level`* | ✅ | Outline the repository's most depended-on classes and functions, ranked by dependents. Definition lines only. |
+| `generate_tests` | `autotest` | `filename`, `focus`* | prompt | Write and run tests for a source file via a sub-agent that may not change the code under test; the file is hashed and restored if it was. |
+| `run_tests` | `shell` | `path`* | depends | Detect the project's test framework and run it. Prefer over `execute_shell`. |
 | `execute_shell` | `shell` | `command` | safe list only | Run a shell command. |
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
-| `last_output` | `last_output` | — | ✅ | Re-read the previous tool's output without re-running it. |
+| `last_output` | `last_output` | `ref`*, `offset`*, `length`* | ✅ | Re-read the previous tool's output without re-running it; pass a truncation `ref` to read the elided part. |
+| `memory_forget` | `memory` | `query` | prompt | Delete one specific memory, but only when exactly one clearly matches; several matches are listed back instead. |
 | `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails. |
+| `describe_tool` | `introspect` | `tool_name` | ✅ | Describe one named tool's live schema — purpose, required/optional args and types. |
 | `web_search` | `search` | `query` | prompt by default | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url`, `task` | prompt | Headless browser — click, fill forms, navigate, and extract via natural-language instructions, not just read static text. |
 | `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
 | `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. |
 | `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
-| `schedule_task` | `cron` | `action`, `schedule`, `task` | prompt | Add/list/remove a scheduled run. |
+| `schedule_task` | `cron` | `action`, `schedule`*, `task`* | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
-| `create_subagent` | `write_text` | `name`, `description`, `tools`, `max_turns`, `model`, `prompt` | escalates | Create a custom sub-agent profile in `user_agents_dir`. |
+| `create_subagent` | `write_text` | `name`, `description`, `tools`, `max_turns`, `model`*, `prompt` | escalates | Create a custom sub-agent profile in `user_agents_dir`. |
 | `present_plan` | `plan` | `plan` | ✅ | Show a plan as markdown and ask the user to approve it (plan mode's exit point). |
 | `execute_plan` | `plan` | `steps` | ✅ | Run an already-decided sequence of tool calls, verified step by step. |
-| `git_status` | `shell` | — | depends | `git status`. |
-| `git_diff` | `shell` | — | depends | `git diff`. |
-| `git_log` | `shell` | — | depends | `git log`. |
+| `git_status` | `shell` | `repo`* | depends | `git status --short --branch`. |
+| `git_diff` | `shell` | `repo`* | depends | Uncommitted working-tree diff only — never a branch's or commit's changes. Use `review_code` for those. |
+| `git_log` | `shell` | `repo`* | depends | `git log --oneline -20`. |
+| `git_init` | `shell` | `directory`* | prompt | Initialise a repository. Host-only: the sandbox cannot write refs. |
 | `git_clone` | `shell` | `url`, `directory` | prompt | Clone a repo. |
-| `git_commit` | `shell` | `message` | prompt | Commit staged changes. |
-| `git_push` | `shell` | — | **blocked** | Refused at the always-on floor. |
+| `git_branch` | `shell` | `name`, `repo`* | prompt | Create a branch without switching. Use this rather than `git branch` through `execute_shell`, which the sandbox refuses. |
+| `git_checkout` | `shell` | `name`, `create`*, `repo`* | prompt | Switch branches (or create and switch with `create=true`). Refuses rather than discarding uncommitted work. |
+| `git_commit` | `shell` | `message`, `repo`* | prompt | Stage all changes and commit. Only when the user asked. |
+| `git_push` | `shell` | `remote`*, `branch`*, `set_upstream`*, `repo`* | **blocked** | Refused at the always-on floor, and separately requires a grant bound to the exact target. |
 | `git_create_pr` | `shell` | `title`, `body` | prompt | Open a PR via `gh`. |
+| `git_remote` | `shell` | `action`, `name`*, `url`*, `repo`* | prompt | Inspect/configure remotes: `list`, `add`, `set-url`, `remove`. |
+| `check_local_hardware` | `local_models` | — | ✅ | Probe RAM and NVIDIA VRAM and recommend which local Ollama models fit. Read-only, loopback only. |
+| `list_local_models` | `local_models` | — | ✅ | List installed local Ollama models and which are loaded. Read-only, loopback only. |
+| `pull_local_model` | `local_models` | `name` | prompt | Download a model into the local Ollama daemon. |
+| `remove_local_model` | `local_models` | `name` | prompt | Delete a model from the local Ollama daemon's disk. |
+| `add_mcp_server` | `mcp_manage` | `name`, `transport`, `command`*, `args`*, `url`*, `env`*, `bearer_token_env`*, `project`* | prompt | Configure and connect an MCP server (stdio or http), immediately reloading its tools. |
+| `list_mcp_servers` | `mcp_manage` | — | ✅ | List configured MCP servers, connection state, and exposed tools. Read-only. |
+| `remove_mcp_server` | `mcp_manage` | `name`, `project`* | prompt | Remove a configured MCP server. |
+| `review_code` | `code_review` | `repo`*, `scope`*, `base`*, `head`*, `commit`*, `mode`*, `background`*, `pull_request`* | prompt | Review a diff and report findings with file, line and severity. See [`review_code`](#review_code). |
 | `view_skill` | `skill` | `name`, `resource` | ✅ | Load one path-confined text resource from an enabled progressive skill. |
 | `cli_anything_status` | `cli_anything` | — | ✅ | Report the isolated CLI-Anything runtime state. |
 | `cli_anything_setup` | `cli_anything` | — | prompt | Install pinned CLI-Hub into its isolated environment. |
@@ -67,11 +88,16 @@ Reading is automatic: point `read_text` at a `.docx`, `.xlsx`, `.pptx` or `.pdf`
 and it comes back as text. `.docx` and `.pptx` are parsed with the standard
 library; `.xlsx` uses openpyxl and `.pdf` uses pypdf. A scanned PDF with no text
 layer says so rather than returning a blank-looking document. Files larger than
-`max_document_bytes` (25 MB) are refused.
+`max_document_bytes` (25 MB) are refused, and extracted text stops at 5 MB of
+accumulated output no matter how far into the document that falls.
 
 Long files arrive one page at a time with a header naming the true line count —
 pass `offset` to continue, `limit` to change the page size (`read_page_lines`,
-default 200). Short files are returned whole with no header.
+default 200). Short files are returned whole with no header. `document_read`
+adds the stateful layer on top: `overview`, `search` at a lossless cursor,
+`read`, and `process` for whole-document synthesis — the last runs every chunk
+outside the main turn loop and returns page-referenced evidence, resumable by
+repeating the same query.
 
 Writing has two routes. The `documents` skill teaches the agent to write
 `python-docx`/`openpyxl`/`python-pptx`/`reportlab` code and run it through
@@ -89,6 +115,35 @@ of them instead of needing a parallel set that could drift.
 > without a prompt under the native sandbox, escalated under `local`, because
 > reading a repo unsandboxed can surface credential content.
 
+## `review_code`
+
+One tool backs both the model's `review_code(...)` and the CLI's `/review`.
+It is off until the engine is installed and `open_code_review_enabled=1`; it is
+blocked outright in plan-only, and it needs host-shell inspection permission
+before it reads the repository.
+
+`scope` picks what is reviewed:
+
+| `scope` | Covers |
+|---|---|
+| `workspace` (default) | Uncommitted work only — **not** the branch's commits. A workspace review that finds the branch ahead of its base says those commits were not reviewed. |
+| `range` | A branch or range. Pass `head`; leave `base` out and the fork point is inferred. |
+| `commit` | One commit, by SHA. |
+| `pull_request` | A GitHub PR, passed as its complete `https://` URL, fetched locally with `gh` and reviewed as a range. A PR is **a separate grant** from a local repository: it reaches the network and lands someone else's code on disk, so it is asked for independently. |
+
+`mode` is `native` (OpenCodeReview's own reviewer runs the pass, using this
+session's provider through a transient subprocess environment), `delegated`
+(scope, rules and the diff are returned for this agent to review in its own
+context), or `auto` (the configured default — native when credentials exist,
+else delegated). The result says which ran; an explicit mode never falls back
+silently. The mode can also be set with `open_code_review_mode`.
+
+What it does **not** do: propose or apply a fix. It reports findings with file,
+line, severity and category, redacts them, and stores them so `/review --resume
+<id>` can re-check each position later. Findings are evidence, not
+authorisation — a line still has to be read before it is changed. This is the
+code reviewer, not the document OCR in `ocr.py`; both upstreams use "OCR".
+
 ## Aliases
 
 The model can call tools by natural names; they resolve to the canonical tool:
@@ -98,8 +153,9 @@ The model can call tools by natural names; they resolve to the canonical tool:
 | `bash`, `sh`, `shell`, `run` | `execute_shell` |
 | `search`, `web`, `google` | `web_search` |
 | `read`, `cat` | `read_text` |
-| `write`, `create_file` | `write_file` |
+| `write`, `create_file`, `writefile` | `write_file` |
 | `calc`, `eval`, `math` | `calculate` |
+| `last`, `prev_output` | `last_output` |
 
 ## Argument transforms
 
@@ -119,14 +175,21 @@ the agent recovers instead of looping when the model invents a tool that
 | `write_text` | write — path zones, sensitive + shell-rc floor |
 | `shell` | command classifier + sandbox |
 | `http_get` / `http_post` | network + SSRF + content wrapping |
+| `search` | network — prompt unless a no-prompt local SearXNG or the ddgs-only chain is in effect |
 | `browser` | network + SSRF |
 | `docker` | sandbox |
-| `cron` | scheduled side effect |
+| `cron` | scheduled side effect — `list` alone is allowed in readonly and plan-only |
 | `subagent` | recursion-depth guarded |
+| `autotest` | delegates to the test-writer sub-agent, then verifies the source file was not modified |
 | `python_eval` | pure computation — allowed in readonly |
 | `last_output` | pure recall — allowed in readonly |
 | `plan` | the plan-only entry point |
 | `introspect` | self-report — allowed in **every** mode; touches no file, socket, or process |
+| `memory` | one-match-only deletion of a stored memory |
+| `repomap` | definition-line outline only — no permission gate, discloses less than the reads it saves |
+| `local_models` | probe/list are read-only loopback calls; pull/remove take the host-shell gate |
+| `mcp_manage` | list is read-only; add/remove take the host-shell gate |
+| `code_review` | host-shell inspection gate, plus a *separate* grant for a PR checkout; blocked in plan-only |
 | `mcp` | external MCP tool — see [MCP](07-mcp.md) |
 | `skill` | path-confined local text loading for enabled progressive skills |
 | `cli_anything` | action-specific catalog, package-change, or host-execution permission checks |

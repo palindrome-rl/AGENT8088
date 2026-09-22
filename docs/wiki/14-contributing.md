@@ -12,8 +12,9 @@ python -m venv .venv
 AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest tests/ -q
 ```
 
-Install **both** extras. Without `gateway`, ~19 platform tests fail at import and
-look like real breakage.
+Install **both** extras. Without `gateway`, `test_gateway_core.py` and
+`test_gateway_startup.py` fail at import (they import the Slack/Discord
+adapters directly) and look like real breakage.
 
 ## Non-negotiable safety rules
 
@@ -98,17 +99,18 @@ VERIFY_HOME="$(mktemp -d)"; AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIF
   .venv/bin/python scripts/verify_features.py; rm -rf -- "$VERIFY_HOME"
 ```
 
-Or invoke the `pr-check` skill, which also does the baseline comparison.
-
 There is **no CI** — GitHub Actions is blocked by a billing issue on this
-account. Local runs are the gate.
+account, and no `.github/workflows/` are checked in. Local runs are the gate.
 
 ## Branch and PR conventions
 
 - Branch from `development`, not `main`.
-- **Never push to `main` or `development` directly.** Open a PR.
-  (`.claude/hooks/guard-protected-push.sh` enforces this from the Bash tool.)
-- Conventional commit prefixes: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`.
+- **Never push to `main` or `development` directly.** Open a PR. (There is no
+  repo-level hook enforcing this — it's discipline, backed by whatever branch
+  protection is configured on GitHub.)
+- Commit messages here are plain imperative sentences, not conventional-commit
+  prefixes — `git log` shows none of `feat:`/`fix:`/`docs:` in recent history.
+  Match that style rather than prefixing.
 - In the PR body, state: what changed, the repro that proves it, verification
   output, and anything you deliberately left out.
 - Flag behaviour changes that could break an existing setup. A security

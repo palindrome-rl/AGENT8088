@@ -62,8 +62,10 @@ Install the extras you actually need:
 |---|---|
 | *(base)* | CLI, all 56 tools, MCP client and server, `browse_page`, keyless web search |
 | `gateway` | Slack, WhatsApp, Discord, Telegram and Email adapters |
-| `dev` | `pytest` for the test suite |
-| `litellm` | Alias — `litellm` is already a base dependency |
+| `repository` | `gitingest`, for `repository_read`'s remote (github.com) mode |
+| `repomap` | `tree-sitter` + `tree-sitter-language-pack`, for `repo_map` |
+| `dev` | `pytest`, `ruff`, `pip-audit` for the test suite and lint/audit gates |
+| `litellm`, `browser`, `search` | Aliases — all three are already base dependencies |
 
 Playwright, `browser-use`, `litellm` and `ddgs` are **base** dependencies, not
 extras — `browse_page` and the keyless search fallback should not depend on how
@@ -178,5 +180,5 @@ On Windows, `config.txt` and `.env` live at `%LOCALAPPDATA%\agent8088\`.
 ## Next
 
 - [Configuration](02-configuration.md) — every key explained
-- [CLI Reference](10-cli-reference.md) — all flags and 46 slash commands
+- [CLI Reference](10-cli-reference.md) — all flags and 45 slash commands
 - [Tools](04-tools.md) — what the agent can actually do
