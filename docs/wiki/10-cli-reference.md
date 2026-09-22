@@ -168,7 +168,7 @@ sensitive-file floor still applies unconditionally.
 | `/agents new [name]` | Create a custom sub-agent profile interactively |
 | `/agents edit <name>` | Open a custom profile in `$EDITOR` |
 | `/agents delete <name>` | Delete a custom profile (bundled ones are refused) |
-| `/agent <type> <task>` | Run a sub-agent directly |
+| `/agent <type> <task>` | Run a sub-agent directly; the prompt stays on it until `/quit` |
 | `/skills` | List skills; `disable`/`enable <name>` |
 | `/cli-anything [task]` | Show integration status, or route a task through the CLI-Anything skill |
 
