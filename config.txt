@@ -439,7 +439,7 @@ web_search_no_prompt=1
 
 project_root=.
 
-default_provider=custom
+default_provider=ollama-cloud
 
 provider.custom.base_url=http://127.0.0.1:8080/v1
 
