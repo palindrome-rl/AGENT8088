@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / benchmark mode (query as args, optional --trace)
 """
-import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.parse  # readline enables input history
+import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request  # readline enables input history
 from collections import Counter
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
@@ -5373,6 +5373,110 @@ def _http_placeholder_error(spec: dict, url: str):
             f"{hint}.")
 
 
+class BlockedAddress(urllib.error.URLError):
+    """A connection refused because the address it would reach is internal."""
+
+
+def _vetted_address(host: str, port: int):
+    """Resolve `host` and return the one address a connection may use.
+
+    None means "no pinning required" -- the policy already permits this host
+    outright (ssrf_allow_private, or an ssrf_allow_hosts entry naming an
+    internal service on purpose).
+
+    Refuses if ANY answer is internal, the same rule _ssrf_check applies: a
+    round-robin record mixing a public and a loopback address must not become
+    usable by picking the convenient one.
+    """
+    import ipaddress
+    import socket as _socket
+
+    if SSRF_ALLOW_PRIVATE or _ssrf_host_allowlisted(host, port):
+        return None
+    try:
+        infos = _socket.getaddrinfo(host, port)
+    except OSError:
+        raise BlockedAddress(f"Blocked: could not resolve host '{host}'.") from None
+    chosen = None
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            raise BlockedAddress("Blocked: unresolvable address.") from None
+        if _ip_is_internal(ip):
+            raise BlockedAddress(_internal_address_refusal(host, ip))
+        chosen = chosen or info[4][0]
+    if chosen is None:
+        raise BlockedAddress("Blocked: unresolvable address.")
+    return chosen
+
+
+def _pinned_connection(base):
+    """A connection class that talks only to the address it just vetted.
+
+    _ssrf_check resolves the hostname and passes judgement; urllib then
+    resolved the same name a second time, independently. A record under an
+    attacker's control with a short TTL answers public for the check and
+    127.0.0.1 for the connection -- and the body of a loopback service (this
+    machine's own web bridge, Ollama, a metadata endpoint) comes back to the
+    agent. _browser_address_check already closes this window for the browsing
+    proxy; this closes it for urllib.
+
+    Only the socket's destination is overridden, so the Host header, SNI and
+    certificate validation still use the real hostname.
+    """
+    import socket as _socket
+
+    class _PinnedConnection(base):
+        def connect(self):
+            pinned = _vetted_address(self.host, self.port)
+            if pinned is not None:
+                def _connect_to_pinned(address, timeout=None, source_address=None):
+                    # socket.create_connection is looked up on the module at
+                    # call time, not captured, so the sandbox's own patches
+                    # (and tests) still see the call.
+                    return _socket.create_connection(
+                        (pinned, address[1]), timeout, source_address)
+
+                self._create_connection = _connect_to_pinned
+            super().connect()
+
+    return _PinnedConnection
+
+
+def _build_safe_opener(*handlers):
+    """An opener whose every connection is address-vetted at connect time."""
+    import http.client
+
+    class _SafeHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_pinned_connection(http.client.HTTPConnection), req)
+
+    class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(
+                _pinned_connection(http.client.HTTPSConnection), req,
+                context=self._context)
+
+    return urllib.request.build_opener(
+        _SafeHTTPHandler(), _SafeHTTPSHandler(), *handlers)
+
+
+def _blocked_reason(exc: BaseException) -> str:
+    """The refusal text from a BlockedAddress, however deeply urllib wrapped it.
+
+    urllib's do_open re-wraps any OSError it sees -- and URLError is one -- so
+    the refusal arrives nested rather than as the exception we raised.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, BlockedAddress):
+            return str(exc.reason)
+        exc = getattr(exc, "reason", None) if isinstance(exc, urllib.error.URLError) else None
+    return ""
+
+
 def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
     """SSRF-guarded HTTP GET/POST with optional auth headers and a jq filter.
 
@@ -5430,7 +5534,7 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
 
     request = urllib.request.Request(
         url, data=data, headers=headers, method="POST" if mode == "http_post" else "GET")
-    opener = urllib.request.build_opener(SafeRedirectHandler())
+    opener = _build_safe_opener(SafeRedirectHandler())
     try:
         with opener.open(request, timeout=timeout) as response:
             raw = response.read(MAX_HTTP_BYTES + 1)
@@ -5440,7 +5544,8 @@ def _exec_http(mode: str, spec: dict, args: dict, timeout: int) -> str:
         detail = raw[:MAX_HTTP_BYTES].decode(errors="replace").strip()
         return f"HTTP {exc.code}: {detail or exc.reason}"
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return f"HTTP request failed: {exc}"
+        # A policy refusal is not a transport failure -- say which it was.
+        return _blocked_reason(exc) or f"HTTP request failed: {exc}"
     if len(raw) > MAX_HTTP_BYTES:
         return f"HTTP response exceeded the {MAX_HTTP_BYTES}-byte limit."
     result = raw.decode(encoding, errors="replace")
@@ -5485,7 +5590,7 @@ def _fetch_url_bytes(url: str) -> tuple:
         url,
         headers={"User-Agent": "Mozilla/5.0 (compatible; Agent8088)"},
     )
-    opener = urllib.request.build_opener(SafeRedirectHandler())
+    opener = _build_safe_opener(SafeRedirectHandler())
     try:
         with opener.open(request, timeout=25) as response:
             raw = response.read(MAX_HTTP_BYTES + 1)
@@ -5493,7 +5598,8 @@ def _fetch_url_bytes(url: str) -> tuple:
     except urllib.error.HTTPError as exc:
         return (None, f"HTTP {exc.code}: {exc.reason}", None)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return (None, f"Fetch failed: {exc}", None)
+        # A policy refusal is not a transport failure -- say which it was.
+        return (None, _blocked_reason(exc) or f"Fetch failed: {exc}", None)
 
     if len(raw) > MAX_HTTP_BYTES:
         return (None, f"Remote file exceeded the {MAX_HTTP_BYTES}-byte limit.", None)

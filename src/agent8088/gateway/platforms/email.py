@@ -20,6 +20,7 @@ Requires (set in config.txt):
 import asyncio
 import email as email_lib
 import logging
+import re
 import smtplib
 import socket
 from email.header import decode_header
@@ -80,18 +81,59 @@ def _is_automated_sender(from_addr: str, msg: email_lib.message.Message) -> bool
     return False
 
 
+def _domain_of(address: str) -> str:
+    """The domain part of an address or a bare domain, lowercased."""
+    return (address or "").strip().strip("<>").rsplit("@", 1)[-1].strip().lower().rstrip(".")
+
+
+def _domains_aligned(candidate: str, from_domain: str) -> bool:
+    """DMARC relaxed alignment: equal, or a subdomain of the From domain.
+
+    Anchored on the dot, so notallowlisted.example is not treated as a
+    subdomain of allowlisted.example the way a plain endswith() would.
+    """
+    if not candidate or not from_domain:
+        return False
+    return candidate == from_domain or candidate.endswith("." + from_domain)
+
+
 def _verify_sender(msg: email_lib.message.Message) -> bool:
-    """Check SPF/DKIM/DMARC authentication results. Fail-closed if no header."""
+    """Authenticate the From header. Fail-closed if there is no result header.
+
+    The From header is what authorizes the message a moment later
+    (Allowlist.is_allowed), so it is the From header that has to be
+    authenticated -- not merely some domain in the message.
+
+    A bare `spf=pass` or `dkim=pass` does not do that, and accepting one was an
+    impersonation hole: SPF authenticates the SMTP envelope sender
+    (smtp.mailfrom) and DKIM authenticates the signing domain (header.d), and
+    neither has to match From. Mail sent from an attacker's own domain passes
+    SPF for that domain while carrying `From: someone@allowlisted.example`.
+
+    So: DMARC pass, which checks alignment by definition; or an SPF/DKIM pass
+    whose domain this function checks is aligned with From itself, for
+    receivers that report no dmarc= result of their own.
+    """
     auth_results = msg.get("Authentication-Results", "")
     if not auth_results:
         return False
     auth_lower = auth_results.lower()
-    if "dmarc=pass" in auth_lower:
+    if re.search(r"\bdmarc\s*=\s*pass\b", auth_lower):
         return True
-    if "spf=pass" in auth_lower:
-        return True
-    if "dkim=pass" in auth_lower:
-        return True
+    from_domain = _domain_of(_extract_email_address(_decode_header_value(msg.get("From", ""))))
+    if not from_domain:
+        return False
+    # Each mechanism is paired with the identity it actually authenticated;
+    # only a result whose identity aligns with From counts.
+    for mechanism, identities in (("spf", ("smtp.mailfrom", "smtp.helo")),
+                                  ("dkim", ("header.d", "header.i"))):
+        if not re.search(r"\b" + mechanism + r"\s*=\s*pass\b", auth_lower):
+            continue
+        for identity in identities:
+            for match in re.finditer(
+                    re.escape(identity) + r"\s*=\s*([^\s;,()]+)", auth_lower):
+                if _domains_aligned(_domain_of(match.group(1)), from_domain):
+                    return True
     return False
 
 

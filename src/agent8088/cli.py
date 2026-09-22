@@ -7851,7 +7851,9 @@ def main():
     parser.add_argument("--web-port", type=int, default=8180,
                         help="port for the web UI server (default 8180)")
     parser.add_argument("--web-host", default="127.0.0.1",
-                        help="bind host for the web UI server (default 127.0.0.1, loopback only)")
+                        help="bind host for the web UI server (default 127.0.0.1; "
+                             "loopback only -- the API is unauthenticated, so a "
+                             "non-loopback host is refused)")
     parser.add_argument("--web-dev", action="store_true",
                         help="with --web: run in dev mode (don't serve built files, use Vite dev server)")
     parser.add_argument("--mcp-serve", action="store_true", help="run Agent8088 as an MCP server (expose tools to external AI agents)")
@@ -7942,7 +7944,12 @@ def main():
         from agent8088.web_server import run_web_server
         project_root = Path(__file__).resolve().parents[2]
         dev_from_uv = bool(os.environ.get("UV")) and (project_root / "web" / "package.json").exists()
-        run_web_server(host=args.web_host, port=args.web_port, dev=args.web_dev or dev_from_uv)
+        try:
+            run_web_server(host=args.web_host, port=args.web_port, dev=args.web_dev or dev_from_uv)
+        except ValueError as exc:
+            # A refused bind host is the operator's mistake, not a crash.
+            print(f"agent8088 --web: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
         return
     if args.full_auto:
         A.PERMISSION_MODE = "full-auto"

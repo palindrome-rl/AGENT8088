@@ -69,12 +69,37 @@ def test_session_name_at_the_limit_is_accepted(client):
         ("post", "/api/fusion/run", {"question": ""}),
         ("post", "/api/search/use", {"provider": "nope"}),
         ("delete", "/api/agents/no-such-agent", None),
+        # Rename and delete kept answering 200 with an {"error": ...} body long
+        # after the rest of the bridge was fixed. apiFetch only throws on
+        # !res.ok, so onSuccess ran: the rename dialog closed as though the
+        # rename had happened, and a failed delete reported nothing at all.
+        ("patch", "/api/sessions/no-such-session-xyz", {"new_name": "whatever"}),
+        ("delete", "/api/sessions/no-such-session-xyz", None),
     ],
 )
 def test_error_responses_use_a_4xx_status(client, method, path, payload):
     call = getattr(client, method)
     response = call(path, json=payload) if payload is not None else call(path)
     assert response.status_code >= 400, response.text
+    assert "error" in response.json()
+
+
+def test_renaming_onto_an_existing_session_is_a_conflict(client):
+    from agent8088 import cli
+
+    for name in ("alpha", "beta"):
+        (cli.SESSIONS_DIR / f"{name}.json").write_text('{"messages": []}')
+    response = client.patch("/api/sessions/alpha", json={"new_name": "beta"})
+    assert response.status_code == 409, response.text
+    assert "beta" in response.json()["error"]
+
+
+def test_an_invalid_new_name_is_a_validation_error(client):
+    from agent8088 import cli
+
+    (cli.SESSIONS_DIR / "alpha.json").write_text('{"messages": []}')
+    response = client.patch("/api/sessions/alpha", json={"new_name": "x" * 5000})
+    assert response.status_code == 400, response.text
 
 
 # --- W-08: unvalidated numeric settings -------------------------------------
