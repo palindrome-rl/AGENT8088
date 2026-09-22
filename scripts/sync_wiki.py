@@ -29,7 +29,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = "tayyabimam1/AGENT8088"
+REPO = "palindrome-rl/AGENT8088"
+# The branch these pages are generated from. Source links must point at the
+# branch that produced them, or a reader follows them to different text.
+SOURCE_BRANCH = "staging-1.2"
 SOURCE_DIR = Path(__file__).resolve().parent.parent / "docs" / "wiki"
 
 # source filename -> wiki page name (no .md). Order defines the sidebar.
@@ -85,7 +88,7 @@ BANNER = (
 
 SOURCE_NOTE = (
     "\n\n---\n\n*Source of truth: [`docs/wiki/`](https://github.com/"
-    f"{REPO}/tree/development/docs/wiki) in the main repository. "
+    f"{REPO}/tree/{SOURCE_BRANCH}/docs/wiki) in the main repository. "
     "Edits here are overwritten by the next sync.*\n"
 )
 
@@ -176,8 +179,14 @@ def main() -> int:
                   f"first page is saved in the UI.\n{result.stderr}", file=sys.stderr)
             return 1
 
+        # Remove only the pages this script owns. The wiki is shared across
+        # branches -- GitHub gives a repository one wiki, not one per branch --
+        # so deleting every page here would erase anything published beside
+        # these, including another channel's pages, on the next sync.
+        owned = {name for name in converted}
         for existing in clone.glob("*.md"):
-            existing.unlink()
+            if existing.name in owned:
+                existing.unlink()
         for name, body in converted.items():
             (clone / name).write_text(body, encoding="utf-8")
 
