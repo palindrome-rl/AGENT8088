@@ -32,7 +32,7 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 | **Use the model you want** | 12 built-in provider profiles, local Ollama, OpenRouter, and custom OpenAI-compatible endpoints. Configure fallback models for retryable provider failures. |
 | **Work safely by default** | `readonly` is the default. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
-| **Delegate without losing context** | Five restricted sub-agent profiles handle exploration, research, coding, verification, and general-purpose work in separate runs. |
+| **Delegate without losing context** | Six restricted sub-agent profiles handle exploration, research, coding, test writing, verification, and general-purpose work in separate runs. |
 | **Use tools without lock-in** | Built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, CLI-Anything, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
 | **Read images without a vision model** | Attached screenshots and scanned PDFs are transcribed by a local OCR engine when the active model has no vision of its own. Multimodal models are untouched and keep using their own capability. |
 | **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store. Nothing leaves your machine. |
@@ -49,14 +49,21 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "development"; iex (irm https://agent8088-installer.pages.dev/install.ps1)
+$env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
 ```
+
+> **Correction.** This previously pointed at `agent8088-installer.pages.dev`, a
+> domain with no corresponding Pages deploy config or CNAME anywhere in this
+> repo. `raw.githubusercontent.com` against the actual `origin` remote
+> (`palindrome-rl/AGENT8088`) is what [Getting
+> Started](docs/wiki/01-getting-started.md) uses and what is verifiable from
+> the tree.
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 

@@ -15,11 +15,26 @@ the plan finishes, so it is not a value `--mode` or `/mode` accepts.
 
 | Mode | Reads | Writes / shell / network | How to get a mutation through |
 |---|---|---|---|
-| **`readonly`** *(default)* | allowed | refused | per-action `y/N` prompt |
-| **`full-auto`** | allowed | allowed, no prompt | — |
+| **`readonly`** | allowed | refused | per-action `y/N` prompt |
+| **`full-auto`** *(default)* | allowed | allowed, no prompt | — |
 | **`plan-only`** | allowed | refused | approve a whole plan up front |
 
-`--full-auto` is a shorthand for `--mode full-auto`.
+> **Correction.** An earlier version of this page said `readonly` is the
+> default. Verified from `engine.py`: `PERMISSION_MODE` is set from
+> `AGENT8088_PERMISSION`, falling back to `APP_CONFIG.get("default_permission_mode",
+> "full-auto")` — and the shipped `config.txt` never sets
+> `default_permission_mode`, so a fresh install with no `--mode` flag starts in
+> **`full-auto`**, not `readonly`. Confirmed by importing the engine against a
+> nonexistent config and reading `PERMISSION_MODE` back: it comes back
+> `full-auto`. Pass `--mode readonly` (or set `default_permission_mode=readonly`
+> in `config.txt`) if you want the cautious starting point. See
+> [Configuration](02-configuration.md#approvals).
+
+`--full-auto` is a shorthand for `--mode full-auto` — redundant against the
+default, but useful to state the mode explicitly in a script, or to override a
+config-level `readonly` default for one run. `--mode` only accepts `readonly`
+and `full-auto`; `edit` is accepted at the `/mode` command as a backward-compat
+alias for `full-auto`, not a third mode.
 
 ### What readonly actually allows
 
@@ -242,17 +257,8 @@ to a bare IP address of any kind — that is what catches an internal address
 written in an obfuscated form (`http://2130706433/` is `127.0.0.1`); use a
 hostname for a public site.
 
-Two caveats worth knowing:
+One caveat worth knowing:
 
-- **`ssrf_allow_hosts` ships non-empty by default** (`127.0.0.1,localhost`, so
-  local tooling stays reachable out of the box), which means the
-  obfuscated-IP-literal check above is inactive by default, not just when an
-  operator deliberately widens it. This does not reopen anything the default
-  didn't already allow in plain form — loopback access was already permitted —
-  but it does mean the obfuscated-form protection only actually applies once
-  `ssrf_allow_hosts` is emptied out. Non-loopback private ranges (RFC1918,
-  link-local, the cloud-metadata address) stay checked regardless, since the
-  filtering proxy resolves the real address before deciding, obfuscated or not.
 - That second layer covers navigation, so a *subresource* request a page makes
   to another port on your own machine (`http://127.0.0.1:<port>/...`) is the
   one case neither layer catches.
@@ -538,14 +544,29 @@ so "which guardrails are active?" in chat gets the same facts. See
 
 ## Verifying any of this yourself
 
-Every claim above is covered by the suites:
+> **Correction.** This page used to point at a dedicated
+> `tests/test_permission.py` / `test_ssrf.py` / `test_egress.py` /
+> `test_exfil_guard.py` / `test_turn_budget.py` / `test_audit_log.py` /
+> `test_command_allowlist.py` / `test_capabilities.py` /
+> `tests/gateway/test_rate_limit.py` suite. None of those files exist in the
+> current tree (verified with `Glob`/`find` over `tests/`) — security behavior
+> is exercised as part of the general test suite instead, under names tied to
+> the feature rather than to "security", e.g. `tests/test_local_search_ssrf_exemption.py`
+> (the loopback SSRF exemption), `tests/test_operational_log.py` (the audit
+> trail), `tests/test_web_search_permission.py`, and `tests/test_describe_tool.py`.
+
+Run the full suite to exercise everything on this page at once:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest \
-  tests/test_permission.py tests/test_security_fixes.py tests/test_ssrf.py \
-  tests/test_egress.py tests/test_exfil_guard.py tests/test_turn_budget.py \
-  tests/test_audit_log.py tests/test_command_allowlist.py \
-  tests/test_capabilities.py tests/gateway/test_rate_limit.py -v
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -v
+```
+
+Or verify the default-mode claim above directly:
+
+```sh
+AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$(mktemp -d)" python -c \
+  "from agent8088 import engine as A; print(A.PERMISSION_MODE)"
+# -> full-auto
 ```
 
 See [Testing & Verification](12-testing-and-verification.md).

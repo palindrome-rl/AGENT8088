@@ -25,7 +25,7 @@ volume — they survive container removal.
 | Component | Included |
 |---|---|
 | `agent8088` CLI | yes — on PATH via `pip install -e` |
-| All 21 tools | yes |
+| All built-in tools (56 in `tools.txt`) | yes |
 | Gateway extras (Slack/Discord/Telegram/Email) | yes |
 | Playwright Chromium (`browse_page`) | yes |
 | WhatsApp bridge (Baileys/express) | yes |
@@ -124,6 +124,11 @@ volumes:
 - **`dev` extras** (pytest, ruff, pip-audit) — not needed to run the agent.
   If you want to run the test suite in a container, install them:
   `docker compose run --rm --entrypoint bash agent8088 -c "pip install -e \".[dev]\" && pytest tests/ -q"`
+
+- **The `repomap` extra** (`tree-sitter`, `tree-sitter-language-pack`) — the
+  Dockerfile only installs `.[gateway]`, so `repo_map` degrades to a clean
+  "unavailable" error inside the container instead of an outline. Install the
+  extra the same way as `dev` above if you need it.
 
 - **An Ollama server** — the default config points at `localhost:11434`, which
   is the host's Ollama from inside the container only if you set

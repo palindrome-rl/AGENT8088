@@ -47,9 +47,10 @@ agent8088 --setup
 
 ### `'anthropic' is not a known provider`
 
-There is no `anthropic` built-in provider — the 12 built-ins do not include one.
-Reach Claude through OpenRouter or a custom `api_mode=litellm` profile; see
-[Model Providers](05-model-providers.md#reaching-anthropic--claude).
+`anthropic` **is** one of the 12 built-in providers — check
+`provider.anthropic.api_key_env` (or `ANTHROPIC_API_KEY`) is actually set; an
+incomplete profile (missing `base_url`/`model`) is dropped rather than
+half-registered. See [Model Providers](05-model-providers.md#reaching-anthropic--claude).
 
 ### Wrong API key being used
 

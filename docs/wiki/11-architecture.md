@@ -42,9 +42,24 @@ than a design choice.
 | `memory/store.py` | Memory: SQLite schema, hybrid BM25 + vector search, RRF |
 | `memory/embed.py` | Memory: embeddings via the provider's `/embeddings` |
 | `memory/extract.py` | Memory: the fact-extraction prompt and its parsing |
+| `agents/*.md` | Built-in sub-agent profiles (`auditor`, `coder`, `explore`, `general-purpose`, `researcher`, `test-writer`) |
+| `open_code_review.py`, `review_store.py` | `review_code` tool / `/review`: native + delegated review, stored findings |
+| `repomap.py` | `repo_map` tool — dependency-ranked repository outline |
+| `repository_access.py` | `repository_read` tool — local dir or `github.com` repo survey |
+| `document_access.py`, `documents.py` | `document_read` cached extraction; document write skill support |
+| `local_models.py` | Ollama hardware probe / list / pull / remove tools |
+| `web_search.py`, `web_server.py` | `web_search` backend routing; `--web` browser-UI mode (FastAPI/uvicorn) |
+| `logging_setup.py` | Daily-rotating JSONL operational log, attached to the `agent8088` logger tree |
+| `testing_support.py` | Shared test/verification helpers |
 | `tools.txt` | Tool registry (data, not code) |
 | `system.md` | Base system prompt |
 | `config.txt` | Default settings |
+
+This is the module map for structure, not a full inventory — `src/agent8088/`
+also has `browser_*.py` (the `browse_page` engine), `cli_anything.py`,
+`fusion.py`, `mcp.py`/`mcp_server.py`, `model_catalog.py`, `ocr.py`,
+`patching.py`, `routing.py`, `searxng_provision.py`, `task_runtime.py`,
+`trajectory.py` and a few more single-purpose modules.
 
 ## The agent loop
 

@@ -41,7 +41,7 @@ Look things up here.
 |---|---|
 | [CLI Reference](10-cli-reference.md) | Every flag, slash command, keybinding and exit code |
 | [Configuration](02-configuration.md) | Every config key, the `.env` store, key resolution order |
-| [Tools](04-tools.md) | All 36 built-in tools, their modes and arguments |
+| [Tools](04-tools.md) | All 56 built-in tools, their modes and arguments |
 | [Memory](16-memory.md) | Persistent memory: what it stores, how retrieval works, `/memory` |
 | [FAQ](15-faq.md) | Short answers to the common questions |
 | [Troubleshooting](13-troubleshooting.md) | Symptom-first fixes |
@@ -65,12 +65,12 @@ At a glance, verified against the current tree:
 
 | | |
 |---|---|
-| Built-in tools | **21** |
+| Built-in tools | **56** |
 | Built-in model providers | **12** (plus custom OpenAI-compatible and litellm) |
 | Permission modes | **3** — `readonly`, `full-auto`, `plan-only` |
-| Sub-agent profiles | **5** — `auditor`, `coder`, `explore`, `general-purpose`, `researcher` |
-| Bundled skills | **5** installed, plus **20** behaviour skills in `skills/*.yaml` |
-| Slash commands | **37** |
+| Sub-agent profiles | **6** — `auditor`, `coder`, `explore`, `general-purpose`, `researcher`, `test-writer` |
+| Bundled skills | **39** packages in `src/agent8088/skills_installed/`, each an installable `SKILL.md` + `tools.txt` bundle |
+| Slash commands | **45** |
 | Gateway platforms | **5** — Slack, WhatsApp, Discord, Telegram, Email |
 | Python | **3.10+** |
 
@@ -100,11 +100,12 @@ derive them from the tree rather than trusting this page:
 ```sh
 export AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$(mktemp -d)"   # never import bare
 
-grep -c '^[a-z]' src/agent8088/tools.txt                             # 21 tools
-uv run python -c "import agent8088.cli as c; print(len(c.COMMANDS))" # 37 commands
+grep -c '^[a-z]' src/agent8088/tools.txt                             # 56 tools
+uv run python -c "import agent8088.cli as c; print(len(c.COMMANDS))" # 45 commands
 ls src/agent8088/gateway/platforms/*.py | grep -vc 'base\|__init__'  # 5 platforms
-ls src/agent8088/agents/ | wc -l                                     # 5 sub-agents
+ls src/agent8088/agents/ | wc -l                                     # 6 sub-agents
 uv run python -c "import agent8088.providers as p; print(len(p.BUILTIN_PROVIDERS))"  # 12
+ls src/agent8088/skills_installed/ | grep -vc '_references\|LICENSE' # 39 bundled skills
 ```
 
 The snippet is POSIX (`export`, `grep -c`, `ls`, `wc -l`); on Windows run it under
@@ -115,6 +116,6 @@ The `AGENT8088_CONFIG` / `AGENT8088_HOME` line is not decoration: importing
 `agent8088.cli` bare reads — and can migrate — your real `~/.agent8088/config.txt`.
 See [Testing & Verification](12-testing-and-verification.md#isolation-rules-for-anything-you-write).
 
-One count that is deliberately *not* derivable: there is no `anthropic` built-in
-provider. Claude is reached through OpenRouter or a custom `api_mode=litellm`
-profile — see [Model Providers](05-model-providers.md#reaching-anthropic--claude).
+Claude now has a built-in `anthropic` provider profile alongside the other 11 —
+see [Model Providers](05-model-providers.md#reaching-anthropic--claude) for that
+and the OpenRouter/litellm alternatives.

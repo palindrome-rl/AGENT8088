@@ -32,33 +32,28 @@ AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
 loading so tests never read — or write — your real `config.txt`. Without it a
 test run can pick up and mutate your live configuration.
 
-Per area:
+`tests/` is a **flat directory** — over 150 files, no `tests/gateway/` or
+`tests/memory/` subdirectories, and no single `test_permission.py` /
+`test_providers.py` / `test_mcp.py` per topic. Coverage for a topic is usually
+spread across several specifically-named files; `pytest -k` is the fastest way
+to find them:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_permission.py -q      # permission modes + floors
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_security_fixes.py -q  # shell/git hard blocks
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_ssrf.py -q            # SSRF
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_egress.py -q          # allowed_domains / blocked_domains
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_exfil_guard.py -q     # outbound secret refusal
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_turn_budget.py -q     # token / cost / wall-clock ceilings
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_command_allowlist.py -q  # allow_commands + write blast radius
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_audit_log.py -q       # audit trail
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_capabilities.py -q    # capability self-report
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/test_rate_limit.py -q  # gateway rate limiting
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp.py -q             # MCP client
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp_server.py -q      # MCP server
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/gateway/ -q                # all 5 platforms
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_env_key_store.py -q   # .env store + redaction
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_providers.py -q       # providers + key precedence
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_subagents.py -q       # sub-agents + guardrails
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_memory.py -q        # memory: store, recall, RRF
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/memory/ -q               # memory: embed, extract, end-to-end, FTS safety
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -k "turn_budget" -q   # e.g. token/cost/wall-clock ceilings
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -k "memory" -q        # store, recall, mem0, forget
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -k "gateway" -q       # gateway core + startup
+AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp_server.py -q  # MCP server
 ```
+
+(Verified against the current `tests/` listing — file names churn as tests are
+added, so treat any specific filename here as illustrative, not a contract.)
 
 ### Gateway extras are required
 
-Without them, the Slack/Discord adapters fail at **import** rather than skipping
-— which looks like real breakage but is a missing optional dependency:
+`test_gateway_core.py` and `test_gateway_startup.py` import the Slack/Discord
+adapters directly, so without the `gateway` extra they fail at **import**
+rather than skipping — which looks like real breakage but is a missing
+optional dependency:
 
 ```sh
 uv sync --all-extras --locked
@@ -121,13 +116,12 @@ Non-negotiable, because violating them has caused a real incident in this repo:
 2. **Always set `AGENT8088_CONFIG=/nonexistent`** for tests.
 3. **Use `AGENT8088_HOME`** for verification scripts.
 4. **Mock `subprocess.run`** rather than executing real mutating commands.
-5. **Write generated files to `artifacts/`, never the repo root.** Use the
-   `artifacts_dir` fixture. A session-scoped guard in `tests/conftest.py`
-   fails the run if anything new appears beside `pyproject.toml`, so this one
-   enforces itself.
-
-A `PreToolUse` hook in `.claude/hooks/guard-agent8088-cli.sh` blocks bare
-invocations as a backstop, but the discipline is the actual protection.
+5. **Write generated files under a temp dir, never the repo root.** A handful
+   of tests (e.g. `test_edit_file_tool.py`, `test_generate_tests_tool.py`)
+   write to an `artifacts/`-named path, but there is no shared `artifacts_dir`
+   fixture and no repo-wide guard enforcing this — `tests/conftest.py` is 26
+   lines and only loads the `engine` module fixture. The discipline is on the
+   test author, not automated.
 
 ## 5. Live-model tool-choice scoring (opt-in)
 
@@ -151,7 +145,8 @@ real baseline on your provider before treating that number as a gate.
 
 ## Pre-PR checklist
 
-The `pr-check` skill (`.claude/skills/pr-check/`) automates this:
+There is no automated `pr-check` skill in this repo (`.claude/skills/` only
+ships `agent8088-live-testing`). Do this by hand:
 
 1. `git fetch origin` and dry-run the merge for conflicts.
 2. **Run the target branch's baseline first**, in a worktree. Without it you

@@ -15,6 +15,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
                  [--web] [--web-port PORT] [--web-host HOST] [--web-dev]
+                 [--logs [MODE]] [-n LIMIT] [--level LEVEL] [--subsystem SUBSYSTEM] [--json]
 ```
 
 | Flag | Purpose |
@@ -37,6 +38,11 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--web-port PORT` | Web UI server port (default `8180`) |
 | `--web-host HOST` | Web UI bind host (default `127.0.0.1`); loopback only |
 | `--web-dev` | Run the web backend without serving built frontend files; use with Vite |
+| `--logs [MODE]` | Print the operational log; pass `follow` to tail it in real time. Bare `--logs` prints the last `--limit` lines and exits |
+| `-n`, `--limit LIMIT` | With `--logs`: number of lines to print (default 50) |
+| `--level LEVEL` | With `--logs`: filter by level (`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`) |
+| `--subsystem SUBSYSTEM` | With `--logs`: substring filter on subsystem name |
+| `--json` | With `--logs`: emit raw JSONL instead of the human-formatted view |
 | `--update` | Pull latest code + reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove the install dir, shim, PATH/config lines, and crontab/scheduled-task entries, then exit. Trace logs and the WhatsApp session dir are kept unless `--workspace`/`--all` is also passed |
@@ -122,8 +128,8 @@ agent8088 --uninstall --all --yes --non-interactive   # fully unattended, full r
 
 ## Slash commands
 
-**40 registered commands.** Prefix-matched, so `/mo` offers `/mode`, `/model`,
-`/models`.
+**45 registered commands** (`COMMANDS` in `src/agent8088/cli.py`). Prefix-matched,
+so `/mo` offers `/mode`, `/model`, `/models`.
 
 Pasting a bare file path into the prompt — nothing else on the line — reads it
 immediately: images go to a vision model, documents are extracted to text.
@@ -157,6 +163,7 @@ sensitive-file floor still applies unconditionally.
 | `/temp <float>` | Sampling temperature |
 | `/maxturns <int>` | Max agent turns per prompt (same as `/limits max_turns`) |
 | `/reasoning` | Toggle reasoning display |
+| `/tool-selection [hybrid\|full\|auto]` | Show or set how native tool schemas are narrowed per request — see [Tool-calling compatibility](05-model-providers.md#tool-calling-compatibility) |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
 | `/fusion setup` | Interactively pick a default panel and judge (checkbox pickers), saved to `config.txt` |
 | `/fusion <query>` | Ask the panel in parallel; a blind judge picks the best answer. `--panel p:m,...`/`--judge p:m` flags override the saved config for one call |
@@ -179,6 +186,9 @@ sensitive-file floor still applies unconditionally.
 | `/agent <type> <task>` | Run a sub-agent directly; the prompt stays on it until `/quit` |
 | `/skills` | List skills; `disable`/`enable <name>` |
 | `/cli-anything [task]` | Show integration status, or route a task through the CLI-Anything skill |
+| `/browser [status\|close\|reset\|stop]` | Show the headless browser session state, or close it and clear its temp files |
+| `/local [list\|available <query>\|pull <name>\|remove <name>]` | Bare form probes hardware and recommends local Ollama models; the CLI counterpart to the `local_models`-mode tools |
+| `/task [list\|start <goal>\|resume <id>\|end <id>\|output <id>]` | Start, resume, or inspect a restart-safe model task backed by `task_runtime.TaskStore`. Bare or `list` shows stored tasks |
 
 ### Permissions and isolation
 
@@ -213,6 +223,8 @@ sensitive-file floor still applies unconditionally.
 | `/schedule remove <index-or-task>` | Remove by the # from `/schedule list`, or by exact task text |
 | `/config` | Active config + file path |
 | `/capabilities` | What the agent can do and which guardrails are in force |
+| `/cost [on\|off\|<task_id>]` | Local telemetry summary of model cost/usage; `on`/`off` toggles recording, persisted to `config.txt` |
+| `/review` | Bare: list stored reviews. With arguments: launch `review_code` from the CLI — same tool the model calls, see [`review_code`](04-tools.md#review_code) |
 | `/doctor [--fix]` | Environment health check; `--fix` repairs a broken web-search install |
 | `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report |
 | `/trace [on\|off]` | Toggle JSON trace capture |

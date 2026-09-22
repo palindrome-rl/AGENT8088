@@ -63,8 +63,16 @@ Confirm with `/tools`. See [Disabling a built-in](04-tools.md#disabling-a-built-
 
 ### Can I use Claude / Anthropic models?
 
-Yes, but not through a built-in provider — there is no `anthropic` entry among
-the 12. Use OpenRouter, or a custom profile with `api_mode=litellm`. See
+Yes — `anthropic` is a built-in provider (one of the 12 in `providers.py`), so
+it needs no `litellm`:
+
+```ini
+default_provider=anthropic
+provider.anthropic.model=claude-sonnet-4-6
+provider.anthropic.api_key_env=ANTHROPIC_API_KEY
+```
+
+OpenRouter and a custom `api_mode=litellm` profile still work too. See
 [Model Providers](05-model-providers.md#reaching-anthropic--claude).
 
 ## When something looks broken
@@ -146,7 +154,10 @@ an outbound payload is never legitimate. See
 
 ### Is it safe to expose over MCP?
 
-The default MCP server surface is 6 non-mutating tools. `write_file` is added
+The default MCP server surface is 7 non-mutating tools (`read_text`,
+`calculate`, `web_search`, `get_page_title`, `last_output`,
+`describe_capabilities`, `describe_tool` — verified from `EXPOSED_TOOLS` in
+`src/agent8088/mcp_server.py`). `write_file` is added
 only with `mcp_server_allow_writes=1`, because MCP has no approval channel —
 there is no prompt for a client to answer. `execute_shell`, `run_sandboxed`,
 `browse_page`, `spawn_subagent` and the mutating git tools are never exposed in
