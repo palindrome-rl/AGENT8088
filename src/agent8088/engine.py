@@ -8445,7 +8445,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             permitted = lambda path: (path.is_relative_to(root) if pr_workspace else _path_is_allowed(path)) and not _is_sensitive_path(str(path))
             runner = lambda argv, cwd, env=None: open_code_review.run_process(
                 argv, cwd, check=review_check, kill=_kill_detached_process,
-                timeout=_review_timeout(args, timeout) if env else 30, extra_env=env)
+                timeout=_review_timeout(args, timeout), extra_env=env)
             mode_choice = str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower()
             if mode_choice not in ("native", "delegated", "auto"):
                 raise ValueError("mode must be native, delegated, or auto.")

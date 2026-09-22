@@ -5594,6 +5594,10 @@ def cmd_review(rest):
     elif args.get("base") or args.get("head"):
         args["scope"] = "range"
 
+    mode_hint = str(args.get("mode") or A.APP_CONFIG.get("open_code_review_mode", "auto")).lower()
+    scope_hint = args.get("commit") or args.get("base") or "working tree"
+    console.print(f"[dim]Reviewing {scope_hint} · mode={mode_hint} — native runs can take "
+                  "minutes on a slow endpoint; Ctrl+C to stop.[/dim]")
     with console.status("[#237dd7]Reviewing...[/#237dd7]", spinner="dots"):
         raw = A.run_tool("review_code", args)
     try:
