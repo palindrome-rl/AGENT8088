@@ -142,7 +142,9 @@ readonly mode it escalates for approval like any other.
 `/agent` runs one; `/agents` manages them.
 
 ```
-/agent explore <task>    # run one directly (no args opens a picker)
+/agent explore <task>    # run one directly (no args opens a picker);
+                         #   the prompt stays on it — /quit returns to 8088,
+                         #   and every task in the loop shares one conversation
 
 /agents                  # list profiles — source, model, tools, and a
                          #   one-line summary of the provider's models

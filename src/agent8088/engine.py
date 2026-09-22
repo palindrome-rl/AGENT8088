@@ -5193,10 +5193,17 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
     return report
 
 
-def _exec_subagent(args: dict, depth: int = 0) -> str:
-    """Run a delegated task in a fresh, tool-restricted sub-agent loop.
+def _exec_subagent(args: dict, depth: int = 0, history: list | None = None) -> str:
+    """Run a delegated task in a tool-restricted sub-agent loop.
     Bounded by SUBAGENT_MAX_DEPTH and by a wall clock. Returns the sub-agent's
-    final answer."""
+    final answer.
+
+    With `history`, the sub-run continues an existing conversation (the
+    interactive /agent session) instead of a fresh single-task one: the task
+    is appended to that list, run, and the assistant answer stays in it, so
+    follow-up tasks see earlier exchanges. The list is reused, not copied --
+    run_agent appends to it in place and auto-compaction (if it fires) also
+    mutates in place, so the caller keeps the same object."""
     global _last_tool_output, _last_tool_name, _last_write_diff
     global _active_budget
     global PERMISSION_MODE, _plan_execution_grant
@@ -5303,9 +5310,11 @@ def _exec_subagent(args: dict, depth: int = 0) -> str:
     # with `find / -maxdepth 5` and the turn sat there until it was killed.
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
+    messages = history if history is not None else []
+    messages.append({"role": "user", "content": task})
     try:
         answer = run_agent(
-            [{"role": "user", "content": task}],
+            messages,
             max_turns=profile["max_turns"], temperature=0.2,
             system_prompt=sub_system, tools_def=sub_tools_def,
             allowed_tools=allowed, depth=depth + 1,
@@ -8445,7 +8454,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             permitted = lambda path: (path.is_relative_to(root) if pr_workspace else _path_is_allowed(path)) and not _is_sensitive_path(str(path))
             runner = lambda argv, cwd, env=None: open_code_review.run_process(
                 argv, cwd, check=review_check, kill=_kill_detached_process,
-                timeout=_review_timeout(args, timeout) if env else 30, extra_env=env)
+                timeout=_review_timeout(args, timeout), extra_env=env)
             mode_choice = str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower()
             if mode_choice not in ("native", "delegated", "auto"):
                 raise ValueError("mode must be native, delegated, or auto.")

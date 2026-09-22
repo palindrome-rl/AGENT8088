@@ -174,6 +174,15 @@ def run_process(argv, root, *, check, kill, timeout=30, extra_env=None):
                 if overflow.is_set():
                     raise ValueError("OpenCodeReview output exceeded 4 MiB; narrow the review scope.")
                 if time.monotonic() >= deadline:
+                    if timeout <= 30:
+                        # Delegated prep and env-less subprocess calls are capped
+                        # at 30s; raising the configured review timeout does not
+                        # move that ceiling, so do not send the user there.
+                        raise ValueError(
+                            "OpenCodeReview was stopped at the 30s preparation ceiling "
+                            "before a review could start. This is not the configured "
+                            "review timeout; on a large or slow-to-clone repo, "
+                            "narrow the scope (a single commit instead of a range).")
                     raise ValueError(
                         "OpenCodeReview ran past open_code_review_timeout_seconds ("
                         + str(timeout) + "s) and was stopped, so there are no findings. "

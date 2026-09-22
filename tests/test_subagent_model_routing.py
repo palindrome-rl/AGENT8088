@@ -251,6 +251,38 @@ def test_exec_subagent_does_not_fetch_second_client():
     mock_get_client.assert_not_called()
 
 
+def test_exec_subagent_history_is_reused_and_carries_the_conversation():
+    """The interactive /agent loop passes the same list every task; a fresh
+    call (history=None) must stay single-task, and a shared history must see
+    the earlier exchanges appended in place."""
+    from agent8088 import engine as eng
+
+    test_specs = {"fast_agent": _base_profile(model="inherit")}
+    with patch.dict(eng.SUBAGENT_SPECS, test_specs, clear=True), \
+         patch("agent8088.engine.load_subagent_specs", return_value=test_specs), \
+         patch("agent8088.engine.ACTIVE_PROVIDER", "anthropic"), \
+         patch("agent8088.engine.MODEL_NAME", "claude-sonnet-4-6"), \
+         patch("agent8088.engine.run_agent") as mock_run:
+        lists = []
+
+        def reply(messages, **kwargs):
+            lists.append(messages)
+            messages.append({"role": "assistant", "content": "first answer"})
+            return "first answer"
+        mock_run.side_effect = reply
+
+        eng._exec_subagent({"agent_type": "fast_agent", "task": "task one"})
+        eng._exec_subagent({"agent_type": "fast_agent", "task": "again"})
+        assert lists[0] is not lists[1]  # fresh call: a new list each time
+
+        history = []
+        eng._exec_subagent({"agent_type": "fast_agent", "task": "task one"}, history=history)
+        eng._exec_subagent({"agent_type": "fast_agent", "task": "task two"}, history=history)
+        assert [m["content"] for m in history] == [
+            "task one", "first answer", "task two", "first answer"]
+        assert mock_run.call_args.args[0] is history  # reused, not copied
+
+
 # ---------------------------------------------------------------------------
 # _exec_create_subagent
 # ---------------------------------------------------------------------------

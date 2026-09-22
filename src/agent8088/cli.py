@@ -2165,7 +2165,7 @@ COMMAND_SPECS = (
     ("capabilities", "/capabilities", "Full self-report: tools, MCP, skills, subagents, limits, guardrails", ()),
     ("tool", "/tool <name> <args>", "Invoke ONE tool directly (args as JSON or key=value)", ()),
     ("agents", "/agents [new|edit|delete|models]", "Manage sub-agent profiles and model routing", ()),
-    ("agent", "/agent [name] [task]", "Run a sub-agent — no args opens an arrow-key picker", ()),
+    ("agent", "/agent [name] [task]", "Run a sub-agent in a task loop that stays on it until /quit; each agent keeps its conversation", ()),
     ("skills", "/skills [name|enable|disable]", "Browse a skill or enable/disable it for this session", ()),
     ("cli-anything", "/cli-anything [task]", "Use CLI-Anything to find, run, build, refine, test, or validate an application CLI", ()),
     ("plan", "/plan [task]", "Enter plan mode — propose a plan, approve it, then it runs", ()),
@@ -2582,12 +2582,13 @@ def select_agent(profiles):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def _run_subagent(name, task):
+def _run_subagent(name, task, history=None):
     """Run one sub-agent directly (no parent model) with the animated nested view."""
     with Live(console=console, refresh_per_second=20, transient=True) as live:
         A.subagent_ui = _make_subagent_ui(live)
         try:
-            result = A._exec_subagent({"agent_type": name, "task": task}, depth=0)
+            result = A._exec_subagent({"agent_type": name, "task": task}, depth=0,
+                                      history=history)
         finally:
             A.subagent_ui = None
     # Strip the "[subagent:name] " prefix before rendering the summary panel.
@@ -2596,7 +2597,11 @@ def _run_subagent(name, task):
 
 
 def cmd_agent(rest):
-    """Run a sub-agent. Usage: /agent  (interactive picker) | /agent <name> [task]."""
+    """Run a sub-agent. Usage: /agent  (interactive picker) | /agent <name> [task].
+
+    An interactive task loop: the prompt stays on the chosen agent until the
+    user types /quit, /exit, or an empty line, and every task in the loop
+    shares one conversation, so the agent remembers what it was just told."""
     rest = (rest or "").strip()
     name, task = None, None
     if rest:
@@ -2610,16 +2615,23 @@ def cmd_agent(rest):
         if not name:
             console.print("[dim]cancelled — try /agent <name> <task>, or /agents to list them[/dim]")
             return
-    if not task:
-        try:
-            task = console.input(f"[#237dd7]task for [bold]{name}[/bold] ›[/#237dd7] ").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("[dim]cancelled[/dim]")
-            return
+    history = []
+    while True:
         if not task:
-            console.print("[dim]cancelled — no task given[/dim]")
+            try:
+                task = console.input(f"[#237dd7]task for [bold]{name}[/bold] ›[/#237dd7] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("[dim]leaving {0}[/dim]".format(name))
+                return
+        if not task or task.lower() in ("/quit", "/exit", "exit", "quit"):
+            console.print(f"[dim]leaving {name}[/dim]")
             return
-    _run_subagent(name, task)
+        try:
+            _run_subagent(name, task, history=history)
+        except KeyboardInterrupt:
+            console.print(f"\n[dim]interrupted — leaving {name}[/dim]")
+            return
+        task = None
 
 
 def _cmd_agents_list():
@@ -5546,7 +5558,8 @@ def _print_review_history():
         when = datetime.fromtimestamp(row["created"]).strftime("%Y-%m-%d %H:%M")
         t.add_row(row["id"], when, row["mode"], str(row["findings"]), row["repo"])
     console.print(t)
-    console.print(Text("Reopen one with /review --resume ID; positions are re-checked then.",
+    console.print(Text("Reopen one with /review --resume ID; positions are re-checked "
+                       "then. Start one with --commit, --from/--to, or --repo.",
                        style="dim"))
 
 def cmd_review(rest):
@@ -5567,16 +5580,19 @@ def cmd_review(rest):
     except ValueError as exc:
         console.print(f"[red]Could not parse review arguments:[/red] {exc}")
         return
+    if not parts:
+        # Bare /review lists stored reviews. It used to start a workspace
+        # review, which is a minutes-long LLM pass behind a bare command that
+        # read as a hang; a review now always names the scope it runs on.
+        _print_review_history()
+        return
     index = 0
     while index < len(parts):
         token = parts[index]
-        if token == "--list":
-            _print_review_history()
-            return
         if token == "--resume" and index + 1 < len(parts):
             reopened = A.reopen_review(parts[index + 1], args.get("repo"))
             if reopened is None:
-                console.print("[red]no such review[/red] (try /review --list)")
+                console.print("[red]no such review[/red] (run /review to list them)")
             else:
                 _print_review(reopened)
             return
@@ -5587,13 +5603,18 @@ def cmd_review(rest):
             index += 2
             continue
         console.print("[red]usage:[/red] /review [--from REF] [--to REF] [--commit SHA] "
-                      "[--mode native|delegated|auto] [--repo PATH] [--resume ID] [--list]")
+                      "[--mode native|delegated|auto] [--repo PATH] [--resume ID]")
+        console.print("[dim]Bare /review lists stored reviews.[/dim]")
         return
     if args.get("commit"):
         args["scope"] = "commit"
     elif args.get("base") or args.get("head"):
         args["scope"] = "range"
 
+    mode_hint = str(args.get("mode") or A.APP_CONFIG.get("open_code_review_mode", "auto")).lower()
+    scope_hint = args.get("commit") or args.get("base") or "working tree"
+    console.print(f"[dim]Reviewing {scope_hint} · mode={mode_hint} — native runs can take "
+                  "minutes on a slow endpoint; Ctrl+C to stop.[/dim]")
     with console.status("[#237dd7]Reviewing...[/#237dd7]", spinner="dots"):
         raw = A.run_tool("review_code", args)
     try:

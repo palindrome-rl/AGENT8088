@@ -14,7 +14,7 @@ Complete inventory of slash commands across all three Agent8088 surfaces.
 | `/help` | Show the command list |
 | `/capabilities` | Full self-report: tools, MCP, skills, sub-agents, limits, guardrails |
 | `/agents` | List available sub-agent profiles |
-| `/agent [name] [task]` | Run a sub-agent (no args → arrow-key picker) |
+| `/agent [name] [task]` | Run a sub-agent (no args → arrow-key picker); stays on it until `/quit` |
 | `/plan [task]` | Enter plan mode — propose, approve, then it runs |
 | `/audit [on\|off]` | Verify top-level mutating tool calls after they run; it does not independently fact-check read-only research or final answers |
 | `/raw <text>` | One raw model call — shows content, reasoning, tool_calls |

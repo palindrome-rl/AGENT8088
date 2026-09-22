@@ -112,3 +112,22 @@ def test_review_command_reports_unclosed_quotes_without_running(cli, monkeypatch
 
     assert called is False
     assert "Could not parse review arguments" in capsys.readouterr().out
+
+
+def test_bare_review_lists_stored_reviews_without_running(cli, monkeypatch, capsys):
+    """A bare /review used to launch a minutes-long workspace review; it lists."""
+    rows = [{"id": "rev-abc123", "created": 1758500000, "mode": "native",
+             "findings": 2, "repo": r"C:\work\mod"}]
+    called = False
+
+    def run_tool(name, args):
+        nonlocal called
+        called = True
+        return _empty_review()
+
+    monkeypatch.setattr(cli.A, "review_history", lambda: rows)
+    monkeypatch.setattr(cli.A, "run_tool", run_tool)
+    cli.cmd_review("")
+
+    assert called is False
+    assert "rev-abc123" in capsys.readouterr().out
