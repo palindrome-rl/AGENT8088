@@ -5311,7 +5311,10 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None) -> s
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
     messages = history if history is not None else []
-    messages.append({"role": "user", "content": task})
+    # The loop is speaking here, not the person. An unmarked user-role turn
+    # joins the set _user_supplied_url trusts, so a task assembled from tool
+    # output would end up authorising its own URLs for browse_page.
+    messages.append(_harness_turn(task))
     try:
         answer = run_agent(
             messages,
