@@ -42,12 +42,23 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.api_key_env` | Name of the env var / `.env` entry holding the key. **Preferred.** |
 | `provider.<name>.api_key` | Literal key. Legacy — migrated to `.env` on first run. |
 | `provider.<name>.api_mode` | `openai` (default) or `litellm`. |
+| `provider.<name>.native_tools` | Use the provider's native function-calling API. Defaults to `1` for every provider except `ollama`, which uses the prompt-based convention. |
 | `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `fallback_models` | Comma-separated `provider:model` chain, tried on 429/503/connection errors. |
 | `context_window` | Token budget for history trimming. |
 | `max_completion_tokens` | Global output-token ceiling when the active model has no reviewed limit or provider override. |
 | `timeout_seconds` | Per-request timeout (default `120`). |
+
+Transient provider failures are retried before the turn fails or `fallback_models`
+takes over:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `api_max_retries` | `3` | Attempts per call on retryable errors (429/503/connection). `0` disables. |
+| `api_retry_initial_delay_ms` | `500` | First backoff delay. |
+| `api_retry_max_delay_ms` | `10000` | Ceiling for the exponential backoff. |
+| `api_retry_jitter_ratio` | `0.1` | Random jitter added to each delay (0-1), so parallel retries do not sync up. |
 
 ### Fusion
 
@@ -73,7 +84,7 @@ setting — `/temp`). Details in [Model Providers](05-model-providers.md).
 | `deny_commands` | (empty) | Shell commands to refuse (fnmatch globs). Refused in every mode. |
 | `allow_commands` | (empty) | If set, the **only** shell commands permitted (fnmatch globs). `deny_commands` still wins, and no allowlist re-enables the unrecoverable floor. |
 | `readonly_safe_commands` | (built-in list) | Commands treated as safe inspection in readonly mode. |
-| `ssrf_allow_hosts` | `127.0.0.1,localhost` | Private/internal hosts the agent may reach, as `host` or `host:port`. Loopback only by default. Add a LAN SearXNG here — `/search setup` does it for you. See [Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng). |
+| `ssrf_allow_hosts` | (empty) | Private/internal hosts the agent may reach, as `host` or `host:port`. A loopback `search_base_url` is allowed automatically for its exact host:port, so a local SearXNG needs no entry; anything else internal does. Add a LAN SearXNG here — `/search setup` does it for you. See [Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng). |
 | `web_search_provider` | `auto` | At startup, selects a verified SearXNG when available, otherwise a fallback. |
 | `web_search_no_prompt` | `1` | Approval-free search, permitted **only** while the effective pin is a loopback or allowlisted-private SearXNG. Inert with no endpoint configured, so a fresh install still prompts on every `ddgs` search. |
 | `search_base_url` | (unset) | SearXNG endpoint, ending at `search?q=`. No default — nothing is assumed about your network. `https://` is required for public hosts. See [Pointing web search at a SearXNG](04-tools.md#pointing-web-search-at-a-searxng). |
@@ -124,13 +135,14 @@ not per call.
 | `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
 | `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox. |
-| `docker_image` / `docker_network` | | Docker fallback settings. |
+| `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings. |
+| `docker_pull_seconds` | `300` | Time allowed for pulling a missing container image. Separate from a tool's own timeout, so a first-run pull does not fail as an unexplained timeout. |
 
 ## Gateway
 
 | Key | Default | Purpose |
 |---|---|---|
-| `slack_enabled` / `whatsapp_enabled` / `discord_enabled` | `0` | Enable a channel. Only one at a time via the wizard. |
+| `slack_enabled` / `whatsapp_enabled` / `discord_enabled` / `email_enabled` / `telegram_enabled` | `0` | Enable a channel. Any combination is allowed; the wizard enables one at a time. |
 | `slack_allowed_users` etc. | (empty) | Comma-separated user ids permitted per platform. **Empty means nobody** — fail-closed. |
 | `strict_platform_allowlist` | `1` | Refuses an id listed under a *different* platform's line. Set `0` only as a temporary migration aid. |
 | `gateway_permission_mode` | `readonly` | `readonly` routes writes to chat approval; `edit` disables prompts. |
@@ -157,7 +169,8 @@ On by default. Full explanation in [Memory](16-memory.md).
 | Key | Default | Purpose |
 |---|---|---|
 | `memory` | `1` | Master switch. `0` stops both recall and learning; stored memories are kept. |
-| `memory_db_path` | `~/.agent8088/memory.db` | The store. One SQLite file, mode `0600`. |
+| `memory_engine` | `native` | Backend: `native` (built-in SQLite with BM25 + vector RRF) or `mem0` (the Mem0 library with graph/vector management). Set by `/memory engine <name>`. |
+| `memory_db_path` | `~/.agent8088/memory.db` | The store for the native engine. One SQLite file, mode `0600`. |
 | `memory_user_id` | `owner` | Whose memories these are. One identity by default, so memory carries across the CLI and every gateway platform. |
 | `memory_scope_by_identity` | `0` | `1` gives each gateway identity its own namespace. Needed only if a `*_allowed_users` line holds more than one person. |
 | `memory_embed_model` | `nomic-embed-text` | Embedding model for semantic recall (274 MB; the installers pull it). Missing or unreachable degrades recall to keyword-only rather than failing. |
@@ -170,23 +183,43 @@ On by default. Full explanation in [Memory](16-memory.md).
 | `memory_max_per_turn` | `10` | Cap on facts one turn may create. |
 | `memory_notifications` | `on` | What you see when a turn learns something: `off` silent, `on` a one-line count, `verbose` the facts themselves plus a line on turns that stored nothing. `/memory notify` changes it live. |
 
+The `mem0` engine reads its own keys (all with working defaults, so switching
+engines is enough):
+
+| Key | Default | Purpose |
+|---|---|---|
+| `memory_mem0_vector_store` | `qdrant` | Vector store backend (embedded local Qdrant). |
+| `memory_mem0_dir` | `<data dir>/mem0` | Mem0 data directory. An explicit value wins, same as `memory_db_path`. |
+| `memory_mem0_llm_provider` / `memory_mem0_llm_model` | active provider / chat model | Model Mem0 uses for its own extraction calls. |
+| `memory_mem0_embed_provider` / `memory_mem0_embed_model` | `memory_embed_provider` / `memory_embed_model` | Embedding pair for Mem0; falls back to the native keys above. |
+
 Only what **you** type can become a memory or trigger a recall — tool output
 never does — and a recalled memory can never authorise a tool call.
 
 ## Limits
 
-| Key | Purpose |
-|---|---|
-| `max_read_bytes` | Cap on a single file read. |
-| `max_http_bytes` | Cap on an HTTP response. |
-| `max_tool_output_bytes` | Cap on tool output fed back to the model. |
-| `max_tool_timeout_seconds` | Hard ceiling for one tool call (default `600`). |
-| `compaction_threshold_pct` | Automatically summarize older messages at this estimated context usage (default `75`; `0` disables). |
-| `max_image_bytes` | Cap on an image attachment. |
-| `browser_max_steps` | Max steps `browse_page`'s browsing agent takes on one task (default `25`). Override once with `AGENT8088_BROWSER_MAX_STEPS`. |
-| `browser_task_timeout_seconds` | Overall wall-clock limit for one `browse_page` call (default `600`). Clamped to `max_tool_timeout_seconds`; override once with `AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS`. |
-| `browser_screenshots` | Enable browser screenshots for a vision-capable model (default `0`); override once with `AGENT8088_BROWSER_SCREENSHOTS=1`. |
-| `browser_llm_extra_body` | JSON fields sent only to browser-use model calls; use `{"chat_template_kwargs":{"enable_thinking":false}}` for Qwen served by vLLM. |
+| Key | Default | Purpose |
+|---|---|---|
+| `max_read_bytes` | `2 MB` | Cap on a single file read. |
+| `max_http_bytes` | `5 MB` | Cap on an HTTP response. |
+| `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
+| `max_tool_timeout_seconds` | `600` | Hard ceiling for one tool call. |
+| `compaction_threshold_pct` | `75` | Automatically summarize older messages at this estimated context usage (`0` disables). |
+| `max_image_bytes` | `20 MB` | Cap on an image attachment. |
+| `document_process_concurrency` | `4` | Document chunks `document_read action=process` keeps in flight (clamped 1-16). Chunk requests are independent, so this multiplies throughput almost linearly until the provider rate-limits. |
+| `browser_max_steps` | `25` | Max steps `browse_page`'s browsing agent takes on one task. Override once with `AGENT8088_BROWSER_MAX_STEPS`. |
+| `browser_task_timeout_seconds` | `600` | Overall wall-clock limit for one `browse_page` call. Clamped to `max_tool_timeout_seconds`; override once with `AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS`. |
+| `browser_screenshots` | `0` | Enable browser screenshots for a vision-capable model; override once with `AGENT8088_BROWSER_SCREENSHOTS=1`. |
+| `browser_max_actions_per_step` | `1` | Actions the browsing model may batch into one step. Raise for form-heavy sites; keep at 1 where clicks reshuffle the DOM. |
+| `browser_headless` | `1` | `0` opens a visible window (demos, debugging a stuck selector). Visibility only — every guard is unaffected. |
+| `browser_reuse_session` | `1` | Keep the browser alive across consecutive tasks in the session, preserving cookies and in-memory tabs. |
+| `browser_hitl` | `1` | Human-in-the-loop interrupts (`ask_human`) for captchas, passwords and user input. |
+| `browser_flash_mode` | `0` | Much smaller system prompt (~2.4 KB vs ~22 KB) and leaner action schema — each step 2-4x faster on a small model. Off by default: A/B it on your model first. |
+| `browser_structured_output_mode` | `auto` | `auto` tries JSON schema then JSON object; `json_object` skips the first attempt — set it for a provider known to ignore schemas (e.g. Ollama Cloud serving GLM). |
+| `browser_llm_max_tokens` | `4096` | Starting completion cap for the browsing model's own calls. Adaptive: doubles when cut off, decays toward ~1.5x actual use. |
+| `browser_llm_min_tokens` | `1024` | Floor for the adaptive cap. |
+| `browser_llm_max_completion_tokens` | `16384` | Ceiling for the adaptive cap. |
+| `browser_llm_extra_body` | (empty) | JSON fields sent only to browser-use model calls; use `{"chat_template_kwargs":{"enable_thinking":false}}` for Qwen served by vLLM. |
 
 ### Dynamic turn budget
 
@@ -263,12 +296,47 @@ Checked *before* the permission gate, so the refusal is not something a user can
 wave through by mistake, and reset only by the outermost request so a subagent
 cannot hand itself a fresh write budget.
 
+### Plan step auditing
+
+With `plan_audit=1`, every mutating `execute_plan` step is verified against the
+real environment by the readonly `auditor` sub-agent before the plan moves on,
+and a failed verification halts the plan. Off by default: it costs one extra
+model call per mutating step, drawn from the same turn budget as the work
+itself. Worth enabling for unattended runs (gateway, cron), which is exactly
+where a silently half-done plan does damage.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `plan_audit` | `0` | `1` turns on step verification. `/audit` shows and toggles it. |
+| `plan_audit_revert` | `1` | With auditing on, a write that **fails** verification is restored to its exact pre-step bytes: only verified state persists. |
+| `plan_audit_revert_max_bytes` | `1048576` | Files larger than this are not snapshotted, so they are not reverted — the plan output says so rather than implying otherwise. |
+| `plan_audit_max_per_turn` | `12` | Verification calls one top-level turn may spend. `0` stops verifying without turning the feature off. |
+| `plan_audit_timeout_seconds` | `120` | Wall clock for one auditor sub-run. |
+
+## Code review
+
+`/review` runs OpenCodeReview locally over a diff and prints findings; see
+[Open code review](../open-code-review.md). `open_code_review_enabled=0` makes
+`/review` say the engine is disabled instead of running.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `open_code_review_enabled` | `0` | `1` after the installer provisions the engine; `/doctor` reports readiness. |
+| `open_code_review_executable` | (installed path) | The native `opencodereview` binary. Written by the installer; set it only for a custom install. |
+| `open_code_review_mode` | `auto` | `native` runs the engine as the reviewer, `delegated` prepares scope and hands the review to this agent, `auto` picks native when credentials exist. |
+| `open_code_review_timeout_seconds` | `1800` | Wall-clock ceiling for one native review. Clamped to 3600. |
+| `open_code_review_token_budget` | `500000` | Token budget for one native review (50 000-2 000 000). |
+| `open_code_review_max_tools` | `50` | Tool rounds the reviewer may take (50-200). |
+| `open_code_review_concurrency` | `8` | Parallel file reviews (1-16). |
+| `open_code_review_file_timeout_minutes` | `15` | Per-file ceiling (1-60). The lever to raise on a slow endpoint — lowering the token budget or reviewing a smaller range are the alternatives. |
+
 ## Extension points
 
 | Key | Purpose |
 |---|---|
 | `tools_file` | Path to `tools.txt` (the tool registry). |
 | `system_file` | Path to `system.md` (base prompt). |
+| `banner_file` | Custom startup banner. |
 | `user_file` | Path to `USER.md` (persona). |
 | `skills_dir` / `agents_dir` | Skill packages and bundled sub-agent profiles. |
 | `user_agents_dir` | Your own sub-agent profiles, merged over `agents_dir`. Defaults to `%LOCALAPPDATA%\agent8088\agents` (POSIX: `~/.agent8088/agents`) so they survive an upgrade. |
@@ -308,7 +376,6 @@ would be a setting that only appeared to work.
 The always-on floor is not on this list and no value reaches it: credential
 files, shell startup files and destructive git stay refused whatever the
 numbers say.
-| `banner_file` | Custom startup banner. |
 
 > To remove a built-in tool, comment out its line in `tools.txt` — see
 > [Disabling a built-in](04-tools.md#disabling-a-built-in). There is no
