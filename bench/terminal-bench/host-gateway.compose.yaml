@@ -1,0 +1,6 @@
+# Lets a task container reach a model server on the Docker host (Linux).
+# Docker Desktop provides host.docker.internal already; Linux needs this.
+services:
+  main:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

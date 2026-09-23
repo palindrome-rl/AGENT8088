@@ -77,3 +77,29 @@ def test_launcher_budget_stops_the_agent_and_exits_zero(tmp_path):
 def test_launcher_propagates_real_failures(tmp_path):
     result, _ = _launcher(tmp_path, "exit 3\n", budget=0)
     assert result.returncode == 3
+
+
+def test_run_script_invokes_harbor_per_task_with_its_budget(tmp_path):
+    tb = tmp_path / "tb" / "tasks"
+    for name, timeout in (("fix-git", 900), ("mailman", 1800)):
+        (tb / name).mkdir(parents=True)
+        (tb / name / "task.toml").write_text(f"[agent]\ntimeout_sec = {timeout}.0\n", encoding="utf-8")
+    tasks = tmp_path / "tasks.txt"
+    tasks.write_text("# comment\nfix-git\n\nmailman\n", encoding="utf-8")
+    wheel = tmp_path / "agent8088-0-py3-none-any.whl"
+    wheel.write_text("", encoding="utf-8")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls.txt"
+    (bindir / "harbor").write_text(f'#!/bin/bash\necho "$@" >> {calls}\n', encoding="utf-8")
+    (bindir / "harbor").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    subprocess.run(["bash", str(BENCH / "run.sh"), "--tb", str(tmp_path / "tb"), "--wheel", str(wheel),
+                    "--tasks", str(tasks), "--base-url", "http://gpu:8000/v1"],
+                   check=True, env=env, capture_output=True, text=True, timeout=60)
+    lines = calls.read_text().splitlines()
+    assert len(lines) == 2
+    assert "-i fix-git" in lines[0] and "budget_sec=855" in lines[0]
+    assert "-i mailman" in lines[1] and "budget_sec=1755" in lines[1]
+    assert all("-n 1" in line and "base_url=http://gpu:8000/v1" in line for line in lines)
+    assert all(f"wheel_path={wheel}" in line for line in lines)
