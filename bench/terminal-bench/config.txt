@@ -44,7 +44,7 @@ skills_dir=/opt/agent8088/bench/skills
 tool_host.execute_shell=1
 # Defaults only: the Harbor adapter rewrites these per task from its time
 # budget (agent8088_harbor/config_edit.py:budget_edits), together with
-# max_turn_seconds, and turns thinking on for tasks of 1500 s or more.
+# max_turn_seconds.
 tool_timeout.execute_shell=600
 max_tool_timeout_seconds=1800
 

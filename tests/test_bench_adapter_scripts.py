@@ -21,15 +21,15 @@ sys.path.insert(0, str(BENCH))
 from agent8088_harbor.config_edit import budget_edits, config_edit_command  # noqa: E402
 
 
-def test_budget_edits_size_timeouts_and_thinking_to_the_task():
+def test_budget_edits_size_timeouts_to_the_task():
     short = budget_edits(855)    # a 900 s task
     assert short == {"max_turn_seconds": "795", "max_tool_timeout_seconds": "735",
                      "tool_timeout.execute_shell": "300"}
 
     long = budget_edits(1755)    # an 1800 s task
     assert long["tool_timeout.execute_shell"] == "600"
-    assert '"enable_thinking": true' in long["provider.vllm.extra_body"]
-    assert long["temperature"] == "0.6"
+    # Sampling is fixed in config.txt, never varied per task.
+    assert not {"temperature", "provider.vllm.extra_body"} & set(long)
 
     assert budget_edits(0) == {}
 
