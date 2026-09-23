@@ -2144,6 +2144,29 @@ def _parse_rate_limit_headers(provider_name: str, headers) -> dict | None:
         return None
 
 
+def _provider_extra_body(provider_name: str) -> dict:
+    """Extra request fields for a provider: provider.<name>.extra_body (a JSON
+    object, e.g. {"chat_template_kwargs": {"enable_thinking": false}} for Qwen3
+    on vLLM) plus the optional provider.<name>.reasoning_effort dial."""
+    profile = (PROVIDERS.get(provider_name) or {}) if provider_name else {}
+    extra = {}
+    raw = str(profile.get("extra_body") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            extra.update(parsed)
+        else:
+            logging.getLogger(__name__).warning(
+                "Ignoring provider.%s.extra_body: not a JSON object.", provider_name)
+    effort = str(profile.get("reasoning_effort") or "").strip()
+    if effort:
+        extra["reasoning_effort"] = effort
+    return extra
+
+
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False):
@@ -2205,11 +2228,9 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     # Optional per-provider reasoning dial (provider.<name>.reasoning_effort).
     # Some OpenAI-compatible layers accept reasoning_effort, others 400 on the
     # unknown field — retry clean once on that specific rejection.
-    effort = ""
-    if provider_name:
-        effort = str((PROVIDERS.get(provider_name) or {}).get("reasoning_effort") or "").strip()
-    if effort and not _skip_optional:
-        request_options["extra_body"] = {"reasoning_effort": effort}
+    extra_body = _provider_extra_body(provider_name)
+    if extra_body and not _skip_optional:
+        request_options["extra_body"] = extra_body
     _raise_if_interrupted(interrupt_check)
     global _last_rate_limit_status
     track_rate_limits = provider_name in providers.RATE_LIMIT_HEADERS
