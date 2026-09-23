@@ -5215,7 +5215,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     global _active_budget
     global PERMISSION_MODE, _plan_execution_grant
     global _local_fallback_grant, _remote_git_grant, _active_role
-    global _sandbox_readonly, SUBAGENT_SPECS
+    global _sandbox_readonly, SUBAGENT_SPECS, _INHERITED_USER_TURNS
 
     # Dynamically reload subagent specifications so on-the-fly markdown
     # changes and newly created subagents are immediately accessible.
@@ -5319,6 +5319,12 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     _active_budget = child_budget
     messages = history if history is not None else []
     messages.append(_delegated_turn(task, from_user))
+    # A task the person typed is its own authority. One the parent model wrote
+    # acts under the parent run's human turns -- read now, while that run is
+    # still the one executing.
+    saved_inherited = _INHERITED_USER_TURNS
+    _INHERITED_USER_TURNS = () if from_user else tuple(
+        _authorising_turns(_CURRENT_RUN_MESSAGES or []))
     try:
         answer = run_agent(
             messages,
@@ -5336,6 +5342,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = f"Sub-agent failed: {e}"
     finally:
+        _INHERITED_USER_TURNS = saved_inherited
         _active_budget = parent_budget
         _bill_parent(parent_budget, child_budget)
         _last_tool_output, _last_tool_name, _last_write_diff = saved
@@ -10627,11 +10634,11 @@ def reopen_review(review_id: str, root=None):
         if _is_sensitive_path(str(review_root / str(finding.get("path") or ""))):
             return False
         if snapshot:
-            return open_code_review.recheck_finding_at_ref(
+            return open_code_review.locate_finding_at_ref(
                 review_root, finding, snapshot,
                 run=lambda argv, cwd: open_code_review.run_process(
                     argv, cwd, check=lambda: None, kill=_kill_detached_process, timeout=30))
-        return open_code_review.recheck_finding(review_root, finding)
+        return open_code_review.locate_finding(review_root, finding)
     return review_store.reopen(REVIEW_STORE_PATH, review_id, base, recheck=recheck)
 
 
@@ -11678,10 +11685,11 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             messages, kwargs.get("system_prompt"), identity=memory_identity)
     answer = None
     try:
-        answer = _run_agent_loop(
-            messages, budget=budget, trajectory=run_trajectory,
-            on_trajectory_state=trajectory_changed, **kwargs,
-        )
+        with _running_on(messages):
+            answer = _run_agent_loop(
+                messages, budget=budget, trajectory=run_trajectory,
+                on_trajectory_state=trajectory_changed, **kwargs,
+            )
         return answer
     finally:
         run_trajectory.finish(answer)
@@ -11947,8 +11955,63 @@ def _delegated_turn(task: str, from_user: bool) -> dict:
 
     (Task skills are not in play either way: sub-agents always pass their own
     `system_prompt`, so `render_task_skill_docs` never runs for them.)
+
+    The marked form carries its own label, not just the harness prefix, so the
+    restriction scans can tell the parent's task apart from a re-shown tool
+    result -- see `_delegated_turns`.
     """
-    return {"role": "user", "content": str(task)} if from_user else _harness_turn(task)
+    if from_user:
+        return {"role": "user", "content": str(task)}
+    return _harness_turn(_DELEGATED_LABEL + str(task))
+
+
+_DELEGATED_LABEL = "Task delegated to you by the parent agent:\n"
+
+# The conversation of the run_agent call currently executing, so a sub-agent
+# spawned from inside it can find the human's turns. A live reference, not a
+# copy: _exec_subagent reads it at spawn time.
+_CURRENT_RUN_MESSAGES = None
+
+# The human turns a spawned sub-agent acts under. Its own message list holds
+# only the parent's marked prose, so without these it would have no user
+# authority at all -- browse_page gated out, "do not use execute_shell" unread.
+_INHERITED_USER_TURNS: tuple = ()
+
+
+@contextmanager
+def _running_on(messages):
+    """Record `messages` as the running conversation for the duration."""
+    global _CURRENT_RUN_MESSAGES
+    previous, _CURRENT_RUN_MESSAGES = _CURRENT_RUN_MESSAGES, messages
+    try:
+        yield
+    finally:
+        _CURRENT_RUN_MESSAGES = previous
+
+
+def _authorising_turns(messages) -> list:
+    """The human turns that decide what this run may do.
+
+    A run's own genuine turns when it has any. A spawned sub-agent has none --
+    its task is the parent model's prose -- so it acts under the turns it
+    inherited from the run that spawned it: the person's actual words, never
+    the parent's restatement of them.
+    """
+    return _genuine_user_turns(messages) or list(_INHERITED_USER_TURNS)
+
+
+def _delegated_turns(messages) -> list:
+    """The parent's delegated task(s), read only by the restriction scans.
+
+    Narrowing what a sub-agent may do is safe whoever asks, so "do not use
+    execute_shell" in the task is enforced. The label keeps this to the task
+    itself: a re-shown tool result is a harness turn too, and it must still
+    not be able to switch a tool off.
+    """
+    label = _HARNESS_PREFIX + _DELEGATED_LABEL
+    return [m for m in messages
+            if m.get("role") == "user"
+            and str(m.get("content", "")).startswith(label)]
 
 
 # Output that is a stream of events — a command's stdout, a page's text — is
@@ -12040,7 +12103,7 @@ def _user_supplied_url(messages, url: object) -> bool:
     """Whether the exact page URL came from the user's request."""
     return (isinstance(url, str) and bool(url) and any(
         url in str(message.get("content", ""))
-        for message in _genuine_user_turns(messages)
+        for message in _authorising_turns(messages)
     ))
 
 
@@ -12065,9 +12128,24 @@ _BROWSER_REFUSAL = re.compile(
 )
 
 
+# "Do not browse yourself" in a request that delegates the browsing is
+# addressed to the run it was typed at. Read by a sub-agent that inherited the
+# turn, it would refuse the child the very work it was handed.
+_PARENT_SCOPED = re.compile(r"\s+(?:yourself|directly|on\s+your\s+own)\b", re.IGNORECASE)
+
+
+def _restricts(pattern, text: str, *, inherited: bool) -> bool:
+    """Whether `text` imposes `pattern`'s restriction on the run reading it."""
+    for match in pattern.finditer(text):
+        if inherited and _PARENT_SCOPED.match(text, match.end()):
+            continue
+        return True
+    return False
+
+
 def _browser_request_text(messages) -> str:
     """Latest human request, or the original goal of a durable continuation."""
-    turns = _genuine_user_turns(messages)
+    turns = _authorising_turns(messages)
     if not turns:
         return ""
     latest = str(turns[-1].get("content") or "")
@@ -12082,7 +12160,11 @@ def _browser_request_text(messages) -> str:
 def _browser_request_is_explicit(messages, url: object = None) -> bool:
     """A physical visit or a search-result link is not browser authorisation."""
     request = _browser_request_text(messages)
-    if not request or _BROWSER_REFUSAL.search(request):
+    inherited = not _genuine_user_turns(messages)
+    if not request or _restricts(_BROWSER_REFUSAL, request, inherited=inherited):
+        return False
+    if any(_BROWSER_REFUSAL.search(str(m.get("content") or ""))
+           for m in _delegated_turns(messages)):
         return False
     if _EXPLICIT_BROWSER_REQUEST.search(request):
         return True
@@ -12109,7 +12191,7 @@ def _user_requested_tool(messages, name: str) -> bool:
     tool call by narrating it first.
     """
     phrases = (name, *_EXPLICIT_TOOL_PHRASES.get(name, ()))
-    for message in _genuine_user_turns(messages):
+    for message in _authorising_turns(messages):
         text = str(message.get("content", "")).lower()
         if any(phrase in text for phrase in phrases):
             return True
@@ -12227,11 +12309,21 @@ def _cli_anything_requested(messages: list[dict]) -> bool:
     )
 
 
+_EXECUTE_SHELL_BAN = re.compile(
+    r"\b(?:do not|don't|never)\s+(?:use|call)\s+execute_shell\b", re.IGNORECASE)
+
+
 def _execute_shell_forbidden(messages: list[dict]) -> bool:
+    inherited = not _genuine_user_turns(messages)
     return any(
-        re.search(r"\b(?:do not|don't|never)\s+(?:use|call)\s+execute_shell\b",
-                  str(message.get("content") or ""), re.IGNORECASE)
-        for message in _genuine_user_turns(messages)
+        _restricts(_EXECUTE_SHELL_BAN, str(message.get("content") or ""),
+                   inherited=inherited)
+        for message in _authorising_turns(messages)
+    ) or any(
+        # The delegated task speaks to the child, so "yourself" there is it.
+        _restricts(_EXECUTE_SHELL_BAN, str(message.get("content") or ""),
+                   inherited=False)
+        for message in _delegated_turns(messages)
     )
 
 

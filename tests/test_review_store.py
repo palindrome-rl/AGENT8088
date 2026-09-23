@@ -99,3 +99,34 @@ def test_connections_release_the_database_file(tmp_path):
     review_store.recent(store)
     store.unlink()  # Windows refuses this if any sqlite connection remains open.
     assert not store.exists()
+
+
+def test_a_relocated_finding_is_moved_and_says_so(tmp_path):
+    """A recheck may answer with the code's current lines. The finding then
+    points there -- a fix must land where the code is -- and records where
+    the review originally put it."""
+    store = tmp_path / "reviews.db"
+    review_id = review_store.save(store, tmp_path, _result())
+    original = review_store.load(store, review_id)["findings"][0]
+
+    reopened = review_store.reopen(store, review_id, tmp_path,
+                                   recheck=lambda root, finding: (41, 42))
+    moved = reopened["findings"][0]
+
+    assert moved["position_valid"] is True
+    assert (moved["start_line"], moved["end_line"]) == (41, 42)
+    assert moved["moved_from"] == original["start_line"]
+    assert moved["verification"] == "moved"
+
+
+def test_a_finding_still_at_its_line_is_not_marked_moved(tmp_path):
+    store = tmp_path / "reviews.db"
+    review_id = review_store.save(store, tmp_path, _result())
+    original = review_store.load(store, review_id)["findings"][0]
+    here = (original["start_line"], original.get("end_line") or original["start_line"])
+
+    reopened = review_store.reopen(store, review_id, tmp_path,
+                                   recheck=lambda root, finding: here)
+
+    assert reopened["findings"][0]["position_valid"] is True
+    assert "moved_from" not in reopened["findings"][0]
