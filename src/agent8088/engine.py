@@ -12230,6 +12230,12 @@ COMPACTION_THRESHOLD_PCT = int(APP_CONFIG.get("compaction_threshold_pct", "75"))
 # How many of the most recent messages survive a compaction untouched -- the
 # agent's active working set. The summary replaces everything older.
 COMPACTION_KEEP_MESSAGES = 6
+# Slack left between the estimated prompt and the window when sizing a
+# completion request -- chars/4 is an estimate, and chat templates add tokens.
+CONTEXT_SAFETY_TOKENS = 512
+# Never ask for less than this; a request that cannot fit even this much is a
+# compaction problem, not a max_tokens one.
+MIN_TURN_COMPLETION_TOKENS = 256
 
 
 def _estimate_context_chars(messages: list[dict], system_prompt: str = "") -> int:
@@ -12672,6 +12678,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             min(turn_completion_limit * 2, turn_context_window) if length_retries == 1 else
             min(1024, turn_completion_limit)
         )
+        # Fit the request in the window: a strict OpenAI-compatible server (vLLM)
+        # rejects prompt + max_tokens > max_model_len with a 400, which ends the
+        # turn. Asking for the full completion limit on a long history -- or
+        # doubling it on a length retry -- produced exactly that request.
+        if turn_context_window:
+            prompt_tokens_estimate = (
+                _estimate_context_chars(messages, round_system_prompt or "")
+                + len(json.dumps(round_tools_def or [], default=str))) // 4
+            headroom = turn_context_window - prompt_tokens_estimate - CONTEXT_SAFETY_TOKENS
+            turn_max_tokens = max(MIN_TURN_COMPLETION_TOKENS, min(turn_max_tokens, headroom))
         try:
             with spin("thinking..."):
                 response = _create_completion_with_fallback(
