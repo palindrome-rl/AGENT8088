@@ -18,7 +18,20 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench" / "terminal-bench"
 sys.path.insert(0, str(BENCH))
 
-from agent8088_harbor.config_edit import config_edit_command  # noqa: E402
+from agent8088_harbor.config_edit import budget_edits, config_edit_command  # noqa: E402
+
+
+def test_budget_edits_size_timeouts_to_the_task():
+    short = budget_edits(855)    # a 900 s task
+    assert short == {"max_turn_seconds": "795", "max_tool_timeout_seconds": "735",
+                     "tool_timeout.execute_shell": "300"}
+
+    long = budget_edits(1755)    # an 1800 s task
+    assert long["tool_timeout.execute_shell"] == "600"
+    # Sampling is fixed in config.txt, never varied per task.
+    assert not {"temperature", "provider.vllm.extra_body"} & set(long)
+
+    assert budget_edits(0) == {}
 
 
 def test_config_edit_replaces_keys_and_keeps_the_rest(tmp_path):

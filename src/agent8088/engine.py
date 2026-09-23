@@ -8592,6 +8592,16 @@ def _run_cli_anything_tool(name: str, args: dict, timeout: int,
     return _wrap_untrusted(str(result), f"CLI-Anything operation: {name}")
 
 
+def _budget_capped_timeout(timeout: int) -> int:
+    """In a disposable container the run is killed at its budget: one long
+    command must not take the whole remainder and leave no turn to write the
+    deliverables. Elsewhere the timeout is returned unchanged."""
+    if not DISPOSABLE_CONTAINER or _active_budget is None:
+        return timeout
+    left = _active_budget.seconds_left()
+    return timeout if left is None else max(1, min(timeout, int(left) - 30))
+
+
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
@@ -8608,7 +8618,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         args = {k: v for k, v in args.items() if k != "timeout"}  # caller's dict untouched
         if str(requested).strip().isdigit():
             _declared_timeout = int(str(requested).strip())
-    timeout = min(max(1, _declared_timeout), MAX_TOOL_TIMEOUT_SECONDS)
+    timeout = _budget_capped_timeout(min(max(1, _declared_timeout), MAX_TOOL_TIMEOUT_SECONDS))
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
     approval_key = _tool_call_key(name, args)
@@ -11567,6 +11577,12 @@ class _TurnBudget:
         slot[0] += prompt
         slot[1] += completion
 
+    def seconds_left(self):
+        """Wall-clock seconds left before max_seconds, or None with no time limit."""
+        if not self.max_seconds:
+            return None
+        return self.max_seconds - (time.monotonic() - self.started - self.idle_seconds)
+
     def credit_idle(self, seconds) -> None:
         """Discount time the turn spent waiting on a person."""
         try:
@@ -12040,6 +12056,20 @@ _HARNESS_PREFIX = "[agent8088] "
 # rather than one prefix, because a scan that checks only the tool-result marker
 # is the bug `_HARNESS_PREFIX` was added to fix, one function away.
 _LOOP_PREFIXES = (_TOOL_RESULT_PREFIX, _HARNESS_PREFIX)
+
+
+# Fractions of the run's wall-clock budget at which a disposable-container run
+# is told how much time is left. Without them the model explores until the
+# budget kills it, often before any deliverable exists.
+TIME_LEFT_NUDGE_AT = (0.6, 0.85)
+
+
+def _time_left_nudge(seconds_left: float) -> str:
+    minutes = max(0, int(seconds_left)) // 60
+    left = f"about {minutes} min" if minutes else "under a minute"
+    return (f"Time check: {left} left before this run is stopped. Make sure every "
+            "required output exists now, even if imperfect; stop exploring and "
+            "finish the most important remaining step first.")
 
 
 def _harness_turn(text: str) -> dict:
@@ -12676,6 +12706,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
     deliverables_checked = False  # disposable-container end-of-run check, once per run
+    time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     plan_mutation_retries = 0
     # Current rung on the `auto` ladder. Sticky for the rest of this turn once
     # escalated -- climbing back down mid-turn would oscillate between a model
@@ -12745,6 +12776,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
+        if DISPOSABLE_CONTAINER and budget and budget.max_seconds:
+            left = budget.seconds_left()
+            crossed = sum(1 - left / budget.max_seconds >= at for at in TIME_LEFT_NUDGE_AT)
+            if crossed > time_nudges:
+                time_nudges = crossed
+                messages.append(_harness_turn(_time_left_nudge(left)))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "time_left", "content": int(left)})
         # After a length cutoff, first allow a larger retry, then force one
         # short answer/tool-call attempt for models with a low output ceiling.
         # The limits are the active model's, not the module constants, so a

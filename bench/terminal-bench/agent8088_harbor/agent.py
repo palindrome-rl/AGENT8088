@@ -26,7 +26,7 @@ from harbor.agents.options import InstalledAgentOptions
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from agent8088_harbor.config_edit import config_edit_command
+from agent8088_harbor.config_edit import budget_edits, config_edit_command
 
 PREFIX = "/opt/agent8088"
 BENCH_REMOTE = f"{PREFIX}/bench"
@@ -106,9 +106,9 @@ class Agent8088(BaseInstalledAgent):
             "project_root": options.workdir,
             "shell_cwd": options.workdir,
         }
-        if options.budget_sec > 90:
-            # Let the loop wrap up on its own before the watchdog kills it.
-            edits["max_turn_seconds"] = str(options.budget_sec - 60)
+        # Let the loop wrap up on its own before the watchdog kills it, and
+        # size tool timeouts and thinking to this task's time.
+        edits.update(budget_edits(options.budget_sec))
         await self.exec_as_root(environment, command=config_edit_command(
             f"{BENCH_REMOTE}/config.txt", edits))
 

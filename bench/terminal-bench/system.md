@@ -43,3 +43,19 @@ judged only by the state you leave behind.
 - When a dataset, library or tool has a README, model card or docs, read the
   relevant part before guessing its structure.
 - For speed or timing requirements, measure several times, not once.
+- Long builds and installs (R packages, compiling from source, pip packages
+  with C extensions): start them with `nohup ... > /tmp/build.log 2>&1 &` and
+  poll the log. Never block on one command for more than a few minutes.
+- Virtual machines and serial consoles are the one exception to "never start
+  interactive programs": drive them with a script (`expect`, python `pexpect`
+  or `socat`), never by hand. QEMU without KVM boots slowly; wait in a loop
+  for the prompt.
+- When hidden tests will run your code on new inputs, the given examples are
+  not enough: write extra cases of your own (edge cases, other sizes) and
+  never hard-code the examples.
+- Keep a short progress file at /tmp/progress.md: what works, what failed,
+  the next step. Re-read it whenever the conversation has been summarized.
+- When editing files in place (secrets, word swaps), change only what the task
+  names, and compare before finishing (`git diff --stat` or checksums).
+- Time is limited and you will be told when it is running out. When that
+  happens, make sure every required output exists before improving anything.
