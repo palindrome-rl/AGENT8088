@@ -13,7 +13,6 @@ Requires (set in config.txt):
 import asyncio
 import logging
 import re
-import time
 from typing import Optional
 
 from telegram import Update
@@ -32,7 +31,6 @@ from agent8088.gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4096
-MIN_EDIT_INTERVAL = 0.5
 DEDUP_MAX = 500
 
 
@@ -74,50 +72,6 @@ def markdown_to_telegram(text: str) -> str:
     return text
 
 
-class TelegramStreamSink:
-    def __init__(self, adapter: "TelegramAdapter", chat_id: str):
-        self.adapter = adapter
-        self.chat_id = chat_id
-        self.buf = ""
-        self.msg_id: Optional[int] = None
-        self.last_edit = 0.0
-
-    def __call__(self, delta: str) -> None:
-        self.buf += delta
-        now = time.time()
-        if now - self.last_edit < MIN_EDIT_INTERVAL:
-            return
-        self.last_edit = now
-        try:
-            asyncio.get_event_loop().create_task(self._flush())
-        except RuntimeError:
-            pass
-
-    async def _flush(self) -> None:
-        text = self.buf[:MAX_MESSAGE_LENGTH]
-        if self.msg_id is None:
-            self.msg_id = await self.adapter._send(self.chat_id, text)
-        else:
-            await self.adapter._edit(self.chat_id, self.msg_id, text)
-
-    async def finalize(self, full_text: str) -> None:
-        chunks = [
-            full_text[i:i + MAX_MESSAGE_LENGTH]
-            for i in range(0, len(full_text), MAX_MESSAGE_LENGTH)
-        ]
-        if not chunks:
-            chunks = [""]
-        if self.msg_id is None:
-            self.msg_id = await self.adapter._send(self.chat_id, chunks[0])
-        else:
-            await self.adapter._edit(self.chat_id, self.msg_id, chunks[0])
-        for chunk in chunks[1:]:
-            await self.adapter._send(self.chat_id, chunk)
-
-    def fail(self, err: Exception) -> None:
-        logger.warning("Telegram stream failed for %s: %s", self.chat_id, err)
-
-
 class TelegramAdapter(BaseChannelAdapter):
     platform = "telegram"
 
@@ -129,7 +83,9 @@ class TelegramAdapter(BaseChannelAdapter):
         self._bot_user_id: Optional[int] = None
         self._bot_username: Optional[str] = None
         self._running = False
-        self._dedup: set = set()
+        # Insertion-ordered dict, not a set: set eviction dropped arbitrary ids
+        # under load, which could re-process a duplicate turn (audit M7).
+        self._dedup: dict = {}
 
     async def connect(self) -> None:
         if not self._token:
@@ -200,9 +156,9 @@ class TelegramAdapter(BaseChannelAdapter):
         uid = str(update.update_id)
         if uid in self._dedup:
             return
-        self._dedup.add(uid)
-        if len(self._dedup) > DEDUP_MAX:
-            self._dedup = set(list(self._dedup)[-DEDUP_MAX:])
+        self._dedup[uid] = None
+        while len(self._dedup) > DEDUP_MAX:
+            self._dedup.pop(next(iter(self._dedup)))
 
         chat = update.effective_chat
         if chat is None:
@@ -276,17 +232,14 @@ class TelegramAdapter(BaseChannelAdapter):
             except Exception as e:
                 logger.debug("Telegram edit failed: %s", e)
 
-    def make_stream_sink(self, chat_id: str) -> TelegramStreamSink:
-        return TelegramStreamSink(self, chat_id)
-
     async def send_message(self, chat_id: str, text: str, **meta) -> str:
-        # Chunk at MAX_MESSAGE_LENGTH so long replies (/capabilities, big
-        # outputs) don't hit Telegram's 4096-char limit and get dropped.
-        body = markdown_to_telegram(text)
-        chunks = [body[i:i + MAX_MESSAGE_LENGTH]
-                  for i in range(0, len(body), MAX_MESSAGE_LENGTH)]
+        # Chunk the RAW text at MAX_MESSAGE_LENGTH and let _send convert once
+        # per chunk. Converting first (the old order) then converting again
+        # inside _send turned **bold** into *bold* into _bold_ (audit M5).
+        chunks = [text[i:i + MAX_MESSAGE_LENGTH]
+                  for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
         if not chunks:
-            chunks = [body]
+            chunks = [text]
         first_id = "0"
         for chunk in chunks:
             msg_id = await self._send(chat_id, chunk)
@@ -302,9 +255,3 @@ class TelegramAdapter(BaseChannelAdapter):
 
     async def on_message(self, event: MessageEvent) -> None:
         await self.runner.on_message(event)
-
-    def supports_streaming(self) -> bool:
-        return True
-
-    def streaming_overflow_limit(self) -> Optional[int]:
-        return MAX_MESSAGE_LENGTH

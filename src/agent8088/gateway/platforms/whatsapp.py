@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL = 1.0
 HEALTH_CHECK_TIMEOUT = 30.0
 MAX_MESSAGE_LENGTH = 4096
-MIN_EDIT_INTERVAL = 0.5
 
 
 def markdown_to_whatsapp(text: str) -> str:
@@ -65,54 +64,6 @@ def markdown_to_whatsapp(text: str) -> str:
     return text
 
 
-class WhatsAppStreamSink:
-    def __init__(self, adapter: "WhatsAppAdapter", chat_id: str):
-        self.adapter = adapter
-        self.chat_id = chat_id
-        self.buf = ""
-        self.msg_id: Optional[str] = None
-        self.last_edit = 0.0
-
-    def __call__(self, delta: str) -> None:
-        self.buf += delta
-        now = time.time()
-        if now - self.last_edit < MIN_EDIT_INTERVAL:
-            return
-        self.last_edit = now
-        # Schedule flush on the adapter's event loop (we may be in a worker thread)
-        loop = self.adapter._loop
-        if loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._flush(), loop)
-
-    async def _flush(self) -> None:
-        text = self.buf[:MAX_MESSAGE_LENGTH]
-        if self.msg_id is None:
-            result = await self.adapter._send(self.chat_id, text)
-            if result and result.ok:
-                self.msg_id = result.message_id
-        else:
-            await self.adapter._edit(self.chat_id, self.msg_id, text)
-
-    async def finalize(self, full_text: str) -> None:
-        chunks = [
-            full_text[i:i + MAX_MESSAGE_LENGTH]
-            for i in range(0, len(full_text), MAX_MESSAGE_LENGTH)
-        ]
-        if not chunks:
-            chunks = [""]
-        if self.msg_id is None:
-            result = await self.adapter._send(self.chat_id, chunks[0])
-            if result and result.ok:
-                self.msg_id = result.message_id
-        else:
-            await self.adapter._edit(self.chat_id, self.msg_id, chunks[0])
-        for chunk in chunks[1:]:
-            await self.adapter._send(self.chat_id, chunk)
-
-    def fail(self, err: Exception) -> None:
-        logger.warning("WhatsApp stream failed for %s: %s", self.chat_id, err)
-
-
 class WhatsAppAdapter(BaseChannelAdapter):
     platform = "whatsapp"
 
@@ -120,9 +71,13 @@ class WhatsAppAdapter(BaseChannelAdapter):
         self.config = config
         self.runner = runner
         self.bridge_port = int(config.get("whatsapp_bridge_port", "3000") or "3000")
-        self.session_dir = Path(
-            config.get("whatsapp_session_dir", "") or ""
-        ).expanduser() or Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
+        # Empty config must fall through to the documented default: Path("") is
+        # Path("."), which is truthy, so `or default` never fired (audit M1).
+        raw_session = (config.get("whatsapp_session_dir") or "").strip()
+        self.session_dir = (
+            Path(raw_session).expanduser() if raw_session
+            else Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
+        ).resolve()  # absolute: Node runs with cwd=bridge_dir, Python checks creds from ours
         self.bridge_url = f"http://127.0.0.1:{self.bridge_port}"
         self.client: Optional[httpx.AsyncClient] = None
         self._running = False
@@ -170,7 +125,10 @@ class WhatsAppAdapter(BaseChannelAdapter):
             self._bridge_process = subprocess.Popen(
                 ["node", str(bridge_js), "--port", str(self.bridge_port),
                  "--session", str(self.session_dir), "--mode", whatsapp_mode],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(bridge_dir),
+                # Never PIPE: bridge.js logs on every reconnect and an undrained
+                # ~4KB Windows pipe freezes Node, which then fails every health
+                # check (audit M2).
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(bridge_dir),
             )
         except FileNotFoundError:
             logger.error("WhatsApp: node not found. Install Node.js 18+.")
@@ -257,7 +215,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
     async def _restart_bridge(self) -> None:
         """Kill and respawn the Node bridge if it has died."""
         logger.warning("WhatsApp: restarting bridge...")
-        # Kill old process
+        # Kill old process (only the one we spawned)
         if self._bridge_process:
             self._bridge_process.terminate()
             try:
@@ -265,6 +223,18 @@ class WhatsAppAdapter(BaseChannelAdapter):
             except subprocess.TimeoutExpired:
                 self._bridge_process.kill()
             self._bridge_process = None
+        else:
+            # Reuse-existing path: we don't own a child, but another bridge may
+            # still hold the port. Spawning a rival then just EADDRINUSE-loops
+            # every few polls (audit L13). Probe first; only spawn if free.
+            try:
+                resp = await self.client.get(f"{self.bridge_url}/health", timeout=3.0)
+                logger.warning(
+                    "WhatsApp: external bridge still answering (status=%s); not spawning a rival",
+                    resp.json().get("status"))
+                return
+            except Exception:
+                pass  # port is free — fall through and spawn
         # Spawn fresh
         bridge_dir = Path(__file__).parent / "whatsapp_bridge"
         bridge_js = bridge_dir / "bridge.js"
@@ -273,7 +243,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
             self._bridge_process = subprocess.Popen(
                 ["node", str(bridge_js), "--port", str(self.bridge_port),
                  "--session", str(self.session_dir), "--mode", whatsapp_mode],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(bridge_dir),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(bridge_dir),
             )
         except Exception as e:
             logger.error("WhatsApp: failed to restart bridge: %s", e)
@@ -337,9 +307,6 @@ class WhatsAppAdapter(BaseChannelAdapter):
         except Exception as e:
             logger.debug("WhatsApp edit failed: %s", e)
 
-    def make_stream_sink(self, chat_id: str) -> WhatsAppStreamSink:
-        return WhatsAppStreamSink(self, chat_id)
-
     async def send_message(self, chat_id: str, text: str, **meta) -> str:
         result = await self._send(chat_id, text)
         return result.message_id or "0" if result else "0"
@@ -349,9 +316,3 @@ class WhatsAppAdapter(BaseChannelAdapter):
 
     async def on_message(self, event: MessageEvent) -> None:
         await self.runner.on_message(event)
-
-    def supports_streaming(self) -> bool:
-        return True
-
-    def streaming_overflow_limit(self) -> Optional[int]:
-        return MAX_MESSAGE_LENGTH
