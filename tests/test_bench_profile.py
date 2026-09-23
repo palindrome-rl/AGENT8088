@@ -52,7 +52,11 @@ def test_profile_provider_and_limits(monkeypatch, tmp_path):
     e = _load(monkeypatch, tmp_path)
     assert e._active_model_token_limits("vllm", "qwen3.8-27b") == (32768, 8192)
     body = e._provider_extra_body("vllm")
-    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    # Every request carries the vLLM server's own sampling defaults, so the
+    # agent never silently overrides them (a sent value always wins).
+    assert body == {"chat_template_kwargs": {"enable_thinking": True}, "top_p": 0.95,
+                    "top_k": 20, "presence_penalty": 0.0, "frequency_penalty": 0.0}
+    assert e.APP_CONFIG["temperature"] == "0.6"
     assert e.MAX_TOOL_TIMEOUT_SECONDS == 1800
 
 

@@ -13,16 +13,20 @@ provider.vllm.native_tools=True
 # Must equal vLLM's --max-model-len. Raise both together.
 provider.vllm.context_window=32768
 provider.vllm.max_completion_tokens=8192
-# Qwen3 thinking off per request (more turns inside the time limit), plus
-# Qwen's recommended non-thinking sampling.
-provider.vllm.extra_body={"chat_template_kwargs": {"enable_thinking": false}, "top_k": 20, "top_p": 0.8}
+# Sampling pinned to the vLLM server's own defaults on every request: a value
+# agent8088 sends always overrides the server's, so each one is sent
+# explicitly. Thinking on (server runs --reasoning-parser qwen3), top_p/top_k
+# from the model's generation_config.json, penalties at the protocol default 0.
+provider.vllm.extra_body={"chat_template_kwargs": {"enable_thinking": true}, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0, "frequency_penalty": 0.0}
 model_name=qwen3.8-27b
 model_base_url=http://host.docker.internal:8000/v1
 context_window=32768
 max_completion_tokens=8192
-# Qwen's recommended sampling for non-thinking mode; 0.1 overrode the server's 0.6.
-temperature=0.7
-presence_penalty=1.0
+# The server's --override-generation-config temperature; agent8088's default
+# 0.1 would otherwise override it.
+temperature=0.6
+presence_penalty=0
+frequency_penalty=0
 timeout_seconds=600
 
 # --- Loop ---
