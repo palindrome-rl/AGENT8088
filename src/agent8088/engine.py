@@ -9829,6 +9829,17 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                         "name": resolved,
                         "arguments": _args_after_function_marker(unstripped, m2.group(1)),
                     })
+    # 2b) Qwen3 XML: <function=name><parameter=p>value</parameter></function>.
+    # vLLM's qwen3_xml parser normally lifts these into tool_calls; this catches
+    # the ones it misses so they run instead of being read as a final answer.
+    if not calls:
+        for m in re.finditer(r"<function=([\w.-]+)>(.*?)</function>", text, re.DOTALL):
+            resolved = _resolve_tool_name(m.group(1))
+            if resolved not in allowed:
+                continue
+            params = {key: value.strip("\n") for key, value in re.findall(
+                r"<parameter=([\w.-]+)>(.*?)</parameter>", m.group(2), re.DOTALL)}
+            calls.append({"name": resolved, "arguments": params})
     # 3) bare JSON {"name": "...", "arguments": {...}}
     # The arguments object's extent is found by counting braces, for the same
     # reason the ✿ARGS✿ branch above does it: a non-greedy `(\{.*?\})` stops at
