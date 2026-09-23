@@ -12,7 +12,6 @@ Requires (set in config.txt):
 import asyncio
 import logging
 import re
-import time
 from typing import Optional
 
 import discord
@@ -26,7 +25,6 @@ from agent8088.gateway.runner import APPROVAL_TIMEOUT
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 2000
-MIN_EDIT_INTERVAL = 0.5
 DEDUP_MAX = 500
 
 
@@ -53,50 +51,6 @@ def markdown_to_discord(text: str) -> str:
     return text
 
 
-class DiscordStreamSink:
-    def __init__(self, adapter: "DiscordAdapter", chat_id: str):
-        self.adapter = adapter
-        self.chat_id = chat_id
-        self.buf = ""
-        self.msg: Optional[discord.Message] = None
-        self.last_edit = 0.0
-
-    def __call__(self, delta: str) -> None:
-        self.buf += delta
-        now = time.time()
-        if now - self.last_edit < MIN_EDIT_INTERVAL:
-            return
-        self.last_edit = now
-        try:
-            asyncio.get_event_loop().create_task(self._flush())
-        except RuntimeError:
-            pass
-
-    async def _flush(self) -> None:
-        text = self.buf[:MAX_MESSAGE_LENGTH]
-        if self.msg is None:
-            self.msg = await self.adapter._send(self.chat_id, text)
-        else:
-            await self.adapter._edit(self.chat_id, self.msg, text)
-
-    async def finalize(self, full_text: str) -> None:
-        chunks = [
-            full_text[i:i + MAX_MESSAGE_LENGTH]
-            for i in range(0, len(full_text), MAX_MESSAGE_LENGTH)
-        ]
-        if not chunks:
-            chunks = [""]
-        if self.msg is None:
-            self.msg = await self.adapter._send(self.chat_id, chunks[0])
-        else:
-            await self.adapter._edit(self.chat_id, self.msg, chunks[0])
-        for chunk in chunks[1:]:
-            await self.adapter._send(self.chat_id, chunk)
-
-    def fail(self, err: Exception) -> None:
-        logger.warning("Discord stream failed for %s: %s", self.chat_id, err)
-
-
 class DiscordAdapter(BaseChannelAdapter):
     platform = "discord"
 
@@ -105,8 +59,11 @@ class DiscordAdapter(BaseChannelAdapter):
         self.runner = runner
         self._token = A.get_secret(config, "discord_bot_token")
         self._client: Optional[discord.Client] = None
+        self._conn_task: Optional[asyncio.Task] = None
         self._running = False
-        self._dedup: set = set()
+        # Insertion-ordered dict, not a set: set eviction dropped arbitrary ids
+        # under load, which could re-process a duplicate turn (audit M7).
+        self._dedup: dict = {}
 
     async def connect(self) -> None:
         if not self._token:
@@ -126,11 +83,22 @@ class DiscordAdapter(BaseChannelAdapter):
             await self._handle_message(message)
 
         try:
-            await self._client.start(self._token)
+            await self._client.login(self._token)
         except discord.LoginFailure:
             logger.error("Discord: invalid bot token")
             self._client = None
             return
+        except Exception as e:
+            logger.error("Discord: login failed: %s", e)
+            self._client = None
+            return
+        # client.start() does not return until the client closes, and the runner
+        # connects adapters sequentially — awaiting it starved every later
+        # adapter (email/telegram never started; audit H2). Login first so a bad
+        # token still fails fast, then run the gateway as a background task,
+        # the same shape as Slack's handler task.
+        self._conn_task = asyncio.get_event_loop().create_task(
+            self._client.connect(reconnect=True))
         self._running = True
         logger.info("Discord: gateway connected")
 
@@ -139,6 +107,9 @@ class DiscordAdapter(BaseChannelAdapter):
         if self._client:
             await self._client.close()
             self._client = None
+        if self._conn_task:
+            self._conn_task.cancel()
+            self._conn_task = None
 
     async def _handle_message(self, message: discord.Message) -> None:
         if message.author == self._client.user:
@@ -148,9 +119,9 @@ class DiscordAdapter(BaseChannelAdapter):
         mid = str(message.id)
         if mid in self._dedup:
             return
-        self._dedup.add(mid)
-        if len(self._dedup) > DEDUP_MAX:
-            self._dedup = set(list(self._dedup)[-DEDUP_MAX:])
+        self._dedup[mid] = None
+        while len(self._dedup) > DEDUP_MAX:
+            self._dedup.pop(next(iter(self._dedup)))
 
         is_dm = isinstance(message.channel, discord.DMChannel)
         if not is_dm:
@@ -191,9 +162,6 @@ class DiscordAdapter(BaseChannelAdapter):
         except Exception as e:
             logger.debug("Discord edit failed: %s", e)
 
-    def make_stream_sink(self, chat_id: str) -> DiscordStreamSink:
-        return DiscordStreamSink(self, chat_id)
-
     async def send_message(self, chat_id: str, text: str, **meta) -> str:
         # Discord's hard limit is 2000 chars (regular) / 4000 (boosted server) —
         # chunk so a long reply (a presented plan, /capabilities, big tool
@@ -224,20 +192,14 @@ class DiscordAdapter(BaseChannelAdapter):
     async def on_message(self, event: MessageEvent) -> None:
         await self.runner.on_message(event)
 
-    def supports_streaming(self) -> bool:
-        return True
-
-    def streaming_overflow_limit(self) -> Optional[int]:
-        return MAX_MESSAGE_LENGTH
-
     async def send_approval_prompt(self, chat_id: str, tool_name: str,
-                                     reason: str, paths: str) -> None:
+                                   reason: str, paths: str, nonce: str = "") -> None:
         """Send an approval prompt with ✅/❌ buttons (Discord ui.View)."""
         text = (f"**Approval Required**\n"
                 f"Tool: `{tool_name}`\n"
                 f"Reason: {reason}\n"
                 f"Paths: {paths}")
-        view = _ApprovalView(self.runner, chat_id)
+        view = _ApprovalView(self.runner, chat_id, nonce)
         await self._send(chat_id, text + "\n\nClick a button below to approve or deny.", view=view)
 
 
@@ -245,15 +207,21 @@ class _ApprovalView(discord.ui.View):
     """Discord button view for approve/deny. Resolves the pending approval
     in the GatewayRunner when a button is clicked."""
 
-    def __init__(self, runner, chat_id: str):
+    def __init__(self, runner, chat_id: str, nonce: str = ""):
         super().__init__(timeout=APPROVAL_TIMEOUT)
         self.runner = runner
         self.chat_id = chat_id
+        self.nonce = nonce
 
     def _lookup(self):
         # _pending_approvals is keyed by (platform, chat_id), not chat_id alone —
         # a bare .get(chat_id) always returns None, so buttons never resolve.
-        return self.runner._pending_approvals.get(("discord", self.chat_id))
+        entry = self.runner._pending_approvals.get(("discord", self.chat_id))
+        # Views live 300s: approval A can resolve early, approval B becomes
+        # pending, and A's still-live buttons must not resolve B (audit M3).
+        if entry is not None and entry.nonce != self.nonce:
+            return None
+        return entry
 
     def _check_clicker(self, entry, interaction):
         # Only the user who triggered the escalation may approve/deny it —
@@ -272,6 +240,11 @@ class _ApprovalView(discord.ui.View):
             return
         if not self._check_clicker(entry, interaction):
             return
+        # Resolve once: a quick /approve then this button must not flip a
+        # verdict already consumed (audit L11).
+        if entry.event.is_set():
+            await interaction.response.send_message("Already resolved.", ephemeral=True)
+            return
         entry.approved = True
         entry.event.set()
         self._disable_all(interaction.message)
@@ -284,6 +257,9 @@ class _ApprovalView(discord.ui.View):
             await interaction.response.send_message("No pending approval.", ephemeral=True)
             return
         if not self._check_clicker(entry, interaction):
+            return
+        if entry.event.is_set():
+            await interaction.response.send_message("Already resolved.", ephemeral=True)
             return
         entry.approved = True
         entry.session_scope = True
@@ -298,6 +274,9 @@ class _ApprovalView(discord.ui.View):
             await interaction.response.send_message("No pending approval.", ephemeral=True)
             return
         if not self._check_clicker(entry, interaction):
+            return
+        if entry.event.is_set():
+            await interaction.response.send_message("Already resolved.", ephemeral=True)
             return
         entry.approved = False
         entry.event.set()

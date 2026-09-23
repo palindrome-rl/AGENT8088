@@ -309,7 +309,13 @@ memory_mem0_dir=~/.agent8088/mem0
 # default_provider asked the wrong host and reported the model as missing when it
 # was simply never requested from the machine holding it. Whatever serves your
 # chat does not matter here. Set this only if your embeddings live elsewhere.
-# memory_embed_provider=ollama
+# Both engines follow this key: mem0 embeds with the same nomic-embed-text
+# (768 dims) the installer pulls for native recall, so one model serves both.
+# Opt into the local fastembed model instead with
+# memory_mem0_embed_provider=fastembed (needs: uv pip install fastembed).
+# Changing the embedder changes vector dimensions, and mem0 has no migration:
+# clear the memory_mem0_dir when switching.
+memory_embed_provider=ollama
 #
 # Model for the fact-extraction call (default: your chat model). Point this at
 # something small if one extra call per turn on your main model is too slow.

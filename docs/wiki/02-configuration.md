@@ -193,7 +193,7 @@ engines is enough):
 | `memory_mem0_vector_store` | `qdrant` | Vector store backend (embedded local Qdrant). |
 | `memory_mem0_dir` | `<data dir>/mem0` | Mem0 data directory. An explicit value wins, same as `memory_db_path`. |
 | `memory_mem0_llm_provider` / `memory_mem0_llm_model` | active provider / chat model | Model Mem0 uses for its own extraction calls. |
-| `memory_mem0_embed_provider` / `memory_mem0_embed_model` | `memory_embed_provider` / `memory_embed_model` | Embedding pair for Mem0; falls back to the native keys above. |
+| `memory_mem0_embed_provider` / `memory_mem0_embed_model` | `memory_embed_provider` / `memory_embed_model` (default `ollama` / `nomic-embed-text`) | Embedding pair for Mem0; falls back to the native keys above, so both engines share one Ollama embedding model. |
 
 Only what **you** type can become a memory or trigger a recall — tool output
 never does — and a recalled memory can never authorise a tool call.

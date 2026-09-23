@@ -122,34 +122,6 @@ function resolveToPhone(jidOrId) {
   return bare;
 }
 
-/**
- * Expand an identifier to all its aliases (LID + phone) by walking
- * the lid-mapping files transitively. Returns a Set of all known forms.
- */
-function expandAliases(identifier) {
-  const normalized = String(identifier || '').trim().replace(/:.*@/, '@').replace(/@.*/, '').replace(/^\+/, '');
-  if (!normalized) return new Set();
-  const resolved = new Set();
-  const queue = [normalized];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current || resolved.has(current)) continue;
-    resolved.add(current);
-    for (const suffix of ['', '_reverse']) {
-      const mappingPath = path.join(SESSION_DIR, `lid-mapping-${current}${suffix}.json`);
-      if (!fs.existsSync(mappingPath)) continue;
-      try {
-        const mapped = JSON.parse(fs.readFileSync(mappingPath, 'utf8'));
-        const normalizedMapped = String(mapped || '').replace(/@.*/, '').replace(/^\+/, '');
-        if (normalizedMapped && !resolved.has(normalizedMapped)) {
-          queue.push(normalizedMapped);
-        }
-      } catch {}
-    }
-  }
-  return resolved;
-}
-
 // --- Send queue serialization (Baileys hangs on overlapping sends) ---
 let _sendQueue = Promise.resolve();
 function enqueueSend(fn) {

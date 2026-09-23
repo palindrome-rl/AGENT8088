@@ -1,6 +1,9 @@
 """execute_shell accepts an optional per-call `timeout`, clamped to the
 configured ceiling, so a long build does not need every command's default
 raised."""
+import os
+
+import pytest
 
 
 def _host_shell(engine, declared=5):
@@ -10,6 +13,7 @@ def _host_shell(engine, declared=5):
     return spec
 
 
+@pytest.mark.skipif(os.name == "nt", reason="uses POSIX sleep")
 def test_timeout_arg_extends_a_short_default(engine):
     _host_shell(engine, declared=1)
     out = engine.run_tool("execute_shell", {"command": "sleep 2; echo ok", "timeout": 5})
@@ -17,12 +21,14 @@ def test_timeout_arg_extends_a_short_default(engine):
     assert "timed out" not in out
 
 
+@pytest.mark.skipif(os.name == "nt", reason="uses POSIX sleep")
 def test_timeout_arg_can_shorten(engine):
     _host_shell(engine, declared=30)
     out = engine.run_tool("execute_shell", {"command": "sleep 5; echo late", "timeout": 1})
     assert "timed out after 1s" in out
 
 
+@pytest.mark.skipif(os.name == "nt", reason="uses POSIX sleep")
 def test_timeout_arg_is_clamped_to_the_ceiling(engine, monkeypatch):
     _host_shell(engine, declared=1)
     monkeypatch.setattr(engine, "MAX_TOOL_TIMEOUT_SECONDS", 2)

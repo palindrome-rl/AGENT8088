@@ -1,6 +1,7 @@
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, runtime_checkable
+from typing import Optional
 
 
 @dataclass
@@ -23,11 +24,21 @@ class SendResult:
     error: Optional[str] = None
 
 
-@runtime_checkable
-class StreamSink(Protocol):
-    def __call__(self, delta: str) -> None: ...
-    def finalize(self, full_text: str) -> None: ...
-    def fail(self, err: Exception) -> None: ...
+# Strong refs for fire-and-forget tasks: the event loop keeps only weak refs,
+# so a queued-message replay could be GC'd mid-flight (audit L2).
+_BG_TASKS: set = set()
+
+
+def spawn_task(coro):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        coro.close()
+        return None
+    task = loop.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
 
 
 class BaseChannelAdapter(ABC):
@@ -48,16 +59,11 @@ class BaseChannelAdapter(ABC):
     @abstractmethod
     async def on_message(self, event: MessageEvent) -> None: ...
 
-    def supports_streaming(self) -> bool:
-        return True
-
-    def streaming_overflow_limit(self) -> Optional[int]:
-        return None
-
     async def send_approval_prompt(self, chat_id: str, tool_name: str,
-                                     reason: str, paths: str) -> None:
+                                   reason: str, paths: str, nonce: str = "") -> None:
         """Send an approval prompt to the chat. Default: plain text.
-        Override in subclasses for buttons/rich UI."""
+        Override in subclasses for buttons/rich UI. `nonce` binds button views
+        to the one pending approval they were built for (audit M3)."""
         text = (f"⚠️ Approval required\n"
                 f"Tool: {tool_name}\n"
                 f"Reason: {reason}\n"

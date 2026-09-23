@@ -4,6 +4,10 @@ import os
 import signal
 import time
 
+import pytest
+
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX shell and signals")
+
 
 def test_background_child_holding_stdout_does_not_hang(engine):
     started = time.monotonic()

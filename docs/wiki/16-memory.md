@@ -326,8 +326,10 @@ Two interchangeable engines sit behind the same `/memory` commands:
   RRF, one file at `memory_db_path`, zero extra dependencies.
 - **mem0** — the [Mem0](https://github.com/mem0ai/mem0) library with an embedded
   local Qdrant vector store, LLM-driven fact extraction, entity-relationship
-  tracking and contradiction resolution. Adds ~200 MB of dependencies plus a
-  local embedding model (`fastembed`, 384 dims by default).
+  tracking and contradiction resolution. Embeds with the same `nomic-embed-text`
+  (768 dims) on Ollama that native recall uses — one embedding model serves both
+  engines. A local `fastembed` model (384 dims) remains available via
+  `memory_mem0_embed_provider=fastembed`; it downloads on first use.
 
 **When to pick which:** native is the right default — it is dependency-free,
 offline, and its hybrid retrieval is tuned for one-line facts. Reach for mem0
@@ -359,6 +361,10 @@ deletes anything — each engine keeps its own store on disk:
 | mem0 | `memory_mem0_dir` (default `<AGENT8088_HOME>/mem0`) — embedded local Qdrant |
 
 A fact learned under one engine is invisible to the other until you switch back.
+Changing the *embedder* (or its dimensions) is the exception to "switching never
+migrates": mem0 has no migration, so clear `memory_mem0_dir` when switching
+embedding models, or new writes fail dimension checks against the old
+collection.
 `/memory` always reports which engine is live and where its store lives — if the
 mem0 library is missing or cannot start (e.g. another process holds the Qdrant
 folder lock), it says so and falls back to native for the turn rather than

@@ -8,6 +8,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+# These scripts run inside Linux benchmark containers. Git Bash on Windows
+# cannot use Python's Windows temp paths as bash paths.
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="Linux container scripts")
+
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench" / "terminal-bench"
 sys.path.insert(0, str(BENCH))
