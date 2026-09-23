@@ -38,3 +38,23 @@ def test_flag_moves_artifacts_out_of_project(monkeypatch, tmp_path):
     assert e.DISPOSABLE_CONTAINER is True
     assert e.PROJECT_ROOT not in e.ARTIFACTS_ROOT.parents
     assert e.ARTIFACTS_ROOT == (tmp_path / "home" / "artifacts").resolve()
+
+
+def test_write_path_is_honoured_in_container(monkeypatch, tmp_path):
+    project = tmp_path / "app"
+    project.mkdir()
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path / "home"))
+    e = _reload(monkeypatch, on=True, _tmp=tmp_path, project_root=str(project),
+                allowed_paths="/")
+    assert e.resolve_write_path(str(project / "solution.txt")) == (project / "solution.txt").resolve()
+    assert e.resolve_write_path("out.txt") == (project / "out.txt").resolve()
+    assert e.resolve_write_path("new_dir/x.py") == (project / "new_dir" / "x.py").resolve()
+
+
+def test_write_path_redirect_unchanged_without_flag(monkeypatch, tmp_path):
+    project = tmp_path / "app"
+    project.mkdir()
+    e = _reload(monkeypatch, on=False, _tmp=tmp_path, project_root=str(project),
+                allowed_paths="/")
+    assert e.resolve_write_path(str(project / "solution.txt")) == (project / "artifacts" / "solution.txt").resolve()
+    assert e.resolve_write_path("out.txt") == (project / "artifacts" / "out.txt").resolve()

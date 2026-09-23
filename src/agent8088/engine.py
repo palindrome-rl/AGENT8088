@@ -3713,6 +3713,13 @@ def resolve_write_path(raw_path: str) -> Path:
     bare name against the sandbox workspace — reported the source missing.
     """
     p = Path(_from_container_path(raw_path)).expanduser()
+    if DISPOSABLE_CONTAINER:
+        # In a task container the stated path IS the deliverable: a grader
+        # looks for /app/solution.txt, not /app/artifacts/solution.txt.
+        resolved = (p if p.is_absolute() else PROJECT_ROOT / p).resolve()
+        if not _path_is_allowed(resolved):
+            raise ValueError(f"Path not allowed: {resolved}")
+        return resolved
     if p.is_absolute():
         resolved = p.resolve()
         if (not resolved.exists() and resolved != ARTIFACTS_ROOT
