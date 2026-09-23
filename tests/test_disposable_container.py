@@ -150,3 +150,44 @@ def test_no_deliverables_check_without_flag(monkeypatch):
     e = _reload(monkeypatch, on=False)
     _, seen = _run_with_script(e, monkeypatch, TOOL_THEN_DONE)
     assert not any("Before finishing" in str(c) for turn in seen for c in turn)
+
+
+# --- Interpreter and web-client checks (found by the 2026-09-23 smoke run) ---
+
+def test_container_shell_description_points_at_system_python(monkeypatch):
+    """In a task container the graders use the system python3; agent8088's own
+    interpreter is a private venv. Advertising it sent pip installs there."""
+    import sys as _sys
+    e = _reload(monkeypatch, on=True)
+    description = e.TOOL_SPECS["execute_shell"]["description"]
+    assert _sys.executable not in description
+    assert "do not assume `python3`" not in description
+    assert "system `python3`" in description
+
+
+def test_shell_description_keeps_agent_python_without_flag(monkeypatch):
+    import sys as _sys
+    e = _reload(monkeypatch, on=False)
+    assert _sys.executable in e.TOOL_SPECS["execute_shell"]["description"]
+
+
+WORD_ONLY_WEB_CLIENT = [
+    "command -v curl wget python3",
+    "which curl",
+    "apt-get install -y curl wget",
+]
+
+
+def test_container_allows_commands_that_only_name_a_web_client(monkeypatch):
+    e = _reload(monkeypatch, on=True)
+    e.TOOL_SPECS["execute_shell"]["host"] = "1"
+    for command in WORD_ONLY_WEB_CLIENT:
+        result = e.run_tool("execute_shell", {"command": f"true {command} > /dev/null; echo ran"})
+        assert "explicit http:// or https:// URL" not in result, command
+
+
+def test_web_client_url_rule_unchanged_without_flag(monkeypatch):
+    e = _reload(monkeypatch, on=False)
+    e.TOOL_SPECS["execute_shell"]["host"] = "1"
+    result = e.run_tool("execute_shell", {"command": "command -v curl wget python3"})
+    assert "explicit http:// or https:// URL" in result
