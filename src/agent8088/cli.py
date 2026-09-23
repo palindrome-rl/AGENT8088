@@ -7825,6 +7825,35 @@ def _run_gateway_setup():
         print("No platform enabled. Run: agent8088 --gateway-setup")
 
 
+def _run_prompt_file(path: str) -> int:
+    """One headless turn with the whole file as the query, then exit.
+
+    Piped stdin is read one line per turn, so a multi-line task instruction
+    arrived as several turns, and a line such as `reset` or `/help` ran as a
+    command. An evaluation harness hands over one instruction; this delivers
+    it intact. Nobody is at the terminal, so the run is full-auto.
+    """
+    try:
+        query = Path(path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        print(f"agent8088 --prompt-file: {exc}", file=sys.stderr)
+        return 2
+    if not query:
+        print("agent8088 --prompt-file: the file is empty", file=sys.stderr)
+        return 2
+    A.PERMISSION_MODE = "full-auto"
+    # Inside a disposable task container the container is the sandbox and
+    # execute_shell runs on it directly; probing native/Docker would only
+    # announce a backend the run never uses.
+    if not A.DISPOSABLE_CONTAINER:
+        A.verify_sandbox_backend()
+    try:
+        do_chat(query)
+    finally:
+        _flush_memory_capture()
+    return 0
+
+
 def main():
     configure_logging()
     import argparse
@@ -7893,6 +7922,9 @@ def main():
                         help="with --logs: substring filter on subsystem name")
     parser.add_argument("--json", action="store_true",
                         help="with --logs: emit raw JSONL instead of human format")
+    parser.add_argument("--prompt-file", default=None, metavar="PATH",
+                        help="run one headless turn with this file's full text, then exit "
+                             "(for evaluation harnesses; implies full-auto)")
     args = parser.parse_args()
 
     # The transport flags are meaningless without --mcp-serve, and argparse happily
@@ -7936,6 +7968,8 @@ def main():
         return 0 if A.native_sandbox_verified() else 1
     if args.memory_setup:
         return run_memory_setup()
+    if args.prompt_file:
+        return _run_prompt_file(args.prompt_file)
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.
