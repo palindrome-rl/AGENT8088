@@ -84,6 +84,13 @@ prompt_paths=~
 # provider.<name>.context_window=1048576
 # provider.<name>.max_completion_tokens=32768
 
+# Per-provider temperature override. `temperature` (unset here; 0.1 default,
+# see cli.py) is sent on every request regardless of provider, which can
+# override a server's own tuned default (a value present in the request
+# always wins), or get rejected outright by a provider/model that does not
+# accept non-default sampling. Pin one provider without changing the rest:
+# provider.<name>.temperature=0.6
+
 timeout_seconds=120
 # Tool schemas sent with each native function-calling request. `hybrid` is the
 # default: it uses keyword + embedding retrieval to send the 10
