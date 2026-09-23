@@ -3938,14 +3938,21 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
             kwargs["executable"] = shutil.which("bash") or "/bin/sh"
     output = bytearray()
     truncated = False
+    detached = threading.Event()
 
     with subprocess.Popen(command, **kwargs) as process:
+        stream = process.stdout
+
         def drain():
             nonlocal truncated
             while True:
-                chunk = process.stdout.read(65536)
+                # read1, not read: read(n) blocks until n bytes or EOF, so a
+                # child holding the pipe would strand short output in the buffer.
+                chunk = stream.read1(65536)
                 if not chunk:
                     break
+                if detached.is_set():
+                    continue  # keep the pipe drained for a live background child
                 remaining = MAX_TOOL_OUTPUT_BYTES - len(output)
                 if remaining > 0:
                     output.extend(chunk[:remaining])
@@ -3966,8 +3973,23 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
             _kill_detached_process(process)
             reader.join(timeout=2)
             raise
-        reader.join()
-    text = output.decode(errors="replace").strip()
+        # bash has exited. A background child (`server &`) that inherited stdout
+        # keeps the pipe open, and an unbounded join waited for that child to
+        # exit -- forever, for a server. Give trailing output a moment, then
+        # return; the child keeps running in its own session.
+        reader.join(timeout=3)
+        still_attached = reader.is_alive()
+        if still_attached:
+            # Hand the read end to the reader thread instead of letting Popen's
+            # exit close it: a closed pipe turns the child's next log line into
+            # SIGPIPE/EPIPE, which kills many servers.
+            detached.set()
+            process.stdout = None
+        captured = bytes(output)
+    text = captured.decode(errors="replace").strip()
+    if still_attached:
+        text += ("\n[a background process is still attached to this command's output; "
+                 "redirect it, e.g. `cmd > /tmp/cmd.log 2>&1 &`]")
     if truncated:
         text += f"\n[output truncated at {MAX_TOOL_OUTPUT_BYTES} bytes]"
     if returncode:
