@@ -62,9 +62,10 @@ class Mem0MemoryStore:
         self.vector_store_type = str(self.config.get("vector_store", "qdrant")).strip().lower()
         self._memory = None
         self._available = None
-        # Which embedder the fallback chain below actually settled on. /memory
-        # reports this instead of guessing, since the chain can land anywhere
-        # from Ollama to a local fastembed model depending on what is installed.
+        # Which embedder the config chain below actually settles on. /memory
+        # reports this instead of guessing: the default is Ollama (nomic, shared
+        # with the native engine), while `memory_mem0_embed_provider=fastembed`
+        # opts out into a local MiniLM copy.
         self.embedder_info = None
         self.llm_info = None
         # Why initialisation failed, for /memory to show. This used to be a
@@ -134,6 +135,11 @@ class Mem0MemoryStore:
 
             embedder_section = None
             embed_provider = str(self.config.get("embed_provider") or "").strip().lower()
+            if not embed_provider:
+                # parse_memory_engine_config defaults to `ollama`; an empty
+                # value means a store constructed directly with a bare dict,
+                # as the tests do. The default model stays nomic for parity.
+                embed_provider = "ollama"
             if embed_provider == "ollama":
                 embed_dims = 768
                 embedder_section = {
@@ -154,24 +160,23 @@ class Mem0MemoryStore:
                     },
                 }
             else:
+                # The explicit fastembed opt-out: memory_mem0_embed_provider=
+                # fastembed (or any value that is not ollama/openai/custom).
+                # No longer pre-warmed by the installers -- the first /memory
+                # under this choice fetches the ~90 MB MiniLM model, pinned
+                # under AGENT8088_HOME so it survives the temp-dir purges that
+                # macOS and Windows both do. The cache is keyed off
+                # AGENT8088_HOME rather than the mem0 dir: the model cache is
+                # shared, not part of the store, so pointing memory_mem0_dir
+                # elsewhere must not orphan it. An explicit FASTEMBED_CACHE_PATH
+                # from the user still wins.
                 try:
                     import fastembed
-                    embed_dims = 384
-                    # fastembed otherwise caches its ~90 MB model under the system
-                    # temp dir (fastembed/common/utils.py: gettempdir() +
-                    # "fastembed_cache"), which macOS and Windows both purge. That
-                    # makes the download fire again mid-conversation, inside the
-                    # REPL, long after the installer already fetched it. Pin it
-                    # under AGENT8088_HOME so it survives, and so the installer's
-                    # pre-download lands in the same place the runtime reads.
-                    # Keyed off AGENT8088_HOME rather than the mem0 dir: the model
-                    # cache is shared, not part of the store, so pointing
-                    # memory_mem0_dir elsewhere must not orphan it.
-                    # An explicit FASTEMBED_CACHE_PATH from the user still wins.
                     agent_home = os.environ.get(
                         "AGENT8088_HOME", os.path.expanduser("~/.agent8088"))
                     os.environ.setdefault(
                         "FASTEMBED_CACHE_PATH", os.path.join(agent_home, "fastembed"))
+                    embed_dims = 384
                     embedder_section = {
                         "provider": "fastembed",
                         "config": {
@@ -190,7 +195,7 @@ class Mem0MemoryStore:
                             },
                         }
 
-            qdrant_cfg = {
+            qdrant_cfg: Dict[str, Any] = {
                 "path": str(self.path),
             }
             if embed_dims:
