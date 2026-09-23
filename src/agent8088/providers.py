@@ -320,7 +320,7 @@ def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL
         for m in resp.data:
             if _normalize_model_id("", str(getattr(m, "id", ""))) == norm:
                 ctx = None
-                for attr in ("context_length", "context_window",
+                for attr in ("context_length", "context_window", "max_model_len",
                              "max_context_length", "max_input_tokens"):
                     v = getattr(m, attr, None)
                     if v:

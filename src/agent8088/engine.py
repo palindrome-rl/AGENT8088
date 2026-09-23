@@ -2167,11 +2167,34 @@ def _provider_extra_body(provider_name: str) -> dict:
     return extra
 
 
+def _resolve_temperature(provider_name: str, temperature: float) -> float:
+    """provider.<name>.temperature overrides the session/global value.
+
+    The session default (0.1) is sent on every request regardless of
+    provider, which silently overrides a server's own tuned default (e.g.
+    vLLM's --override-generation-config) since a value present in the
+    request always wins. It also risks a 400 on providers/models that
+    reject non-default sampling (e.g. newer Anthropic models, OpenAI's
+    reasoning models). This lets one provider be pinned without changing
+    the global default every other provider still uses."""
+    profile = (PROVIDERS.get(provider_name) or {}) if provider_name else {}
+    raw = str(profile.get("temperature") or "").strip()
+    if not raw:
+        return temperature
+    try:
+        return float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "Ignoring provider.%s.temperature: not a number.", provider_name)
+        return temperature
+
+
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False):
     selected_model = model_name or MODEL_NAME
     full_messages = _normalised_messages(system_prompt or current_system_prompt(), messages)
+    temperature = _resolve_temperature(provider_name, temperature)
     penalties = {}
     if FREQUENCY_PENALTY:
         penalties["frequency_penalty"] = FREQUENCY_PENALTY
