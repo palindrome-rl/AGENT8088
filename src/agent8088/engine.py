@@ -344,6 +344,16 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
 
 PROJECT_ROOT = _configured_project_root(APP_CONFIG)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
+# Set by an evaluation harness that runs Agent8088 inside a throwaway task
+# container (Terminal-Bench under Harbor). The container is the sandbox: there
+# is no user home to protect, the task's files are the deliverable, and the run
+# is graded on exact paths. Environment-only on purpose -- a model that can
+# write config.txt must not be able to flip it.
+DISPOSABLE_CONTAINER = os.environ.get("AGENT8088_DISPOSABLE_CONTAINER", "").strip() == "1"
+if DISPOSABLE_CONTAINER:
+    # Scratch output must not land inside the graded project tree.
+    ARTIFACTS_ROOT = (Path(os.environ.get("AGENT8088_HOME") or "/tmp/agent8088")
+                      / "artifacts").resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Unset unless the operator configured one. A loopback default used to live here
