@@ -97,3 +97,43 @@ def test_container_file_tools_allow_token_named_files(monkeypatch):
     assert not e._is_shell_startup_file("/root/.bashrc")
     off = _reload(monkeypatch, on=False)
     assert off._is_sensitive_path("/app/count_tokens.py")
+
+
+def _response(content):
+    message = type("M", (), {"content": content, "tool_calls": None})()
+    return type("R", (), {"choices": [type("C", (), {"message": message, "finish_reason": "stop"})()]})()
+
+
+def _run_with_script(e, monkeypatch, replies):
+    seen = []
+
+    def fake(messages, tools, **kwargs):
+        seen.append([m.get("content") for m in messages])
+        return _response(replies[min(len(seen) - 1, len(replies) - 1)])
+
+    monkeypatch.setattr(e, "_create_completion_with_fallback", fake)
+    e.TOOL_SPECS["execute_shell"]["host"] = "1"
+    answer = e.run_agent([{"role": "user", "content": "write /tmp/x.txt"}], max_turns=6)
+    return answer, seen
+
+
+TOOL_THEN_DONE = [
+    '✿FUNCTION✿: execute_shell ✿ARGS✿: {"command": "echo hi"}',
+    "done",
+    "done after checking",
+]
+
+
+def test_container_run_checks_deliverables_once_before_finishing(monkeypatch):
+    e = _reload(monkeypatch, on=True)
+    answer, seen = _run_with_script(e, monkeypatch, TOOL_THEN_DONE)
+    nudges = [c for c in seen[-1] if isinstance(c, str) and "Before finishing" in c]
+    assert len(nudges) == 1
+    assert not any("generate_tests" in str(c) for turn in seen for c in turn)
+    assert answer.startswith("done after checking")
+
+
+def test_no_deliverables_check_without_flag(monkeypatch):
+    e = _reload(monkeypatch, on=False)
+    _, seen = _run_with_script(e, monkeypatch, TOOL_THEN_DONE)
+    assert not any("Before finishing" in str(c) for turn in seen for c in turn)

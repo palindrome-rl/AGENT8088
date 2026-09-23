@@ -12491,6 +12491,12 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
 # Modes whose identical repeat is worth re-running: their result reflects
 # external state this process does not own, so a cached answer can be stale in
 # a way a re-read cannot. They still do not count as progress -- see the loop.
+DELIVERABLES_CHECK_NUDGE = (
+    "Before finishing: re-read the original task. For each required output "
+    "(file path, format, service or port), run a check now that confirms it exists "
+    "and behaves exactly as specified. Remove scratch files, test users and other "
+    "leftovers you created that the task did not ask for. Then give your final answer."
+)
 _REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
 _WAIT_COMMAND_RE = re.compile(r"(?:^|[\s;&|(])sleep\s+\d")
 
@@ -12564,6 +12570,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
+    deliverables_checked = False  # disposable-container end-of-run check, once per run
     plan_mutation_retries = 0
     # Current rung on the `auto` ladder. Sticky for the rest of this turn once
     # escalated -- climbing back down mid-turn would oscillate between a model
@@ -12962,6 +12969,15 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
+            if DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
+                # Graded on exact outputs with nobody to ask: before the one
+                # final answer, re-check every deliverable against the task.
+                deliverables_checked = True
+                messages.append(_harness_turn(DELIVERABLES_CHECK_NUDGE))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "deliverables_check"})
+                continue
+
             if trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -12980,7 +12996,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "tool is available. If verification is not possible, say that plainly."
                 )))
                 continue
-            if trajectory is not None and trajectory.request_tests():
+            if (trajectory is not None and not DISPOSABLE_CONTAINER
+                    and trajectory.request_tests()):
                 if on_trajectory_state:
                     on_trajectory_state()
                 messages.append(_harness_turn((
