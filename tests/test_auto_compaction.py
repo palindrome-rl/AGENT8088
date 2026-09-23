@@ -75,3 +75,40 @@ def test_auto_compaction_failure_does_not_abort_the_turn(monkeypatch, engine):
     monkeypatch.setattr(engine, "_create_completion_with_fallback", lambda *args, **kwargs: _response())
 
     assert engine.run_agent(messages, max_turns=1) == "done"
+
+
+def _tool_result(text):
+    return {"role": "user", "content": f"Tool result (execute_shell):\n{text}"}
+
+
+def test_single_task_instruction_survives_compaction(monkeypatch, engine):
+    """A one-shot run has exactly one human turn: the task. Summarising it away
+    leaves the agent working from a paraphrase of its own specification."""
+    instruction = {"role": "user", "content": "Write /app/out.txt with exactly: 42\n(no newline)"}
+    messages = [instruction]
+    for i in range(10):
+        messages += [{"role": "assistant", "content": f"step {i}"}, _tool_result(f"output {i}")]
+    monkeypatch.setattr(engine, "create_completion", lambda *a, **k: _response("summary"))
+
+    assert engine.compact_messages(messages, keep=4)
+    assert messages[0] == {"role": "system", "content": "Conversation summary:\nsummary"}
+    assert messages[1] == instruction
+    assert messages.count(instruction) == 1
+    assert len(messages) == 2 + 4
+
+
+def test_summary_call_gets_room_to_finish(monkeypatch, engine):
+    """The summary call used create_completion's 2,000-token default, which a
+    reasoning model can spend entirely on thinking, returning no summary."""
+    seen = {}
+
+    def fake_completion(client, request, tools, **kwargs):
+        seen.update(kwargs)
+        return _response("summary")
+
+    monkeypatch.setattr(engine, "create_completion", fake_completion)
+    monkeypatch.setattr(engine, "_active_model_token_limits", lambda *a: (32768, 8192))
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(10)]
+    assert engine.compact_messages(messages, keep=3)
+    assert seen["max_tokens"] > 2000
+    assert seen["max_tokens"] <= 8192

@@ -1,0 +1,31 @@
+# Terminal-Bench 2.1, first half (tasks 1-44): the 26 rated LIKELY or POSSIBLE
+# for Qwen3.8-27B. One task name per line; run.sh reads each task's agent
+# timeout from its task.toml.
+# LIKELY
+cobol-modernization
+crack-7z-hash
+db-wal-recovery
+extract-elf
+fix-code-vulnerability
+fix-git
+git-leak-recovery
+git-multibranch
+headless-terminal
+hf-model-inference
+kv-store-grpc
+log-summary-date-ranges
+# POSSIBLE
+adaptive-rejection-sampler
+break-filter-js-from-html
+build-cython-ext
+build-pmars
+cancel-async-tasks
+configure-git-webserver
+constraints-scheduling
+count-dataset-tokens
+dna-insert
+filter-js-from-html
+financial-document-processor
+large-scale-text-editing
+largest-eigenval
+mailman
