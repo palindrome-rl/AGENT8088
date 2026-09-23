@@ -112,6 +112,11 @@ def reopen(store_path, review_id: str, root, *, recheck) -> dict | None:
     the stored value is replaced, never trusted, and a finding that no longer
     matches is marked rather than dropped -- the reviewer still said something
     about that file, and silently losing it would be worse than saying it moved.
+
+    `recheck` answers True/False, or the (start_line, end_line) the quoted code
+    sits at now. When that differs from the stored lines the finding is moved
+    there and remembers where the review put it: a fix has to land on the code,
+    not on whatever now occupies the old line number.
     """
     payload = load(store_path, review_id)
     if payload is None:
@@ -119,7 +124,15 @@ def reopen(store_path, review_id: str, root, *, recheck) -> dict | None:
     refreshed = []
     for finding in payload.get("findings") or []:
         current = dict(finding)
-        current["position_valid"] = bool(recheck(root, finding))
+        answer = recheck(root, finding)
+        current["position_valid"] = bool(answer)
+        if isinstance(answer, tuple) and len(answer) == 2:
+            start, end = answer
+            stored = finding.get("start_line")
+            if (start, end) != (stored, finding.get("end_line") or stored):
+                current["start_line"], current["end_line"] = start, end
+                current["moved_from"] = stored
+                current["verification"] = "moved"
         if finding.get("position_valid") and not current["position_valid"]:
             current["verification"] = "stale"
         refreshed.append(current)

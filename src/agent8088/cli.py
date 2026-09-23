@@ -2206,7 +2206,7 @@ COMMAND_SPECS = (
     ("schedule", "/schedule [list|add <cron> <task>|remove <index-or-task>]", "Add/list/remove a recurring run of this agent (cron/Task Scheduler)", ()),
     ("browser", "/browser [status|close|reset]", "Inspect or close the active reusable browser session", ()),
     ("help", "/help", "Show this list", ()),
-    ("exit", "/exit", "Leave", ()),
+    ("exit", "/exit, /quit", "Leave", ()),
 )
 
 
@@ -2598,6 +2598,22 @@ def _run_subagent(name, task, history=None):
     render_answer(answer)
 
 
+# Words that leave the REPL, and that leave the /agent task loop.
+_EXIT_WORDS = ("/quit", "/exit", "quit", "exit")
+
+
+def _is_repl_command(task: str) -> bool:
+    """A line that names a REPL command (`/status`, `/help`), not a task.
+
+    Only a known command word counts, so a task that starts with a path --
+    "/usr/local/bin -- is it on PATH?" -- still goes to the agent.
+    """
+    if not task.startswith("/"):
+        return False
+    word = task[1:].split(None, 1)[0].lower() if len(task) > 1 else ""
+    return word in COMMANDS
+
+
 def cmd_agent(rest):
     """Run a sub-agent. Usage: /agent  (interactive picker) | /agent <name> [task].
 
@@ -2611,6 +2627,14 @@ def cmd_agent(rest):
         if first in A.SUBAGENT_SPECS:
             name, task = first, remainder.strip()
         else:
+            # Said, never assumed: "/agent code the parser" is a task and a
+            # picker, while "/agent wbe open ..." is a typo -- no string test
+            # tells the two apart, so a near-miss only earns a hint.
+            import difflib
+            close = difflib.get_close_matches(first, list(A.SUBAGENT_SPECS), n=1, cutoff=0.6)
+            if close:
+                console.print(f"[dim]no agent named {first!r} — did you mean "
+                              f"[bold]{close[0]}[/bold]? The whole line is the task.[/dim]")
             task = rest  # not a known profile -> treat the whole line as the task
     if not name:
         name = select_agent(A.SUBAGENT_SPECS)
@@ -2625,9 +2649,14 @@ def cmd_agent(rest):
             except (EOFError, KeyboardInterrupt):
                 console.print("[dim]leaving {0}[/dim]".format(name))
                 return
-        if not task or task.lower() in ("/quit", "/exit", "exit", "quit"):
+        if not task or task.lower() in _EXIT_WORDS:
             console.print(f"[dim]leaving {name}[/dim]")
             return
+        if _is_repl_command(task):
+            console.print(f"[dim]{task.split()[0]} is a REPL command, not a task for "
+                          f"{name} — type /quit to leave the agent first[/dim]")
+            task = None
+            continue
         try:
             _run_subagent(name, task, history=history)
         except KeyboardInterrupt:
@@ -5533,7 +5562,12 @@ def _print_review(result):
     for finding in result["findings"]:
         severity = str(finding.get("severity", "info"))
         where = f"{finding.get('path')}:{finding.get('start_line')}"
-        mark = "" if finding.get("position_valid") else "  [dim](position not verified)[/dim]"
+        if not finding.get("position_valid"):
+            mark = "  [dim](position not verified)[/dim]"
+        elif finding.get("moved_from"):
+            mark = f"  [dim](moved from line {finding['moved_from']})[/dim]"
+        else:
+            mark = ""
         console.print(Text(f"{severity.upper():8} {where}",
                            style=_REVIEW_SEVERITY_STYLE.get(severity, "#237dd7")), end="")
         console.print(mark)
@@ -7995,7 +8029,7 @@ def main():
             break
         if not line:
             continue
-        if line in ("/exit", "exit"):
+        if line in _EXIT_WORDS:
             console.print("[dim]bye[/dim]")
             break
         # Bare command parity with the classic REPL: a single word that exactly
