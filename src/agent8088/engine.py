@@ -8565,6 +8565,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
 
     mode = (spec.get("mode") or "").lower()
     _declared_timeout = int(spec.get("timeout") or 25)
+    if name == "execute_shell" and "timeout" in args:
+        # Optional per-call override: a build or install can ask for more time
+        # without raising every command's default. Still capped below.
+        requested = args["timeout"]
+        args = {k: v for k, v in args.items() if k != "timeout"}  # caller's dict untouched
+        if str(requested).strip().isdigit():
+            _declared_timeout = int(str(requested).strip())
     timeout = min(max(1, _declared_timeout), MAX_TOOL_TIMEOUT_SECONDS)
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
@@ -12428,6 +12435,17 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
 # external state this process does not own, so a cached answer can be stale in
 # a way a re-read cannot. They still do not count as progress -- see the loop.
 _REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
+_WAIT_COMMAND_RE = re.compile(r"(?:^|[\s;&|(])sleep\s+\d")
+
+
+def _is_wait_command(name: str, args: dict) -> bool:
+    """A shell command that deliberately waits (`sleep 30; tail build.log`).
+
+    Repeating it is polling external state -- a build, a server booting --
+    not the model spinning, so it re-runs and counts as progress. max_turns
+    still bounds how long a poll can go on.
+    """
+    return name == "execute_shell" and bool(_WAIT_COMMAND_RE.search(str(args.get("command") or "")))
 
 
 def _consult_llmrouter(config, messages, eligible):
@@ -13023,6 +13041,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             elif ("__parse_error__" not in args and last_completed
                     and sig == last_completed[0]):
                 previous_output, repeated = last_completed[1], True
+            if repeated and _is_wait_command(name, args):
+                repeated, previous_output = False, None
             # Re-running these observes the world, not our own side effect.
             if repeated and (spec_mode := (TOOL_SPECS.get(name, {}).get("mode") or "")) in _REPEAT_RERUNS:
                 repeated, previous_output = False, None
