@@ -959,6 +959,8 @@ SHELL_STARTUP_FILES = frozenset([
 
 def _is_shell_startup_file(filepath: str) -> bool:
     """True if the path's filename is a shell startup file (write-blocked)."""
+    if DISPOSABLE_CONTAINER:
+        return False
     return Path(filepath).name.lower() in SHELL_STARTUP_FILES
 
 ALLOWED_SENSITIVE_FILES = set(
@@ -968,6 +970,10 @@ ALLOWED_SENSITIVE_FILES = set(
 
 def _is_sensitive_path(filepath: str) -> bool:
     """Check if a file path matches the sensitive blocklist. Returns True if blocked."""
+    if DISPOSABLE_CONTAINER:
+        # The container holds no user credentials, and names like
+        # count_tokens.py or request.key are ordinary task code.
+        return False
     fn = Path(filepath).name.lower()
     fp = str(filepath).lower()
 
@@ -1067,6 +1073,10 @@ def _shell_parts(command: str) -> list:
 
 
 def _dangerous_git_args(tokens: list) -> bool:
+    if DISPOSABLE_CONTAINER:
+        # Checkout, reset, clean and push to a local repo are task steps in a
+        # throwaway container, and there is no user history to lose.
+        return False
     cursor = 0
     options_with_value = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
     while cursor < len(tokens) and tokens[cursor].startswith("-"):
@@ -1146,7 +1156,10 @@ _UNRECOVERABLE_PATTERNS = [
     re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
-    # pipe remote content to shell (curl/wget ... | sh|bash)
+]
+# Pipe remote content to a shell (curl/wget ... | sh|bash). Unrecoverable on a
+# user's machine; an ordinary installer step inside a disposable container.
+_PIPE_TO_SHELL_PATTERNS = [
     re.compile(r"\b(?:curl|wget)\b[^|;&<>]*\|\s*(?:sh|bash|dash|zsh|ksh)\b"),
     re.compile(r"\b(?:sh|bash|dash|zsh|ksh)\s*<\s*\(\s*(?:curl|wget)\s+"),
 ]
@@ -1159,7 +1172,10 @@ def _is_unrecoverable_command(command: str) -> bool:
     are caught even when the command is wrapped (bash -c 'rm -rf /') — the
     recursive _hard_blocked_shell call re-enters here for wrapped payloads.
     """
-    for pattern in _UNRECOVERABLE_PATTERNS:
+    patterns = _UNRECOVERABLE_PATTERNS
+    if not DISPOSABLE_CONTAINER:
+        patterns = [*patterns, *_PIPE_TO_SHELL_PATTERNS]
+    for pattern in patterns:
         if pattern.search(command):
             return True
     return False

@@ -58,3 +58,42 @@ def test_write_path_redirect_unchanged_without_flag(monkeypatch, tmp_path):
                 allowed_paths="/")
     assert e.resolve_write_path(str(project / "solution.txt")) == (project / "artifacts" / "solution.txt").resolve()
     assert e.resolve_write_path("out.txt") == (project / "artifacts" / "out.txt").resolve()
+
+
+CONTAINER_WORK = [
+    "git checkout master",
+    "git reset --hard HEAD~1",
+    "git restore about.md",
+    "git clean -fd",
+    "git push origin master",
+    "python3 count_tokens.py",
+    'python3 -c "print(request.key)"',
+    "cat /app/server.key",
+    "curl -LsSf https://astral.sh/uv/install.sh | sh",
+]
+
+
+def test_container_allows_ordinary_task_commands(monkeypatch):
+    e = _reload(monkeypatch, on=True)
+    blocked = [c for c in CONTAINER_WORK if e._hard_blocked_shell(c)]
+    assert blocked == []
+
+
+def test_container_keeps_catastrophic_floor(monkeypatch):
+    e = _reload(monkeypatch, on=True)
+    for command in ("rm -rf /", "rm -rf ~", "mkfs.ext4 /dev/sda", ":(){ :|:& };:"):
+        assert e._hard_blocked_shell(command), command
+
+
+def test_floors_unchanged_without_flag(monkeypatch):
+    e = _reload(monkeypatch, on=False)
+    still_blocked = [c for c in CONTAINER_WORK if e._hard_blocked_shell(c)]
+    assert still_blocked == CONTAINER_WORK
+
+
+def test_container_file_tools_allow_token_named_files(monkeypatch):
+    e = _reload(monkeypatch, on=True)
+    assert not e._is_sensitive_path("/app/count_tokens.py")
+    assert not e._is_shell_startup_file("/root/.bashrc")
+    off = _reload(monkeypatch, on=False)
+    assert off._is_sensitive_path("/app/count_tokens.py")
