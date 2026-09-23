@@ -1,11 +1,24 @@
 """The Terminal-Bench profile in bench/terminal-bench/ loads as intended and
 fits the 32k window it was sized for."""
 import importlib
+
+import pytest
 import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _restore_default_engine():
+    """These tests reload the engine under a special environment or config.
+    Requested before monkeypatch, so this teardown runs after monkeypatch has
+    restored the environment: reload once more so later test files do not
+    inherit the flag or the bench profile (e.g. ssrf_allow_private=1)."""
+    yield
+    from agent8088 import engine
+    importlib.reload(engine)
 BENCH = ROOT / "bench" / "terminal-bench"
 
 
