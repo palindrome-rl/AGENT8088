@@ -79,9 +79,12 @@ by Terminal-Bench. To use a larger window, raise `--max-model-len` and both
 
 ## Thinking
 
-`config.txt` turns Qwen3 thinking off per request. That gives more turns
-inside each task's time limit. To compare, set
-`"enable_thinking": true` in `provider.vllm.extra_body`.
+`config.txt` sends the vLLM server's own sampling defaults on every request:
+thinking on, temperature 0.6, top_p 0.95, top_k 20, presence and frequency
+penalty 0. A value in the request always overrides the server's default, so
+each is sent explicitly rather than left to agent8088's own defaults (its
+temperature default is 0.1). To compare with thinking off, set
+`"enable_thinking": false` in `provider.vllm.extra_body`.
 
 ## Verified so far
 
