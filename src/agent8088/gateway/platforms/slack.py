@@ -13,7 +13,6 @@ Requires (set in config.txt):
 import asyncio
 import logging
 import re
-import time
 from typing import Optional
 
 from slack_bolt.async_app import AsyncApp
@@ -28,7 +27,6 @@ from agent8088.gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 39000
-MIN_EDIT_INTERVAL = 0.5
 DEDUP_MAX = 500
 
 
@@ -59,55 +57,6 @@ def markdown_to_slack(text: str) -> str:
     return text
 
 
-class SlackStreamSink:
-    def __init__(self, adapter: "SlackAdapter", chat_id: str, thread_ts: Optional[str] = None):
-        self.adapter = adapter
-        self.chat_id = chat_id
-        self.thread_ts = thread_ts
-        self.buf = ""
-        self.msg_ts: Optional[str] = None
-        self.last_edit = 0.0
-
-    def __call__(self, delta: str) -> None:
-        self.buf += delta
-        now = time.time()
-        if now - self.last_edit < MIN_EDIT_INTERVAL:
-            return
-        self.last_edit = now
-        try:
-            asyncio.get_event_loop().create_task(self._flush())
-        except RuntimeError:
-            pass
-
-    async def _flush(self) -> None:
-        text = self.buf[:MAX_MESSAGE_LENGTH]
-        if self.msg_ts is None:
-            result = await self.adapter._send(self.chat_id, text, self.thread_ts)
-            if result and result.ok:
-                self.msg_ts = result.message_id
-        else:
-            await self.adapter._edit(self.chat_id, self.msg_ts, text)
-
-    async def finalize(self, full_text: str) -> None:
-        chunks = [
-            full_text[i:i + MAX_MESSAGE_LENGTH]
-            for i in range(0, len(full_text), MAX_MESSAGE_LENGTH)
-        ]
-        if not chunks:
-            chunks = [""]
-        if self.msg_ts is None:
-            result = await self.adapter._send(self.chat_id, chunks[0], self.thread_ts)
-            if result and result.ok:
-                self.msg_ts = result.message_id
-        else:
-            await self.adapter._edit(self.chat_id, self.msg_ts, chunks[0])
-        for chunk in chunks[1:]:
-            await self.adapter._send(self.chat_id, chunk, self.thread_ts)
-
-    def fail(self, err: Exception) -> None:
-        logger.warning("Slack stream failed for %s: %s", self.chat_id, err)
-
-
 class SlackAdapter(BaseChannelAdapter):
     platform = "slack"
 
@@ -122,7 +71,9 @@ class SlackAdapter(BaseChannelAdapter):
         self.bot_user_id: str = ""
         self._running = False
         self._socket_task: Optional[asyncio.Task] = None
-        self._dedup: set = set()
+        # Insertion-ordered dict, not a set: set eviction dropped arbitrary ids
+        # under load, which could re-process a duplicate turn (audit M7).
+        self._dedup: dict = {}
 
     async def connect(self) -> None:
         if not self.bot_token or not self.app_token:
@@ -177,9 +128,9 @@ class SlackAdapter(BaseChannelAdapter):
         if ts and ts in self._dedup:
             return
         if ts:
-            self._dedup.add(ts)
-            if len(self._dedup) > DEDUP_MAX:
-                self._dedup = set(list(self._dedup)[-DEDUP_MAX:])
+            self._dedup[ts] = None
+            while len(self._dedup) > DEDUP_MAX:
+                self._dedup.pop(next(iter(self._dedup)))
         user_id = event.get("user", "")
         if user_id == self.bot_user_id:
             return
@@ -231,22 +182,24 @@ class SlackAdapter(BaseChannelAdapter):
         except Exception as e:
             logger.debug("Slack edit failed: %s", e)
 
-    def make_stream_sink(self, chat_id: str, thread_ts: Optional[str] = None) -> SlackStreamSink:
-        return SlackStreamSink(self, chat_id, thread_ts)
-
     async def send_message(self, chat_id: str, text: str, **meta) -> str:
+        # Chunk like every other adapter: MAX_MESSAGE_LENGTH exists but only the
+        # (removed) stream sink used it, so a >=40k reply was rejected outright
+        # and the user got nothing (audit M9).
         thread_ts = meta.get("thread_ts") or meta.get("thread_id")
-        result = await self._send(chat_id, text, thread_ts)
-        return result.message_id or "0" if result else "0"
+        chunks = [text[i:i + MAX_MESSAGE_LENGTH]
+                  for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+        if not chunks:
+            chunks = [text]
+        first_id = "0"
+        for chunk in chunks:
+            result = await self._send(chat_id, chunk, thread_ts)
+            if result and result.ok and first_id == "0":
+                first_id = result.message_id or "0"
+        return first_id
 
     async def edit_message(self, chat_id: str, msg_id: str, text: str) -> None:
         await self._edit(chat_id, msg_id, text)
 
     async def on_message(self, event: MessageEvent) -> None:
         await self.runner.on_message(event)
-
-    def supports_streaming(self) -> bool:
-        return True
-
-    def streaming_overflow_limit(self) -> Optional[int]:
-        return MAX_MESSAGE_LENGTH

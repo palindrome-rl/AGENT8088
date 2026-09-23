@@ -3398,7 +3398,7 @@ def _install_mem0_extra():
     --seed has no pip module, and install.sh populates those venvs via
     `uv pip install --python` -- so fall back to exactly that command.
     """
-    packages = "mem0ai>=0.1.40 fastembed>=0.3.0"
+    packages = "mem0ai>=0.1.40 ollama>=0.3.0"
     pip_result = subprocess.run(
         [sys.executable, "-m", "pip", "install", *packages.split()],
         capture_output=True, text=True, timeout=600,
@@ -3427,7 +3427,7 @@ def run_memory_setup():
     find /memory engine afterwards. Config is only flipped after the deps
     import cleanly -- a failed install must not point config at Qdrant.
     """
-    print("Installing the mem0 memory backend (mem0ai, fastembed, qdrant)...")
+    print("Installing the mem0 memory backend (mem0ai, ollama, qdrant)...")
     ok, detail = _install_mem0_extra()
     if not ok:
         print(f"Installation failed: {detail}")
