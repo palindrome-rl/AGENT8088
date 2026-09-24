@@ -101,8 +101,18 @@ class Mem0MemoryStore:
                 except Exception:
                     pass
 
+            # Same Ollama the native engine embeds against (the configured
+            # client), not a hardcoded localhost that may not be running.
+            ollama_url = os.environ.get("OLLAMA_HOST") or (
+                client_base_url.removesuffix("/v1") if client_base_url else "http://localhost:11434")
+
             llm_provider = str(self.config.get("llm_provider") or "").strip().lower()
 
+            # mem0 always builds an LLM, defaulting to OpenAI, whose client refuses
+            # to construct without OPENAI_API_KEY -- so an unset provider killed the
+            # whole engine. Extraction is agent8088's own (add() uses infer=False),
+            # so mem0's LLM is never called; it just has to construct.
+            llm_provider = llm_provider or "openai"
             llm_section = None
             if llm_provider:
                 # mem0 validates this name against its own registry and refuses
@@ -119,10 +129,10 @@ class Mem0MemoryStore:
                 llm_cfg = {
                     "model": str(self.config.get("llm_model") or "gpt-4o-mini"),
                 }
-                if client_api_key:
-                    llm_cfg["api_key"] = client_api_key
+                if client_api_key or resolved_provider == "openai":
+                    llm_cfg["api_key"] = client_api_key or "none"
                 if resolved_provider == "ollama":
-                    llm_cfg["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+                    llm_cfg["ollama_base_url"] = ollama_url
                 elif resolved_provider == "openai" and client_base_url:
                     # Only meaningful for the OpenAI-shaped client; setting it for
                     # anthropic/gemini/groq would be noise at best.
@@ -146,7 +156,7 @@ class Mem0MemoryStore:
                     "provider": "ollama",
                     "config": {
                         "model": str(self.config.get("embed_model") or "nomic-embed-text"),
-                        "ollama_base_url": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+                        "ollama_base_url": ollama_url,
                     },
                 }
             elif embed_provider in {"openai", "custom"} and client_base_url:
@@ -335,7 +345,9 @@ class Mem0MemoryStore:
             return []
         try:
             try:
-                resp = mem.search(str(query), filters={"user_id": str(user_id)}, limit=int(limit))
+                # mem0 2.x renamed limit -> top_k; limit landed in **kwargs and
+                # raised, so every search silently returned nothing.
+                resp = mem.search(str(query), filters={"user_id": str(user_id)}, top_k=int(limit))
             except (TypeError, ValueError):
                 resp = mem.search(str(query), user_id=str(user_id), limit=int(limit))
             items = []
@@ -377,7 +389,7 @@ class Mem0MemoryStore:
             return []
         try:
             try:
-                resp = mem.get_all(filters={"user_id": str(user_id)})
+                resp = mem.get_all(filters={"user_id": str(user_id)}, top_k=int(limit))
             except (TypeError, ValueError):
                 resp = mem.get_all(user_id=str(user_id))
             items = []

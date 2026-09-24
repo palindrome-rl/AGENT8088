@@ -54,8 +54,8 @@ def parse_memory_engine_config(config=None):
     mem0_cfg = {
         "vector_store": str(config.get("memory_mem0_vector_store", "qdrant")).strip().lower(),
         "path": os.path.expanduser(str(config.get("memory_mem0_dir", default_mem0_dir)).strip()),
-        "llm_provider": str(config.get("memory_mem0_llm_provider") or config.get("provider") or "").strip().lower(),
-        "llm_model": str(config.get("memory_mem0_llm_model") or config.get("model") or "").strip(),
+        "llm_provider": str(config.get("memory_mem0_llm_provider") or config.get("default_provider") or "").strip().lower(),
+        "llm_model": str(config.get("memory_mem0_llm_model") or config.get("model_name") or "").strip(),
         # Same default as the native engine's MEMORY_EMBED_PROVIDER (engine.py):
         # `ollama`, where nomic-embed-text actually lives. mem0 and native then
         # share the one model the installer pulls, instead of mem0 shipping its
