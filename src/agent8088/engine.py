@@ -4506,6 +4506,57 @@ _STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$)")
 # before the single-character forms. `|` is absent: `_readonly_shell` already
 # decomposes pipelines itself, under its own stricter rules.
 _SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|&|\n")
+# The same, plus `|`, for splitting once quoted operators are masked out.
+_AUDIT_STAGE_SPLIT = re.compile(r"&&|\|\||;|&|\n|\|")
+# `2>&1` / `>&2` point one output stream at another; no file is named.
+_FD_DUPLICATE = re.compile(r"\d?>&\d+\b")
+# A sed script made only of line numbers and p/q/d/= prints; it cannot write,
+# run a command, or read another file (w, W, e, r, R are all letters).
+_SED_PRINT_SCRIPT = re.compile(r"[\d,$;!pqd=\s]+")
+_SED_READ_FLAGS = {"-n", "-E", "-r", "--quiet", "--silent"}
+
+
+def _mask_quoted_operators(command: str):
+    """Replace shell operators inside quotes with '_', keeping every offset.
+
+    `grep -E "a|b" f` has no pipe, and `grep 'x[^<]*' f` no redirect, but the
+    audit predicate's operator checks only see characters. Returns None when a
+    quote never closes: that command cannot be read, so it is not trusted.
+    """
+    out, quote, escaped = [], None, False
+    for char in command:
+        if escaped:
+            escaped = False
+            if quote and char in "|;&<>\n":
+                char = "_"     # "a\|b": still inside the quotes
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+            elif char in "|;&<>\n":
+                char = "_"
+        elif char in "'\"":
+            quote = char
+        out.append(char)
+    return None if quote else "".join(out)
+
+
+def _sed_prints_only(command: str) -> bool:
+    """`sed -n '415,445p' f`: a sed call that can only print lines by number."""
+    # sed uses POSIX shell quoting even when Agent8088 is hosted on Windows
+    # through Git Bash. _shell_parts intentionally keeps quotes on Windows,
+    # which made every quoted, print-only sed script look unsafe to the audit.
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not parts or Path(parts[0]).stem.lower() != "sed":
+        return False
+    flags = [part for part in parts[1:] if part.startswith("-")]
+    operands = [part for part in parts[1:] if not part.startswith("-")]
+    return (bool(operands) and all(flag in _SED_READ_FLAGS for flag in flags)
+            and _SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None)
 
 
 def _shell_call_is_read_only(command: str) -> bool:
@@ -4525,14 +4576,28 @@ def _shell_call_is_read_only(command: str) -> bool:
     requires EVERY segment to satisfy the strict predicate independently — a
     conjunction that can only ever be stricter than the whole-string answer,
     never a way to smuggle a write past the auditor.
+
+    Operators inside quotes are masked first, so a grep pattern like "a|b" or
+    '[^<]*' is not a pipe or a redirect; the mask keeps offsets, so each stage
+    can still be read from the original text. Auditing those reads, plus
+    `sed -n '415,445p'` and `2>&1`, took 144 of a 293-second live run.
     """
     if re.search(r"[`]|\$\(", command):
         return False           # substitution can run anything, anywhere
-    probe = _STDERR_TO_NULL.sub("", command)
+    probe = _mask_quoted_operators(command)
+    if probe is None:
+        return False           # quoting that never closes cannot be read
+    blank = lambda match: " " * len(match.group(0))
+    probe = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe))
+    original = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command))
     if re.search(r"[<>]", probe):
         return False           # a redirection writes a file
-    segments = [part.strip() for part in _SHELL_SEQUENCERS.split(probe)]
-    return bool(segments) and all(part and _readonly_shell(part) for part in segments)
+    bounds = [0] + [edge for m in _AUDIT_STAGE_SPLIT.finditer(probe)
+                    for edge in m.span()] + [len(probe)]
+    stages = [(probe[start:end].strip(), original[start:end].strip())
+              for start, end in zip(bounds[::2], bounds[1::2])]
+    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original))
+               for masked, original in stages)
 
 
 def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
@@ -9770,11 +9835,18 @@ def _scan_json_object(text: str, start: int, limit: int = None) -> str:
 def _normalize_tool_markers(text: str) -> str:
     text = re.sub(r"\u273fARGS(?:</arg_key>\s*)?<arg_value>\s*:?", "\u273fARGS\u273f: ", text)
     text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
-    return re.sub(
+    text = re.sub(
         r"✿(FUNCTION|ARGS)[^:\w\s]{0,3}\s*:",
         lambda match: f"✿{match.group(1)}✿:",
         text,
     )
+    # Whatever short junk sits between ✿ARGS and the object's opening brace on
+    # the same line is a mangled delimiter, not content: glm-5.3 sends both
+    # "✿ARGS✟ {" and "✿ARGS�<arg_value>: {". Left alone, the call parsed
+    # with no arguments, so an approved web_search retry ran as
+    # web_search({}). No second flower is allowed in the junk, so the match
+    # cannot reach into the next call's header.
+    return re.sub(r"✿ARGS✿?[^\n{✿]{0,24}(?=\{)", "✿ARGS✿: ", text)
 
 
 # Only whitespace and an opening code fence may sit between a bare ✿FUNCTION✿
@@ -9951,7 +10023,10 @@ def strip_tool_json(text: str) -> str:
         part = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', part, flags=re.DOTALL)
         # Hard sanitize: strip any leftover ✿…✿ fragments and stray sentinels so raw
         # tool-call markup can NEVER leak into a user-facing answer.
-        parts[index] = re.sub(r'✿[^✿\n]*✿', '', part).replace('✿', '')
+        part = re.sub(r'✿[^✿\n]*✿', '', part).replace('✿', '')
+        # Orphaned closers from hybrid markup ("✿ARGS<arg_value>: {…}</arg_value>
+        # </tool_call>") outlive the block they belonged to.
+        parts[index] = re.sub(r'</?(?:arg_value|arg_key)>|</tool_call>', '', part)
     text = "".join(parts)
     # Tidy whitespace WITHOUT flattening newlines, so multi-line answers survive.
     text = re.sub(r'[ \t]+\n', '\n', text)
@@ -11096,6 +11171,14 @@ def _web_search_limit() -> int:
         return 5
 
 
+def _web_search_turn_cap() -> int:
+    """Searches one request may run before it must answer; 0 means no cap."""
+    try:
+        return max(0, int(APP_CONFIG.get("web_search_max_per_turn", "6")))
+    except (TypeError, ValueError):
+        return 6
+
+
 _WEB_SEARCH_MAX_QUERY_CHARS = 500
 _WEB_SEARCH_SENSITIVE_PATTERNS = (
     (re.compile(r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----", re.IGNORECASE),
@@ -11193,15 +11276,14 @@ def _search_was_usable(result: str) -> bool:
 
     An error or an empty result is not an answer; trapping the agent with it
     would be worse than letting it try once more.
+
+    Only web_search.format_results output counts, and it always carries this
+    heading. Anything else — an approval prompt, "Every configured web search
+    provider failed", "No results from ddgs." — used to pass as long as it
+    was not "Error:", so a page fetch after a search that found nothing was
+    refused as "the search already answered this".
     """
-    stripped = (result or "").strip()
-    if not stripped or stripped.startswith("Error:"):
-        return False
-    # Framed results carry a stamp line; a stamp with nothing under it is empty.
-    if stripped.startswith(_SEARCH_STAMP_PREFIX):
-        _stamp, _, body = stripped.partition("]")
-        return bool(body.strip())
-    return True
+    return "Search results (via " in (result or "")
 
 
 def _frame_search_results(results: str, now=None) -> str:
@@ -12740,6 +12822,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
+    searches_run = 0     # web searches that actually ran, against _web_search_turn_cap
     forced_stop = False
     user_turns = _genuine_user_turns(messages)
     durable_browser_goal = next((str(message.get("content") or "")
@@ -13260,6 +13343,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     messages.append({"role": "user",
                                      "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                     continue
+                # Rephrasing is not bounded by the guard above. A model chasing
+                # detail that snippets never carry (a full 20-team table from
+                # five-result DDGS searches) rephrased 23 times until the turn
+                # was killed with no answer; stop it and make it answer.
+                cap = _web_search_turn_cap()
+                if cap and searches_run >= cap:
+                    result = (f"Search limit reached: {searches_run} web searches "
+                              "already ran for this request. Do not search again. "
+                              "Answer now from the results above, and say plainly "
+                              "what they did not confirm.")
+                    tool_outputs.append(result)
+                    if on_result:
+                        on_result(name, result)
+                    if turn_tools is not None:
+                        turn_tools.append({"name": name, "arguments": args,
+                                           "result": result, "blocked": True})
+                    messages.append({"role": "user",
+                                     "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                    continue
 
             # Two separate jobs, deliberately not merged.
             #
@@ -13398,6 +13500,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # pending approval was filed as a completed one, so the retry the
                 # user had just authorised was answered from the escalation text.
                 search_results[_search_signature(str(args.get("query") or ""))] = result
+                searches_run += 1
             searched = searched or (name == "web_search" and _search_was_usable(result))
 
             blocked = result.startswith("ESCALATION_REQUEST\x1f")

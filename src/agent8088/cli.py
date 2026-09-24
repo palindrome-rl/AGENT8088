@@ -766,6 +766,12 @@ def _tool_summary(name, args, limit=None):
         subject = args[path_arg]
         content_arg = spec.get("content_arg")
         body = args.get(content_arg) if content_arg in declared else None
+        source = args.get("source_url") if "source_url" in declared else None
+        if not body and isinstance(source, str) and source.strip():
+            # The engine fetches only when content is empty. Sizing the empty
+            # content read "(0 lines, 0 B)" for a 581 KB download.
+            host = urlparse(source.strip()).hostname
+            return f"{subject} ← {host}" if host else subject
         if isinstance(body, str):
             lines = body.count("\n") + 1 if body else 0
             size = _human_size(len(body.encode("utf-8", "replace")))
@@ -3068,7 +3074,11 @@ def _detect_pasted_file(line: str):
     return None
 
 
-def _handle_pasted_file(path, question):
+def _handle_pasted_file(path, question, original=None):
+    # `original` is the line as typed. A text file's instruction is that line
+    # with the path still in it: cutting it out turned "grep … artifacts/t.html"
+    # into a grep with no file. Images keep the split — cmd_image gets the path.
+    #
     # Check the sensitive-file floor before touching the file at all, for
     # both branches below — extract_text() has no floor of its own, so
     # skipping this would let a pasted-path .docx read a credential file that
@@ -3095,7 +3105,8 @@ def _handle_pasted_file(path, question):
         except (ValueError, UnicodeDecodeError):
             return False  # not text either — let it fall through as chat
     body = A._paginate_read(text, {}, resolved)
-    instruction = question or f"Here is the content of {resolved.name}."
+    typed = (original or "").strip() if question else ""
+    instruction = typed or question or f"Here is the content of {resolved.name}."
     do_chat(f"{instruction}\n\n{body}")
     return True
 def _cmd_model_auto_setup():
@@ -4981,8 +4992,12 @@ def _show_memory_status():
     last = report.get("last_capture") or {}
     if last:
         cost = (last.get("input_tokens", 0) or 0) + (last.get("output_tokens", 0) or 0)
-        table.add_row("Last learning call", f"{cost} tokens, stored "
-                      f"{last.get('stored', 0)}")
+        # The capture runs in the background after the reply; until it lands,
+        # "stored 0" read as memory having failed when it was still saving.
+        thread = getattr(A, "memory_capture_thread", None)
+        saving = thread is not None and thread.is_alive()
+        table.add_row("Last learning call", f"{cost} tokens, " + (
+            "saving…" if saving else f"stored {last.get('stored', 0)}"))
     if report["error"]:
         table.add_row("Error", report["error"])
     console.print(table)
@@ -5095,7 +5110,8 @@ def cmd_memory(rest):
             if argument == "mem0":
                 flag = ("install.ps1 -WithMem0" if os.name == "nt"
                         else "install.sh --memory mem0")
-                console.print(f"[dim]  install it by rerunning the installer: {flag}[/dim]")
+                console.print("[dim]  install it with: agent8088 --memory-setup  "
+                              f"(or rerun the installer: {flag}), then restart agent8088[/dim]")
         else:
             console.print(f"[green]memory engine: {live}[/green] "
                           f"[dim]— {report['count']} memories, embedder "
@@ -8082,6 +8098,9 @@ def main():
                 console.print(f"[red]error:[/red] {e}")
             continue
         if line.startswith("/"):
+            # Otherwise a finished capture waits for the next chat turn, and a
+            # /memory right after "remember X" looks like nothing was stored.
+            _report_pending_capture()
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:
@@ -8093,7 +8112,7 @@ def main():
                 console.print(f"[red]unknown command:[/red] /{cmd}  (try /help)")
             continue
         pasted = _detect_pasted_file(line)
-        if pasted and _handle_pasted_file(*pasted):
+        if pasted and _handle_pasted_file(*pasted, original=line):
             continue
         try:
             do_chat(line)

@@ -101,8 +101,22 @@ class Mem0MemoryStore:
                 except Exception:
                     pass
 
+            # The configured embedding client is authoritative for Ollama
+            # embeddings. OLLAMA_HOST is often a server bind address such as
+            # 0.0.0.0, which a client cannot connect to; preferring it made
+            # mem0 fail even while Agent8088's native embedder worked.
+            embed_provider = str(self.config.get("embed_provider") or "ollama").strip().lower()
+            configured_ollama_url = (client_base_url.removesuffix("/v1")
+                                     if embed_provider == "ollama" and client_base_url else "")
+            ollama_url = configured_ollama_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+
             llm_provider = str(self.config.get("llm_provider") or "").strip().lower()
 
+            # mem0 always builds an LLM, defaulting to OpenAI, whose client refuses
+            # to construct without OPENAI_API_KEY -- so an unset provider killed the
+            # whole engine. Extraction is agent8088's own (add() uses infer=False),
+            # so mem0's LLM is never called; it just has to construct.
+            llm_provider = llm_provider or "openai"
             llm_section = None
             if llm_provider:
                 # mem0 validates this name against its own registry and refuses
@@ -119,10 +133,10 @@ class Mem0MemoryStore:
                 llm_cfg = {
                     "model": str(self.config.get("llm_model") or "gpt-4o-mini"),
                 }
-                if client_api_key:
-                    llm_cfg["api_key"] = client_api_key
+                if client_api_key or resolved_provider == "openai":
+                    llm_cfg["api_key"] = client_api_key or "none"
                 if resolved_provider == "ollama":
-                    llm_cfg["ollama_base_url"] = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+                    llm_cfg["ollama_base_url"] = ollama_url
                 elif resolved_provider == "openai" and client_base_url:
                     # Only meaningful for the OpenAI-shaped client; setting it for
                     # anthropic/gemini/groq would be noise at best.
@@ -134,19 +148,15 @@ class Mem0MemoryStore:
                 self.llm_info = {"requested": llm_provider, "resolved": resolved_provider}
 
             embedder_section = None
-            embed_provider = str(self.config.get("embed_provider") or "").strip().lower()
-            if not embed_provider:
-                # parse_memory_engine_config defaults to `ollama`; an empty
-                # value means a store constructed directly with a bare dict,
-                # as the tests do. The default model stays nomic for parity.
-                embed_provider = "ollama"
+            # parse_memory_engine_config defaults to `ollama`; a bare store
+            # config uses the same default for parity with the native engine.
             if embed_provider == "ollama":
                 embed_dims = 768
                 embedder_section = {
                     "provider": "ollama",
                     "config": {
                         "model": str(self.config.get("embed_model") or "nomic-embed-text"),
-                        "ollama_base_url": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+                        "ollama_base_url": ollama_url,
                     },
                 }
             elif embed_provider in {"openai", "custom"} and client_base_url:
@@ -244,7 +254,17 @@ class Mem0MemoryStore:
         return self
 
     def close(self) -> None:
-        pass
+        memory = self._memory
+        self._memory = None
+        self._available = None
+        if memory is None:
+            return
+        # Embedded Qdrant holds an exclusive file lock on Windows. A config
+        # reload or engine switch must release it before reopening the store.
+        client = getattr(getattr(memory, "vector_store", None), "client", None)
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
 
     def __enter__(self):
         return self
@@ -335,7 +355,9 @@ class Mem0MemoryStore:
             return []
         try:
             try:
-                resp = mem.search(str(query), filters={"user_id": str(user_id)}, limit=int(limit))
+                # mem0 2.x renamed limit -> top_k; limit landed in **kwargs and
+                # raised, so every search silently returned nothing.
+                resp = mem.search(str(query), filters={"user_id": str(user_id)}, top_k=int(limit))
             except (TypeError, ValueError):
                 resp = mem.search(str(query), user_id=str(user_id), limit=int(limit))
             items = []
@@ -377,7 +399,7 @@ class Mem0MemoryStore:
             return []
         try:
             try:
-                resp = mem.get_all(filters={"user_id": str(user_id)})
+                resp = mem.get_all(filters={"user_id": str(user_id)}, top_k=int(limit))
             except (TypeError, ValueError):
                 resp = mem.get_all(user_id=str(user_id))
             items = []

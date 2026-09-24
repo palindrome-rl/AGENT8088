@@ -168,3 +168,4 @@ def test_gateway_setup_reconfigures_already_active_discord(tmp_path, monkeypatch
     content = config_file.read_text(encoding="utf-8")
     assert "discord_enabled=1" in content
     assert "discord_allowed_users=user1,user2" in content
+
