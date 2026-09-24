@@ -62,12 +62,8 @@ curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindro
 $env:AGENT8088_BRANCH = "staging-1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
 ```
 
-> **Correction.** This previously pointed at `agent8088-installer.pages.dev`, a
-> domain with no corresponding Pages deploy config or CNAME anywhere in this
-> repo. `raw.githubusercontent.com` against the actual `origin` remote
-> (`palindrome-rl/AGENT8088`) is what [Getting
-> Started](docs/wiki/01-getting-started.md) uses and what is verifiable from
-> the tree.
+These staging commands intentionally fetch the branch-specific installers;
+the Pages installer URL serves the development channel.
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
