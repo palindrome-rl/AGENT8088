@@ -4981,8 +4981,12 @@ def _show_memory_status():
     last = report.get("last_capture") or {}
     if last:
         cost = (last.get("input_tokens", 0) or 0) + (last.get("output_tokens", 0) or 0)
-        table.add_row("Last learning call", f"{cost} tokens, stored "
-                      f"{last.get('stored', 0)}")
+        # The capture runs in the background after the reply; until it lands,
+        # "stored 0" read as memory having failed when it was still saving.
+        thread = getattr(A, "memory_capture_thread", None)
+        saving = thread is not None and thread.is_alive()
+        table.add_row("Last learning call", f"{cost} tokens, " + (
+            "saving…" if saving else f"stored {last.get('stored', 0)}"))
     if report["error"]:
         table.add_row("Error", report["error"])
     console.print(table)
@@ -5095,7 +5099,8 @@ def cmd_memory(rest):
             if argument == "mem0":
                 flag = ("install.ps1 -WithMem0" if os.name == "nt"
                         else "install.sh --memory mem0")
-                console.print(f"[dim]  install it by rerunning the installer: {flag}[/dim]")
+                console.print("[dim]  install it with: agent8088 --memory-setup  "
+                              f"(or rerun the installer: {flag}), then restart agent8088[/dim]")
         else:
             console.print(f"[green]memory engine: {live}[/green] "
                           f"[dim]— {report['count']} memories, embedder "
@@ -8082,6 +8087,9 @@ def main():
                 console.print(f"[red]error:[/red] {e}")
             continue
         if line.startswith("/"):
+            # Otherwise a finished capture waits for the next chat turn, and a
+            # /memory right after "remember X" looks like nothing was stored.
+            _report_pending_capture()
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:

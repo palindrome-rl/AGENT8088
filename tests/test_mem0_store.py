@@ -61,6 +61,39 @@ def test_ollama_still_gets_its_own_base_url():
     assert "ollama_base_url" in _llm_section(fake)["config"]
 
 
+def test_configured_ollama_endpoint_beats_server_bind_address(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0")
+    fake = _fake_mem0()
+    client = MagicMock(api_key="none", base_url="http://127.0.0.1:11434/v1")
+    store = Mem0MemoryStore({"path": "/tmp/test_mem0", "embed_provider": "ollama"},
+                            client_factory=lambda: client)
+    with patch("agent8088.memory.mem0_store._import_mem0", return_value=fake):
+        assert store.available() is True
+    config = fake.from_config.call_args[0][0]
+    assert config["embedder"]["config"]["ollama_base_url"] == "http://127.0.0.1:11434"
+
+
+def test_non_ollama_embedder_does_not_use_its_endpoint_for_ollama_llm(monkeypatch):
+    monkeypatch.setenv("OLLAMA_HOST", "http://ollama.internal:11434")
+    fake = _fake_mem0()
+    client = MagicMock(api_key="none", base_url="http://embeddings.internal/v1")
+    store = Mem0MemoryStore({"path": "/tmp/test_mem0", "embed_provider": "openai",
+                             "llm_provider": "ollama"}, client_factory=lambda: client)
+    with patch("agent8088.memory.mem0_store._import_mem0", return_value=fake):
+        assert store.available() is True
+    assert _llm_section(fake)["config"]["ollama_base_url"] == "http://ollama.internal:11434"
+
+
+def test_close_releases_embedded_qdrant_client():
+    fake = _fake_mem0()
+    store = Mem0MemoryStore({"path": "/tmp/test_mem0"})
+    with patch("agent8088.memory.mem0_store._import_mem0", return_value=fake):
+        assert store.available() is True
+    store.close()
+    fake.from_config.return_value.vector_store.client.close.assert_called_once_with()
+    assert store._memory is None
+
+
 # --- the failure must say why --------------------------------------------
 
 
@@ -139,7 +172,7 @@ def test_mem0_store_add_and_search_delegates():
         assert hits[0]["text"] == "Prefers python over go"
         assert hits[0]["score"] == 0.95
         mock_mem0_instance.search.assert_called_once_with(
-            "coding preferences", filters={"user_id": "alice"}, limit=3
+            "coding preferences", filters={"user_id": "alice"}, top_k=3
         )
         
         # Test recent
