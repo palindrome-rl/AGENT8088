@@ -54,6 +54,9 @@ opencode.json
 # WhatsApp bridge npm deps
 src/agent8088/gateway/platforms/whatsapp_bridge/node_modules/
 
+# OpenCodeReview npm installation
+code-review/
+
 # Test and run artifacts — generated files never belong in the repo root
 artifacts/*
 !artifacts/.gitkeep

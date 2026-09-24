@@ -7047,7 +7047,10 @@ def _run_update(force=False):
     if status.returncode != 0:
         print(status.stderr.strip() or "Could not inspect the install directory.")
         return False
-    dirty = [line for line in status.stdout.splitlines() if line.strip()]
+    dirty = [
+        line for line in status.stdout.splitlines()
+        if line.strip() and not line.strip().endswith("code-review/") and not line.strip().endswith("code-review")
+    ]
     if dirty and not force:
         # Naming the files matters: the old message said only that there were
         # local changes, and pointed at a /update command that does not exist.
@@ -7574,8 +7577,8 @@ def _run_gateway_setup():
     else:
         newly_enabled = set()
 
-    # --- Slack configuration (only if newly enabled) ---
-    if slack_on and "slack" in newly_enabled:
+    # --- Slack configuration ---
+    if slack_on:
         print("\n--- Slack ---")
         print("Create a Slack app at https://api.slack.com/apps:")
         print("  1. Create New App -> From scratch")
@@ -7605,8 +7608,8 @@ def _run_gateway_setup():
             app_token = _env_vars.get("SLACK_APP_TOKEN", "")
         allowed = _custom_prompt("Allowed Slack user IDs (comma-separated):",
                                  _current("slack_allowed_users"))
-        if allowed:
-            content = _set_line(content, "slack_allowed_users", allowed)
+        if allowed is not None:
+            content = _set_line(content, "slack_allowed_users", allowed.strip())
         if not (bot_token and app_token):
             content = _set_line(content, "slack_enabled", "0")
             slack_on = False
@@ -7615,8 +7618,8 @@ def _run_gateway_setup():
             content = _set_line(content, "slack_enabled", "1")
             print("Slack configured.\n")
 
-    # --- WhatsApp configuration (only if newly enabled) ---
-    if wa_on and "whatsapp" in newly_enabled:
+    # --- WhatsApp configuration ---
+    if wa_on:
         print("\n--- WhatsApp ---")
         session_dir = _current("whatsapp_session_dir") or str(
             Path.home() / ".local" / "share" / "agent8088" / "whatsapp" / "session"
@@ -7626,8 +7629,8 @@ def _run_gateway_setup():
             content = _set_line(content, "whatsapp_session_dir", session_dir)
         allowed = _custom_prompt("Allowed WhatsApp numbers (comma-separated, e.g. +923214567891):",
                                  _current("whatsapp_allowed_users"))
-        if allowed:
-            content = _set_line(content, "whatsapp_allowed_users", allowed)
+        if allowed is not None:
+            content = _set_line(content, "whatsapp_allowed_users", allowed.strip())
         mode = _choice_prompt("WhatsApp mode:", ["self-chat", "bot"],
                               _current("whatsapp_mode") or "self-chat")
         content = _set_line(content, "whatsapp_mode", mode)
@@ -7709,8 +7712,8 @@ def _run_gateway_setup():
         content = _set_line(content, "whatsapp_enabled", "1")
         print("WhatsApp configured.\n")
 
-    # --- Discord configuration (only if newly enabled) ---
-    if discord_on and "discord" in newly_enabled:
+    # --- Discord configuration ---
+    if discord_on:
         print("\n--- Discord ---")
         print("Create a Discord bot at https://discord.com/developers/applications:")
         print("  1. New Application -> give it a name")
@@ -7730,8 +7733,8 @@ def _run_gateway_setup():
             bot_token = _env_vars.get("DISCORD_BOT_TOKEN", "")
         allowed = _custom_prompt("Allowed Discord user IDs (comma-separated):",
                                  _current("discord_allowed_users"))
-        if allowed:
-            content = _set_line(content, "discord_allowed_users", allowed)
+        if allowed is not None:
+            content = _set_line(content, "discord_allowed_users", allowed.strip())
         if not bot_token:
             content = _set_line(content, "discord_enabled", "0")
             discord_on = False
@@ -7740,8 +7743,8 @@ def _run_gateway_setup():
             content = _set_line(content, "discord_enabled", "1")
             print("Discord configured.\n")
 
-    # --- Email configuration (only if newly enabled) ---
-    if email_on and "email" in newly_enabled:
+    # --- Email configuration ---
+    if email_on:
         print("\n--- Email ---")
         print("Email uses Python stdlib (imaplib/smtplib) — no extra deps needed.\n")
         print("For Gmail: enable 2FA and create an App Password at")
@@ -7764,7 +7767,7 @@ def _run_gateway_setup():
             email_pass = _env_vars.get("EMAIL_PASSWORD", "")
 
         smtp_host = _custom_prompt("SMTP host (e.g. smtp.gmail.com):",
-                                    default=_env_vars.get("EMAIL_SMTP_HOST", ""))
+                                     default=_env_vars.get("EMAIL_SMTP_HOST", ""))
         if smtp_host:
             A.update_env_file(A.ENV_FILE_PATH, {"EMAIL_SMTP_HOST": smtp_host})
         else:
@@ -7790,8 +7793,8 @@ def _run_gateway_setup():
 
         allowed = _custom_prompt("Allowed email addresses (comma-separated):",
                                  _current("email_allowed_users"))
-        if allowed:
-            content = _set_line(content, "email_allowed_users", allowed)
+        if allowed is not None:
+            content = _set_line(content, "email_allowed_users", allowed.strip())
 
         if not (email_addr and email_pass and smtp_host and imap_host):
             content = _set_line(content, "email_enabled", "0")
@@ -7801,8 +7804,8 @@ def _run_gateway_setup():
             content = _set_line(content, "email_enabled", "1")
             print("Email configured.\n")
 
-    # --- Telegram configuration (only if newly enabled) ---
-    if telegram_on and "telegram" in newly_enabled:
+    # --- Telegram configuration ---
+    if telegram_on:
         print("\n--- Telegram ---")
         print("Create a Telegram bot via @BotFather (https://t.me/BotFather):")
         print("  1. Send /newbot to @BotFather")
@@ -7823,8 +7826,8 @@ def _run_gateway_setup():
             bot_token = _env_vars.get("TELEGRAM_BOT_TOKEN", "")
         allowed = _custom_prompt("Allowed Telegram user IDs (comma-separated numerics, or *):",
                                  _current("telegram_allowed_users"))
-        if allowed:
-            content = _set_line(content, "telegram_allowed_users", allowed)
+        if allowed is not None:
+            content = _set_line(content, "telegram_allowed_users", allowed.strip())
         if not bot_token:
             content = _set_line(content, "telegram_enabled", "0")
             telegram_on = False
@@ -7853,6 +7856,8 @@ def _run_gateway_setup():
         print(f"Enabled: {', '.join(enabled)}")
         if newly_enabled:
             print(f"Newly configured: {', '.join(sorted(newly_enabled))}")
+        else:
+            print(f"Updated configuration: {', '.join(s.lower() for s in enabled)}")
         print("\nStart the gateway with: agent8088 --gateway")
     else:
         print(f"Config written to {config_path}")
