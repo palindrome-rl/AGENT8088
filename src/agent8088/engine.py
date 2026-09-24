@@ -9770,11 +9770,18 @@ def _scan_json_object(text: str, start: int, limit: int = None) -> str:
 def _normalize_tool_markers(text: str) -> str:
     text = re.sub(r"\u273fARGS(?:</arg_key>\s*)?<arg_value>\s*:?", "\u273fARGS\u273f: ", text)
     text = re.sub(r"✿ARGS</arg_key>\s*<arg_value>", "✿ARGS✿: ", text)
-    return re.sub(
+    text = re.sub(
         r"✿(FUNCTION|ARGS)[^:\w\s]{0,3}\s*:",
         lambda match: f"✿{match.group(1)}✿:",
         text,
     )
+    # Whatever short junk sits between ✿ARGS and the object's opening brace on
+    # the same line is a mangled delimiter, not content: glm-5.3 sends both
+    # "✿ARGS✟ {" and "✿ARGS�<arg_value>: {". Left alone, the call parsed
+    # with no arguments, so an approved web_search retry ran as
+    # web_search({}). No second flower is allowed in the junk, so the match
+    # cannot reach into the next call's header.
+    return re.sub(r"✿ARGS✿?[^\n{✿]{0,24}(?=\{)", "✿ARGS✿: ", text)
 
 
 # Only whitespace and an opening code fence may sit between a bare ✿FUNCTION✿
@@ -9951,7 +9958,10 @@ def strip_tool_json(text: str) -> str:
         part = re.sub(r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}', '', part, flags=re.DOTALL)
         # Hard sanitize: strip any leftover ✿…✿ fragments and stray sentinels so raw
         # tool-call markup can NEVER leak into a user-facing answer.
-        parts[index] = re.sub(r'✿[^✿\n]*✿', '', part).replace('✿', '')
+        part = re.sub(r'✿[^✿\n]*✿', '', part).replace('✿', '')
+        # Orphaned closers from hybrid markup ("✿ARGS<arg_value>: {…}</arg_value>
+        # </tool_call>") outlive the block they belonged to.
+        parts[index] = re.sub(r'</?(?:arg_value|arg_key)>|</tool_call>', '', part)
     text = "".join(parts)
     # Tidy whitespace WITHOUT flattening newlines, so multi-line answers survive.
     text = re.sub(r'[ \t]+\n', '\n', text)
@@ -11094,6 +11104,14 @@ def _web_search_limit() -> int:
         return max(1, min(int(APP_CONFIG.get("web_search_results", "5")), 20))
     except (TypeError, ValueError):
         return 5
+
+
+def _web_search_turn_cap() -> int:
+    """Searches one request may run before it must answer; 0 means no cap."""
+    try:
+        return max(0, int(APP_CONFIG.get("web_search_max_per_turn", "6")))
+    except (TypeError, ValueError):
+        return 6
 
 
 _WEB_SEARCH_MAX_QUERY_CHARS = 500
@@ -12740,6 +12758,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
+    searches_run = 0     # web searches that actually ran, against _web_search_turn_cap
     forced_stop = False
     user_turns = _genuine_user_turns(messages)
     durable_browser_goal = next((str(message.get("content") or "")
@@ -13260,6 +13279,25 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     messages.append({"role": "user",
                                      "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
                     continue
+                # Rephrasing is not bounded by the guard above. A model chasing
+                # detail that snippets never carry (a full 20-team table from
+                # five-result DDGS searches) rephrased 23 times until the turn
+                # was killed with no answer; stop it and make it answer.
+                cap = _web_search_turn_cap()
+                if cap and searches_run >= cap:
+                    result = (f"Search limit reached: {searches_run} web searches "
+                              "already ran for this request. Do not search again. "
+                              "Answer now from the results above, and say plainly "
+                              "what they did not confirm.")
+                    tool_outputs.append(result)
+                    if on_result:
+                        on_result(name, result)
+                    if turn_tools is not None:
+                        turn_tools.append({"name": name, "arguments": args,
+                                           "result": result, "blocked": True})
+                    messages.append({"role": "user",
+                                     "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                    continue
 
             # Two separate jobs, deliberately not merged.
             #
@@ -13398,6 +13436,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # pending approval was filed as a completed one, so the retry the
                 # user had just authorised was answered from the escalation text.
                 search_results[_search_signature(str(args.get("query") or ""))] = result
+                searches_run += 1
             searched = searched or (name == "web_search" and _search_was_usable(result))
 
             blocked = result.startswith("ESCALATION_REQUEST\x1f")

@@ -126,7 +126,10 @@ def scrub_markup(text: str) -> str:
     session history and model context stay raw)."""
     if not text:
         return text
-    text = re.sub(r"\u273fARGS(?:</arg_key>\s*)?<arg_value>\s*:?", "\u273fARGS\u273f: ", text)
+    # The engine's normalizer, so a garbled ARGS delimiter the parser runs as a
+    # call is also recognised here as one and not shown as text.
+    from agent8088.engine import _normalize_tool_markers
+    text = _normalize_tool_markers(text)
     text = _FUNC_BLOCK_RE.sub("", text)
     text = _BARE_BLOCK_RE.sub("", text)
     text = _THINK_RE.sub("", text)

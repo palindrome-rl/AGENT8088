@@ -392,6 +392,9 @@ web_search_no_prompt=1
 # Results per search (default 5, max 20):
 # web_search_results=5
 #
+# Searches one request may run before it must answer (default 6, 0 = no cap):
+# web_search_max_per_turn=6
+#
 # Optional backends. Add a key and they join the chain automatically; leave them
 # unset and they stay out of it entirely. Keys live in the .env store next to
 # this file, NEVER here:
