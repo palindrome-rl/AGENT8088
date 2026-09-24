@@ -766,6 +766,12 @@ def _tool_summary(name, args, limit=None):
         subject = args[path_arg]
         content_arg = spec.get("content_arg")
         body = args.get(content_arg) if content_arg in declared else None
+        source = args.get("source_url") if "source_url" in declared else None
+        if not body and isinstance(source, str) and source.strip():
+            # The engine fetches only when content is empty. Sizing the empty
+            # content read "(0 lines, 0 B)" for a 581 KB download.
+            host = urlparse(source.strip()).hostname
+            return f"{subject} ← {host}" if host else subject
         if isinstance(body, str):
             lines = body.count("\n") + 1 if body else 0
             size = _human_size(len(body.encode("utf-8", "replace")))
