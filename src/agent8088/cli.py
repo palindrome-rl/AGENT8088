@@ -8077,6 +8077,9 @@ def main():
                 console.print(f"[red]error:[/red] {e}")
             continue
         if line.startswith("/"):
+            # Otherwise a finished capture waits for the next chat turn, and a
+            # /memory right after "remember X" looks like nothing was stored.
+            _report_pending_capture()
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:
