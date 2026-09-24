@@ -56,7 +56,15 @@ def parse_memory_engine_config(config=None):
         "path": os.path.expanduser(str(config.get("memory_mem0_dir", default_mem0_dir)).strip()),
         "llm_provider": str(config.get("memory_mem0_llm_provider") or config.get("provider") or "").strip().lower(),
         "llm_model": str(config.get("memory_mem0_llm_model") or config.get("model") or "").strip(),
-        "embed_provider": str(config.get("memory_mem0_embed_provider") or config.get("memory_embed_provider") or "").strip().lower(),
+        # Same default as the native engine's MEMORY_EMBED_PROVIDER (engine.py):
+        # `ollama`, where nomic-embed-text actually lives. mem0 and native then
+        # share the one model the installer pulls, instead of mem0 shipping its
+        # own fastembed copy. `memory_mem0_embed_provider=fastembed` opts out.
+        "embed_provider": str(config.get("memory_mem0_embed_provider") or config.get("memory_embed_provider") or "ollama").strip().lower(),
+        # Left empty when unset: the store picks the matching model per provider
+        # (nomic-embed-text for ollama, text-embedding-3-small for openai), so a
+        # parse-time model default would send the wrong model to a non-Ollama
+        # embeddings host.
         "embed_model": str(config.get("memory_mem0_embed_model") or config.get("memory_embed_model") or "").strip(),
         "disable_telemetry": True,
     }

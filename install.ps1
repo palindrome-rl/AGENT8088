@@ -261,7 +261,6 @@ $TOcrModels   = 600 * $TimeoutScale   # OCR detection + recognition models
 $TDownload    = 180 * $TimeoutScale   # ~30 MB archives (Node, MinGit, repo ZIP)
 $TPip         = 300 * $TimeoutScale   # gateway extras: tens of MB of wheels
 $TLibreOffice = 1800 * $TimeoutScale  # ~350 MB MSI plus dependency resolution/install
-$TMem0Model   = 600 * $TimeoutScale   # ~90 MB fastembed model, same size as the OCR ones
 # The core editable install is the stage that actually hangs: it pulls
 # playwright's and ddgs's native wheels plus mcp and Pillow. Not optional, so a
 # premature cut fails the install outright -- but it is still the largest
@@ -927,9 +926,9 @@ function Install-LibreOffice {
 # Memory backend - which engine `memory_engine` in config.txt points at.
 #
 # native needs nothing extra: it is SQLite plus the embedder the core install
-# already provides. mem0 pulls mem0ai, fastembed, qdrant-client, grpcio and
-# sqlalchemy, then downloads an embedding model on first use, so it is opt-in
-# for the same reason LibreOffice is.
+# already provides. mem0 pulls mem0ai, qdrant-client, grpcio, sqlalchemy and
+# the ollama client, and reuses the embedding model the install already pulls
+# for native memory, so it is opt-in for the same reason LibreOffice is.
 #
 # Both paths write memory_engine to config.txt, so what is installed and what is
 # configured cannot disagree -- a config asking for mem0 with the extra missing
@@ -957,7 +956,7 @@ function Read-Mem0Consent {
     Write-Host "    Agent8088 remembers facts across sessions. Pick the backend:"
     Write-Host "      native - SQLite with keyword + semantic search. No extra downloads." -ForegroundColor Gray
     Write-Host "      mem0   - Mem0 with a Qdrant vector store and LLM fact extraction." -ForegroundColor Gray
-    Write-Host "               Adds ~200 MB of dependencies plus an embedding model."
+    Write-Host "               Adds the mem0 library chain; embeddings reuse the Ollama model."
     Write-Host "    Either can be changed later with /memory engine <name>."
     do {
         $rawAnswer = Read-Host "Which memory backend? [native/mem0]"
@@ -1031,33 +1030,16 @@ function Install-Mem0Extra {
         [Parameter(Mandatory = $true)][string]$PythonExe,
         [Parameter(Mandatory = $true)][string]$SourceDir
     )
-    Write-Info "Installing the mem0 memory backend (mem0ai, fastembed, qdrant)..."
+    Write-Info "Installing the mem0 memory backend (mem0ai, ollama, qdrant)..."
     $result = Invoke-WithTimeout -FilePath $script:UvCmd `
         -Arguments @("pip", "install", "--python", $PythonExe, "-e", "$SourceDir[mem0]") `
         -TimeoutSec $TPip -Activity "Installing the mem0 memory backend"
     if ($result.ExitCode -eq 0) {
         Write-Success "mem0 memory backend installed"
-        # fastembed fetches this on first construction. Doing it here rather than
-        # mid-conversation keeps the first /memory instant -- otherwise the
-        # download fires inside the REPL and floods it with progress bars -- and
-        # lets a machine that is offline later still work.
-        Write-Info "Downloading the mem0 embedding models (~90 MB)..."
-        # Same cache the runtime pins (memory/mem0_store.py). fastembed's own
-        # default is the system temp dir, which Storage Sense clears -- downloading
-        # there would leave the REPL to fetch it all over again. Process-scoped:
-        # the child inherits it, the user's environment is untouched.
-        $env:FASTEMBED_CACHE_PATH = Join-Path $Agent8088Home "fastembed"
-        $modelResult = Invoke-WithTimeout -FilePath $PythonExe `
-            -Arguments @("-c", "from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')") `
-            -TimeoutSec $TMem0Model -Activity "Downloading the mem0 embedding model"
-        if ($modelResult.ExitCode -eq 0) {
-            Write-Success "mem0 embedding model installed"
-        } else {
-            Write-StageWarning -Result $modelResult -TimeoutSec $TMem0Model `
-                -What "mem0 embedding model" `
-                -Consequence "the first /memory call will download it instead" `
-                -Fix "`"$PythonExe`" -c `"from fastembed import TextEmbedding, SparseTextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); SparseTextEmbedding('Qdrant/bm25')`""
-        }
+        # Embeddings are nomic-embed-text on Ollama -- the model the install
+        # already pulls once for native memory -- so there is no second model to
+        # fetch here. Anyone opting out with memory_mem0_embed_provider=fastembed
+        # gets that model downloaded on first use instead.
         return $true
     }
     # Non-fatal on purpose: memory falls back to the native engine, which needs

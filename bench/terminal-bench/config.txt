@@ -1,0 +1,61 @@
+# Agent8088 profile for Terminal-Bench 2.1 under Harbor.
+# Loaded via AGENT8088_CONFIG inside the task container, together with
+# AGENT8088_DISPOSABLE_CONTAINER=1. The Harbor adapter rewrites base_url and
+# model from its --ak options at install time.
+
+# --- Model: Qwen3.8-27B on vLLM (--max-model-len 32768) ---
+default_provider=vllm
+provider.vllm.base_url=http://host.docker.internal:8000/v1
+provider.vllm.model=qwen3.8-27b
+provider.vllm.api_mode=openai
+provider.vllm.api_key_env=OPENAI_API_KEY
+provider.vllm.native_tools=True
+# Must equal vLLM's --max-model-len. Raise both together.
+provider.vllm.context_window=32768
+provider.vllm.max_completion_tokens=8192
+# Sampling pinned to the vLLM server's own defaults on every request: a value
+# agent8088 sends always overrides the server's, so each one is sent
+# explicitly. Thinking on (server runs --reasoning-parser qwen3), top_p/top_k
+# from the model's generation_config.json, penalties at the protocol default 0.
+provider.vllm.extra_body={"chat_template_kwargs": {"enable_thinking": true}, "top_p": 0.95, "top_k": 20, "presence_penalty": 0.0, "frequency_penalty": 0.0}
+model_name=qwen3.8-27b
+model_base_url=http://host.docker.internal:8000/v1
+context_window=32768
+max_completion_tokens=8192
+# The server's --override-generation-config temperature; agent8088's default
+# 0.1 would otherwise override it.
+temperature=0.6
+presence_penalty=0
+frequency_penalty=0
+timeout_seconds=600
+
+# --- Loop ---
+max_turns=150
+dynamic_turns_ceiling_multiplier=1
+# Compact well before prompt + 8192 output reaches 32k.
+compaction_threshold_pct=55
+tool_selection=full
+memory=0
+plan_audit=0
+reuse_known_verdicts=0
+open_code_review_enabled=0
+subagent_max_depth=0
+
+# --- Tools: trimmed list, shell runs directly in the task container ---
+tools_file=/opt/agent8088/bench/tools.txt
+system_file=/opt/agent8088/bench/system.md
+skills_dir=/opt/agent8088/bench/skills
+tool_host.execute_shell=1
+# Defaults only: the Harbor adapter rewrites these per task from its time
+# budget (agent8088_harbor/config_edit.py:budget_edits), together with
+# max_turn_seconds.
+tool_timeout.execute_shell=600
+max_tool_timeout_seconds=1800
+
+# --- Workspace and permissions (container is disposable) ---
+project_root=/app
+shell_cwd=/app
+allowed_paths=/
+ssrf_allow_private=1
+default_permission_mode=full-auto
+cron_mode=approve

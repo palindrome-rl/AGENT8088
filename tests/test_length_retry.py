@@ -569,3 +569,41 @@ def test_cwd_config_isolated_from_global(monkeypatch, tmp_path):
 
     content = local_config.read_text()
     assert "provider.localprov.context_window=200000" in content
+
+
+def _set_limits(monkeypatch, engine, ctx, comp):
+    monkeypatch.setattr(engine, "ACTIVE_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "DEFAULT_PROVIDER", "ollama-cloud")
+    monkeypatch.setattr(engine, "MODEL_NAME", "qwen-small-window")
+    engine.PROVIDERS["ollama-cloud"] = {
+        "model": "qwen-small-window", "context_window": str(ctx),
+        "max_completion_tokens": str(comp),
+    }
+
+
+def _request_tokens(engine, messages, tools, system_prompt, max_tokens):
+    import json
+    prompt = (engine._estimate_context_chars(messages, system_prompt or "")
+              + len(json.dumps(tools or []))) // 4
+    return prompt + max_tokens
+
+
+def test_request_never_exceeds_the_context_window(monkeypatch, engine):
+    """A strict server (vLLM) rejects prompt + max_tokens > max_model_len with a
+    400, which ends the turn. The request must shrink max_tokens to fit."""
+    _set_limits(monkeypatch, engine, 32768, 8192)
+    monkeypatch.setattr(engine, "COMPACTION_THRESHOLD_PCT", 0)  # isolate the clamp
+    seen = []
+
+    def _fake(messages, tools, max_tokens=None, system_prompt=None, **kw):
+        seen.append(_request_tokens(engine, messages, tools, system_prompt, max_tokens))
+        if len(seen) == 1:
+            return _length_response("<think>reasoning forever with no end")
+        return _stop_response("done")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    big = "word " * 8000  # ~10k tokens of history; prompt still fits the window
+    engine.run_agent([{"role": "user", "content": big}], max_turns=5)
+
+    assert len(seen) == 2
+    assert all(total <= 32768 for total in seen), seen

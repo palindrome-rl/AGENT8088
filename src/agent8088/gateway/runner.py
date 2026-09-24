@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import re
+import secrets
 import threading
 import time
 
 from agent8088 import engine as A
 from agent8088.gateway.agent_bridge import run_turn
 from agent8088.gateway.auth import Allowlist
-from agent8088.gateway.platforms.base import MessageEvent
+from agent8088.gateway.platforms.base import MessageEvent, spawn_task
 from agent8088.gateway.session import SessionStore, build_session_key
 
 log = logging.getLogger("agent8088.gateway")
@@ -49,22 +50,36 @@ class _RateLimiter:
         window = [t for t in self._hits.get(user_id, []) if current - t < 60.0]
         if len(window) >= self.per_minute:
             self._hits[user_id] = window
+            self._maybe_prune(current)
             return False
         window.append(current)
         self._hits[user_id] = window
+        self._maybe_prune(current)
         return True
+
+    def _maybe_prune(self, current: float) -> None:
+        # ponytail: a `*` allowlist grows _hits by one entry per new user forever
+        # (audit L3). Prune only past 512 users — O(n) scan, gateway scale.
+        if len(self._hits) <= 512:
+            return
+        self._hits = {u: ts for u, ts in self._hits.items()
+                      if any(current - t < 60.0 for t in ts)}
 
 
 class _PendingApproval:
     """One pending escalation waiting for a chat reply."""
     def __init__(self, chat_id: str, tool_name: str, change_type: str,
-                 session_key: str = "", user_id: str = "", platform: str = ""):
+                 session_key: str = "", user_id: str = "", platform: str = "",
+                 nonce: str = ""):
         self.chat_id = chat_id
         self.tool_name = tool_name
         self.change_type = change_type
         self.session_key = session_key
         self.user_id = user_id
         self.platform = platform
+        # Bound into the button view: a stale Discord view live for 300s must
+        # not resolve the NEXT approval in the same chat (audit M3).
+        self.nonce = nonce
         self.event = threading.Event()
         self.approved = False
         self.session_scope = False  # /approve session → True
@@ -84,6 +99,32 @@ class _PendingPlanApproval:
         self.mode = ""  # "" means still-declined/keep-planning
 
 
+def _dedup_reply(clean: str) -> str:
+    """Collapse model-loop repeats in one reply (audit M4).
+
+    The model (glm-5.2) repeats "I'll create that file for you now." 24x on a
+    single line with no newlines. Two passes: repeated substrings, then
+    consecutive identical lines — but only outside code fences, where three
+    identical log lines are content, not a loop. Consecutive blank lines are
+    kept: collapsing them ate intentional spacing.
+    """
+    fences = []
+    def _stash(m):
+        fences.append(m.group(0))
+        return f"\x00FENCE{len(fences) - 1}\x00"
+    work = re.sub(r"```.*?```", _stash, clean, flags=re.DOTALL)
+    work = re.sub(r'(.{10,80}?)(?:\1){2,}', r'\1', work)
+    deduped = []
+    for line in work.split('\n'):
+        if line.strip() and deduped and deduped[-1].rstrip() == line.rstrip():
+            continue
+        deduped.append(line)
+    out = '\n'.join(deduped).strip()
+    for i, fence in enumerate(fences):
+        out = out.replace(f"\x00FENCE{i}\x00", fence)
+    return out
+
+
 class GatewayRunner:
     def __init__(self, sessions: SessionStore, allowlist: Allowlist):
         self.sessions = sessions
@@ -97,12 +138,27 @@ class GatewayRunner:
         # regardless of which chat it's from. Concurrent turns from different
         # chats would corrupt each other's state.
         self._turn_lock = asyncio.Lock()
+        # Which session key is holding the turn lock right now. /stop needs it
+        # so it interrupts its own chat's turn and never a bystander's (audit M8).
+        self._turn_key = ""
+        # Flagged by /stop; run_agent polls it and raises AgentInterrupted.
+        self._interrupt = threading.Event()
         # Approval routing: (platform, chat_id) → _PendingApproval.
         self._pending_approvals: dict[tuple[str, str], _PendingApproval] = {}
         # Plan-mode approval routing: (platform, chat_id) → _PendingPlanApproval.
         self._pending_plan_approvals: dict[tuple[str, str], _PendingPlanApproval] = {}
         # Session-scoped approvals are bound to the originating session and user.
         self._session_allowlist: set[tuple[str, str, str]] = set()
+        # Per-chat permission mode (audit H3): PERMISSION_MODE is a process
+        # global in the engine, and one allowlisted person flipping it to
+        # full-auto must not silently apply to every other user's turns. The
+        # engine global is (re)applied at the start of each serialized turn,
+        # under the turn lock — never from a slash handler, which may run
+        # concurrently with another chat's in-flight turn.
+        self._default_mode = str(
+            A.APP_CONFIG.get("gateway_permission_mode", "readonly") or "readonly")
+        self._chat_modes: dict[str, str] = {}
+        self._plan_keys: set[str] = set()
         self._rate_limiter = _RateLimiter(
             int(A.APP_CONFIG.get("gateway_rate_limit_per_min", "20")))
 
@@ -142,7 +198,7 @@ class GatewayRunner:
                         text=remaining, attachments=[], thread_id=event.thread_id,
                         raw=event.raw,
                     )
-                    asyncio.create_task(self.on_message(follow_up))
+                    spawn_task(self.on_message(follow_up))
                 return
         key = build_session_key(event.platform, event.chat_type, event.chat_id, event.thread_id)
         async with self._lock:
@@ -163,7 +219,7 @@ class GatewayRunner:
                 next_evt = queued.pop(0)
                 if not queued:
                     del self._pending[key]
-                asyncio.create_task(self.on_message(next_evt))
+                spawn_task(self.on_message(next_evt))
         log.info("turn complete for chat %s (%s)", event.chat_id, event.platform)
 
     async def _run_turn(self, key: str, event: MessageEvent) -> None:
@@ -173,17 +229,7 @@ class GatewayRunner:
             clean = A.strip_tool_json(answer)
             if not clean.strip():
                 return
-            # Deduplicate repeated phrases (model loop within a single response).
-            # The model (glm-5.2) repeats "I'll create that file for you now."
-            # 24x on a single line with no newlines. Collapse to one occurrence.
-            clean = re.sub(r'(.{10,80}?)(?:\1){2,}', r'\1', clean)
-            # Also deduplicate consecutive identical lines
-            lines = clean.split('\n')
-            deduped = []
-            for line in lines:
-                if not deduped or deduped[-1].rstrip() != line.rstrip():
-                    deduped.append(line)
-            clean = '\n'.join(deduped).strip()
+            clean = _dedup_reply(clean)
             if not clean:
                 return
             try:
@@ -214,8 +260,9 @@ class GatewayRunner:
                 return True
 
             approval_key = (event.platform, event.chat_id)
+            nonce = secrets.token_hex(8)
             entry = _PendingApproval(event.chat_id, name, change_type, key, event.user_id,
-                                     event.platform)
+                                     event.platform, nonce)
             self._pending_approvals[approval_key] = entry
             log.info("escalation: sent approval prompt to %s, waiting for /approve or /deny", event.chat_id)
 
@@ -223,7 +270,7 @@ class GatewayRunner:
             try:
                 future = asyncio.run_coroutine_threadsafe(
                     adapter.send_approval_prompt(
-                        event.chat_id, name, reason, paths,
+                        event.chat_id, name, reason, paths, nonce=nonce,
                     ),
                     loop,
                 )
@@ -280,28 +327,52 @@ class GatewayRunner:
             self._pending_plan_approvals.pop(approval_key, None)
             return entry.mode
 
+        restored = ""
         try:
             async with self._turn_lock:
+                self._interrupt.clear()
+                self._turn_key = key
+                # Apply this chat's own permission state (audit H3): the engine
+                # global is process-wide, so it is only safe to touch here, with
+                # the lock held and no other chat's turn in flight.
+                mode = self._chat_modes.get(key, self._default_mode)
+                if A.PERMISSION_MODE != mode:
+                    A.set_permission_mode(mode)
+                if key in self._plan_keys:
+                    A.enter_plan_mode()
                 A._plan_on_approval = _plan_on_approval
                 try:
                     answer = await asyncio.to_thread(
                         run_turn, key, event.text, self.sessions,
                         on_escalation=_on_escalation,
                         platform=event.platform, chat_type=event.chat_type,
+                        user_id=event.user_id,
+                        interrupt_check=self._interrupt.is_set,
                     )
                 finally:
                     A._plan_on_approval = None
+                    self._turn_key = ""
+                    self._interrupt.clear()
+                # Mirrors cli.py's _after_turn_plan_state: an approved plan's
+                # turn just finished, so the session goes back to the mode it
+                # had before /plan. Under the lock — it mutates the same engine
+                # globals the next queued turn is about to apply.
+                restored = A.finish_plan_session()
+                if restored:
+                    self._chat_modes[key] = restored
+                    self._plan_keys.discard(key)
             await _finalize(answer)
-            # Mirrors cli.py's _after_turn_plan_state: an approved plan's turn
-            # just finished, so the session goes back to the mode it had before
-            # /plan / /mode plan-only. No-op if no plan was approved this turn.
-            # Without this the mode picked at approval time (full-auto/readonly)
-            # stuck forever instead of reverting, unlike the CLI.
-            restored = A.finish_plan_session()
             if restored and adapter:
                 try:
                     await adapter.send_message(
                         event.chat_id, f"plan complete — permission mode back to {restored}.")
+                except Exception:
+                    pass
+        except A.AgentInterrupted:
+            log.info("turn interrupted for %s", key)
+            if adapter:
+                try:
+                    await adapter.send_message(event.chat_id, "⏹ Stopped.")
                 except Exception:
                     pass
         except Exception as e:
@@ -320,6 +391,8 @@ class GatewayRunner:
             key = build_session_key(event.platform, event.chat_type, event.chat_id, event.thread_id)
             self.sessions.clear(key)
             self._session_allowlist = {scope for scope in self._session_allowlist if scope[0] != key}
+            self._plan_keys.discard(key)
+            self._chat_modes.pop(key, None)
             if adapter:
                 await adapter.send_message(event.chat_id, "Session cleared.")
             return True
@@ -335,6 +408,14 @@ class GatewayRunner:
         if cmd == "/stop":
             key = build_session_key(event.platform, event.chat_type, event.chat_id, event.thread_id)
             self._pending.pop(key, None)
+            # The in-flight turn holds the global turn lock and never noticed
+            # /stop before — the help text promised an interrupt that never
+            # happened (audit M8). Flag the active turn; run_agent polls it.
+            if self._turn_key == key and not self._interrupt.is_set():
+                self._interrupt.set()
+                if adapter:
+                    await adapter.send_message(event.chat_id, "Stopping the running turn; queued messages cleared.")
+                return True
             if adapter:
                 await adapter.send_message(event.chat_id, "Queued messages cleared.")
             return True
@@ -351,7 +432,15 @@ class GatewayRunner:
                     return True
                 parts = event.text.split(None, 1)
                 arg = parts[1].strip().lower() if len(parts) > 1 else ""
-                plan_entry.mode = "readonly" if arg == "readonly" else "full-auto"
+                # A typo must not silently mean full-auto: reject unknown args
+                # instead of treating everything ≠ "readonly" as full-auto (L1).
+                if arg and arg not in ("readonly", "full-auto"):
+                    if adapter:
+                        await adapter.send_message(
+                            event.chat_id,
+                            f"Unknown option: {arg}\nUsage: /approve [readonly|full-auto]")
+                    return True
+                plan_entry.mode = arg or "full-auto"
                 plan_entry.event.set()
                 if adapter:
                     await adapter.send_message(
@@ -365,6 +454,13 @@ class GatewayRunner:
             if entry.user_id and entry.user_id != event.user_id:
                 if adapter:
                     await adapter.send_message(event.chat_id, "Only the requester may approve this action.")
+                return True
+            # Once resolved, the waiter pops the entry within moments — but in
+            # that window a second /approve then /deny could flip a verdict the
+            # engine already received (audit L11).
+            if entry.event.is_set():
+                if adapter:
+                    await adapter.send_message(event.chat_id, "Already resolved.")
                 return True
             parts = event.text.split(None, 1)
             entry.session_scope = len(parts) > 1 and parts[1].strip().lower() == "session"
@@ -396,6 +492,10 @@ class GatewayRunner:
                 if adapter:
                     await adapter.send_message(event.chat_id, "Only the requester may deny this action.")
                 return True
+            if entry.event.is_set():
+                if adapter:
+                    await adapter.send_message(event.chat_id, "Already resolved.")
+                return True
             entry.approved = False
             entry.event.set()
             if adapter:
@@ -405,15 +505,19 @@ class GatewayRunner:
             # plan-only is deliberately not offered here — /plan is the one
             # door into plan mode (mirrors cli.py's /plan vs /mode split).
             valid = ("readonly", "full-auto")
+            key = build_session_key(event.platform, event.chat_type, event.chat_id, event.thread_id)
             arg = event.text.split(None, 1)
             arg = arg[1].strip().lower() if len(arg) > 1 else ""
             if arg == "edit":
                 arg = "full-auto"
+            current = self._chat_modes.get(key, self._default_mode)
+            if key in self._plan_keys:
+                current = "plan-only"
             if not arg:
                 if adapter:
                     await adapter.send_message(
                         event.chat_id,
-                        f"Current mode: {A.PERMISSION_MODE}\n"
+                        f"Current mode: {current} (this chat)\n"
                         f"Valid modes: {', '.join(valid)}")
                 return True
             if arg not in valid:
@@ -422,18 +526,22 @@ class GatewayRunner:
                         event.chat_id,
                         f"Unknown mode: {arg}\nValid modes: {', '.join(valid)}")
                 return True
-            # Mirrors cli.py's cmd_mode. Switching mode resets any escalation
-            # grant banked under the old mode (engine.py:set_permission_mode).
-            A.cancel_plan_session()
-            A.set_permission_mode(arg)
+            # Per-chat state only (audit H3): the engine global is applied at
+            # the start of this chat's next turn, under the turn lock. Slash
+            # handlers must never touch engine globals — another chat's turn
+            # may be mid-flight under the lock.
+            self._chat_modes[key] = arg
+            self._plan_keys.discard(key)
             if adapter:
-                await adapter.send_message(event.chat_id, f"Permission mode: {arg}")
+                await adapter.send_message(event.chat_id, f"Permission mode: {arg} (this chat)")
             return True
         if cmd == "/plan":
             # Mirrors cli.py's cmd_plan: enter plan mode, then let on_message's
             # existing "text after the command" follow-up (see below) run the
-            # task in the same turn if one was given inline.
-            A.enter_plan_mode()
+            # task in the same turn if one was given inline. Per-chat state
+            # only (audit H3); _run_turn applies it under the turn lock.
+            key = build_session_key(event.platform, event.chat_type, event.chat_id, event.thread_id)
+            self._plan_keys.add(key)
             if adapter:
                 await adapter.send_message(
                     event.chat_id,
@@ -467,21 +575,21 @@ def build_runner() -> GatewayRunner:
             runner.register_adapter(SlackAdapter(config, runner))
         except ImportError:
             log.warning("Slack enabled but slack-bolt not installed. "
-                         "Run: uv pip install -e \".[gateway]\"")
+                        "Run: uv pip install -e \".[gateway]\"")
     if config.get("whatsapp_enabled", "0") in ("1", "true", "True"):
         try:
             from agent8088.gateway.platforms.whatsapp import WhatsAppAdapter
             runner.register_adapter(WhatsAppAdapter(config, runner))
         except ImportError:
             log.warning("WhatsApp enabled but httpx not installed. "
-                         "Run: uv pip install -e \".[gateway]\"")
+                        "Run: uv pip install -e \".[gateway]\"")
     if config.get("discord_enabled", "0") in ("1", "true", "True"):
         try:
             from agent8088.gateway.platforms.discord import DiscordAdapter
             runner.register_adapter(DiscordAdapter(config, runner))
         except ImportError:
             log.warning("Discord enabled but discord.py not installed. "
-                         "Run: uv pip install -e \".[gateway]\"")
+                        "Run: uv pip install -e \".[gateway]\"")
     if config.get("email_enabled", "0") in ("1", "true", "True"):
         try:
             from agent8088.gateway.platforms.email import EmailAdapter

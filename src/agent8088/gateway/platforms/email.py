@@ -48,11 +48,16 @@ _AUTOMATED_HEADERS = ("Auto-Submitted", "Precedence", "X-Auto-Response-Suppress"
 
 
 def _extract_email_address(from_header: str) -> str:
-    """Extract the email address from a From header like 'Name <addr@x.com>'."""
-    if "<" in from_header and ">" in from_header:
-        start = from_header.index("<") + 1
-        end = from_header.index(">", start)
-        return from_header[start:end].strip().lower()
+    """Extract the email address from a From header like 'Name <addr@x.com>'.
+
+    A '>' sitting before the '<' must not crash the batch: index(">", start)
+    raised ValueError on such headers and aborted the whole uid loop (M11).
+    """
+    start = from_header.find("<")
+    if start != -1:
+        end = from_header.find(">", start + 1)
+        if end != -1:
+            return from_header[start + 1:end].strip().lower()
     return from_header.strip().lower()
 
 
@@ -178,7 +183,9 @@ class EmailAdapter(BaseChannelAdapter):
         self._imap_host = A.get_secret(config, "email_imap_host", "EMAIL_IMAP_HOST")
         self._imap_port = int(config.get("email_imap_port") or "993")
         self._running = False
-        self._seen_uids: set = set()
+        # Insertion-ordered dict, not a set: next(iter(set)) evicted an arbitrary
+        # uid under load (audit L12). Oldest uid falls out first now.
+        self._seen_uids: dict = {}
         self._thread_context: dict = {}  # sender → {subject, message_id}
         self._poll_task = None
         self._dispatch_futures: set = set()
@@ -209,14 +216,26 @@ class EmailAdapter(BaseChannelAdapter):
 
     async def _poll_inbox(self) -> None:
         """Poll IMAP for unread messages."""
+        failures = 0
         while self._running:
             try:
                 await asyncio.to_thread(self._check_inbox)
+                failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.debug("Email poll error: %s", e)
-            await asyncio.sleep(POLL_INTERVAL)
+                failures += 1
+                # Failures used to log at debug forever, so a wrong password left
+                # the platform silently dead (audit M10). Warn once it sticks,
+                # and back off instead of hammering a dead server every 15s.
+                if failures >= 3:
+                    logger.warning("Email poll failed %d times in a row (%s)", failures, e)
+                else:
+                    logger.debug("Email poll error: %s", e)
+            delay = POLL_INTERVAL
+            if failures >= 3:
+                delay = POLL_INTERVAL * min(2 ** (failures - 2), 8)
+            await asyncio.sleep(delay)
 
     def _check_inbox(self) -> None:
         """Connect to IMAP, fetch unread messages, dispatch to runner."""
@@ -234,16 +253,27 @@ class EmailAdapter(BaseChannelAdapter):
                 uid = uid_b.decode()
                 if uid in self._seen_uids:
                     continue
-                self._seen_uids.add(uid)
-                if len(self._seen_uids) > SEEN_UID_CAP:
-                    oldest = next(iter(self._seen_uids))
-                    self._seen_uids.discard(oldest)
+                self._seen_uids[uid] = None
+                while len(self._seen_uids) > SEEN_UID_CAP:
+                    self._seen_uids.pop(next(iter(self._seen_uids)))
                 status, msg_data = imap.uid("fetch", uid_b, "(RFC822)")
                 if status != "OK" or not msg_data or not msg_data[0]:
                     continue
                 raw_email = msg_data[0][1]
                 msg = email_lib.message_from_bytes(raw_email)
-                self._process_message(msg)
+                # One message must not be able to abort the batch (audit M11):
+                # a malformed From (or anything else in one email) used to raise
+                # out of the uid loop and silently lose the rest of the inbox.
+                try:
+                    self._process_message(msg)
+                except Exception:
+                    logger.exception("Email: failed to process message uid=%s", uid)
+                # Consume it: UNSEEN search would otherwise re-dispatch the same
+                # mail after every restart (audit L12).
+                try:
+                    imap.uid("store", uid_b, "+FLAGS", "(\\Seen)")
+                except Exception:
+                    pass
         finally:
             try:
                 imap.logout()
@@ -271,7 +301,10 @@ class EmailAdapter(BaseChannelAdapter):
             if not self.runner.allowlist.is_allowed(from_addr, "email"):
                 return
 
-        subject = _decode_header_value(msg.get("Subject", ""))
+        # Collapse to one line: a decoded-word can unpack to embedded \r\n and
+        # a header containing "name:" then makes as_string() raise, which turned
+        # the whole outbound reply into a silent "0" (audit L6).
+        subject = " ".join(_decode_header_value(msg.get("Subject", "")).split())
         message_id = msg.get("Message-ID", "")
         body = _extract_text_body(msg)
         if not body.strip():
@@ -392,9 +425,3 @@ class EmailAdapter(BaseChannelAdapter):
 
     async def on_message(self, event: MessageEvent) -> None:
         await self.runner.on_message(event)
-
-    def supports_streaming(self) -> bool:
-        return False  # email cannot stream
-
-    def streaming_overflow_limit(self) -> Optional[int]:
-        return None
