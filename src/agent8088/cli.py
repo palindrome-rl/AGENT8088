@@ -3068,7 +3068,11 @@ def _detect_pasted_file(line: str):
     return None
 
 
-def _handle_pasted_file(path, question):
+def _handle_pasted_file(path, question, original=None):
+    # `original` is the line as typed. A text file's instruction is that line
+    # with the path still in it: cutting it out turned "grep … artifacts/t.html"
+    # into a grep with no file. Images keep the split — cmd_image gets the path.
+    #
     # Check the sensitive-file floor before touching the file at all, for
     # both branches below — extract_text() has no floor of its own, so
     # skipping this would let a pasted-path .docx read a credential file that
@@ -3095,7 +3099,8 @@ def _handle_pasted_file(path, question):
         except (ValueError, UnicodeDecodeError):
             return False  # not text either — let it fall through as chat
     body = A._paginate_read(text, {}, resolved)
-    instruction = question or f"Here is the content of {resolved.name}."
+    typed = (original or "").strip() if question else ""
+    instruction = typed or question or f"Here is the content of {resolved.name}."
     do_chat(f"{instruction}\n\n{body}")
     return True
 def _cmd_model_auto_setup():
@@ -8093,7 +8098,7 @@ def main():
                 console.print(f"[red]unknown command:[/red] /{cmd}  (try /help)")
             continue
         pasted = _detect_pasted_file(line)
-        if pasted and _handle_pasted_file(*pasted):
+        if pasted and _handle_pasted_file(*pasted, original=line):
             continue
         try:
             do_chat(line)
