@@ -21,7 +21,7 @@
   ```powershell
   $env:AGENT8088_INSTALL_LIBREOFFICE = 'yes'   # or 'no' to skip
   $env:AGENT8088_BRANCH = 'development'
-  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+  iex (irm https://agent8088-installer.pages.dev/install.ps1)
   ```
 
 No admin rights are needed for the base install. WinGet may prompt for
@@ -33,14 +33,14 @@ WinGet's own prompt, not something this installer requests.
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | AGENT8088_BRANCH=development bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
 $env:AGENT8088_BRANCH = 'development'
-iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+iex (irm https://agent8088-installer.pages.dev/install.ps1)
 ```
 
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the

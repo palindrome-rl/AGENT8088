@@ -49,21 +49,14 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | AGENT8088_BRANCH=development bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+$env:AGENT8088_BRANCH = "development"; iex (irm https://agent8088-installer.pages.dev/install.ps1)
 ```
-
-> **Correction.** This previously pointed at `agent8088-installer.pages.dev`, a
-> domain with no corresponding Pages deploy config or CNAME anywhere in this
-> repo. `raw.githubusercontent.com` against the actual `origin` remote
-> (`palindrome-rl/AGENT8088`) is what [Getting
-> Started](docs/wiki/01-getting-started.md) uses and what is verifiable from
-> the tree.
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
