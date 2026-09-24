@@ -4506,6 +4506,51 @@ _STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$)")
 # before the single-character forms. `|` is absent: `_readonly_shell` already
 # decomposes pipelines itself, under its own stricter rules.
 _SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|&|\n")
+# The same, plus `|`, for splitting once quoted operators are masked out.
+_AUDIT_STAGE_SPLIT = re.compile(r"&&|\|\||;|&|\n|\|")
+# `2>&1` / `>&2` point one output stream at another; no file is named.
+_FD_DUPLICATE = re.compile(r"\d?>&\d+\b")
+# A sed script made only of line numbers and p/q/d/= prints; it cannot write,
+# run a command, or read another file (w, W, e, r, R are all letters).
+_SED_PRINT_SCRIPT = re.compile(r"[\d,$;!pqd=\s]+")
+_SED_READ_FLAGS = {"-n", "-E", "-r", "--quiet", "--silent"}
+
+
+def _mask_quoted_operators(command: str):
+    """Replace shell operators inside quotes with '_', keeping every offset.
+
+    `grep -E "a|b" f` has no pipe, and `grep 'x[^<]*' f` no redirect, but the
+    audit predicate's operator checks only see characters. Returns None when a
+    quote never closes: that command cannot be read, so it is not trusted.
+    """
+    out, quote, escaped = [], None, False
+    for char in command:
+        if escaped:
+            escaped = False
+            if quote and char in "|;&<>\n":
+                char = "_"     # "a\|b": still inside the quotes
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+            elif char in "|;&<>\n":
+                char = "_"
+        elif char in "'\"":
+            quote = char
+        out.append(char)
+    return None if quote else "".join(out)
+
+
+def _sed_prints_only(command: str) -> bool:
+    """`sed -n '415,445p' f`: a sed call that can only print lines by number."""
+    parts = _shell_parts(command)
+    if not parts or Path(parts[0]).stem.lower() != "sed":
+        return False
+    flags = [part for part in parts[1:] if part.startswith("-")]
+    operands = [part for part in parts[1:] if not part.startswith("-")]
+    return (bool(operands) and all(flag in _SED_READ_FLAGS for flag in flags)
+            and _SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None)
 
 
 def _shell_call_is_read_only(command: str) -> bool:
@@ -4525,14 +4570,28 @@ def _shell_call_is_read_only(command: str) -> bool:
     requires EVERY segment to satisfy the strict predicate independently — a
     conjunction that can only ever be stricter than the whole-string answer,
     never a way to smuggle a write past the auditor.
+
+    Operators inside quotes are masked first, so a grep pattern like "a|b" or
+    '[^<]*' is not a pipe or a redirect; the mask keeps offsets, so each stage
+    can still be read from the original text. Auditing those reads, plus
+    `sed -n '415,445p'` and `2>&1`, took 144 of a 293-second live run.
     """
     if re.search(r"[`]|\$\(", command):
         return False           # substitution can run anything, anywhere
-    probe = _STDERR_TO_NULL.sub("", command)
+    probe = _mask_quoted_operators(command)
+    if probe is None:
+        return False           # quoting that never closes cannot be read
+    blank = lambda match: " " * len(match.group(0))
+    probe = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe))
+    original = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command))
     if re.search(r"[<>]", probe):
         return False           # a redirection writes a file
-    segments = [part.strip() for part in _SHELL_SEQUENCERS.split(probe)]
-    return bool(segments) and all(part and _readonly_shell(part) for part in segments)
+    bounds = [0] + [edge for m in _AUDIT_STAGE_SPLIT.finditer(probe)
+                    for edge in m.span()] + [len(probe)]
+    stages = [(probe[start:end].strip(), original[start:end].strip())
+              for start, end in zip(bounds[::2], bounds[1::2])]
+    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original))
+               for masked, original in stages)
 
 
 def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
