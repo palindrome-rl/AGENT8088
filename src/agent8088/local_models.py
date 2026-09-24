@@ -537,6 +537,17 @@ def _ollama_request(path: str, method: str = "GET", body: dict | None = None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        # HTTPError subclasses URLError, but it means the daemon answered: a
+        # 404 from /api/delete is "no such model", not "Ollama isn't running".
+        try:
+            detail = json.loads(exc.read() or b"{}").get("error", "")
+        except (ValueError, OSError):
+            detail = ""
+        name = (body or {}).get("model") or (body or {}).get("name") or ""
+        if exc.code == 404 and name:
+            raise OllamaError(f"Model '{name}' is not installed (see /local list).") from exc
+        raise OllamaError(f"Ollama returned HTTP {exc.code}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise OllamaError(_daemon_unreachable_message(host, exc)) from exc
     except json.JSONDecodeError as exc:

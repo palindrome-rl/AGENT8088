@@ -2278,6 +2278,11 @@ def _render_tools_table(show_full: bool = False):
     console.print(t)
 
 
+# Set by the web server while it runs a slash command: {"command": "/memory clear",
+# "yes": True when the user re-sent it with --yes}. None in the terminal.
+WEB_CONFIRM = None
+
+
 def _confirm_destructive(what: str, detail: str = "") -> bool:
     """Ask before an action that discards state the user cannot get back.
 
@@ -2288,9 +2293,18 @@ def _confirm_destructive(what: str, detail: str = "") -> bool:
     Returns True to proceed. Non-interactive sessions proceed without asking —
     there is nobody to ask, and blocking would break scripted use.
     """
+    suffix = f" {detail}" if detail else ""
+    if WEB_CONFIRM is not None:
+        # The web UI has no stdin: console.input() here raised "EOF when reading
+        # a line", so /memory clear, /mcp reload and /local remove could never
+        # run in the browser. Ask for an explicit re-send instead.
+        if WEB_CONFIRM["yes"] or not A.DESTRUCTIVE_CONFIRM:
+            return True
+        console.print(f"{what}{suffix} — this cannot be undone. To go ahead, send: "
+                      f"{WEB_CONFIRM['command']} --yes")
+        return False
     if not A.DESTRUCTIVE_CONFIRM or not sys.stdin.isatty():
         return True
-    suffix = f" {detail}" if detail else ""
     answer = console.input(
         f"[#f5a623]{what}{suffix}[/#f5a623] — this cannot be undone. Continue? [y/N] ")
     return answer.strip().lower() in ("y", "yes")
@@ -2327,7 +2341,7 @@ def cmd_mcp(rest):
         extra = [item for item in extra if item != "--project"]
         config = ({"command": target, "args": extra} if transport == "stdio" else {"url": target} if transport == "http" else None)
         if config is None:
-            console.print("[red]Usage:[/red] /mcp add <name> stdio <command> [args...] [--project] | http <url> [--project]")
+            console.print("[red]Usage:[/red] /mcp add <name> stdio <command> \\[args...] \\[--project] | http <url> \\[--project]")
             return
         try:
             A.MCP_RUNTIME.set_server(name, config, project=project)
@@ -2345,7 +2359,7 @@ def cmd_mcp(rest):
             console.print(f"[red]MCP remove failed:[/red] {exc}")
             return
     elif action not in {"list", "status"}:
-        console.print("[red]Usage:[/red] /mcp [reload|add|remove]")
+        console.print("[red]Usage:[/red] /mcp \\[list|status|reload|add|remove]")
         return
     table = Table(title="MCP Servers", box=box.SIMPLE, title_style="bold #00edff", header_style="bold #00edff", border_style="#0077B6")
     table.add_column("Server", style="#237dd7")
@@ -2364,8 +2378,11 @@ def cmd_skills(rest):
     action = parts[0].lower() if parts else ""
     name = parts[1].strip() if len(parts) > 1 else ""
     if action in {"enable", "disable"}:
+        if not name:
+            console.print(f"[red]usage:[/red] /skills {action} <name>  (see /skills for names)")
+            return
         if name not in A.SKILL_PACKAGES:
-            console.print(f"[red]unknown skill:[/red] {name or '(missing name)'}")
+            console.print(f"[red]unknown skill:[/red] {name}")
             return
         if action == "enable":
             S.disabled_skills.discard(name)
@@ -2565,8 +2582,15 @@ def select_agent(profiles):
     """Interactive arrow-key picker over sub-agent profiles.
     Returns the chosen name, or None on cancel / non-interactive stdin."""
     names = sorted(profiles)
-    if not names or termios is None or not sys.stdin.isatty():
+    if not names or not sys.stdin.isatty():
         return None
+    if termios is None:
+        # Windows has no termios, so this used to return None every time and
+        # bare /agent always printed "cancelled". Use the same picker /models uses.
+        try:
+            return _choice_prompt("Select a sub-agent:", names) or None
+        except (EOFError, KeyboardInterrupt):
+            return None
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     idx = 0
@@ -3255,6 +3279,13 @@ def cmd_model(rest):
     elif arg in ("ornith", "custom", "default"):
         os.environ.pop("USE_GEMMA4", None)
         A.client, A.MODEL_NAME = A.get_client()
+    if arg in ("gemma", "gemma4", "ornith", "default") and A.DEFAULT_PROVIDER:
+        # Legacy aliases only choose a model when no default_provider is set.
+        # Otherwise they re-open the saved default, which /model <provider>
+        # also updates -- say so rather than a bare "switched".
+        console.print(f"[dim]'{arg}' is a legacy alias: with default_provider set it reopens "
+                      f"your saved default ({A.DEFAULT_PROVIDER}). Switch with "
+                      f"/model <provider>[:model].[/dim]")
     elif separator and provider_ref.lower() in A.PROVIDERS:
         A.activate_model(provider_ref.lower(), model_ref)
     else:
@@ -3668,7 +3699,7 @@ def _cmd_local_remove(name: str):
         console.print("[red]usage:[/red] /local remove <model-name>")
         return
     try:
-        if not _confirm_destructive(f"Remove local model '{name}'", name):
+        if not _confirm_destructive(f"Remove local model '{name}'"):
             console.print("[dim]cancelled[/dim]")
             return
     except (EOFError, KeyboardInterrupt):
@@ -4022,6 +4053,11 @@ def cmd_search(rest):
         return
 
     if action == "stop":
+        if not A._docker_available():
+            # Otherwise the raw "failed to connect to the docker API at npipe..."
+            # reached the user for what is simply "nothing to stop".
+            console.print("Nothing to stop: Docker isn't running, so no local SearXNG container is either.")
+            return
         result = searxng_provision.stop()
         console.print(result["detail"] or ("stopped" if result["ok"] else "failed"))
         return
@@ -4185,7 +4221,7 @@ def cmd_audit(rest):
     elif arg in _AUDIT_OFF:
         want = False
     else:
-        console.print("[red]usage:[/red] /audit [on|off]   (no argument shows the "
+        console.print("[red]usage:[/red] /audit \\[on|off]   (no argument shows the "
                       "current setting)")
         return
 
@@ -4664,7 +4700,7 @@ def cmd_compact(rest):
         if keep < 2:
             raise ValueError
     except ValueError:
-        console.print("[red]usage:[/red] /compact [keep>=2]")
+        console.print("[red]usage:[/red] /compact \\[keep>=2]")
         return
     if len(S.messages) <= keep:
         console.print(f"[dim]nothing to compact — {len(S.messages)} messages, keeping {keep}[/dim]")
@@ -4765,7 +4801,7 @@ def cmd_reasoning(rest):
 def cmd_verbose(rest):
     mode = (rest or "").strip().lower() or "on"
     if mode not in {"on", "off", "full"}:
-        console.print("[red]usage:[/red] /verbose [on|off|full]")
+        console.print("[red]usage:[/red] /verbose \\[on|off|full]")
         return
     S.verbose = mode
     if mode == "full" and not S.show_trace:
@@ -4784,7 +4820,7 @@ def cmd_usage(rest):
     mode = (rest or "").strip().lower()
     if mode:
         if mode not in {"off", "tokens", "full"}:
-            console.print("[red]usage:[/red] /usage [off|tokens|full]")
+            console.print("[red]usage:[/red] /usage \\[off|tokens|full]")
             return
         S.usage_mode = mode
         _save_preferences()

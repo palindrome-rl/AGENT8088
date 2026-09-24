@@ -2389,7 +2389,9 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
                                 "result": "plan mode — reads only. Agent8088 will research, propose a "
                                           "plan, and wait for your approval before anything is written or run."})
         return
-    if command.lower() in {"exit"}:
+    # /help lists "/exit, /quit" and the CLI accepts both; /quit used to be
+    # "unknown command" here.
+    if command.lower() in {"exit", "quit"}:
         await ws.send_json({"type": "command_result", "command": command,
                             "result": f"/{command} is CLI-only and does nothing in the browser."})
         return
@@ -2412,7 +2414,9 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
     model_arg = str(args).strip().lower()
     if ((command.lower() == "models" and (not model_arg or model_arg in C.A.PROVIDERS or
                                              model_arg in {"custom", "selfhosted", "self-hosted"})) or
-            (command.lower() == "model" and model_arg == "setup")):
+            (command.lower() == "model" and model_arg in {"setup", "auto setup", "auto-setup"})):
+        # auto setup is an interactive checklist too; run in the browser it
+        # leaked prompt_toolkit's "expecting a Windows console" error.
         await ws.send_json({"type": "command_result", "command": command,
                             "result": "Use Settings → Config → Model Switcher for interactive model selection and setup. "
                                       "You can still switch directly with /model <provider>[:model]."})
@@ -2430,15 +2434,24 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
         from rich.console import Console as RichConsole
         loop = asyncio.get_running_loop()
 
+        # A trailing --yes answers a destructive command's confirmation, which
+        # the browser has no stdin to ask (see cli._confirm_destructive).
+        run_args = str(args).strip()
+        confirmed = run_args == "--yes" or run_args.endswith(" --yes")
+        if confirmed:
+            run_args = run_args[:-len("--yes")].strip()
+
         def _exec_command():
             buf = io.StringIO()
             temp_console = RichConsole(file=buf, force_terminal=False, no_color=True, width=120)
             original_console = C.console
             C.console = temp_console
+            C.WEB_CONFIRM = {"command": f"/{command} {run_args}".strip(), "yes": confirmed}
             try:
-                handler(args)
+                handler(run_args)
             finally:
                 C.console = original_console
+                C.WEB_CONFIRM = None
             return buf.getvalue()
 
         output = await loop.run_in_executor(None, _exec_command)
