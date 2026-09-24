@@ -75,3 +75,33 @@ def test_select_agent_without_termios_uses_the_choice_picker(monkeypatch):
     monkeypatch.setattr(cli, "_choice_prompt", lambda message, choices, default="": choices[1])
     profiles = {"coder": {}, "explore": {}}
     assert cli.select_agent(profiles) == "explore"
+
+
+@pytest.mark.parametrize("provider", ["openai", "custom", "default", "gemma", "ornith"])
+def test_model_switch_never_says_unknown_provider_for_known_names(monkeypatch, provider):
+    """A legacy-alias note was inserted between an if/elif chain's branches,
+    which split the chain: every bare /model <name> printed "unknown provider"
+    (and an unknown one still must), while the switch had already happened."""
+    monkeypatch.setattr(A, "PROVIDERS", {"openai": {"model": "gpt-4o", "api_mode": "openai",
+                                                    "base_url": "http://x"}})
+    monkeypatch.setattr(A, "MODEL_NAME", "gpt-4o")
+    monkeypatch.setattr(A, "DEFAULT_PROVIDER", "")
+    monkeypatch.delenv("USE_GEMMA4", raising=False)
+    monkeypatch.setattr(A, "get_client", lambda *a, **k: ("client", "gpt-4o"))
+    monkeypatch.setattr(A, "activate_model", lambda *a, **k: None)
+    monkeypatch.setattr(A, "_active_model_token_limits", lambda: (32768, 8192))
+    monkeypatch.setattr(cli, "_active_provider_name", lambda: "openai")
+    monkeypatch.setattr(cli, "banner", lambda: None)
+    _, out = _capture(cli.cmd_model, provider)
+    assert "unknown provider" not in out
+    assert "switched" in out
+
+
+def test_model_switch_still_rejects_an_unknown_provider(monkeypatch):
+    monkeypatch.setattr(A, "PROVIDERS", {"openai": {"model": "gpt-4o", "api_mode": "openai",
+                                                    "base_url": "http://x"}})
+    monkeypatch.setattr(A, "_active_model_token_limits", lambda: (32768, 8192))
+    monkeypatch.setattr(cli, "_active_provider_name", lambda: "openai")
+    monkeypatch.setattr(cli, "banner", lambda: None)
+    _, out = _capture(cli.cmd_model, "bogus")
+    assert "unknown provider" in out

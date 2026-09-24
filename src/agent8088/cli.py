@@ -3270,6 +3270,7 @@ def cmd_model(rest):
         console.print(f"Active: [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]  ·  switch with "
                       f"[#237dd7]/model <profile>[:model][/#237dd7]")
         return
+    legacy_alias = arg in ("gemma", "gemma4", "ornith", "default")
     if arg in ("gemma", "gemma4"):
         os.environ["USE_GEMMA4"] = "1"
         A.client, A.MODEL_NAME = A.get_client()
@@ -3279,13 +3280,6 @@ def cmd_model(rest):
     elif arg in ("ornith", "custom", "default"):
         os.environ.pop("USE_GEMMA4", None)
         A.client, A.MODEL_NAME = A.get_client()
-    if arg in ("gemma", "gemma4", "ornith", "default") and A.DEFAULT_PROVIDER:
-        # Legacy aliases only choose a model when no default_provider is set.
-        # Otherwise they re-open the saved default, which /model <provider>
-        # also updates -- say so rather than a bare "switched".
-        console.print(f"[dim]'{arg}' is a legacy alias: with default_provider set it reopens "
-                      f"your saved default ({A.DEFAULT_PROVIDER}). Switch with "
-                      f"/model <provider>[:model].[/dim]")
     elif separator and provider_ref.lower() in A.PROVIDERS:
         A.activate_model(provider_ref.lower(), model_ref)
     else:
@@ -3300,6 +3294,13 @@ def cmd_model(rest):
             console.print(f"[dim]'{arg}' is a permission mode, not a provider — "
                           f"use [/dim][#237dd7]/mode {arg}[/#237dd7][dim].[/dim]")
         return
+    if legacy_alias and A.DEFAULT_PROVIDER:
+        # Legacy aliases only choose a model when no default_provider is set.
+        # Otherwise they re-open the saved default, which /model <provider>
+        # also updates -- say so rather than a bare "switched".
+        console.print(f"[dim]'{arg}' is a legacy alias: with default_provider set it reopens "
+                      f"your saved default ({A.DEFAULT_PROVIDER}). Switch with "
+                      f"/model <provider>[:model].[/dim]")
     active = _active_provider_name()
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]")
     _ctx, _out = A._active_model_token_limits()
