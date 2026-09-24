@@ -415,7 +415,7 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
     prompt = build_prompt(exchange, existing, max_memories=max_per_turn)
 
     raw, usage = completion(prompt)
-    _LAST_CAPTURE.update(usage or {})
+    _LAST_CAPTURE.update(usage or {}, stored=0)
     candidates = parse_response(raw, max_memories=max_per_turn)
     if not candidates:
         if on_stored:
