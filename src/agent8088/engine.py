@@ -11270,15 +11270,14 @@ def _search_was_usable(result: str) -> bool:
 
     An error or an empty result is not an answer; trapping the agent with it
     would be worse than letting it try once more.
+
+    Only web_search.format_results output counts, and it always carries this
+    heading. Anything else — an approval prompt, "Every configured web search
+    provider failed", "No results from ddgs." — used to pass as long as it
+    was not "Error:", so a page fetch after a search that found nothing was
+    refused as "the search already answered this".
     """
-    stripped = (result or "").strip()
-    if not stripped or stripped.startswith("Error:"):
-        return False
-    # Framed results carry a stamp line; a stamp with nothing under it is empty.
-    if stripped.startswith(_SEARCH_STAMP_PREFIX):
-        _stamp, _, body = stripped.partition("]")
-        return bool(body.strip())
-    return True
+    return "Search results (via " in (result or "")
 
 
 def _frame_search_results(results: str, now=None) -> str:
