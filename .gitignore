@@ -82,3 +82,22 @@ tmp/
 
 # Git worktrees (superpowers subagent-driven-development)
 .worktrees/
+
+# Local test-run reports, screenshots and scratch data — generated, not source
+/agent8088-*.md
+/agent8088-*.pdf
+/agent8088_*.md
+/agent8088_dry_run_prompts.py
+/opencode-agent8088-*.md
+/image*.png
+test-screenshots/
+test_mem0_data/
+docs/Agent8088 Scrennshot/
+docs/opencode-test-run*/
+docs/webui-test-manual/screenshots/
+docs/webui-test-manual/playwright-test-results.md
+
+# AI planning docs and one-off audit/live test scripts — not shipped
+.claude/plans/
+docs/superpowers/
+web/tests/audit/
