@@ -67,7 +67,7 @@ artifacts/*
 
 # Claude Code session runtime state (scheduled-wakeup lock, etc.) — not project
 # content, and specific to whichever machine/session created it.
-.claude/*.lock
+.claude/
 
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/
@@ -98,6 +98,8 @@ docs/webui-test-manual/screenshots/
 docs/webui-test-manual/playwright-test-results.md
 
 # AI planning docs and one-off audit/live test scripts — not shipped
-.claude/plans/
 docs/superpowers/
 web/tests/audit/
+
+# Local AI-assistant instructions — not shipped
+CLAUDE.md

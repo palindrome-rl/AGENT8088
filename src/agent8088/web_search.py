@@ -460,8 +460,7 @@ def probe_searxng(ctx: SearchContext, timeout: int = None) -> bool:
 # ddgs — the bundled keyless fallback
 # ---------------------------------------------------------------------------
 # Engine -> every host that engine reaches. Derived from the INSTALLED ddgs
-# package, not from documentation — see .claude/plans/ddgs-engine-hosts.md for the
-# derivation and for three things a guess gets wrong (google/bing/yandex are not
+# package, not from documentation. Three things a guess gets wrong (google/bing/yandex are not
 # registered text engines in 9.x; yahoo also reaches www.bing.com; the previous
 # lite.duckduckgo.com entry is stale).
 #
