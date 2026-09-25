@@ -67,7 +67,7 @@ artifacts/*
 
 # Claude Code session runtime state (scheduled-wakeup lock, etc.) — not project
 # content, and specific to whichever machine/session created it.
-.claude/*.lock
+.claude/
 
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/
@@ -82,3 +82,20 @@ tmp/
 
 # Git worktrees (superpowers subagent-driven-development)
 .worktrees/
+
+# Local test-run reports, screenshots and scratch data — generated, not source
+/agent8088-*.md
+/agent8088-*.pdf
+/agent8088_*.md
+/agent8088_dry_run_prompts.py
+/opencode-agent8088-*.md
+/image*.png
+test-screenshots/
+test_mem0_data/
+docs/Agent8088 Scrennshot/
+docs/opencode-test-run*/
+docs/webui-test-manual/screenshots/
+docs/webui-test-manual/playwright-test-results.md
+
+# Local planning drafts — not shipped
+docs/superpowers/

@@ -131,7 +131,8 @@ did not catch it here. Run the AST check.
 
 - Code-level facts belong in this wiki, kept accurate against the source. Where
   the README drifts, the wiki notes the discrepancy rather than mirroring it.
-- Design records go in `docs/superpowers/specs/`.
+- Record design decisions in the relevant PR; keep enduring implementation
+  facts in this wiki.
 - Update the relevant wiki page in the same PR as the code change.
 
 ### Publishing to the GitHub Wiki tab

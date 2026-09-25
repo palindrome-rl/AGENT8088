@@ -1,7 +1,6 @@
 """A small loopback-only HTTP/CONNECT proxy that runs the same host/IP-based
 SSRF check on every request browser-use's Chromium makes, not just the first
-navigation - see docs/superpowers/specs/2026-08-25-browser-use-integration-design.md
-section 4 for why this exists (browser-use has no page.route()-style hook)."""
+navigation (browser-use has no page.route()-style hook)."""
 import http.client
 import socket
 import struct
