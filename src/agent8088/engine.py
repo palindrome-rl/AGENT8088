@@ -8302,7 +8302,11 @@ def schedule_task(action: str = "list", schedule: str = "", task: str = "") -> d
     action = str(action or "list").strip().lower()
     result = _exec_cron({"action": action, "schedule": schedule, "task": task})
     if action != "list":
-        return {"ok": not result.startswith(("Error:", "Invalid", "Unknown", "Cron unavailable", "Cron error", "Windows scheduler error")),
+        # "Unsupported Windows schedule" and "No matching ..." were missing, so
+        # `/schedule add ... 1-5` on Windows and removing a task that never
+        # existed both printed a green success while nothing happened.
+        return {"ok": not result.startswith(("Error:", "Invalid", "Unknown", "Unsupported", "No matching",
+                                             "Cron unavailable", "Cron error", "Windows scheduler error")),
                 "detail": result, "entries": []}
     entries = []
     for line in result.splitlines():

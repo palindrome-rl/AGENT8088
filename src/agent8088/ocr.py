@@ -8,10 +8,9 @@ Engine choice, recorded here because the trade-offs are not obvious from the
 imports: recognition is RapidOCR on ONNX Runtime, and PDF pages are
 rasterized with pypdfium2. Both are Apache-2.0/BSD, ship as pip wheels with
 no system binary and no second inference server, and add roughly 30MB to an
-install with no torch anywhere in the tree. The alternatives were weighed in
-docs/superpowers/specs/2026-09-09-ocr-for-non-vision-models-design.md -- in
-short, Surya needs vllm or llama.cpp alongside and its weights are not
-redistributable by an MIT project, PyMuPDF is AGPL, and Tesseract would put a
+install with no torch anywhere in the tree. In short, Surya needs vllm or
+llama.cpp alongside and its weights are not redistributable by an MIT project,
+PyMuPDF is AGPL, and Tesseract would put a
 per-OS system binary back into the installer.
 
 Recognition runs out of process for the same reason document extraction does:

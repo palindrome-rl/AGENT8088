@@ -153,8 +153,7 @@ real baseline on your provider before treating that number as a gate.
 
 ## Pre-PR checklist
 
-There is no automated `pr-check` skill in this repo (`.claude/skills/` only
-ships `agent8088-live-testing`). Do this by hand:
+There is no automated `pr-check` skill in this repo. Do this by hand:
 
 1. `git fetch origin` and dry-run the merge for conflicts.
 2. **Run the target branch's baseline first**, in a worktree. Without it you
