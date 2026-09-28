@@ -75,7 +75,7 @@ explicit operational boundaries.
 
 Agent8088 is developed around measured failure modes rather than idealized
 demos. Its reliability work is informed by regression testing, live workflow
-analysis, and the practical limits of small models.
+analysis, academic research and community pain-points.
 
 ---
 
@@ -93,22 +93,28 @@ Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**.
 It reads files, runs tools, researches the web, and edits code through a
 permission system you control. Its goal is not simply to produce an answer,
 but to carry a task through execution, validation, and recovery when something
-goes wrong.
+goes wrong. It is designed around the constraints that make real agent work
+difficult: smaller models, limited context windows, unreliable tools, partial
+results, and the need to prove that a requested outcome was actually produced.
 
 Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
 
 - **Local-first and context-aware.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR, and session history are stored on disk and never uploaded. Context budgeting and compaction help long tasks continue without silently overflowing the model window.
-- **Verification before confidence.** Tool results, tests, expected deliverables, and execution state provide evidence for completion. Recovery paths help the agent retry or surface a clear failure instead of pretending the task succeeded.
+- **Verification before confidence.** Tool results, tests, expected deliverables, and execution state provide evidence for completion. Recovery paths help the agent retry, preserve useful progress, or surface a clear failure instead of pretending the task succeeded.
 - **Guardrails built in.** Shell commands run in a native OS sandbox. Turn on `audit_log=1` and every tool call and approval decision is recorded in `audit.jsonl` in the agent's data folder (normally `~/.agent8088/`). Switch to `readonly` (`--mode readonly`) and writes, network access and shell commands each need your approval. Some safety rules are enforced in code, so a prompt can't switch them off.
 - **One engine, many front ends.** The CLI, the web UI and the messaging gateway (Slack, Discord, WhatsApp, Telegram, email) share one agent loop, one session model and one permission layer.
 - **Open by design.** Works with any OpenAI-compatible provider. It can use external MCP servers and can also serve its own tools over MCP. It supports skills and focused sub-agents, and all settings live in one plain-text config file.
 
 <table>
   <tr>
-    <td align="center" width="25%"><b>🔒 Guardrails built in</b><br><sub>Sandbox, approvals, audit log</sub></td>
-    <td align="center" width="25%"><b>🏠 Local-first</b><br><sub>Ollama, local memory, local OCR</sub></td>
-    <td align="center" width="25%"><b>🧩 Extensible</b><br><sub>MCP, skills, sub-agents</sub></td>
-    <td align="center" width="25%"><b>💬 Everywhere</b><br><sub>CLI, web UI, Slack, Discord, WhatsApp, Telegram, email</sub></td>
+    <td align="center" width="33%"><b>🛡️ Reliable by design</b><br><sub>Recovery, durable progress, context protection</sub></td>
+    <td align="center" width="33%"><b>🔎 Transparent, safe, and controlled</b><br><sub>Permissions, usage visibility, audit trails</sub></td>
+    <td align="center" width="33%"><b>⚙️ Execution grounded</b><br><sub>Structured tools and observable results</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><b>✅ Verification gated</b><br><sub>Tests, deliverable checks, step verification</sub></td>
+    <td align="center" width="33%"><b>🏠 Small-model-first</b><br><sub>Efficient tools, context budgets, local models</sub></td>
+    <td align="center" width="33%"><b>🧩 Extensible</b><br><sub>MCP, skills, sub-agents, gateways</sub></td>
   </tr>
 </table>
 
@@ -119,15 +125,20 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | Capability | What it gives you |
 | --- | --- |
 | **Use the model you want** | 12 built-in provider profiles, local Ollama, OpenRouter, and custom OpenAI-compatible endpoints. Configure fallback models for retryable provider failures. |
+| **Make smaller models practical** | Hardware-aware local-model recommendations, automatic model routing, hybrid tool selection, and on-demand tool schemas reduce unnecessary context and escalate only when a model is genuinely struggling. |
 | **Work safely** | `full-auto` is the default, inside the workspace and the always-on safety floor; switch to `readonly` for per-action approval. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
+| **Verify and recover** | Optional step verification checks mutating work, failed verification can restore the previous file state, and completion checks keep required deliverables from being silently skipped. |
+| **Protect long-running work** | Context budgeting, automatic compaction, content handles, persistent trajectory state, and durable tasks help lengthy workflows retain their instructions and completed progress. |
 | **Delegate without losing context** | Six restricted sub-agent profiles handle exploration, research, coding, test writing, verification, and general-purpose work in separate runs. |
 | **Use tools without lock-in** | Built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, CLI-Anything, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
 | **Read images without a vision model** | Attached screenshots and scanned PDFs are transcribed by a local OCR engine when the active model has no vision of its own. Multimodal models are untouched and keep using their own capability. |
+| **Work across documents** | Read and process PDFs, Word documents, spreadsheets, and presentations, with checkpointed handling for larger files and OCR fallback for scanned content. |
 | **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store. Nothing leaves your machine. |
 | **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
+| **See what the agent is using** | Per-turn token and timing summaries, optional local cost telemetry, provider-limit indicators where supported, and audit logs make resource use and execution visible. |
 
 ---
 
