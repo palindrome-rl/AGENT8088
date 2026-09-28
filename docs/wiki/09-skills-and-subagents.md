@@ -1,0 +1,267 @@
+# Skills & Sub-agents
+
+[← Wiki index](README.md)
+
+Two different extension mechanisms that are easy to confuse:
+
+| | Skills | Sub-agents |
+|---|---|---|
+| What it is | Packaged knowledge + extra tools | A separate agent run with its own context |
+| Cost | Text in the prompt | A whole nested agent loop |
+| Use when | The agent needs to *know* something | You want work done *without* polluting context |
+| Configured in | `skills_dir` packages | `agents_dir` markdown profiles |
+
+---
+
+## Sub-agents
+
+`spawn_subagent(agent_type, task)` runs a nested agent with its own
+conversation, its own turn budget, and a **restricted tool set**. The parent
+gets back only the final answer — intermediate steps never enter its context.
+
+### The 6 bundled profiles
+
+| Profile | Tools | Max turns | For |
+|---|---|---|---|
+| `explore` | `execute_shell`, `read_text`, `repository_read`, `web_search`, `get_page_title`, `last_output` | 6 | Read-only codebase search. No write tool at all. |
+| `researcher` | `web_search`, `get_page_title`, `read_text`, `last_output` | 8 | Web research with citations. No shell. |
+| `coder` | `execute_shell`, `read_text`, `write_file`, `last_output` | 10 | Write code and verify it runs. |
+| `auditor` | `read_text`, `execute_shell`, `last_output` | 6 | Verify a completed step against the environment. Pinned readonly. |
+| `test-writer` | `read_text`, `run_tests`, `write_file`, `edit_file`, `execute_shell`, `last_output` | 12 | Write and run tests for an existing file, via `generate_tests`. Refuses to change the code under test — the file is hashed and checked. |
+| `general-purpose` | `execute_shell`, `read_text`, `write_file`, `web_search`, `get_page_title`, `calculate`, `last_output` | 8 | Mixed multi-step work. |
+
+Note the tool restriction is real isolation, not advice: `explore` has no
+`write_file`, so an explore sub-agent physically cannot write, whatever the
+model decides.
+
+### The permission floor
+
+A profile may add `permission: readonly` to its frontmatter. The sub-run is then
+pinned to readonly for its whole lifetime, whatever mode the caller was in —
+including `full-auto`. `auditor` is the one bundled profile that uses it.
+
+The floor only ever restricts. There is no frontmatter value that grants a
+sub-agent more than the caller already had, so a profile cannot widen its own
+permissions.
+
+It also clears any grant the parent is holding — a one-shot y/n approval, or the
+temporary grant `execute_plan` holds while running an approved plan. That part
+matters more than it looks: without it, an auditor spawned in the middle of an
+approved plan would be running inside the parent's write grant, and an agent
+whose entire contract is "I only observe" could change the thing it was sent to
+inspect.
+
+And a pinned agent is **refused** a mutation rather than offered an escalation.
+Sub-agent escalations do reach the user, so leaving them in place left "this agent
+only observes" as a question someone could answer yes to — about the very file the
+auditor was sent to look at. Only profiles that declare the floor are refused;
+plain readonly mode still escalates, because that prompt *is* the approval flow.
+
+This is why the auditor's read-only-ness is a property of the engine rather than
+of its prompt. `check_permission()` refuses the write; the model is not being
+asked to behave.
+
+### Which model a sub-agent runs on
+
+A sub-agent runs on the **same provider as the session** — it never opens a
+second provider connection, and it cannot mutate the session's active provider
+or model.
+
+Its profile may name a `model:` in frontmatter. That name is checked against the
+live model list the active provider actually publishes:
+
+| `model:` value | Result |
+|---|---|
+| omitted, empty, or `inherit` | Runs on the session's current model. |
+| a model the provider offers | Runs on that model. |
+| a model the provider does not offer | Falls back to the session model, with a warning on the report. |
+| `provider:model` (cross-provider) | Rejected. Falls back to the session model with a warning. |
+
+The fallback is deliberate. A profile pinned to `kimi-k2.6` keeps working after
+you `/model` over to a provider that has never heard of it — you get a warning,
+not a dead sub-agent. Creation is stricter than running: `create_subagent`
+refuses an unavailable model up front (and lists real ones), because at that
+moment the provider is known, whereas at spawn time it may have changed since.
+
+Model discovery is the provider's own `/v1/models`, cached for an hour. If that
+fetch fails, validation is skipped rather than failing closed — a network blip
+must not invalidate a model that is genuinely there.
+
+### Defining your own
+
+Two directories are merged into the available set:
+
+| Directory | Setting | Contents |
+|---|---|---|
+| package `agents/` | `agents_dir` | The bundled profiles. Read-only; replaced on upgrade. |
+| `%LOCALAPPDATA%\agent8088\agents` (POSIX: `~/.agent8088/agents`) | `user_agents_dir` | Your custom profiles. Survives upgrades. |
+
+A user profile **overrides** a bundled one of the same name, so you can shadow
+`coder` without editing the package. The set is re-read on every delegation, so
+a profile written mid-session is usable immediately — no restart.
+
+Markdown with YAML frontmatter:
+
+```markdown
+---
+name: reviewer
+description: Reviews a diff for correctness and flags risky changes.
+tools: read_text, execute_shell, last_output
+max_turns: 8
+model: inherit
+---
+
+You are a code reviewer. Read the diff, then report only defects you can
+point at with a file and line. Do not restate what the code does.
+```
+
+The body becomes the sub-agent's system prompt.
+
+You can also just ask for one in conversation — the agent calls
+`create_subagent`, which validates the name, tools, turn budget and model, and
+writes the profile to `user_agents_dir` for you. It is a normal write: in
+readonly mode it escalates for approval like any other.
+
+### Guardrails
+
+- **Depth-limited** — `subagent_max_depth` prevents a sub-agent spawning an
+  infinite chain of sub-agents. `spawn_subagent` is also stripped from every
+  sub-agent's tool set outright, so the limit is not the only thing holding.
+- **Permission layer still applies** — a sub-agent's `write_file` escalates to
+  the same approval prompt as the parent's would.
+- **Unknown profile falls back** to `default_subagent` rather than erroring.
+- **Tool set is intersected** — a profile can only narrow the available tools,
+  never grant something the parent didn't have.
+- **Bundled names are reserved** — `create_subagent` refuses to overwrite a
+  bundled profile; shadow it with a `user_agents_dir` file instead if you mean to.
+- **Profile fields are sanitized on write** — a `description` cannot contain a
+  line break, so it cannot close the frontmatter block early and smuggle extra
+  instructions into the prompt body or widen the declared tool set.
+
+### From the REPL
+
+`/agent` runs one; `/agents` manages them.
+
+```
+/agent explore <task>    # run one directly (no args opens a picker);
+                         #   the prompt stays on it — /quit returns to 8088,
+                         #   and every task in the loop shares one conversation
+
+/agents                  # list profiles — source, model, tools, and a
+                         #   one-line summary of the provider's models
+/agents models           # every model the active provider offers
+/agents new [name]       # create one interactively
+/agents edit <name>      # open a custom profile in $EDITOR
+/agents delete <name>    # remove a custom profile (bundled ones are refused)
+```
+
+---
+
+## Skills
+
+A skill package bundles instructions, and optionally extra tool definitions,
+that get merged into the agent's context.
+
+### The 39 bundled skills
+
+Verified by counting `src/agent8088/skills_installed/*/` (excluding
+`_references/`). A representative slice — see the directory for the rest,
+covering everything from `api-and-interface-design` to `workspace-engineering`:
+
+| Skill | Category |
+|---|---|
+| `documents` | software-development |
+| `github-pr-workflow` | software-development |
+| `simplify-code` | software-development |
+| `document-to-action-items` | software-development |
+| `grounded-citations` | research |
+| `humanizer` | creative |
+| `spike` | workflow |
+| `browsing` | workflow |
+| `cli-anything` | application-automation |
+| `delegation-and-audit` | harness |
+| `tool-orchestration` | harness |
+| `workspace-engineering` | harness |
+| `test-driven-development` | (uncategorized) |
+| `repository-reading` | (uncategorized) |
+
+Loaded skills appear in the system prompt under `## Installed skills`, and in
+`/status`.
+
+Nearly every bundled skill declares `progressive: true` in its frontmatter.
+Agent8088 initially advertises only their metadata and loads `SKILL.md` or a
+referenced text resource through the path-confined `view_skill` tool when the
+skill is relevant. This prevents a large methodology from consuming context on
+unrelated turns. Disabled skills cannot be loaded through that tool.
+
+### Managing them
+
+```
+/skills                    # list, with enabled/disabled state
+/skills disable plan       # turn one off for this session
+/skills enable plan
+```
+
+Disabled state is saved with a named session, so `/resume` restores it.
+
+### Writing a skill
+
+A directory in `skills_dir` containing `SKILL.md`:
+
+```markdown
+---
+name: my-skill
+description: What this is for and when to use it.
+category: workflow
+---
+
+Instructions the agent should follow when this skill applies.
+```
+
+A skill may also declare extra tools, which are merged into the registry —
+**but skill tools cannot override core tools.** A skill declaring `write_file`
+does not get to replace the real one. A directory without `SKILL.md` is skipped
+rather than erroring.
+
+---
+
+### CLI-Anything
+
+The bundled experimental `cli-anything` skill connects Agent8088 to the HKUDS
+CLI-Anything methodology and catalog. It supports two paths:
+
+1. Discover and run an existing `cli-anything-*` application harness.
+2. Build, refine, test, or validate a new harness when the catalog has no match.
+
+For the first path, Agent8088 lists or searches the official catalog, installs
+one reviewed harness, then loads that package's own `SKILL.md` before invoking
+its structured one-shot command. Harness guidance and output are treated as
+untrusted reference content and cannot override Agent8088's permission layer.
+
+CLI-Hub is created lazily in `integrations/cli-anything` beside Agent8088's
+configuration, not in Agent8088's main virtual environment. Catalog access,
+package changes, harness execution, workspace writes, and host-application
+access continue through Agent8088's normal permission checks.
+
+## SkillOpt
+
+Agent8088 can improve its own skill text through text-space optimisation:
+run a skill, score the outcome, rewrite the instructions, repeat. This is
+"self-improving" in the prompt-engineering sense — it edits skill markdown, not
+model weights. See the SkillOpt section in the top-level `README.md`.
+
+---
+
+## Persona — `USER.md`
+
+`USER.md` is a plain markdown file describing you, injected into the prompt so
+the agent has standing context ("I work in Python", "prefer terse answers").
+
+Two properties worth knowing:
+
+- **Frontmatter is dropped** — only the body is used.
+- **It's framed as data, not instructions.** Content in `USER.md` is presented
+  as facts about the user, so it can't be used to issue commands that bypass the
+  permission layer.
+
+An empty or missing `USER.md` adds nothing — it's entirely optional.

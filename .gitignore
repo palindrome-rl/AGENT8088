@@ -1,0 +1,130 @@
+# A working config at the repository root is always someone's local setup, and
+# the loader reads ./config.txt in preference to the user's own, exclusively.
+# The template to copy from is src/agent8088/config.txt.
+/config.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+.DS_Store
+
+# Environment
+.env
+venv/
+.venv/
+env/
+# Local dev venvs live in the repo root; `venv/` alone does not cover them.
+agent/
+
+# Secrets
+*.key
+*.pem
+*_secret*
+*_password*
+
+# Large files
+*.db
+*.safetensors
+*.bin
+*.gguf
+qwen-tooluse-lora/
+
+# Logs
+*.log
+model-telemetry/
+*.model-telemetry.jsonl
+
+# Generated reports
+output/pdf/
+
+.a8088_verify.png
+traces/
+skillopt_data/
+
+# Local tooling (graphify knowledge graph + opencode config)
+graphify-out/
+.opencode/
+
+# Config snapshots (may contain secrets - never commit)
+backup.txt
+opencode.json
+
+# WhatsApp bridge npm deps
+src/agent8088/gateway/platforms/whatsapp_bridge/node_modules/
+
+# OpenCodeReview npm installation
+code-review/
+
+# Test and run artifacts — generated files never belong in the repo root
+artifacts/*
+!artifacts/.gitkeep
+
+# AGENT8088_HOME pointed in-repo for local testing — config, sessions, memory
+# db, model cache, sandbox state. Local runtime state, never source.
+.agent8088/
+
+# Claude Code session runtime state (scheduled-wakeup lock, etc.) — not project
+# content, and specific to whichever machine/session created it.
+.claude/
+
+# E2E run output (per-scenario logs, summary, PDF) — never committed
+logs/
+
+# Subagent-driven-development scratch workspace (ledgers, briefs, reports) —
+# per-plan working state, not part of the shipped change
+.superpowers/
+
+# Local agent plans and generated artifacts
+.hermes/
+tmp/
+
+# Git worktrees (superpowers subagent-driven-development)
+.worktrees/
+
+# Local test-run reports, screenshots and scratch data — generated, not source
+/agent8088-*.md
+/agent8088-*.pdf
+/agent8088_*.md
+/agent8088_dry_run_prompts.py
+/opencode-agent8088-*.md
+/image*.png
+test-screenshots/
+test_mem0_data/
+docs/Agent8088 Scrennshot/
+docs/opencode-test-run*/
+
+# Local planning drafts — not shipped
+docs/superpowers/
+
+# Staging publishes runtime code without the development-only Python suite.
+# The suite remains tracked on the development branch.
+/tests/
+# Tool caches and coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+# Raw recordings dropped in the repo root (assets/demo.mp4 stays tracked)
+/*.mp4
+/*.mov
+# Env variants
+.env.*
+!.env.example
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+# Web build output
+web/dist/
+
+# Local reference data and manual test plans — not shipped
+docs/webui-test-manual/
+docs/reference/freellm_catalog_*.json

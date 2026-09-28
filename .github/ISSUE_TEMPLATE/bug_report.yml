@@ -1,0 +1,81 @@
+name: Bug report
+description: Something does not work as documented.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please remove API keys,
+        tokens and personal data from anything you paste. Security issues go
+        through [private reporting](https://github.com/palindrome-rl/AGENT8088/security/advisories/new), not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `agent8088 --mode readonly`
+        2. Ask "..."
+        3. See the error
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `agent8088 --version`.
+      placeholder: agent8088 1.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - WSL2
+        - Docker
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it happen?
+      options:
+        - CLI
+        - Web UI
+        - Messaging gateway
+        - MCP server
+        - Installer
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Model provider and model
+      placeholder: ollama:qwen2.5-coder:14b
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or `/dump` output
+      description: Run `/dump` in the CLI to collect a redacted bug-report bundle.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: I removed secrets and personal data from this report.
+          required: true

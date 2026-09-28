@@ -1,0 +1,45 @@
+import { Routes, Route } from 'react-router-dom'
+import { AppLayout } from '@/components/layout/AppLayout'
+import ChatPage from '@/pages/ChatPage'
+import ArtifactsPage from '@/pages/ArtifactsPage'
+import ToolsPage from '@/pages/ToolsPage'
+import SkillsPage from '@/pages/SkillsPage'
+import AgentsPage from '@/pages/AgentsPage'
+import McpPage from '@/pages/McpPage'
+import MemoryPage from '@/pages/MemoryPage'
+import SessionsPage from '@/pages/SessionsPage'
+import ConfigPage from '@/pages/ConfigPage'
+import DoctorPage from '@/pages/DoctorPage'
+import FusionPage from '@/pages/FusionPage'
+import TasksPage from '@/pages/TasksPage'
+import SearchPage from '@/pages/SearchPage'
+import SchedulesPage from '@/pages/SchedulesPage'
+import AppearancePage from '@/pages/AppearancePage'
+import NotFoundPage from '@/pages/NotFoundPage'
+
+export default function App() {
+  return (
+    <Routes>
+      <Route element={<AppLayout />}>
+        <Route path="/" element={<ChatPage />} />
+        <Route path="/artifacts" element={<ArtifactsPage />} />
+        <Route path="/tools" element={<ToolsPage />} />
+        <Route path="/skills" element={<SkillsPage />} />
+        <Route path="/agents" element={<AgentsPage />} />
+        <Route path="/mcp" element={<McpPage />} />
+        <Route path="/memory" element={<MemoryPage />} />
+        <Route path="/sessions" element={<SessionsPage />} />
+        <Route path="/appearance" element={<AppearancePage />} />
+        <Route path="/config" element={<ConfigPage />} />
+        <Route path="/doctor" element={<DoctorPage />} />
+        <Route path="/fusion" element={<FusionPage />} />
+        <Route path="/tasks" element={<TasksPage />} />
+        <Route path="/search" element={<SearchPage />} />
+        <Route path="/schedules" element={<SchedulesPage />} />
+        {/* Inside AppLayout on purpose: an unmatched route still gets the
+            sidebar and status bar, so there is a way back. */}
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
+  )
+}

@@ -1,0 +1,390 @@
+@config "../tailwind.config.ts";
+@import "tailwindcss";
+.chat-markdown p { margin: 0.8em 0; }
+.chat-markdown table { border-collapse: collapse; margin: 1em 0; table-layout: auto; width: 100%; }
+.chat-markdown th, .chat-markdown td { min-width: 0; overflow-wrap: break-word; padding: 0.5em 0.9em; border-bottom: 1px solid #8885; text-align: left; vertical-align: top; }
+.chat-markdown td code { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+.chat-markdown th { background: #8881; font-weight: 600; }
+@media (min-width: 640px) {
+  .chat-markdown th:first-child, .chat-markdown td:first-child { min-width: 7.5rem; }
+  .chat-markdown th:nth-child(3), .chat-markdown td:nth-child(3) { min-width: 6.5rem; }
+}
+.chat-markdown ul { list-style: disc; padding-left: 1.5em; margin: 0.8em 0; }
+.chat-markdown ol { list-style: decimal; padding-left: 1.5em; margin: 0.8em 0; }
+.chat-markdown li { margin: 0.3em 0; }
+.chat-markdown a { color: #237dd7; text-decoration: underline; overflow-wrap: anywhere; }
+.chat-markdown h1, .chat-markdown h2, .chat-markdown h3 { font-weight: 600; margin: 1em 0 0.5em; }
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --brand-primary: #237dd7;
+  --brand-cyan: #00edff;
+  --brand-border: #0077B6;
+  --brand-primary-rgb: 35 125 215;
+  --brand-cyan-rgb: 0 237 255;
+  --brand-border-rgb: 0 119 182;
+  --ambient-primary-rgb: 35 125 215;
+  --ambient-secondary-rgb: 0 237 255;
+
+  /* Semantic surface/text/diff tokens. Light values live on :root; html.dark
+     overrides them below, matching the existing darkMode: 'class' setup.
+     Added alongside the raw zinc-* usage, not replacing it. */
+  --ink: #18181b;
+  --ink-2: #52525b;
+  --ink-3: #a1a1aa;
+  --surface: #ffffff;
+  --field: #f4f4f5;
+  --hover: #f4f4f5;
+  --hover-2: #e4e4e7;
+  --line: #e4e4e7;
+  --green: #1a7f37;
+  --red: #cf222e;
+  --green-tint: rgb(26 127 55 / 0.10);
+  --red-tint: rgb(207 34 46 / 0.10);
+}
+
+html[data-accent='violet'] { --brand-primary: #8b5cf6; --brand-cyan: #d8b4fe; --brand-border: #7c3aed; --brand-primary-rgb: 139 92 246; --brand-cyan-rgb: 216 180 254; --brand-border-rgb: 124 58 237; --ambient-primary-rgb: 139 92 246; --ambient-secondary-rgb: 216 180 254; }
+html[data-accent='ember'] { --brand-primary: #f97316; --brand-cyan: #facc15; --brand-border: #ea580c; --brand-primary-rgb: 249 115 22; --brand-cyan-rgb: 250 204 21; --brand-border-rgb: 234 88 12; --ambient-primary-rgb: 249 115 22; --ambient-secondary-rgb: 250 204 21; }
+html[data-accent='mono'] { --brand-primary: #a1a1aa; --brand-cyan: #f4f4f5; --brand-border: #71717a; --brand-primary-rgb: 161 161 170; --brand-cyan-rgb: 244 244 245; --brand-border-rgb: 113 113 122; --ambient-primary-rgb: 161 161 170; --ambient-secondary-rgb: 244 244 245; }
+html[data-accent='cobalt'] { --brand-primary: #2563eb; --brand-cyan: #60a5fa; --brand-border: #1d4ed8; --brand-primary-rgb: 37 99 235; --brand-cyan-rgb: 96 165 250; --brand-border-rgb: 29 78 216; --ambient-primary-rgb: 37 99 235; --ambient-secondary-rgb: 96 165 250; }
+html[data-accent='rose'] { --brand-primary: #db2777; --brand-cyan: #f9a8d4; --brand-border: #be185d; --brand-primary-rgb: 219 39 119; --brand-cyan-rgb: 249 168 212; --brand-border-rgb: 190 24 93; --ambient-primary-rgb: 219 39 119; --ambient-secondary-rgb: 249 168 212; }
+html[data-accent='forest'] { --brand-primary: #4d7c0f; --brand-cyan: #bef264; --brand-border: #3f6212; --brand-primary-rgb: 77 124 15; --brand-cyan-rgb: 190 242 100; --brand-border-rgb: 63 98 18; --ambient-primary-rgb: 77 124 15; --ambient-secondary-rgb: 190 242 100; }
+html[data-accent='gold'] { --brand-primary: #d97706; --brand-cyan: #fcd34d; --brand-border: #b45309; --brand-primary-rgb: 217 119 6; --brand-cyan-rgb: 252 211 77; --brand-border-rgb: 180 83 9; --ambient-primary-rgb: 217 119 6; --ambient-secondary-rgb: 252 211 77; }
+
+/* Dark mode (default) */
+html.dark {
+  color-scheme: dark;
+
+  /* Diff green and red match the CLI's _DIFF_ADD/_DIFF_DEL so one change
+     reads the same colour in the terminal and the browser. */
+  --ink: #e4e4e7;
+  --ink-2: #a1a1aa;
+  --ink-3: #71717a;
+  --surface: #18181b;
+  --field: #27272a;
+  --hover: #27272a;
+  --hover-2: rgb(63 63 70 / 0.40);
+  --line: #27272a;
+  --green: #3fb950;
+  --red: #f85149;
+  --green-tint: rgb(63 185 80 / 0.14);
+  --red-tint: rgb(248 81 73 / 0.14);
+}
+html.dark body {
+  background: #0a0a0b;
+  color: #e4e4e7;
+}
+
+/* Light mode */
+html:not(.dark) {
+  color-scheme: light;
+}
+html:not(.dark) body {
+  background: #fafafa;
+  color: #18181b;
+}
+
+body {
+  font-family: 'Inter', system-ui, ui-sans-serif, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app-shell { isolation: isolate; filter: contrast(var(--ui-contrast, 1)); }
+.app-shell::before {
+  content: '';
+  position: absolute;
+  inset: -20%;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 20%, rgb(var(--ambient-primary-rgb) / 0.14), transparent 28%),
+    radial-gradient(circle at 82% 72%, rgb(var(--ambient-secondary-rgb) / 0.08), transparent 24%);
+  animation: ambient-drift 18s ease-in-out infinite alternate;
+}
+.app-shell > * { position: relative; z-index: 1; }
+html[data-ui-font='system'] body, html[data-content-font='system'] .chat-markdown { font-family: system-ui, ui-sans-serif, sans-serif; }
+html[data-ui-font='inter'] body, html[data-content-font='inter'] .chat-markdown { font-family: Inter, system-ui, ui-sans-serif, sans-serif; }
+html[data-ui-font='serif'] body, html[data-content-font='serif'] .chat-markdown { font-family: Georgia, ui-serif, serif; }
+html[data-ui-font='mono'] body, html[data-content-font='mono'] .chat-markdown { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+html[data-code-font='system'] :is(code, pre) { font-family: system-ui, ui-sans-serif, sans-serif; }
+html[data-code-font='mono'] :is(code, pre) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+html[data-code-font='serif'] :is(code, pre) { font-family: Georgia, ui-serif, serif; }
+html[data-sidebar-translucent='true'][class~='dark'] [data-sidebar] { background-color: rgb(9 9 11 / 0.72) !important; backdrop-filter: blur(18px); }
+html[data-sidebar-translucent='true']:not(.dark) [data-sidebar] { background-color: rgb(255 255 255 / 0.72) !important; backdrop-filter: blur(18px); }
+@keyframes ambient-drift { from { transform: translate3d(-1%, -1%, 0) scale(1); } to { transform: translate3d(2%, 2%, 0) scale(1.04); } }
+
+/* Beautiful UI — pixel-grid loader */
+.pixel-grid-loader {
+  background-image:
+    linear-gradient(rgba(35, 125, 215, 0.1) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(35, 125, 215, 0.1) 1px, transparent 1px);
+  background-size: 8px 8px;
+  animation: pixel-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pixel-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.8; }
+}
+
+/* Beautiful UI — streaming text cursor */
+.stream-cursor::after {
+  content: '▊';
+  animation: blink 1s step-end infinite;
+  color: var(--brand-cyan);
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* Beautiful UI — shimmer for loading states */
+.shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
+  animation: shimmer 1.8s infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Smooth sidebar transition — Beautiful UI easing */
+.sidebar-transition {
+  transition: width 280ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Fluid message entrance */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.msg-enter {
+  animation: msg-in 0.25s ease-out;
+}
+
+/* User message slide-in from right */
+@keyframes user-msg-in {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.user-msg-enter {
+  animation: user-msg-in 0.2s ease-out;
+}
+
+/* Beautiful UI — pixel-grid loader keyframes */
+@keyframes pixel-on {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 1; }
+}
+
+@keyframes shimmer-text {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Beautiful UI — fade-in for settled text */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Beautiful UI — fade-up for trace rows */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Beautiful UI — spinner for active step */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Beautiful UI — word reveal for streaming text */
+@keyframes word-reveal {
+  from { opacity: 0; filter: blur(4px); }
+  to { opacity: 1; filter: blur(0); }
+}
+
+/* Beautiful UI — pop-in for menus */
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96) translateY(4px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Beautiful UI — equalizer bounce for dictation */
+@keyframes eq-bounce {
+  0%, 100% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1); }
+}
+
+/* Beautiful UI — primitive card padding & footer */
+.primitive-card-pad {
+  padding: 14px 16px 12px;
+}
+.primitive-card-footer {
+  padding: 10px 14px;
+  border-top: 1px solid var(--line, rgba(39, 39, 42, 0.5));
+}
+.primitive-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  padding: 4px;
+  transition: background-color 100ms ease, color 100ms ease;
+}
+
+/* ── Otto — composer mascot ─────────────────────────────── */
+/* One SVG, state-driven via [data-otto] on the root. All color comes from
+ * the accent CSS vars so Otto follows every theme; flat fills only. */
+.otto-arm, .otto-eye, .otto-pupil, .otto-root { transform-box: fill-box; }
+.otto-arm { transform-origin: top center; animation: otto-arm-idle 3.4s ease-in-out infinite; }
+.otto-eye { transform-origin: center; animation: otto-blink 4.6s ease-in-out infinite; }
+.otto-pupil { transform-origin: center; }
+.otto-root { transform-origin: center; animation: otto-bob 3.4s ease-in-out infinite; }
+.otto[data-otto='offline'] { opacity: 0.55; }
+
+.otto[data-otto='thinking'] .otto-root { animation: otto-bob 1.6s ease-in-out infinite; }
+.otto[data-otto='thinking'] .otto-arm  { animation: otto-arm-work 0.9s ease-in-out infinite; }
+.otto[data-otto='thinking'] .otto-pupil { animation: otto-scan 2.4s ease-in-out infinite; }
+
+.otto[data-otto='tool'] .otto-root { animation: otto-reach 1.1s ease-in-out infinite; }
+.otto[data-otto='tool'] .otto-arm  { animation: otto-arm-work 0.6s ease-in-out infinite; }
+.otto[data-otto='tool'] .otto-eye  { animation: otto-focus 1.1s ease-in-out infinite; }
+
+.otto[data-otto='writing'] .otto-root { animation: otto-pulse 1.2s ease-in-out infinite; }
+.otto[data-otto='writing'] .otto-arm  { animation: otto-arm-idle 2.2s ease-in-out infinite; }
+
+.otto[data-otto='approval'] .otto-root { animation: otto-nudge 1.5s ease-in-out infinite; }
+.otto[data-otto='error'] .otto-root    { animation: otto-shake 0.45s ease-in-out infinite; }
+.otto[data-otto='offline'] .otto-root  { animation: otto-sag 2.8s ease-in-out infinite; }
+.otto[data-otto='offline'] .otto-arm   { animation: otto-arm-idle 5.5s ease-in-out infinite; }
+
+@keyframes otto-bob {
+  0%, 100% { transform: translateY(0) scale(1, 1); }
+  50% { transform: translateY(-1.5px) scale(1.02, 0.98); }
+}
+@keyframes otto-arm-idle {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(3deg); }
+}
+@keyframes otto-arm-work {
+  0%, 100% { transform: rotate(-7deg); }
+  50% { transform: rotate(7deg); }
+}
+@keyframes otto-blink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  95% { transform: scaleY(0.08); }
+}
+@keyframes otto-scan {
+  0%, 100% { transform: translateX(-0.9px); }
+  50% { transform: translateX(0.9px); }
+}
+@keyframes otto-focus {
+  0%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(0.55); }
+}
+@keyframes otto-reach {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  40% { transform: translate(-2.2px, -1.6px) rotate(-6deg); }
+}
+@keyframes otto-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.06); }
+}
+@keyframes otto-nudge {
+  0%, 55%, 100% { transform: translateX(0); }
+  10%, 30% { transform: translateX(-1.6px); }
+  20%, 40% { transform: translateX(1.6px); }
+}
+@keyframes otto-shake {
+  0%, 100% { transform: rotate(0deg); }
+  20% { transform: rotate(-5deg); }
+  40% { transform: rotate(4deg); }
+  60% { transform: rotate(-3deg); }
+  80% { transform: rotate(2deg); }
+}
+@keyframes otto-sag {
+  0%, 100% { transform: translateY(0) scale(1, 1); }
+  50% { transform: translateY(1.2px) scale(1.01, 0.97); }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+/* Focus ring — subtle */
+*:focus-visible {
+  outline: 2px solid rgba(35, 125, 215, 0.4);
+  outline-offset: 1px;
+}
+
+/* The composer owns focus feedback as one control; its text area must not
+   receive a second, nested browser-style focus box. */
+.prompt-textarea:focus-visible {
+  outline: none;
+}
+
+html[data-motion='reduced'] * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+@media (prefers-reduced-motion: reduce) { * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; } }
+
+/* Legacy pages predate the dark: variants used by the newer shell. Keep their
+   existing class names usable when the theme is switched to light. */
+html:not(.dark) .bg-zinc-950 { background-color: #ffffff !important; }
+html:not(.dark) .bg-zinc-900 { background-color: #ffffff !important; }
+html:not(.dark) .bg-zinc-800 { background-color: #f4f4f5 !important; }
+html:not(.dark) .bg-zinc-700 { background-color: #e4e4e7 !important; }
+html:not(.dark) .text-zinc-100 { color: #18181b !important; }
+html:not(.dark) .text-zinc-200 { color: #27272a !important; }
+html:not(.dark) .text-zinc-300 { color: #3f3f46 !important; }
+html:not(.dark) .text-zinc-400 { color: #71717a !important; }
+html:not(.dark) .text-zinc-500 { color: #71717a !important; }
+html:not(.dark) .text-zinc-600 { color: #52525b !important; }
+html:not(.dark) .text-brand-cyan { color: #0077b6 !important; }
+html:not(.dark) .border-zinc-800 { border-color: #e4e4e7 !important; }
+html:not(.dark) .border-zinc-700 { border-color: #d4d4d8 !important; }
+html:not(.dark) [class~="bg-zinc-950/50"],
+html:not(.dark) [class~="bg-zinc-950/30"],
+html:not(.dark) [class~="bg-zinc-950/20"],
+html:not(.dark) [class~="bg-zinc-900/50"],
+html:not(.dark) [class~="bg-zinc-900/40"],
+html:not(.dark) [class~="bg-zinc-900/30"],
+html:not(.dark) [class~="bg-zinc-800/60"],
+html:not(.dark) [class~="bg-zinc-800/50"],
+html:not(.dark) [class~="bg-zinc-800/40"],
+html:not(.dark) [class~="bg-zinc-800/20"] { background-color: rgb(244 244 245 / 0.72) !important; }
+html:not(.dark) [class~="border-zinc-800/60"],
+html:not(.dark) [class~="border-zinc-800/70"],
+html:not(.dark) [class~="border-zinc-800/50"] { border-color: rgb(228 228 231 / 0.85) !important; }
+html:not(.dark) [class~="placeholder:text-zinc-600"]::placeholder { color: #a1a1aa !important; }
+html:not(.dark) [class~="bg-zinc-900"][class~="text-white"] { background-color: #18181b !important; }
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The diff chips animate in on every tool result. At one per write that is a
+     lot of motion for anyone who asked the OS for less of it. */
+  [style*="fade-up"], [style*="pop-in"], [style*="fade-in"] { animation: none !important; }
+}

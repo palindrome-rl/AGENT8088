@@ -1,0 +1,129 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent8088"
+version = "1.2.0"
+description = "Agent8088 - Local AI Assistant"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0,<3",
+    "rich>=13.0.0,<16",
+    "InquirerPy>=0.3.4,<1",
+    # 1.26 rather than 1.27: browser-use hard-pins mcp==1.26.0, and a floor of
+    # 1.27 makes the two impossible to install together.
+    "mcp>=1.26,<2",
+    "Pillow>=9,<13",
+    # Both are imported directly by cli.py and were reaching the install only as
+    # transitive dependencies -- prompt_toolkit via InquirerPy, Pygments via
+    # rich. That works until an upstream drops or re-bounds them, and the failure
+    # is silent rather than loud: both call sites fall back on ImportError, so
+    # Tab completion would quietly disappear and every syntax theme would quietly
+    # validate as invalid. Depend on what you import.
+    "prompt_toolkit>=3.0.1,<4",
+    "Pygments>=2.13,<3",
+    # browse_page's engine. Core rather than optional: a browser that may or may
+    # not be there makes the tool's availability a property of how someone
+    # installed rather than of what the product is.
+    "playwright>=1.40,<2",
+    # browser-use requires Python >= 3.11, but this project supports 3.10 (see
+    # requires-python above, and the installers' 3.10 fallback). Without the
+    # marker the whole package becomes uninstallable on 3.10 - pip and uv both
+    # fail to resolve rather than dropping one tool. With it, a 3.10 install
+    # keeps every other tool and browse_page reports what is missing.
+    "browser-use>=0.13,<0.14; python_version >= '3.11'",
+    "litellm>=1,<2",
+    # Keyless web search fallback. web_search must always have a backend needing
+    # no Docker, no API key and no setup, so an unreachable SearXNG still
+    # returns results rather than an error. As an extra that guarantee held only
+    # when the installer's best-effort step happened to succeed, and its failure
+    # was silent: search degraded to having no backend at all, with nothing said.
+    "ddgs>=9,<10",
+    # Document reading and writing. Core for the same reason playwright is: a
+    # user who hands the agent a .xlsx should not have to discover that reading
+    # it depends on which extras their installer happened to complete. .docx and
+    # .pptx are read with stdlib zipfile, so only .xlsx and .pdf reading need a
+    # library -- openpyxl and pypdf are both pure Python. The other three are for
+    # writing, done by generated code through execute_shell (see the `documents`
+    # skill); python-docx and python-pptx pull lxml, which is a C extension but
+    # ships wheels for every desktop platform this project supports.
+    "openpyxl>=3.1,<4",
+    "pypdf>=4,<7",
+    "python-docx>=1.1,<2",
+    "python-pptx>=0.6.23,<2",
+    "reportlab>=4,<5",
+    # RAM probing for check_local_hardware (local_models.py). Was reaching
+    # the install only as a transitive dependency of something else -- same
+    # "depend on what you import" reasoning as prompt_toolkit/Pygments above.
+    "psutil>=5.9,<8",
+    # Optional browser UI backend. Kept in core because --web is a shipped CLI
+    # mode and both installers resolve dependencies from this file.
+    "fastapi>=0.115.0,<1",
+    "uvicorn[standard]>=0.34.0,<1",
+]
+
+[project.optional-dependencies]
+repository = ["gitingest==0.3.1"]
+# repo_map's parser. Optional rather than core, unlike playwright and the
+# document libraries above, because this is the one dependency here that cannot
+# install everywhere: the wheels are manylinux_2_34 (glibc >= 2.34, so not
+# Ubuntu 20.04 and not a manylinux2014 image) with no musl build, so Alpine
+# falls back to compiling from sdist. Making it core would trade installability
+# the product already has for a tool nobody has yet. What made playwright and
+# ddgs core was that their absence degraded silently; this one does not --
+# repo_map names the extra and says to install it.
+repomap = ["tree-sitter-language-pack>=1.20,<2", "tree-sitter>=0.25,<0.27"]
+gateway = ["slack-bolt>=1.18.0,<2", "slack-sdk>=3.23.0,<4", "httpx>=0.24.0,<1", "discord.py>=2.3.0,<3", "python-telegram-bot>=20,<23"]
+# browser and search are now aliases: both packages are core dependencies above.
+# They are kept so `pip install agent8088[browser]` and the installers' existing
+# best-effort steps stay valid instead of erroring on an unknown extra.
+#
+# They were briefly optional so that Termux, whose rolling `pkg install python`
+# lands on brand-new minors and which cannot build ddgs's primp (Rust, no
+# Android wheel), could install the core agent. Termux is no longer a supported
+# target, and optional was the wrong trade for every platform that is: it made
+# browse_page and the keyless search fallback a property of whether a
+# best-effort install step happened to succeed, and both degrade silently.
+browser = ["playwright>=1.40,<2"]
+search = ["ddgs>=9,<10"]
+dev = ["pytest>=7.0.0,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.8,<1", "pip-audit>=2.7,<3"]
+# litellm is now a core dependency above (browse_page's interactive
+# browsing needs it regardless of which provider the main agent loop uses).
+# Kept as an alias, like `browser` and `search` above, so
+# `pip install agent8088[litellm]` stays valid instead of erroring on an
+# unknown extra.
+litellm = ["litellm>=1,<2"]
+# OCR for models without vision. Optional because it is the one part of the
+# runtime a text-only setup never touches, and because onnxruntime has no wheel
+# on every platform this project otherwise installs on -- the installers add it
+# best-effort, and ocr.available() reports the gap instead of raising.
+#
+# rapidocr runs on ONNX Runtime rather than torch or paddle, and pypdfium2
+# rasterizes scanned PDF pages (pypdf extracts text but cannot render). Both
+# are permissively licensed with no system binary, which is why they are here
+# and Surya (restricted weights, needs vllm or llama.cpp alongside), PyMuPDF
+# (AGPL) and Tesseract (per-OS system binary) are not.
+ocr = ["rapidocr>=3,<4", "onnxruntime>=1.17,<2", "pypdfium2>=4,<6"]
+mem0 = ["mem0ai>=0.1.40", "ollama>=0.3.0"]
+
+[project.scripts]
+agent8088 = "agent8088.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "browser_integration: slow end-to-end tests that launch a real headless browser and call a real LLM provider",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent8088"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"assets/palindrome-research-labs.png" = "agent8088/assets/palindrome-research-labs.png"
+"assets/palindrome-research-labs.ansi" = "agent8088/assets/palindrome-research-labs.ansi"
+"src/agent8088/gateway/platforms/whatsapp_bridge/bridge.js" = "agent8088/gateway/platforms/whatsapp_bridge/bridge.js"
+"src/agent8088/gateway/platforms/whatsapp_bridge/package.json" = "agent8088/gateway/platforms/whatsapp_bridge/package.json"
+"src/agent8088/gateway/platforms/whatsapp_bridge/package-lock.json" = "agent8088/gateway/platforms/whatsapp_bridge/package-lock.json"
