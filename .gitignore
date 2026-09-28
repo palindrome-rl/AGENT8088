@@ -94,8 +94,6 @@ test-screenshots/
 test_mem0_data/
 docs/Agent8088 Scrennshot/
 docs/opencode-test-run*/
-docs/webui-test-manual/screenshots/
-docs/webui-test-manual/playwright-test-results.md
 
 # Local planning drafts — not shipped
 docs/superpowers/
@@ -123,3 +121,7 @@ Thumbs.db
 desktop.ini
 # Web build output
 web/dist/
+
+# Local reference data and manual test plans — not shipped
+docs/webui-test-manual/
+docs/reference/freellm_catalog_*.json
