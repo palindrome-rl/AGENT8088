@@ -98,6 +98,31 @@ def test_a_vision_model_gets_no_ocr_and_the_engine_is_never_called(monkeypatch, 
     assert calls == []
 
 
+def test_view_image_refuses_a_sensitive_local_path(engine, tmp_path, monkeypatch):
+    """A local (non-URL) view_image ref must not bypass the sensitive-file
+    floor that other read paths enforce -- it used to build the image
+    message before any such check ran."""
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path / "artifacts")
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    # view_image (mode=image) ships in test-mode-setting/tools.txt, not this
+    # repo's default tools.txt -- register it directly so the branch is
+    # reachable regardless of which tools file is configured.
+    monkeypatch.setitem(engine.TOOL_SPECS, "view_image",
+                        {"mode": "image", "args": ["path"], "path_arg": "path", "timeout": 30})
+    target = tmp_path / "id_rsa"
+    target.write_bytes(b"not actually a key but named like one")
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("build_image_message must not run for a sensitive local path")
+
+    monkeypatch.setattr(engine, "_is_sensitive_path", lambda path: True)
+    monkeypatch.setattr(engine, "build_image_message", _must_not_run)
+    result = engine.run_tool("view_image", {"path": str(target)})
+    assert "sensitive file denied" in result
+    assert not result.startswith(engine._IMAGE_MARKER_PREFIX)
+
+
 def test_a_scanned_pdf_is_ocrd_only_once_extraction_has_come_up_empty(monkeypatch, tmp_path):
     calls = _stub_ocr(monkeypatch)
     monkeypatch.setattr(web, "_vision_capable_probed", lambda: False)

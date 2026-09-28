@@ -18,20 +18,33 @@ ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "test-mode-setting"
 sys.path.insert(0, str(BENCH))
 
-from agent8088_harbor.config_edit import budget_edits, config_edit_command  # noqa: E402
+import json  # noqa: E402
+
+from agent8088_harbor.config_edit import (  # noqa: E402
+    SHELL_TIMEOUT_SENTENCE, budget_edits, config_edit_command, tools_description_command,
+    trace_token_totals)
 
 
 def test_budget_edits_size_timeouts_to_the_task():
-    short = budget_edits(855)    # a 900 s task
-    assert short == {"max_turn_seconds": "795", "max_tool_timeout_seconds": "735",
+    short = budget_edits(880)    # a 900 s task
+    assert short == {"max_turn_seconds": "865", "max_tool_timeout_seconds": "760",
                      "tool_timeout.execute_shell": "300"}
 
-    long = budget_edits(1755)    # an 1800 s task
+    long = budget_edits(1780)    # an 1800 s task
     assert long["tool_timeout.execute_shell"] == "600"
     # Sampling is fixed in config.txt, never varied per task.
     assert not {"temperature", "provider.vllm.extra_body"} & set(long)
 
     assert budget_edits(0) == {}
+
+
+def test_trace_token_totals_sum_the_turns():
+    data = {"trace": [{"usage": {"input_tokens": 100, "output_tokens": 20}},
+                      {"usage": None},
+                      {"usage": {"input_tokens": 50, "output_tokens": 5}}]}
+    assert trace_token_totals(data) == (150, 25)
+    assert trace_token_totals({"trace": [{"steps": []}]}) is None   # older agent8088
+    assert trace_token_totals({"messages": [], "trace": []}) is None
 
 
 def test_config_edit_replaces_keys_and_keeps_the_rest(tmp_path):
@@ -90,7 +103,37 @@ def test_launcher_budget_stops_the_agent_and_exits_zero(tmp_path):
         pytest.skip("coreutils timeout not installed on this host")
     result, _ = _launcher(tmp_path, "sleep 30\n", budget=2)
     assert result.returncode == 0
-    assert "stopped at the 2s budget" in result.stdout
+    assert "stopped at the 2s budget (watchdog)" in result.stdout
+    record = json.loads((tmp_path / "logs" / "agent8088-exit.json").read_text())
+    assert record["stopped_by"] == "watchdog" and record["exit_code"] == 124
+    assert record["end_reason"] == "watchdog"
+    assert record["budget_sec"] == 2 and record["elapsed_sec"] >= 2
+
+
+def _exit_record(tmp_path):
+    return json.loads((tmp_path / "logs" / "agent8088-exit.json").read_text())
+
+
+def test_launcher_records_a_normal_finish(tmp_path):
+    result, _ = _launcher(tmp_path, 'echo "[agent8088] run ended: answered"\n', budget=30)
+    assert result.returncode == 0 and "stopped at the" not in result.stdout
+    record = _exit_record(tmp_path)
+    assert record["exit_code"] == 0 and record["stopped_by"] == "none"
+    assert record["end_reason"] == "answered"
+
+
+def test_launcher_reports_the_agents_own_time_stop_as_a_budget_stop(tmp_path):
+    result, _ = _launcher(tmp_path, 'echo "[agent8088] run ended: time_budget"\n', budget=30)
+    assert result.returncode == 0
+    assert "stopped at the 30s budget (self)" in result.stdout
+    assert _exit_record(tmp_path)["stopped_by"] == "self"
+
+
+def test_launcher_records_a_model_error_without_calling_it_a_timeout(tmp_path):
+    result, _ = _launcher(tmp_path, 'echo "[agent8088] run ended: model_error"\n', budget=30)
+    assert "stopped at the" not in result.stdout
+    record = _exit_record(tmp_path)
+    assert record["end_reason"] == "model_error" and record["stopped_by"] == "none"
 
 
 def test_launcher_propagates_real_failures(tmp_path):
@@ -112,13 +155,105 @@ def test_run_script_invokes_harbor_per_task_with_its_budget(tmp_path):
     calls = tmp_path / "calls.txt"
     (bindir / "harbor").write_text(f'#!/bin/bash\necho "$@" >> {calls}\n', encoding="utf-8")
     (bindir / "harbor").chmod(0o755)
+    # The docker-access guard must not depend on the test host: fake a working
+    # daemon so run.sh takes neither the sg re-exec nor the exit-3 path.
+    (bindir / "docker").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    (bindir / "docker").chmod(0o755)
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
     subprocess.run(["bash", str(BENCH / "run.sh"), "--tb", str(tmp_path / "tb"), "--wheel", str(wheel),
                     "--tasks", str(tasks), "--base-url", "http://gpu:8000/v1"],
                    check=True, env=env, capture_output=True, text=True, timeout=60)
     lines = calls.read_text().splitlines()
     assert len(lines) == 2
-    assert "-i fix-git" in lines[0] and "budget_sec=855" in lines[0]
-    assert "-i mailman" in lines[1] and "budget_sec=1755" in lines[1]
-    assert all("-n 1" in line and "base_url=http://gpu:8000/v1" in line for line in lines)
+    assert "-i fix-git" in lines[0] and "budget_sec=880" in lines[0]
+    assert "-i mailman" in lines[1] and "budget_sec=1780" in lines[1]
+    # Every Harbor timeout multiplier stays at its default 1.0 (Terminus-2/Pi parity).
+    assert not any("multiplier" in line for line in lines)
+    assert all("-n 1" in line and "base-url" not in line and "http://gpu:8000/v1" in line for line in lines)
     assert all(f"wheel_path={wheel}" in line for line in lines)
+
+
+def test_run_script_extra_compose_replaces_the_default(tmp_path):
+    tb = tmp_path / "tb" / "tasks"
+    tb.mkdir(parents=True)
+    (tb / "fix-git").mkdir()
+    (tb / "fix-git" / "task.toml").write_text("[agent]\ntimeout_sec = 900.0\n", encoding="utf-8")
+    tasks = tmp_path / "tasks.txt"
+    tasks.write_text("fix-git\n", encoding="utf-8")
+    wheel = tmp_path / "agent8088-0-py3-none-any.whl"
+    wheel.write_text("", encoding="utf-8")
+    custom = tmp_path / "host-network.yaml"
+    custom.write_text("services:\n  main:\n    network_mode: host\n", encoding="utf-8")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls.txt"
+    (bindir / "harbor").write_text(f'#!/bin/bash\necho "$@" >> {calls}\n', encoding="utf-8")
+    (bindir / "harbor").chmod(0o755)
+    (bindir / "docker").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    (bindir / "docker").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    subprocess.run(["bash", str(BENCH / "run.sh"), "--tb", str(tmp_path / "tb"), "--wheel", str(wheel),
+                    "--tasks", str(tasks), "--extra-compose", str(custom)],
+                   check=True, env=env, capture_output=True, text=True, timeout=60)
+    line = calls.read_text().splitlines()[0]
+    assert f"--extra-docker-compose {custom}" in line
+    assert "host-gateway.compose.yaml" not in line
+
+
+def test_tasks_file_lists_all_89_tasks():
+    """The full Terminal-Bench 2.1 run set: 89 unique task names."""
+    names = [ln.strip() for ln in (BENCH / "tasks.txt").read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    assert len(names) == 89, len(names)
+    assert len(set(names)) == 89
+
+
+def test_run_script_reports_harbor_failures_after_running_every_task(tmp_path):
+    tb = tmp_path / "tb" / "tasks"
+    for name in ("fix-git", "mailman"):
+        (tb / name).mkdir(parents=True)
+        (tb / name / "task.toml").write_text("[agent]\ntimeout_sec = 900.0\n", encoding="utf-8")
+    tasks = tmp_path / "tasks.txt"
+    tasks.write_text("fix-git\nmailman\n", encoding="utf-8")
+    wheel = tmp_path / "agent8088-0-py3-none-any.whl"
+    wheel.write_text("", encoding="utf-8")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls.txt"
+    (bindir / "harbor").write_text(f'#!/bin/bash\necho "$@" >> {calls}\nexit 7\n', encoding="utf-8")
+    (bindir / "harbor").chmod(0o755)
+    (bindir / "docker").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    (bindir / "docker").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    result = subprocess.run(["bash", str(BENCH / "run.sh"), "--tb", str(tmp_path / "tb"),
+                             "--wheel", str(wheel), "--tasks", str(tasks)],
+                            env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 1
+    assert len(calls.read_text().splitlines()) == 2        # both tasks still ran
+    assert "failed for 2 task(s): fix-git mailman" in result.stderr
+
+
+def test_launcher_copies_agent8088s_internal_log_even_after_a_watchdog_stop(tmp_path):
+    if subprocess.run(["bash", "-c", "command -v timeout"], capture_output=True).returncode:
+        pytest.skip("coreutils timeout not installed on this host")
+    body = ('mkdir -p "$AGENT8088_HOME/logs"; echo \'{"msg": "auto-compacted"}\' '
+            '> "$AGENT8088_HOME/logs/agent8088-2026-09-26.log"; sleep 30\n')
+    result, _ = _launcher(tmp_path, body, budget=2)
+    assert "stopped at the 2s budget (watchdog)" in result.stdout
+    copied = tmp_path / "logs" / "agent8088-internal-logs" / "agent8088-2026-09-26.log"
+    assert "auto-compacted" in copied.read_text()
+
+
+def test_tools_txt_states_the_tasks_real_shell_timeouts(tmp_path):
+    shipped = (BENCH / "tools.txt").read_text(encoding="utf-8")
+    # The adapter rewrites this exact sentence; if it drifts, the rewrite would no-op.
+    assert SHELL_TIMEOUT_SENTENCE in shipped
+    tools = tmp_path / "tools.txt"
+    tools.write_text(shipped, encoding="utf-8")
+    subprocess.run(["bash", "-c", tools_description_command(str(tools), 880)], check=True)
+    text = tools.read_text(encoding="utf-8")
+    assert "up to 760) for installs, builds and long runs; the default is 300." in text
+    assert SHELL_TIMEOUT_SENTENCE not in text
+    others = lambda t: [l for l in t.splitlines() if not l.startswith("execute_shell|")]  # noqa: E731
+    assert others(text) == others(shipped)
+    assert tools_description_command(str(tools), 0) == "true"      # no budget: unchanged

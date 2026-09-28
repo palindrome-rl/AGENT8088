@@ -379,6 +379,15 @@ MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
 TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
 CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
+# Characters per token for the context-size estimate. 4 suits English prose on
+# OpenAI tokenizers; code, JSON and the Qwen tokenizer run nearer 3 (measured
+# 2.9-3.3 on Terminal-Bench conversations). Over-estimating the free space ends
+# in the server's "maximum context length" rejection, which ends the turn.
+CHARS_PER_TOKEN = max(1.0, float(APP_CONFIG.get("chars_per_token", "4")))
+# Characters of one tool result shown to the model before it is cut (the rest
+# stays reachable through read_content). 3,000 by default; a benchmark profile
+# can match the output window of the agents it is compared with.
+TOOL_RESULT_MAX_CHARS = max(500, int(APP_CONFIG.get("tool_result_max_chars", "3000")))
 # Not clamped to CONTEXT_WINDOW here -- that constant is only the *global*
 # fallback context, not the active model's real one. _active_model_token_limits
 # already does min(completion, context) against each call's actual resolved
@@ -408,6 +417,10 @@ MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds",
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = int(APP_CONFIG.get("max_turn_seconds", "0"))
+# Ceiling for the larger request a length cut-off earns (the retry otherwise
+# doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
+# at one output limit sets it to that limit.
+LENGTH_RETRY_MAX_TOKENS = max(0, int(APP_CONFIG.get("length_retry_max_tokens", "0")))
 PLAN_MODE_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("plan_mode_timeout_seconds", "300")))
 PLAN_MODE_RETRY_LIMIT = max(1, int(APP_CONFIG.get("plan_mode_retry_limit", "2")))
 MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
@@ -794,6 +807,9 @@ def last_audit_share() -> float:
     """Verification's share of the last completed turn's tokens, 0.0 if none."""
     return _last_audit_share
 _active_budget = None  # set by run_agent so subagents/plan steps share the ceiling
+# The outermost turn's budget, kept after the turn ends so its token totals
+# can still be read (turn_usage) once _active_budget has been restored.
+_outer_turn_budget = None
 # Which role is spending right now: "main", or "subagent:<type>". Verification is
 # not free — published figures put auditors at 19-38% of harness tokens — and a
 # cost you cannot see is a cost you cannot decide about. Both the turn budget and
@@ -2016,7 +2032,7 @@ def _finish_interrupt_watcher(stop, watcher):
 def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                       temperature=0.1, on_token=None, interrupt_check=None,
                       model_name: str = "", provider_name: str = "",
-                      telemetry_attempt: str = "direct"):
+                      telemetry_attempt: str = "direct", thinking=None):
     """Create one model response and record metadata-only local telemetry."""
     started = time.monotonic()
     selected_model = model_name or MODEL_NAME
@@ -2030,7 +2046,7 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         response = _create_completion(
             client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
             temperature=temperature, on_token=observe_token if on_token else None, interrupt_check=interrupt_check,
-            model_name=selected_model, provider_name=provider,
+            model_name=selected_model, provider_name=provider, thinking=thinking,
         )
     except Exception as exc:
         _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
@@ -2191,7 +2207,8 @@ def _resolve_temperature(provider_name: str, temperature: float) -> float:
 
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
-                       model_name: str = "", provider_name: str = "", _skip_optional=False):
+                       model_name: str = "", provider_name: str = "", _skip_optional=False,
+                       thinking=None):
     selected_model = model_name or MODEL_NAME
     full_messages = _normalised_messages(system_prompt or current_system_prompt(), messages)
     temperature = _resolve_temperature(provider_name, temperature)
@@ -2252,6 +2269,15 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     # Some OpenAI-compatible layers accept reasoning_effort, others 400 on the
     # unknown field — retry clean once on that specific rejection.
     extra_body = _provider_extra_body(provider_name)
+    if thinking is False:
+        # A summary call must not spend its whole budget reasoning and come
+        # back empty: force the template's thinking switch off and drop the
+        # effort dial, without touching the provider's normal requests.
+        extra_body = dict(extra_body or {})
+        template_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+        template_kwargs["enable_thinking"] = False
+        extra_body["chat_template_kwargs"] = template_kwargs
+        extra_body.pop("reasoning_effort", None)
     if extra_body and not _skip_optional:
         request_options["extra_body"] = extra_body
     _raise_if_interrupted(interrupt_check)
@@ -2316,7 +2342,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 client, messages, tools, max_tokens=max_tokens,
                 system_prompt=system_prompt, temperature=temperature,
                 on_token=on_token, interrupt_check=interrupt_check,
-                model_name=model_name, provider_name=provider_name, _skip_optional=True)
+                model_name=model_name, provider_name=provider_name, _skip_optional=True,
+                thinking=thinking)
         raise
     collected, tool_chunks, finish_reason = [], {}, None
     stream_usage = None
@@ -3970,6 +3997,32 @@ def _non_interactive_env() -> dict:
     return env
 
 
+# Commands whose exit is being waited for right now. Each runs in its own
+# session, so a signal to this process never reaches them; a harness stopping
+# the run kills them explicitly (kill_running_commands) so they cannot keep
+# running while the task is graded. A background child a finished command left
+# behind (`server &`) is not in here and is left alone.
+_RUNNING_COMMANDS = set()
+_RUNNING_COMMANDS_LOCK = threading.Lock()
+
+
+def kill_running_commands() -> int:
+    """SIGKILL the process group of every command still being waited for."""
+    with _RUNNING_COMMANDS_LOCK:
+        running = list(_RUNNING_COMMANDS)
+    killed = 0
+    for process in running:
+        try:
+            if sys.platform == "win32":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return killed
+
+
 def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     kwargs = {
         "shell": shell,
@@ -4013,6 +4066,8 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
 
         reader = threading.Thread(target=drain, daemon=True)
         reader.start()
+        with _RUNNING_COMMANDS_LOCK:
+            _RUNNING_COMMANDS.add(process)
         try:
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -4025,6 +4080,9 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
             _kill_detached_process(process)
             reader.join(timeout=2)
             raise
+        finally:
+            with _RUNNING_COMMANDS_LOCK:
+                _RUNNING_COMMANDS.discard(process)
         # bash has exited. A background child (`server &`) that inherited stdout
         # keeps the pipe open, and an unbounded join waited for that child to
         # exit -- forever, for a server. Give trailing output a moment, then
@@ -4300,6 +4358,34 @@ _MISSING_BINARY_MARKERS = (
     "is not recognized as an internal or external command",
     "no such file or directory",
 )
+
+
+# What bash/dash print when the program itself is missing:
+#   bash: line 1: xxd: command not found      /bin/sh: 1: xxd: not found
+_SHELL_NOT_FOUND = re.compile(
+    r"^\S*sh(?:: line \d+|: \d+)?: (?P<prog>[^\s:]+): (?:command )?not found\s*$", re.M)
+
+
+def _shell_missing_program_note(result: str) -> str:
+    """A shell command's output, unchanged, plus a note for programs the shell
+    itself could not find.
+
+    Shell commands used to go through _missing_binary_hint, which REPLACED the
+    whole output with "'<first word>' is not available" whenever "No such file
+    or directory" or "status 127" appeared anywhere. A missing data file, a
+    failed compile or `cd dir && ./prog` then came back as "'cd'/'mkdir' is not
+    available", and the real output -- usually the error the model needed --
+    was lost. The program is now named from the shell's own "not found" line,
+    and nothing the command printed is dropped.
+    """
+    text = result or ""
+    programs = list(dict.fromkeys(m.group("prog") for m in _SHELL_NOT_FOUND.finditer(text)))
+    if not programs:
+        return result
+    names = ", ".join(f"'{p}'" for p in programs)
+    verb = "is" if len(programs) == 1 else "are"
+    return (f"{text}\n[note: {names} {verb} not installed where this command ran "
+            "(the shell reported 'command not found'); install it or use another tool]")
 
 
 def _missing_binary_hint(program: str, result: str) -> str:
@@ -8402,7 +8488,7 @@ def _run_repo_map_tool(args: dict) -> str:
     # than being added on top of it.
     try:
         rendered = repomap.build_map(
-            PROJECT_ROOT, budget_tokens=max(1, budget - len(header) // 4), focus=focus,
+            PROJECT_ROOT, budget_tokens=max(1, budget - _estimate_tokens(len(header))), focus=focus,
             detail_level=detail_level)
     except repomap.RepoMapUnavailable as exc:
         return efficiency.tool_error(
@@ -8958,6 +9044,38 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         except (OSError, ValueError) as exc:
             return efficiency.tool_error("repository_read_failed", str(exc),
                 "Check source, filters, dependency installation and permissions; retry overview after changes.", recoverable=True)
+
+    # --- Layer 0: images (#21) ---
+    # Attaches a local or remote image to the next model message. The tool
+    # result itself is a marker; the agent loop swaps it for the real
+    # multimodal message (see _IMAGE_MARKER_PREFIX), so the image never
+    # reaches non-vision UIs as base64 text.
+    if mode == "image":
+        ref = str(args.get("path") or "").strip()
+        if not ref:
+            return _tool_arg_missing_error(name, "path")
+        if not re.match(r"^https?://", ref, re.IGNORECASE):
+            try:
+                resolved_ref = resolve_user_path(ref)
+            except ValueError as exc:
+                return f"Error: {exc}"
+            if _is_sensitive_path(str(resolved_ref)):
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=str(resolved_ref), reason="sensitive_path")
+                return f"Error: Access to sensitive file denied: {resolved_ref}"
+        try:
+            message = build_image_message(
+                f"Tool result ({name}): {ref} is attached to this message.",
+                [ref])
+        except ValueError as exc:
+            return efficiency.tool_error("image_unavailable", str(exc),
+                "Check the path, the file type (png/jpg/gif/webp/bmp) and the "
+                "size limit, then retry.", recoverable=True)
+        except Exception as exc:  # provider/encoding refusal
+            return efficiency.tool_error("image_failed", str(exc),
+                "The image could not be attached for this model.", recoverable=True)
+        import json as _json
+        return _IMAGE_MARKER_PREFIX + _json.dumps({"message": message})
 
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
@@ -9605,8 +9723,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return _exec_structured_tool(name, args, timeout)
         command = _format_with_args(spec.get("command") or "{command}", args)
         if spec.get("host"):
-            result = _missing_binary_hint(
-                command.split()[0] if command.split() else "",
+            # Never replace a shell command's output (see _shell_missing_program_note).
+            result = _shell_missing_program_note(
                 _exec_process(command, timeout=timeout, shell=True))
         else:
             result = _exec_shell_command(
@@ -10555,7 +10673,7 @@ def _model_usage(response) -> tuple[dict, str]:
     choices = getattr(response, "choices", ()) or ()
     message = getattr(choices[0], "message", None) if choices else None
     content = getattr(message, "content", "") or ""
-    return {"input_tokens": None, "output_tokens": len(content) // 4}, "output_estimate"
+    return {"input_tokens": None, "output_tokens": _estimate_tokens(len(content))}, "output_estimate"
 
 
 def _stable_prefix_hash(prompt: str, tools, model: str = "") -> str:
@@ -10712,6 +10830,12 @@ def _document_timeout_message(output_tokens: int, timeout_seconds: int) -> str:
 
 
 _FALLBACK_EXCERPT_CHARS = 1800
+
+
+def _model_error_step(turn, error) -> dict:
+    """Trace step for a model call that failed for good (after any retries)."""
+    return {"turn": turn, "type": "model_error",
+            "error_type": type(error).__name__, "detail": str(error)[:500]}
 
 
 def _fallback_answer(last_tool_output: str, error) -> str:
@@ -11724,7 +11848,7 @@ class _TurnBudget:
                             getattr(usage, "completion_tokens", 0))
             return
         if text:
-            self.add_tokens(0, len(text) // 4)
+            self.add_tokens(0, _estimate_tokens(len(text)))
 
     @property
     def total_tokens(self) -> int:
@@ -11750,6 +11874,18 @@ class _TurnBudget:
             return (f"Turn budget exceeded: ${self.cost_usd:.4f} spent "
                     f"(limit ${self.max_cost:.4f}). Raise max_turn_cost_usd in config.txt.")
         return None
+
+
+def turn_usage():
+    """Token totals of the outermost turn in progress, else of the last one.
+
+    Sub-agent spend is included once each sub-agent finishes (_bill_parent).
+    None before the first turn.
+    """
+    budget = _outer_turn_budget
+    if budget is None:
+        return None
+    return {"input_tokens": budget.input_tokens, "output_tokens": budget.output_tokens}
 
 
 @contextmanager
@@ -11889,8 +12025,10 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             max_cost=MAX_TURN_COST_USD,
             cost_in=COST_PER_1K_INPUT, cost_out=COST_PER_1K_OUTPUT,
         )
-    global _last_audit_share
+    global _last_audit_share, _outer_turn_budget
     previous, _active_budget = _active_budget, budget
+    if previous is None:
+        _outer_turn_budget = budget
     global _document_progress, _document_interrupt, _document_root
     old_document_hooks = (_document_progress, _document_interrupt, _document_root)
     _document_progress = kwargs.get("spin")
@@ -11972,7 +12110,7 @@ REUSE_KNOWN_VERDICTS = APP_CONFIG.get("reuse_known_verdicts", "1") != "0"
 
 # Wide enough to be worth a turn, small enough that the window itself is not
 # then clamped — retrieval that gets truncated would just re-create the bug.
-_OUTPUT_WINDOW = 2_400
+_OUTPUT_WINDOW = max(500, int(APP_CONFIG.get("read_content_window_chars", "2400")))
 
 
 def _content_length(args: dict) -> int:
@@ -12152,6 +12290,9 @@ def _reuse_known_verdict(command: str) -> str:
 # Every tool result the loop feeds back starts with this. It is the marker that
 # separates "the human said it" from "a web page said it".
 _TOOL_RESULT_PREFIX = "Tool result ("
+# view_image returns this marker instead of text; the agent loop replaces it
+# with a multimodal message carrying the actual image part (#21).
+_IMAGE_MARKER_PREFIX = "IMAGE\x1f"
 # Everything the LOOP says to the model wears this. Tool results already had a
 # marker; the loop's own nudges -- plan-mode blocks, repeat warnings, permission
 # outcomes, "give your final answer now" -- did not, so `_genuine_user_turns`
@@ -12184,6 +12325,14 @@ def _time_left_nudge(seconds_left: float) -> str:
 def _harness_turn(text: str) -> dict:
     """A message from the loop to the model. Never mistaken for the person."""
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
+
+
+def _image_turn(message: dict) -> dict:
+    """The multimodal message swapped in for an IMAGE marker tool result
+    (#21). Marked by construction: mode="image" always prefixes the
+    accompanying text part with _TOOL_RESULT_PREFIX before it ever reaches
+    the loop, so this is never mistaken for something the human typed."""
+    return message
 
 
 def _delegated_turn(task: str, from_user: bool) -> dict:
@@ -12307,7 +12456,7 @@ def _tool_result_for_model(name: str, result: str) -> str:
     elif _active_role == "subagent:auditor" and name in {"read_text", "last_output"}:
         limit = 12_000
     else:
-        limit = 3_000
+        limit = TOOL_RESULT_MAX_CHARS
 
     mode = (TOOL_SPECS.get(name, {}).get("mode") or "").lower()
     streamed = mode in _STREAM_MODES
@@ -12320,7 +12469,10 @@ def _tool_result_for_model(name: str, result: str) -> str:
     # an absent banner is honest, a guessed one is the original bug.
     banner = tool_output.detect_verdict(body).banner() if streamed else ""
     ref = _OUTPUT_STORE.put(name, result)
-    hint = f"read_content with ref={ref} and offset=N returns the middle"
+    # A head-kept result (read_text) is missing its END, a stream its middle.
+    hint = (f"read_content with ref={ref} and offset={limit} returns the rest"
+            if mode in _HEAD_FIRST_MODES else
+            f"read_content with ref={ref} and offset=N returns the middle")
     shown = tool_output.clamp(
         body, limit - len(banner) - 1 if banner else limit,
         keep="head" if mode in _HEAD_FIRST_MODES else "tail", hint=hint)
@@ -12504,6 +12656,11 @@ CONTEXT_SAFETY_TOKENS = 512
 MIN_TURN_COMPLETION_TOKENS = 256
 # Output budget for the compaction summary call.
 COMPACTION_SUMMARY_TOKENS = 4096
+# Turns a failed compaction waits before trying again.
+COMPACTION_RETRY_TURNS = 3
+# Malformed tool calls (unparseable or missing arguments) a run may correct
+# before a round without any executed tool counts as "no progress".
+MALFORMED_CALL_RETRIES = 3
 
 
 def _estimate_context_chars(messages: list[dict], system_prompt: str = "") -> int:
@@ -12526,9 +12683,15 @@ def _estimate_context_chars(messages: list[dict], system_prompt: str = "") -> in
     return chars
 
 
+def _estimate_tokens(chars: int) -> int:
+    """Single chars->tokens conversion for every context estimate, so the
+    ratio lives in one place (CHARS_PER_TOKEN) instead of a scattered // 4."""
+    return int(chars / CHARS_PER_TOKEN)
+
+
 def compact_messages(messages: list[dict], keep: int = COMPACTION_KEEP_MESSAGES,
                      *, completion_client=None, provider_name: str = "",
-                     model_name: str = "") -> bool:
+                     model_name: str = "", budget=None) -> bool:
     """Summarize everything but the last `keep` messages and replace the
     older block in place with a single system summary. Mutates `messages`
     in place (S.messages[:] = ...) rather than rebinding, because callers
@@ -12555,15 +12718,19 @@ def compact_messages(messages: list[dict], keep: int = COMPACTION_KEEP_MESSAGES,
     window, completion_limit = _active_model_token_limits(provider_name, model_name)
     summary_budget = min(COMPACTION_SUMMARY_TOKENS, completion_limit)
     if window:
-        headroom = window - len(prompt) // 4 - CONTEXT_SAFETY_TOKENS
+        headroom = window - _estimate_tokens(len(prompt)) - CONTEXT_SAFETY_TOKENS
         summary_budget = max(MIN_TURN_COMPLETION_TOKENS, min(summary_budget, headroom))
+    # Thinking off: on a reasoning model the summary budget was shared with the
+    # reasoning, which could use all of it and leave an empty summary.
     response = create_completion(
         completion_client if completion_client is not None else client,
         [{"role": "user", "content": prompt}], [], temperature=0,
         system_prompt="You write accurate session summaries.",
         provider_name=provider_name, model_name=model_name,
-        max_tokens=summary_budget,
+        max_tokens=summary_budget, thinking=False,
     )
+    if budget is not None:      # the summary call is part of the turn's spend
+        budget.add_usage(response, text=(response.choices[0].message.content or ""))
     summary = _strip_reasoning(response.choices[0].message.content or "").strip()
     if not summary:
         return False
@@ -12814,8 +12981,10 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # token-limited calls are incomplete and must never execute
+    malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
+    compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     plan_mutation_retries = 0
     # Current rung on the `auto` ladder. Sticky for the rest of this turn once
     # escalated -- climbing back down mid-turn would oscillate between a model
@@ -12931,8 +13100,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # Escalating onto a *smaller*-window model would overflow, so a rung
             # only qualifies if it can hold what we already have. Same estimator
             # auto-compaction uses, converted chars -> tokens.
-            _min_context_needed = _estimate_context_chars(
-                messages, round_system_prompt or "") // 4
+            _min_context_needed = _estimate_tokens(_estimate_context_chars(
+                messages, round_system_prompt or ""))
             if (not llmrouter_consulted and routing.variant(model_name or MODEL_NAME) != 'smart'
                     and APP_CONFIG.get('llmrouter_mode', 'off') in ('shadow', 'enabled')):
                 llmrouter_consulted = True
@@ -12973,31 +13142,62 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # doesn't retry (and fail) the same summarization call every turn.
         # Compaction failure must never abort the turn -- a broken summary
         # degrades a run, it must not kill it.
+        # The estimate includes the tool schemas: they are sent with every
+        # request, so leaving them out let the real prompt pass the overflow
+        # line before compaction fired.
+        context_tokens_estimate = _estimate_tokens(
+            _estimate_context_chars(messages, round_system_prompt or "")
+            + len(json.dumps(round_tools_def or [], default=str)))
         if (COMPACTION_THRESHOLD_PCT > 0 and turn_context_window
                 and len(messages) >= COMPACTION_KEEP_MESSAGES + 2
-                and (_estimate_context_chars(messages, round_system_prompt or "") // 4)
+                and turn >= compaction_retry_turn
+                # Tool schemas ride along on every request; an estimate that
+                # omits them fires compaction late, by roughly their own size.
+                and context_tokens_estimate
                     > turn_context_window * COMPACTION_THRESHOLD_PCT / 100):
+            # Retry no more often than every COMPACTION_RETRY_TURNS: a failed
+            # summary re-reads the whole older conversation (minutes on a slow
+            # server), and retrying it every turn burns the run's clock for
+            # nothing when the very next turn would have failed the same way.
+            compacted = False
             try:
-                if compact_messages(messages, completion_client=loop_client,
-                                    provider_name=loop_provider or "",
-                                    model_name=loop_model or ""):
+                compacted = compact_messages(
+                    messages, completion_client=loop_client,
+                    provider_name=loop_provider or "",
+                    model_name=loop_model or "", budget=budget)
+                if compacted:
                     _log.info("auto-compacted conversation at turn %d (%d%% threshold)",
                               turn, COMPACTION_THRESHOLD_PCT)
+                else:
+                    _log.warning("auto-compaction failed at turn %d: empty summary", turn)
             except Exception as exc:
                 _log.warning("auto-compaction failed at turn %d: %s", turn, exc)
+            # A failed summary is not retried on the very next turn: each try
+            # re-reads the whole older conversation, which on a slow server
+            # costs minutes, and the same input would most likely fail again.
+            if not compacted:
+                compaction_retry_turn = turn + COMPACTION_RETRY_TURNS
+            if trace is not None:
+                trace.append({"turn": turn, "type": "compaction", "ok": compacted,
+                              "tokens_before": context_tokens_estimate,
+                              "tokens_after": _estimate_tokens(
+                                  _estimate_context_chars(messages, round_system_prompt or "")
+                                  + len(json.dumps(round_tools_def or [], default=str)))})
         turn_max_tokens = (
             turn_completion_limit if not length_retries else
             min(turn_completion_limit * 2, turn_context_window) if length_retries == 1 else
             min(1024, turn_completion_limit)
         )
+        if length_retries and LENGTH_RETRY_MAX_TOKENS:
+            turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
         # Fit the request in the window: a strict OpenAI-compatible server (vLLM)
         # rejects prompt + max_tokens > max_model_len with a 400, which ends the
         # turn. Asking for the full completion limit on a long history -- or
         # doubling it on a length retry -- produced exactly that request.
         if turn_context_window:
-            prompt_tokens_estimate = (
+            prompt_tokens_estimate = _estimate_tokens(
                 _estimate_context_chars(messages, round_system_prompt or "")
-                + len(json.dumps(round_tools_def or [], default=str))) // 4
+                + len(json.dumps(round_tools_def or [], default=str)))
             headroom = turn_context_window - prompt_tokens_estimate - CONTEXT_SAFETY_TOKENS
             turn_max_tokens = max(MIN_TURN_COMPLETION_TOKENS, min(turn_max_tokens, headroom))
         try:
@@ -13052,13 +13252,18 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                         e = retry_error
                         continue
                 if response is None:
+                    if trace is not None:
+                        trace.append(_model_error_step(turn, e))
                     answer = _guard_answer(_fallback_answer(_last_tool_output, e))
                     if on_answer:
                         on_answer(answer)
                     return answer
             else:
                 # Backend/model error (timeout, context overflow, 5xx): don't crash
-                # the turn -- return the best we have, guarded.
+                # the turn -- return the best we have, guarded. The trace step
+                # keeps it from reading as an ordinary final answer.
+                if trace is not None:
+                    trace.append(_model_error_step(turn, e))
                 answer = _guard_answer(_fallback_answer(_last_tool_output, e))
                 if on_answer:
                     on_answer(answer)
@@ -13119,19 +13324,19 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
-            if length_retries < 2:
-                length_retries += 1
-                messages.append(_harness_turn((
-                    retry_instruction if length_retries == 1 else
-                    "Your last two responses reached the output limit. Reply within 200 tokens "
-                    "with exactly one complete tool call or a final answer. Do not include analysis "
-                    "or thinking."
-                )))
-                continue
-            answer = _guard_answer(warning)
-            if on_answer:
-                on_answer(answer)
-            return answer
+            # Never end the run on cut-offs: a model that overruns its output
+            # limit is told to reply briefly and the run carries on, bounded by
+            # its turn and time budget -- the same behaviour as comparable
+            # agents, which retry until their clock runs out rather than giving
+            # up with time left (#18).
+            length_retries += 1
+            messages.append(_harness_turn((
+                retry_instruction if length_retries == 1 else
+                "Your last responses reached the output limit. Reply within 200 tokens "
+                "with exactly one complete tool call or a final answer. Do not include analysis "
+                "or thinking."
+            )))
+            continue
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -13277,6 +13482,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             on_calls(calls)
 
         executed = False
+        malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
         turn_tools = [] if trace is not None else None
         for call in calls:
@@ -13451,6 +13657,26 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
+            if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):
+                # view_image (#21): hand the model the actual image part. The
+                # marker never reaches the message list as text.
+                import json as _json
+                try:
+                    result_message = _json.loads(
+                        result[len(_IMAGE_MARKER_PREFIX):])["message"]
+                except (ValueError, KeyError):
+                    result_message = None
+                if result_message is None:
+                    messages.append(_harness_turn(
+                        "Error: the attached image could not be delivered."))
+                else:
+                    messages.append(_image_turn(result_message))
+                if on_result:
+                    on_result(name, "[image attached]")
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "image_attached", "tool": name})
+                executed = executed or not no_progress
+                continue
             if (PERMISSION_MODE == "plan-only"
                     and result.startswith("Error: plan mode")):
                 plan_mutation_retries += 1
@@ -13463,6 +13689,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if _is_missing_argument_error(result) and missing_args_retries < 2:
                 if on_result:
                     on_result(name, result)
+                malformed_round = True
                 missing_args_retries += 1
                 messages.append(_harness_turn(result))
                 if trace is not None:
@@ -13480,6 +13707,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if _is_parse_error_result(result):
                 if on_result:
                     on_result(name, result)
+                malformed_round = True
                 parse_error_retries += 1
                 messages.append(_harness_turn((
                     f"The arguments for '{name}' could not be parsed as JSON. Do "
@@ -13619,6 +13847,13 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if granted and trace is not None:
                 trace.append({"turn": turn, "type": "turn_extension",
                               "from": granted[0], "to": granted[1]})
+        elif malformed_round and parse_error_retries + missing_args_retries <= MALFORMED_CALL_RETRIES:
+            # The round's only failure was an unparseable call and the
+            # correction is already queued: let the model retry. One typo must
+            # not end the attempt -- the COBOL task gave up with 4 minutes
+            # left and never wrote the file it needed. Endless malformed calls
+            # still hit the normal breaker once the cap is spent.
+            policy.record_round(fresh=False, output=None)
         elif forcing:
             forced_stop = True
             break

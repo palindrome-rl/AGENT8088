@@ -1,0 +1,20 @@
+# ThunderCompute networking override — REQUIRED on Thunder instances.
+#
+# Thunder's Docker daemon runs with bridge:none / iptables:false, so creating
+# private networks fails outright:
+#     $ docker network create tb-canary
+#     Error response from daemon: operation not permitted
+# and `host-gateway` cannot be resolved either:
+#     $ docker run --add-host=host.docker.internal:host-gateway ...
+#     docker: Error response from daemon: unable to derive the IP value for host-gateway
+#
+# Task containers therefore share the host network namespace. Harbor appends
+# this file after its base compose files, so the explicit network_mode wins.
+# With host networking, 127.0.0.1 inside a container IS the host: pass
+# --base-url http://127.0.0.1:8000/v1 to run.sh.
+#
+# Watch: task containers then share every host port (vLLM holds :8000); no task
+# in the 89-task set binds :8000.
+services:
+  main:
+    network_mode: host

@@ -58,6 +58,10 @@ def test_agent_auto_compacts_before_the_next_completion(monkeypatch, engine):
 
     assert result == "done"
     assert len(compact_calls) == 1
+    # 0.2.3: the turn's budget is passed so the summary call's tokens are
+    # counted with the turn (BUG_REPORT.md #11).
+    budget = compact_calls[0].pop("budget")
+    assert isinstance(budget, engine._TurnBudget)
     assert compact_calls[0] == {
         "completion_client": selected_client,
         "provider_name": "provider-x",

@@ -15,9 +15,10 @@ left behind.
 | `config.txt` | Agent8088 profile: model, limits, trimmed tools, workspace |
 | `tools.txt` | The six tools the profile exposes |
 | `system.md` | Headless system prompt with task-agnostic working rules |
-| `tasks.txt` | The 26 target tasks, from the first 44 |
+| `tasks.txt` | All 89 Terminal-Bench 2.1 tasks |
 | `run.sh` | One `harbor run` per task, one at a time |
-| `host-gateway.compose.yaml` | Lets containers reach the host's vLLM on Linux |
+| `host-gateway.compose.yaml` | Lets containers reach the host's vLLM on Linux (Docker Desktop / standard Docker) |
+| `thunder-host-network.compose.yaml` | Same, for ThunderCompute instances (host networking) |
 
 ## What the profile changes
 
@@ -63,12 +64,46 @@ Options:
 | `--tasks` | `tasks.txt` | One task name per line |
 | `--attempts` | `1` | Attempts per task |
 | `--jobs-dir` | `jobs` | Where Harbor writes results |
+| `--extra-compose` | `host-gateway.compose.yaml` on Linux | Repeatable; replaces the default overlay |
+
+Timeout settings stay at Harbor's defaults (`timeout_multiplier` 1.0, the rest
+unset), matching the Terminus-2 run. Agent setup has a 360 s base in Harbor
+0.23.0; the in-container install measured ~60 s, so the default is enough.
 
 Results are under `jobs/agent8088-<task>-<time>/`. The reward is in each
 trial's `verifier/reward.txt`, and the agent's full log is
 `agent/agent8088.txt`.
 
 Runs are one at a time (`-n 1`) because vLLM runs with `--max-num-seqs 1`.
+
+### ThunderCompute
+
+Thunder instances block private Docker networks, so `host.docker.internal`
+cannot be resolved and task containers must share the host network namespace.
+Pass the Thunder overlay and the loopback endpoint: with host networking,
+`127.0.0.1` inside a container is the host.
+
+```bash
+test-mode-setting/run.sh \
+  --tb ~/agent8088-terminal-bench \
+  --wheel ~/agent8088-terminal-bench/dist/agent8088-*.whl \
+  --base-url http://127.0.0.1:8000/v1 \
+  --extra-compose test-mode-setting/thunder-host-network.compose.yaml \
+  --jobs-dir ~/agent8088-terminal-bench/jobs
+```
+
+`--tb` points at a directory containing `tasks/`; the downloaded dataset
+(`~/terminal-bench-terminus/datasets/terminal-bench-2-1`) satisfies this with a
+symlink: `ln -s .../terminal-bench-2-1 ~/agent8088-terminal-bench/tasks`.
+`run.sh` re-execs itself under `sg docker` when the calling shell predates the
+user's `docker` group membership.
+
+On this instance Harbor is not installed globally; put the venv's bin
+directory on PATH (or the equivalent for your install):
+
+```bash
+PATH="/home/ubuntu/terminal-bench-terminus/.venv-harbor/bin:$PATH" test-mode-setting/run.sh ...
+```
 
 ## Context window
 

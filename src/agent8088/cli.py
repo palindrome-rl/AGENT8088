@@ -258,6 +258,10 @@ class Session:
         self.last_trace = None
         self.conversation_trace = []
         self.trace_path = ""
+        # The turn in progress while a trace export is open, so the export can
+        # be rewritten mid-turn (see _LiveTrace); None between turns.
+        self.live_turn = None
+        self.live_turn_started = 0.0
         self.name = ""
         self.disabled_skills = {
             name.strip() for name in config.get("disabled_skills", "").split(",")
@@ -289,13 +293,16 @@ def _write_private_text(path, content):
 
 
 def _trace_export_data():
+    trace = S.conversation_trace
+    if S.live_turn is not None:
+        trace = trace + [S.live_turn]
     return {
         "version": 2,
         "session": S.name or None,
         "model": A.MODEL_NAME,
         "messages": S.messages,
         "trajectory_state": S.trajectory_state,
-        "trace": S.conversation_trace,
+        "trace": trace,
     }
 
 
@@ -317,8 +324,49 @@ def _start_trace_export():
     return path
 
 
+class _LiveTrace(list):
+    """A turn's step list that rewrites the open trace export on every step.
+
+    The export used to be written only when a turn ended, so a run killed
+    mid-turn (a harness watchdog) left an export with no messages and no steps.
+    """
+
+    def append(self, item):
+        super().append(item)
+        _flush_live_trace()
+
+
+def _start_live_turn(query):
+    """Begin a turn whose steps reach the open export as they happen."""
+    trace = _LiveTrace()
+    S.live_turn_started = time.time()
+    S.live_turn = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "input": query,
+        "steps": trace,
+        "seconds": 0.0,
+        "interrupted": False,
+        "in_progress": True,
+        "usage": None,
+    }
+    return trace
+
+
+def _flush_live_trace():
+    """Rewrite the open export with the turn so far; best effort."""
+    if S.live_turn is None or not S.trace_path:
+        return
+    S.live_turn["seconds"] = round(time.time() - S.live_turn_started, 3)
+    S.live_turn["usage"] = A.turn_usage()
+    try:
+        _write_trace_export(S.trace_path)
+    except OSError:
+        pass
+
+
 def _record_trace(query, trace, elapsed, interrupted=False):
     """Keep a per-turn trace so /trace save can export the whole conversation."""
+    S.live_turn = None
     if trace is None:
         return
     S.last_trace = trace
@@ -328,6 +376,7 @@ def _record_trace(query, trace, elapsed, interrupted=False):
         "steps": trace,
         "seconds": round(elapsed, 3),
         "interrupted": interrupted,
+        "usage": A.turn_usage(),
     })
     if S.trace_path:
         try:
@@ -1958,12 +2007,23 @@ def _flush_memory_capture(timeout=MEMORY_FLUSH_SECONDS):
 
 
 def _await_memory_capture(stored_ref):
-    """Report completed capture or defer it; never wait before accepting input."""
+    """Finish the turn's memory save before the prompt returns.
+
+    The store is part of answering "remember this": the prompt must not come
+    back while the fact is still unsaved, or the user's next message reports
+    the save that their last one asked for. A local extraction call routinely
+    takes 15-20s; the join is bounded by MEMORY_FLUSH_SECONDS so a wedged
+    call cannot freeze the session, and a capture that outlives it is still
+    reported later, marked (from your previous message), rather than dropped.
+    """
     if S.memory_notifications == "off":
         return
     # Drain anything owed from earlier turns first, so reports stay in order.
     _report_pending_capture()
     thread = A.memory_capture_thread
+    if thread is not None and thread.is_alive():
+        console.print("[dim]⏺ memory · saving…[/dim]")
+        thread.join(MEMORY_FLUSH_SECONDS)
     if thread is not None and thread.is_alive():
         _pending_captures.append((thread, stored_ref))
         return
@@ -1988,7 +2048,10 @@ def do_chat(query):
     memory_stored = []
     A.memory_on_capture = memory_stored.extend
     S.turns_this_run = 0
-    trace = [] if S.show_trace else None
+    if S.show_trace and S.trace_path:
+        trace = _start_live_turn(query)
+    else:
+        trace = [] if S.show_trace else None
     reasoning_parts = []
     stream = _StreamFilter()
     tokens_ref = [0]
@@ -7939,11 +8002,94 @@ def _run_prompt_file(path: str) -> int:
     # announce a backend the run never uses.
     if not A.DISPOSABLE_CONTAINER:
         A.verify_sandbox_backend()
+    # A headless evaluation harness opts into the structured trace the same way
+    # the REPL does (show_trace=1). This path returns before the REPL's own
+    # _start_trace_export() call, so without this the export never starts and
+    # the run leaves only the human-readable transcript.
+    if S.show_trace:
+        try:
+            _start_trace_export()
+        except OSError as exc:
+            S.show_trace = False
+            print(f"agent8088 --prompt-file: could not enable trace export: {exc}",
+                  file=sys.stderr)
+    previous_sigterm = _save_trace_on_sigterm()
     try:
         do_chat(query)
     finally:
+        _restore_sigterm(previous_sigterm)
         _flush_memory_capture()
+    # One machine-readable line for the harness (container/run-agent.sh): a
+    # budget stop or a model failure otherwise ends like any answered run.
+    print(f"\n[agent8088] run ended: {_run_end_reason(S.last_trace)}", flush=True)
     return 0
+
+
+def _run_end_reason(steps):
+    """Why the last turn ended, from its trace steps (newest decisive one).
+
+    answered | time_budget | turn_limit | model_error | interrupted | unknown
+    (unknown: no trace, or the turn left none of these steps).
+    """
+    if S.conversation_trace and S.conversation_trace[-1].get("interrupted"):
+        return "interrupted"
+    for step in reversed(steps or []):
+        kind = step.get("type") if isinstance(step, dict) else None
+        if kind == "model_error":
+            return "model_error"
+        if kind == "budget_exceeded":
+            return "time_budget" if "seconds elapsed" in str(step.get("content", "")) else "budget"
+        if kind in {"budget_wrap_up", "max_turns"}:
+            return "turn_limit"
+        if kind == "final_answer":
+            return "answered"
+    return "unknown"
+
+
+def _save_trace_on_sigterm():
+    """Save the trace and transcript when a harness watchdog stops the run.
+
+    `timeout` sends SIGTERM, then SIGKILL a few seconds later. Python's default
+    for SIGTERM is to die on the spot, so the run left an empty trace and a
+    transcript cut mid-buffer. Here the turn so far is written out, marked
+    interrupted, and the process exits at once (no memory capture or other
+    cleanup that could outlast the grace period).
+    """
+    import signal
+
+    def on_sigterm(signum, _frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # A command still running sits in its own session and never got the
+        # signal; left alone it would keep running while the task is graded.
+        killed = A.kill_running_commands()
+        if S.live_turn is not None:
+            S.live_turn["interrupted"] = True
+            S.live_turn["stop_reason"] = "SIGTERM"
+            S.live_turn["commands_killed"] = killed
+        saved = ""
+        if S.trace_path:
+            try:
+                if S.live_turn is not None:
+                    S.live_turn["seconds"] = round(time.time() - S.live_turn_started, 3)
+                    S.live_turn["usage"] = A.turn_usage()
+                saved = str(_write_trace_export(S.trace_path))
+            except OSError as exc:
+                saved = f"(not saved: {exc})"
+        try:
+            print(f"\n[agent8088] stopped by SIGTERM; killed {killed} running command(s); "
+                  f"trace: {saved or '(none)'}", flush=True)
+            print("[agent8088] run ended: watchdog", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(128 + signum)
+
+    return signal.signal(signal.SIGTERM, on_sigterm)
+
+
+def _restore_sigterm(previous):
+    import signal
+    signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
 
 
 def main():
