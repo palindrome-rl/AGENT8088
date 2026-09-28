@@ -15,7 +15,7 @@ import pytest
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="Linux container scripts")
 
 ROOT = Path(__file__).resolve().parent.parent
-BENCH = ROOT / "bench" / "terminal-bench"
+BENCH = ROOT / "test-mode-setting"
 sys.path.insert(0, str(BENCH))
 
 from agent8088_harbor.config_edit import budget_edits, config_edit_command  # noqa: E402
