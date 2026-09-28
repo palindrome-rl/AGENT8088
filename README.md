@@ -5,13 +5,22 @@
 </p>
 
 <p align="center">
-  <strong>A local-first AI agent that can use tools, work across your chats, and ask before it acts.</strong>
+  <strong>Reliable AI agents&mdash;even on small, local models.</strong>
+</p>
+
+<p align="center">
+  An open-source agentic harness for reliable, verifiable task completion.<br>
+  Grounded execution, robust context management, sandboxed tools, and transparent control&mdash;on your machine.
+</p>
+
+<p align="center">
+  <strong>Small-model-first&nbsp;&nbsp;&middot;&nbsp;&nbsp;Research-backed reliability&nbsp;&nbsp;&middot;&nbsp;&nbsp;Execution you control</strong>
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#demo">Demo</a> ·
-  <a href="#about">About</a> ·
+  <a href="#why-agent8088">Why Agent8088</a> ·
   <a href="#what-it-does">Features</a> ·
   <a href="#documentation">Documentation</a> ·
   <a href="#contributing">Contributing</a>
@@ -26,6 +35,50 @@
   <img src="https://img.shields.io/badge/MCP-client%20%2B%20server-8b5cf6" alt="MCP client and server">
 </p>
 
+## Why Agent8088
+
+Most agent harnesses are designed around large hosted models and optimistic
+execution. Agent8088 starts from a different premise: useful agents should be
+able to complete real work reliably with smaller models, limited context, and
+explicit operational boundaries.
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Small-model-first</strong><br>
+      <sub>Efficient prompts, minimized tool schemas, model-aware routing, and local-model support make capable local models practical.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Verification-gated completion</strong><br>
+      <sub>Tasks are checked against their required outputs, tests, and observable tool results before completion is reported.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Grounded execution</strong><br>
+      <sub>A persistent control loop plans, acts through structured tools, observes the result, and recovers when execution fails.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Robust context management</strong><br>
+      <sub>Pre-call budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Transparent and controlled</strong><br>
+      <sub>Permission modes, usage visibility, audit trails, credential protection, and OS-level sandboxing keep actions accountable.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Low-friction and extensible</strong><br>
+      <sub>Use the CLI or web UI, connect local or hosted models, and extend the harness through MCP, skills, sub-agents, and gateways.</sub>
+    </td>
+  </tr>
+</table>
+
+Agent8088 is developed around measured failure modes rather than idealized
+demos. Its reliability work is informed by regression testing, live workflow
+analysis, and the practical limits of small models.
+
+---
+
 ## Demo
 
 <p align="center">
@@ -36,11 +89,16 @@
 
 ## About
 
-Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**. It reads files, runs tools, researches the web and edits code, and every change goes through a permission system you control.
+Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**.
+It reads files, runs tools, researches the web, and edits code through a
+permission system you control. Its goal is not simply to produce an answer,
+but to carry a task through execution, validation, and recovery when something
+goes wrong.
 
 Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
 
-- **Local-first.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR and session history are stored on disk and never uploaded.
+- **Local-first and context-aware.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR, and session history are stored on disk and never uploaded. Context budgeting and compaction help long tasks continue without silently overflowing the model window.
+- **Verification before confidence.** Tool results, tests, expected deliverables, and execution state provide evidence for completion. Recovery paths help the agent retry or surface a clear failure instead of pretending the task succeeded.
 - **Guardrails built in.** Shell commands run in a native OS sandbox. Turn on `audit_log=1` and every tool call and approval decision is recorded in `audit.jsonl` in the agent's data folder (normally `~/.agent8088/`). Switch to `readonly` (`--mode readonly`) and writes, network access and shell commands each need your approval. Some safety rules are enforced in code, so a prompt can't switch them off.
 - **One engine, many front ends.** The CLI, the web UI and the messaging gateway (Slack, Discord, WhatsApp, Telegram, email) share one agent loop, one session model and one permission layer.
 - **Open by design.** Works with any OpenAI-compatible provider. It can use external MCP servers and can also serve its own tools over MCP. It supports skills and focused sub-agents, and all settings live in one plain-text config file.
