@@ -177,7 +177,7 @@ On by default. Full explanation in [Memory](16-memory.md).
 | Key | Default | Purpose |
 |---|---|---|
 | `memory` | `1` | Master switch. `0` stops both recall and learning; stored memories are kept. |
-| `memory_engine` | `native` | Backend: `native` (built-in SQLite with BM25 + vector RRF) or `mem0` (the Mem0 library with graph/vector management). Set by `/memory engine <name>`. Code-level default (when the key is absent) is `native` — see `parse_memory_engine_config` in `src/agent8088/memory/__init__.py`. **The packaged `src/agent8088/config.txt` itself ships with `memory_engine=mem0` uncommented**, so anything that copies that file verbatim (the Docker entrypoint, or the "last-resort default" resolution path above) gets `mem0` even though the `mem0` extra isn't installed there by default — e.g. the Docker image only installs `.[gateway]`. The installers (`install.sh` / `install.ps1`) always overwrite this key to match what was actually installed, so a normal CLI install is unaffected. |
+| `memory_engine` | `native` | Backend: `native` (built-in SQLite with BM25 + vector RRF) or `mem0` (the Mem0 library with graph/vector management). Set by `/memory engine <name>`. Default `native`; the installers and `--memory-setup` switch it to `mem0`. |
 | `memory_db_path` | `~/.agent8088/memory.db` | The store for the native engine. One SQLite file, mode `0600`. |
 | `memory_user_id` | `owner` | Whose memories these are. One identity by default, so memory carries across the CLI and every gateway platform. |
 | `memory_scope_by_identity` | `0` | `1` gives each gateway identity its own namespace. Needed only if a `*_allowed_users` line holds more than one person. |

@@ -278,7 +278,7 @@ memory=1
 #
 # Memory engine backend: `native` (default built-in SQLite with BM25 + vector RRF)
 # or `mem0` (uses Mem0 library with graph/vector entity management).
-memory_engine=mem0
+memory_engine=native
 
 # Mem0 vector store backend (defaults to embedded local qdrant)
 memory_mem0_vector_store=qdrant
