@@ -42,8 +42,8 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url`, `task` | prompt | Headless browser — click, fill forms, navigate, and extract via natural-language instructions, not just read static text. |
 | `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
-| `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. |
-| `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
+| `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. LibreOffice is opt-in; when it is missing the tool says to run `agent8088 --libreoffice-setup`. |
+| `run_sandboxed` | `docker` | `code` | prompt | Run a Python snippet with native OS isolation and no network, falling back to Docker. |
 | `schedule_task` | `cron` | `action`, `schedule`*, `task`* | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
 | `create_subagent` | `write_text` | `name`, `description`, `tools`, `max_turns`, `model`*, `prompt` | escalates | Create a custom sub-agent profile in `user_agents_dir`. |
@@ -111,9 +111,10 @@ key on that mode — the sensitive-file floor, write path zones, plan-only
 blocking, plan-audit revert. Sharing the mode means the tool inherits every one
 of them instead of needing a parallel set that could drift.
 
-> `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
-> without a prompt under the native sandbox, escalated under `local`, because
-> reading a repo unsandboxed can surface credential content.
+> `git_status`/`git_diff`/`git_log` are host tools (`host=1`), so they run on
+> the host whatever the sandbox backend. In `readonly` they still ask, because a
+> host-side git read can surface credential content; they are not treated as
+> fixed commands since each takes an optional `repo` argument.
 
 ## `review_code`
 

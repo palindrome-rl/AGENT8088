@@ -164,8 +164,8 @@ agent8088 --sandbox-setup
 
 This installs the open-source Anthropic sandbox runtime so shell commands run
 isolated from your filesystem and network. Without it Agent8088 falls back to
-Docker, and if neither exists it asks before every local command. See
-[Sandboxing](06-sandboxing.md).
+Docker, and if neither exists shell and code execution are refused outright
+rather than prompted for. See [Sandboxing](06-sandboxing.md).
 
 ## Where things live
 

@@ -42,8 +42,12 @@ Verified against `check_permission()`:
 
 | Tool mode | readonly |
 |---|---|
-| `read_text`, `last_output`, `python_eval`, `plan` | ✅ allowed |
-| `write_text`, `shell`, `http_get`, `http_post`, `docker`, `cron`, `browser`, `subagent` | ❌ refused |
+| `read_text`, `last_output`, `python_eval`, `plan`, `introspect` | ✅ allowed |
+| `cron` with `action=list` | ✅ allowed |
+| `write_text`, `shell`, `http_get`, `http_post`, `search`, `docker`, `cron` (add/remove), `browser`, `subagent` | ❌ refused |
+
+`write_text` to a path in `no_prompt_paths` is also allowed. When `read_paths`
+is set, a `read_text` outside it asks first.
 
 Note that **network reads are refused too** — `web_search` and
 `get_page_title` need approval in readonly, because fetching a URL is an
@@ -110,6 +114,14 @@ with per-step verification (see `plan_audit`). It is not how a plan is proposed.
 
 These are refused in **every** mode — full-auto included — and no escalation
 grant unlocks them.
+
+> **Exception: `AGENT8088_DISPOSABLE_CONTAINER=1`.** This environment variable
+> is meant for throwaway benchmark containers holding no user data. It turns off
+> the credential-file floor, the shell-startup-file floor, the destructive-git
+> check, and the pipe-to-shell (`curl | sh`) patterns (`engine.py`:
+> `_is_sensitive_path`, `_is_shell_startup_file`, `_dangerous_git_args`, the
+> unrecoverable-command check). Never set it on a machine with real credentials
+> or history.
 
 ### 1. Credential files
 

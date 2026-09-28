@@ -42,13 +42,13 @@ Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**. It
 Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
 
 - **Local-first.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR and session history are stored on disk and never uploaded.
-- **Safe by default.** It starts in read-only mode. Writes, network access and shell commands need your approval, run in a native OS sandbox, and are recorded in an audit log. Some safety rules are enforced in code, so a prompt can't switch them off.
+- **Guardrails built in.** Shell commands run in a native OS sandbox and every action is recorded in an audit log. Switch to `readonly` (`--mode readonly`) and writes, network access and shell commands each need your approval. Some safety rules are enforced in code, so a prompt can't switch them off.
 - **One engine, many front ends.** The CLI, the web UI and the messaging gateway (Slack, Discord, WhatsApp, Telegram, email) share one agent loop, one session model and one permission layer.
 - **Open by design.** Works with any OpenAI-compatible provider. It can use external MCP servers and can also serve its own tools over MCP. It supports skills and focused sub-agents, and all settings live in one plain-text config file.
 
 <table>
   <tr>
-    <td align="center" width="25%"><b>🔒 Safe by default</b><br><sub>Read-only until you approve</sub></td>
+    <td align="center" width="25%"><b>🔒 Guardrails built in</b><br><sub>Sandbox, approvals, audit log</sub></td>
     <td align="center" width="25%"><b>🏠 Local-first</b><br><sub>Ollama, local memory, local OCR</sub></td>
     <td align="center" width="25%"><b>🧩 Extensible</b><br><sub>MCP, skills, sub-agents</sub></td>
     <td align="center" width="25%"><b>💬 Everywhere</b><br><sub>CLI, web UI, Slack, Discord, WhatsApp, Telegram, email</sub></td>
@@ -62,7 +62,7 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | Capability | What it gives you |
 | --- | --- |
 | **Use the model you want** | 12 built-in provider profiles, local Ollama, OpenRouter, and custom OpenAI-compatible endpoints. Configure fallback models for retryable provider failures. |
-| **Work safely by default** | `readonly` is the default. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
+| **Work safely** | `full-auto` is the default, inside the workspace and the always-on safety floor; switch to `readonly` for per-action approval. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
 | **Delegate without losing context** | Six restricted sub-agent profiles handle exploration, research, coding, test writing, verification, and general-purpose work in separate runs. |
 | **Use tools without lock-in** | Built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, CLI-Anything, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
@@ -190,8 +190,8 @@ Agent8088 has three permission modes:
 
 | Mode | Behaviour |
 | --- | --- |
-| **`readonly`** *(default)* | Read and inspect safely; request a one-time approval for writes, network access, scheduling, or non-safe shell commands. |
-| **`full-auto`** | Work without per-action prompts inside the configured workspace. The always-on safety floor still applies. |
+| **`readonly`** | Read and inspect safely; request a one-time approval for writes, network access, scheduling, or non-safe shell commands. |
+| **`full-auto`** *(default)* | Work without per-action prompts inside the configured workspace. The always-on safety floor still applies. |
 | **`plan-only`** | Research and present a plan first; approved work then uses the regular permission path. |
 
 Some actions are blocked in every mode: credential paths, shell startup-file writes, destructive Git operations such as `push` and `reset --hard`, and system-prompt exfiltration. See the [security guide](docs/wiki/03-permissions-and-security.md) for the exact boundaries and configuration.
