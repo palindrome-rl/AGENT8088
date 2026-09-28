@@ -39,7 +39,7 @@ _ANSI_OTHER = re.compile(r"\x1b[@-Z\\-_]")
 _REPEAT_FLOOR = 3
 
 ELISION = "[tool result truncated: {dropped} characters elided — {hint}]"
-DEFAULT_HINT = "ask for the middle with last_output"
+DEFAULT_HINT = "ask for the middle with read_content"
 
 
 def strip_ansi(text: str) -> str:

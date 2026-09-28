@@ -42,7 +42,8 @@ def _load(monkeypatch, tmp_path):
 def test_profile_exposes_only_the_core_tools(monkeypatch, tmp_path):
     e = _load(monkeypatch, tmp_path)
     assert set(e.TOOL_SPECS) == {"execute_shell", "write_file", "edit_file",
-                                 "read_text", "last_output", "read_content"}
+                                 "read_text", "last_output", "read_content",
+                                 "view_image"}
     shell = e.TOOL_SPECS["execute_shell"]
     assert shell["host"] and shell["timeout"] == 600
     assert "timeout" in shell["optional"]

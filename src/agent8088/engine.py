@@ -9007,6 +9007,15 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         ref = str(args.get("path") or "").strip()
         if not ref:
             return _tool_arg_missing_error(name, "path")
+        if not re.match(r"^https?://", ref, re.IGNORECASE):
+            try:
+                resolved_ref = resolve_user_path(ref)
+            except ValueError as exc:
+                return f"Error: {exc}"
+            if _is_sensitive_path(str(resolved_ref)):
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=str(resolved_ref), reason="sensitive_path")
+                return f"Error: Access to sensitive file denied: {resolved_ref}"
         try:
             message = build_image_message(
                 f"Tool result ({name}): {ref} is attached to this message.",
@@ -12251,6 +12260,14 @@ def _harness_turn(text: str) -> dict:
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
 
 
+def _image_turn(message: dict) -> dict:
+    """The multimodal message swapped in for an IMAGE marker tool result
+    (#21). Marked by construction: mode="image" always prefixes the
+    accompanying text part with _TOOL_RESULT_PREFIX before it ever reaches
+    the loop, so this is never mistaken for something the human typed."""
+    return message
+
+
 def _delegated_turn(task: str, from_user: bool) -> dict:
     """The opening turn of a sub-agent run, marked unless a human typed it.
 
@@ -12385,7 +12402,10 @@ def _tool_result_for_model(name: str, result: str) -> str:
     # an absent banner is honest, a guessed one is the original bug.
     banner = tool_output.detect_verdict(body).banner() if streamed else ""
     ref = _OUTPUT_STORE.put(name, result)
-    hint = f"read_content with ref={ref} and offset=N returns the middle"
+    # A head-kept result (read_text) is missing its END, a stream its middle.
+    hint = (f"read_content with ref={ref} and offset={limit} returns the rest"
+            if mode in _HEAD_FIRST_MODES else
+            f"read_content with ref={ref} and offset=N returns the middle")
     shown = tool_output.clamp(
         body, limit - len(banner) - 1 if banner else limit,
         keep="head" if mode in _HEAD_FIRST_MODES else "tail", hint=hint)
@@ -13373,6 +13393,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
         executed = False
         round_fresh = False  # did this round do something the run had not done?
+        malformed_round = False
         turn_tools = [] if trace is not None else None
         for call in calls:
             name = call["name"]
@@ -13554,9 +13575,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     result_message = _json.loads(
                         result[len(_IMAGE_MARKER_PREFIX):])["message"]
                 except (ValueError, KeyError):
-                    result_message = _harness_turn(
-                        "Error: the attached image could not be delivered.")
-                messages.append(result_message)
+                    result_message = None
+                if result_message is None:
+                    messages.append(_harness_turn(
+                        "Error: the attached image could not be delivered."))
+                else:
+                    messages.append(_image_turn(result_message))
                 if on_result:
                     on_result(name, "[image attached]")
                 if trace is not None:
@@ -13739,7 +13763,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # not end the attempt -- the COBOL task gave up with 4 minutes
             # left and never wrote the file it needed. Endless malformed calls
             # still hit the normal breaker once the cap is spent.
-            malformed_round = False
             policy.record_round(fresh=False, output=None)
         elif forcing:
             forced_stop = True

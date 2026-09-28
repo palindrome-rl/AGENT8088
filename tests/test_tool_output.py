@@ -35,8 +35,10 @@ def test_runs_of_blank_lines_collapse_to_one():
     assert tool_output.denoise("a\n\n\n\n\n\nb") == "a\n\nb"
 
 
-def test_trailing_whitespace_goes_away():
-    assert tool_output.denoise("a   \nb\t\n") == "a\nb"
+def test_trailing_whitespace_is_kept():
+    # Fixed-width records and exact `cat` output are spacing-sensitive; only
+    # colour codes, progress bars and repeated/blank lines are cleaned.
+    assert tool_output.denoise("a   \nb\t\n") == "a   \nb\t"
 
 
 def test_already_clean_text_is_unchanged():

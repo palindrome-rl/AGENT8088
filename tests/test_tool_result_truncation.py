@@ -64,7 +64,7 @@ def test_truncation_is_announced_in_the_middle_with_a_count(engine):
     assert "characters elided" in marker
     # The exact count is pinned in test_tool_output; what matters here is that
     # the marker names a retrieval route for the part that was dropped.
-    assert "last_output" in marker and "ref=" in marker
+    assert "read_content" in marker and "ref=" in marker
 
 
 def test_result_stays_within_its_budget(engine):
@@ -75,8 +75,12 @@ def test_result_stays_within_its_budget(engine):
 
 
 def test_document_read_is_still_exempt(engine):
+    # Exempt from truncation, but past the read_content window it still gets
+    # a content-ref note appended so the rest stays reachable.
     payload = "x" * 50_000
-    assert engine._tool_result_for_model("document_read", payload) == payload
+    shown = engine._tool_result_for_model("document_read", payload)
+    assert shown.startswith(payload)
+    assert "use read_content with ref=" in shown
 
 
 def test_skill_payload_keeps_its_larger_allowance(engine):

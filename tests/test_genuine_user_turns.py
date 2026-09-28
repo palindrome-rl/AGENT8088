@@ -128,8 +128,10 @@ def test_every_loop_injected_turn_carries_a_marker():
         # construction; _delegated_turn applies it unless a human typed the task,
         # and the two tests below pin both of its branches -- a source check
         # cannot see which one a call takes, so behaviour carries that weight.
+        # _image_turn passes through the multimodal message built by mode="image",
+        # whose text part is prefixed with _TOOL_RESULT_PREFIX before it exists.
         if (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
-                and arg.func.id in ("_harness_turn", "_delegated_turn")):
+                and arg.func.id in ("_harness_turn", "_delegated_turn", "_image_turn")):
             continue
         if isinstance(arg, ast.Dict):
             roles = [v for k, v in zip(arg.keys, arg.values)
