@@ -544,12 +544,15 @@ so "which guardrails are active?" in chat gets the same facts. See
 
 ## Verifying any of this yourself
 
+The root Python suite is maintained on `development`, not shipped in this
+staging checkout. Run the following test commands from a development clone.
+
 > **Correction.** This page used to point at a dedicated
 > `tests/test_permission.py` / `test_ssrf.py` / `test_egress.py` /
 > `test_exfil_guard.py` / `test_turn_budget.py` / `test_audit_log.py` /
 > `test_command_allowlist.py` / `test_capabilities.py` /
 > `tests/gateway/test_rate_limit.py` suite. None of those files exist in the
-> current tree (verified with `Glob`/`find` over `tests/`) — security behavior
+> development tree (verified against that branch's `tests/`) — security behavior
 > is exercised as part of the general test suite instead, under names tied to
 > the feature rather than to "security", e.g. `tests/test_local_search_ssrf_exemption.py`
 > (the loopback SSRF exemption), `tests/test_operational_log.py` (the audit

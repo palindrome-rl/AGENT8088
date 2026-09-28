@@ -122,8 +122,9 @@ volumes:
 ## What the Dockerfile does not include
 
 - **`dev` extras** (pytest, ruff, pip-audit) — not needed to run the agent.
-  If you want to run the test suite in a container, install them:
-  `docker compose run --rm --entrypoint bash agent8088 -c "pip install -e \".[dev]\" && pytest tests/ -q"`
+  The image excludes `tests/`, and this staging branch does not track the
+  root Python suite. Run those tests from a separate `development` checkout;
+  installing `.[dev]` inside this image cannot provide the missing files.
 
 - **The `repomap` extra** (`tree-sitter`, `tree-sitter-language-pack`) — the
   Dockerfile only installs `.[gateway]`, so `repo_map` degrades to a clean

@@ -30,6 +30,11 @@ def _required_executable(name: str, error: str) -> str:
 
 
 def main() -> None:
+    if not (ROOT / "tests" / "conftest.py").is_file():
+        raise SystemExit(
+            "FAIL: the Python test suite is not present in this checkout. "
+            "Run the release gate from the development branch before promotion."
+        )
     uv = _required_executable("uv", "FAIL: uv is required for the release gate")
     npm = _required_executable(
         "npm", "FAIL: npm is required to audit the bundled WhatsApp bridge")

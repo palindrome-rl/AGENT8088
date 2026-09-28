@@ -4,9 +4,14 @@
 
 Three layers, all runnable offline with no model backend.
 
+> This staging branch deliberately omits the root Python `tests/` directory.
+> The unit-test commands below apply to a separate `development` checkout;
+> they are not installation or runtime requirements. Feature-verification
+> scripts and the Web UI's separate `web/tests/` remain in staging.
+
 | Layer | Command | Covers |
 |---|---|---|
-| Unit tests | `uv run python -m pytest tests/` | Permission layer, tools, gateway, MCP |
+| Unit tests (development checkout) | `uv run python -m pytest tests/` | Permission layer, tools, gateway, MCP |
 | Feature verification | `scripts/verify_features.py` | Real behaviour in temp repos and sandboxes |
 | Exhaustive verification | `scripts/verify_everything.py` | Tool specs, shell-classifier matrix, CLI surface |
 
@@ -32,6 +37,9 @@ checks that exercise shell and permission behaviour cannot complete without it.
 
 ## 1. Unit tests
 
+Clone `development` before running this section. A fresh `staging-1.2`
+checkout has no root `tests/` directory.
+
 ```sh
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
 ```
@@ -53,7 +61,7 @@ AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -k "gateway" -q    
 AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp_server.py -q  # MCP server
 ```
 
-(Verified against the current `tests/` listing — file names churn as tests are
+(Verified against the development branch's `tests/` listing — file names churn as tests are
 added, so treat any specific filename here as illustrative, not a contract.)
 
 ### Gateway extras are required
@@ -131,25 +139,11 @@ Non-negotiable, because violating them has caused a real incident in this repo:
    lines and only loads the `engine` module fixture. The discipline is on the
    test author, not automated.
 
-## 5. Live-model tool-choice scoring (opt-in)
+## 5. Live-model tool-choice scoring
 
-The suite can prove a search query leaves with the year attached. It cannot
-prove the model decides to search in the first place, or resists searching for
-something it already knows — that is judgement, and only a real model has any.
-
-```sh
-A8088_LIVE_MODEL=1 AGENT8088_HOME="$(mktemp -d)" \
-  uv run --extra dev python scripts/verify_tool_intelligence.py
-```
-
-It runs the shared scenario table in `tests/data/tool_intelligence_cases.py`
-against the configured provider and scores tool choice, writing a report to
-`artifacts/`. It refuses to start without `A8088_LIVE_MODEL=1` and refuses to
-run against a real `~/.agent8088`.
-
-Not part of the default suite: it costs tokens and is not deterministic. Set
-the pass threshold with `A8088_TOOL_THRESHOLD` (default `0.8`) — establish the
-real baseline on your provider before treating that number as a gate.
+The old optional scorer depended on a missing `tests/data/` fixture and could
+not run. It is not included in staging. To assess tool choice, test the agent
+with an isolated configuration and record the prompts, tool calls, and answers.
 
 ## Pre-PR checklist
 
@@ -166,7 +160,11 @@ There is no automated `pr-check` skill in this repo. Do this by hand:
 
 ## Public-release gate
 
-Before publishing, run the strict local gate (there is no hosted CI):
+`scripts/release_check.py` requires the Python suite. It fails clearly on a
+fresh staging checkout; run it from `development` before promoting a release.
+
+Before publishing, run the strict local gate from a `development` checkout
+(there is no hosted CI):
 
 ```sh
 uv run python scripts/release_check.py

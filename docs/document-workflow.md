@@ -76,19 +76,11 @@ the same processing request reuses checkpoints rather than starting from zero.
 
 ## Verification
 
-Unit/integration coverage is in `tests/test_document_access.py` and
-`tests/test_document_upload_workflow.py`. Live model-backed browser acceptance:
-
-```powershell
-Set-Location web
-$env:AGENT8088_WEB_URL = 'http://127.0.0.1:8184'
-node tests/document-workflow-live.cjs
-```
-
-The live suite uses the local 87-page report, compares two policies, extracts
-requirements from an instruction-contaminated file, and checks missing evidence.
-It also verifies reload history and real table rendering. It uses provider quota
-and saves local screenshots/results under ignored `web/test-results`.
+Python unit/integration coverage is maintained on the `development` branch in
+`tests/test_document_access.py` and `tests/test_document_upload_workflow.py`.
+This staging checkout does not ship the root test suite. The old live browser
+script referenced here was already removed; validate document uploads in the
+running Web UI when changing this workflow.
 
 ## Local verification (2026-09-08)
 

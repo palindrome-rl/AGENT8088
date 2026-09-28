@@ -92,7 +92,10 @@ The installer provisions an isolated Python environment, installs the global `ag
 After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
 `/dump` to produce a bundle for a bug report.
 
-The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed — run `uv pip install -e ".[dev]"` if you need the test suite.
+The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed. The Python
+`tests/` suite lives on the `development` branch, not in this staging checkout;
+use a development clone for contributor tests. Installed Agent8088 does not
+need that directory.
 
 ### Configure and run
 

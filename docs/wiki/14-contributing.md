@@ -4,8 +4,11 @@
 
 ## Setup
 
+Contribute from `development`: this staging branch does not include the root
+Python `tests/` directory. Runtime installs do not need it.
+
 ```sh
-git clone https://github.com/tayyabimam1/AGENT8088.git
+git clone --branch development https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"

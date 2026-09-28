@@ -99,3 +99,7 @@ docs/webui-test-manual/playwright-test-results.md
 
 # Local planning drafts — not shipped
 docs/superpowers/
+
+# Staging publishes runtime code without the development-only Python suite.
+# The suite remains tracked on the development branch.
+/tests/
