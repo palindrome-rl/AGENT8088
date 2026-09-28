@@ -825,40 +825,19 @@ function Install-WindowsTerminal {
 # invocation, same "warn and register a skipped stage, never abort the whole
 # installer" contract as every other optional component here.
 #
-# Unlike the others it asks first. ~350 MB installed per-machine by WinGet is
-# the slowest stage in this installer by a wide margin, and the three
-# capabilities it unlocks are ones plenty of users never touch.
+# Opt-in only: ~350 MB installed per-machine by WinGet is the slowest stage in
+# this installer by a wide margin, and the capabilities it unlocks are ones
+# plenty of users never touch. Pass -WithLibreOffice (or set
+# AGENT8088_INSTALL_LIBREOFFICE=1), or add it later with
+# `agent8088 --libreoffice-setup`.
 # ----------------------------------------------------------------------------
-# Consent for the one stage nobody should be made to wait on unasked. Kept out
-# of Install-LibreOffice so the tests can stub the console read.
-#
-# The $NonInteractive guard is not a policy choice: on a headless host Read-Host
-# returns empty immediately, so the explicit-answer loop below would spin
-# forever.
 function Read-LibreOfficeConsent {
     if ($WithLibreOffice -and $SkipLibreOffice) {
         throw "-WithLibreOffice and -SkipLibreOffice cannot be used together."
     }
     if ($WithLibreOffice) { return $true }
     if ($SkipLibreOffice) { return $false }
-    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(1|y|yes|true)$') { return $true }
-    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(0|n|no|false)$') { return $false }
-    $runningInCI = $env:CI -match '^(1|y|yes|true)$'
-    if ($NonInteractive -or $runningInCI) {
-        Write-Info "Non-interactive - skipping the optional LibreOffice install."
-        return $false
-    }
-
-    Write-Host ""
-    Write-Warn "LibreOffice is optional (~350 MB) and can take several minutes to download and install."
-    Write-Host "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading,"
-    Write-Host "    and Excel formula recalculation. Skipping is safe."
-    Write-Host "    Add it later with: winget install TheDocumentFoundation.LibreOffice"
-    do {
-        $rawAnswer = Read-Host "Install LibreOffice now? [yes/no]"
-        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
-    } while ($answer -notin @("yes", "no"))
-    return ($answer -eq "yes")
+    return ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(1|y|yes|true)$')
 }
 
 function Install-LibreOffice {
@@ -872,6 +851,14 @@ function Install-LibreOffice {
         return $true
     }
 
+    if (-not (Read-LibreOfficeConsent)) {
+        Write-Info "Skipping LibreOffice (opt-in; add it later with: agent8088 --libreoffice-setup)."
+        Register-SkippedStage -Label "LibreOffice" `
+            -Reason "opt-in (optional, slow to install)" `
+            -Fix "agent8088 --libreoffice-setup, or rerun with -WithLibreOffice"
+        return $false
+    }
+
     $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $winget) {
@@ -879,16 +866,6 @@ function Install-LibreOffice {
         Register-SkippedStage -Label "LibreOffice" `
             -Reason "no WinGet available" `
             -Fix "install App Installer from the Microsoft Store, then rerun, or install LibreOffice manually from https://www.libreoffice.org/download/"
-        return $false
-    }
-
-    # Asked only once both cheap preconditions hold: nothing installed already,
-    # and a WinGet that could actually carry the answer out.
-    if (-not (Read-LibreOfficeConsent)) {
-        Write-Info "Skipping LibreOffice."
-        Register-SkippedStage -Label "LibreOffice" `
-            -Reason "not selected (optional, slow to install)" `
-            -Fix "winget install TheDocumentFoundation.LibreOffice"
         return $false
     }
 

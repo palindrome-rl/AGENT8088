@@ -8,25 +8,24 @@
 - A model endpoint — either local [Ollama](https://ollama.com) or any
   OpenAI-compatible API key
 - Optional: Node.js 20.11+ for the native sandbox and the WhatsApp bridge
-- Optional (Windows): LibreOffice, for `.docx`/`.pptx`/`.xlsx`→PDF conversion,
+- Optional: LibreOffice, for `.docx`/`.pptx`/`.xlsx`→PDF conversion,
   legacy `.doc`/`.ppt`/`.xls` reading, and Excel formula recalculation. It is
-  ~350 MB and by far the slowest stage in the installer, so the installer
-  **asks before installing it** rather than assuming. Answer `no` and setup
-  carries on — those three capabilities are simply unavailable until you run
-  `winget install TheDocumentFoundation.LibreOffice`, which the end-of-install
-  summary reminds you of.
+  ~350 MB and by far the slowest optional stage, so it is **opt-in**: the
+  installers skip it unless you pass `--with-libreoffice` (bash) or
+  `-WithLibreOffice` (PowerShell), or set `AGENT8088_INSTALL_LIBREOFFICE=1`.
+  Everything else works without it. Add it at any time with:
 
-  To answer in advance, or on a machine that cannot be prompted:
-
-  ```powershell
-  $env:AGENT8088_INSTALL_LIBREOFFICE = 'yes'   # or 'no' to skip
-  $env:AGENT8088_BRANCH = 'staging-1.2'
-  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
+  ```sh
+  agent8088 --libreoffice-setup
   ```
 
-No admin rights are needed for the base install. WinGet may prompt for
-elevation if you accept LibreOffice, since it's a per-machine install — that's
-WinGet's own prompt, not something this installer requests.
+  This uses WinGet on Windows, Homebrew on macOS, and apt/dnf/pacman on Linux.
+  If the agent needs LibreOffice and it is missing, it tells you to run this
+  command.
+
+WinGet may prompt for elevation when installing LibreOffice, since it's a
+per-machine install — that's WinGet's own prompt, not something Agent8088
+requests. No admin rights are needed for the base install.
 
 ## Install
 
