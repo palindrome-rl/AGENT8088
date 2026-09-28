@@ -10,6 +10,8 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#demo">Demo</a> ·
+  <a href="#about">About</a> ·
   <a href="#what-it-does">Features</a> ·
   <a href="#documentation">Documentation</a> ·
   <a href="#contributing">Contributing</a>
@@ -19,9 +21,39 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
   <a href="https://github.com/palindrome-rl/AGENT8088/tree/staging-1.2"><img src="https://img.shields.io/badge/branch-staging--1.2-f59e0b" alt="Staging 1.2 branch"></a>
+  <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux, Windows">
+  <img src="https://img.shields.io/badge/MCP-client%20%2B%20server-8b5cf6" alt="MCP client and server">
 </p>
 
-Agent8088 is a local-first agent for real work: it reads files, runs tools, researches the web, and can make changes only within a permission system you control. Run it against local Ollama or a hosted OpenAI-compatible model, use it from the terminal or a messaging gateway, and extend it with MCP servers, skills, and focused sub-agents.
+## Demo
+
+<p align="center">
+  <a href="assets/demo.mp4">
+    <img src="assets/demo.gif" alt="Agent8088 tour: one-command install, plan and audit, the web UI with live diffs, local OCR, local model sizing, and a plain-text config" width="820">
+  </a>
+</p>
+
+<p align="center"><sub>A 67-second tour. <a href="assets/demo.mp4">Watch the full-quality MP4 with sound ▶</a></sub></p>
+
+## About
+
+Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**. It reads files, runs tools, researches the web and edits code, and every change goes through a permission system you control.
+
+Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
+
+- **Local-first.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR and session history are stored on disk and never uploaded.
+- **Safe by default.** It starts in read-only mode. Writes, network access and shell commands need your approval, run in a native OS sandbox, and are recorded in an audit log. Some safety rules are enforced in code, so a prompt can't switch them off.
+- **One engine, many front ends.** The CLI, the web UI and the messaging gateway (Slack, Discord, WhatsApp, Telegram, email) share one agent loop, one session model and one permission layer.
+- **Open by design.** Works with any OpenAI-compatible provider. It can use external MCP servers and can also serve its own tools over MCP. It supports skills and focused sub-agents, and all settings live in one plain-text config file.
+
+<table>
+  <tr>
+    <td align="center" width="25%"><b>🔒 Safe by default</b><br><sub>Read-only until you approve</sub></td>
+    <td align="center" width="25%"><b>🏠 Local-first</b><br><sub>Ollama, local memory, local OCR</sub></td>
+    <td align="center" width="25%"><b>🧩 Extensible</b><br><sub>MCP, skills, sub-agents</sub></td>
+    <td align="center" width="25%"><b>💬 Everywhere</b><br><sub>CLI, web UI, Slack, Discord, WhatsApp, Telegram, email</sub></td>
+  </tr>
+</table>
 
 ---
 
@@ -67,6 +99,9 @@ the Pages installer URL serves the development channel.
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
+<details>
+<summary><b>What the installer provisions, and supported platforms</b></summary>
+
 **What the installer provisions automatically:**
 
 | Component | Linux / macOS | Windows |
@@ -88,6 +123,8 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Windows Server, legacy Console Host, PowerShell ISE | Not supported | needs a modern terminal host — see `install.ps1`'s terminal check |
 | Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
 | Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
+
+</details>
 
 After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
 `/dump` to produce a bundle for a bug report.
@@ -159,7 +196,8 @@ Agent8088 has three permission modes:
 
 Some actions are blocked in every mode: credential paths, shell startup-file writes, destructive Git operations such as `push` and `reset --hard`, and system-prompt exfiltration. See the [security guide](docs/wiki/03-permissions-and-security.md) for the exact boundaries and configuration.
 
-### CLI-Anything integration *(experimental)*
+<details>
+<summary><b>CLI-Anything integration</b> <i>(experimental)</i></summary>
 
 Agent8088 can use the [HKUDS CLI-Anything](https://github.com/HKUDS/CLI-Anything)
 ecosystem without turning it into a second agent. Agent8088 remains responsible
@@ -179,6 +217,8 @@ Python harness entries; public npm, uv, bundled, and generic shell installers
 remain visible for manual review. After installing a harness, Agent8088 loads
 its packaged `SKILL.md` before execution so application-specific prerequisites
 and command guidance remain available without eagerly expanding the prompt.
+
+</details>
 
 ## CLI and messaging quick reference
 
