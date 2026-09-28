@@ -158,7 +158,7 @@ are in [Configuration](02-configuration.md#api-keys-and-the-env-store).
 
 | Setting | Where |
 |---|---|
-| temperature | `/temp <float>` at runtime |
+| temperature | `/temp <float>` at runtime; `provider.<name>.temperature` in `config.txt` overrides it for one provider |
 | max agent turns | `/maxturns <int>` |
 | `context_window` | `config.txt` — global fallback when the active model has no better value |
 | `max_completion_tokens` | `config.txt` — global output ceiling, sized for long chat answers |
@@ -169,7 +169,8 @@ are in [Configuration](02-configuration.md#api-keys-and-the-env-store).
 override the globals for one provider, and are auto-applied on `/model switch`.
 When neither is set, Agent8088 probes the endpoint for the model's own limits —
 Ollama's `/api/show`, Gemini's native model endpoint, Anthropic's Models API, or
-the non-standard fields some OpenAI-compatible `/v1/models` responses carry —
+the non-standard fields some OpenAI-compatible `/v1/models` responses carry
+(including vLLM's `max_model_len`) —
 and falls back to the globals only when the probe finds nothing. The active
 pair is re-read by every token-limit consumer, so `/doctor` and the context
 meter agree with the wire.

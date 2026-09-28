@@ -6,7 +6,8 @@ in PRs. The GitHub Wiki tab is a *separate* git repository
 (`<repo>.wiki.git`) with different conventions, so publishing is a conversion,
 not a copy:
 
-  - the landing page must be `Home.md`
+  - development pages keep their established names while other channels use
+    distinct namespaces in the shared wiki
   - pages are addressed by name with no `.md`, so every internal link is
     rewritten (`[Tools](04-tools.md)` -> `[Tools](Tools)`)
   - numeric filename prefixes look wrong in the wiki's page list, so they are
@@ -29,7 +30,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = "tayyabimam1/AGENT8088"
+REPO = "palindrome-rl/AGENT8088"
+# The branch these pages are generated from. Source links must point at the
+# branch that produced them, or a reader follows them to different text.
+SOURCE_BRANCH = "development"
+WIKI_PREFIX = ""
 SOURCE_DIR = Path(__file__).resolve().parent.parent / "docs" / "wiki"
 
 # source filename -> wiki page name (no .md). Order defines the sidebar.
@@ -50,6 +55,7 @@ PAGES = [
     ("13-troubleshooting.md", "Troubleshooting"),
     ("14-contributing.md", "Contributing"),
     ("15-faq.md", "FAQ"),
+    ("16-memory.md", "Memory"),
     ("17-docker.md", "Docker"),
 ]
 
@@ -65,6 +71,7 @@ SIDEBAR_SECTIONS = [
         "MCP",
         "Messaging-Gateway",
         "Skills-and-Subagents",
+        "Memory",
         "Docker",
     ]),
     ("Reference", [
@@ -83,9 +90,12 @@ BANNER = (
     "     the next sync — change the source file and open a PR instead. -->\n\n"
 )
 
+SIDEBAR_START = "<!-- agent8088-development:start -->"
+SIDEBAR_END = "<!-- agent8088-development:end -->"
+
 SOURCE_NOTE = (
     "\n\n---\n\n*Source of truth: [`docs/wiki/`](https://github.com/"
-    f"{REPO}/tree/development/docs/wiki) in the main repository. "
+    f"{REPO}/tree/{SOURCE_BRANCH}/docs/wiki) in the main repository. "
     "Edits here are overwritten by the next sync.*\n"
 )
 
@@ -114,16 +124,34 @@ def build_sidebar() -> str:
     if unknown:
         raise SystemExit(f"sync_wiki: sidebar references unknown page(s): {sorted(unknown)}")
 
-    lines = ["### Agent8088 Wiki", ""]
+    lines = [SIDEBAR_START, "", "### Agent8088 Wiki", ""]
     for section, pages in SIDEBAR_SECTIONS:
         lines.append(f"**{section}**")
         lines.append("")
         for page in pages:
             label = "Home" if page == "Home" else page.replace("-", " ")
-            lines.append(f"- [{label}]({page})")
+            lines.append(f"- [{label}]({WIKI_PREFIX}{page})")
         lines.append("")
-    lines.append(f"[Repository](https://github.com/{REPO})")
+    lines.append(f"[Repository](https://github.com/{REPO}/tree/{SOURCE_BRANCH})")
+    lines.extend(["", SIDEBAR_END])
     return "\n".join(lines) + "\n"
+
+
+def update_sidebar(existing: str) -> str:
+    """Insert or replace this channel's block without touching other entries."""
+    block = build_sidebar().rstrip()
+    pattern = re.compile(
+        re.escape(SIDEBAR_START) + r".*?" + re.escape(SIDEBAR_END), re.DOTALL
+    )
+    if pattern.search(existing):
+        return pattern.sub(block, existing).rstrip() + "\n"
+    # The old development publisher owned the entire sidebar and had no
+    # markers. Upgrade that generated sidebar in place, preserving any
+    # independently authored sidebar instead of duplicating the old block.
+    if existing.startswith(BANNER):
+        return BANNER + block + "\n"
+    prefix = existing.rstrip()
+    return (prefix + "\n\n" if prefix else "") + block + "\n"
 
 
 def main() -> int:
@@ -137,14 +165,12 @@ def main() -> int:
         print(f"error: missing source pages: {', '.join(missing)}", file=sys.stderr)
         return 1
 
-    link_map = {src: page for src, page in PAGES}
+    link_map = {src: f"{WIKI_PREFIX}{page}" for src, page in PAGES}
     converted = {}
     for src, page in PAGES:
         text = (SOURCE_DIR / src).read_text(encoding="utf-8")
         body = convert(text, link_map)
-        converted[f"{page}.md"] = BANNER + body.rstrip("\n") + SOURCE_NOTE
-
-    converted["_Sidebar.md"] = BANNER + build_sidebar()
+        converted[f"{WIKI_PREFIX}{page}.md"] = BANNER + body.rstrip("\n") + SOURCE_NOTE
 
     # Any internal .md link that survived conversion is a broken wiki link.
     stale = set()
@@ -157,10 +183,11 @@ def main() -> int:
             print(f"  {item}", file=sys.stderr)
         return 1
 
-    print(f"Converted {len(PAGES)} pages + _Sidebar.md, no broken links.")
+    print(f"Converted {len(PAGES)} pages + sidebar block, no broken links.")
     if args.dry_run:
         for name in converted:
             print(f"  would write {name}")
+        print("  would update _Sidebar.md (preserving all other entries)")
         return 0
 
     workdir = Path(tempfile.mkdtemp(prefix="agent8088-wiki-"))
@@ -176,10 +203,19 @@ def main() -> int:
                   f"first page is saved in the UI.\n{result.stderr}", file=sys.stderr)
             return 1
 
+        # Remove only the pages this script owns. The wiki is shared across
+        # branches -- GitHub gives a repository one wiki, not one per branch --
+        # so deleting every page here would erase anything published beside
+        # these, including another channel's pages, on the next sync.
+        owned = {name for name in converted}
         for existing in clone.glob("*.md"):
-            existing.unlink()
+            if existing.name in owned:
+                existing.unlink()
         for name, body in converted.items():
             (clone / name).write_text(body, encoding="utf-8")
+        sidebar = clone / "_Sidebar.md"
+        previous_sidebar = sidebar.read_text(encoding="utf-8") if sidebar.exists() else ""
+        sidebar.write_text(update_sidebar(previous_sidebar), encoding="utf-8")
 
         subprocess.run(["git", "add", "-A"], cwd=clone, check=True)
         status = subprocess.run(["git", "status", "--porcelain"], cwd=clone,

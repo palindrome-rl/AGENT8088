@@ -5,15 +5,16 @@ with its own uv-managed Python -- about half the task images have no Python,
 and the verifier runs in the same container, so nothing touches the system
 interpreter -- then runs one headless turn per trial.
 
-    PYTHONPATH=bench/terminal-bench harbor run \\
+    PYTHONPATH=test-mode-setting harbor run \\
         -a agent8088_harbor.agent:Agent8088 -m openai/qwen3.8-27b \\
         --ak wheel_path=/abs/path/agent8088-X-py3-none-any.whl \\
         --ak base_url=http://host.docker.internal:8000/v1 --ak budget_sec=870 ...
 
-See bench/terminal-bench/README.md.
+See test-mode-setting/README.md.
 """
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
 from typing import ClassVar
@@ -25,13 +26,17 @@ from harbor.agents.model_connection import ModelConnectionSpec
 from harbor.agents.options import InstalledAgentOptions
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
+from harbor.trial.errors import AgentTimeoutError
 
-from agent8088_harbor.config_edit import budget_edits, config_edit_command
+from agent8088_harbor.config_edit import (
+    budget_edits, config_edit_command, tools_description_command, trace_token_totals)
 
 PREFIX = "/opt/agent8088"
-BENCH_REMOTE = f"{PREFIX}/bench"
-BENCH_LOCAL = Path(__file__).resolve().parent.parent  # bench/terminal-bench
+BENCH_REMOTE = f"{PREFIX}/test-mode-setting"
+BENCH_LOCAL = Path(__file__).resolve().parent.parent  # test-mode-setting
 UV = f"{PREFIX}/uv/uv"
+# Printed by container/run-agent.sh when its watchdog stopped agent8088.
+BUDGET_STOP_LINE = "[agent8088] stopped at the "
 
 
 class Agent8088Options(InstalledAgentOptions):
@@ -49,7 +54,11 @@ class Agent8088Options(InstalledAgentOptions):
 class Agent8088(BaseInstalledAgent):
     options_model = Agent8088Options
     MODEL_CONNECTION = ModelConnectionSpec(default_provider="openai", passthrough=True)
-    # uv + Python + agent8088's dependencies download inside the container.
+    # NOTE: Harbor 0.23.0 does NOT read this attribute; agent setup is capped by
+    # harbor/trial/trial.py _AGENT_SETUP_TIMEOUT_SEC (360 s) times the job's
+    # --agent-setup-timeout-multiplier. run.sh leaves every Harbor multiplier at
+    # its default 1.0, as the Terminus-2 and Pi runs did (setup takes ~50 s).
+    # Kept for documentation; uv + Python + the wheel download inside the container.
     DEFAULT_SETUP_TIMEOUT_SEC: ClassVar[float] = 900.0
 
     @staticmethod
@@ -111,9 +120,34 @@ class Agent8088(BaseInstalledAgent):
         edits.update(budget_edits(options.budget_sec))
         await self.exec_as_root(environment, command=config_edit_command(
             f"{BENCH_REMOTE}/config.txt", edits))
+        # State the task's real shell timeouts in the tool description.
+        await self.exec_as_root(environment, command=tools_description_command(
+            f"{BENCH_REMOTE}/tools.txt", options.budget_sec))
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        pass
+        """Token totals from the trace export, plus run-agent.sh's exit record.
+
+        Runs after Harbor has copied /logs/agent to the host, also after a
+        timeout. Best effort: a missing or unreadable file leaves the field unset.
+        """
+        metadata = {}
+        exit_record = self.logs_dir / "agent8088-exit.json"
+        try:
+            metadata["exit"] = json.loads(exit_record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        traces = sorted(self.logs_dir.glob("agent8088-trace-*.json"))
+        if traces:
+            metadata["trace_file"] = traces[-1].name
+            try:
+                data = json.loads(traces[-1].read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+            totals = trace_token_totals(data) if data is not None else None
+            if totals is not None:
+                context.n_input_tokens, context.n_output_tokens = totals
+        if metadata:
+            context.metadata = metadata
 
     @with_prompt_template
     async def run(self, instruction: str, environment: BaseEnvironment,
@@ -133,8 +167,20 @@ class Agent8088(BaseInstalledAgent):
             "AGENT8088_UNATTENDED": "1",
             "AGENT8088_PERMISSION": "full-auto",
             "AGENT8088_WORKDIR": options.workdir,
+            # show_trace=1 in the profile: put the structured JSON trace where
+            # Harbor collects agent logs, so every trial keeps both the readable
+            # transcript (agent8088.txt) and the machine-readable trajectory.
+            "AGENT8088_TRACE_DIR": "/logs/agent",
         }
         env.setdefault("OPENAI_API_KEY", "EMPTY")
-        await self.exec_as_agent(environment, env=env, command=(
+        result = await self.exec_as_agent(environment, env=env, command=(
             f"{BENCH_REMOTE}/container/run-agent.sh {instruction_path} {int(options.budget_sec)}"
         ))
+        # A watchdog stop exits 0 so the grader still runs; report it to Harbor
+        # as the timeout it is, exactly like an agent Harbor itself timed out.
+        # Harbor records the exception and then grades as usual.
+        stdout = getattr(result, "stdout", None) or ""
+        if BUDGET_STOP_LINE in stdout:
+            by = "its own time limit" if "budget (self)" in stdout else "the watchdog"
+            raise AgentTimeoutError(
+                f"agent8088 stopped by {by} ({int(options.budget_sec)}s in-container budget)")

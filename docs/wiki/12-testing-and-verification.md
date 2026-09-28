@@ -10,6 +10,14 @@ Three layers, all runnable offline with no model backend.
 | Feature verification | `scripts/verify_features.py` | Real behaviour in temp repos and sandboxes |
 | Exhaustive verification | `scripts/verify_everything.py` | Tool specs, shell-classifier matrix, CLI surface |
 
+The optional [Terminal-Bench 2.1 adapter](../../test-mode-setting/README.md)
+is a separate evaluation profile. It installs into disposable task containers,
+uses `--prompt-file` for one unattended turn, and deliberately relaxes some
+ordinary workstation safeguards only when `AGENT8088_DISPOSABLE_CONTAINER=1`.
+Do not set that flag on a normal install. The adapter tests do not constitute
+a full Harbor benchmark run; the benchmark README records what has actually
+been exercised.
+
 ## Prerequisites
 
 Install the sandbox runtime before running anything here:

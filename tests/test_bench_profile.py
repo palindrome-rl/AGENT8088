@@ -1,4 +1,4 @@
-"""The Terminal-Bench profile in bench/terminal-bench/ loads as intended and
+"""The Terminal-Bench profile in test-mode-setting/ loads as intended and
 fits the 32k window it was sized for."""
 import importlib
 
@@ -19,14 +19,14 @@ def _restore_default_engine():
     yield
     from agent8088 import engine
     importlib.reload(engine)
-BENCH = ROOT / "bench" / "terminal-bench"
+BENCH = ROOT / "test-mode-setting"
 
 
 def _load(monkeypatch, tmp_path):
     workspace = tmp_path / "app"
     workspace.mkdir()
     text = (BENCH / "config.txt").read_text(encoding="utf-8")
-    text = text.replace("/opt/agent8088/bench", str(BENCH)).replace("=/app", f"={workspace}")
+    text = text.replace("/opt/agent8088/test-mode-setting", str(BENCH)).replace("=/app", f"={workspace}")
     cfg = tmp_path / "config.txt"
     cfg.write_text(text, encoding="utf-8")
     monkeypatch.setenv("AGENT8088_CONFIG", str(cfg))
@@ -42,7 +42,8 @@ def _load(monkeypatch, tmp_path):
 def test_profile_exposes_only_the_core_tools(monkeypatch, tmp_path):
     e = _load(monkeypatch, tmp_path)
     assert set(e.TOOL_SPECS) == {"execute_shell", "write_file", "edit_file",
-                                 "read_text", "last_output", "read_content"}
+                                 "read_text", "last_output", "read_content",
+                                 "view_image"}
     shell = e.TOOL_SPECS["execute_shell"]
     assert shell["host"] and shell["timeout"] == 600
     assert "timeout" in shell["optional"]
@@ -55,7 +56,8 @@ def test_profile_provider_and_limits(monkeypatch, tmp_path):
     # Every request carries the vLLM server's own sampling defaults, so the
     # agent never silently overrides them (a sent value always wins).
     assert body == {"chat_template_kwargs": {"enable_thinking": True}, "top_p": 0.95,
-                    "top_k": 20, "presence_penalty": 0.0, "frequency_penalty": 0.0}
+                    "top_k": 20, "presence_penalty": 0.0, "frequency_penalty": 0.0,
+                    "reasoning_effort": "medium"}
     assert e.APP_CONFIG["temperature"] == "0.6"
     assert e.MAX_TOOL_TIMEOUT_SECONDS == 1800
 
@@ -75,3 +77,11 @@ def test_profile_uses_native_tool_calls(monkeypatch, tmp_path):
     e = _load(monkeypatch, tmp_path)
     assert e._native_tools_enabled(e.build_tools_def(e.TOOL_SPECS), "vllm")
     assert e.DISPOSABLE_CONTAINER and e.PERMISSION_MODE == "full-auto"
+
+
+def test_profile_records_a_structured_trace(monkeypatch, tmp_path):
+    """show_trace=1 + the adapter's AGENT8088_TRACE_DIR mean every trial keeps
+    a machine-readable trajectory next to the readable transcript."""
+    e = _load(monkeypatch, tmp_path)
+    assert e.APP_CONFIG["show_trace"] == "1"
+    assert e.TOOL_SELECTION == "hybrid"

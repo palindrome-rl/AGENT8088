@@ -39,7 +39,7 @@ _ANSI_OTHER = re.compile(r"\x1b[@-Z\\-_]")
 _REPEAT_FLOOR = 3
 
 ELISION = "[tool result truncated: {dropped} characters elided — {hint}]"
-DEFAULT_HINT = "ask for the middle with last_output"
+DEFAULT_HINT = "ask for the middle with read_content"
 
 
 def strip_ansi(text: str) -> str:
@@ -66,18 +66,28 @@ def denoise(text: str) -> str:
         # real terminal and should not reach the model as separate lines.
         if "\r" in raw:
             raw = raw.rsplit("\r", 1)[-1]
-        lines.append(raw.rstrip())
+        # Trailing spaces are kept: fixed-width records, expected-output files
+        # and `cat -A` checks depend on them. Only a whitespace-only line counts
+        # as blank below.
+        lines.append(raw)
 
     out: list[str] = []
     index = 0
     while index < len(lines):
         line = lines[index]
         run = 1
+        if not line.strip():
+            # Blank lines group with each other even when their (invisible)
+            # whitespace differs, now that trailing spaces are kept.
+            while index + run < len(lines) and not lines[index + run].strip():
+                run += 1
         while index + run < len(lines) and lines[index + run] == line:
             run += 1
 
-        if not line:
-            # Any run of blank lines becomes a single separator.
+        if not line.strip():
+            # Any run of blank or whitespace-only lines becomes one separator.
+            # Trailing spaces are real data (fixed-width records), so a line is
+            # judged blank by strip(), never rewritten to be blank.
             out.append("")
             index += run
             continue

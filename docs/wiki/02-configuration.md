@@ -45,6 +45,8 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.native_tools` | Use the provider's native function-calling API. Defaults to `1` for every provider except `ollama`, which uses the prompt-based convention. |
 | `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
+| `provider.<name>.temperature` | Sampling temperature for one provider; overrides the session value, including `/temp`, on that provider's requests. Useful when a server expects a particular sampling setting. |
+| `provider.<name>.extra_body` | JSON object sent as additional request fields for that provider, such as vLLM `chat_template_kwargs`. Invalid JSON is ignored with a warning. Only configure fields your server accepts. |
 | `fallback_models` | Comma-separated `provider:model` chain, tried on 429/503/connection errors. |
 | `context_window` | Token budget for history trimming. |
 | `max_completion_tokens` | Global output-token ceiling when the active model has no reviewed limit or provider override. |
@@ -73,8 +75,9 @@ takes over:
 | `fusion_panel_max_tokens` | `1200` | Max completion tokens per panel member |
 | `fusion_judge_max_tokens` | `500` | Max completion tokens for the judge |
 
-Sampling: `frequency_penalty`, `presence_penalty` (temperature is a runtime
-setting — `/temp`). Details in [Model Providers](05-model-providers.md).
+Sampling: `frequency_penalty`, `presence_penalty`, and `/temp` for the session
+temperature. A `provider.<name>.temperature` setting takes precedence for that
+provider. Details in [Model Providers](05-model-providers.md).
 
 ## Security
 

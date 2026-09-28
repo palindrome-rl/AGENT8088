@@ -118,6 +118,43 @@ def test_escalated_and_malformed_calls_do_not_use_up_the_cap(monkeypatch):
     assert not any("Search limit reached" in p for p in prompts)
 
 
+def test_malformed_round_does_not_leak_into_the_next_round(monkeypatch):
+    """A round with BOTH a malformed call and an executed one must not leave
+    malformed_round set for the next round. If it leaks, the next no-progress
+    round wrongly takes the malformed-retry branch and skips the "stop
+    repeating" nudge that would otherwise be queued for the model."""
+    responses = iter([
+        _response('✿FUNCTION✿: web_search ✿ARGS✿: {}\n'
+                   '✿FUNCTION✿: web_search ✿ARGS✿: {"query": "q1"}'),
+        _response('✿FUNCTION✿: web_search ✿ARGS✿: {"query": "q1"}'),  # cached repeat
+        _response('✿FUNCTION✿: web_search ✿ARGS✿: {"query": "q1"}'),  # cached repeat
+        _response("done"),
+    ])
+    prompts_per_call = []
+
+    def completion(messages, *_a, **_k):
+        prompts_per_call.append([str(m.get("content") or "") for m in messages])
+        return next(responses)
+
+    def run_tool(name, args, **_kwargs):
+        if not args.get("query"):
+            return "Error: web_search requires 'query'."
+        return RESULT
+
+    monkeypatch.setattr(A, "_native_tools_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr(A, "run_tool", run_tool)
+    monkeypatch.setattr(A, "_create_completion_with_fallback", completion)
+
+    A.run_agent(
+        [{"role": "user", "content": "la liga current ranking?"}], max_turns=6,
+        system_prompt="", allowed_tools={"web_search"}, memory_capture=False,
+    )
+
+    # Prompt for turn 3 (index 2) is built after turn 2's cached-repeat round
+    # -- the round the leaked flag used to hijack.
+    assert any("You keep repeating tool calls" in p for p in prompts_per_call[2])
+
+
 def test_a_cached_repeat_does_not_use_up_the_cap(monkeypatch):
     replies = [_search("la liga table"), _search("table la liga"),
                _search("la liga standings"), _response("done")]
