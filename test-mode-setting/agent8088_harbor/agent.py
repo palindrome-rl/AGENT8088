@@ -5,12 +5,12 @@ with its own uv-managed Python -- about half the task images have no Python,
 and the verifier runs in the same container, so nothing touches the system
 interpreter -- then runs one headless turn per trial.
 
-    PYTHONPATH=bench/terminal-bench harbor run \\
+    PYTHONPATH=test-mode-setting harbor run \\
         -a agent8088_harbor.agent:Agent8088 -m openai/qwen3.8-27b \\
         --ak wheel_path=/abs/path/agent8088-X-py3-none-any.whl \\
         --ak base_url=http://host.docker.internal:8000/v1 --ak budget_sec=870 ...
 
-See bench/terminal-bench/README.md.
+See test-mode-setting/README.md.
 """
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ from harbor.models.agent.context import AgentContext
 from agent8088_harbor.config_edit import budget_edits, config_edit_command
 
 PREFIX = "/opt/agent8088"
-BENCH_REMOTE = f"{PREFIX}/bench"
-BENCH_LOCAL = Path(__file__).resolve().parent.parent  # bench/terminal-bench
+BENCH_REMOTE = f"{PREFIX}/test-mode-setting"
+BENCH_LOCAL = Path(__file__).resolve().parent.parent  # test-mode-setting
 UV = f"{PREFIX}/uv/uv"
 
 

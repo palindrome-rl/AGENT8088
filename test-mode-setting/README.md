@@ -51,7 +51,7 @@ On the GPU machine, with vLLM already serving `qwen3.8-27b` on port 8000:
 uv tool install harbor
 git clone https://github.com/harbor-framework/terminal-bench-2-1.git
 uv build --wheel -o dist                    # in this repository
-bench/terminal-bench/run.sh --tb terminal-bench-2-1 --wheel dist/agent8088-*.whl
+test-mode-setting/run.sh --tb terminal-bench-2-1 --wheel dist/agent8088-*.whl
 ```
 
 Options:

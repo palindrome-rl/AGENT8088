@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs inside the Terminal-Bench task container. Uploaded by the Harbor adapter
-# to /opt/agent8088/bench/container/run-agent.sh and invoked once per trial.
+# to /opt/agent8088/test-mode-setting/container/run-agent.sh and invoked once per trial.
 #
 #   run-agent.sh <instruction-file> [budget-seconds]
 #

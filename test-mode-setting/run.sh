@@ -2,9 +2,9 @@
 # Run agent8088 on Terminal-Bench 2.1 tasks with Harbor, one task at a time
 # (vLLM runs with --max-num-seqs 1).
 #
-#   bench/terminal-bench/run.sh --tb /path/to/terminal-bench-2-1 --wheel dist/agent8088-*.whl \
+#   test-mode-setting/run.sh --tb /path/to/terminal-bench-2-1 --wheel dist/agent8088-*.whl \
 #       [--base-url http://host.docker.internal:8000/v1] [--model qwen3.8-27b] \
-#       [--tasks bench/terminal-bench/tasks.txt] [--attempts 1] [--jobs-dir jobs]
+#       [--tasks test-mode-setting/tasks.txt] [--attempts 1] [--jobs-dir jobs]
 #
 # Each task gets its own `harbor run` so the in-container watchdog can use that
 # task's agent timeout (task.toml) minus a margin.

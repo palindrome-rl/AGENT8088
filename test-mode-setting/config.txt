@@ -42,9 +42,9 @@ open_code_review_enabled=0
 subagent_max_depth=0
 
 # --- Tools: trimmed list, shell runs directly in the task container ---
-tools_file=/opt/agent8088/bench/tools.txt
-system_file=/opt/agent8088/bench/system.md
-skills_dir=/opt/agent8088/bench/skills
+tools_file=/opt/agent8088/test-mode-setting/tools.txt
+system_file=/opt/agent8088/test-mode-setting/system.md
+skills_dir=/opt/agent8088/test-mode-setting/skills
 tool_host.execute_shell=1
 # Defaults only: the Harbor adapter rewrites these per task from its time
 # budget (agent8088_harbor/config_edit.py:budget_edits), together with

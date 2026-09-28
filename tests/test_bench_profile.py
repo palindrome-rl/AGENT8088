@@ -1,4 +1,4 @@
-"""The Terminal-Bench profile in bench/terminal-bench/ loads as intended and
+"""The Terminal-Bench profile in test-mode-setting/ loads as intended and
 fits the 32k window it was sized for."""
 import importlib
 
@@ -19,14 +19,14 @@ def _restore_default_engine():
     yield
     from agent8088 import engine
     importlib.reload(engine)
-BENCH = ROOT / "bench" / "terminal-bench"
+BENCH = ROOT / "test-mode-setting"
 
 
 def _load(monkeypatch, tmp_path):
     workspace = tmp_path / "app"
     workspace.mkdir()
     text = (BENCH / "config.txt").read_text(encoding="utf-8")
-    text = text.replace("/opt/agent8088/bench", str(BENCH)).replace("=/app", f"={workspace}")
+    text = text.replace("/opt/agent8088/test-mode-setting", str(BENCH)).replace("=/app", f"={workspace}")
     cfg = tmp_path / "config.txt"
     cfg.write_text(text, encoding="utf-8")
     monkeypatch.setenv("AGENT8088_CONFIG", str(cfg))
