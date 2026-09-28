@@ -8998,6 +8998,29 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             return efficiency.tool_error("repository_read_failed", str(exc),
                 "Check source, filters, dependency installation and permissions; retry overview after changes.", recoverable=True)
 
+    # --- Layer 0: images (#21) ---
+    # Attaches a local or remote image to the next model message. The tool
+    # result itself is a marker; the agent loop swaps it for the real
+    # multimodal message (see _IMAGE_MARKER_PREFIX), so the image never
+    # reaches non-vision UIs as base64 text.
+    if mode == "image":
+        ref = str(args.get("path") or "").strip()
+        if not ref:
+            return _tool_arg_missing_error(name, "path")
+        try:
+            message = build_image_message(
+                f"Tool result ({name}): {ref} is attached to this message.",
+                [ref])
+        except ValueError as exc:
+            return efficiency.tool_error("image_unavailable", str(exc),
+                "Check the path, the file type (png/jpg/gif/webp/bmp) and the "
+                "size limit, then retry.", recoverable=True)
+        except Exception as exc:  # provider/encoding refusal
+            return efficiency.tool_error("image_failed", str(exc),
+                "The image could not be attached for this model.", recoverable=True)
+        import json as _json
+        return _IMAGE_MARKER_PREFIX + _json.dumps({"message": message})
+
     # --- Layer 1: Sensitive file read protection (before anything else) ---
     read_target = None
     if mode == "read_text":
@@ -12191,6 +12214,9 @@ def _reuse_known_verdict(command: str) -> str:
 # Every tool result the loop feeds back starts with this. It is the marker that
 # separates "the human said it" from "a web page said it".
 _TOOL_RESULT_PREFIX = "Tool result ("
+# view_image returns this marker instead of text; the agent loop replaces it
+# with a multimodal message carrying the actual image part (#21).
+_IMAGE_MARKER_PREFIX = "IMAGE\x1f"
 # Everything the LOOP says to the model wears this. Tool results already had a
 # marker; the loop's own nudges -- plan-mode blocks, repeat warnings, permission
 # outcomes, "give your final answer now" -- did not, so `_genuine_user_turns`
@@ -13188,19 +13214,19 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 on_result("error", warning)
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
-            if length_retries < 2:
-                length_retries += 1
-                messages.append(_harness_turn((
-                    retry_instruction if length_retries == 1 else
-                    "Your last two responses reached the output limit. Reply within 200 tokens "
-                    "with exactly one complete tool call or a final answer. Do not include analysis "
-                    "or thinking."
-                )))
-                continue
-            answer = _guard_answer(warning)
-            if on_answer:
-                on_answer(answer)
-            return answer
+            # Never end the run on cut-offs: a model that overruns its output
+            # limit is told to reply briefly and the run carries on, bounded by
+            # its turn and time budget -- the same behaviour as comparable
+            # agents, which retry until their clock runs out rather than giving
+            # up with time left (#18).
+            length_retries += 1
+            messages.append(_harness_turn((
+                retry_instruction if length_retries == 1 else
+                "Your last responses reached the output limit. Reply within 200 tokens "
+                "with exactly one complete tool call or a final answer. Do not include analysis "
+                "or thinking."
+            )))
+            continue
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -13520,6 +13546,23 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
+            if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):
+                # view_image (#21): hand the model the actual image part. The
+                # marker never reaches the message list as text.
+                import json as _json
+                try:
+                    result_message = _json.loads(
+                        result[len(_IMAGE_MARKER_PREFIX):])["message"]
+                except (ValueError, KeyError):
+                    result_message = _harness_turn(
+                        "Error: the attached image could not be delivered.")
+                messages.append(result_message)
+                if on_result:
+                    on_result(name, "[image attached]")
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "image_attached", "tool": name})
+                executed = executed or not no_progress
+                continue
             if (PERMISSION_MODE == "plan-only"
                     and result.startswith("Error: plan mode")):
                 plan_mutation_retries += 1
