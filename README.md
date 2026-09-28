@@ -33,8 +33,6 @@
   </a>
 </p>
 
-<p align="center"><sub>A 67-second tour. <a href="assets/demo.mp4">Watch the full-quality MP4 with sound ▶</a></sub></p>
-
 ## About
 
 Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**. It reads files, runs tools, researches the web and edits code, and every change goes through a permission system you control.
