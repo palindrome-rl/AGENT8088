@@ -3551,6 +3551,61 @@ def run_memory_setup():
     return 0
 
 
+def _libreoffice_install_command():
+    """The system package-manager command that installs LibreOffice here, or
+    None. Same package sources as install.sh / install.ps1's opt-in stage."""
+    if sys.platform == "win32":
+        if shutil.which("winget"):
+            return ["winget", "install", "--id", "TheDocumentFoundation.LibreOffice",
+                    "--exact", "--silent", "--accept-package-agreements",
+                    "--accept-source-agreements"]
+        return None
+    if sys.platform == "darwin":
+        return ["brew", "install", "--cask", "libreoffice"] if shutil.which("brew") else None
+    sudo = [] if os.geteuid() == 0 or not shutil.which("sudo") else ["sudo"]
+    for tool, args in (("apt-get", ["install", "-y", "libreoffice"]),
+                       ("dnf", ["install", "-y", "libreoffice"]),
+                       ("pacman", ["-S", "--noconfirm", "libreoffice-fresh"])):
+        if shutil.which(tool):
+            return sudo + [tool] + args
+    return None
+
+
+def run_libreoffice_setup():
+    """`agent8088 --libreoffice-setup`: add LibreOffice to an existing install.
+
+    LibreOffice is opt-in in both installers (~350 MB, the slowest optional
+    stage), so this is the one-command way to add it later -- the same shape
+    as --memory-setup. Runs attached to the terminal so sudo/UAC prompts and
+    package-manager progress are visible; success is judged by soffice being
+    findable afterwards, not by the exit code alone.
+    """
+    from agent8088.documents import _soffice_executable
+    if _soffice_executable():
+        print(f"LibreOffice is already installed: {_soffice_executable()}")
+        return 0
+    cmd = _libreoffice_install_command()
+    if cmd is None:
+        print("No supported package manager found (winget, brew, apt-get, dnf, pacman).")
+        print("Install LibreOffice manually from https://www.libreoffice.org/download/")
+        return 1
+    print(f"Installing LibreOffice (~350 MB, can take several minutes): {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Installation failed: {exc}")
+    found = _soffice_executable()
+    if not found:
+        print("LibreOffice was not found after the install. Install it manually from "
+              "https://www.libreoffice.org/download/ or rerun the installer with "
+              "--with-libreoffice / -WithLibreOffice.")
+        return 1
+    print(f"LibreOffice installed: {found}")
+    print("Document conversion (convert_document), legacy .doc/.ppt/.xls and "
+          "formula recalculation are now available.")
+    return 0
+
+
 def _reinstall_package(package: str) -> tuple[bool, str]:
     """Force-reinstall `package` into the interpreter currently running this
     process. Tries pip first -- it works whether the venv is stdlib-created or a
@@ -8134,6 +8189,8 @@ def main():
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
     parser.add_argument("--memory-setup", action="store_true",
                         help="install the mem0 memory backend and make it the default engine")
+    parser.add_argument("--libreoffice-setup", action="store_true",
+                        help="install LibreOffice for document conversion, legacy Office formats and formula recalculation")
     parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp/Discord/Email/Telegram) instead of the REPL")
     parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp/Discord/Email/Telegram messaging gateways, then exit")
     parser.add_argument("--web", action="store_true",
@@ -8206,6 +8263,8 @@ def main():
         return 0 if A.native_sandbox_verified() else 1
     if args.memory_setup:
         return run_memory_setup()
+    if args.libreoffice_setup:
+        return run_libreoffice_setup()
     if args.prompt_file:
         return _run_prompt_file(args.prompt_file)
     # Resolve web_search_provider=auto once, here: every path below this line

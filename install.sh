@@ -237,8 +237,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-setup          Skip interactive setup wizard"
             echo "  --branch NAME         Git branch to install (default: $REPO_BRANCH)"
             echo "  --memory BACKEND      Memory engine: native (default) or mem0"
-            echo "  --with-libreoffice    Install LibreOffice (docx/pptx/xlsx conversion)"
-            echo "  --skip-libreoffice    Don't install LibreOffice"
+            echo "  --with-libreoffice    Also install LibreOffice (off by default; docx/pptx/xlsx conversion)"
+            echo "  --skip-libreoffice    Don't install LibreOffice (the default)"
             echo "  -h, --help            Show this help"
             exit 0
             ;;
@@ -323,8 +323,9 @@ resolve_memory_choice() {
 #
 # Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading, and
 # Excel formula recalculation (see documents.py's _soffice_executable). It is
-# the slowest optional stage here by a wide margin, so it asks first, same as
-# mem0 above and Install-LibreOffice in install.ps1.
+# the slowest optional stage here by a wide margin, so it is opt-in only:
+# --with-libreoffice or AGENT8088_INSTALL_LIBREOFFICE=1, or later
+# `agent8088 --libreoffice-setup`. Same contract as install.ps1.
 resolve_libreoffice_choice() {
     if [ -n "$LIBREOFFICE_CHOICE" ]; then
         echo "$LIBREOFFICE_CHOICE"
@@ -332,30 +333,8 @@ resolve_libreoffice_choice() {
     fi
     case "${AGENT8088_INSTALL_LIBREOFFICE:-}" in
         1|y|yes|true)  echo "true"; return ;;
-        0|n|no|false)  echo "false"; return ;;
     esac
-    if [ "$DISTRO" = "termux" ]; then
-        echo "false"  # no LibreOffice build for Android
-        return
-    fi
-    if ! _can_prompt || [ -n "${CI:-}" ]; then
-        echo "false"
-        return
-    fi
-    {
-        echo ""
-        echo "    LibreOffice is optional (~350 MB+) and can take several minutes to"
-        echo "    download and install."
-        echo "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls"
-        echo "    reading, and Excel formula recalculation. Skipping is safe."
-    } >&2
-    local answer=""
-    while [ "$answer" != "yes" ] && [ "$answer" != "no" ]; do
-        answer="$(_read_from_terminal "Install LibreOffice now? [yes/no]: ")"
-        [ -z "$answer" ] && continue
-        answer="$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-    done
-    [ "$answer" = "yes" ] && echo "true" || echo "false"
+    echo "false"
 }
 
 # Best-effort install: macOS via Homebrew cask, Linux via the distro's package
@@ -1941,7 +1920,7 @@ verify_install() {
     if [ "$LIBREOFFICE_INSTALLED" = true ]; then
         echo "  Office:   LibreOffice ready (docx/pptx/xlsx conversion)"
     else
-        echo "  Office:   LibreOffice not installed (rerun with --with-libreoffice)"
+        echo "  Office:   LibreOffice not installed (add it with: agent8088 --libreoffice-setup)"
     fi
     if [ "$REPOSITORY_INSTALLED" = true ]; then
         echo "  Repos:    repository_read ready (bounded repository overviews)"
