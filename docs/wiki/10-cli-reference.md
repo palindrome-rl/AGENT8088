@@ -12,6 +12,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
                  [--uninstall] [--workspace] [--all] [--yes]
                  [--non-interactive] [--dry-run]
                  [--update] [--force] [--setup] [--model-setup] [--sandbox-setup] [--memory-setup]
+                 [--libreoffice-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
                  [--web] [--web-port PORT] [--web-host HOST] [--web-dev]
@@ -29,6 +30,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--model-setup` | Configure a model provider profile |
 | `--sandbox-setup` | Install the native sandbox runtime |
 | `--memory-setup` | Install the mem0 memory backend deps and set `memory_engine=mem0`; switch back with `/memory engine native` |
+| `--libreoffice-setup` | Install LibreOffice (via winget/brew/apt-get/dnf/pacman, whichever is available) for document conversion, legacy Office formats, and formula recalculation |
 | `--gateway` | Run the messaging gateway instead of the REPL |
 | `--gateway-setup` | Configure gateway channels, then exit |
 | `--mcp-serve` | Run as an MCP server |

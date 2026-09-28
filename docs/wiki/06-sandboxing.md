@@ -12,7 +12,7 @@ command can't reach your whole filesystem or network.
 | Value | Behaviour |
 |---|---|
 | `auto` *(default)* | Native runtime first, Docker if it is missing or fails its one-time probe, otherwise refuse execution |
-| `native` | Force the free OS-level sandbox |
+| `native` | Force the free OS-level sandbox (if it is installed but fails its probe, Docker is used when available, otherwise execution is refused) |
 | `docker` | Force the Docker fallback |
 
 Check what's active:
@@ -103,20 +103,17 @@ Worth being precise, because it's easy to over-trust:
 
 ## Interaction with git tools
 
-Under the native sandbox, `git status` / `git diff` / `git log` run without a
-prompt. If no sandbox is available they are refused; `git show HEAD:.env` is
-separately blocked outright in every backend.
+`git status` / `git diff` / `git log` typed through `execute_shell` are
+sandboxed like any other command, and are refused when no sandbox is available.
+The dedicated `git_*` tools are host tools (`host=1` in `tools.txt`): they run
+on the host regardless of backend and are gated by the permission layer
+instead (in `readonly`, `git_status`/`git_diff`/`git_log` ask first).
+`git show HEAD:.env` is separately blocked outright in every backend.
 
 ## Verifying it works
 
-```sh
-VERIFY_HOME="$(mktemp -d)"
-AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" \
-  python scripts/verify_features.py
-rm -rf -- "$VERIFY_HOME"
-```
-
-Section 3 covers sandboxing and reports the resolved backend. If the native
-runtime isn't installed or cannot pass its probe you get an explicit `⊘ SKIP`
-naming the missing dependency or failed backend rather than a silent pass — see
+Run `/sandbox` in the REPL: it reports the resolved backend and whether native
+isolation is `verified`, `unverified` or `failed`. The feature-verification
+script (`scripts/verify_features.py`) and the test suite live on the
+`development` branch, not in staging releases — see
 [Testing & Verification](12-testing-and-verification.md).
