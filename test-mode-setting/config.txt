@@ -34,6 +34,12 @@ max_turns=150
 dynamic_turns_ceiling_multiplier=1
 # Compact well before prompt + 8192 output reaches 32k.
 compaction_threshold_pct=55
+# Measured chars-per-token for this content is 2.9-3.3; 2.8 errs on the safe
+# side so compaction fires before a request can overflow the 32k window.
+chars_per_token=2.8
+# Match what Terminus-2 shows per observation: first 5,000 + last 5,000 bytes.
+tool_result_max_chars=10000
+read_content_window_chars=10000
 tool_selection=full
 memory=0
 plan_audit=0

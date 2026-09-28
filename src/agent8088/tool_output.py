@@ -66,7 +66,7 @@ def denoise(text: str) -> str:
         # real terminal and should not reach the model as separate lines.
         if "\r" in raw:
             raw = raw.rsplit("\r", 1)[-1]
-        lines.append(raw.rstrip())
+        lines.append(raw)
 
     out: list[str] = []
     index = 0
@@ -76,8 +76,10 @@ def denoise(text: str) -> str:
         while index + run < len(lines) and lines[index + run] == line:
             run += 1
 
-        if not line:
-            # Any run of blank lines becomes a single separator.
+        if not line.strip():
+            # Any run of blank or whitespace-only lines becomes one separator.
+            # Trailing spaces are real data (fixed-width records), so a line is
+            # judged blank by strip(), never rewritten to be blank.
             out.append("")
             index += run
             continue
