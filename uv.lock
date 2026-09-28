@@ -16,7 +16,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent8088"
-version = "0.2.0"
+version = "0.2.3"
 source = { editable = "." }
 dependencies = [
     { name = "browser-use", marker = "python_full_version >= '3.11'" },

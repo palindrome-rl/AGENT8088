@@ -64,6 +64,7 @@ def test_truncation_is_announced_in_the_middle_with_a_count(engine):
     assert "characters elided" in marker
     # The exact count is pinned in test_tool_output; what matters here is that
     # the marker names a retrieval route for the part that was dropped.
+    # last_output was renamed read_content; the hint names the current tool.
     assert "read_content" in marker and "ref=" in marker
 
 
@@ -81,6 +82,13 @@ def test_document_read_is_still_exempt(engine):
     shown = engine._tool_result_for_model("document_read", payload)
     assert shown.startswith(payload)
     assert "use read_content with ref=" in shown
+    assert "[content ref=" in shown[len(payload):]
+
+
+def test_a_cut_file_read_says_the_rest_is_missing_not_the_middle(engine):
+    shown = engine._tool_result_for_model("read_text", "z" * 10_000)
+    assert "returns the rest" in shown and "offset=3000" in shown
+    assert "returns the middle" not in shown
 
 
 def test_skill_payload_keeps_its_larger_allowance(engine):

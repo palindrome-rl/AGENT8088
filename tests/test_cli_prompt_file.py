@@ -49,3 +49,40 @@ def test_prompt_file_outside_container_still_verifies_sandbox(cli, monkeypatch, 
 def test_missing_prompt_file_exits_2(cli, monkeypatch, tmp_path):
     rc, seen = _run(cli, monkeypatch, ["--prompt-file", str(tmp_path / "nope.md")])
     assert rc == 2 and seen == []
+
+
+def test_prompt_file_starts_trace_export_when_show_trace_is_on(cli, monkeypatch, tmp_path):
+    """show_trace=1 must work headlessly: the REPL's _start_trace_export call is
+    on a path --prompt-file returns before, so the one-shot run starts it too."""
+    prompt = tmp_path / "instruction.md"
+    prompt.write_text("do the thing", encoding="utf-8")
+    trace_dir = tmp_path / "traces"
+    monkeypatch.setenv("AGENT8088_TRACE_DIR", str(trace_dir))
+    monkeypatch.setattr(cli.S, "show_trace", True)
+    monkeypatch.setattr(cli.A, "DISPOSABLE_CONTAINER", True)
+    started = []
+    real_start = cli._start_trace_export
+
+    def spy():
+        started.append(True)
+        return real_start()
+
+    monkeypatch.setattr(cli, "_start_trace_export", spy)
+    rc, seen = _run(cli, monkeypatch, ["--prompt-file", str(prompt)])
+    assert rc == 0 and seen == ["do the thing"] and started == [True]
+    exports = list(trace_dir.glob("agent8088-trace-*.json"))
+    assert len(exports) == 1, exports
+
+
+def test_prompt_file_leaves_trace_off_by_default(cli, monkeypatch, tmp_path):
+    prompt = tmp_path / "instruction.md"
+    prompt.write_text("do the thing", encoding="utf-8")
+    trace_dir = tmp_path / "traces"
+    monkeypatch.setenv("AGENT8088_TRACE_DIR", str(trace_dir))
+    monkeypatch.setattr(cli.S, "show_trace", False)
+    monkeypatch.setattr(cli.A, "DISPOSABLE_CONTAINER", True)
+    monkeypatch.setattr(cli, "_start_trace_export",
+                        lambda: pytest.fail("trace must stay off by default"))
+    rc, seen = _run(cli, monkeypatch, ["--prompt-file", str(prompt)])
+    assert rc == 0 and seen == ["do the thing"]
+    assert not trace_dir.exists()

@@ -66,6 +66,9 @@ def denoise(text: str) -> str:
         # real terminal and should not reach the model as separate lines.
         if "\r" in raw:
             raw = raw.rsplit("\r", 1)[-1]
+        # Trailing spaces are kept: fixed-width records, expected-output files
+        # and `cat -A` checks depend on them. Only a whitespace-only line counts
+        # as blank below.
         lines.append(raw)
 
     out: list[str] = []
@@ -73,6 +76,11 @@ def denoise(text: str) -> str:
     while index < len(lines):
         line = lines[index]
         run = 1
+        if not line.strip():
+            # Blank lines group with each other even when their (invisible)
+            # whitespace differs, now that trailing spaces are kept.
+            while index + run < len(lines) and not lines[index + run].strip():
+                run += 1
         while index + run < len(lines) and lines[index + run] == line:
             run += 1
 

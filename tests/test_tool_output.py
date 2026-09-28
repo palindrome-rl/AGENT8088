@@ -36,8 +36,9 @@ def test_runs_of_blank_lines_collapse_to_one():
 
 
 def test_trailing_whitespace_is_kept():
-    # Fixed-width records and exact `cat` output are spacing-sensitive; only
-    # colour codes, progress bars and repeated/blank lines are cleaned.
+    # Changed in 0.2.3 (BUG_REPORT.md #5): stripping it corrupted fixed-width
+    # records and exact-output checks the model was reading. Only a trailing
+    # newline at the very end is still dropped.
     assert tool_output.denoise("a   \nb\t\n") == "a   \nb\t"
 
 
