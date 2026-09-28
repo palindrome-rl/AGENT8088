@@ -1958,12 +1958,23 @@ def _flush_memory_capture(timeout=MEMORY_FLUSH_SECONDS):
 
 
 def _await_memory_capture(stored_ref):
-    """Report completed capture or defer it; never wait before accepting input."""
+    """Finish the turn's memory save before the prompt returns.
+
+    The store is part of answering "remember this": the prompt must not come
+    back while the fact is still unsaved, or the user's next message reports
+    the save that their last one asked for. A local extraction call routinely
+    takes 15-20s; the join is bounded by MEMORY_FLUSH_SECONDS so a wedged
+    call cannot freeze the session, and a capture that outlives it is still
+    reported later, marked (from your previous message), rather than dropped.
+    """
     if S.memory_notifications == "off":
         return
     # Drain anything owed from earlier turns first, so reports stay in order.
     _report_pending_capture()
     thread = A.memory_capture_thread
+    if thread is not None and thread.is_alive():
+        console.print("[dim]⏺ memory · saving…[/dim]")
+        thread.join(MEMORY_FLUSH_SECONDS)
     if thread is not None and thread.is_alive():
         _pending_captures.append((thread, stored_ref))
         return
