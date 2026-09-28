@@ -103,3 +103,23 @@ docs/superpowers/
 # Staging publishes runtime code without the development-only Python suite.
 # The suite remains tracked on the development branch.
 /tests/
+# Tool caches and coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+# Raw recordings dropped in the repo root (assets/demo.mp4 stays tracked)
+/*.mp4
+/*.mov
+# Env variants
+.env.*
+!.env.example
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+# Web build output
+web/dist/
