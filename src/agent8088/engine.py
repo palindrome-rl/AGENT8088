@@ -1227,6 +1227,17 @@ def _git_read_targets_sensitive_file(command: str) -> bool:
     return False
 
 
+# LibreOffice is opt-in (~350 MB, per-machine, may raise UAC/sudo): only the user
+# installs it, via `agent8088 --libreoffice-setup`. Seen live: told it was
+# missing, the model ran that command itself through execute_shell.
+_LIBREOFFICE_INSTALL_RE = re.compile(
+    r"--libreoffice-setup"
+    r"|\b(?:winget|choco|scoop|brew|apt|apt-get|dnf|yum|pacman|zypper|snap|flatpak)\b"
+    r"[^\n;&|]*\blibreoffice",
+    re.IGNORECASE,
+)
+
+
 def _shell_targets_credential_path(command: str) -> bool:
     """Refuse shell access to the same protected paths as file tools.
 
@@ -9340,6 +9351,13 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         )
     if remote_git_approved:
         _remote_git_grant = False
+
+    if mode == "shell" and _LIBREOFFICE_INSTALL_RE.search(command or ""):
+        _audit("tool_call", tool=name, mode=mode, decision="denied",
+               detail=command[:200], reason="libreoffice_install")
+        return ("Blocked: installing LibreOffice is the user's decision, not the agent's "
+                "(~350 MB, may need admin). Do not retry or work around this. Tell the user "
+                "to run `agent8088 --libreoffice-setup` themselves, then stop.")
 
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         _audit("tool_call", tool=name, mode=mode, decision="denied",

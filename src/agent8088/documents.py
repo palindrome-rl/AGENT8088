@@ -514,7 +514,9 @@ def convert_document(path, target_format: str, timeout: int = 60) -> str:
     soffice = _soffice_executable()
     if not soffice:
         return ("LibreOffice is not installed, so conversion is unavailable. "
-                 "Install it with: agent8088 --libreoffice-setup, then try again.")
+                 "Do not install it yourself. Tell the user to run "
+                 "`agent8088 --libreoffice-setup` in their own terminal and ask again "
+                 "afterwards, then stop.")
 
     if not path.exists():
         return f"Cannot convert: {path} does not exist."
