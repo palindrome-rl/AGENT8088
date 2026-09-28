@@ -35,8 +35,11 @@ def test_runs_of_blank_lines_collapse_to_one():
     assert tool_output.denoise("a\n\n\n\n\n\nb") == "a\n\nb"
 
 
-def test_trailing_whitespace_goes_away():
-    assert tool_output.denoise("a   \nb\t\n") == "a\nb"
+def test_trailing_whitespace_is_kept():
+    # Changed in 0.2.3 (BUG_REPORT.md #5): stripping it corrupted fixed-width
+    # records and exact-output checks the model was reading. Only a trailing
+    # newline at the very end is still dropped.
+    assert tool_output.denoise("a   \nb\t\n") == "a   \nb\t"
 
 
 def test_already_clean_text_is_unchanged():
