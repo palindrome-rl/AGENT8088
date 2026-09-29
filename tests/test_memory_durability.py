@@ -136,3 +136,64 @@ def test_a_stream_that_cannot_be_reconfigured_is_left_alone():
     from agent8088 import cli
 
     cli._force_utf8_streams(io.StringIO(), None, object())
+
+
+# -- the "saving" indicator is transient -------------------------------------
+
+def _terminal_console(monkeypatch):
+    from rich.console import Console
+    from agent8088 import cli
+
+    out = io.StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=out, force_terminal=True, width=100))
+    return out
+
+
+def _saving_line_was_erased(text):
+    """The saving text must be followed by an erase-line before anything else."""
+    tail = text[text.rindex("saving"):]
+    return "\x1b[2K" in tail
+
+
+def test_the_turn_end_saving_line_is_erased_once_the_save_finishes(monkeypatch):
+    """`⏺ memory · saving…` stayed in the scrollback above `stored 1 new memory`.
+
+    It was a plain console.print before the join, so nothing could clear it.
+    """
+    from agent8088 import cli
+
+    out = _terminal_console(monkeypatch)
+    stored = []
+
+    def capture():
+        time.sleep(0.3)
+        stored.append({"text": "user prefers tabs"})
+
+    thread = threading.Thread(target=capture, daemon=True)
+    thread.start()
+    monkeypatch.setattr(cli.S, "memory_notifications", "on")
+    monkeypatch.setattr(cli.A, "memory_capture_thread", thread, raising=False)
+    monkeypatch.setattr(cli, "_pending_captures", [])
+
+    cli._await_memory_capture(stored)
+
+    text = out.getvalue()
+    assert "saving" in text
+    assert _saving_line_was_erased(text), repr(text)
+    assert "new memory" in text[text.rindex("saving"):]
+
+
+def test_the_exit_saving_line_is_erased_once_the_save_finishes(monkeypatch):
+    from agent8088 import cli
+
+    out = _terminal_console(monkeypatch)
+    thread = threading.Thread(target=time.sleep, args=(0.3,), daemon=True)
+    thread.start()
+    monkeypatch.setattr(cli.A, "memory_capture_thread", thread, raising=False)
+    monkeypatch.setattr(cli, "_pending_captures", [])
+
+    cli._flush_memory_capture(timeout=5.0)
+
+    text = out.getvalue()
+    assert "saving" in text
+    assert _saving_line_was_erased(text), repr(text)

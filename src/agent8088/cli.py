@@ -1997,8 +1997,10 @@ def _flush_memory_capture(timeout=MEMORY_FLUSH_SECONDS):
     thread = getattr(A, "memory_capture_thread", None)
     if thread is None or not thread.is_alive():
         return
-    console.print("[dim]saving memory…[/dim]")
-    thread.join(timeout)
+    # A transient spinner, not a printed line: it clears itself once the join
+    # returns instead of staying in the scrollback above the result.
+    with status_cm("saving memory…"):
+        thread.join(timeout)
     if thread.is_alive():
         console.print("[yellow]memory is still saving — leaving it unfinished; "
                       "this turn's facts may not have been stored.[/yellow]")
@@ -2022,8 +2024,8 @@ def _await_memory_capture(stored_ref):
     _report_pending_capture()
     thread = A.memory_capture_thread
     if thread is not None and thread.is_alive():
-        console.print("[dim]⏺ memory · saving…[/dim]")
-        thread.join(MEMORY_FLUSH_SECONDS)
+        with status_cm("memory · saving…"):
+            thread.join(MEMORY_FLUSH_SECONDS)
     if thread is not None and thread.is_alive():
         _pending_captures.append((thread, stored_ref))
         return
