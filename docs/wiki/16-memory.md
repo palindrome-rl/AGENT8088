@@ -115,9 +115,12 @@ different problems and only one of them needs fixing:
 Change it live with `/memory notify off|on|verbose`.
 
 The line appears after the answer, because that is when the extraction call runs.
-The REPL waits up to 10 seconds for it. A local extraction call routinely takes
-15–20 seconds, so past that budget the line is shown with your **next** message
-instead, marked `(from your previous message)`:
+When your message explicitly asks it to remember something ("remember …",
+"don't forget …", "save this", "note that …"), the REPL waits up to 15 seconds
+for the save before the prompt returns. Every other save finishes in the
+background. Either way, a save that is not done in time is shown with your
+**next** message instead, marked `(from your previous message)`, and any
+still-pending save is flushed when you exit:
 
 ```
 ⏺ memory · stored 1 new memory (from your previous message)
@@ -285,7 +288,8 @@ Also:
 | Disk | a few KB per fact |
 
 The extra call is the real cost. It happens *after* your answer is rendered, on
-a background thread in the REPL, so it adds no latency — but you do pay the
+a background thread in the REPL, so it adds no latency — except that an explicit
+"remember …" request waits up to 15 seconds for the save. You do pay the
 tokens. `/memory` reports what the last one cost, the same way `plan_audit`
 reports `verification cost this turn`.
 

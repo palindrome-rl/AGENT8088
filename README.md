@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/palindrome-research-labs-agent8088.png" alt="Palindrome Research Labs" width="420">
+  <img src="assets/palindrome-research-labs-agent8088.png" alt="Palindrome Research Labs" width="294">
   <br>
   <img src="assets/agent8088-wordmark-readme.png" alt="Agent8088" width="540">
 </p>
@@ -35,6 +35,66 @@
   <img src="https://img.shields.io/badge/messaging-Slack%20%7C%20Discord%20%7C%20WhatsApp%20%7C%20Telegram%20%7C%20email-f43f5e" alt="Slack, Discord, WhatsApp, Telegram, email">
   <img src="https://img.shields.io/badge/local%20OCR-vision--free%20image%20reading-a3a3a3" alt="Local OCR">
 </p>
+
+## Quick start
+
+### Install Agent8088 v1.2
+
+The commands below install the public v1.2 branch. `agent8088 --update`
+continues to use this branch.
+
+**macOS, Linux, or WSL2**
+
+```sh
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | AGENT8088_BRANCH=AGENT8088-v1.2 bash
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+```
+
+Use these branch-specific installers for v1.2; the generic Pages installer
+may track a different release.
+
+The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
+
+<details>
+<summary><b>What the installer provisions, and supported platforms</b></summary>
+
+**What the installer provisions automatically:**
+
+| Component | Linux / macOS | Windows |
+| --- | --- | --- |
+| Core agent (chat, tools, MCP, search) | yes | yes |
+| Gateway adapters (Slack, Discord, WhatsApp, Telegram) | yes | yes |
+| Playwright Chromium (`browse_page`) | yes | yes |
+| Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
+| Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
+
+### Supported platforms
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS 12+ (Apple Silicon & Intel) | Supported | `install.sh` |
+| Ubuntu / Debian / Fedora / Arch (x64, arm64) | Supported | `install.sh` |
+| WSL2 | Supported | `install.sh`; clone with LF line endings, not CRLF |
+| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1` |
+| Windows Server, legacy Console Host, PowerShell ISE | Not supported | needs a modern terminal host — see `install.ps1`'s terminal check |
+| Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
+| Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
+
+</details>
+
+After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
+`/dump` to produce a bundle for a bug report.
+
+The installers do not add the `[dev]` extra (pytest, ruff, pip-audit), and the
+root Python `tests/` suite is not included in this release branch. Neither is
+needed to install or run Agent8088.
+
+---
 
 ## Why Agent8088
 
@@ -77,6 +137,49 @@ explicit operational boundaries.
 Agent8088 is developed around measured failure modes rather than idealized
 demos. Its reliability work is informed by regression testing, live workflow
 analysis, academic research and community pain-points.
+
+---
+
+## Configure and run
+
+```sh
+agent8088 --setup            # choose a provider, model, workspace, and search backend
+agent8088                    # start the interactive agent
+```
+
+The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`. Start with a local Ollama model or select a hosted provider; the agent can switch models later with `/model` or `/models`.
+
+> **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account + WFP egress filter. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
+
+### Use the web UI
+
+See the [Web UI CLI reference](docs/wiki/10-cli-reference.md#web-ui) for details.
+
+```sh
+agent8088 --web          # production build   -> http://127.0.0.1:8180
+uv run agent8088 --web   # development (FastAPI + Vite) -> http://127.0.0.1:5180
+```
+
+The first source-checkout run needs `npm install` in `web`; production builds the frontend automatically when needed.
+
+Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
+
+### A few useful commands
+
+| Command | Purpose |
+| --- | --- |
+| `agent8088` | Start an interactive session. |
+| `agent8088 --memory-setup` | Add the mem0 memory engine to an existing install (installs the backend deps and makes mem0 the default engine). The installers offer the same choice up front: `-WithMem0`/`-SkipMem0` (PowerShell) or `--memory mem0`/`--memory native` (bash), plus an interactive prompt. Switch engines any time with `/memory engine native\|mem0` — both stores are kept. |
+| `agent8088 --uninstall` | Remove the install dir, config, env vars, and cron/scheduled-task entries. Add `--workspace` to also remove trace logs + WhatsApp session data, or `--dry-run` to preview first. |
+| `agent8088 --gateway-setup` | Configure Slack, Discord, WhatsApp, Telegram, or email. |
+| `agent8088 --gateway` | Run the messaging gateway. |
+| `agent8088 --prompt-file PATH` | Run one unattended, full-auto task from a UTF-8 file. Use only in a trusted, isolated environment. |
+| `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |
+| `/plan <task>` | Research, propose a plan, and wait for your approval before mutations. |
+| `/capabilities` | Show the live tool, MCP, sandbox, skill, sub-agent, and guardrail configuration. |
+| `/cli-anything <task>` | Find, install, run, build, refine, test, or validate an application CLI through the experimental CLI-Anything integration. |
+| `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
+| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report. |
 
 ---
 
@@ -146,107 +249,6 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
 | **See what the agent is using** | Per-turn token and timing summaries, optional local cost telemetry, provider-limit indicators where supported, and audit logs make resource use and execution visible. |
-
----
-
-## Quick start
-
-### Install Agent8088 v1.2
-
-The commands below install the public v1.2 branch. `agent8088 --update`
-continues to use this branch.
-
-**macOS, Linux, or WSL2**
-
-```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | AGENT8088_BRANCH=AGENT8088-v1.2 bash
-```
-
-**Windows (PowerShell)**
-
-```powershell
-$env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
-```
-
-Use these branch-specific installers for v1.2; the generic Pages installer
-may track a different release.
-
-The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
-
-<details>
-<summary><b>What the installer provisions, and supported platforms</b></summary>
-
-**What the installer provisions automatically:**
-
-| Component | Linux / macOS | Windows |
-| --- | --- | --- |
-| Core agent (chat, tools, MCP, search) | yes | yes |
-| Gateway adapters (Slack, Discord, WhatsApp, Telegram) | yes | yes |
-| Playwright Chromium (`browse_page`) | yes | yes |
-| Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
-| Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
-
-### Supported platforms
-
-| Platform | Status | Notes |
-|---|---|---|
-| macOS 12+ (Apple Silicon & Intel) | Supported | `install.sh` |
-| Ubuntu / Debian / Fedora / Arch (x64, arm64) | Supported | `install.sh` |
-| WSL2 | Supported | `install.sh`; clone with LF line endings, not CRLF |
-| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1` |
-| Windows Server, legacy Console Host, PowerShell ISE | Not supported | needs a modern terminal host — see `install.ps1`'s terminal check |
-| Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
-| Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
-
-</details>
-
-After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
-`/dump` to produce a bundle for a bug report.
-
-The installers do not add the `[dev]` extra (pytest, ruff, pip-audit), and the
-root Python `tests/` suite is not included in this release branch. Neither is
-needed to install or run Agent8088.
-
-### Configure and run
-
-```sh
-agent8088 --setup            # choose a provider, model, workspace, and search backend
-agent8088                    # start the interactive agent
-```
-
-The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`. Start with a local Ollama model or select a hosted provider; the agent can switch models later with `/model` or `/models`.
-
-> **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account + WFP egress filter. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
-
-### Use the web UI
-
-See the [Web UI CLI reference](docs/wiki/10-cli-reference.md#web-ui) for details.
-
-```sh
-agent8088 --web          # production build   -> http://127.0.0.1:8180
-uv run agent8088 --web   # development (FastAPI + Vite) -> http://127.0.0.1:5180
-```
-
-The first source-checkout run needs `npm install` in `web`; production builds the frontend automatically when needed.
-
-Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
-
-### A few useful commands
-
-| Command | Purpose |
-| --- | --- |
-| `agent8088` | Start an interactive session. |
-| `agent8088 --memory-setup` | Add the mem0 memory engine to an existing install (installs the backend deps and makes mem0 the default engine). The installers offer the same choice up front: `-WithMem0`/`-SkipMem0` (PowerShell) or `--memory mem0`/`--memory native` (bash), plus an interactive prompt. Switch engines any time with `/memory engine native\|mem0` — both stores are kept. |
-| `agent8088 --uninstall` | Remove the install dir, config, env vars, and cron/scheduled-task entries. Add `--workspace` to also remove trace logs + WhatsApp session data, or `--dry-run` to preview first. |
-| `agent8088 --gateway-setup` | Configure Slack, Discord, WhatsApp, Telegram, or email. |
-| `agent8088 --gateway` | Run the messaging gateway. |
-| `agent8088 --prompt-file PATH` | Run one unattended, full-auto task from a UTF-8 file. Use only in a trusted, isolated environment. |
-| `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |
-| `/plan <task>` | Research, propose a plan, and wait for your approval before mutations. |
-| `/capabilities` | Show the live tool, MCP, sandbox, skill, sub-agent, and guardrail configuration. |
-| `/cli-anything <task>` | Find, install, run, build, refine, test, or validate an application CLI through the experimental CLI-Anything integration. |
-| `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
-| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report. |
 
 ---
 

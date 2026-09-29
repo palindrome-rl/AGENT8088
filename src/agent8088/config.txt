@@ -359,12 +359,13 @@ memory_embed_provider=ollama
 #          different, and only one of them is a problem
 # Change it live with `/memory notify off|on|verbose`.
 #
-# The turn waits up to 15s after the answer for the extraction call to finish,
-# so the store lands before the prompt returns: "remember this" is actually
-# saved when the exchange ends, not on your next message. A local extraction
-# call routinely takes 15-20s; past that budget the line is shown with your NEXT
-# message instead, marked "(from your previous message)" -- deferred rather
-# than dropped, and silence stays distinguishable from memory not working.
+# When a message explicitly asks to remember something ("remember ...",
+# "don't forget ...", "save this", "note that ..."), the turn waits up to 15s
+# after the answer for the extraction call to finish, so the store lands before
+# the prompt returns. Every other save finishes in the background. A save that
+# is not done in time is shown with your NEXT message instead, marked "(from
+# your previous message)" -- deferred rather than dropped, and silence stays
+# distinguishable from memory not working. Pending saves are flushed on exit.
 #
 # `/memory test` runs one real extraction call on a sample exchange and shows the
 # raw reply, what parsed out of it, and how long it took. Use it when memory seems

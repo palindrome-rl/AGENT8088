@@ -2008,7 +2008,7 @@ def _flush_memory_capture(timeout=MEMORY_FLUSH_SECONDS):
     _report_pending_capture()
 
 
-def _await_memory_capture(stored_ref):
+def _await_memory_capture(stored_ref, query=""):
     """Finish the turn's memory save before the prompt returns.
 
     The store is part of answering "remember this": the prompt must not come
@@ -2023,7 +2023,10 @@ def _await_memory_capture(stored_ref):
     # Drain anything owed from earlier turns first, so reports stay in order.
     _report_pending_capture()
     thread = A.memory_capture_thread
-    if thread is not None and thread.is_alive():
+    # Only an explicit "remember ..." ask is worth blocking the prompt for; anything
+    # else saves in the background and is reported next turn (or flushed on /exit).
+    if thread is not None and thread.is_alive() and re.search(
+            r"\b(remember|memori[sz]e|don'?t forget|save (this|that)|note that)\b", query or "", re.I):
         with status_cm("memory · saving…"):
             thread.join(MEMORY_FLUSH_SECONDS)
     if thread is not None and thread.is_alive():
@@ -2148,6 +2151,9 @@ def do_chat(query):
         A._plan_on_escalation = _plan_on_escalation
         A._plan_on_approval = _make_plan_approval(live, esc)
 
+        # Paint the spinner now: run_agent's own spin("thinking") only fires after
+        # memory recall / prompt / tool-def setup, which left a dead gap after Enter.
+        live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=True))
         try:
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
@@ -2203,7 +2209,7 @@ def do_chat(query):
         console.print(f"[dim]{elapsed:.1f}s · {S.turns_this_run} turn{'s' if S.turns_this_run != 1 else ''} · "
                       f"↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
-    _await_memory_capture(memory_stored)
+    _await_memory_capture(memory_stored, query)
     if trace is not None:
         _record_trace(query, trace, elapsed)
         console.print(Panel(Text(json.dumps(trace, indent=2)), title="[#237dd7]trace[/#237dd7]",
