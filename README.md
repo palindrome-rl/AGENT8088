@@ -9,15 +9,6 @@
 </p>
 
 <p align="center">
-  An open-source agentic harness for reliable, verifiable task completion.<br>
-  Grounded execution, robust context management, sandboxed tools, and transparent control&mdash;on your machine.
-</p>
-
-<p align="center">
-  <strong>Small-model-first&nbsp;&nbsp;&middot;&nbsp;&nbsp;Research-backed reliability&nbsp;&nbsp;&middot;&nbsp;&nbsp;Execution you control</strong>
-</p>
-
-<p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#demo">Demo</a> ·
   <a href="#why-agent8088">Why Agent8088</a> ·
@@ -33,6 +24,16 @@
   <a href="https://github.com/palindrome-rl/AGENT8088/tree/AGENT8088-v1.2"><img src="https://img.shields.io/badge/release-v1.2-f59e0b" alt="Agent8088 v1.2 branch"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux, Windows">
   <img src="https://img.shields.io/badge/MCP-client%20%2B%20server-8b5cf6" alt="MCP client and server">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/56%20built--in%20tools-execution%20grounded-10b981" alt="56 built-in tools">
+  <img src="https://img.shields.io/badge/verification--gated%20completion-recovery%20%2B%20reverts-059669" alt="Verification-gated completion">
+  <img src="https://img.shields.io/badge/6%20sub--agent%20profiles-context%20isolation-3b82f6" alt="6 sub-agent profiles">
+  <img src="https://img.shields.io/badge/39%20skill%20packages-extensible-6366f1" alt="39 skill packages">
+  <img src="https://img.shields.io/badge/12%20provider%20profiles-any%20OpenAI--compatible-8b5cf6" alt="12 provider profiles">
+  <img src="https://img.shields.io/badge/messaging-Slack%20%7C%20Discord%20%7C%20WhatsApp%20%7C%20Telegram%20%7C%20email-f43f5e" alt="Slack, Discord, WhatsApp, Telegram, email">
+  <img src="https://img.shields.io/badge/local%20OCR-vision--free%20image%20reading-a3a3a3" alt="Local OCR">
 </p>
 
 ## Why Agent8088
@@ -63,8 +64,8 @@ explicit operational boundaries.
       <sub>Pre-call budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters.</sub>
     </td>
     <td width="33%" valign="top">
-      <strong>Transparent and controlled</strong><br>
-      <sub>Permission modes, usage visibility, audit trails, credential protection, and OS-level sandboxing keep actions accountable.</sub>
+      <strong>Transparent, safe and controlled</strong><br>
+      <sub>Permission modes, usage visibility, audit trails, credential protection, SSRF and egress security controls, and OS-level sandboxing keep actions accountable.</sub>
     </td>
     <td width="33%" valign="top">
       <strong>Low-friction and extensible</strong><br>
@@ -100,7 +101,9 @@ results, and the need to prove that a requested outcome was actually produced.
 Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
 
 - **Local-first and context-aware.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR, and session history are stored on disk and never uploaded. Context budgeting and compaction help long tasks continue without silently overflowing the model window.
+- **Small-model-first and grounded.** Efficient prompts, minimized tool schemas, and model-aware routing make small local models practical, while a persistent control loop plans, acts through structured tools, observes results, and recovers when execution fails.
 - **Verification before confidence.** Tool results, tests, expected deliverables, and execution state provide evidence for completion. Recovery paths help the agent retry, preserve useful progress, or surface a clear failure instead of pretending the task succeeded.
+- **Security at the floor.** Credential paths, shell startup-file writes, destructive Git operations, and system-prompt exfiltration are blocked in every mode. SSRF and egress controls and command allowlists are enforced in code, not by prompt, and an optional audit log (`audit_log=1`) keeps a persistent trail.
 - **Guardrails built in.** Shell commands run in a native OS sandbox. Turn on `audit_log=1` and every tool call and approval decision is recorded in `audit.jsonl` in the agent's data folder (normally `~/.agent8088/`). Switch to `readonly` (`--mode readonly`) and writes, network access and shell commands each need your approval. Some safety rules are enforced in code, so a prompt can't switch them off.
 - **One engine, many front ends.** The CLI, the web UI and the messaging gateway (Slack, Discord, WhatsApp, Telegram, email) share one agent loop, one session model and one permission layer.
 - **Open by design.** Works with any OpenAI-compatible provider. It can use external MCP servers and can also serve its own tools over MCP. It supports skills and focused sub-agents, and all settings live in one plain-text config file.
@@ -129,13 +132,17 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | **Work safely** | `full-auto` is the default, inside the workspace and the always-on safety floor; switch to `readonly` for per-action approval. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
 | **Verify and recover** | Optional step verification checks mutating work, failed verification can restore the previous file state, and completion checks keep required deliverables from being silently skipped. |
+| **Review code and generate tests** | `review_code` reports findings with file, line, and severity; `generate_tests` has a sub-agent write and run tests for a source file, with the file hashed and restored if the sub-agent touches it. |
+| **Survey a codebase before touching it** | `repository_read` gives bounded overviews, search, and source reads of local directories or GitHub repos; `repo_map` outlines the most depended-on classes and functions. |
+| **Schedule recurring work** | `schedule_task` adds, lists, and removes scheduled runs through cron or Windows Task Scheduler, with the same unattended safety floor as every other run. |
+| **Create and convert documents** | Build `.docx`/`.xlsx`/`.pptx` from plain lines, or convert existing Office documents through LibreOffice, with the same write gate as every other file change. |
 | **Protect long-running work** | Context budgeting, automatic compaction, content handles, persistent trajectory state, and durable tasks help lengthy workflows retain their instructions and completed progress. |
 | **Delegate without losing context** | Six restricted sub-agent profiles handle exploration, research, coding, test writing, verification, and general-purpose work in separate runs. |
 | **Use tools without lock-in** | Built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, CLI-Anything, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
 | **Read images without a vision model** | Attached screenshots and scanned PDFs are transcribed by a local OCR engine when the active model has no vision of its own. Multimodal models are untouched and keep using their own capability. |
 | **Work across documents** | Read and process PDFs, Word documents, spreadsheets, and presentations, with checkpointed handling for larger files and OCR fallback for scanned content. |
 | **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store. Nothing leaves your machine. |
-| **Stay in your workflow** | Use the interactive CLI or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
+| **Stay in your workflow** | Use the interactive CLI, the browser-based web UI with live diffs and approvals, or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
 | **See what the agent is using** | Per-turn token and timing summaries, optional local cost telemetry, provider-limit indicators where supported, and audit logs make resource use and execution visible. |
