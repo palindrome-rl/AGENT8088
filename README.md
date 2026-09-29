@@ -124,7 +124,7 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 
 | Capability | What it gives you |
 | --- | --- |
-| **Use the model you want** | 12 built-in provider profiles, local Ollama, OpenRouter, and custom OpenAI-compatible endpoints. Configure fallback models for retryable provider failures. |
+| **Use the model you want** | 12 built-in provider profiles, local Ollama, Anthropic and custom OpenAI-compatible endpoints. Configure fallback models for retryable provider failures. |
 | **Make smaller models practical** | Hardware-aware local-model recommendations, automatic model routing, hybrid tool selection, and on-demand tool schemas reduce unnecessary context and escalate only when a model is genuinely struggling. |
 | **Work safely** | `full-auto` is the default, inside the workspace and the always-on safety floor; switch to `readonly` for per-action approval. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
