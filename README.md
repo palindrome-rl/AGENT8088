@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick start</a> ·
   <a href="#demo">Demo</a> ·
-  <a href="#why-agent8088">Why Agent8088</a> ·
-  <a href="#what-it-does">Features</a> ·
+  <a href="#about">About</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#inside-agent8088">Features</a> ·
   <a href="#documentation">Documentation</a> ·
   <a href="#contributing">Contributing</a>
 </p>
@@ -35,6 +35,66 @@
   <img src="https://img.shields.io/badge/messaging-Slack%20%7C%20Discord%20%7C%20WhatsApp%20%7C%20Telegram%20%7C%20email-f43f5e" alt="Slack, Discord, WhatsApp, Telegram, email">
   <img src="https://img.shields.io/badge/local%20OCR-vision--free%20image%20reading-a3a3a3" alt="Local OCR">
 </p>
+
+## Demo
+
+<p align="center">
+  <a href="assets/demo.mp4">
+    <img src="assets/demo.gif" alt="Agent8088 tour: one-command install, plan and audit, the web UI with live diffs, local OCR, local model sizing, and a plain-text config" width="820">
+  </a>
+</p>
+
+## About
+
+Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**.
+It reads files, runs tools, researches the web, and edits code through a
+permission system you control. Its goal is not simply to produce an answer,
+but to carry a task through execution, validation, and recovery when something
+goes wrong. It is designed around the constraints that make real agent work
+difficult: smaller models, limited context windows, unreliable tools, partial
+results, and the need to prove that a requested outcome was actually produced.
+
+Most agent harnesses are designed around large hosted models and optimistic
+execution. Agent8088 starts from a different premise: useful agents should be
+able to complete real work reliably with smaller models, limited context, and
+explicit operational boundaries.
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Small-model-first</strong><br>
+      <sub>Efficient prompts, minimized tool schemas, model-aware routing, and local-model support make capable local models practical.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Verification-gated completion</strong><br>
+      <sub>Tasks are checked against their required outputs, tests, and observable tool results before completion is reported.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Grounded execution</strong><br>
+      <sub>A persistent control loop plans, acts through structured tools, observes the result, and recovers when execution fails.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Robust context management</strong><br>
+      <sub>Pre-call budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Transparent, safe and controlled</strong><br>
+      <sub>Permission modes, usage visibility, audit trails, credential protection, SSRF and egress security controls, and OS-level sandboxing keep actions accountable.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Low-friction and extensible</strong><br>
+      <sub>Use the CLI or web UI, connect local or hosted models, and extend the harness through MCP, skills, sub-agents, and gateways.</sub>
+    </td>
+  </tr>
+</table>
+
+Agent8088 is developed around measured failure modes rather than idealized
+demos. Its reliability work is informed by regression testing, live workflow
+analysis, academic research and community pain-points.
+
+---
 
 ## Quick start
 
@@ -96,50 +156,6 @@ needed to install or run Agent8088.
 
 ---
 
-## Why Agent8088
-
-Most agent harnesses are designed around large hosted models and optimistic
-execution. Agent8088 starts from a different premise: useful agents should be
-able to complete real work reliably with smaller models, limited context, and
-explicit operational boundaries.
-
-<table>
-  <tr>
-    <td width="33%" valign="top">
-      <strong>Small-model-first</strong><br>
-      <sub>Efficient prompts, minimized tool schemas, model-aware routing, and local-model support make capable local models practical.</sub>
-    </td>
-    <td width="33%" valign="top">
-      <strong>Verification-gated completion</strong><br>
-      <sub>Tasks are checked against their required outputs, tests, and observable tool results before completion is reported.</sub>
-    </td>
-    <td width="33%" valign="top">
-      <strong>Grounded execution</strong><br>
-      <sub>A persistent control loop plans, acts through structured tools, observes the result, and recovers when execution fails.</sub>
-    </td>
-  </tr>
-  <tr>
-    <td width="33%" valign="top">
-      <strong>Robust context management</strong><br>
-      <sub>Pre-call budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters.</sub>
-    </td>
-    <td width="33%" valign="top">
-      <strong>Transparent, safe and controlled</strong><br>
-      <sub>Permission modes, usage visibility, audit trails, credential protection, SSRF and egress security controls, and OS-level sandboxing keep actions accountable.</sub>
-    </td>
-    <td width="33%" valign="top">
-      <strong>Low-friction and extensible</strong><br>
-      <sub>Use the CLI or web UI, connect local or hosted models, and extend the harness through MCP, skills, sub-agents, and gateways.</sub>
-    </td>
-  </tr>
-</table>
-
-Agent8088 is developed around measured failure modes rather than idealized
-demos. Its reliability work is informed by regression testing, live workflow
-analysis, academic research and community pain-points.
-
----
-
 ## Configure and run
 
 ```sh
@@ -148,6 +164,8 @@ agent8088                    # start the interactive agent
 ```
 
 The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`. Start with a local Ollama model or select a hosted provider; the agent can switch models later with `/model` or `/models`.
+
+`full-auto` is the default permission mode: the agent works without per-action prompts inside the workspace, with the always-on safety floor still enforced. Use `--mode readonly` to approve writes, network access, and shell commands one at a time.
 
 > **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account + WFP egress filter. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
 
@@ -183,23 +201,7 @@ Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
 
 ---
 
-## Demo
-
-<p align="center">
-  <a href="assets/demo.mp4">
-    <img src="assets/demo.gif" alt="Agent8088 tour: one-command install, plan and audit, the web UI with live diffs, local OCR, local model sizing, and a plain-text config" width="820">
-  </a>
-</p>
-
-## About
-
-Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**.
-It reads files, runs tools, researches the web, and edits code through a
-permission system you control. Its goal is not simply to produce an answer,
-but to carry a task through execution, validation, and recovery when something
-goes wrong. It is designed around the constraints that make real agent work
-difficult: smaller models, limited context windows, unreliable tools, partial
-results, and the need to prove that a requested outcome was actually produced.
+## Inside Agent8088
 
 Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
 
@@ -223,10 +225,6 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
     <td align="center" width="33%"><b>🧩 Extensible</b><br><sub>MCP, skills, sub-agents, gateways</sub></td>
   </tr>
 </table>
-
----
-
-## What it does
 
 | Capability | What it gives you |
 | --- | --- |
