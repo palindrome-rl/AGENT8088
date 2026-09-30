@@ -40,7 +40,7 @@
 
 <p align="center">
   <a href="assets/demo.mp4">
-    <img src="assets/demo.gif" alt="Agent8088 tour: one-command install, plan and audit, the web UI with live diffs, local OCR, local model sizing, and a plain-text config" width="820">
+    <img src="assets/demo.gif" alt="Agent8088 tour: the live CLI, context budgeting, verification-gated completion, execution-grounded tests, usage transparency, permissions and OS sandboxing, and every front end from one engine" width="820">
   </a>
 </p>
 
