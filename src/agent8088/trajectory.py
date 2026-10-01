@@ -13,6 +13,7 @@ MAX_EVIDENCE = 6
 
 
 MAX_UNTESTED = 8
+MAX_VERIFICATION_REQUESTS = 2
 
 # Suffixes worth a test. Config, data, docs and markup are excluded because a
 # generated test for them asserts that a file parses, which nobody needed.
@@ -71,6 +72,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "mutation_count": 0,
         "verification": "not_needed",
         "verification_requested": False,
+        "verification_requests": 0,
         "untested_changes": [],
         "tests_requested": False,
         "consecutive_setbacks": 0,
@@ -224,9 +226,14 @@ class TrajectoryState:
         return self.data.get("verification") == "pending"
 
     def request_verification(self) -> bool:
-        if not self.needs_verification() or self.data.get("verification_requested"):
+        # Each write re-arms the reminder, and a model that answers it by
+        # writing yet another check re-arms it again; capped, an unresolved
+        # change is still disclosed by the final answer's verification note.
+        if (not self.needs_verification() or self.data.get("verification_requested")
+                or int(self.data.get("verification_requests") or 0) >= MAX_VERIFICATION_REQUESTS):
             return False
         self.data["verification_requested"] = True
+        self.data["verification_requests"] = int(self.data.get("verification_requests") or 0) + 1
         return True
 
     def needs_replan(self) -> bool:

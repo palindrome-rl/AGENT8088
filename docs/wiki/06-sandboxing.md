@@ -88,6 +88,16 @@ Commands start in `artifacts/`, the only project directory they may write. A
 read-only auditor runs tests in a disposable copy, so runtime files created by a
 test disappear afterward and the real workspace remains unchanged.
 
+When a sandboxed command fails with an access error (`Access is denied`,
+`Permission denied`, `os error 5`), the result gets a `[sandbox]` note naming
+the writable folder and saying that creating virtual environments or installing
+packages from the shell will not work. The boundary itself is unchanged; the note
+only stops the model from probing folder after folder to find it.
+
+`run_sandboxed` passes the snippet to Python base64-encoded, because `cmd.exe`
+ends a command at its first newline and would otherwise run only the first line
+of multi-line code.
+
 ## What sandboxing does *not* cover
 
 Worth being precise, because it's easy to over-trust:

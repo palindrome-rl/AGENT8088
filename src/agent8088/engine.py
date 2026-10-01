@@ -4116,6 +4116,22 @@ def _process_display(argv: list) -> str:
     return subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
 
 
+def _python_snippet_command(code: str) -> str:
+    """Shell command line that runs a Python snippet, newlines and all.
+
+    cmd.exe ends a command at its first newline, so `python -c "<code>"` ran
+    only the first line of a multi-line snippet and reported success with no
+    output. Passing the source base64-encoded keeps the command on one line and
+    free of quotes on every platform.
+    """
+    import base64
+
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    loader = ("import base64;exec(compile(base64.b64decode("
+              f"'{encoded}').decode('utf-8'),'<sandbox>','exec'))")
+    return _process_display([sys.executable, "-c", loader])
+
+
 # Auth failures git reports once prompting is disabled. Each is a dead end the
 # model cannot fix by retrying, so the raw text is kept (it names the remote)
 # and guidance the user can act on is appended to it.
@@ -7853,6 +7869,27 @@ def _artifact_workspace_command(command: str) -> str:
     )
 
 
+_SANDBOX_DENIED_RE = re.compile(
+    r"Access is denied|os error (?:5|13)\b|EACCES|EPERM|Permission denied(?! \(publickey\))")
+
+
+def _explain_sandbox_denial(result: str, workspace: Path) -> str:
+    """Say where the sandbox lets a command write when it was refused access.
+
+    "Access is denied" alone does not tell the model the boundary is deliberate,
+    so a real run spent ~12 turns probing folders for a uv cache, a venv and a
+    downloaded interpreter. Naming the boundary once ends that search.
+    """
+    if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
+        return result
+    return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
+            "the sandbox temp folder; everything else is read-only, and programs "
+            "outside the agent's own runtime may be refused. Creating virtual "
+            "environments or installing packages from the shell will not work "
+            "here: keep outputs under that folder, use the packages the agent's "
+            "Python already has, or ask the user to install what is missing.")
+
+
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
@@ -7870,28 +7907,35 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
     try:
-        if backend == "native":
-            if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
-                return (_exec_docker_command(command, timeout, python_code, image,
-                                             workspace=workspace)
-                        if _docker_usable() else _sandbox_required_error())
-            local_command = (
-                _process_display([sys.executable, "-c", command])
-                if python_code else command
-            )
-            return _native_or_docker(
-                lambda: _exec_native_sandbox(
-                    local_command, timeout, workspace, readonly=_sandbox_readonly,
-                ),
-                lambda: _exec_docker_command(
-                    command, timeout, python_code, image, workspace=workspace,
-                ),
-            )
-        return _exec_docker_command(command, timeout, python_code, image,
-                                    workspace=workspace)
+        return _explain_sandbox_denial(
+            _run_in_sandbox_backend(backend, command, timeout, python_code, image,
+                                    workspace),
+            ARTIFACTS_ROOT if temporary is None else workspace)
     finally:
         if temporary:
             temporary.cleanup()
+
+
+def _run_in_sandbox_backend(backend: str, command: str, timeout: int,
+                            python_code: bool, image: str, workspace: Path) -> str:
+    if backend == "native":
+        if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
+            return (_exec_docker_command(command, timeout, python_code, image,
+                                         workspace=workspace)
+                    if _docker_usable() else _sandbox_required_error())
+        local_command = (
+            _python_snippet_command(command) if python_code else command
+        )
+        return _native_or_docker(
+            lambda: _exec_native_sandbox(
+                local_command, timeout, workspace, readonly=_sandbox_readonly,
+            ),
+            lambda: _exec_docker_command(
+                command, timeout, python_code, image, workspace=workspace,
+            ),
+        )
+    return _exec_docker_command(command, timeout, python_code, image,
+                                workspace=workspace)
 
 
 def install_native_sandbox() -> str:
@@ -7976,6 +8020,23 @@ def _is_missing_argument_error(result: str) -> bool:
     read it as the step having failed.
     """
     return bool(_MISSING_ARG_RE.match((result or "").lstrip()))
+
+
+def _parse_error_args(raw: str) -> dict:
+    """Arguments marking an unparseable ARGS block, with where it broke.
+
+    The position matters: a large write whose content has one unescaped quote
+    is fixable by the model only if it is told where the JSON stopped parsing.
+    """
+    args = {"__parse_error__": raw[:400]}
+    try:
+        json.loads(raw)
+    except ValueError as error:
+        pos = getattr(error, "pos", None)
+        if pos is not None:
+            args["__parse_error_at__"] = (f"{error.msg} at char {pos}, near "
+                                          f"{raw[max(0, pos - 60):pos + 20]!r}")
+    return args
 
 
 def _is_parse_error_result(result: str) -> bool:
@@ -9888,7 +9949,15 @@ def _escape_invalid_backslashes(raw: str) -> str:
                               and all(c in "0123456789abcdefABCDEF"
                                       for c in raw[index + 2:index + 6]))
             if following in '"\\/bfnrt' or unicode_escape:
-                out.append(char)
+                # Keep the pair and step over it: re-reading the escaped char
+                # would let `\"` close the string and `\\U` look invalid.
+                out.append(char + following)
+                index += 2
+                continue
+            if following == "'":
+                # JSON has no \' escape; models carry it over from Python and
+                # mean a plain quote, not a literal backslash.
+                pass
             else:
                 out.append("\\\\")
         else:
@@ -9904,9 +9973,40 @@ def _loads_tool_args(raw: str):
     so callers can distinguish "unparseable" from "no arguments given".
     """
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except ValueError:
-        return json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+        parsed = json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+    return _unwrap_args_envelope(parsed)
+
+
+_ARGS_ENVELOPE_RE = re.compile(r"^\W*ARGS\W*?:?\s*(?=\{)")
+
+
+def _unwrap_args_envelope(parsed):
+    """Recover the real arguments a model nested inside an ✿ARGS✿ envelope.
+
+    Native-tool models that see ✿FUNCTION✿/✿ARGS✿ lines in their history copy
+    the marker into the native arguments: {"ARGS": "{...}"},
+    {"✿ARGS✿: {...}": ""} or {"": "ARGS✿: {...}"} (all observed from glm-5.3).
+    Taken literally, the tool sees no arguments and blames the model for an
+    omission it did not make.
+    """
+    if not (isinstance(parsed, dict) and len(parsed) == 1):
+        return parsed
+    key, value = next(iter(parsed.items()))
+    for text in (key, value):
+        if not isinstance(text, str):
+            continue
+        match = _ARGS_ENVELOPE_RE.match(text)
+        if not match and not (text is value and key.strip("✿: ") == "ARGS"):
+            continue
+        try:
+            inner = _loads_tool_args(text[match.end() if match else 0:])
+        except ValueError:
+            continue
+        if isinstance(inner, dict):
+            return inner
+    return parsed
 
 
 _MARKDOWN_FENCE_RE = re.compile(r"(^```[^\n]*\n.*?^```[ \t]*$)", re.MULTILINE | re.DOTALL)
@@ -10005,7 +10105,7 @@ def _args_after_function_marker(text: str, name: str):
         # An argument object was clearly intended but is broken. Same reason
         # as the ✿ARGS✿ path: flag the parse failure rather than let it look
         # like the model passed nothing.
-        return {"__parse_error__": raw_args[:400]}
+        return _parse_error_args(raw_args)
 
 
 def find_tool_calls(text: str, allowed: set = None) -> list:
@@ -10050,8 +10150,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 # args here would make the tool report the argument as
                 # missing, which sends the model chasing the wrong problem.
                 # Flag the parse failure instead.
-                calls.append({"name": resolved,
-                              "arguments": {"__parse_error__": raw_args[:400]}})
+                calls.append({"name": resolved, "arguments": _parse_error_args(raw_args)})
         # An ✿ARGS✿ block that is not a JSON object matches no header above (they
         # require a '{'), and the loose-line branch below skips it because ✿ARGS✿
         # IS present — so the call was dropped and the model saw no result at
@@ -10062,7 +10161,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 resolved = _resolve_tool_name(loose.group(1))
                 if resolved in allowed:
                     calls.append({"name": resolved,
-                                  "arguments": {"__parse_error__": loose.group(2).strip()[:400]}})
+                                  "arguments": _parse_error_args(loose.group(2).strip())})
         # A loose ✿FUNCTION✿ line with no ✿ARGS✿ marker. "No marker" is NOT
         # proof the model passed no arguments — it may have put them in a
         # following fence or on the next line bare, so look for the object
@@ -13709,11 +13808,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_result(name, result)
                 malformed_round = True
                 parse_error_retries += 1
+                where = args.get("__parse_error_at__")
                 messages.append(_harness_turn((
-                    f"The arguments for '{name}' could not be parsed as JSON. Do "
-                    "not re-send the same payload unchanged. Send a smaller, "
-                    "simpler one instead: drop every optional argument, keep the "
-                    "JSON on a single line, and include only the required arguments."
+                    f"The arguments for '{name}' could not be parsed as JSON"
+                    + (f" ({where})" if where else "") + ". Do not re-send the "
+                    "same payload unchanged. The usual cause is a double quote "
+                    "inside a string value that is not escaped as \\\" (code "
+                    "with \"\"\"docstrings\"\"\" or f\"...\" strings). Escape every "
+                    "quote and newline inside values. For long file content, "
+                    "write a shorter first part and add the rest with further "
+                    "calls; otherwise send only the required arguments."
                 )))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",
