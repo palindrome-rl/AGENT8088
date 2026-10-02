@@ -52,12 +52,13 @@ permission system you control. Its goal is not simply to produce an answer,
 but to carry a task through execution, validation, and recovery when something
 goes wrong. It is designed around the constraints that make real agent work
 difficult: smaller models, limited context windows, unreliable tools, partial
-results, and the need to prove that a requested outcome was actually produced.
+results, long-running tasks, and the need to prove that a requested outcome was
+actually produced.
 
 Most agent harnesses are designed around large hosted models and optimistic
 execution. Agent8088 starts from a different premise: useful agents should be
-able to complete real work reliably with smaller models, limited context, and
-explicit operational boundaries.
+able to complete real work reliably, including long multi-step tasks, with
+smaller models, limited context, and explicit operational boundaries.
 
 <table>
   <tr>
