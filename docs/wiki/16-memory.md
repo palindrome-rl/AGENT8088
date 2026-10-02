@@ -118,7 +118,7 @@ instead, marked `(from your previous message)`:
 
 ```
 ⏺ memory · stored 1 new memory (from your previous message)
-    • User works at Five Rivers Technologies as a backend engineer
+    • User works at Acme Corp as a backend engineer
 ```
 
 Deferred rather than dropped: a line printed after the prompt is drawn would land

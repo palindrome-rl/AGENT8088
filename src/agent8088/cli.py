@@ -3498,7 +3498,7 @@ def cmd_memory(rest):
         # extraction call on a fixed exchange and shows both what came back and
         # what survived parsing, so the two cases are distinguishable.
         from agent8088.memory import extract as _extract
-        sample_user = ("i work at five rivers technologies and i prefer uv over pip "
+        sample_user = ("i work at acme corp and i prefer uv over pip "
                        "for python projects")
         exchange = _extract.format_exchange([sample_user], "Understood, noted.")
         console.print("[dim]Testing extraction with a sample exchange:[/dim]")
