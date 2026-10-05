@@ -362,6 +362,36 @@ whole turn budget to arrive at the same no. After N consecutive denials the requ
 ends with the model told to stop and report. One approval resets the count, and the
 count resets per request.
 
+## Config blockers: who can change this
+
+Many refusals come from a `config.txt` setting, not from the task. Without being
+told, the model reads them as obstacles to work around. So each kind of refusal
+is counted per request, and the **third** one gets a single note appended to its
+result, outside the untrusted-content wrapper. The note says which setting is
+responsible and that only the user can change it. Nothing is said up front: a
+small model told about a restriction in advance tends to give up before trying.
+
+| Refusal | The note names |
+|---|---|
+| Sandbox network closed | `sandbox_allowed_domains` and the hosts the task asked for; on the Docker fallback, `agent8088 --sandbox-setup` first |
+| Write into a blocked folder | `blocked_paths` |
+| Command on the user's deny list / missing from their allowlist | `deny_commands` / `allow_commands` |
+| Domain outside the web domain policy | `allowed_domains` / `blocked_domains` |
+| Literal LAN or loopback address | `ssrf_allow_hosts=<host>:<port>` |
+| Command timed out three times | `max_tool_timeout_seconds` and `/limits` |
+| Credential file, `.env`, startup file, secret in a request | That it is protected, and the user can open it themselves |
+| Built-in safety rule, link-local or cloud-metadata address, an internal host given by name | That it is a fixed rule no setting changes |
+
+Notes contain setting names, the config file path and what the model already
+tried (a host, a path). They never contain a URL path, a query or a config
+value. Credential refusals deliberately do **not** mention
+`allowed_sensitive_files`, so injected content cannot steer the model into
+talking the user into unlocking their keys. `ssrf_allow_hosts` is offered only
+for a literal private or loopback address, because a name can resolve anywhere.
+
+A run that hits `max_turns` ends with a footer telling the user to raise it with
+`/maxturns` or `max_turns` in `config.txt`.
+
 ## Unattended runs
 
 A scheduled run has no operator, so an approval prompt there was emitted to nobody

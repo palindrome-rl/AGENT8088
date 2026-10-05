@@ -795,6 +795,177 @@ E._docker_available = _da
 E._native_sandbox_broken = _nsb
 E.SANDBOX_BACKEND = prev_backend
 
+section("8f. SANDBOX — repeated network failures point at the setting")
+# A first-run user's agent spent its whole turn trying to download a file the
+# sandbox could never reach: the network is closed unless sandbox_allowed_domains
+# names the host. Telling the model up front makes it give up before trying, so
+# the note comes only after the third failure, once per turn.
+_rb, _ad = E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS
+E._resolve_sandbox_backend = lambda: "native"
+E.SANDBOX_ALLOWED_DOMAINS = []
+E.reset_turn_counters()
+dns_fail = "curl: (6) Could not resolve host: onfe.itch.io\nCommand exited with status 6."
+fetch = 'curl -sL -o onfe.zip "https://onfe.itch.io/pack?key=sk-supersecret1234567890"'
+notes = [E._sandbox_network_note(dns_fail, fetch) for _ in range(4)]
+ok("silent for the first two failures", notes[0] == "" and notes[1] == "")
+ok("third failure names the setting", "sandbox_allowed_domains" in notes[2], notes[2][:60])
+ok("note names the domain the task needs", "onfe.itch.io" in notes[2])
+ok("note leaks no URL path, query or secret",
+   "sk-supersecret" not in notes[2] and "pack?key" not in notes[2])
+ok("note tells the model to ask the user, not work around it",
+   "user" in notes[2].lower() and "config.txt" in notes[2])
+ok("once per turn", notes[3] == "")
+E.reset_turn_counters()
+ok("reset each turn", [E._sandbox_network_note(dns_fail, fetch) for _ in range(3)][2] != "")
+E.reset_turn_counters()
+for failure in ("<urlopen error [Errno -3] Temporary failure in name resolution>",
+                "wget: unable to resolve host address 'onfe.itch.io'",
+                "curl: (56) CONNECT tunnel failed, response 403",
+                "Failed to establish a new connection: [Errno 101] Network is unreachable",
+                "getaddrinfo ENOTFOUND registry.npmjs.org",
+                "System.Net.Sockets.SocketException: No such host is known.",
+                "Invoke-WebRequest : The remote name could not be resolved: 'onfe.itch.io'",
+                "[WinError 10013] An attempt was made to access a socket in a way forbidden "
+                "by its access permissions"):
+    E.reset_turn_counters()
+    ok(f"counts as a network failure: {failure[:45]}",
+       [E._sandbox_network_note(failure, "x") for _ in range(3)][2] != "")
+E.reset_turn_counters()
+ok("ordinary failures do not count",
+   all(E._sandbox_network_note("Permission denied\nCommand exited with status 1.", "x") == ""
+       for _ in range(5)))
+E.reset_turn_counters()
+E._resolve_sandbox_backend = lambda: "docker"
+docker_note = [E._sandbox_network_note(dns_fail, fetch) for _ in range(3)][2]
+ok("docker fallback says why, and how to get the native sandbox",
+   "docker" in docker_note.lower() and "--sandbox-setup" in docker_note, docker_note[:80])
+# Wired into run_tool, after the untrusted-content wrapper so it reads as the
+# harness speaking, not as command output the model is told to distrust.
+E._resolve_sandbox_backend = lambda: "native"
+E.reset_turn_counters()
+_es = E._exec_shell_command
+E._exec_shell_command = lambda command, timeout=25, image="": (
+    "urllib.error.URLError: <urlopen error [Errno -3] Temporary failure in name resolution>")
+with with_mode("full-auto"):
+    runs = [E.run_tool("execute_shell", {"command": (
+        f"python3 -c \"import urllib.request as u; u.urlopen('https://onfe.itch.io/{i}')\"")})
+        for i in range(3)]
+E._exec_shell_command = _es
+ok("run_tool adds the note on the third failure", "sandbox_allowed_domains" in runs[2]
+   and "sandbox_allowed_domains" not in runs[1], runs[2][-80:])
+ok("note sits outside the untrusted wrapper",
+   runs[2].rfind("sandbox_allowed_domains") > runs[2].rfind("END_UNTRUSTED_CONTENT"))
+E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS = _rb, _ad
+E.reset_turn_counters()
+
+section("8g. CONFIG BLOCKERS — the third refusal names who can change it")
+# Same rule as 8f for every refusal a config.txt setting causes: silent twice,
+# then one note naming the setting. Credential and fixed-safety refusals never
+# name a way to unlock them.
+def third(results):
+    return results[0] == results[0].split("[agent8088]")[0] and "[agent8088]" not in results[1] \
+        and "[agent8088]" in results[2]
+
+E.reset_turn_counters()
+_bp, _pa = E.BLOCKED_PATHS, E.ALLOWED_PATHS
+E.BLOCKED_PATHS, E.ALLOWED_PATHS = [(TMP / "locked").resolve()], [TMP]
+with with_mode("edit"):
+    r = [E.run_tool("write_file", {"filename": str(TMP / "locked" / f"f{i}.txt"), "content": "x"})
+         for i in range(3)]
+E.BLOCKED_PATHS, E.ALLOWED_PATHS = _bp, _pa
+ok("blocked_paths: silent twice, then a note", third(r), r[2][-90:])
+ok("blocked_paths note names the setting and config.txt",
+   "blocked_paths" in r[2] and "config.txt" in r[2])
+
+E.reset_turn_counters()
+_deny, _allow = E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS
+E._USER_DENY_GLOBS = ["npm publish*"]
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"npm publish --tag t{i}"}) for i in range(3)]
+ok("deny_commands: note names the user's own rule", third(r) and "deny_commands" in r[2], r[2][-90:])
+E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS = [], ["ls*"]
+E.reset_turn_counters()
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"whoami /{i}"}) for i in range(3)]
+ok("allow_commands: note names the allowlist", third(r) and "allow_commands" in r[2], r[2][-90:])
+E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS = _deny, _allow
+
+E.reset_turn_counters()
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"git push --force origin b{i}"}) for i in range(3)]
+ok("built-in rule: note says no setting changes it",
+   third(r) and "fixed safety rule" in r[2] and "deny_commands" not in r[2], r[2][-90:])
+
+E.reset_turn_counters()
+secret_file = TMP / ".env"
+secret_file.write_text("K=v")
+_pa = E.ALLOWED_PATHS
+E.ALLOWED_PATHS = [TMP]
+r = [E.run_tool("read_text", {"filename": str(secret_file)}) for _ in range(3)]
+E.ALLOWED_PATHS = _pa
+secret_file.unlink(missing_ok=True)
+ok("credential file: note says protected", third(r) and "protected" in r[2], r[2][-90:])
+ok("credential note never names the unlock setting", "allowed_sensitive_files" not in r[2])
+
+E.reset_turn_counters()
+_ea = E.EGRESS_ALLOWED_DOMAINS
+E.EGRESS_ALLOWED_DOMAINS = ["example.com"]
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="https://evil.example.net/x?token=abc123")
+note = E._take_blocker_note()
+E.EGRESS_ALLOWED_DOMAINS = _ea
+ok("allowed_domains: note names setting and host", "allowed_domains" in note
+   and "evil.example.net" in note, note[:90])
+ok("egress note leaks no URL path or query", "token=abc123" not in note and "/x" not in note)
+E.reset_turn_counters()
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="http://192.168.1.10:8888/search?q=x")
+note = E._take_blocker_note()
+ok("LAN service: note names ssrf_allow_hosts with host:port",
+   "ssrf_allow_hosts=192.168.1.10:8888" in note, note[:90])
+E.reset_turn_counters()
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="http://169.254.169.254/latest/meta-data/")
+note = E._take_blocker_note()
+ok("cloud metadata address is never offered as allowable",
+   "ssrf_allow_hosts" not in note and "fixed safety rule" in note, note[:90])
+
+E.reset_turn_counters()
+_es = E._exec_shell_command
+E._exec_shell_command = lambda command, timeout=25, image="": f"Command timed out after {timeout}s."
+_rb = E._resolve_sandbox_backend
+E._resolve_sandbox_backend = lambda: "native"
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"findstr /s TODO part{i}"}) for i in range(3)]
+E._exec_shell_command, E._resolve_sandbox_backend = _es, _rb
+ok("timeouts: third one names max_tool_timeout_seconds and /limits",
+   third(r) and "max_tool_timeout_seconds" in r[2] and "/limits" in r[2], r[2][-90:])
+
+E.reset_turn_counters()
+log = TMP / "build.log"
+log.write_text("Command timed out after 5s.")
+_pa = E.ALLOWED_PATHS
+E.ALLOWED_PATHS = [TMP]
+r = [E.run_tool("read_text", {"filename": str(log)}) for _ in range(3)]
+E.ALLOWED_PATHS = _pa
+ok("reading a file that mentions a timeout is not a timeout", "[agent8088]" not in r[2], r[2][-60:])
+
+ok("turn-limit footer tells the user how to raise it",
+   "/maxturns" in E._turn_limit_reason(10) and "max_turns" in E._turn_limit_reason(10))
+
+E.reset_turn_counters()
+for _ in range(5):
+    E._audit("tool_call", decision="denied", reason="blocked_path", detail="/p")
+notes = [E._take_blocker_note() for _ in range(2)]
+ok("one note per kind per turn, taken once", notes[0] != "" and notes[1] == "")
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="readonly_floor", detail="x")
+ok("refusals with no setting behind them stay silent", E._take_blocker_note() == "")
+E.reset_turn_counters()
+
 # ============================================================ 9. PROVIDERS
 section("9. PROVIDERS")
 provs = E.load_providers({

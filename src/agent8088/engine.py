@@ -876,9 +876,11 @@ def plan_tool_ran() -> bool:
 def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
-    global _turn_writes, _plan_tool_ran
+    global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
     _turn_writes = 0
     _plan_tool_ran = False
+    _turn_blocker_counts = {}
+    _pending_blocker_note = ""
 
 
 # ---------------------------------------------------------------------------
@@ -4222,6 +4224,173 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
 
 def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str:
     return _exec_sandbox_command(command, timeout=timeout, image=image)
+
+
+# What a closed sandbox network looks like from inside: DNS that never answers
+# (Docker --network none), the native runtime's proxy refusing the tunnel, or no
+# route at all. curl, wget, Python, pip, npm and Windows each word it differently.
+_SANDBOX_NETWORK_FAILURE_RE = re.compile(
+    r"could not resolve host|unable to resolve host address|temporary failure in name resolution"
+    r"|name or service not known|nodename nor servname|getaddrinfo (?:failed|ENOTFOUND|EAI_AGAIN)"
+    r"|network is unreachable|failed to establish a new connection"
+    r"|tunnel connection failed|CONNECT tunnel failed"
+    # Windows: DNS (curl.exe, PowerShell) and the sandbox firewall (WinError 10013).
+    r"|no such host is known|remote name could not be resolved"
+    r"|forbidden by its access permissions",
+    re.IGNORECASE,
+)
+# --- Config blockers ----------------------------------------------------------
+# A refusal caused by a config.txt setting reads, to the model, like an obstacle
+# to get around: a real run spent its whole turn on workarounds for a download
+# the sandbox could never make. Told about the limits up front, a small model
+# gives up before trying. So each kind of refusal is counted per turn and, at the
+# third, one note says which setting is responsible and that only the user can
+# change it -- the same shape as the denial breaker. Notes name settings and what
+# the model already tried (a host, a path), never a URL path, query or config
+# value, and credential or fixed-rule refusals never name a way to unlock them.
+CONFIG_BLOCKER_NOTE_AFTER = 3
+_turn_blocker_counts = {}
+_pending_blocker_note = ""
+_FIXED_RULE_NOTE = ("This was refused by a fixed safety rule; no setting or approval "
+                    "changes it. Do not look for another way to do the same thing. "
+                    "Tell the user plainly what you could not do.")
+_PROTECTED_NOTE = ("This is a protected file or credential, refused by a fixed safety "
+                   "rule; no setting or approval changes it here. Do not look for "
+                   "another way to read, write or send it. If the user needs it, they "
+                   "can open it themselves.")
+_TIMEOUT_RE = re.compile(r"Command timed out after \d+s")
+
+
+def _config_file() -> str:
+    """Where the user edits settings, always naming config.txt even when
+    AGENT8088_CONFIG points at a file called something else."""
+    return str(CONFIG_PATH) if CONFIG_PATH.name == "config.txt" else f"config.txt ({CONFIG_PATH})"
+
+
+def _count_blocker(kind: str) -> bool:
+    """Count one refusal of this kind; True exactly when it reaches the threshold."""
+    _turn_blocker_counts[kind] = _turn_blocker_counts.get(kind, 0) + 1
+    return _turn_blocker_counts[kind] == CONFIG_BLOCKER_NOTE_AFTER
+
+
+def _blocker_note(text: str) -> str:
+    return (f"\n{_HARNESS_PREFIX}Refused {CONFIG_BLOCKER_NOTE_AFTER} times this turn. "
+            f"{text}")
+
+
+def _internal_host_note(url: str) -> tuple:
+    """The SSRF refusal's note. Offers ssrf_allow_hosts only for a literal LAN or
+    loopback address the user may run a service on -- never a name (it could
+    resolve anywhere) and never the link-local cloud-metadata range."""
+    import ipaddress
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        ip = ipaddress.ip_address("127.0.0.1" if host == "localhost" else host)
+    except ValueError:
+        return "fixed_rule", _FIXED_RULE_NOTE
+    if ip.is_link_local or not (ip.is_private or ip.is_loopback):
+        return "fixed_rule", _FIXED_RULE_NOTE
+    return "ssrf", (f"`{host}` is on a private or local network, which web tools may "
+                    "not reach by default. If it is the user's own service, only they "
+                    f"can allow that one address with `ssrf_allow_hosts={host}:{port}` in "
+                    f"{_config_file()}. Stop retrying; tell the user.")
+
+
+def _config_blocker(reason: str, detail: str):
+    """(kind, note text) for a refusal a person could act on, else None."""
+    if reason == "blocked_path":
+        return "blocked_path", (f"Writing to `{detail}` is blocked by `blocked_paths` in "
+                                f"{_config_file()}. Only the user can change that list. Stop "
+                                "retrying; write somewhere else or tell the user.")
+    if reason == "hard_blocked_shell":
+        if _matches_user_deny(detail):
+            return "deny_commands", ("This command matches the user's own `deny_commands` "
+                                     f"rule in {_config_file()}. Only the user can change it. "
+                                     "Stop retrying; tell the user.")
+        if _outside_user_allowlist(detail):
+            return "allow_commands", ("Only commands matching `allow_commands` in "
+                                      f"{_config_file()} may run, and this one does not. Only "
+                                      "the user can change that list. Stop retrying; "
+                                      "tell the user.")
+        return "fixed_rule", _FIXED_RULE_NOTE
+    if reason in ("sensitive_path", "shell_startup_file", "sensitive_query", "outbound_secret"):
+        return "protected", _PROTECTED_NOTE
+    if reason == "egress_policy":
+        if _egress_check(detail):
+            host = urllib.parse.urlsplit(detail).hostname or "this host"
+            return "egress_domains", (f"`{host}` is outside the web domain policy "
+                                      "(`allowed_domains` / `blocked_domains` in "
+                                      f"{_config_file()}). Only the user can change it. "
+                                      "Stop retrying; tell the user.")
+        return _internal_host_note(detail)
+    return None
+
+
+def _note_config_blocker(reason: str, detail: str) -> None:
+    """Called for every audited refusal. Never raises: it only adds advice."""
+    global _pending_blocker_note
+    try:
+        found = _config_blocker(reason, detail)
+        if found and _count_blocker(found[0]):
+            _pending_blocker_note = _blocker_note(found[1])
+    except Exception as exc:  # noqa: BLE001 — advice must never break a refusal
+        _log.debug("config blocker note failed: %s", exc)
+
+
+def _take_blocker_note() -> str:
+    global _pending_blocker_note
+    note, _pending_blocker_note = _pending_blocker_note, ""
+    return note
+
+
+def _turn_limit_reason(limit: int) -> str:
+    """Footer for a run that hit max_turns. The user reads it, so it says how
+    to raise the limit -- first-run users hit it repeatedly with no way to know."""
+    return (f"reached the {limit}-turn limit before completing the task -- raise it "
+            "with /maxturns, or max_turns in config.txt")
+
+
+def _timeout_note(result: str) -> str:
+    if not _TIMEOUT_RE.search(result or "") or not _count_blocker("timeout"):
+        return ""
+    return _blocker_note(
+        f"Commands are capped at `max_tool_timeout_seconds` ({MAX_TOOL_TIMEOUT_SECONDS}s). "
+        "A call may pass a larger `timeout` up to that cap; beyond it, only the user can "
+        f"raise it, with /limits or in {_config_file()}. Otherwise narrow the command.")
+
+
+def _sandbox_network_note(result: str, source: str) -> str:
+    """The note to append when sandboxed code keeps hitting the closed network.
+
+    The sandbox reaches only the hosts in sandbox_allowed_domains (none by
+    default; none at all on the Docker fallback), and nothing in a failed fetch
+    says so. Counted like every other config blocker.
+    """
+    if not _SANDBOX_NETWORK_FAILURE_RE.search(result or ""):
+        return ""
+    if not _count_blocker("sandbox_network"):
+        return ""
+    hosts = sorted({urllib.parse.urlsplit(url).hostname or ""
+                    for url in _SHELL_HTTP_URL.findall(source or "")} - {""})
+    needed = ", ".join(hosts) or "the host this task needs"
+    allowed = ", ".join(SANDBOX_ALLOWED_DOMAINS) or "none"
+    if _resolve_sandbox_backend() == "docker":
+        setting = ("Commands are running in the Docker fallback, which has no network "
+                   "at all, because the native sandbox is not set up. The user can "
+                   "set it up with `agent8088 --sandbox-setup` (on Linux it needs "
+                   "bubblewrap, socat and ripgrep), then add "
+                   f"`sandbox_allowed_domains={needed}` to {_config_file()}.")
+    else:
+        setting = (f"Sandboxed commands reach only the hosts in `sandbox_allowed_domains` "
+                   f"in {_config_file()} (currently: {allowed}). The user can add "
+                   f"`sandbox_allowed_domains={needed}` there and restart Agent8088.")
+    return (f"\n{_HARNESS_PREFIX}The sandbox has blocked network access "
+            f"{CONFIG_BLOCKER_NOTE_AFTER} times this turn. This is a setting, not a "
+            f"problem to work around. {setting} Only the user can change config.txt. "
+            "Stop retrying the download; tell the user what this task needs and "
+            "that they can change the setting or fetch the file themselves.")
 
 
 def _process_display(argv: list) -> str:
@@ -8959,6 +9128,18 @@ def _budget_capped_timeout(timeout: int) -> int:
 
 
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
+    _take_blocker_note()  # a refusal audited outside run_tool must not attach here
+    result = _run_tool(name, args, allow_plan, depth)
+    if not isinstance(result, str) or result.startswith("ESCALATION_REQUEST"):
+        return result
+    # Outside any untrusted-content wrapper, so it reads as the harness speaking.
+    # Only command runners count timeouts: a file that merely contains the phrase
+    # must not.
+    runs_commands = (TOOL_SPECS.get(name) or {}).get("mode") in ("shell", "docker")
+    return result + (_take_blocker_note() or (_timeout_note(result) if runs_commands else ""))
+
+
+def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
     if not spec:
@@ -9669,7 +9850,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _exec_cron(args)
 
     if mode == "docker":
-        return _exec_docker(args)
+        result = _exec_docker(args)
+        return result + _sandbox_network_note(result, str(args.get("code") or ""))
 
     if mode == "browser":
         return _exec_browser(args)
@@ -9923,7 +10105,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             text = testing_support.trim_output(text)
         _record_verdict(ledger_command or command, text)
         _record_localization_requirement(name, command, text)
-        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
+        # Host tools have the real network; only the sandbox's closed one is a setting.
+        note = "" if spec.get("host") else _sandbox_network_note(text, command)
+        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}") + note
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
@@ -10863,6 +11047,9 @@ def _audit(event: str, **fields) -> None:
     _redact_secrets, so a blocked exfiltration attempt is recorded without
     writing the credential to disk.
     """
+    # Before the AUDIT_ENABLED check: turning the log off must not turn this off.
+    if fields.get("decision") == "denied":
+        _note_config_blocker(str(fields.get("reason") or ""), str(fields.get("detail") or ""))
     if not AUDIT_ENABLED:
         return
     try:
@@ -14082,7 +14269,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).
     reason = ("stopped because repeated tool calls made no progress"
-              if forced_stop else f"reached the {policy.limit}-turn limit before completing the task")
+              if forced_stop else _turn_limit_reason(policy.limit))
     wrapped = _answer_from_context(
         messages, system_prompt=(system_prompt() if callable(system_prompt)
                                  else system_prompt),
