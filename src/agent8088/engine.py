@@ -7869,8 +7869,13 @@ def _artifact_workspace_command(command: str) -> str:
     )
 
 
+# "Permission denied" only in the filesystem's own wording -- Python's
+# "[Errno 13] Permission denied" or coreutils/bash's "<path>: Permission
+# denied". An API or registry saying it ({"message": "Permission denied"},
+# npm's "403 Forbidden - ... - Permission denied") is not the sandbox.
 _SANDBOX_DENIED_RE = re.compile(
-    r"Access is denied|os error (?:5|13)\b|EACCES|EPERM|Permission denied(?! \(publickey\))")
+    r"Access is denied|os error (?:5|13)\b|EACCES|EPERM"
+    r"|(?:\[Errno 13\] |: )Permission denied(?! \(publickey\))")
 
 
 def _explain_sandbox_denial(result: str, workspace: Path) -> str:

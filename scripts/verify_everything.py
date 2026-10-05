@@ -590,6 +590,17 @@ ok("sandbox access denial names the writable folder",
 ok("sandbox denial note skips unrelated output",
    _explain("Command completed.", E.ARTIFACTS_ROOT) == "Command completed."
    and "[sandbox]" not in _explain("git@x: Permission denied (publickey).", E.ARTIFACTS_ROOT))
+# Only the filesystem's wording counts: an API or registry that says
+# "Permission denied" is not the sandbox, and the note would mislead.
+for _fs_denied in ("PermissionError: [Errno 13] Permission denied: 'C:\\\\venv\\\\x'",
+                   "mkdir: cannot create directory '/opt/x': Permission denied",
+                   "bash: /usr/local/bin/tool: Permission denied"):
+    ok(f"filesystem denial gets the note: {_fs_denied[:40]}",
+       "[sandbox]" in _explain(_fs_denied, E.ARTIFACTS_ROOT))
+for _api_denied in ('{"message": "Permission denied"}',
+                    "npm error 403 Forbidden - PUT https://registry.npmjs.org/x - Permission denied"):
+    ok(f"API denial gets no sandbox note: {_api_denied[:40]}",
+       "[sandbox]" not in _explain(_api_denied, E.ARTIFACTS_ROOT))
 
 section("8c. SANDBOX — real execution")
 E.SANDBOX_BACKEND = prev_backend
@@ -876,6 +887,13 @@ for _ in range(5):
     _nudges += _traj.request_verification()
 ok("verification reminder is capped per task", _nudges <= 2, f"{_nudges} reminders")
 ok("unverified change is still disclosed after the cap", _traj.needs_verification())
+# The cap is per request. A request that ends unverified keeps its state for
+# the next message (it is unresolved), and the spent count must not come
+# with it, or every later request in the session gets no reminder at all.
+_next = TrajectoryState(_traj.data, goal="now fix the parser", message_count=3)
+_next.after_tool(_next.before_tool("write_file"), "Wrote 10 bytes", failed=False,
+                 blocked=False, mutated=True, path="parser.py")
+ok("the next request gets its own reminders", _next.request_verification())
 
 section("11b. TOOL-CALL PARSING")
 ok("parses FUNCTION/ARGS form",

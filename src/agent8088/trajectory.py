@@ -119,6 +119,10 @@ class TrajectoryState:
         if goal and (not self.data.get("goal") or (message_count > previous_count and not unresolved)):
             self.data.clear()
             self.data.update(_blank(goal, workspace))
+        elif message_count > previous_count:
+            # Unresolved state carries over to the next request; the reminder
+            # budget is per request and must not, or the session goes silent.
+            self.data["verification_requests"] = 0
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
