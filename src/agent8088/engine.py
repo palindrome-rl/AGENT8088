@@ -3677,6 +3677,19 @@ SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 # Left None, sub-agents run silently (benchmark, one-shot, plain REPL) — so this
 # is fully backward-compatible. Kept out of the loop, same as every other hook.
 subagent_ui = None
+# Front-end hook: the commands the person can type (CLI slash commands, gateway
+# /approve and friends), as name -> (usage, description). Each front end
+# registers its own table at start-up; empty here, so the engine knows none.
+# Without it the model, asked "what does /local do", said no such command
+# existed -- it only ever sees tool schemas.
+FRONTEND_COMMANDS = {}
+
+
+def register_frontend_commands(commands: dict) -> None:
+    """Replace the command table describe_tool and per-turn facts read from."""
+    global FRONTEND_COMMANDS
+    FRONTEND_COMMANDS = {str(name).lstrip("/").lower(): (str(usage), str(description))
+                         for name, (usage, description) in dict(commands).items()}
 # Human-in-the-loop hook: a presentation layer (e.g. Rich CLI) may set this to
 #   human_input_handler(question, reason) -> str
 # to present an interactive prompt with terminal UI controls (e.g. pausing spinners).
@@ -10570,6 +10583,72 @@ def _recalled_memory_prompt(messages, system_prompt, identity=None):
     return with_memory
 
 
+# A slash command as a word of its own: not a path (/usr/local), a URL's path
+# (https://x/local) or a home path (~/local).
+_SLASH_MENTION_RE = re.compile(r"(?<![\w/:.~])/([a-z][\w-]*)(?![\w/.-])", re.IGNORECASE)
+MAX_MENTION_FACTS = 8
+_TOOL_FAMILY_FACTS = 6
+_MENTION_HEADER = ("## What the user's message refers to\n"
+                   "Facts from Agent8088's own command and tool registry. Answer from "
+                   "these; do not guess.\n")
+
+
+def _tool_fact(name: str) -> str:
+    description = str(TOOL_SPECS[name].get("description") or "").split(". ")[0].rstrip(".")
+    return f"- tool `{name}`: {description}."
+
+
+def _mentioned_capability_facts(text: str) -> list:
+    """Registry facts for the commands and tools a message names.
+
+    Only names are taken from the message; every fact comes from a registry.
+    An unknown slash word is reported only when it is a near miss for a real
+    command (/seatch), so "what's in /etc" draws no false "no such command".
+    """
+    facts = []
+    for word in dict.fromkeys(m.lower() for m in _SLASH_MENTION_RE.findall(text or "")):
+        if word in FRONTEND_COMMANDS:
+            usage, description = FRONTEND_COMMANDS[word]
+            facts.append(f"- `{usage}`: {description} (a command the user types; "
+                         "not a tool you can call)")
+        elif close := _close_commands(word, cutoff=0.75)[:1]:
+            facts.append(f"- /{word}: no such command; the user probably means "
+                         f"/{close[0]}: {FRONTEND_COMMANDS[close[0]][1]}")
+    # Words joined the way tool names are, so "cli anything" finds cli_anything_*.
+    joined = "_" + re.sub(r"[\s\-]+", "_", (text or "").lower()) + "_"
+    named = [name for name in TOOL_SPECS
+             if "_" in name and re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", joined)]
+    facts.extend(_tool_fact(name) for name in named)
+    families = Counter("_".join(name.split("_")[:2]) for name in TOOL_SPECS
+                       if name.count("_") >= 2)
+    for family, size in families.items():
+        if size >= 3 and re.search(rf"(?<![a-z0-9]){re.escape(family)}(?![a-z0-9])", joined):
+            members = [n for n in TOOL_SPECS if n.startswith(family + "_") and n not in named]
+            facts.extend(_tool_fact(n) for n in members[:_TOOL_FAMILY_FACTS])
+    return facts[:MAX_MENTION_FACTS]
+
+
+def _mentioned_capabilities_prompt(messages, system_prompt):
+    """Wrap `system_prompt` with registry facts for what this turn's message names.
+
+    The same shape and boundary as _recalled_memory_prompt: built from the last
+    GENUINE user turn only, so tool output cannot inject "facts". Nothing is
+    added when nothing is named -- telling a small model everything up front
+    costs every turn and makes it worse at the task.
+    """
+    turns = _genuine_user_turns(messages)
+    facts = _mentioned_capability_facts(_message_text(turns[-1])) if turns else []
+    if not facts:
+        return system_prompt
+    addition = _MENTION_HEADER + "\n".join(facts)
+
+    def with_facts():
+        base = system_prompt() if callable(system_prompt) else system_prompt
+        return (base or current_system_prompt()) + "\n\n" + addition
+
+    return with_facts
+
+
 def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
                          source_channel="", in_background=False) -> None:
     global memory_capture_thread
@@ -11636,6 +11715,28 @@ def _on_off(value, unit: str = "") -> str:
     return f"{value}{unit}"
 
 
+_COMMAND_IS_TYPED = ("This is a command the user types at the Agent8088 prompt. It is not "
+                     "a tool you can call; tell the user to type it.")
+
+
+def _close_commands(name: str, cutoff: float = 0.6) -> list:
+    import difflib
+    return difflib.get_close_matches(name.lower(), FRONTEND_COMMANDS, n=3, cutoff=cutoff)
+
+
+def _describe_command(name: str) -> str:
+    """describe_tool for a front-end command -- or for one that does not exist."""
+    key = name.strip().lower()
+    if key in FRONTEND_COMMANDS:
+        usage, description = FRONTEND_COMMANDS[key]
+        return json.dumps({"command": f"/{key}", "usage": usage, "description": description,
+                           "how_to_use": _COMMAND_IS_TYPED}, ensure_ascii=False, indent=2)
+    close = _close_commands(key)
+    hint = f" Did you mean {', '.join('/' + c for c in close)}?" if close else ""
+    return (f"No /{key} command exists in this Agent8088 front end.{hint} "
+            "Do not describe one that does not exist.")
+
+
 def describe_tool(tool_name, specs=None) -> str:
     """Return one live tool schema without executing the described tool.
 
@@ -11648,6 +11749,8 @@ def describe_tool(tool_name, specs=None) -> str:
     if not isinstance(tool_name, str) or not tool_name.strip() or len(tool_name) > 200:
         return "Error: Provide one exact tool name, e.g. read_text. Use /tools to list available names."
     name = tool_name.strip()
+    if name.startswith("/") or (name not in registry and name.lower() in FRONTEND_COMMANDS):
+        return _describe_command(name.lstrip("/"))
     spec = registry.get(name)
     if spec is None:
         return f"Error: Unknown or unavailable tool {name!r}. Use /tools to list available names. No tool was executed."
@@ -11715,6 +11818,12 @@ def describe_capabilities() -> str:
             for mcp_tool in tools:
                 lines.append(f"    - {mcp_tool}")
     lines.append("")
+
+    if FRONTEND_COMMANDS:
+        lines.append(f"## Commands the user can type ({len(FRONTEND_COMMANDS)})")
+        lines.extend(f"- /{name}: {description}"
+                     for name, (_, description) in sorted(FRONTEND_COMMANDS.items()))
+        lines.append("")
 
     # --- Skills and subagents ---
     lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
@@ -12053,6 +12162,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             kwargs["spin"]("thinking...")
         kwargs["system_prompt"] = _recalled_memory_prompt(
             messages, kwargs.get("system_prompt"), identity=memory_identity)
+        kwargs["system_prompt"] = _mentioned_capabilities_prompt(
+            messages, kwargs.get("system_prompt"))
     answer = None
     try:
         with _running_on(messages):

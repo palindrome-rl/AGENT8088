@@ -2290,6 +2290,24 @@ def command_catalog():
     ]
 
 
+# The model only ever sees tool schemas; this tells the engine which commands
+# the person can type here, so "what does /local do" is answered from this
+# table instead of guessed. The web UI imports this module and shares it; the
+# gateway registers its own commands when it starts.
+def _unknown_command_message(cmd: str) -> str:
+    """`/seatch` -> suggest /search, instead of only pointing at /help."""
+    import difflib
+    close = difflib.get_close_matches(cmd.lower(), COMMANDS, n=1, cutoff=0.6)
+    hint = f" — did you mean /{close[0]}?" if close else ""
+    return f"[red]unknown command:[/red] /{cmd}{hint}  (try /help)"
+
+
+A.register_frontend_commands({
+    name: (command["usage"], command["description"])
+    for command in command_catalog() for name in (command["name"], *command["aliases"])
+})
+
+
 def cmd_help(_):
     t = Table(title="Commands", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
@@ -8294,7 +8312,7 @@ def main():
                 except Exception as e:
                     console.print(f"[red]error:[/red] {e}")
             else:
-                console.print(f"[red]unknown command:[/red] /{cmd}  (try /help)")
+                console.print(_unknown_command_message(cmd))
             continue
         pasted = _detect_pasted_file(line)
         if pasted and _handle_pasted_file(*pasted, original=line):

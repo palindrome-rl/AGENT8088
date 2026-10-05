@@ -127,6 +127,9 @@ def _dedup_reply(clean: str) -> str:
 
 class GatewayRunner:
     def __init__(self, sessions: SessionStore, allowlist: Allowlist):
+        # Chat users type these, not the CLI's; the model answers from them.
+        A.register_frontend_commands(
+            {name: (name, description) for name, description in SLASH_COMMANDS.items()})
         self.sessions = sessions
         self.allowlist = allowlist
         self.adapters = []

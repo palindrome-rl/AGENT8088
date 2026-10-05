@@ -12,6 +12,15 @@ Use `/tools read_text` or `/tool describe read_text` to inspect one tool without
 executing it. With no name, `/tools` still lists all active tools. Names must match
 the registry exactly; unknown names return an actionable error, not the full list.
 
+The model also knows the commands the person can type. Each front end registers
+its own table with the engine (`register_frontend_commands`): the CLI and web UI
+register `COMMAND_SPECS`, the gateway its chat commands. When a message names a
+command (`/local`) or a tool (`read_text`, or a family in words such as "cli
+anything"), that turn's system prompt gets a short block of facts from these
+registries, at most eight lines, so the answer comes from the registry instead
+of a guess. Only the person's own message is read, never tool output, and
+nothing is added when nothing is named.
+
 The model-facing `describe_tool(tool_name)` uses the same live schema, including
 required fields, optional fields, types, and native MCP parameter schemas. It is
 available in read-only and plan-only modes and exposed by the MCP server. Web API
@@ -36,8 +45,8 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | `ref`*, `offset`*, `length`* | ✅ | Re-read the previous tool's output without re-running it; pass a truncation `ref` to read the elided part. |
 | `memory_forget` | `memory` | `query` | prompt | Delete one specific memory, but only when exactly one clearly matches; several matches are listed back instead. |
-| `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails. |
-| `describe_tool` | `introspect` | `tool_name` | ✅ | Describe one named tool's live schema — purpose, required/optional args and types. |
+| `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, the commands the user can type, mode, sandbox, and active guardrails. |
+| `describe_tool` | `introspect` | `tool_name` | ✅ | Describe one named tool's live schema — purpose, required/optional args and types. Given `/name` (or a command name), describes that slash command instead, or says it does not exist and suggests the nearest. |
 | `web_search` | `search` | `query` | prompt by default | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url`, `task` | prompt | Headless browser — click, fill forms, navigate, and extract via natural-language instructions, not just read static text. |
