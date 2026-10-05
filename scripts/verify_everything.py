@@ -414,6 +414,49 @@ for alias, canonical in [("bash", "execute_shell"), ("sh", "execute_shell"),
 ok("canonical names pass through", E._resolve_tool_name("execute_shell") == "execute_shell")
 ok("unknown names pass through", E._resolve_tool_name("zzz") == "zzz")
 
+section("5c. SELF-DESCRIPTION — commands the user types, tools by name")
+# Asked "what does /local do", the model said no such command existed: it is a
+# real CLI command, and nothing told the model its own front end's commands.
+_fc = dict(E.FRONTEND_COMMANDS)
+E.register_frontend_commands({})
+ok("no front end registered: /local is unknown", "No /local command" in E.describe_tool("/local"))
+E.register_frontend_commands({
+    "local": ("/local [check|list|available [query]|pull <name>|remove <name>]",
+              "Probe hardware, show installed Ollama models or browse pullable ones"),
+    "search": ("/search [status|use|setup|stop]", "Inspect and configure web-search backends"),
+})
+d = E.describe_tool("/local")
+ok("describe_tool explains a command", "Ollama" in d and "/local [check" in d, d[:80])
+ok("...and says it is typed by the user, not called",
+   "not a tool you can call" in d)
+ok("bare name of a command works too", "Ollama" in E.describe_tool("local"))
+ok("a typo suggests the real command", "/search" in E.describe_tool("/seatch"))
+ok("describe_capabilities lists the commands",
+   "/local" in E.describe_capabilities() and "Commands the user can type" in E.describe_capabilities())
+
+def _facts(text, extra=()):
+    msgs = [*extra, {"role": "user", "content": text}]
+    prompt = E._mentioned_capabilities_prompt(msgs, "BASE")
+    return prompt() if callable(prompt) else prompt
+
+f = _facts("what does /local do")
+ok("a mentioned command brings its facts into this turn", "Ollama" in f and f.startswith("BASE"), f[-80:])
+ok("a typo'd command is named as one", "/search" in _facts("what does /seatch do"))
+for text in ("what is in /usr/local/bin", "open https://example.com/local", "what's in /etc",
+             "list ~/local files", "hello there"):
+    ok(f"no facts for: {text}", _facts(text) == "BASE")
+f = _facts("what task can I perform with cli anything")
+ok("a tool family named in words lists its tools", "cli_anything_status" in f, f[-80:])
+ok("...at most six of them", f.count("- tool `cli_anything_") <= 6)
+ok("an exact tool name brings its description", "read_text" in _facts("what does read_text do"))
+ok("...and how to call it", "read_text(" in _facts("what does read_text do"),
+   _facts("what does read_text do")[-120:])
+ok("tool output never triggers it", _facts("thanks", extra=(
+    {"role": "user", "content": E._TOOL_RESULT_PREFIX + "see /local"},)) == "BASE")
+many = "/local /search " + " ".join(list(E.TOOL_SPECS)[:20])
+ok("capped at eight entries", _facts(many).count("\n- ") <= 8)
+E.register_frontend_commands(_fc)
+
 # ================================================ 6. TOOL EXECUTION (readonly)
 section("6. TOOL EXECUTION — readonly-safe tools, real runs")
 with with_mode("readonly"):
@@ -1532,6 +1575,42 @@ ok("all expected CLI commands registered", not missing, f"missing: {missing}" if
 for cmd in sorted(expected_cmds & set(C.COMMANDS)):
     ok(f"/{cmd} is callable", callable(C.COMMANDS[cmd]))
 ok("engine reachable from cli", hasattr(C, "A") or hasattr(C, "engine"))
+ok("CLI registers its commands with the engine",
+   "local" in E.FRONTEND_COMMANDS and "Ollama" in E.FRONTEND_COMMANDS["local"][1])
+# A one-line usage left the model to invent the rest: asked about /memory it
+# said bare /memory lists every fact (it shows the settings) and that forget
+# takes a fact (it takes an id). Every command carries its real usage.
+_names = {name for name, *_ in C.COMMAND_SPECS if name}
+ok("every command has usage details", not (_names - set(C.COMMAND_DETAILS)),
+   sorted(_names - set(C.COMMAND_DETAILS)))
+ok("no details for a command that does not exist", not (set(C.COMMAND_DETAILS) - _names),
+   sorted(set(C.COMMAND_DETAILS) - _names))
+d = E.describe_tool("/memory")
+ok("describe_tool /memory gives the real subcommands",
+   "forget <id>" in d and "search <query>" in d and "settings" in d, d[:120])
+p = E._mentioned_capabilities_prompt([{"role": "user", "content": "what does /memory do"}], "B")
+p = p() if callable(p) else p
+ok("asking about /memory brings its usage into the turn", "forget <id>" in p, p[-120:])
+_lc = C._cmd_local_check
+C._cmd_local_check = lambda: setattr(C, "_local_check_ran", True)
+C._local_check_ran = False
+C.cmd_local("check")
+C._cmd_local_check = _lc
+ok("/local check runs the check it advertises", C._local_check_ran)
+ok("an unknown typed command suggests the near one", "/search" in C._unknown_command_message("seatch"))
+ok("...and stays plain when nothing is near", "did you mean" not in C._unknown_command_message("zzzzqq"))
+try:
+    from agent8088.gateway.runner import GatewayRunner
+    from agent8088.gateway.session import SessionStore
+    from agent8088.gateway.auth import Allowlist
+except ImportError as exc:
+    skip("gateway registers its own commands", f"gateway extra not installed: {exc}")
+else:
+    _cli_commands = dict(E.FRONTEND_COMMANDS)
+    GatewayRunner(SessionStore(str(TMP / "gw")), Allowlist([], session_dir=TMP / "gw"))
+    ok("gateway registers its own commands, not the CLI's",
+       "approve" in E.FRONTEND_COMMANDS and "local" not in E.FRONTEND_COMMANDS)
+    E.register_frontend_commands(_cli_commands)
 ok("save_model_profile never writes a literal key", True, "covered by unit tests")
 
 # =============================================================== SUMMARY

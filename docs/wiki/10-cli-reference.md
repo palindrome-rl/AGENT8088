@@ -131,7 +131,11 @@ agent8088 --uninstall --all --yes --non-interactive   # fully unattended, full r
 ## Slash commands
 
 **45 registered commands** (`COMMANDS` in `src/agent8088/cli.py`). Prefix-matched,
-so `/mo` offers `/mode`, `/model`, `/models`.
+so `/mo` offers `/mode`, `/model`, `/models`. A mistyped command names the
+nearest real one: `/seatch` → `unknown command: /seatch — did you mean /search?`.
+
+The agent knows this list too, so "what does /local do?" is answered from it
+rather than guessed (see [Tools](04-tools.md)).
 
 Pasting a bare file path into the prompt — nothing else on the line — reads it
 immediately: images go to a vision model, documents are extracted to text.
