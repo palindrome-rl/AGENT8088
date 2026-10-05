@@ -764,6 +764,114 @@ ok("note sits outside the untrusted wrapper",
 E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS = _rb, _ad
 E.reset_turn_counters()
 
+section("8g. CONFIG BLOCKERS — the third refusal names who can change it")
+# Same rule as 8f for every refusal a config.txt setting causes: silent twice,
+# then one note naming the setting. Credential and fixed-safety refusals never
+# name a way to unlock them.
+def third(results):
+    return results[0] == results[0].split("[agent8088]")[0] and "[agent8088]" not in results[1] \
+        and "[agent8088]" in results[2]
+
+E.reset_turn_counters()
+_bp, _pa = E.BLOCKED_PATHS, E.ALLOWED_PATHS
+E.BLOCKED_PATHS, E.ALLOWED_PATHS = [(TMP / "locked").resolve()], [TMP]
+with with_mode("edit"):
+    r = [E.run_tool("write_file", {"filename": str(TMP / "locked" / f"f{i}.txt"), "content": "x"})
+         for i in range(3)]
+E.BLOCKED_PATHS, E.ALLOWED_PATHS = _bp, _pa
+ok("blocked_paths: silent twice, then a note", third(r), r[2][-90:])
+ok("blocked_paths note names the setting and config.txt",
+   "blocked_paths" in r[2] and "config.txt" in r[2])
+
+E.reset_turn_counters()
+_deny, _allow = E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS
+E._USER_DENY_GLOBS = ["npm publish*"]
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"npm publish --tag t{i}"}) for i in range(3)]
+ok("deny_commands: note names the user's own rule", third(r) and "deny_commands" in r[2], r[2][-90:])
+E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS = [], ["ls*"]
+E.reset_turn_counters()
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"whoami /{i}"}) for i in range(3)]
+ok("allow_commands: note names the allowlist", third(r) and "allow_commands" in r[2], r[2][-90:])
+E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS = _deny, _allow
+
+E.reset_turn_counters()
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"git push --force origin b{i}"}) for i in range(3)]
+ok("built-in rule: note says no setting changes it",
+   third(r) and "fixed safety rule" in r[2] and "deny_commands" not in r[2], r[2][-90:])
+
+E.reset_turn_counters()
+secret_file = TMP / ".env"
+secret_file.write_text("K=v")
+_pa = E.ALLOWED_PATHS
+E.ALLOWED_PATHS = [TMP]
+r = [E.run_tool("read_text", {"filename": str(secret_file)}) for _ in range(3)]
+E.ALLOWED_PATHS = _pa
+secret_file.unlink(missing_ok=True)
+ok("credential file: note says protected", third(r) and "protected" in r[2], r[2][-90:])
+ok("credential note never names the unlock setting", "allowed_sensitive_files" not in r[2])
+
+E.reset_turn_counters()
+_ea = E.EGRESS_ALLOWED_DOMAINS
+E.EGRESS_ALLOWED_DOMAINS = ["example.com"]
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="https://evil.example.net/x?token=abc123")
+note = E._take_blocker_note()
+E.EGRESS_ALLOWED_DOMAINS = _ea
+ok("allowed_domains: note names setting and host", "allowed_domains" in note
+   and "evil.example.net" in note, note[:90])
+ok("egress note leaks no URL path or query", "token=abc123" not in note and "/x" not in note)
+E.reset_turn_counters()
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="http://192.168.1.10:8888/search?q=x")
+note = E._take_blocker_note()
+ok("LAN service: note names ssrf_allow_hosts with host:port",
+   "ssrf_allow_hosts=192.168.1.10:8888" in note, note[:90])
+E.reset_turn_counters()
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="http://169.254.169.254/latest/meta-data/")
+note = E._take_blocker_note()
+ok("cloud metadata address is never offered as allowable",
+   "ssrf_allow_hosts" not in note and "fixed safety rule" in note, note[:90])
+
+E.reset_turn_counters()
+_es = E._exec_shell_command
+E._exec_shell_command = lambda command, timeout=25, image="": f"Command timed out after {timeout}s."
+_rb = E._resolve_sandbox_backend
+E._resolve_sandbox_backend = lambda: "native"
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"findstr /s TODO part{i}"}) for i in range(3)]
+E._exec_shell_command, E._resolve_sandbox_backend = _es, _rb
+ok("timeouts: third one names max_tool_timeout_seconds and /limits",
+   third(r) and "max_tool_timeout_seconds" in r[2] and "/limits" in r[2], r[2][-90:])
+
+E.reset_turn_counters()
+log = TMP / "build.log"
+log.write_text("Command timed out after 5s.")
+_pa = E.ALLOWED_PATHS
+E.ALLOWED_PATHS = [TMP]
+r = [E.run_tool("read_text", {"filename": str(log)}) for _ in range(3)]
+E.ALLOWED_PATHS = _pa
+ok("reading a file that mentions a timeout is not a timeout", "[agent8088]" not in r[2], r[2][-60:])
+
+ok("turn-limit footer tells the user how to raise it",
+   "/maxturns" in E._turn_limit_reason(10) and "max_turns" in E._turn_limit_reason(10))
+
+E.reset_turn_counters()
+for _ in range(5):
+    E._audit("tool_call", decision="denied", reason="blocked_path", detail="/p")
+notes = [E._take_blocker_note() for _ in range(2)]
+ok("one note per kind per turn, taken once", notes[0] != "" and notes[1] == "")
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="readonly_floor", detail="x")
+ok("refusals with no setting behind them stay silent", E._take_blocker_note() == "")
+E.reset_turn_counters()
+
 # ============================================================ 9. PROVIDERS
 section("9. PROVIDERS")
 provs = E.load_providers({

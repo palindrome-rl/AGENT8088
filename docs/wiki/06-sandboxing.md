@@ -86,7 +86,8 @@ decide. On the Docker fallback, which has no network at all, it names
 `agent8088 --sandbox-setup` first. The note never includes a URL path, a query
 or any other config value, and the model cannot change `config.txt` itself. It
 is not shown earlier because a small model told about the restriction up front
-tends to give up before trying.
+tends to give up before trying. This is one case of the general config-blocker
+notes described in [Permissions and security](03-permissions-and-security.md).
 
 ## No unsandboxed fallback
 
