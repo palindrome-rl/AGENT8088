@@ -78,6 +78,16 @@ tools* may reach. Shell commands that invoke a web client such as `curl` or
 domain and SSRF policies before the command can run. Both layers apply
 independently.
 
+A blocked fetch only says the host could not be reached, so a model can spend a
+whole turn on workarounds. After the **third** network failure from sandboxed
+code in one turn, Agent8088 appends one note to the result. It names the setting
+and the hosts the task asked for, then tells the model to stop and let the user
+decide. On the Docker fallback, which has no network at all, it names
+`agent8088 --sandbox-setup` first. The note never includes a URL path, a query
+or any other config value, and the model cannot change `config.txt` itself. It
+is not shown earlier because a small model told about the restriction up front
+tends to give up before trying.
+
 ## No unsandboxed fallback
 
 When neither backend is available, Agent8088 refuses shell and code execution
