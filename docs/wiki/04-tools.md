@@ -18,7 +18,10 @@ register `COMMAND_SPECS`, the gateway its chat commands. When a message names a
 command (`/local`) or a tool (`read_text`, or a family in words such as "cli
 anything"), that turn's system prompt gets a short block of facts from these
 registries, at most eight lines, so the answer comes from the registry instead
-of a guess. Only the person's own message is read, never tool output, and
+of a guess. A command's line carries every subcommand and its arguments (from
+`COMMAND_DETAILS` in `cli.py`, which `verify_everything.py` keeps in step with
+`COMMAND_SPECS`); a tool's line shows how it is called, e.g.
+`read_text(filename, [offset], [limit])`. Only the person's own message is read, never tool output, and
 nothing is added when nothing is named.
 
 The model-facing `describe_tool(tool_name)` uses the same live schema, including

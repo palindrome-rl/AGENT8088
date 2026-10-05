@@ -3686,10 +3686,15 @@ FRONTEND_COMMANDS = {}
 
 
 def register_frontend_commands(commands: dict) -> None:
-    """Replace the command table describe_tool and per-turn facts read from."""
+    """Replace the command table describe_tool and per-turn facts read from.
+
+    Each value is (usage, description) or (usage, description, details), where
+    details spells out every subcommand -- without it the model invents them.
+    """
     global FRONTEND_COMMANDS
-    FRONTEND_COMMANDS = {str(name).lstrip("/").lower(): (str(usage), str(description))
-                         for name, (usage, description) in dict(commands).items()}
+    FRONTEND_COMMANDS = {
+        str(name).lstrip("/").lower(): tuple(str(part) for part in (*entry, "")[:3])
+        for name, entry in dict(commands).items()}
 # Human-in-the-loop hook: a presentation layer (e.g. Rich CLI) may set this to
 #   human_input_handler(question, reason) -> str
 # to present an interactive prompt with terminal UI controls (e.g. pausing spinners).
@@ -10594,8 +10599,12 @@ _MENTION_HEADER = ("## What the user's message refers to\n"
 
 
 def _tool_fact(name: str) -> str:
-    description = str(TOOL_SPECS[name].get("description") or "").split(". ")[0].rstrip(".")
-    return f"- tool `{name}`: {description}."
+    """One line: what the tool is for and how it is called (optional args in [])."""
+    spec = TOOL_SPECS[name]
+    description = str(spec.get("description") or "").split(". ")[0].rstrip(".")
+    optional = set(spec.get("optional") or ())
+    args = ", ".join(f"[{a}]" if a in optional else a for a in spec.get("args") or ())
+    return f"- tool `{name}({args})`: {description}."
 
 
 def _mentioned_capability_facts(text: str) -> list:
@@ -10608,8 +10617,9 @@ def _mentioned_capability_facts(text: str) -> list:
     facts = []
     for word in dict.fromkeys(m.lower() for m in _SLASH_MENTION_RE.findall(text or "")):
         if word in FRONTEND_COMMANDS:
-            usage, description = FRONTEND_COMMANDS[word]
-            facts.append(f"- `{usage}`: {description} (a command the user types; "
+            usage, description, details = FRONTEND_COMMANDS[word]
+            about = " ".join(part for part in (description.rstrip(".") + ".", details) if part)
+            facts.append(f"- `{usage}`: {about} (a command the user types; "
                          "not a tool you can call)")
         elif close := _close_commands(word, cutoff=0.75)[:1]:
             facts.append(f"- /{word}: no such command; the user probably means "
@@ -11728,9 +11738,10 @@ def _describe_command(name: str) -> str:
     """describe_tool for a front-end command -- or for one that does not exist."""
     key = name.strip().lower()
     if key in FRONTEND_COMMANDS:
-        usage, description = FRONTEND_COMMANDS[key]
+        usage, description, details = FRONTEND_COMMANDS[key]
         return json.dumps({"command": f"/{key}", "usage": usage, "description": description,
-                           "how_to_use": _COMMAND_IS_TYPED}, ensure_ascii=False, indent=2)
+                           "details": details, "how_to_use": _COMMAND_IS_TYPED},
+                          ensure_ascii=False, indent=2)
     close = _close_commands(key)
     hint = f" Did you mean {', '.join('/' + c for c in close)}?" if close else ""
     return (f"No /{key} command exists in this Agent8088 front end.{hint} "
@@ -11822,7 +11833,7 @@ def describe_capabilities() -> str:
     if FRONTEND_COMMANDS:
         lines.append(f"## Commands the user can type ({len(FRONTEND_COMMANDS)})")
         lines.extend(f"- /{name}: {description}"
-                     for name, (_, description) in sorted(FRONTEND_COMMANDS.items()))
+                     for name, (_, description, _) in sorted(FRONTEND_COMMANDS.items()))
         lines.append("")
 
     # --- Skills and subagents ---

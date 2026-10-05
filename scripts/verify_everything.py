@@ -390,6 +390,8 @@ f = _facts("what task can I perform with cli anything")
 ok("a tool family named in words lists its tools", "cli_anything_status" in f, f[-80:])
 ok("...at most six of them", f.count("- tool `cli_anything_") <= 6)
 ok("an exact tool name brings its description", "read_text" in _facts("what does read_text do"))
+ok("...and how to call it", "read_text(" in _facts("what does read_text do"),
+   _facts("what does read_text do")[-120:])
 ok("tool output never triggers it", _facts("thanks", extra=(
     {"role": "user", "content": E._TOOL_RESULT_PREFIX + "see /local"},)) == "BASE")
 many = "/local /search " + " ".join(list(E.TOOL_SPECS)[:20])
@@ -1269,6 +1271,26 @@ for cmd in sorted(expected_cmds & set(C.COMMANDS)):
 ok("engine reachable from cli", hasattr(C, "A") or hasattr(C, "engine"))
 ok("CLI registers its commands with the engine",
    "local" in E.FRONTEND_COMMANDS and "Ollama" in E.FRONTEND_COMMANDS["local"][1])
+# A one-line usage left the model to invent the rest: asked about /memory it
+# said bare /memory lists every fact (it shows the settings) and that forget
+# takes a fact (it takes an id). Every command carries its real usage.
+_names = {name for name, *_ in C.COMMAND_SPECS if name}
+ok("every command has usage details", not (_names - set(C.COMMAND_DETAILS)),
+   sorted(_names - set(C.COMMAND_DETAILS)))
+ok("no details for a command that does not exist", not (set(C.COMMAND_DETAILS) - _names),
+   sorted(set(C.COMMAND_DETAILS) - _names))
+d = E.describe_tool("/memory")
+ok("describe_tool /memory gives the real subcommands",
+   "forget <id>" in d and "search <query>" in d and "settings" in d, d[:120])
+p = E._mentioned_capabilities_prompt([{"role": "user", "content": "what does /memory do"}], "B")
+p = p() if callable(p) else p
+ok("asking about /memory brings its usage into the turn", "forget <id>" in p, p[-120:])
+_lc = C._cmd_local_check
+C._cmd_local_check = lambda: setattr(C, "_local_check_ran", True)
+C._local_check_ran = False
+C.cmd_local("check")
+C._cmd_local_check = _lc
+ok("/local check runs the check it advertises", C._local_check_ran)
 ok("an unknown typed command suggests the near one", "/search" in C._unknown_command_message("seatch"))
 ok("...and stays plain when nothing is near", "did you mean" not in C._unknown_command_message("zzzzqq"))
 try:
