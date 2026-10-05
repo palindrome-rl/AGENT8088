@@ -122,6 +122,14 @@ path:
 | Extensions | `.pem`, `.key`, `.rsa`, `.p12` |
 | Globs | `*_KEY*`, `*_SECRET*`, `*_TOKEN*`, `*_PASSWORD*` (and lowercase) |
 
+Two narrow exceptions keep ordinary project files usable. Env templates
+(`.env.example`, `.env.sample`, `.env.template`, `.env.dist`) hold no values and
+are judged by their directory only, so `cat .env.example` works while `.env`,
+`.env.local`, `.envrc` and `~/.ssh/.env.example` stay blocked. The globs skip
+source files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.md`, …), so
+`count_tokens.py` and `reset_password.py` are code, while `api_key.txt`,
+`client_secret.json` and `github_token` are still credentials.
+
 This covers indirect routes too: symlinks are resolved before the check, and
 `git show HEAD:.env` / `git diff -- .env` are blocked explicitly because they'd
 otherwise read a credential without touching the file tool.
@@ -170,6 +178,14 @@ full-auto and even after a grant. The check sees through `sh -c '...'`,
 `git -C /path push`, `/usr/bin/git push`, and `echo hi; git push`. Meanwhile
 `echo git push` and `grep git push file` are correctly *not* blocked — it
 distinguishes git-as-a-command from git-as-a-word.
+
+Only operations that can lose work are refused. `git checkout -b <new>`,
+`git branch -d` / `--delete` (git itself refuses an unmerged branch) and
+`git restore --staged` (unstages, leaves the file alone) are allowed; their
+forcing or overwriting forms — `checkout -B`, `checkout <path>`, `checkout --`,
+`branch -D`, `branch -d -f`, `restore` without `--staged`, `restore --worktree` —
+stay blocked. Use `git switch <branch>` to change branches: a bare
+`git checkout <name>` cannot be told apart from `git checkout <file>`.
 
 ### 4. System-prompt exfiltration
 
@@ -400,7 +416,11 @@ Enforced at the always-on floor, so an unlisted command is **not escalatable** �
 the same standing as a deny rule. Precedence:
 
 1. Unrecoverable floor wins over everything. `allow_commands=*` does **not**
-   re-enable `rm -rf /`, `mkfs`, or `curl | sh`.
+   re-enable `rm -rf /`, `mkfs`, or `curl | sh`. The floor covers `rm -r` of
+   `/`, `/*`, `~`, `~/`, `~/*`, `$HOME`, `${HOME}` (quoted or not) and the
+   top-level system directories (`/usr`, `/etc`, `/home`, `/var`, `/Users`, …),
+   and `chmod`/`chown`/`chgrp -R` on the same targets. Paths below them —
+   `rm -rf ~/projects/old`, `rm -rf /tmp/x` — are ordinary deletes.
 2. `deny_commands` wins over `allow_commands` — deny is the more specific intent.
 3. Otherwise, an allowlist (if set) must match.
 

