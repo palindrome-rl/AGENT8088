@@ -71,6 +71,9 @@ def _stub_doctor_network(monkeypatch):
     # these tests never touch the network or the host's real config, same as
     # test_dump_redaction.py does for cmd_dump.
     monkeypatch.setattr(cli, "_endpoint_probe", lambda endpoint: "stubbed")
+    # The live checks (provider /models, Ollama, MCP, Playwright, Docker, the
+    # home dir) are covered with their own mocks in test_doctor_checks.py.
+    monkeypatch.setattr(cli, "_doctor_live_checks", lambda: [])
     monkeypatch.setattr(cli.A, "sandbox_status", lambda: {
         "requested": "auto", "resolved": "unavailable",
         "detail": "test", "verification": "n/a",

@@ -66,6 +66,11 @@ function wireSocket(ws: WebSocket) {
           }
         }
         break
+      case 'stream_reset':
+        // The reply broke off mid-stream and is being retried: drop the
+        // fragment already shown so the retry doesn't append to it.
+        useSessionStore.setState({ streamingText: '', streamingReasoning: [] })
+        break
       case 'tool_calls':
         break
       case 'tool_start':

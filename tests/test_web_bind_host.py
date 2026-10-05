@@ -37,6 +37,8 @@ def test_loopback_binds_are_accepted(host, monkeypatch):
         started["host"] = host
 
     monkeypatch.setattr(web_server, "_frontend_root", lambda: None)
+    # Not this test's subject, and it would bind a real port.
+    monkeypatch.setattr(web_server, "_ensure_port_free", lambda *a, **k: None)
     monkeypatch.setattr("uvicorn.run", _fake_run)
     # _frontend_root() returning None raises its own RuntimeError about a
     # missing frontend -- which is proof the bind check let the host through.
