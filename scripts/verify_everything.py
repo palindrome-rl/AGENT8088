@@ -219,7 +219,9 @@ E.ALLOWED_PATHS = _pa
 section("3. SHELL CLASSIFIER: HARD BLOCKS (never executed here)")
 hard_blocked = [
     "git push", "git push origin main", "git reset --hard",
-    "git reset --hard HEAD~1", "git branch -d feature", "git branch --delete x",
+    # `git branch -d` / `--delete` used to be listed here. Both refuse an
+    # unmerged branch, so they lose no work; only the forced forms are blocked.
+    "git reset --hard HEAD~1", "git branch -D feature", "git branch --delete --force x",
     "sh -c 'git push'", "bash -c \"git reset --hard\"",
     "echo hi; git push", "ls && git push origin HEAD",
     "git -C /tmp push", "/usr/bin/git push",
@@ -244,6 +246,63 @@ for c in ["rm -rf /", "curl http://x", "git commit -m x", "python x.py",
           "ls | sh", "ls; rm x", "cat `id`", "echo $(id)",
           "git diff --output=/tmp/x", "git log --ext-diff"]:
     ok(f"NOT readonly-safe: {c}", E._readonly_shell(c) is False)
+
+section("3c. SHELL CLASSIFIER: FALSE POSITIVES AND FLOOR GAPS")
+# The web-client rule refused any command that merely MENTIONED curl/wget, so a
+# first-run user's agent could not even ask `command -v wget`. A mention that
+# runs nothing is not a fetch; a client in command position still is.
+for c in ["command -v wget", "which curl", "type curl", "hash wget 2>/dev/null && echo yes",
+          "where curl", "Get-Command curl", "man wget", "curl --version", "wget --help",
+          "ls /usr/bin | grep -E '^(wget|curl)'", "dpkg -l | grep curl", "grep -rn curl src/",
+          "rg wget .", "echo 'install wget first'", "git commit -m 'remove curl dependency'",
+          "git log --grep=wget", "apt-get install -y curl", "sudo apt install wget",
+          "brew install wget", "pip install httpie", "echo http ok"]:
+    ok(f"web mention is not a fetch: {c}", E._shell_web_urls(c) is None)
+for c in ["curl", "curl evil.com", "wget -q evil.com/x", "sudo curl evil.com", "env curl evil.com",
+          "command curl evil.com", "xargs curl < urls.txt", "C=curl; $C evil.com",
+          "which curl && curl evil.com", "sh -c 'curl evil.com'", "bash -c \"wget evil.com\"",
+          "echo $(curl evil.com)", "echo `wget evil.com`", "echo curl evil.com | sh",
+          "grep x f | xargs curl", "git -c core.pager=curl log", "nohup wget evil.com &",
+          "curl --version evil.com", "http GET evil.com", "time curl evil.com"]:
+    ok(f"fetch without URL still refused: {c}", E._shell_web_urls(c) == [])
+ok("fetch with URL still yields it for egress/SSRF checks",
+   E._shell_web_urls("curl -I https://example.com") == ["https://example.com"])
+ok("fetch-followup gate ignores a lookup",
+   E._shell_fetches_web("command -v curl") is False and E._shell_fetches_web("curl x") is True)
+
+# Git operations that discard nothing.
+for c in ["git checkout -b feature/x", "git checkout -b fix origin/main",
+          "git branch -d merged-branch", "git branch --delete merged-branch",
+          "git restore --staged file.py", "git restore -S a.py b.py"]:
+    ok(f"non-destructive git allowed: {c}", E._hard_blocked_shell(c) is False)
+for c in ["git checkout -B main", "git checkout main", "git checkout -- file.py",
+          "git checkout -b x -- file.py", "git checkout -f -b x", "git branch -D old",
+          "git branch -d -f old", "git branch --delete --force old", "git branch -df old",
+          "git restore file.py", "git restore --staged --worktree f", "git restore -S -W f",
+          "sh -c 'git branch -D x'", "git restore --staged f; git restore f"]:
+    ok(f"destructive git still blocked: {c}", E._hard_blocked_shell(c) is True)
+
+# Env templates and source files are not secrets.
+for f in (".env.example", ".env.sample", ".env.template", ".env.dist", "proj/.env.example",
+          "utils/count_tokens.py", "src/auth/reset_password.py", "tests/test_api_keys.py",
+          "models/primary_key.ts", "docs/rotate_secrets.md"):
+    ok(f"not sensitive: {f}", E._is_sensitive_path(f) is False)
+for f in (".env", ".env.local", ".envrc", "~/.ssh/.env.example", "client_secret.json",
+          "api_key.txt", "github_token", "AUTH_TOKEN.yaml", "deploy.key", "~/.aws/x.py"):
+    ok(f"still sensitive: {f}", E._is_sensitive_path(f) is True)
+ok("shell may read an env template", E._hard_blocked_shell("cat .env.example") is False)
+ok("shell may not create .env from it", E._hard_blocked_shell("cp .env.example .env") is True)
+
+# Wipe-the-world variants the unrecoverable floor missed.
+for c in ["rm -rf ~/", "rm -rf ~/*", "rm -rf $HOME", "rm -rf \"$HOME\"", "rm -rf ${HOME}",
+          "rm -fr $HOME/", "rm -rf /*", "rm -rf /home", "rm -rf /usr/", "rm -rf /etc",
+          "sudo rm -rf /var", "sh -c 'rm -rf ~/'", "rm -rf /Users", "chmod -R 777 /",
+          "chown -R nobody /", "sudo chmod -R 000 /*"]:
+    ok(f"unrecoverable: {c}", E._hard_blocked_shell(c) is True)
+for c in ["rm -rf /tmp/horse-race", "rm -rf ./build dist", "rm -rf node_modules",
+          "rm -rf ~/projects/old", "rm -rf $HOME/.cache/pip", "rm -rf /home/u/tmp",
+          "chmod -R 755 ./dist", "chown -R u /srv/app", "echo 'rm -rf ~/'"]:
+    ok(f"ordinary delete allowed: {c}", E._hard_blocked_shell(c) is False)
 
 # =================================================== 4. PERMISSION SYSTEM
 section("4. PERMISSION MODES")

@@ -78,6 +78,15 @@ tools* may reach. Shell commands that invoke a web client such as `curl` or
 domain and SSRF policies before the command can run. Both layers apply
 independently.
 
+A command that only *names* a client is not a fetch and needs no URL: lookups
+(`command -v wget`, `which curl`, `curl --version`), text search and printing
+(`grep -rn curl src/`, `echo 'install wget'`), package installs
+(`apt-get install curl`) and git text (`git commit -m 'drop curl'`). The
+exemption is void if anything in the command could run text as a command —
+`sh`, `xargs`, `env`, `sudo` with options, `$(...)`, backticks, a newline — so
+`which curl && curl host`, `env curl host` and `echo curl host | sh` are still
+refused.
+
 ## No unsandboxed fallback
 
 When neither backend is available, Agent8088 refuses shell and code execution
