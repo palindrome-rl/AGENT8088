@@ -570,6 +570,37 @@ ok("docker mounts the workspace", "type=bind" in argv_s and "/workspace" in argv
 ok("docker runs python -c for code", "python" in argv_s and "-c" in argv_s)
 ok("invalid image name rejected",
    "invalid container image" in E._exec_docker_command("x", 5, image="bad;rm -rf /"))
+# The native backend runs the snippet through the platform shell, and cmd.exe
+# ends a command at its first newline: multi-line code ran only `import sys`
+# and reported "Command completed." with no output.
+_snippet = getattr(E, "_python_snippet_command", lambda code: "")("import sys\nprint('second ' + 'line')")
+_ran = subprocess.run(_snippet, shell=True, capture_output=True, text=True) if _snippet else None
+ok("multi-line python snippet survives the shell",
+   bool(_ran) and "second line" in _ran.stdout, repr(_ran.stdout[:80]) if _ran else "no helper")
+
+# A run spent ~12 turns probing which folders the sandbox lets it write
+# (uv cache, venv, downloaded interpreter) because "Access is denied" alone
+# does not say the boundary is deliberate or where it is.
+_uv_denied = ("error: Failed to initialize cache at `C:\\x\\uv\\cache`\n  Caused by: failed "
+              "to open file: Access is denied. (os error 5)\nCommand exited with status 2.")
+_explain = getattr(E, "_explain_sandbox_denial", lambda text, workspace: text)
+ok("sandbox access denial names the writable folder",
+   str(E.ARTIFACTS_ROOT) in _explain(_uv_denied, E.ARTIFACTS_ROOT)
+   and "install" in _explain(_uv_denied, E.ARTIFACTS_ROOT))
+ok("sandbox denial note skips unrelated output",
+   _explain("Command completed.", E.ARTIFACTS_ROOT) == "Command completed."
+   and "[sandbox]" not in _explain("git@x: Permission denied (publickey).", E.ARTIFACTS_ROOT))
+# Only the filesystem's wording counts: an API or registry that says
+# "Permission denied" is not the sandbox, and the note would mislead.
+for _fs_denied in ("PermissionError: [Errno 13] Permission denied: 'C:\\\\venv\\\\x'",
+                   "mkdir: cannot create directory '/opt/x': Permission denied",
+                   "bash: /usr/local/bin/tool: Permission denied"):
+    ok(f"filesystem denial gets the note: {_fs_denied[:40]}",
+       "[sandbox]" in _explain(_fs_denied, E.ARTIFACTS_ROOT))
+for _api_denied in ('{"message": "Permission denied"}',
+                    "npm error 403 Forbidden - PUT https://registry.npmjs.org/x - Permission denied"):
+    ok(f"API denial gets no sandbox note: {_api_denied[:40]}",
+       "[sandbox]" not in _explain(_api_denied, E.ARTIFACTS_ROOT))
 
 section("8c. SANDBOX — real execution")
 E.SANDBOX_BACKEND = prev_backend
@@ -843,6 +874,27 @@ for prompt in ("hello how are you", "read notes.txt and summarize",
     ok(f"pre-flight allows: {prompt[:34]}",
        E._preflight_refusal([{"role": "user", "content": prompt}]) is None)
 
+section("11a. CONTROLLER REMINDERS")
+from agent8088.trajectory import TrajectoryState
+# A run answered each "no fresh verification evidence" reminder by writing a
+# new verification script; every write re-armed the reminder, so it fired 4
+# times and the agent kept producing low-value checks instead of finishing.
+_traj = TrajectoryState(None, goal="validate the paper", message_count=1)
+_nudges = 0
+for _ in range(5):
+    _traj.after_tool(_traj.before_tool("write_file"), "Wrote 10 bytes", failed=False,
+                     blocked=False, mutated=True, path="check.py")
+    _nudges += _traj.request_verification()
+ok("verification reminder is capped per task", _nudges <= 2, f"{_nudges} reminders")
+ok("unverified change is still disclosed after the cap", _traj.needs_verification())
+# The cap is per request. A request that ends unverified keeps its state for
+# the next message (it is unresolved), and the spent count must not come
+# with it, or every later request in the session gets no reminder at all.
+_next = TrajectoryState(_traj.data, goal="now fix the parser", message_count=3)
+_next.after_tool(_next.before_tool("write_file"), "Wrote 10 bytes", failed=False,
+                 blocked=False, mutated=True, path="parser.py")
+ok("the next request gets its own reminders", _next.request_verification())
+
 section("11b. TOOL-CALL PARSING")
 ok("parses FUNCTION/ARGS form",
    E.find_tool_calls('✿FUNCTION✿: calculate ✿ARGS✿: {"expression":"1"}')[0]["name"] == "calculate")
@@ -853,6 +905,30 @@ ok("parses loose FUNCTION with no args",
 ok("resolves alias while parsing",
    E.find_tool_calls('✿FUNCTION✿: bash ✿ARGS✿: {"command":"ls"}')[0]["name"] == "execute_shell")
 ok("ignores unknown tool names", E.find_tool_calls('✿FUNCTION✿: current_time') == [])
+# Shapes glm-5.3 sent as native arguments after seeing ✿ARGS✿ in its history:
+# the real object nested under an "ARGS" key, inside a marker-prefixed key, or
+# inside a marker-prefixed value. Each surfaced as "called with no arguments".
+for label, wrapped in (
+        ("ARGS key", '{"ARGS": "{\\"command\\": \\"dir\\"}"}'),
+        ("marker key", '{"\\u273fARGS\\u273f: {\\"command\\": \\"dir\\"}": ""}'),
+        ("marker value", '{"": "ARGS\\u273f: {\\"command\\": \\"dir\\"}"}')):
+    ok(f"unwraps ARGS envelope ({label})",
+       E.find_tool_calls(f"✿FUNCTION✿: execute_shell ✿ARGS✿: {wrapped}")[0]["arguments"]
+       == {"command": "dir"})
+def _loads_or_none(raw):
+    try:
+        return E._loads_tool_args(raw)
+    except ValueError:
+        return None
+ok("args repair keeps escaped backslashes and quotes intact",
+   _loads_or_none('{"filename": "C:\\\\Users\\\\a.py", "new_string": "x = o[\\\'k\\\'] + \\"q\\""}')
+   == {"filename": "C:\\Users\\a.py", "new_string": "x = o['k'] + \"q\""})
+_broken = E.find_tool_calls('✿FUNCTION✿: write_file ✿ARGS✿: {"content": "a\\n"""doc"""\\n", "filename": "x.py"}')
+ok("parse error says where the JSON broke",
+   "char " in str(_broken[0]["arguments"].get("__parse_error_at__", "")),
+   str(_broken[0]["arguments"])[:120])
+ok("args repair still escapes a bare Windows path",
+   _loads_or_none('{"path": "C:\\Users\\docs"}') == {"path": "C:\\Users\\docs"})
 ok("no false positive on plain prose",
    E.find_tool_calls("I will calculate the total for you.") == [])
 ok("strip_tool_json removes markup",
