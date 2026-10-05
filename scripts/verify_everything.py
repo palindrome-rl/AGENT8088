@@ -732,7 +732,11 @@ for failure in ("<urlopen error [Errno -3] Temporary failure in name resolution>
                 "wget: unable to resolve host address 'onfe.itch.io'",
                 "curl: (56) CONNECT tunnel failed, response 403",
                 "Failed to establish a new connection: [Errno 101] Network is unreachable",
-                "getaddrinfo ENOTFOUND registry.npmjs.org"):
+                "getaddrinfo ENOTFOUND registry.npmjs.org",
+                "System.Net.Sockets.SocketException: No such host is known.",
+                "Invoke-WebRequest : The remote name could not be resolved: 'onfe.itch.io'",
+                "[WinError 10013] An attempt was made to access a socket in a way forbidden "
+                "by its access permissions"):
     E.reset_turn_counters()
     ok(f"counts as a network failure: {failure[:45]}",
        [E._sandbox_network_note(failure, "x") for _ in range(3)][2] != "")

@@ -4116,12 +4116,15 @@ def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str
 
 # What a closed sandbox network looks like from inside: DNS that never answers
 # (Docker --network none), the native runtime's proxy refusing the tunnel, or no
-# route at all. curl, wget, Python, pip and npm each word it differently.
+# route at all. curl, wget, Python, pip, npm and Windows each word it differently.
 _SANDBOX_NETWORK_FAILURE_RE = re.compile(
     r"could not resolve host|unable to resolve host address|temporary failure in name resolution"
     r"|name or service not known|nodename nor servname|getaddrinfo (?:failed|ENOTFOUND|EAI_AGAIN)"
     r"|network is unreachable|failed to establish a new connection"
-    r"|tunnel connection failed|CONNECT tunnel failed",
+    r"|tunnel connection failed|CONNECT tunnel failed"
+    # Windows: DNS (curl.exe, PowerShell) and the sandbox firewall (WinError 10013).
+    r"|no such host is known|remote name could not be resolved"
+    r"|forbidden by its access permissions",
     re.IGNORECASE,
 )
 # --- Config blockers ----------------------------------------------------------
