@@ -36,6 +36,10 @@ WinGet's own prompt, not something this installer requests.
 curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | AGENT8088_BRANCH=development bash
 ```
 
+Run it as your normal user, **not** with `sudo` — the installer asks for sudo
+itself for the few system packages it needs, and refuses to run under `sudo`
+(that would install into root's home). Plain root in a container is fine.
+
 **Windows (PowerShell)**
 
 ```powershell
@@ -43,17 +47,39 @@ $env:AGENT8088_BRANCH = 'development'
 iex (irm https://agent8088-installer.pages.dev/install.ps1)
 ```
 
+Run this in **PowerShell**, not `cmd.exe`. From `cmd.exe`, or where the
+execution policy blocks scripts, use:
+
+```bat
+powershell -ExecutionPolicy Bypass -c "irm https://agent8088-installer.pages.dev/install.ps1 | iex"
+```
+
+Run it from a normal (non-admin) window: an elevated one installs for the
+administrator account's profile.
+
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the
 repo into an isolated venv, exposes a global `agent8088` command, and writes a
 default `config.txt` pointing at localhost Ollama.
 
+If the install fails, it prints the last lines of the failing step, the likely
+cause (TLS interception by a proxy, a full disk, GitHub credentials for the
+private repository, no wheel for your Python) and the command to re-run. Every
+step's full output is kept in `~/.agent8088/install.log`
+(`%LOCALAPPDATA%\agent8088\install.log` on Windows). Re-running the same
+command resumes; anything already complete is skipped.
+
 **From a clone, for development:**
+
+Needs Python **3.10 or newer** (3.11/3.12 recommended) — check with
+`python3 --version` first; an older `python` gives a confusing resolver error
+rather than a version message.
 
 ```sh
 git clone https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
-python -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
+.venv/bin/playwright install chromium   # browser for browse_page
 ```
 
 Install the extras you actually need:
@@ -90,7 +116,13 @@ playwright install chromium
 
 ```sh
 agent8088 --version
+agent8088 --doctor     # checks your setup
 ```
+
+If `agent8088` is not found, open a new terminal (the installer updated your
+shell's PATH) or run the `export PATH=...` line the installer printed. If the
+installer warned that *another agent8088* will run instead, remove that copy or
+put `~/.local/bin` first in `PATH`.
 
 ## Configure a model
 

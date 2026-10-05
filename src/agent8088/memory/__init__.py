@@ -36,8 +36,8 @@ from .store import MemoryStore, MemoryStoreError
 log = logging.getLogger("agent8088.memory")
 
 __all__ = ["MemoryStore", "MemoryStoreError", "capture", "configure", "embedder",
-           "enabled", "parse_memory_engine_config", "recall", "recall_block",
-           "reset", "status", "store"]
+           "enabled", "memory_status", "parse_memory_engine_config", "recall",
+           "recall_block", "reset", "status", "store"]
 
 def parse_memory_engine_config(config=None):
     """Extract memory engine selection and Mem0 settings from configuration dict."""
@@ -86,6 +86,28 @@ _BLOCK_HEADER = (
 _RUNTIME = {}
 _LOCK = threading.RLock()
 _LAST_CAPTURE = {}
+
+
+def _note_error(operation, exc):
+    """Record why memory degraded, for memory_status()/`/memory` to show.
+
+    Memory still never breaks a turn (see the module docstring), but a
+    failure that only went to log.debug was invisible: a locked database
+    looked exactly like "nothing to remember". Logged at warning once per
+    distinct message, so a store failing every turn doesn't flood the log.
+    """
+    message = " ".join(str(exc).split())[:300] or type(exc).__name__
+    if _RUNTIME.get("last_error") != message or _RUNTIME.get("last_error_op") != operation:
+        log.warning("memory %s failed: %s", operation, message)
+    _RUNTIME["last_error"] = message
+    _RUNTIME["last_error_op"] = operation
+
+
+def _clear_error(operation):
+    """A later success of the same operation means the problem has passed."""
+    if _RUNTIME.get("last_error_op") == operation:
+        _RUNTIME.pop("last_error", None)
+        _RUNTIME.pop("last_error_op", None)
 
 
 def configure(*, config=None, client_factory=None, completion=None, redact=None,
@@ -208,15 +230,14 @@ def store():
                             "falling back to native store", _RUNTIME["mem0_error"])
             except Exception as exc:
                 _RUNTIME["mem0_error"] = " ".join(str(exc).split())[:300]
-                log.debug("mem0 store instantiation failed: %s; falling back to native", exc)
+                log.warning("mem0 store instantiation failed: %s; falling back to native", exc)
 
         try:
             db_path = _RUNTIME.get("db_path") or os.path.expanduser("~/.agent8088/memory.db")
             opened = MemoryStore(db_path)
             opened.connect()
         except Exception as exc:
-            log.debug("memory store unavailable: %s", exc)
-            _RUNTIME["last_error"] = str(exc)[:200]
+            _note_error("open", exc)
             return None
         _RUNTIME["store"] = opened
         return opened
@@ -261,7 +282,7 @@ def recall(query, *, identity=None, limit=None):
         if engine_name != "mem0":
             active_embedder = embedder()
             vector = active_embedder.embed_one(query) if active_embedder else []
-        return active_store.search(
+        found = active_store.search(
             str(query),
             user_id=user_id(identity),
             embedding=vector,
@@ -270,8 +291,10 @@ def recall(query, *, identity=None, limit=None):
             rrf_k=_RUNTIME.get("rrf_k", 60),
             min_score=_RUNTIME.get("min_score", 0.0),
         )
+        _clear_error("recall")
+        return found
     except Exception as exc:
-        log.debug("memory recall failed: %s", exc)
+        _note_error("recall", exc)
         return []
 
 
@@ -365,11 +388,13 @@ def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id
                      source_channel="", files_touched=None, on_stored=None,
                      close_connection=False):
     try:
-        return _capture(user_turns, answer, identity=identity, run_id=run_id,
-                        agent_id=agent_id, source_channel=source_channel,
-                        files_touched=files_touched, on_stored=on_stored)
+        stored = _capture(user_turns, answer, identity=identity, run_id=run_id,
+                          agent_id=agent_id, source_channel=source_channel,
+                          files_touched=files_touched, on_stored=on_stored)
+        _clear_error("capture")
+        return stored
     except Exception as exc:
-        log.debug("memory capture failed: %s", exc)
+        _note_error("capture", exc)
         return 0
     finally:
         # Connections are thread-local, so the one this background thread opened
@@ -530,3 +555,38 @@ def status() -> dict:
         report["embedder_ok"] = active_embedder.available()
         report["embedder_error"] = active_embedder.last_error
     return report
+
+
+def memory_status() -> dict:
+    """{engine, ok, error, fix}: one line of health for a banner or /doctor.
+
+    engine is what is actually serving ("native", "mem0", or "off"), which
+    can differ from memory_engine in config when mem0 fell back. ok is False
+    only when memory is on and not working; a mem0 -> native fallback is ok
+    (memory works) but still carries the reason and how to get mem0 back.
+    Opens the store if it isn't open yet, as status() does.
+    """
+    if not enabled():
+        return {"engine": "off", "ok": True, "error": "", "fix": ""}
+    configured = _RUNTIME.get("engine_name", "native")
+    active = store()
+    if active is None:
+        return {"engine": configured, "ok": False,
+                "error": _RUNTIME.get("last_error", "") or "the memory store could not be opened",
+                "fix": "Check that memory_db_path (default ~/.agent8088/memory.db) is writable "
+                       "and not locked by another process, or set memory=0 in config.txt."}
+    engine = "mem0" if type(active).__name__ == "Mem0MemoryStore" else "native"
+    error = _RUNTIME.get("last_error", "")
+    op = _RUNTIME.get("last_error_op", "")
+    if error and op in ("recall", "capture"):
+        fix = ("Memory is still on; this turn went without it. If it keeps happening, "
+               "check that the embedding model is available (memory_embed_model) and run /memory.")
+        return {"engine": engine, "ok": False, "error": f"{op}: {error}", "fix": fix}
+    if engine != configured:
+        reason = _RUNTIME.get("mem0_error", "") or "unavailable"
+        fix = ("Install it with `pip install mem0ai`, or set memory_engine=native."
+               if "install" in reason.lower() or "no module" in reason.lower()
+               else "Fix the mem0 settings (memory_mem0_*) or set memory_engine=native.")
+        return {"engine": engine, "ok": True,
+                "error": f"mem0 unavailable, using native memory: {reason}", "fix": fix}
+    return {"engine": engine, "ok": True, "error": "", "fix": ""}

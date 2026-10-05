@@ -213,6 +213,20 @@ export interface DoctorCheck {
   cli_anything: string
 }
 
+/** One entry of /api/doctor's `checks` (the same list /doctor prints). */
+export interface DoctorCheckItem {
+  name: string
+  status: 'ok' | 'warn' | 'fail' | 'info'
+  detail: string
+  fix: string
+  repair: string
+}
+
+export interface DoctorReport extends DoctorCheck {
+  checks?: DoctorCheckItem[]
+  ok?: boolean
+}
+
 export interface McpServerInfo {
   name: string
   state: string
@@ -291,6 +305,7 @@ export type WSEvent =
   | { type: 'plan_step'; index: number; total: number; step_text: string; tool_name: string; status: 'pending' | 'running' | 'done' | 'failed'; result?: string }
   | { type: 'answer'; text: string; usage: { seconds: number; tokens: number; context?: number }; rate_limit_status: StatusInfo['rate_limit_status'] }
   | { type: 'turn_complete' }
+  | { type: 'stream_reset' }
   | { type: 'interrupted'; elapsed: number; partial: string }
   | { type: 'error'; message: string }
   | { type: 'session_saved'; name: string }

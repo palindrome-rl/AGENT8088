@@ -689,9 +689,10 @@ def _classic_masthead():
 def banner():
     console.print(_classic_masthead(), justify="center")
     active_profile = _active_provider_name()
-    # Get endpoint from the provider registry, not old config keys
-    provider_info = A.PROVIDERS.get(active_profile, {})
-    endpoint = provider_info.get("base_url", A.APP_CONFIG.get("model_base_url", "?"))
+    # Where requests actually go. The old provider_info/model_base_url lookup
+    # printed "?" or a legacy URL nothing talks to whenever the active
+    # provider wasn't a configured profile.
+    endpoint = A.active_endpoint_url() or "provider-managed"
     backend = active_profile or "default"
 
     if console.width < 70:
@@ -740,6 +741,98 @@ def banner():
     layout.add_row(brand, Group(details, Text(""), catalogue))
     console.print(Panel(layout, title="[bold #00edff]AGENT8088[/bold #00edff]",
                         subtitle="type /help for commands", box=box.ROUNDED, border_style="#00C8FF"))
+
+
+# Shown under the banner; the rest are one /doctor away.
+STARTUP_WARNING_LINES = 3
+
+
+def _config_explicitly_sets_model(provider):
+    """Whether the user's config names the model, as opposed to a built-in default."""
+    if provider and provider in A.PROVIDERS:
+        return bool(str(A.APP_CONFIG.get(f"provider.{provider}.model") or "").strip())
+    return bool(str(A.APP_CONFIG.get("model_name") or "").strip()) and A.CONFIG_PATH.exists()
+
+
+def _startup_ollama_model_check():
+    """A local Ollama default model that isn't pulled: switch or warn, once.
+
+    Only for a local Ollama (one quick /api/tags call, no retries). A model the
+    config names explicitly is never swapped behind the person's back -- that
+    only warns; a built-in default that nobody chose is replaced, for this
+    session only, by an installed chat model. Returns notice lines.
+    """
+    from agent8088.providers import is_local_ollama
+    active = A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER or ""
+    endpoint = A.active_endpoint_url()
+    model = A.MODEL_NAME
+    if not model or A.routing.is_auto(model) or not is_local_ollama(active, endpoint):
+        return []
+    try:
+        installed = A.local_models.pick_installed_ollama_model(endpoint, model, timeout=2.0)
+    except Exception:  # noqa: BLE001 -- a startup nicety must never stop startup
+        return []
+    if not installed or installed == model:
+        return []
+    if _config_explicitly_sets_model(active):
+        return [f"model {model} isn't pulled in Ollama — pull it with `ollama pull {model}`, "
+                f"or pick another with /models ({installed} is installed)."]
+    A.MODEL_NAME = installed
+    if active in A.PROVIDERS:
+        A.PROVIDERS[active]["model"] = installed
+    return [f"model {model} isn't pulled; using {installed} (pull {model} with "
+            f"`ollama pull {model}`)."]
+
+
+def _startup_notices(extra=()):
+    """Lines worth seeing before the first prompt: config mistakes, a degraded
+    memory store, MCP servers that already failed. Never raises."""
+    lines = list(extra)
+    warnings = list(getattr(A, "CONFIG_WARNINGS", []) or [])
+    # Provider mistakes first: they explain why every request then fails
+    # (a typo'd default_provider silently lands on localhost Ollama).
+    warnings.sort(key=lambda w: 0 if "provider" in w.lower() else 1)
+    lines.extend(warnings[:STARTUP_WARNING_LINES])
+    if len(warnings) > STARTUP_WARNING_LINES:
+        lines.append(f"{len(warnings) - STARTUP_WARNING_LINES} more — /doctor")
+    try:
+        from agent8088 import memory as _memory
+        status = _memory.memory_status()
+        if status.get("error"):
+            line = f"Memory: {status['error']}"
+            if status.get("fix"):
+                line += f" — {status['fix']}"
+            lines.append(line)
+    except Exception:  # noqa: BLE001
+        pass
+    lines.extend(_mcp_failure_notice())
+    return lines
+
+
+_MCP_NOTICE = {"shown": False}
+
+
+def _mcp_failure_notice():
+    """MCP failures, once per process, as soon as they are known.
+
+    The connect runs in the background, so at the banner it is usually still
+    pending; the REPL asks again before each prompt and this speaks up the
+    first time the result is in and something failed."""
+    if _MCP_NOTICE["shown"]:
+        return []
+    try:
+        summary = A.mcp_status_summary()
+    except Exception:  # noqa: BLE001
+        return []
+    if summary.get("pending") or summary.get("connecting"):
+        return []
+    _MCP_NOTICE["shown"] = True
+    return [summary["text"]] if summary.get("failed") else []
+
+
+def _print_notices(lines):
+    for line in lines:
+        console.print(Text(f"  ! {line}", style="yellow"))
 
 
 def status_cm(msg):
@@ -1406,9 +1499,23 @@ class _AnswerMarkdown(Markdown):
         super().__init__(_fence_ascii_art(markup), code_theme=_syntax_theme(), **kwargs)
 
 
+# A final answer that is really a failure report: engine._fallback_answer's
+# "I could not answer: ..." (and the older "Error: ..." form). Shown as an
+# error so it doesn't read like the model's reply.
+ERROR_ANSWER_PREFIXES = ("I could not answer:", "Error:")
+
+
+def is_error_answer(answer) -> bool:
+    return str(answer or "").lstrip().startswith(ERROR_ANSWER_PREFIXES)
+
+
 def render_answer(answer):
     if not answer:
         console.print("[dim](no answer)[/dim]")
+        return
+    if is_error_answer(answer):
+        console.print(Panel(Text(answer.strip(), style="red"), title="[bold red]error[/bold red]",
+                            box=box.ROUNDED, border_style="red"))
         return
     try:
         console.print(Panel(_AnswerMarkdown(answer),
@@ -2092,6 +2199,20 @@ def do_chat(query):
             else:
                 live.update(_stream_view(reasoning_parts, stream.prose_text()))
 
+        def on_status(message):
+            # Retry / fallback notices: in the status line while it waits, and
+            # one dim line above it so the reason survives the transient Live.
+            console.print(Text(f"  ↻ {message}", style="dim"))
+            live.update(_StatusLine(message, turn_start, tokens_ref, interruptible=True))
+
+        def on_stream_reset():
+            # A reply that broke off mid-stream is being retried. The live
+            # region is redrawn from these buffers, so clearing them erases the
+            # fragment instead of leaving it glued in front of the retry.
+            stream.reset()
+            reasoning_parts.clear()
+            live.update(_StatusLine("reconnecting", turn_start, tokens_ref, interruptible=True))
+
         # Let sub-agents render their own nested, animated activity in this Live.
         A.subagent_ui = _make_subagent_ui(live)
 
@@ -2163,6 +2284,7 @@ def do_chat(query):
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
                 on_result=_on_result, on_escalation=_on_escalation,
                 on_answer=None, on_token=on_token,
+                on_status=on_status, on_stream_reset=on_stream_reset,
                 interrupt_check=esc.triggered.is_set, trace=trace,
                 system_prompt=_session_system_prompt,
                 tools_def=lambda: A.build_tools_def(_active_tool_specs()),
@@ -2439,8 +2561,13 @@ def _summarize_tool_description(description: str) -> str:
     return m.group(1).strip() if m else cleaned
 
 
+# How long /tools, /mcp and /doctor wait for the background MCP connect.
+MCP_DISPLAY_WAIT_SECONDS = 5
+
+
 def cmd_tools(rest):
     arg = rest.strip()
+    A.ensure_mcp_ready(MCP_DISPLAY_WAIT_SECONDS)
     if arg in ("--full", "--all", "-v", "full", "all"):
         _render_tools_table(show_full=True)
         return
@@ -2554,6 +2681,9 @@ def cmd_mcp(rest):
     elif action not in {"list", "status"}:
         console.print("[red]Usage:[/red] /mcp \\[list|status|reload|add|remove]")
         return
+    # Servers connect in the background; give a pending connect a moment so
+    # the table shows results rather than "connecting".
+    A.ensure_mcp_ready(MCP_DISPLAY_WAIT_SECONDS)
     table = Table(title="MCP Servers", box=box.SIMPLE, title_style="bold #00edff", header_style="bold #00edff", border_style="#0077B6")
     table.add_column("Server", style="#237dd7")
     table.add_column("State", style="#237dd7")
@@ -3445,20 +3575,23 @@ def cmd_model(rest):
                       "calls, or no progress; resets each turn.[/dim]")
         return
     if not arg:
-        if A.PROVIDERS:
-            t = Table(title="Providers", box=box.SIMPLE, title_style="bold #00edff",
-                      header_style="bold #00edff", border_style="#0077B6")
-            t.add_column("Name", style="#237dd7")
-            t.add_column("Model", style="#237dd7")
-            t.add_column("Mode", style="#237dd7")
-            t.add_column("Endpoint", style="#237dd7")
-            for name in sorted(A.PROVIDERS):
-                p = A.PROVIDERS[name]
-                t.add_row(name, p.get("model", "—"), p.get("api_mode", "openai"), p.get("base_url", "—"))
-            console.print(t)
-        else:
-            console.print(f"[dim]No providers configured — run `/model setup` "
-                          f"or add one to {A.CONFIG_PATH}[/dim]")
+        # PROVIDERS always holds the built-ins, so "nothing configured" is
+        # whether the config names any provider, not whether this is empty.
+        t = Table(title="Providers", box=box.SIMPLE, title_style="bold #00edff",
+                  header_style="bold #00edff", border_style="#0077B6")
+        t.add_column("Name", style="#237dd7")
+        t.add_column("Model", style="#237dd7")
+        t.add_column("Mode", style="#237dd7")
+        t.add_column("Endpoint", style="#237dd7")
+        t.add_column("Key", style="#237dd7")
+        for name in sorted(A.PROVIDERS):
+            p = A.PROVIDERS[name]
+            t.add_row(name, p.get("model", "—"), p.get("api_mode", "openai"), p.get("base_url", "—"),
+                      _provider_key_state(p))
+        console.print(t)
+        if not _user_configured_providers():
+            console.print(f"[dim]No provider configured yet (built-ins listed) — run "
+                          f"`agent8088 --setup` or `/model setup`, or edit {A.CONFIG_PATH}[/dim]")
         active = _active_provider_name()
         console.print(f"Active: [#237dd7]{active}:{A.MODEL_NAME}[/#237dd7]  ·  switch with "
                       f"[#237dd7]/model <profile>[:model][/#237dd7]")
@@ -3470,11 +3603,13 @@ def cmd_model(rest):
     elif arg in A.PROVIDERS:
         os.environ.pop("USE_GEMMA4", None)
         A.activate_model(arg)
+        _warn_missing_provider_key(arg)
     elif arg in ("ornith", "custom", "default"):
         os.environ.pop("USE_GEMMA4", None)
         A.client, A.MODEL_NAME = A.get_client()
     elif separator and provider_ref.lower() in A.PROVIDERS:
         A.activate_model(provider_ref.lower(), model_ref)
+        _warn_missing_provider_key(provider_ref.lower())
     else:
         console.print(f"[red]unknown provider[/red] '{arg}' — known: "
                       + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
@@ -3501,15 +3636,59 @@ def cmd_model(rest):
     banner()
 
 
+def _provider_key_state(profile):
+    env = profile.get("api_key_env", "")
+    if not env:
+        return "not needed" if profile.get("api_mode", "openai") != "litellm" else "provider-managed"
+    return "set" if A._provider_api_key(profile) else f"{env} missing"
+
+
+def _user_configured_providers():
+    """Provider names the config itself names (not just the built-in table)."""
+    names = {key.split(".", 2)[1] for key in A.APP_CONFIG
+             if str(key).startswith("provider.") and str(key).count(".") >= 2}
+    if A.APP_CONFIG.get("default_provider"):
+        names.add(A.APP_CONFIG["default_provider"])
+    return names
+
+
+def _warn_missing_provider_key(provider):
+    """Say so at switch time, not as the first chat's 401."""
+    profile = A.PROVIDERS.get(provider) or {}
+    env = profile.get("api_key_env", "")
+    if env and not A._provider_api_key(profile):
+        console.print(f"[yellow]{env} isn't set[/yellow] — set it or run `agent8088 --setup`.")
+
+
+# provider -> why its last live model listing failed ("" when it worked).
+_MODEL_DISCOVERY_ERRORS = {}
+
+
 def _fetch_models_for_provider(provider):
+    _MODEL_DISCOVERY_ERRORS.pop(provider, None)
     try:
-        from agent8088.providers import FALLBACK_MODELS, list_models
+        from agent8088.providers import FALLBACK_MODELS, last_list_error, list_models
         client, _ = A.get_client(provider)
         if hasattr(client, "models"):
-            return list_models(provider, client=client, fallback=True)
+            models = list_models(provider, client=client, fallback=True)
+            error = last_list_error(provider)
+            if error is not None:
+                _MODEL_DISCOVERY_ERRORS[provider] = A.explain_model_error(error, provider).message
+            return models
         return list(FALLBACK_MODELS.get(provider, []))
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 -- the picker falls back to typing a name
+        _MODEL_DISCOVERY_ERRORS[provider] = A.explain_model_error(exc, provider).message
         return []
+
+
+def _model_discovery_note(provider, models):
+    """"(offline list — discovery failed: why)" when the list isn't live."""
+    reason = _MODEL_DISCOVERY_ERRORS.get(provider)
+    if not reason:
+        return ""
+    if models:
+        return f"(offline list — discovery failed: {reason})"
+    return f"(discovery failed: {reason})"
 
 
 def cmd_models(rest):
@@ -3519,10 +3698,7 @@ def cmd_models(rest):
         _configure_custom_models_endpoint()
         return
     if not provider:
-        choices = sorted(A.PROVIDERS)
-        if not choices:
-            console.print("[red]No providers configured.[/red] Run [bold]/model setup[/bold].")
-            return
+        choices = sorted(A.PROVIDERS)  # never empty: the built-ins are always there
         active = _active_provider_name()
         provider = _choice_prompt("Select provider:", choices, active if active in choices else "")
     if provider not in A.PROVIDERS:
@@ -3530,6 +3706,9 @@ def cmd_models(rest):
                       + (", ".join(sorted(A.PROVIDERS)) or "(none configured)"))
         return
     models = _fetch_models_for_provider(provider)
+    note = _model_discovery_note(provider, models)
+    if note:
+        console.print(Text(note, style="yellow"))
     if models:
         current = A.PROVIDERS.get(provider, {}).get("model", "")
         model = _choice_prompt("Select model:", models, current if current in models else "")
@@ -3541,6 +3720,7 @@ def cmd_models(rest):
     os.environ.pop("USE_GEMMA4", None)
     A.activate_model(provider, model)
     console.print(f"[#237dd7]switched[/#237dd7] → [#237dd7]{provider}:{A.MODEL_NAME}[/#237dd7]")
+    _warn_missing_provider_key(provider)
     banner()
 
 
@@ -3561,7 +3741,13 @@ def save_model_profile(path, name, api_mode, model, base_url="", api_key_env="")
 
 def configure_model_profile():
     """Configure a model profile from inside the running REPL."""
-    _run_setup(config_path=_resolve_config_path(), include_workspace=False, activate_runtime=True, heading="Model setup")
+    try:
+        _run_setup(config_path=_resolve_config_path(), include_workspace=False,
+                   activate_runtime=True, heading="Model setup")
+    except (KeyboardInterrupt, EOFError):
+        console.print(f"\n[dim]{SETUP_CANCELLED_MESSAGE}[/dim]")
+        return False
+    return True
 
 
 def cmd_config(_):
@@ -3709,44 +3895,77 @@ def _reinstall_package(package: str) -> tuple[bool, str]:
     return False, (pip_result.stderr or pip_result.stdout or "unknown pip error")[-300:]
 
 
-def cmd_doctor(rest):
-    arg = rest.strip()
-    fix = arg.lower() == "--fix"
-    if arg and not fix:
-        console.print(f"[red]unknown option:[/red] {arg}  (try /doctor or /doctor --fix)")
-        return
+# --- /doctor -----------------------------------------------------------------
+#
+# One set of checks behind /doctor, `agent8088 --doctor` and the web UI's
+# /api/doctor. Each check is a plain dict so all three can render it:
+#   {"name", "status": ok|warn|fail|info, "detail", "fix", "repair"}
+# `fix` is the command or edit that resolves a failure; `repair`, when set, is
+# the id of something `/doctor --fix` can do itself (see _DOCTOR_REPAIRS).
+
+DOCTOR_HTTP_TIMEOUT_SECONDS = 5
+
+
+def _doctor_check(name, status, detail, fix="", repair=""):
+    return {"name": name, "status": status, "detail": str(detail), "fix": fix, "repair": repair}
+
+
+def _doctor_base_checks():
+    """The original /doctor rows: cheap, and no request carries a prompt."""
+    checks = []
     active = _active_provider_name()
     provider = A.PROVIDERS.get(active, {})
     endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
     key_env = provider.get("api_key_env", "")
+    auth_status = "ok"
+    auth_fix = ""
     if key_env:
         # Route through the same resolver model calls use (.env store -> config
         # api_key -> os.environ). Reading os.environ directly reported "missing"
         # for keys that live in the .env key store the wizard writes to.
-        auth = f"{key_env}: {'set' if A._provider_api_key(provider) else 'missing'}"
+        present = bool(A._provider_api_key(provider))
+        auth = f"{key_env}: {'set' if present else 'missing'}"
+        if not present:
+            auth_status, auth_fix = "fail", f"Set {key_env}, or run `agent8088 --setup`."
     elif provider.get("api_mode", "").lower() == "litellm":
         auth = "provider-managed / not configured"
     else:
         auth = "configured" if A._provider_api_key(provider) else "not required / not configured"
-    t = Table(title="Doctor", box=box.SIMPLE, title_style="bold #00edff",
-              header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Check", style="#00edff", no_wrap=True)
-    t.add_column("Result", style="#237dd7")
-    t.add_row("Model", f"{active}:{A.MODEL_NAME}")
+    checks.append(_doctor_check("Model", "info", f"{active}:{A.MODEL_NAME}"))
     model_context, model_output = A._active_model_token_limits()
-    t.add_row("Model token limits", f"{model_context:,} context / {model_output:,} output")
-    t.add_row("Endpoint", str(endpoint or "provider-managed"))
-    t.add_row("Reachability", _endpoint_probe(endpoint) if endpoint else "provider-managed")
-    t.add_row("Authentication", auth)
-    t.add_row("Configuration", f"{A.CONFIG_PATH} ({'found' if A.CONFIG_PATH.exists() else 'missing'})")
+    checks.append(_doctor_check("Model token limits", "info",
+                                f"{model_context:,} context / {model_output:,} output"))
+    checks.append(_doctor_check("Endpoint", "info", str(endpoint or "provider-managed")))
+    if endpoint:
+        reach = _endpoint_probe(endpoint)
+        reach_status = "fail" if str(reach).startswith("unreachable") else "ok"
+        reach_fix = ""
+        if reach_status == "fail":
+            from agent8088.providers import is_local_ollama
+            reach_fix = ("Start Ollama: `ollama serve`." if is_local_ollama(active, endpoint)
+                         else "Check the server is running and base_url in config.txt.")
+        checks.append(_doctor_check("Reachability", reach_status, reach, reach_fix))
+    else:
+        checks.append(_doctor_check("Reachability", "info", "provider-managed"))
+    checks.append(_doctor_check("Authentication", auth_status, auth, auth_fix))
+    config_found = A.CONFIG_PATH.exists()
+    checks.append(_doctor_check(
+        "Configuration", "ok" if config_found else "warn",
+        f"{A.CONFIG_PATH} ({'found' if config_found else 'missing'})",
+        "" if config_found else "Run `agent8088 --setup`."))
     sandbox = A.sandbox_status()
-    t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}")
-    t.add_row("Capabilities", f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills")
-    t.add_row("Web search", "ok" if A.web_search._ddgs_installed() else "[red]ddgs broken - run /doctor --fix[/red]")
+    checks.append(_doctor_check("Sandbox", "info",
+                                f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}"))
+    checks.append(_doctor_check("Capabilities", "info",
+                                f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills"))
+    ddgs_ok = A.web_search._ddgs_installed()
+    checks.append(_doctor_check("Web search", "ok" if ddgs_ok else "fail",
+                                "ok" if ddgs_ok else "ddgs broken - run /doctor --fix",
+                                "" if ddgs_ok else "/doctor --fix (reinstalls ddgs)"))
     cli_state = A.cli_anything.status(A.CONFIG_PATH)
-    cli_label = (f"ready (CLI-Hub {cli_state['version']})" if cli_state["available"]
-                 else "available on demand")
-    t.add_row("CLI-Anything", cli_label)
+    checks.append(_doctor_check("CLI-Anything", "info",
+                                f"ready (CLI-Hub {cli_state['version']})" if cli_state["available"]
+                                else "available on demand"))
     # Code review is a separate subsystem from document OCR; say so in the
     # label so a reader never has to work out which "OCR" this row means.
     try:
@@ -3756,30 +3975,488 @@ def cmd_doctor(rest):
         _review = _ocr_review.health(A.APP_CONFIG, run=lambda argv, cwd:
             _ocr_review.run_process(argv, cwd, check=lambda: None,
                                     kill=lambda proc: proc.kill(), timeout=15))
-        t.add_row("Code review", _review["detail"])
+        checks.append(_doctor_check("Code review", "info", _review["detail"]))
     except Exception as _exc:  # a health probe must never break /doctor
-        t.add_row("Code review", f"unavailable ({_exc})")
-    console.print(t)
+        checks.append(_doctor_check("Code review", "info", f"unavailable ({_exc})"))
+    return checks
 
-    if fix:
-        console.print("[dim]Checking for auto-repairable issues...[/dim]")
-        if A.web_search._ddgs_installed():
-            console.print("[dim]No auto-repairable issues found.[/dim]")
+
+def _doctor_http_get(url, headers=None, timeout=DOCTOR_HTTP_TIMEOUT_SECONDS):
+    """(status_code, parsed_json_or_None, exception_or_None). Never raises,
+    never retries."""
+    import httpx
+    try:
+        response = httpx.get(url, headers=headers or {}, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 -- classified by the caller
+        return None, None, exc
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    return response.status_code, payload, None
+
+
+def _doctor_provider_checks():
+    """GET {base}/models with the real key: reachable, key accepted, URL right,
+    and is the active model actually there."""
+    from agent8088.providers import _normalize_model_id, is_local_ollama
+    active = A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER or ""
+    profile = A.PROVIDERS.get(active, {}) if active else {}
+    if str(profile.get("api_mode", "")).lower() == "litellm":
+        return []
+    endpoint = A.active_endpoint_url()
+    if not endpoint:
+        return []
+    ollama = is_local_ollama(active, endpoint)
+    key = A._provider_api_key(profile) if profile else A.APP_CONFIG.get("api_key", "")
+    key_env = profile.get("api_key_env", "")
+    headers = {}
+    if key and key not in ("none", "ollama"):
+        headers["Authorization"] = f"Bearer {key}"
+        if active == "anthropic":
+            headers.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
+    url = endpoint.rstrip("/") + "/models"
+    status, payload, error = _doctor_http_get(url, headers)
+    name = "Provider API"
+    if error is not None:
+        friendly = A.explain_model_error(error, active)
+        return [_doctor_check(name, "fail", friendly.message,
+                              "Start Ollama: `ollama serve`." if ollama else friendly.fix)]
+    if status in (401, 403):
+        fix = (f"{key_env} isn't set — set it or run `agent8088 --setup`." if key_env and not key
+               else f"Check {key_env or 'the API key'}, or run `agent8088 --setup`.")
+        return [_doctor_check(name, "fail", f"API key rejected (HTTP {status})", fix)]
+    if status == 404:
+        if not endpoint.rstrip("/").endswith("/v1"):
+            setting = f"provider.{active}.base_url" if active else "model_base_url"
+            fix = f"base_url probably needs /v1: set {setting}={endpoint.rstrip('/')}/v1"
         else:
-            ok, detail = _reinstall_package("ddgs")
-            if ok and A.web_search._ddgs_installed():
-                console.print(f"[green]Fixed:[/green] web search — {detail}")
-            elif ok:
-                console.print(
-                    f"[yellow]Reinstalled ddgs but it still fails to import[/yellow] "
-                    f"({detail}) — this usually means a missing system library; "
-                    f"see: pip install ddgs -v"
-                )
-            else:
-                console.print(f"[red]Could not fix web search:[/red] {detail}")
-                console.print(
-                    f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
-                )
+            fix = "Check base_url in config.txt points at an OpenAI-compatible API."
+        return [_doctor_check(name, "fail", f"{url} answered 404 (no model list there)", fix)]
+    if status is None or status >= 400:
+        return [_doctor_check(name, "warn", f"{url} answered HTTP {status}",
+                              "Retry in a moment; if it persists, check the provider's status page.")]
+    ids = []
+    for item in (payload or {}).get("data", []) if isinstance(payload, dict) else []:
+        if isinstance(item, dict) and item.get("id"):
+            ids.append(_normalize_model_id(active, str(item["id"])))
+    checks = [_doctor_check(name, "ok", f"reachable, key accepted · {len(ids)} models")]
+    model = A.MODEL_NAME
+    if not model or A.routing.is_auto(model) or not ids:
+        return checks
+
+    def bare(value):
+        return value[:-len(":latest")] if value.endswith(":latest") else value
+
+    if bare(model) in {bare(i) for i in ids}:
+        checks.append(_doctor_check("Active model", "ok", f"{model} is available"))
+    elif ollama:
+        checks.append(_doctor_check("Active model", "fail", f"{model} isn't pulled in Ollama",
+                                    f"`ollama pull {model}` (or pick an installed one with /models)",
+                                    f"ollama_pull:{model}"))
+    else:
+        # Some providers list only part of what they serve (aliases, gated
+        # models), so this is a warning, not a verdict.
+        checks.append(_doctor_check("Active model", "warn",
+                                    f"{model} isn't in {active or 'the endpoint'}'s model list",
+                                    "Pick another with /models if requests fail."))
+    if ollama:
+        checks.extend(_doctor_ollama_context_check(endpoint, model, key))
+    return checks
+
+
+def _doctor_ollama_context_check(endpoint, model, key=""):
+    from agent8088.providers import ollama_served_context
+    served, source = ollama_served_context(endpoint, model, api_key=key or "",
+                                           timeout=DOCTOR_HTTP_TIMEOUT_SECONDS)
+    planned, _ = A._active_model_token_limits()
+    if not served:
+        return [_doctor_check("Ollama context", "info",
+                              f"served context unknown; agent8088 plans for {planned:,} tokens")]
+    if served < planned:
+        return [_doctor_check(
+            "Ollama context", "warn",
+            f"Ollama serves {model} with {served:,} tokens ({source}) but agent8088 plans for "
+            f"{planned:,}; Ollama silently drops the overflow",
+            f"Set provider.ollama.context_window={served} in config.txt, or raise Ollama's "
+            "context (OLLAMA_CONTEXT_LENGTH=32768 ollama serve).")]
+    return [_doctor_check("Ollama context", "ok", f"{served:,} tokens ({source})")]
+
+
+def _doctor_writable(path):
+    """Whether `path` (or, if it doesn't exist yet, its nearest parent) is writable."""
+    probe = Path(path)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return os.access(probe, os.W_OK)
+
+
+def _doctor_files_checks():
+    checks = []
+    fix_owner = ("Fix ownership: `sudo chown -R \"$USER\" {}`" if os.name != "nt"
+                 else "Give your user write access to {}")
+    home = A._agent_data_dir()
+    if _doctor_writable(home):
+        checks.append(_doctor_check("Home directory", "ok", f"{home} (writable)"))
+    else:
+        checks.append(_doctor_check("Home directory", "fail", f"{home} isn't writable",
+                                    fix_owner.format(home)))
+    env_path = A.ENV_FILE_PATH
+    if _doctor_writable(env_path):
+        checks.append(_doctor_check("Key store (.env)", "ok",
+                                    f"{env_path} ({'found' if env_path.exists() else 'not created yet'})"))
+    else:
+        checks.append(_doctor_check("Key store (.env)", "fail", f"{env_path} isn't writable",
+                                    fix_owner.format(env_path)))
+    packaged = Path(A.__file__).resolve().with_name("config.txt")
+    try:
+        using_packaged = A.CONFIG_PATH.resolve() == packaged
+    except OSError:
+        using_packaged = False
+    if not A.CONFIG_PATH.exists():
+        checks.append(_doctor_check("User config", "warn", f"{A.CONFIG_PATH} doesn't exist",
+                                    "Run `agent8088 --setup` (or /doctor --fix to write the defaults).",
+                                    "seed_config"))
+    elif using_packaged:
+        checks.append(_doctor_check("User config", "warn",
+                                    "no user config — running on the packaged defaults",
+                                    "Run `agent8088 --setup`."))
+    elif A.CONFIG_PATH.exists() and not _doctor_writable(A.CONFIG_PATH):
+        checks.append(_doctor_check("User config", "fail", f"{A.CONFIG_PATH} isn't writable",
+                                    fix_owner.format(A.CONFIG_PATH)))
+    for warning in list(getattr(A, "CONFIG_WARNINGS", []) or []):
+        checks.append(_doctor_check("Config warning", "warn", warning,
+                                    f"Edit {A.CONFIG_PATH.name} ({A.CONFIG_PATH})."))
+    return checks
+
+
+def _doctor_memory_checks():
+    from agent8088 import memory as _memory
+    try:
+        status = _memory.memory_status()
+    except Exception as exc:  # noqa: BLE001
+        return [_doctor_check("Memory", "warn", f"status unavailable ({exc})")]
+    checks = []
+    if status["engine"] == "off":
+        checks.append(_doctor_check("Memory", "info", "off"))
+    elif not status["ok"]:
+        checks.append(_doctor_check("Memory", "warn", f"{status['engine']}: {status['error']}",
+                                    status.get("fix", "")))
+    elif status.get("error"):
+        configured = str(A.APP_CONFIG.get("memory_engine", "native")).strip().lower()
+        missing = "install" in status["error"].lower() or "no module" in status["error"].lower()
+        checks.append(_doctor_check(
+            "Memory", "warn", status["error"],
+            "`agent8088 --memory-setup`" if configured == "mem0" and missing else status.get("fix", ""),
+            "memory_setup" if configured == "mem0" and missing else ""))
+    else:
+        checks.append(_doctor_check("Memory", "ok", status["engine"]))
+    if status["engine"] != "off":
+        checks.extend(_doctor_embed_check())
+    return checks
+
+
+def _doctor_embed_check():
+    """Semantic recall needs the embedding model in the Ollama memory uses."""
+    if str(getattr(A, "MEMORY_EMBED_PROVIDER", "ollama")) != "ollama":
+        return []
+    embed = str(A.APP_CONFIG.get("memory_embed_model") or DEFAULT_EMBED_MODEL).strip()
+    try:
+        installed = A.local_models.list_installed_models()
+    except Exception:  # noqa: BLE001 -- no Ollama here: the provider check says so
+        return []
+    names = {str(m.get("name") or m.get("model") or "") for m in installed}
+    if embed in names or f"{embed}:latest" in names:
+        return [_doctor_check("Semantic recall", "ok", f"{embed} available")]
+    return [_doctor_check("Semantic recall", "warn",
+                          f"{embed} isn't pulled — recall falls back to keyword search",
+                          f"`ollama pull {embed}`", f"ollama_pull:{embed}")]
+
+
+def _doctor_mcp_checks():
+    if not A.MCP_RUNTIME.has_servers():
+        return []
+    A.ensure_mcp_ready(MCP_DISPLAY_WAIT_SECONDS)
+    summary = A.mcp_status_summary()
+    checks = []
+    for server, status in sorted(A.MCP_RUNTIME.statuses.items()):
+        if status.get("state") == "error":
+            checks.append(_doctor_check(f"MCP {server}", "warn", status.get("error") or "failed",
+                                        "Check its command/url in mcp.json, then /mcp reload."))
+    if not checks:
+        state = ("still connecting" if summary.get("pending") or summary.get("connecting")
+                 else f"{len(summary.get('connected', []))} connected · {summary.get('tools', 0)} tools")
+        checks.append(_doctor_check("MCP", "ok", state))
+    return checks
+
+
+_CHROMIUM_PROBE = """
+import os, sys
+from playwright.sync_api import sync_playwright
+for root in sys.argv[1:]:
+    if root:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = root
+    else:
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+    with sync_playwright() as p:
+        path = p.chromium.executable_path
+    if path and os.path.exists(path):
+        print(path)
+        break
+"""
+
+
+def _playwright_chromium_installed():
+    # In a child process: starting Playwright's driver in-process leaves
+    # asyncio tasks that print "Task was destroyed but it is pending!" at exit,
+    # right under the doctor report. Same candidate order as the engine's lookup.
+    explicit = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    roots = [explicit] if explicit else [str(A._agent_data_dir() / "playwright-browsers"), ""]
+    try:
+        out = subprocess.run([sys.executable, "-c", _CHROMIUM_PROBE, *roots],
+                             capture_output=True, text=True, timeout=30,
+                             stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and bool(out.stdout.strip())
+
+
+def _doctor_browser_checks():
+    if _playwright_chromium_installed():
+        return [_doctor_check("Browser (Chromium)", "ok", "installed")]
+    return [_doctor_check("Browser (Chromium)", "warn",
+                          "Playwright's Chromium isn't installed — browse_page can't run",
+                          f"`{sys.executable} -m playwright install chromium`", "playwright")]
+
+
+def _doctor_docker_checks():
+    checks = []
+    docker = A._docker_available()
+    search_url = str(A.APP_CONFIG.get("search_base_url") or "").strip()
+    uses_searxng = bool(search_url) and search_url.lower() != "none"
+    sandbox_wants_docker = str(A.sandbox_status().get("requested", "")).lower() == "docker"
+    if docker:
+        checks.append(_doctor_check("Docker", "ok", "available"))
+    elif sandbox_wants_docker:
+        checks.append(_doctor_check("Docker", "fail", "not available, but sandbox=docker",
+                                    "Start Docker, or set sandbox=auto in config.txt."))
+    else:
+        checks.append(_doctor_check("Docker", "info", "not available (only needed for SearXNG / "
+                                                      "the Docker sandbox)"))
+    if uses_searxng:
+        try:
+            healthy = A.web_search.probe_searxng(A._search_context())
+        except Exception:  # noqa: BLE001
+            healthy = False
+        if healthy:
+            checks.append(_doctor_check("SearXNG", "ok", f"answering at {search_url}"))
+        else:
+            fix = ("Start Docker, then run /search setup." if not docker
+                   else "Run /search setup to (re)start it, or check search_base_url.")
+            checks.append(_doctor_check("SearXNG", "warn",
+                                        f"not answering at {search_url} — search falls back to ddgs",
+                                        fix))
+    return checks
+
+
+def _doctor_live_checks():
+    """Checks that talk to the network, Docker, Ollama or the disk."""
+    checks = []
+    for group in (_doctor_provider_checks, _doctor_files_checks, _doctor_memory_checks,
+                  _doctor_mcp_checks, _doctor_browser_checks, _doctor_docker_checks):
+        try:
+            checks.extend(group())
+        except Exception as exc:  # noqa: BLE001 -- one broken probe must not hide the rest
+            checks.append(_doctor_check(group.__name__.replace("_doctor_", "").replace("_checks", ""),
+                                        "warn", f"check failed: {exc}"))
+    return checks
+
+
+def doctor_checks(live=True):
+    """Every /doctor check, as dicts (see the comment above _doctor_check)."""
+    checks = _doctor_base_checks()
+    if live:
+        checks.extend(_doctor_live_checks())
+        if any(c["name"] == "Provider API" and c["status"] == "fail" for c in checks):
+            # The live check says the same thing more precisely; one fix line is enough.
+            for check in checks:
+                if check["name"] == "Reachability":
+                    check["fix"] = ""
+    return checks
+
+
+def doctor_report(live=True):
+    """doctor_checks() plus the flat fields the web UI's Doctor page reads."""
+    checks = doctor_checks(live)
+    first = {}
+    for check in checks:
+        first.setdefault(check["name"], check["detail"])
+    return {
+        "model": first.get("Model", ""),
+        "endpoint": first.get("Endpoint", ""),
+        "reachability": first.get("Reachability", ""),
+        "authentication": first.get("Authentication", ""),
+        "configuration": first.get("Configuration", ""),
+        "sandbox": first.get("Sandbox", ""),
+        "capabilities": first.get("Capabilities", ""),
+        "web_search": "ok" if first.get("Web search") == "ok" else "broken",
+        "cli_anything": first.get("CLI-Anything", ""),
+        "checks": checks,
+        "ok": not any(check["status"] == "fail" for check in checks),
+    }
+
+
+_DOCTOR_STYLES = {"ok": "#237dd7", "info": "#237dd7", "warn": "yellow", "fail": "red"}
+
+
+def _render_doctor(checks):
+    t = Table(title="Doctor", box=box.SIMPLE, title_style="bold #00edff",
+              header_style="bold #00edff", border_style="#0077B6")
+    t.add_column("Check", style="#00edff", no_wrap=True)
+    t.add_column("Result", style="#237dd7")
+    for check in checks:
+        t.add_row(check["name"], Text(check["detail"], style=_DOCTOR_STYLES.get(check["status"], "")))
+    console.print(t)
+    problems = [c for c in checks if c["status"] in ("fail", "warn") and c.get("fix")]
+    for check in problems:
+        line = Text()
+        line.append("  ✗ " if check["status"] == "fail" else "  ! ",
+                    style=_DOCTOR_STYLES[check["status"]])
+        line.append(f"{check['name']}: ")
+        line.append(check["fix"])
+        console.print(line)
+
+
+def _doctor_confirm(question, command=""):
+    """Ask before a /doctor --fix repair. Never silently: with no one to ask
+    (no TTY, or the web UI without --yes) the answer is no and the command is
+    printed instead."""
+    if WEB_CONFIRM is not None:
+        if WEB_CONFIRM.get("yes"):
+            return True
+        console.print(f"{question} — to go ahead, send: /doctor --fix --yes")
+        return False
+    if not sys.stdin.isatty():
+        if command:
+            console.print(f"  skipped (no terminal to ask): {question} — run {command}")
+        return False
+    answer = console.input(f"[#f5a623]{question}[/#f5a623] [y/N] ")
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _repair_seed_config(_arg=""):
+    packaged = Path(A.__file__).resolve().with_name("config.txt")
+    target = A.CONFIG_PATH
+    if target.exists():
+        return True, f"{target} already exists"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _write_private_text(target, packaged.read_text(encoding="utf-8"))
+    return True, f"wrote {target} from the packaged defaults (run `agent8088 --setup` to choose a model)"
+
+
+def _repair_ollama_pull(model):
+    return True, A.local_models.pull_model(model, timeout=1800)
+
+
+def _repair_playwright(_arg=""):
+    result = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                            capture_output=True, text=True, timeout=900)
+    if result.returncode == 0:
+        return True, "installed Chromium"
+    return False, (result.stderr or result.stdout or "playwright install failed")[-300:]
+
+
+def _repair_memory_setup(_arg=""):
+    return run_memory_setup() == 0, "ran --memory-setup"
+
+
+# repair id -> (question, function(arg) -> (ok, detail), command shown when declined)
+_DOCTOR_REPAIRS = {
+    "seed_config": ("Write a default config.txt?", _repair_seed_config, "agent8088 --setup"),
+    "ollama_pull": ("Pull {arg} into Ollama?", _repair_ollama_pull, "ollama pull {arg}"),
+    "playwright": ("Install Playwright's Chromium (~150 MB)?", _repair_playwright,
+                   "python -m playwright install chromium"),
+    "memory_setup": ("Install the mem0 memory backend?", _repair_memory_setup,
+                     "agent8088 --memory-setup"),
+}
+
+
+def _doctor_fix(checks):
+    """Run the repairs `checks` offer, asking before each one."""
+    console.print("[dim]Checking for auto-repairable issues...[/dim]")
+    did_anything = False
+    if not A.web_search._ddgs_installed():
+        did_anything = True
+        ok, detail = _reinstall_package("ddgs")
+        if ok and A.web_search._ddgs_installed():
+            console.print(f"[green]Fixed:[/green] web search — {detail}")
+        elif ok:
+            console.print(
+                f"[yellow]Reinstalled ddgs but it still fails to import[/yellow] "
+                f"({detail}) — this usually means a missing system library; "
+                f"see: pip install ddgs -v"
+            )
+        else:
+            console.print(f"[red]Could not fix web search:[/red] {detail}")
+            console.print(
+                f"  Manual repair: {sys.executable} -m pip install --force-reinstall ddgs"
+            )
+    seen = set()
+    for check in checks:
+        repair = check.get("repair") or ""
+        if not repair or repair in seen:
+            continue
+        seen.add(repair)
+        kind, _, arg = repair.partition(":")
+        spec = _DOCTOR_REPAIRS.get(kind)
+        if spec is None:
+            continue
+        did_anything = True
+        question, action, command = spec
+        if not _doctor_confirm(question.format(arg=arg), command.format(arg=arg)):
+            continue
+        try:
+            ok, detail = action(arg)
+        except Exception as exc:  # noqa: BLE001 -- report and move on to the next repair
+            ok, detail = False, str(exc)
+        if ok:
+            console.print(f"[green]Fixed:[/green] {check['name']} — {detail}")
+        else:
+            console.print(f"[red]Could not fix {check['name']}:[/red] {detail}")
+            console.print(f"  Manual repair: {command.format(arg=arg)}")
+    if not did_anything:
+        console.print("[dim]No auto-repairable issues found.[/dim]")
+
+
+def cmd_doctor(rest):
+    arg = rest.strip()
+    fix = arg.lower() == "--fix"
+    if arg and not fix:
+        console.print(f"[red]unknown option:[/red] {arg}  (try /doctor or /doctor --fix)")
+        return
+    checks = doctor_checks(live=True)
+    _render_doctor(checks)
+    if fix:
+        _doctor_fix(checks)
+
+
+def run_doctor_cli():
+    """`agent8088 --doctor`: the /doctor checks without the REPL. Exit status
+    1 when any check failed outright, so scripts (and the installer) can act on it."""
+    checks = doctor_checks(live=True)
+    _render_doctor(checks)
+    failed = [c for c in checks if c["status"] == "fail"]
+    if failed:
+        console.print(f"[red]{len(failed)} problem{'s' if len(failed) != 1 else ''} found.[/red] "
+                      "Fix the ✗ lines above, then run `agent8088 --doctor` again.")
+        return 1
+    warned = sum(1 for c in checks if c["status"] == "warn")
+    if warned:
+        console.print(f"[yellow]No blocking problems; {warned} warning{'s' if warned != 1 else ''} "
+                      "above (! lines) — optional features that won't work until fixed.[/yellow]")
+    else:
+        console.print("[green]No problems found.[/green]")
+    return 0
 
 
 def _cmd_local_check():
@@ -4184,6 +4861,9 @@ def _search_setup_options():
         options.append("ddgs (keyless fallback — already active, nothing to do)")
     else:
         options.append("ddgs (keyless fallback — already active, nothing to do)")
+        # Still offered, so picking it can say what's missing rather than the
+        # option silently not existing.
+        options.append("SearXNG (needs Docker — not detected)")
     options.append("Existing SearXNG / remote instance URL")
     for name in ("tavily", "exa"):
         provider = registry.get(name)
@@ -5582,13 +6262,14 @@ def _custom_prompt(message, default="", secret=False, instruction=""):
         if instruction:
             kwargs["instruction"] = instruction
         value = prompt(**kwargs).execute()
-    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+    except (ImportError, EOFError, OSError):
         # ImportError: InquirerPy not installed.
         # EOFError/OSError: InquirerPy crashed at runtime (e.g. macOS Python
         #   3.13 kqueue selector issue with prompt_toolkit, non-interactive
         #   terminal, piped stdin).
-        # KeyboardInterrupt: user hit Ctrl-C during a prompt.
-        # All fall back to stdlib input()/getpass().
+        # All fall back to stdlib input()/getpass(). KeyboardInterrupt is NOT
+        # one of them: Ctrl+C means "stop", and catching it here turned it
+        # into a second, plain-text copy of the same prompt.
         suffix = ""
         if secret and instruction:
             suffix = f" {instruction}"
@@ -5620,8 +6301,9 @@ def _choice_prompt(message, choices, default=""):
             ordered = [default] + [c for c in choices if c != default]
         kwargs = {"message": message, "choices": ordered, "max_height": "70%"}
         return inquirer.fuzzy(**kwargs).execute()
-    except (ImportError, EOFError, OSError, KeyboardInterrupt):
-        # See _custom_prompt for why these exceptions are grouped.
+    except (ImportError, EOFError, OSError):
+        # See _custom_prompt for why these exceptions are grouped (and why
+        # KeyboardInterrupt is not one of them).
         print(message)
         for index, choice in enumerate(choices, 1):
             marker = " (default)" if choice == default else ""
@@ -5647,7 +6329,7 @@ def _multi_choice_prompt(message, choices, checked=()):
         options = [Choice(c, enabled=c in checked) for c in choices]
         return inquirer.checkbox(message=message, choices=options,
                                   instruction="(space to toggle, enter to confirm)").execute()
-    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+    except (ImportError, EOFError, OSError):
         print(message)
         for index, choice in enumerate(choices, 1):
             marker = " (default)" if choice in checked else ""
@@ -5688,7 +6370,7 @@ def _count_prompt(message, default=1, min_allowed=1):
                 "right": [],
             },
         ).execute())
-    except (ImportError, EOFError, OSError, KeyboardInterrupt):
+    except (ImportError, EOFError, OSError):
         value = input(f"{message} [{default}]: ").strip()
         if not value:
             return default
@@ -6330,12 +7012,47 @@ def _remove_agent8088_shim(home):
     return True
 
 
+def _posix_rc_files():
+    """Every shell rc file install.sh may have appended a line to (it also
+    edits another shell's files when they exist, and ~/.bash_login when that
+    is the one bash reads at login)."""
+    home = Path.home()
+    return tuple(home / name for name in (".zshrc", ".zprofile", ".bashrc", ".bash_profile",
+                                          ".bash_login", ".profile"))
+
+
+# install.sh's write_fish_config(): fish reads none of the rc files above.
+FISH_CONF_MARKER = "# Added by the agent8088 installer"
+
+
+def _fish_conf_file():
+    return Path.home() / ".config" / "fish" / "conf.d" / "agent8088.fish"
+
+
+def _agent8088_fish_conf_present():
+    path = _fish_conf_file()
+    try:
+        return path.is_file() and path.read_text(encoding="utf-8", errors="ignore").startswith(
+            FISH_CONF_MARKER)
+    except OSError:
+        return False
+
+
+def _remove_agent8088_fish_conf():
+    """Remove the conf.d snippet, only if the installer wrote it (marker line)."""
+    if not _agent8088_fish_conf_present():
+        return False
+    try:
+        _fish_conf_file().unlink()
+    except OSError:
+        return False
+    return True
+
+
 def _remove_agent8088_config_exports():
     removed = 0
     markers = ("AGENT8088_CONFIG",)
-    for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
-               Path.home() / ".bashrc", Path.home() / ".bash_profile",
-               Path.home() / ".profile"):
+    for rc in _posix_rc_files():
         if not rc.exists() or not rc.is_file():
             continue
         lines = rc.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -6357,9 +7074,7 @@ def _remove_agent8088_path_exports():
     link_dir = _agent8088_link_dir()
     path_line = f'export PATH="{link_dir}:$PATH"'
     removed = 0
-    for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
-               Path.home() / ".bashrc", Path.home() / ".bash_profile",
-               Path.home() / ".profile"):
+    for rc in _posix_rc_files():
         if not rc.exists() or not rc.is_file():
             continue
         lines = rc.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -6597,11 +7312,11 @@ def _describe_agent8088_side_effects(home, include_workspace=False):
     else:
         link_dir = _agent8088_link_dir()
         path_line = f'export PATH="{link_dir}:$PATH"'
-        for rc in (Path.home() / ".zshrc", Path.home() / ".zprofile",
-                   Path.home() / ".bashrc", Path.home() / ".bash_profile",
-                   Path.home() / ".profile"):
+        for rc in _posix_rc_files():
             if rc.exists() and path_line in rc.read_text(encoding="utf-8", errors="ignore").splitlines():
                 lines.append(f"PATH line in {rc}")
+        if _agent8088_fish_conf_present():
+            lines.append(f"fish config {_fish_conf_file()}")
         try:
             current = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=20)
             if current.returncode == 0:
@@ -7223,6 +7938,8 @@ def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
     if os.name != "nt":
         _remove_agent8088_config_exports()
         _remove_agent8088_path_exports()
+        if _remove_agent8088_fish_conf():
+            print(f"Removed {_fish_conf_file()}")
         _remove_agent8088_crontab_entries()
     if workspace:
         removed_data = _remove_agent8088_workspace_data()
@@ -7436,6 +8153,8 @@ def _reload_model_runtime(config_path, provider="", model=""):
     A.APP_CONFIG = A.load_simple_config(Path(config_path))
     A.PROVIDERS = A.load_providers(A.APP_CONFIG, include_builtins=True)
     A.DEFAULT_PROVIDER = A.APP_CONFIG.get("default_provider", "")
+    # /local follows the Ollama the config names; setup may just have changed it.
+    A.local_models.set_default_host(A.APP_CONFIG.get("provider.ollama.base_url", ""))
     if provider:
         A.activate_model(provider, model)
 
@@ -7504,6 +8223,54 @@ def _embedding_model_present() -> bool:
     return listing.returncode == 0 and DEFAULT_EMBED_MODEL in listing.stdout
 
 
+# The wizard's 1-token test call. Long enough for a hosted API, short enough
+# that a dead endpoint doesn't look like a hang; a local model still loading
+# into memory is the expected reason to hit it, and is reported as such.
+SETUP_TEST_CALL_TIMEOUT_SECONDS = 20
+
+
+def _explain_setup_error(exc, provider, base_url, model="", api_key_env="",
+                         timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS):
+    """errors.Friendly for a wizard failure; render(hint=False) -- we're in setup."""
+    from agent8088.errors import explain_model_error
+    return explain_model_error(exc, provider=provider, base_url=base_url,
+                               model=model or None, api_key_env=api_key_env or None,
+                               timeout_seconds=timeout)
+
+
+def _setup_discover_models(provider, base_url, api_key):
+    """(models, error) from the endpoint's /models; error is the exception."""
+    from agent8088.providers import last_list_error, list_models
+    from openai import OpenAI
+    try:
+        fetch_client = OpenAI(base_url=base_url, api_key=api_key or "none",
+                              timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS, max_retries=0)
+        models = list_models(provider, client=fetch_client, fallback=False)
+    except Exception as exc:  # noqa: BLE001 -- a bad URL can fail in the constructor
+        return [], exc
+    return models, (None if models else last_list_error(provider))
+
+
+def _setup_test_call(base_url, api_key, model):
+    """One 1-token chat request. Returns the exception, or None on success."""
+    from openai import OpenAI
+    try:
+        OpenAI(base_url=base_url, api_key=api_key or "none",
+               timeout=SETUP_TEST_CALL_TIMEOUT_SECONDS, max_retries=0
+               ).chat.completions.create(
+            model=model, messages=[{"role": "user", "content": "ping"}], max_tokens=1)
+    except Exception as exc:  # noqa: BLE001 -- every failure is reported, none is fatal
+        return exc
+    return None
+
+
+class SetupCancelled(KeyboardInterrupt):
+    """The person chose Cancel inside the wizard; handled exactly like Ctrl+C."""
+
+
+SETUP_CANCELLED_MESSAGE = "Setup cancelled — nothing was written."
+
+
 def _run_setup(config_path=None, include_workspace=True, activate_runtime=False, heading="Agent8088 setup"):
     """Interactive config wizard with searchable provider + model picker."""
     import re as _re
@@ -7513,15 +8280,16 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         # Seed from the packaged template so the wizard has defaults to edit.
         # The old behaviour — refusing to run and telling the user to "run the
         # installer first" — was a dead end when the config had been deleted or
-        # never created: --setup is the tool that creates it.
+        # never created: --setup is the tool that creates it. Seeded in memory
+        # only: the file is written once, at the end, so a cancelled wizard
+        # leaves nothing behind.
         packaged = Path(__file__).with_name("config.txt")
         try:
             content = packaged.read_text(encoding="utf-8")
         except OSError:
             content = ""
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_private_text(config_path, content)
-    content = config_path.read_text(encoding="utf-8")
+    else:
+        content = config_path.read_text(encoding="utf-8")
     def _current(key):
         m = _re.search(rf'^{_re.escape(key)}=(.*)$', content, _re.MULTILINE)
         return m.group(1).strip() if m else ""
@@ -7598,25 +8366,31 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         )
         print(f"No API key needed — {provider} runs locally at {_local_url}.")
     # Fetch models
+    from agent8088.errors import status_code as _status_code
     print(f"\nFetching model list (up to {MODEL_DISCOVERY_TIMEOUT_SECONDS}s)...")
-    try:
-        from agent8088.providers import list_models
-        from openai import OpenAI
-        defaults = provider_registry.builtin_provider_defaults(provider)
-        base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
-        api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
-        fetch_client = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS,
-            max_retries=0,
-        )
-        models = list_models(provider, client=fetch_client, fallback=False)
-    except Exception:
-        models = []
+    defaults = provider_registry.builtin_provider_defaults(provider)
+    base_url = custom_base_url or _current(f"provider.{provider}.base_url") or defaults.get("base_url", "")
+    api_key = key or current_key or os.environ.get(defaults.get("api_key_env", ""), "") or defaults.get("api_key", "")
+    key_env_label = defaults.get("api_key_env", "") or (env_var_name if _needs_api_key else "")
+    models, discovery_error = _setup_discover_models(provider, base_url, api_key)
+    if (not models and discovery_error is not None and _status_code(discovery_error) == 404
+            and base_url and not base_url.rstrip("/").endswith("/v1")):
+        # The most common custom-endpoint mistake: the server's OpenAI API
+        # lives under /v1 and the URL was typed without it.
+        with_v1 = base_url.rstrip("/") + "/v1"
+        alt_models, _alt_error = _setup_discover_models(provider, with_v1, api_key)
+        if alt_models:
+            print(f"{base_url} has no model list, but {with_v1} does.")
+            if _choice_prompt(f"Use {with_v1} as the URL?", ["Yes", "No"], "Yes") == "Yes":
+                base_url = custom_base_url = with_v1
+                models, discovery_error = alt_models, None
     if models:
         model_name = _choice_prompt("Select model:", models)
     else:
+        if discovery_error is not None:
+            reason = _explain_setup_error(discovery_error, provider, base_url,
+                                          api_key_env=key_env_label).render(hint=False)
+            print(f"Model discovery failed: {reason}")
         print("Model discovery unavailable; enter the model name manually.")
         model_name = ""
         while not model_name:
@@ -7625,6 +8399,41 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             ).strip()
             if not model_name:
                 print("A model is required.")
+
+    # One real request before anything is saved: a wrong key, model name or
+    # URL otherwise surfaces as the first chat failing, far from the wizard.
+    while True:
+        print(f"\nTesting {provider}:{model_name} with a 1-token request...")
+        failure = _setup_test_call(base_url, api_key, model_name)
+        if failure is None:
+            print("  OK — the model answered.")
+            break
+        friendly = _explain_setup_error(failure, provider, base_url, model_name, key_env_label,
+                                        timeout=SETUP_TEST_CALL_TIMEOUT_SECONDS)
+        if friendly.kind == "timeout":
+            print(f"  No answer in {SETUP_TEST_CALL_TIMEOUT_SECONDS}s — a local model may still "
+                  "be loading. Saving anyway; run /doctor once it is up.")
+            break
+        if friendly.kind == "bad_request":
+            # The server is there and accepted the key; only this tiny probe
+            # request was refused (some models reject max_tokens=1).
+            print(f"  The endpoint answered but refused the test request: {friendly.message}")
+            print("  Saving; if chats fail, run /doctor.")
+            break
+        print(f"  Test failed: {friendly.render(hint=False)}")
+        options = ["Enter a different model", "Save anyway", "Cancel (nothing is written)"]
+        if _needs_api_key:
+            options.insert(1, "Re-enter the API key")
+        pick = _choice_prompt("What now?", options, options[0])
+        if pick.startswith("Enter a different"):
+            model_name = _custom_prompt("Model name:", model_name).strip() or model_name
+        elif pick.startswith("Re-enter"):
+            key = _custom_prompt(f"API key for {provider}:", secret=True)
+            api_key = key or api_key
+        elif pick.startswith("Save"):
+            break
+        else:
+            raise SetupCancelled()
 
     search = ""
     search_provider = ""
@@ -7642,10 +8451,18 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         choice = _choice_prompt("Web search:", options, options[0]).lower()
         if choice.startswith("keep current"):
             pass  # leave search_base_url / web_search_provider untouched
+        elif choice.startswith("searxng (") and not A._docker_available():
+            print("SearXNG runs in Docker, and Docker isn't available here (not installed, "
+                  "or not running).")
+            print("Until it is, web search uses ddgs — keyless, but less reliable. Start "
+                  "Docker, then run /search setup.")
         elif choice.startswith("searxng ("):
             searxng_port = _searxng_host_port()
             provisioned = searxng_provision.start(_agent8088_home(), port=searxng_port)
             print(provisioned["detail"])
+            if not provisioned["ok"]:
+                print("Leaving web search on ddgs (keyless, less reliable) until SearXNG "
+                      "starts; retry with /search setup.")
             if provisioned["ok"]:
                 ready = searxng_provision.wait_ready(port=searxng_port)
                 print(ready["detail"])
@@ -7668,11 +8485,13 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
         elif choice.startswith("none"):
             search = "none"
         else:
+            # Not `provider`: that is the model provider chosen above, and
+            # reusing the name wrote default_provider=<ExaProvider ...>.
             for name in ("tavily", "exa"):
-                provider = A.WEB_SEARCH_REGISTRY.get(name)
-                if not provider or not choice.startswith(name):
+                search_backend = A.WEB_SEARCH_REGISTRY.get(name)
+                if not search_backend or not choice.startswith(name):
                     continue
-                schema = provider.setup_schema()
+                schema = search_backend.setup_schema()
                 for env_var in schema.get("env_vars") or []:
                     entered = _custom_prompt(
                         f"{env_var['prompt']} ({env_var.get('url', '')}):",
@@ -7737,6 +8556,7 @@ def _run_setup(config_path=None, include_workspace=True, activate_runtime=False,
             print(f"Added web_search_no_prompt={value} "
                   "(approval-free search, local SearXNG only).")
     content = _backfill_memory_key(content, _set_line)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     _write_private_text(config_path, content)
     if activate_runtime:
         _reload_model_runtime(config_path, provider, model_name)
@@ -8260,6 +9080,9 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="with --update: discard local changes in the install dir first")
     parser.add_argument("--setup", action="store_true", help="run interactive config wizard, then exit")
+    parser.add_argument("--doctor", action="store_true",
+                        help="check the setup (provider, key, model, config, memory, MCP, browser), "
+                             "print fixes, then exit; non-zero exit status on any failure")
     parser.add_argument("--model-setup", action="store_true", help="configure model provider profile")
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
     parser.add_argument("--memory-setup", action="store_true",
@@ -8326,11 +9149,14 @@ def main():
         _run_update(force=args.force)
         return
     if args.setup:
-        _run_setup()
+        try:
+            _run_setup()
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{SETUP_CANCELLED_MESSAGE}")
+            return 130
         return
     if args.model_setup:
-        configure_model_profile()
-        return
+        return 0 if configure_model_profile() else 130
     if args.sandbox_setup:
         print(A.install_native_sandbox())
         return 0 if A.native_sandbox_verified() else 1
@@ -8351,12 +9177,18 @@ def main():
     # operator is still watching instead of midway through a turn.
     A.verify_sandbox_backend()
 
+    if args.doctor:
+        return run_doctor_cli()
     if args.gateway:
         from agent8088.gateway import main as gateway_main
         gateway_main()
         return
     if args.gateway_setup:
-        _run_gateway_setup()
+        try:
+            _run_gateway_setup()
+        except (KeyboardInterrupt, EOFError):
+            print("\nGateway setup cancelled.")
+            return 130
         return
     if args.mcp_serve:
         from agent8088.mcp_server import run_mcp_server
@@ -8375,6 +9207,11 @@ def main():
             # A refused bind host is the operator's mistake, not a crash.
             print(f"agent8088 --web: {exc}", file=sys.stderr)
             raise SystemExit(2) from None
+        except (RuntimeError, OSError) as exc:
+            # A missing/failed frontend build or a taken port: the message says
+            # what to do; a traceback would only bury it.
+            print(f"agent8088 --web: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
         return
     if args.full_auto:
         A.PERMISSION_MODE = "full-auto"
@@ -8387,9 +9224,74 @@ def main():
             S.show_trace = False
             console.print(f"[red]could not enable trace export:[/red] {exc}")
     _install_completion()
+    _first_run_check()
+    model_notices = _startup_ollama_model_check()
     banner()
+    _print_notices(_startup_notices(model_notices))
     warn_about_unknown_theme()
+    try:
+        _repl_loop()
+    finally:
+        # Every way out of the REPL — /exit, EOF, Ctrl+C mid-turn, an
+        # unexpected exception — lands here, which is why the save and the
+        # flush are after the loop rather than beside each `break`. Saving a
+        # session do_chat already saved rewrites the same content.
+        _save_session_on_exit()
+        _flush_memory_capture()
+
+
+def _save_session_on_exit():
+    try:
+        _save_active_session()
+    except Exception as exc:  # noqa: BLE001 -- never mask why the REPL is ending
+        console.print(f"[red]could not save session {S.name!r}:[/red] {exc}")
+
+
+def _first_run_check():
+    """No provider configured and the default endpoint isn't there: offer setup.
+
+    Probes only when nothing names a provider, so a configured install never
+    pays for it; the probe is the 2s TCP connect /doctor uses, no retries.
+    """
+    if (A.APP_CONFIG.get("default_provider") or os.environ.get("AGENT8088_PROVIDER")
+            or _user_configured_providers()):
+        return
+    endpoint = A.active_endpoint_url()
+    if str(_endpoint_probe(endpoint)).startswith("reachable"):
+        return
+    hint = (f"No model provider is configured and {endpoint or 'the default endpoint'} "
+            "isn't answering.")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        console.print(f"[yellow]{hint}[/yellow] Run `agent8088 --setup`.")
+        return
+    try:
+        answer = console.input(f"[yellow]{hint}[/yellow] Run setup now? [Y/n] ")
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return
+    if answer.strip().lower() not in ("", "y", "yes"):
+        console.print("[dim]Skipped. Run `agent8088 --setup` any time.[/dim]")
+        return
+    try:
+        _run_setup(activate_runtime=True)
+    except (KeyboardInterrupt, EOFError):
+        console.print(f"\n[dim]{SETUP_CANCELLED_MESSAGE}[/dim]")
+
+
+def _run_repl_command(handler, rest):
+    try:
+        handler(rest)
+    except KeyboardInterrupt:
+        # Ctrl+C inside a command's picker or prompt cancels that command;
+        # it is Ctrl+C during a chat turn that quits.
+        console.print("\n[dim]cancelled[/dim]")
+    except Exception as e:
+        console.print(f"[red]error:[/red] {e}")
+
+
+def _repl_loop():
     while True:
+        _print_notices(_mcp_failure_notice())
         try:
             line = _read_line().strip()
         except (EOFError, KeyboardInterrupt):
@@ -8405,10 +9307,7 @@ def main():
         # than being sent to the model — so typing 'reset' clears the context
         # instead of making the model ramble about "confirming the clearing".
         if " " not in line and not line.startswith("/") and line.lower() in COMMANDS:
-            try:
-                COMMANDS[line.lower()]("")
-            except Exception as e:
-                console.print(f"[red]error:[/red] {e}")
+            _run_repl_command(COMMANDS[line.lower()], "")
             continue
         if line.startswith("/"):
             # Otherwise a finished capture waits for the next chat turn, and a
@@ -8417,10 +9316,7 @@ def main():
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:
-                try:
-                    handler(rest)
-                except Exception as e:
-                    console.print(f"[red]error:[/red] {e}")
+                _run_repl_command(handler, rest)
             else:
                 console.print(_unknown_command_message(cmd))
             continue
@@ -8432,14 +9328,12 @@ def main():
         except KeyboardInterrupt:
             # Ctrl+C ends agent8088. ESC is the key that cancels just the task
             # in flight — do_chat catches AgentInterrupted for that and returns
-            # normally, so reaching here means the user asked to quit.
+            # normally, so reaching here means the user asked to quit. The
+            # session (with this turn's question) is saved on the way out.
             console.print("\n[dim]bye[/dim]")
             break
         except Exception as e:
             console.print(f"[red]error:[/red] {e}")
-    # Every way out of the REPL — /exit, EOF, Ctrl+C — lands here, which is why
-    # the flush is after the loop rather than beside each `break`.
-    _flush_memory_capture()
 
 
 if __name__ == "__main__":

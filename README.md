@@ -58,6 +58,8 @@ curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/inst
 $env:AGENT8088_BRANCH = "development"; iex (irm https://agent8088-installer.pages.dev/install.ps1)
 ```
 
+Run it in PowerShell, not `cmd.exe`. From `cmd.exe` or a locked-down execution policy: `powershell -ExecutionPolicy Bypass -c "irm https://agent8088-installer.pages.dev/install.ps1 | iex"`. On macOS/Linux, don't prefix the installer with `sudo` — it asks for sudo itself when a system package needs it.
+
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
 **What the installer provisions automatically:**
@@ -82,8 +84,8 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
 | Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
 
-After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
-`/dump` to produce a bundle for a bug report.
+After installing, run `agent8088 --doctor` (or `/doctor [--fix]` inside the agent) to verify your setup, or
+`/dump` to produce a bundle for a bug report. If the install itself fails, it prints the likely cause and the command to re-run; the full output is in `~/.agent8088/install.log`.
 
 The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed — run `uv pip install -e ".[dev]"` if you need the test suite.
 

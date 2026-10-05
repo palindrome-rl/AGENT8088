@@ -1449,30 +1449,17 @@ async def set_sandbox(body: SandboxBody):
 
 @app.get("/api/doctor")
 async def get_doctor():
-    """Health check results."""
-    A, C = _eng(), _cl()
-    active = C._active_provider_name()
-    provider = A.PROVIDERS.get(active, {})
-    endpoint = provider.get("base_url") if provider else A.MODEL_BASE_URL
-    key_env = provider.get("api_key_env", "")
-    if key_env:
-        auth = f"{key_env}: {'set' if A._provider_api_key(provider) else 'missing'}"
-    elif provider.get("api_mode", "").lower() == "litellm":
-        auth = "provider-managed"
-    else:
-        auth = "configured" if A._provider_api_key(provider) else "not required"
-    sandbox = A.sandbox_status()
-    return {
-        "model": f"{active}:{A.MODEL_NAME}",
-        "endpoint": str(endpoint or "provider-managed"),
-        "reachability": C._endpoint_probe(endpoint) if endpoint else "provider-managed",
-        "authentication": auth,
-        "configuration": f"{A.CONFIG_PATH} ({'found' if A.CONFIG_PATH.exists() else 'missing'})",
-        "sandbox": f"{sandbox['resolved']} ({sandbox['verification']})",
-        "capabilities": f"{len(C._active_tool_specs())} tools, {len(C._active_skills())} skills",
-        "web_search": "ok" if A.web_search._ddgs_installed() else "broken",
-        "cli_anything": "ready" if A.cli_anything.status(A.CONFIG_PATH)["available"] else "available on demand",
-    }
+    """Health check results: the same checks as /doctor and `agent8088 --doctor`.
+
+    The flat fields are what the Doctor page has always read; `checks` is the
+    full list ({name, status, detail, fix, repair}). Off the event loop: the
+    live checks make network requests.
+    """
+    C = _cl()
+    try:
+        return await asyncio.to_thread(C.doctor_report)
+    except Exception as exc:
+        return _exc_error(exc)
 
 
 class DoctorFixBody(BaseModel):
@@ -1480,11 +1467,30 @@ class DoctorFixBody(BaseModel):
 
 @app.post("/api/doctor/fix")
 async def doctor_fix(body: DoctorFixBody):
-    """Run --fix repair."""
+    """Run --fix repair.
+
+    Only the unattended repair (reinstalling ddgs) runs from here: the others
+    download or install things and each needs a yes, which this endpoint has
+    no way to ask -- they are listed in `output` with the command to run.
+    """
     C = _cl()
+
+    def _fix():
+        import io
+        from rich.console import Console as RichConsole
+        buf = io.StringIO()
+        original_console, original_confirm = C.console, C.WEB_CONFIRM
+        C.console = RichConsole(file=buf, force_terminal=False, no_color=True, width=120)
+        C.WEB_CONFIRM = {"command": "/doctor --fix", "yes": False}
+        try:
+            C.cmd_doctor("--fix")
+        finally:
+            C.console, C.WEB_CONFIRM = original_console, original_confirm
+        return buf.getvalue()
+
     try:
-        C.cmd_doctor("--fix")
-        return {"ok": True}
+        output = await asyncio.to_thread(_fix)
+        return {"ok": True, "output": scrub_markup(output)}
     except Exception as exc:
         return _exc_error(exc)
 
@@ -2076,8 +2082,8 @@ async def websocket_endpoint(ws: WebSocket):
                 turn = asyncio.create_task(_run_turn(handler, ws, msg, A, C))
                 turn.add_done_callback(_turn_finished)
             elif msg_type == "interrupt":
-                # Signal the agent thread; run_agent polls _interrupt_event.is_set.
-                _interrupt_event.set()
+                # Signal this socket's turn; run_agent polls its event.is_set.
+                _interrupt_turn_of(ws)
             elif msg_type == "approval":
                 esc_id = msg.get("id", "")
                 entry = _pending_approvals.get(esc_id)
@@ -2093,13 +2099,14 @@ async def websocket_endpoint(ws: WebSocket):
                     entry["event"].set()
     except WebSocketDisconnect:
         manager.disconnect(ws)
-        _interrupt_event.set()   # let the orphaned turn wind itself down
-        _fail_pending_waits()
+        # Only this socket's turn: closing one tab used to stop another's.
+        _interrupt_turn_of(ws)   # let the orphaned turn wind itself down
+        _fail_pending_waits(owner=id(ws))
     except Exception as exc:
         log.error("WebSocket error: %s", exc)
         manager.disconnect(ws)
-        _interrupt_event.set()
-        _fail_pending_waits()
+        _interrupt_turn_of(ws)
+        _fail_pending_waits(owner=id(ws))
 
 
 async def _run_turn(handler, ws: WebSocket, msg: dict, A, C) -> None:
@@ -2122,19 +2129,36 @@ async def _run_turn(handler, ws: WebSocket, msg: dict, A, C) -> None:
 _pending_approvals: dict = {}
 _pending_plan_approvals: dict = {}
 _pending_direct_tools: dict = {}
-_interrupt_event = threading.Event()
+# One interrupt event per running turn, keyed by the socket that started it
+# (id(ws)). A single process-wide event let any tab stop any other tab's turn,
+# and a new chat cleared it while an older turn was still running.
+_turn_interrupts: dict = {}
+# Every turn mutates the one shared session (S.messages); two at once from two
+# tabs interleaved their messages. The second is refused, not queued.
+_TURN_LOCK = threading.Lock()
+ANOTHER_TURN_RUNNING = ("Another turn is already running (in another tab or window). "
+                        "Wait for it to finish or stop it there, then send this again.")
+# Final answers that are failure reports (engine._fallback_answer), shown as errors.
+_ERROR_ANSWER_PREFIXES = ("Error:", "I could not answer:")
 
 
-def _fail_pending_waits():
-    """On WS disconnect, release every waiting escalation/plan prompt as denied."""
-    for entry in _pending_approvals.values():
-        entry.setdefault("approved", False)
-        entry["event"].set()
-    _pending_approvals.clear()
-    for entry in _pending_plan_approvals.values():
-        entry["mode"] = ""
-        entry["event"].set()
-    _pending_plan_approvals.clear()
+def _interrupt_turn_of(ws) -> None:
+    event = _turn_interrupts.get(id(ws))
+    if event is not None:
+        event.set()
+
+
+def _fail_pending_waits(owner=None):
+    """On WS disconnect, release that socket's waiting escalation/plan prompts
+    as denied (every socket's when owner is None)."""
+    for store, deny in ((_pending_approvals, lambda e: e.setdefault("approved", False)),
+                        (_pending_plan_approvals, lambda e: e.__setitem__("mode", ""))):
+        for key, entry in list(store.items()):
+            if owner is not None and entry.get("owner", owner) != owner:
+                continue
+            deny(entry)
+            entry["event"].set()
+            store.pop(key, None)
 
 
 async def _handle_chat(ws: WebSocket, msg: dict, A, C):
@@ -2148,7 +2172,24 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         await ws.send_json({"type": "error", "message": str(exc)})
         return
 
-    _interrupt_event.clear()
+    if not _TURN_LOCK.acquire(blocking=False):
+        await ws.send_json({"type": "error", "message": ANOTHER_TURN_RUNNING})
+        return
+    interrupt = threading.Event()
+    _turn_interrupts[id(ws)] = interrupt
+    handed_off = [False]  # set the moment the agent thread owns the lock
+    try:
+        await _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C)
+    finally:
+        if not handed_off[0]:
+            if _turn_interrupts.get(id(ws)) is interrupt:
+                _turn_interrupts.pop(id(ws), None)
+            _TURN_LOCK.release()
+
+
+async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C):
+    """The turn itself, under _TURN_LOCK. Once its thread starts, that thread
+    owns the lock (handed_off[0] is True) and releases it when the turn ends."""
     S = C.S
 
     # Append user message
@@ -2200,6 +2241,18 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         from contextlib import nullcontext
         return nullcontext()
 
+    def on_status(message):
+        # Retry / fallback notices ride the existing spin event, which the UI
+        # already shows as the turn's activity line.
+        spin(message)
+
+    def on_stream_reset():
+        # A reply that broke off mid-stream is being retried: the UI drops
+        # the partial text it has shown, and the scrubber starts over with it.
+        nonlocal scrubber
+        scrubber = _StreamScrubber()
+        asyncio.run_coroutine_threadsafe(ws.send_json({"type": "stream_reset"}), loop)
+
     def on_token(kind, delta):
         # Count characters, not chunks — each callback is one streaming delta
         # of arbitrary size, so += 1 wildly overstated "tokens".
@@ -2241,7 +2294,8 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         prompt can never read a verdict meant for a different escalation.
         """
         esc_id = f"esc-{int(time.time()*1000)}-{id(result)}"
-        entry = {"event": threading.Event(), "approved": False, "session_scope": False}
+        entry = {"event": threading.Event(), "approved": False, "session_scope": False,
+                 "owner": id(ws)}
         _pending_approvals[esc_id] = entry
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "escalation", "tool_name": name,
@@ -2279,7 +2333,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         gate; the mode also has to be one the browser is allowed to ask for.
         """
         plan_id = f"plan-{int(time.time()*1000)}-{id(escalation_text)}"
-        entry = {"event": threading.Event(), "mode": ""}
+        entry = {"event": threading.Event(), "mode": "", "owner": id(ws)}
         _pending_plan_approvals[plan_id] = entry
         asyncio.run_coroutine_threadsafe(
             ws.send_json({"type": "plan_approval", "plan": escalation_text[:2000],
@@ -2293,7 +2347,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
 
     def on_answer(answer):
         elapsed = time.time() - turn_start
-        if answer.startswith("Error:"):
+        if answer.lstrip().startswith(_ERROR_ANSWER_PREFIXES):
             asyncio.run_coroutine_threadsafe(
                 ws.send_json({"type": "error", "message": scrub_markup(answer.split("\n\nLatest tool result:", 1)[0])}), loop)
             return
@@ -2326,7 +2380,8 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
                 spin=spin, on_calls=on_calls, on_tool=on_tool,
                 on_result=on_result, on_escalation=on_escalation,
                 on_answer=on_answer, on_token=on_token,
-                interrupt_check=_interrupt_event.is_set, trace=trace,
+                on_status=on_status, on_stream_reset=on_stream_reset,
+                interrupt_check=interrupt.is_set, trace=trace,
                 system_prompt=C._session_system_prompt,
                 tools_def=lambda: A.build_tools_def(C._active_tool_specs()),
                 allowed_tools=lambda: set(C._active_tool_specs()),
@@ -2351,6 +2406,7 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         except A.AgentInterrupted:
             elapsed = time.time() - turn_start
             C._record_trace(text, trace, elapsed, interrupted=True)
+            _save_session_quietly(C)
             asyncio.run_coroutine_threadsafe(
                 ws.send_json({"type": "interrupted", "elapsed": elapsed,
                               "partial": ""}),
@@ -2359,6 +2415,9 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         except Exception as exc:
             import traceback
             traceback.print_exc()
+            # The question (and any tool steps) are already in S.messages;
+            # keep them for a resume rather than losing the turn with the error.
+            _save_session_quietly(C)
             asyncio.run_coroutine_threadsafe(
                 ws.send_json({"type": "error", "message": scrub_markup(str(exc))}),
                 loop,
@@ -2367,11 +2426,24 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
             A._plan_on_step = None
             A._plan_on_escalation = None
             A._plan_on_approval = None
+            if _turn_interrupts.get(id(ws)) is interrupt:
+                _turn_interrupts.pop(id(ws), None)
+            _TURN_LOCK.release()
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
+    # From here the thread owns _TURN_LOCK and releases it when the turn ends,
+    # even if this coroutine is abandoned (a closed socket).
+    handed_off[0] = True
     # Await thread completion without blocking the event loop
     await loop.run_in_executor(None, thread.join)
+
+
+def _save_session_quietly(C) -> None:
+    try:
+        C._save_active_session()
+    except Exception as exc:  # noqa: BLE001 -- never replace the turn's own error
+        log.warning("could not save the session: %s", exc)
 
 
 async def _handle_command(ws: WebSocket, msg: dict, A, C):
@@ -2548,6 +2620,38 @@ def _build_frontend(web_root: Path) -> Path:
     return dist_dir
 
 
+def _ensure_port_free(host: str, port: int, flag: str = "--web-port") -> None:
+    """Fail before anything starts when `port` is taken, with the way out.
+
+    uvicorn reports a busy port as a bare errno after the "web UI on ..." line
+    had already been printed, so the address it announced was someone else's.
+    """
+    import errno
+    import socket
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if os.name != "nt":
+            # Match uvicorn's own bind: a lingering TIME_WAIT socket from a
+            # server stopped a moment ago is not "in use".
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", -1), errno.EACCES):
+            hint = (f" — try `agent8088 --web {flag} {port + 1}`" if flag
+                    else " (the Vite dev server needs it) — stop whatever is using it")
+            raise RuntimeError(f"port {port} is in use{hint}") from None
+        # Anything else (an address this machine doesn't have, say) is
+        # uvicorn's to report; this check only exists for the busy port.
+    finally:
+        probe.close()
+
+
+# The Vite dev server's fixed port (web/vite.config.ts and the CORS/origin
+# allow-lists above use the same number); --strictPort makes a clash an error.
+VITE_DEV_PORT = 5180
+
+
 def run_web_server(host: str = "127.0.0.1", port: int = 8180, dev: bool = False):
     """Launch the API server and, in development, its Vite frontend.
 
@@ -2567,13 +2671,15 @@ def run_web_server(host: str = "127.0.0.1", port: int = 8180, dev: bool = False)
             "configured. To reach it from another machine, forward the port "
             f"over SSH: ssh -N -L {port}:127.0.0.1:{port} <this-host>")
     _BIND_PORT = port
+    _ensure_port_free(host, port)
     web_root = _frontend_root()
     vite: subprocess.Popen[str] | None = None
     if dev:
         if web_root is None:
             raise RuntimeError("development web UI requires an Agent8088 source checkout")
+        _ensure_port_free(host, VITE_DEV_PORT, flag="")
         vite = _start_vite(web_root, port, host)
-        print("Agent8088 web UI on http://127.0.0.1:5180", flush=True)
+        print(f"Agent8088 web UI on http://127.0.0.1:{VITE_DEV_PORT}", flush=True)
     else:
         if web_root is None:
             raise RuntimeError(
