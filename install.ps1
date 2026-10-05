@@ -2,7 +2,9 @@
 # Agent8088 Installer - Windows (native PowerShell)
 # ============================================================================
 # Usage:
-#   iex (irm https://<YOUR-URL>/install.ps1)
+#   iex (irm https://agent8088-installer.pages.dev/install.ps1)
+#   or, from cmd.exe / when scripts are blocked by execution policy:
+#   powershell -ExecutionPolicy Bypass -c "irm https://agent8088-installer.pages.dev/install.ps1 | iex"
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, PortableGit install, repo clone,
@@ -247,7 +249,7 @@ function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -Fore
 # comfortably.
 #
 # Scale them all for a slow connection:
-#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm <url>)
+#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm https://agent8088-installer.pages.dev/install.ps1)
 $TimeoutScale = 1
 if ($env:AGENT8088_TIMEOUT_SCALE -match '^\d+$' -and [int]$env:AGENT8088_TIMEOUT_SCALE -ge 1) {
     $TimeoutScale = [int]$env:AGENT8088_TIMEOUT_SCALE
@@ -368,7 +370,7 @@ function Invoke-WithTimeout {
         [int]$DrainSec = 10
     )
 
-    $result = @{ ExitCode = -1; TimedOut = $false; Output = "" }
+    $result = @{ ExitCode = -1; TimedOut = $false; Output = ""; ErrorOutput = "" }
     $proc = $null
     $activityState = $null
 
@@ -438,6 +440,11 @@ function Invoke-WithTimeout {
                 try {
                     if ($outTask.Wait($DrainSec * 1000)) { $result.Output = $outTask.Result }
                 } catch { }
+                # stderr is where git, uv and pip say WHY they failed; callers
+                # that capture output need it for the failure message and log.
+                try {
+                    if ($errTask.Wait($DrainSec * 1000)) { $result.ErrorOutput = $errTask.Result }
+                } catch { }
             }
         } else {
             $result.TimedOut = $true
@@ -448,6 +455,7 @@ function Invoke-WithTimeout {
             try { [void]$proc.WaitForExit(5000) } catch { }
         }
         if ($null -eq $result.Output) { $result.Output = "" }
+        if ($null -eq $result.ErrorOutput) { $result.ErrorOutput = "" }
     } catch {
         $result.ExitCode = -1
         $result.Error = $_.Exception.Message
@@ -1323,6 +1331,27 @@ function Test-HostConnectivity {
     }
 }
 
+# An elevated window installs into the elevated account's profile
+# (%LOCALAPPDATA%, the user PATH). When that is a different admin account than
+# the one the person signs in with, agent8088 is then "not recognized" in their
+# own terminals. Warn, do not refuse: an admin installing for itself is fine.
+function Test-RunningAsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Show-AdministratorWarningIfNeeded {
+    if (-not (Test-RunningAsAdministrator)) { return }
+    $who = try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { $env:USERNAME }
+    Write-Warn "Running as Administrator: Agent8088 installs for $who, into $Agent8088Home."
+    Write-Warn "If that is not the account you use day to day, close this window and re-run from a normal (non-admin) PowerShell."
+}
+
 # Rough throughput probe against this repo's own install.ps1 (a host we
 # already trust and are about to talk to for uv). Bounded to 8s so a probe
 # that itself stalls doesn't add a real delay to the install it's trying to
@@ -1779,6 +1808,145 @@ function Remove-IncompleteInstallDirectory {
     return $false
 }
 
+# ----------------------------------------------------------------------------
+# Install log + failure diagnosis
+# ----------------------------------------------------------------------------
+# The heavy stages capture their output instead of discarding it, so a failure
+# can show its last lines and the user has a file to attach to a bug report.
+$script:InstallLog = Join-Path $Agent8088Home "install.log"
+
+function Start-InstallLog {
+    try {
+        New-Item -ItemType Directory -Path $Agent8088Home -Force -ErrorAction Stop | Out-Null
+        if (Test-Path -LiteralPath $script:InstallLog) {
+            Move-Item -LiteralPath $script:InstallLog -Destination "$($script:InstallLog).prev" -Force -ErrorAction SilentlyContinue
+        }
+        Set-Content -LiteralPath $script:InstallLog -Value "agent8088 install log, started $((Get-Date).ToUniversalTime().ToString('o')) branch=$Branch" -ErrorAction Stop
+    } catch {
+        Write-Warn "Cannot write $($script:InstallLog) - command output will not be kept ($_)"
+        $script:InstallLog = $null
+    }
+}
+
+function Add-InstallLog {
+    param([string]$Title, [string]$Text)
+    if (-not $script:InstallLog) { return }
+    try {
+        Add-Content -LiteralPath $script:InstallLog -Value @("", "> $Title", $Text) -ErrorAction Stop
+    } catch { }
+}
+
+function Write-OutputTail {
+    param([string]$Text, [int]$Lines = 20)
+    if (-not $Text) { return }
+    $all = @($Text -split "\r?\n" | Where-Object { $_ -ne "" })
+    if ($all.Count -eq 0) { return }
+    Write-Host "  ---- last $Lines lines of output ----"
+    $all | Select-Object -Last $Lines | ForEach-Object { Write-Host "  | $_" }
+    Write-Host "  ----"
+}
+
+# Name the common root causes in a failed step's output. Each one otherwise
+# surfaces as a page of resolver or TLS noise that never says what to change.
+function Write-InstallFailureHint {
+    param([string]$Text)
+    if (-not $Text) { return }
+    if ($Text -match '(?i)certificate verify failed|UnknownIssuer|invalid peer certificate|unable to get local issuer|self[- ]signed certificate|SSL certificate problem|CERTIFICATE_VERIFY_FAILED') {
+        Write-Warn "TLS certificate check failed - usually a corporate proxy or antivirus that re-signs HTTPS."
+        Write-Info "  Trust the Windows certificate store, then re-run:  `$env:UV_NATIVE_TLS = '1'"
+        Write-Info "  Or name your CA bundle:  `$env:SSL_CERT_FILE = 'C:\path\to\ca.pem'"
+    } elseif ($Text -match '(?i)No space left on device|not enough space on the disk') {
+        Write-Warn "The disk is full. Free about 4 GB, or install elsewhere with -Agent8088Home, then re-run."
+    } elseif ($Text -match '(?i)no matching distribution|no solution found|requires-python|has no wheels|no wheels with a matching|not compatible with|unsupported python') {
+        Write-Warn "A dependency has no build for this Python version or platform."
+        Write-Info "  Python 3.11 or 3.12 is the safe choice. To start over on a fresh Python, delete"
+        Write-Info "  $InstallDir\venv and re-run the installer."
+    } elseif ($Text -match '(?i)could not resolve host|dns error|No such host is known|connection refused|network is unreachable|connection reset|operation timed out|error sending request|failed to fetch') {
+        Write-Warn "A download failed - the network, a VPN or a firewall blocked it."
+        if (-not $script:ResolvedProxy) { Write-Info "  Behind a proxy? `$env:HTTPS_PROXY = 'http://proxy.example:8080', then re-run." }
+    } elseif ($Text -match '(?i)Access is denied|being used by another process|permission denied') {
+        Write-Warn "A file is locked or not writable - close running agent8088 windows and antivirus scans, then re-run."
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Repository access (private repo)
+# ----------------------------------------------------------------------------
+# Same classification as classify_git_error in install.sh. Order matters: a
+# TLS failure also says "unable to access", and GitHub answers "Repository not
+# found" to a signed-in account that lacks access, which no sign-in can fix.
+function Get-GitFailureKind {
+    param([string]$Text)
+    if ($Text -match '(?i)SSL certificate problem|certificate verify|unable to get local issuer|server certificate verification failed|schannel') { return "tls" }
+    if ($Text -match '(?i)repository not found|repository .* does not exist') { return "access" }
+    if ($Text -match '(?i)authentication failed|could not read username|could not read password|terminal prompts disabled|invalid username or password|returned error: 40[13]|permission denied \(publickey\)|permission to .* denied') { return "auth" }
+    if ($Text -match '(?i)could not resolve|failed to connect|connection timed out|connection refused|network is unreachable|operation timed out|proxy|unable to access') { return "network" }
+    return "unknown"
+}
+
+function Write-RepoAccessHelp {
+    param([string]$Kind)
+    switch ($Kind) {
+        "branch" {
+            Write-Err "Branch '$Branch' does not exist in $RepoUrl."
+            Write-Info "Use an existing branch:  `$env:AGENT8088_BRANCH = 'development'; then re-run."
+        }
+        "access" {
+            Write-Err "GitHub says the repository does not exist for this account (it is private)."
+            Write-Info "Your login works but has no access: ask an palindrome-rl admin to add you,"
+            Write-Info "or switch accounts (gh auth status / gh auth login, or remove the github.com"
+            Write-Info "entry in Windows Credential Manager), then re-run."
+        }
+        "auth" {
+            Write-Err "GitHub refused the credentials for $RepoUrl (private repository)."
+            Write-Info "Give git your GitHub credentials, then re-run. Any one of:"
+            Write-Info "  gh auth login; gh auth setup-git     (GitHub CLI, easiest)"
+            Write-Info "  sign in when Git Credential Manager opens its window"
+            Write-Info "  a personal access token with repo scope as the password: https://github.com/settings/tokens"
+        }
+        "tls" {
+            Write-Err "git could not verify github.com's TLS certificate (a proxy or antivirus re-signing HTTPS?)."
+            Write-Info "  Use the Windows certificate store:  git config --global http.sslBackend schannel"
+        }
+        "network" {
+            Write-Err "Could not reach github.com - check your connection, VPN or proxy (HTTPS_PROXY)."
+        }
+        default {
+            Write-Err "git could not reach $RepoUrl."
+        }
+    }
+}
+
+# Probe the repository and branch before clone/fetch. Returns "ok", "branch",
+# or a Get-GitFailureKind result. Non-interactive on purpose: a stored
+# credential still works, but nothing prompts here. "auth" is therefore not
+# final (the real clone can still sign in through Git Credential Manager), but
+# it does mean the ZIP fallback is pointless: a private repo's archive is a 404
+# that would hide the real error.
+function Test-RepoAccess {
+    $gitExe = (Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $gitExe) { $gitExe = "git" }
+    $prevPrompt = $env:GIT_TERMINAL_PROMPT
+    $prevGcm = $env:GCM_INTERACTIVE
+    try {
+        $env:GIT_TERMINAL_PROMPT = "0"
+        $env:GCM_INTERACTIVE = "never"
+        $probe = Invoke-WithTimeout -FilePath $gitExe -Arguments @("ls-remote", "--heads", $RepoUrl, $Branch) `
+            -TimeoutSec 60 -CaptureOutput -Activity "Checking access to the Agent8088 repository"
+    } finally {
+        $env:GIT_TERMINAL_PROMPT = $prevPrompt
+        $env:GCM_INTERACTIVE = $prevGcm
+    }
+    $script:RepoProbeOutput = ("$($probe.Output)`n$($probe.ErrorOutput)").Trim()
+    Add-InstallLog -Title "git ls-remote --heads $RepoUrl $Branch (exit $($probe.ExitCode))" -Text $script:RepoProbeOutput
+    if ($probe.TimedOut) { return "network" }
+    if ($probe.ExitCode -eq 0) {
+        if ($probe.Output -match "refs/heads/$([regex]::Escape($Branch))(\r?\n|$)") { return "ok" }
+        return "branch"
+    }
+    return (Get-GitFailureKind -Text $script:RepoProbeOutput)
+}
+
 function Clone-Repo {
     Write-Info "Installing to $InstallDir..."
 
@@ -1820,8 +1988,28 @@ function Clone-Repo {
             }
             & git -c windows.appendAtomically=false remote set-url origin $RepoUrl 2>$null
             if ($LASTEXITCODE -ne 0) { Write-Err "Could not configure the Agent8088 remote."; return $false }
-            & git -c windows.appendAtomically=false fetch --depth 1 origin $Branch 2>$null
-            if ($LASTEXITCODE -ne 0) { Write-Err "Could not fetch '$Branch' from the Agent8088 remote."; return $false }
+            $access = Test-RepoAccess
+            if ($access -in @("branch", "access")) {
+                Write-RepoAccessHelp -Kind $access
+                return $false
+            }
+            if ($access -eq "auth") {
+                Write-Warn "No stored GitHub credentials work for this private repository."
+                Write-Info "Git will ask you to sign in. Use an account with access to palindrome-rl."
+            }
+            # 2>&1 + Write-Host rather than 2>$null: git's stderr is the only
+            # place that says why a fetch failed.
+            $fetchLines = @(& git -c windows.appendAtomically=false fetch --depth 1 origin $Branch 2>&1 |
+                ForEach-Object { "$_" })
+            $fetchExit = $LASTEXITCODE
+            Add-InstallLog -Title "git fetch --depth 1 origin $Branch (exit $fetchExit)" -Text ($fetchLines -join "`n")
+            if ($fetchExit -ne 0) {
+                Write-Err "Could not fetch '$Branch' from the Agent8088 remote (exit $fetchExit)."
+                Write-OutputTail -Text ($fetchLines -join "`n")
+                $kind = Get-GitFailureKind -Text ($fetchLines -join "`n")
+                if ($kind -ne "unknown") { Write-RepoAccessHelp -Kind $kind }
+                return $false
+            }
             & git -c windows.appendAtomically=false checkout -B $Branch FETCH_HEAD 2>$null | Out-Host
             if ($LASTEXITCODE -ne 0) { Write-Err "Could not check out '$Branch'."; return $false }
             & git -c windows.appendAtomically=false reset --hard FETCH_HEAD 2>$null | Out-Host
@@ -1830,18 +2018,45 @@ function Clone-Repo {
             Pop-Location
         }
     } else {
+        $access = Test-RepoAccess
+        if ($access -in @("branch", "access")) {
+            Write-RepoAccessHelp -Kind $access
+            return $false
+        }
+        $authProblem = ($access -eq "auth")
+        if ($authProblem) {
+            Write-Warn "No stored GitHub credentials work for this private repository."
+            Write-Info "Git will ask you to sign in. Use an account with access to palindrome-rl."
+        } elseif ($access -ne "ok") {
+            Write-Warn "Repository check failed ($access) - trying the clone anyway:"
+            Write-OutputTail -Text $script:RepoProbeOutput -Lines 5
+        }
         Write-Info "Cloning Agent8088 repository..."
         if (-not (Remove-IncompleteInstallDirectory)) { return $false }
         New-Item -ItemType Directory -Path (Split-Path $InstallDir -Parent) -Force | Out-Null
 
+        $cloneLines = @()
         try {
-            & git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrl $InstallDir | Out-Host
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $InstallDir ".git"))) {
-                throw "git clone failed (exit $LASTEXITCODE)"
+            # Shown as it runs AND kept, so a failure can be classified below.
+            $cloneLines = @(& git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrl $InstallDir 2>&1 |
+                ForEach-Object { $line = "$_"; Write-Host $line; $line })
+            $cloneExit = $LASTEXITCODE
+            Add-InstallLog -Title "git clone --depth 1 --branch $Branch (exit $cloneExit)" -Text ($cloneLines -join "`n")
+            if ($cloneExit -ne 0 -or -not (Test-Path (Join-Path $InstallDir ".git"))) {
+                throw "git clone failed (exit $cloneExit)"
             }
             & git -C $InstallDir -c windows.appendAtomically=false config core.autocrlf false
             if ($LASTEXITCODE -ne 0) { throw "git config failed (exit $LASTEXITCODE)" }
         } catch {
+            $cloneKind = Get-GitFailureKind -Text ($cloneLines -join "`n")
+            if ($authProblem -or $cloneKind -in @("auth", "access")) {
+                # The ZIP archive of a private repo is a 404, which would replace
+                # this real cause with a misleading "download failed".
+                Write-RepoAccessHelp -Kind $(if ($cloneKind -in @("auth", "access")) { $cloneKind } else { "auth" })
+                Write-Info "Not trying the ZIP download: the repository is private, so it cannot work."
+                [void](Remove-IncompleteInstallDirectory)
+                return $false
+            }
             # ZIP fallback: GitHub archive. Then git init so future updates work.
             Write-Warn "git clone failed; falling back to ZIP archive: $_"
             if (-not (Remove-IncompleteInstallDirectory)) { return $false }
@@ -1938,20 +2153,32 @@ function Install-Deps {
         # This is the stage that actually hangs: playwright's and ddgs's native
         # wheels plus mcp and Pillow. Mandatory, so a timeout is a hard failure
         # with a specific message rather than a skip.
+        # Captured (it used to be discarded) so a failure can say WHY: the last
+        # lines, plus a diagnosis of TLS interception, a full disk, or a
+        # dependency with no wheel for this Python. Everything goes to the log.
         $coreResult = Invoke-WithTimeout -FilePath $script:UvCmd `
             -Arguments @("pip", "install", "--python", $py,
                          "--reinstall-package", "agent8088", "-e", $InstallDir) `
-            -TimeoutSec $TCoreInstall -Activity "Installing Agent8088 core dependencies"
+            -TimeoutSec $TCoreInstall -CaptureOutput -Activity "Installing Agent8088 core dependencies"
         $ErrorActionPreference = $prevEAP
+        $coreText = ("$($coreResult.Output)`n$($coreResult.ErrorOutput)").Trim()
+        Add-InstallLog -Title "uv pip install -e $InstallDir (exit $($coreResult.ExitCode))" -Text $coreText
         if ($coreResult.TimedOut) {
             Write-Err "uv pip install timed out after $([int]($TCoreInstall / 60))m - a package download stalled."
             Write-Err 'Retry on a slower link with: $env:AGENT8088_TIMEOUT_SCALE = 3'
+            Write-OutputTail -Text $coreText
             Write-Err "Or see the underlying error with:"
             Write-Err "  $script:UvCmd pip install --python `"$py`" -e `"$InstallDir`""
+            if ($script:InstallLog) { Write-Info "Full log: $($script:InstallLog)" }
             throw "uv pip install timed out"
         }
         if ($coreResult.ExitCode -ne 0) {
             Write-Err "uv pip install failed (exit $($coreResult.ExitCode))"
+            Write-OutputTail -Text $coreText
+            Write-InstallFailureHint -Text $coreText
+            Write-Info "See the underlying error with:"
+            Write-Info "  $script:UvCmd pip install --python `"$py`" -e `"$InstallDir`""
+            if ($script:InstallLog) { Write-Info "Full log: $($script:InstallLog)" }
             throw "Failed to install agent8088"
         }
     } catch {
@@ -2776,14 +3003,72 @@ function Drop-Config {
 # ----------------------------------------------------------------------------
 # Stage 9: Verify + finish
 # ----------------------------------------------------------------------------
+# Which agent8088 a NEW terminal will run. Windows searches the Machine PATH
+# before the User PATH this installer edits, so a pip-installed or older copy
+# there runs instead, and every fix lands in the copy that is not being used.
+function Test-CommandShadowing {
+    $ours = Join-Path $LauncherDir "agent8088.cmd"
+    $dirs = @()
+    foreach ($scope in @("Machine", "User")) {
+        $value = [Environment]::GetEnvironmentVariable("Path", $scope)
+        if ($value) { $dirs += @($value -split ";" | Where-Object { $_ }) }
+    }
+    foreach ($dir in $dirs) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($dir).TrimEnd('\')
+        if ($expanded -eq $LauncherDir.TrimEnd('\')) { return }
+        foreach ($ext in @(".exe", ".cmd", ".bat", ".ps1")) {
+            $candidate = Join-Path $expanded "agent8088$ext"
+            if (Test-Path -LiteralPath $candidate) {
+                Write-Warn "Another agent8088 at $candidate will run instead of $ours."
+                Write-Info "  Remove it, or move $LauncherDir ahead of $expanded in PATH."
+                return
+            }
+        }
+    }
+}
+
 function Verify-Install {
     Write-Info "Verifying install..."
     $agentExe = Join-Path $InstallDir "venv\Scripts\agent8088.exe"
+    $ready = $false
+    $versionText = ""
+    $versionResult = $null
+    # Actually run it: an exe that exists but cannot import the package used
+    # to be followed by "Done. Run 'agent8088' to start." anyway.
     if (Test-Path $agentExe) {
-        try { & $agentExe --version 2>$null | Out-Host } catch { }
+        $versionResult = Invoke-WithTimeout -FilePath $agentExe -Arguments @("--version") `
+            -TimeoutSec 120 -CaptureOutput
+        $versionAll = ("$($versionResult.Output)`n$($versionResult.ErrorOutput)").Trim()
+        Add-InstallLog -Title "agent8088 --version (exit $($versionResult.ExitCode))" -Text $versionAll
+        if (-not $versionResult.TimedOut -and $versionResult.ExitCode -eq 0) {
+            $ready = $true
+            $versionText = @("$($versionResult.Output)".Trim() -split "\r?\n")[-1]
+        }
     }
+    if ($ready) {
+        Write-Success "agent8088 is ready ($versionText)"
+    } else {
+        $script:InstallBroken = $true
+        Write-Host ""
+        Write-Err "agent8088 was installed but does not start."
+        if ($versionResult) {
+            Write-OutputTail -Text $versionAll
+            Write-InstallFailureHint -Text $versionAll
+        } else {
+            Write-Err "The executable is missing: $agentExe"
+        }
+        Write-Info "See the error directly:  & `"$InstallDir\venv\Scripts\python.exe`" -m agent8088.cli --version"
+        Write-Info "Fix: re-run the installer:  iex (irm https://agent8088-installer.pages.dev/install.ps1)"
+        Write-Info "If that fails too, delete $InstallDir\venv and re-run."
+        if ($script:InstallLog) { Write-Info "Full log: $($script:InstallLog)" }
+    }
+    Test-CommandShadowing
     Write-Host ""
-    Write-Success "Done. Run 'agent8088' to start."
+    if ($ready) {
+        Write-Success "Done. Run 'agent8088' to start."
+    } else {
+        Write-Err "Install incomplete: agent8088 does not start (see above)."
+    }
     Write-Host "  Config: $Agent8088Home\config.txt"
     # Readiness summary - reflects what actually installed, not static text.
     if ($script:GatewayExtrasInstalled) {
@@ -2842,8 +3127,11 @@ function Verify-Install {
         Write-Host "            elevated agent8088 --sandbox-setup"
     }
     Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://agent8088-installer.pages.dev/install.ps1)"
+    if ($script:InstallLog) { Write-Host "  Log:    $($script:InstallLog)" }
     Write-Host ""
-    Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated)."
+    Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated),"
+    Write-Host "or run this in the current one:  `$env:Path = `"$LauncherDir;`$env:Path`""
+    if ($ready) { Write-Host "Run 'agent8088 --doctor' to check your setup." }
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
     # view minutes ago on a multi-minute install, which is how a failed WhatsApp
     # bridge got reported and still went unnoticed.
@@ -2936,6 +3224,8 @@ if (-not (Test-DiskSpace)) {
 }
 Show-LongPathWarningIfNeeded
 Test-HostConnectivity
+Show-AdministratorWarningIfNeeded
+Start-InstallLog
 if (-not $env:AGENT8088_TIMEOUT_SCALE -and (Test-SlowConnection)) {
     Write-Warn "Slow connection detected - doubling all download timeouts."
     $TOllamaPull *= 2; $TNpm *= 2; $TChromium *= 2; $TDownload *= 2; $TPip *= 2; $TOcrModels *= 2
@@ -2995,11 +3285,16 @@ try {
     Drop-Config
     Run-InitialSetup
     Verify-Install
+    if ($script:InstallBroken) {
+        Set-InstallerExitStatus -ExitCode 1
+        return
+    }
     Start-InitialAgent
 } catch {
     Write-Host ""
     Write-Err "Installation failed: $_"
     Write-Info "Re-run the installer to retry - completed stages are skipped or resumed automatically."
+    if ($script:InstallLog) { Write-Info "Log: $($script:InstallLog)" }
     Write-SkippedSummary
     Set-InstallerExitStatus -ExitCode 1
     return

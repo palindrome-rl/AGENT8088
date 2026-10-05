@@ -5,7 +5,7 @@
 ## Setup
 
 ```sh
-git clone https://github.com/tayyabimam1/AGENT8088.git
+git clone https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
