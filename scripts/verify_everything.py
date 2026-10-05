@@ -705,6 +705,65 @@ E._docker_available = _da
 E._native_sandbox_broken = _nsb
 E.SANDBOX_BACKEND = prev_backend
 
+section("8f. SANDBOX — repeated network failures point at the setting")
+# A first-run user's agent spent its whole turn trying to download a file the
+# sandbox could never reach: the network is closed unless sandbox_allowed_domains
+# names the host. Telling the model up front makes it give up before trying, so
+# the note comes only after the third failure, once per turn.
+_rb, _ad = E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS
+E._resolve_sandbox_backend = lambda: "native"
+E.SANDBOX_ALLOWED_DOMAINS = []
+E.reset_turn_counters()
+dns_fail = "curl: (6) Could not resolve host: onfe.itch.io\nCommand exited with status 6."
+fetch = 'curl -sL -o onfe.zip "https://onfe.itch.io/pack?key=sk-supersecret1234567890"'
+notes = [E._sandbox_network_note(dns_fail, fetch) for _ in range(4)]
+ok("silent for the first two failures", notes[0] == "" and notes[1] == "")
+ok("third failure names the setting", "sandbox_allowed_domains" in notes[2], notes[2][:60])
+ok("note names the domain the task needs", "onfe.itch.io" in notes[2])
+ok("note leaks no URL path, query or secret",
+   "sk-supersecret" not in notes[2] and "pack?key" not in notes[2])
+ok("note tells the model to ask the user, not work around it",
+   "user" in notes[2].lower() and "config.txt" in notes[2])
+ok("once per turn", notes[3] == "")
+E.reset_turn_counters()
+ok("reset each turn", [E._sandbox_network_note(dns_fail, fetch) for _ in range(3)][2] != "")
+E.reset_turn_counters()
+for failure in ("<urlopen error [Errno -3] Temporary failure in name resolution>",
+                "wget: unable to resolve host address 'onfe.itch.io'",
+                "curl: (56) CONNECT tunnel failed, response 403",
+                "Failed to establish a new connection: [Errno 101] Network is unreachable",
+                "getaddrinfo ENOTFOUND registry.npmjs.org"):
+    E.reset_turn_counters()
+    ok(f"counts as a network failure: {failure[:45]}",
+       [E._sandbox_network_note(failure, "x") for _ in range(3)][2] != "")
+E.reset_turn_counters()
+ok("ordinary failures do not count",
+   all(E._sandbox_network_note("Permission denied\nCommand exited with status 1.", "x") == ""
+       for _ in range(5)))
+E.reset_turn_counters()
+E._resolve_sandbox_backend = lambda: "docker"
+docker_note = [E._sandbox_network_note(dns_fail, fetch) for _ in range(3)][2]
+ok("docker fallback says why, and how to get the native sandbox",
+   "docker" in docker_note.lower() and "--sandbox-setup" in docker_note, docker_note[:80])
+# Wired into run_tool, after the untrusted-content wrapper so it reads as the
+# harness speaking, not as command output the model is told to distrust.
+E._resolve_sandbox_backend = lambda: "native"
+E.reset_turn_counters()
+_es = E._exec_shell_command
+E._exec_shell_command = lambda command, timeout=25, image="": (
+    "urllib.error.URLError: <urlopen error [Errno -3] Temporary failure in name resolution>")
+with with_mode("full-auto"):
+    runs = [E.run_tool("execute_shell", {"command": (
+        f"python3 -c \"import urllib.request as u; u.urlopen('https://onfe.itch.io/{i}')\"")})
+        for i in range(3)]
+E._exec_shell_command = _es
+ok("run_tool adds the note on the third failure", "sandbox_allowed_domains" in runs[2]
+   and "sandbox_allowed_domains" not in runs[1], runs[2][-80:])
+ok("note sits outside the untrusted wrapper",
+   runs[2].rfind("sandbox_allowed_domains") > runs[2].rfind("END_UNTRUSTED_CONTENT"))
+E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS = _rb, _ad
+E.reset_turn_counters()
+
 # ============================================================ 9. PROVIDERS
 section("9. PROVIDERS")
 provs = E.load_providers({

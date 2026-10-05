@@ -876,9 +876,10 @@ def plan_tool_ran() -> bool:
 def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
-    global _turn_writes, _plan_tool_ran
+    global _turn_writes, _plan_tool_ran, _turn_network_failures
     _turn_writes = 0
     _plan_tool_ran = False
+    _turn_network_failures = 0
 
 
 # ---------------------------------------------------------------------------
@@ -4110,6 +4111,57 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
 
 def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str:
     return _exec_sandbox_command(command, timeout=timeout, image=image)
+
+
+# What a closed sandbox network looks like from inside: DNS that never answers
+# (Docker --network none), the native runtime's proxy refusing the tunnel, or no
+# route at all. curl, wget, Python, pip and npm each word it differently.
+_SANDBOX_NETWORK_FAILURE_RE = re.compile(
+    r"could not resolve host|unable to resolve host address|temporary failure in name resolution"
+    r"|name or service not known|nodename nor servname|getaddrinfo (?:failed|ENOTFOUND|EAI_AGAIN)"
+    r"|network is unreachable|failed to establish a new connection"
+    r"|tunnel connection failed|CONNECT tunnel failed",
+    re.IGNORECASE,
+)
+NETWORK_GUIDANCE_AFTER = 3
+_turn_network_failures = 0
+
+
+def _sandbox_network_note(result: str, source: str) -> str:
+    """The note to append when sandboxed code keeps hitting the closed network.
+
+    The sandbox reaches only the hosts in sandbox_allowed_domains (none by
+    default; none at all on the Docker fallback). Nothing in a failed fetch says
+    so, and a real run spent its whole turn on workarounds for a download that
+    could never succeed. Told up front, a small model gives up before trying,
+    so this speaks once, at the third failure in a turn, and names only the
+    setting and the hosts -- never a URL path, query or other config value.
+    """
+    global _turn_network_failures
+    if not _SANDBOX_NETWORK_FAILURE_RE.search(result or ""):
+        return ""
+    _turn_network_failures += 1
+    if _turn_network_failures != NETWORK_GUIDANCE_AFTER:
+        return ""
+    hosts = sorted({urllib.parse.urlsplit(url).hostname or ""
+                    for url in _SHELL_HTTP_URL.findall(source or "")} - {""})
+    needed = ", ".join(hosts) or "the host this task needs"
+    allowed = ", ".join(SANDBOX_ALLOWED_DOMAINS) or "none"
+    if _resolve_sandbox_backend() == "docker":
+        setting = ("Commands are running in the Docker fallback, which has no network "
+                   "at all, because the native sandbox is not set up. The user can "
+                   "set it up with `agent8088 --sandbox-setup` (on Linux it needs "
+                   "bubblewrap, socat and ripgrep), then add "
+                   f"`sandbox_allowed_domains={needed}` to {CONFIG_PATH}.")
+    else:
+        setting = (f"Sandboxed commands reach only the hosts in `sandbox_allowed_domains` "
+                   f"in {CONFIG_PATH} (currently: {allowed}). The user can add "
+                   f"`sandbox_allowed_domains={needed}` there and restart Agent8088.")
+    return (f"\n{_HARNESS_PREFIX}The sandbox has blocked network access "
+            f"{_turn_network_failures} times this turn. This is a setting, not a "
+            f"problem to work around. {setting} Only the user can change config.txt. "
+            "Stop retrying the download; tell the user what this task needs and "
+            "that they can change the setting or fetch the file themselves.")
 
 
 def _process_display(argv: list) -> str:
@@ -9491,7 +9543,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _exec_cron(args)
 
     if mode == "docker":
-        return _exec_docker(args)
+        result = _exec_docker(args)
+        return result + _sandbox_network_note(result, str(args.get("code") or ""))
 
     if mode == "browser":
         return _exec_browser(args)
@@ -9745,7 +9798,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             text = testing_support.trim_output(text)
         _record_verdict(ledger_command or command, text)
         _record_localization_requirement(name, command, text)
-        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
+        # Host tools have the real network; only the sandbox's closed one is a setting.
+        note = "" if spec.get("host") else _sandbox_network_note(text, command)
+        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}") + note
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
