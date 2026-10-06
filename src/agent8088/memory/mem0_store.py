@@ -181,7 +181,7 @@ class Mem0MemoryStore:
                 # elsewhere must not orphan it. An explicit FASTEMBED_CACHE_PATH
                 # from the user still wins.
                 try:
-                    import fastembed
+                    import fastembed  # noqa: F401 -- verify the optional runtime imports
                     agent_home = os.environ.get(
                         "AGENT8088_HOME", os.path.expanduser("~/.agent8088"))
                     os.environ.setdefault(

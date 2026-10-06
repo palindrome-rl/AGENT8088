@@ -95,6 +95,8 @@ $env:AGENT8088_BRANCH = "staging-1.2"; iex (irm https://raw.githubusercontent.co
 These staging commands intentionally fetch the branch-specific installers;
 the Pages installer URL serves the development channel.
 
+Run it in PowerShell, not `cmd.exe`. From `cmd.exe` or a locked-down execution policy: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1 | iex"`. On macOS/Linux, don't prefix the installer with `sudo` — it asks for sudo itself when a system package needs it.
+
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
 <details>
@@ -117,15 +119,15 @@ The installer provisions an isolated Python environment, installs the global `ag
 | macOS 12+ (Apple Silicon & Intel) | Supported | `install.sh` |
 | Ubuntu / Debian / Fedora / Arch (x64, arm64) | Supported | `install.sh` |
 | WSL2 | Supported | `install.sh`; clone with LF line endings, not CRLF |
-| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1` |
+| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1`; blocked by security software or unattended? set `AGENT8088_SKIP_TERMINAL_CHECK=1` ([troubleshooting](docs/wiki/13-troubleshooting.md)) |
 | Windows Server, legacy Console Host, PowerShell ISE | Not supported | needs a modern terminal host — see `install.ps1`'s terminal check |
 | Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
 | Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |
 
 </details>
 
-After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
-`/dump` to produce a bundle for a bug report.
+After installing, run `agent8088 --doctor` (or `/doctor [--fix]` inside the agent) to verify your setup, or
+`/dump` to produce a bundle for a bug report. If the install itself fails, it prints the likely cause and the command to re-run; the full output is in `~/.agent8088/install.log`.
 
 The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed. The Python
 `tests/` suite lives on the `development` branch, not in this staging checkout;

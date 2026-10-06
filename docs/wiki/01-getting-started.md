@@ -38,6 +38,10 @@ These commands install the **staging-1.2** channel and keep it there:
 curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.sh | AGENT8088_BRANCH=staging-1.2 bash
 ```
 
+Run it as your normal user, **not** with `sudo` — the installer asks for sudo
+itself for the few system packages it needs, and refuses to run under `sudo`
+(that would install into root's home). Plain root in a container is fine.
+
 **Windows (PowerShell)**
 
 ```powershell
@@ -45,18 +49,40 @@ $env:AGENT8088_BRANCH = 'staging-1.2'
 iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
 ```
 
+Run this in **PowerShell**, not `cmd.exe`. From `cmd.exe`, or where the
+execution policy blocks scripts, use:
+
+```bat
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1 | iex"
+```
+
+Run it from a normal (non-admin) window: an elevated one installs for the
+administrator account's profile.
+
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the
 repo into an isolated venv, exposes a global `agent8088` command, and writes a
 default `config.txt` pointing at localhost Ollama.
 
+If the install fails, it prints the last lines of the failing step, the likely
+cause (TLS interception by a proxy, a full disk, GitHub credentials for the
+private repository, no wheel for your Python) and the command to re-run. Every
+step's full output is kept in `~/.agent8088/install.log`
+(`%LOCALAPPDATA%\agent8088\install.log` on Windows). Re-running the same
+command resumes; anything already complete is skipped.
+
 **From a clone, to work on the code.** Contributions are branched from
 `development`, so this deliberately clones that rather than `staging-1.2`:
+
+Needs Python **3.10 or newer** (3.11/3.12 recommended) — check with
+`python3 --version` first; an older `python` gives a confusing resolver error
+rather than a version message.
 
 ```sh
 git clone --branch development https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
-python -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
+.venv/bin/playwright install chromium   # browser for browse_page
 ```
 
 Install the extras you actually need:
@@ -93,7 +119,13 @@ playwright install chromium
 
 ```sh
 agent8088 --version
+agent8088 --doctor     # checks your setup
 ```
+
+If `agent8088` is not found, open a new terminal (the installer updated your
+shell's PATH) or run the `export PATH=...` line the installer printed. If the
+installer warned that *another agent8088* will run instead, remove that copy or
+put `~/.local/bin` first in `PATH`.
 
 ## Configure a model
 

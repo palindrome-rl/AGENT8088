@@ -126,7 +126,7 @@ def model_token_limits(provider_name, model_id):
     """
     return {}
 
-import csv, hashlib, json, os, stat, subprocess, sys, tempfile, time
+import csv, hashlib, json, os, re, stat, subprocess, sys, tempfile, time
 from pathlib import Path, PureWindowsPath
 
 _CACHE_FILE = Path(os.environ.get("AGENT8088_HOME", str(Path.home() / ".agent8088"))) / "models_cache.json"
@@ -208,9 +208,22 @@ def builtin_provider_choice_label(name):
     return f"{info['label']} ({name}) - default: {info['default_model']}"
 
 
+# Why the last live listing per provider failed, so a caller that got the
+# static fallback (or nothing) can say "offline list -- discovery failed: why"
+# instead of passing the fallback off as what the server offers.
+LAST_LIST_ERROR: dict = {}
+
+
+def last_list_error(provider_name):
+    """The exception the last failed list_models() call hit, or None."""
+    return LAST_LIST_ERROR.get(provider_name)
+
+
 def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, fallback=True):
     """Fetch available models from provider's /v1/models endpoint.
-    Disk-cached for 1 hour. Falls back to FALLBACK_MODELS on error."""
+    Disk-cached for 1 hour. Falls back to FALLBACK_MODELS on error
+    (the error is kept in LAST_LIST_ERROR)."""
+    LAST_LIST_ERROR.pop(provider_name, None)
     now = time.time()
     disk = _load_disk_cache()
     if client is None:
@@ -233,8 +246,69 @@ def list_models(provider_name, client=None, timeout=MODEL_LIST_TIMEOUT_SECONDS, 
         disk[cache_key] = {"ts": now, "models": models}
         _save_disk_cache(disk)
         return models
-    except Exception:
+    except Exception as exc:
+        LAST_LIST_ERROR[provider_name] = exc
         return list(FALLBACK_MODELS.get(provider_name, [])) if fallback else []
+
+
+# What a local Ollama runs a model at when nothing sets num_ctx, on the
+# smallest GPUs. Current Ollama picks 4k / 32k / 256k by VRAM (<24 / 24-48 /
+# >=48 GiB), which this client cannot see -- so it is a floor, not a guess.
+OLLAMA_DEFAULT_NUM_CTX = 4096
+
+
+def is_local_ollama(provider_name="", base_url=""):
+    """A self-hosted Ollama (not Ollama Cloud), where num_ctx is the server's."""
+    if provider_name == "ollama-cloud" or "ollama.com" in (base_url or ""):
+        return False
+    return provider_name == "ollama" or ":11434" in (base_url or "")
+
+
+def ollama_served_context(base_url, model_id, api_key="", timeout=MODEL_LIST_TIMEOUT_SECONDS):
+    """The context Ollama will actually run `model_id` with, and where it came from.
+
+    /api/show's "<arch>.context_length" is the model's *maximum*; Ollama loads
+    it at num_ctx, which defaults to a few thousand tokens. Its
+    OpenAI-compatible /v1/chat/completions has no way to raise that per
+    request (documented: "The OpenAI API does not have a way of setting the
+    context size"), and it truncates an over-long prompt silently instead of
+    rejecting it. So the engine must size its window to the served value:
+      1. the loaded model's context in /api/ps (newer Ollama reports it),
+      2. a `num_ctx` PARAMETER baked into the model (/api/show parameters),
+      3. OLLAMA_CONTEXT_LENGTH in this environment (when Ollama runs here).
+    Returns (tokens, source), or (None, "unknown") when none of those say --
+    Ollama's own default depends on the server's VRAM. Never raises.
+    """
+    import httpx
+    root = str(base_url or "").rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    bare = model_id[:-len(":latest")] if model_id.endswith(":latest") else model_id
+    try:
+        r = httpx.get(f"{root}/api/ps", headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            for entry in r.json().get("models", []) or []:
+                name = str(entry.get("name") or entry.get("model") or "")
+                if name in (model_id, bare, f"{bare}:latest"):
+                    value = entry.get("context_length")
+                    if isinstance(value, int) and value > 0:
+                        return value, "ollama ps"
+    except Exception:  # noqa: BLE001 -- best-effort probe
+        pass
+    try:
+        r = httpx.post(f"{root}/api/show", json={"model": model_id}, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            params = str(r.json().get("parameters") or "")
+            match = re.search(r"^\s*num_ctx\s+(\d+)", params, re.MULTILINE)
+            if match and int(match.group(1)) > 0:
+                return int(match.group(1)), "model num_ctx"
+    except Exception:  # noqa: BLE001
+        pass
+    env = os.environ.get("OLLAMA_CONTEXT_LENGTH", "").strip()
+    if env.isdigit() and int(env) > 0:
+        return int(env), "OLLAMA_CONTEXT_LENGTH"
+    return None, "unknown"
 
 
 def probe_model_context_window(client, model_id, provider_name="", timeout=MODEL_LIST_TIMEOUT_SECONDS):

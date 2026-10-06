@@ -138,6 +138,24 @@ export interface StatusInfo {
   disabled_skills: string[]
   auto_compaction?: { threshold_pct: number; keep_messages: number }
   browser?: { current_host: string | null }
+  /** Degradation registry rows, worst first (agent8088.capabilities.rows()). */
+  capabilities?: CapabilityRow[]
+  /** Which model answered last; fallback_for is set when the primary failed over. */
+  model_served?: { provider: string; model: string; fallback_for: string; reason: string }
+}
+
+export interface CapabilityRow {
+  name: string
+  label: string
+  active: string
+  preferred: string
+  state: 'ok' | 'degraded' | 'unavailable'
+  reason: string
+  impact: string
+  fix: string
+  model_note: string
+  since: number
+  updated: number
 }
 
 export interface ConfigInfo {
@@ -213,6 +231,22 @@ export interface DoctorCheck {
   cli_anything: string
 }
 
+/** One entry of /api/doctor's `checks` (the same list /doctor prints). */
+export interface DoctorCheckItem {
+  name: string
+  status: 'ok' | 'warn' | 'fail' | 'info'
+  detail: string
+  fix: string
+  repair: string
+}
+
+export interface DoctorReport extends DoctorCheck {
+  checks?: DoctorCheckItem[]
+  /** Degradation registry rows (same shape as StatusInfo.capabilities). */
+  limited?: CapabilityRow[]
+  ok?: boolean
+}
+
 export interface McpServerInfo {
   name: string
   state: string
@@ -281,6 +315,7 @@ export type WSClientMessage =
 
 export type WSEvent =
   | { type: 'status'; data: StatusInfo }
+  | { type: 'capabilities'; data: CapabilityRow[] }
   | { type: 'token'; kind: 'reasoning' | 'content'; delta: string }
   | { type: 'tool_start'; name: string }
   | { type: 'tool_result'; name: string; result: string; diff?: ToolDiffPayload }
@@ -291,6 +326,7 @@ export type WSEvent =
   | { type: 'plan_step'; index: number; total: number; step_text: string; tool_name: string; status: 'pending' | 'running' | 'done' | 'failed'; result?: string }
   | { type: 'answer'; text: string; usage: { seconds: number; tokens: number; context?: number }; rate_limit_status: StatusInfo['rate_limit_status'] }
   | { type: 'turn_complete' }
+  | { type: 'stream_reset' }
   | { type: 'interrupted'; elapsed: number; partial: string }
   | { type: 'error'; message: string }
   | { type: 'session_saved'; name: string }

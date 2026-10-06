@@ -4,6 +4,7 @@ import { ArrowLeft } from 'lucide-react'
 import { Sidebar } from './Sidebar'
 import { StatusBar } from './StatusBar'
 import { ConnectionBanner } from './ConnectionBanner'
+import { CapabilityBadge } from './CapabilityBadge'
 import { CommandPalette } from '@/components/CommandPalette'
 import { ModelSwitcher } from '@/components/ModelSwitcher'
 import { useWebSocket } from '@/hooks/useWebSocket'
@@ -78,6 +79,7 @@ export function AppLayout() {
             </button>
           )}
           <ModelSwitcher />
+          <CapabilityBadge />
         </div>
         <main className="flex-1 overflow-auto">
           <Outlet />

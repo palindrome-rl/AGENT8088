@@ -45,8 +45,8 @@ def main() -> None:
                          "AGENT8088_CONFIG": str(Path(home) / "config.txt"),
                          "PYTHONUTF8": "1"})
         _run(uv, "lock", "--check")
-        _run(uv, "sync", "--locked", "--extra", "dev", "--extra", "gateway")
-        _run(uv, "run", "--extra", "dev", "--extra", "gateway", "pytest", "-q", env=isolated)
+        _run(uv, "sync", "--locked", "--extra", "dev", "--extra", "gateway", "--extra", "repository")
+        _run(uv, "run", "--extra", "dev", "--extra", "gateway", "--extra", "repository", "pytest", "-q", env=isolated)
         _run(uv, "run", "--extra", "dev", "ruff", "check", "--select=E9,F", "src", "tests", "scripts")
         _run(uv, "run", "python", "scripts/check_duplicate_defs.py", env=isolated)
         _run(uv, "run", "python", "scripts/check_requirements_sync.py", env=isolated)

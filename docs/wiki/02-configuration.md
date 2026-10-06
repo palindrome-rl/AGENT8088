@@ -47,7 +47,7 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `provider.<name>.temperature` | Sampling temperature for one provider; overrides the session value, including `/temp`, on that provider's requests. Useful when a server expects a particular sampling setting. |
 | `provider.<name>.extra_body` | JSON object sent as additional request fields for that provider, such as vLLM `chat_template_kwargs`. Invalid JSON is ignored with a warning. Only configure fields your server accepts. |
-| `fallback_models` | Comma-separated `provider:model` chain, tried on 429/503/connection errors. |
+| `fallback_models` | Comma-separated `provider:model` chain for transient errors, missing models, capacity failures, and independent-provider authentication failures. |
 | `tool_selection` | Which tool schemas go on the wire for native function-calling. `hybrid` (default) sends the ~10 most relevant via keyword + embedding retrieval, falling back to `full` when the two signals disagree or embeddings are unavailable; `full` always sends every schema; `auto` enables hybrid only for the measured `provider:model` entries in `tool_selection_models`. `/tool-selection <mode>` changes it live. |
 | `tool_selection_models` | Comma-separated `provider:model` entries `tool_selection=auto` treats as measured-safe for hybrid mode. |
 | `context_window` | Token budget for history trimming. |
@@ -442,3 +442,31 @@ model's answers, so `cat config.txt` cannot exfiltrate them.
 
 Setting `AGENT8088_CONFIG=/nonexistent` forces packaged defaults — this is how
 the test suite stays hermetic.
+
+
+### Recovery limits and fallback diagnostics
+
+Each completion is fitted to the selected provider/model's context window and
+output ceiling. A fallback with insufficient prompt headroom is skipped before
+sending a request. Switching models does not carry the first model's output
+limit into the next request.
+
+`max_turn_seconds` applies between retry, fallback, automatic escalation and
+context-repair attempts. Request timeouts and backoff waits use the remaining
+time. A response arriving after expiry cannot execute its tool calls.
+
+A 401/403 can try a configured independent provider once. Targets using the
+same rejected credential or the same provider are skipped. A dropped stream
+gets one primary reset, then may switch to a configured fallback with its
+partial presentation reset. Incomplete tool calls never execute.
+
+Fallback entries are trimmed and deduplicated in order. Missing `provider:model`
+syntax, unknown providers and empty models are reported at startup and in
+`/doctor`; correcting the setting clears its old warnings.
+
+Repeated browser tasks and opaque CLI-Anything commands reuse their result for
+the whole request, including uncertain timeout results. An intervening read does
+not authorize replay. Inspect external state with a different observation task
+and ask for a new instruction when replay is needed. Built-in read-only
+CLI-Anything status/list/search/info/skill queries can refresh; arbitrary
+harness commands are not assumed read-only based on their names.

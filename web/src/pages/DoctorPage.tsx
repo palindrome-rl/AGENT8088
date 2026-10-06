@@ -4,7 +4,7 @@ import {
   CheckCircle2, XCircle, Activity, Network, KeyRound, Settings as SettingsIcon,
   Shield, Search, Terminal,
 } from 'lucide-react'
-import type { DoctorCheck } from '@/types/api'
+import type { DoctorCheck, DoctorReport } from '@/types/api'
 import { cn } from '@/lib/utils'
 import { apiFetch, handled, assertOk } from '@/lib/api'
 import { ErrorCard } from '@/components/ErrorCard'
@@ -136,7 +136,7 @@ export default function DoctorPage() {
   // Doctor health check
   const doctorQuery = useQuery({
     queryKey: ['doctor'],
-    queryFn: () => fetchJSON<DoctorCheck>('/api/doctor'),
+    queryFn: () => fetchJSON<DoctorReport>('/api/doctor'),
   })
 
   // Fix mutation
@@ -282,10 +282,54 @@ export default function DoctorPage() {
             </table>
           </div>
 
+          {/* What failed, and the command that fixes it */}
+          <ProblemList checks={data.checks ?? []} limited={data.limited ?? []} />
+
           {/* Overall status */}
           <OverallStatus data={data} />
         </>
       )}
+    </div>
+  )
+}
+
+// ---- Problems with fixes ----
+
+// Capabilities /doctor reports under a dedicated row instead of "Limited: …".
+const DEDICATED_CAPABILITY_ROWS = new Set(['search', 'ocr', 'documents'])
+
+function ProblemList({ checks, limited }: {
+  checks: NonNullable<DoctorReport['checks']>
+  limited: NonNullable<DoctorReport['limited']>
+}) {
+  const problems = checks.filter((c) => c.status === 'fail' || c.status === 'warn')
+  // Registry rows the check list did not already cover (an older server, or a
+  // capability reported after the checks ran) still belong in Problems.
+  for (const row of limited) {
+    if (row.state === 'ok' || DEDICATED_CAPABILITY_ROWS.has(row.name)) continue
+    const name = `Limited: ${row.label}`
+    if (problems.some((c) => c.name === name)) continue
+    const extra = [row.reason, row.impact].filter(Boolean).join('; ')
+    problems.push({
+      name,
+      status: 'warn',
+      detail: `${row.state}: ${row.active || 'none'}${extra ? ` — ${extra}` : ''}`,
+      fix: row.fix,
+      repair: '',
+    })
+  }
+  if (problems.length === 0) return null
+  return (
+    <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
+      <h3 className="text-sm font-semibold text-zinc-200">Problems</h3>
+      {problems.map((c, i) => (
+        <div key={`${c.name}-${i}`} className="text-xs">
+          <span className={c.status === 'fail' ? 'text-red-400' : 'text-yellow-400'}>
+            {c.name}: {c.detail}
+          </span>
+          {c.fix && <div className="font-mono text-zinc-400">{c.fix}</div>}
+        </div>
+      ))}
     </div>
   )
 }

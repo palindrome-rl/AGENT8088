@@ -48,6 +48,14 @@ function wireSocket(ws: WebSocket) {
       case 'status':
         setStatus(data.data)
         break
+      case 'capabilities':
+        {
+          // A capability changed state server-side (search fell back, model
+          // failed over, ...): patch just that slice of the status.
+          const current = useSessionStore.getState().status
+          if (current) setStatus({ ...current, capabilities: data.data })
+        }
+        break
       case 'spin':
         if (interruptRequested) break
         setStreaming(true)
@@ -65,6 +73,11 @@ function wireSocket(ws: WebSocket) {
             useSessionStore.getState().setActivity('Writing answer')
           }
         }
+        break
+      case 'stream_reset':
+        // The reply broke off mid-stream and is being retried: drop the
+        // fragment already shown so the retry doesn't append to it.
+        useSessionStore.setState({ streamingText: '', streamingReasoning: [] })
         break
       case 'tool_calls':
         break
