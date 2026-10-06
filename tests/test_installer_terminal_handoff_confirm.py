@@ -47,7 +47,10 @@ def _run(script: str, tmp_path: Path, **env) -> subprocess.CompletedProcess:
     script_file.write_text(script, encoding="utf-8")
     environment = {**os.environ, "TMPDIR": str(tmp_path), "TEMP": str(tmp_path),
                    "TMP": str(tmp_path), **env}
-    return subprocess.run([POWERSHELL, "-NoProfile", "-File", str(script_file)],
+    # Match the installer's plain-text handoff on hosts that disallow -File.
+    literal = "'" + str(script_file).replace("'", "''") + "'"
+    command = f"Invoke-Expression ([IO.File]::ReadAllText({literal}))"
+    return subprocess.run([POWERSHELL, "-NoProfile", "-Command", command],
                           capture_output=True, text=True, env=environment, timeout=60)
 
 
