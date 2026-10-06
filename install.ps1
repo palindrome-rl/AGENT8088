@@ -14,6 +14,11 @@
 param(
     [switch]$SkipSetup,
     [switch]$TerminalBootstrap,
+    # Install in the current window instead of Windows Terminal. For machines
+    # where the Terminal setup is blocked (antivirus, policy) and for unattended
+    # runs by another agent. Also AGENT8088_SKIP_TERMINAL_CHECK=1, which works
+    # with the documented `iex (irm ...)` form that cannot take parameters.
+    [switch]$SkipTerminalCheck,
     [switch]$WithLibreOffice,
     [switch]$SkipLibreOffice,
     [switch]$WithMem0,
@@ -701,6 +706,10 @@ function Get-WindowsTerminalPackage {
     }
 }
 
+function Test-TerminalCheckSkipped {
+    return ([bool]$SkipTerminalCheck -or ($env:AGENT8088_SKIP_TERMINAL_CHECK -match '^(1|y|yes|true)$'))
+}
+
 function Test-SupportedTerminalHost {
     if ($env:TERM_PROGRAM -eq "vscode") { return $true }
     if (-not $env:WT_SESSION) { return $false }
@@ -1069,6 +1078,31 @@ function ConvertTo-EncodedPowerShellCommand {
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
 }
 
+# Hands a command to a new PowerShell window. It used to be -EncodedCommand, and
+# the helper window's text held a second, nested -EncodedCommand: encoded inside
+# encoded is the shape antivirus products flag on sight, and a manager's machine
+# stopped at "This script contains malicious content and has been blocked".
+#
+# Now the command is plain, readable text in a one-time file that the new window
+# reads with -Command and deletes. -Command is not a script file, so machine
+# execution policy still cannot block it (the reason -EncodedCommand was used),
+# and there is no base64 anywhere. The returned line has no ';' and no quotes:
+# wt.exe splits its command line on ';'.
+function New-HandoffCommand {
+    param([Parameter(Mandatory = $true)][string]$Command)
+    $dir = Join-Path ([IO.Path]::GetTempPath()) "agent8088-handoff"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    # The window that reads a file deletes it; sweep what a crash left behind.
+    Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    $file = Join-Path $dir ("{0}.txt" -f [guid]::NewGuid().ToString("N"))
+    $fileLiteral = ConvertTo-PowerShellLiteral $file
+    $text = "Remove-Item -LiteralPath $fileLiteral -Force -ErrorAction SilentlyContinue`r`n$Command"
+    [IO.File]::WriteAllText($file, $text, (New-Object Text.UTF8Encoding($false)))
+    return "Invoke-Expression ([IO.File]::ReadAllText($fileLiteral))"
+}
+
 function Get-InstallerInvocation {
     param(
         [switch]$ForTerminalBootstrap,
@@ -1114,15 +1148,18 @@ function Start-InstallerInWindowsTerminal {
     }
 
     $installCommand = Get-InstallerInvocation -PreferLocalScript
-    $encodedCommand = ConvertTo-EncodedPowerShellCommand -Command $installCommand
+    $handoff = New-HandoffCommand -Command $installCommand
     $powerShellExe = Get-PowerShellHostExe
     $terminalArgs = @(
         "-w", "new", "`"$powerShellExe`"", "-NoExit", "-ExecutionPolicy", "Bypass",
-        "-EncodedCommand", $encodedCommand
+        "-Command", "`"$handoff`""
     )
     try {
         Start-Process -FilePath $terminalExe -ArgumentList $terminalArgs | Out-Null
         Write-Success "Continuing installation in Windows Terminal..."
+        # A blocked launch is reported inside that new window, where this one
+        # cannot see it; say here how to get past it.
+        Write-Info "If that window shows an error instead of progress (security software can block it), close it and install in this window: `$env:AGENT8088_SKIP_TERMINAL_CHECK = '1', then run the install command again."
         return $true
     } catch {
         Write-Err "Could not launch Windows Terminal: $_"
@@ -1137,14 +1174,14 @@ function Start-TerminalUpgradeBootstrap {
     # Run the actual installer in a child PowerShell. Its `exit 1` must not close
     # this visible bootstrap window before the user can read the error.
     $childCommand = Get-InstallerInvocation -ForTerminalBootstrap -PreferLocalScript
-    $childEncoded = ConvertTo-EncodedPowerShellCommand -Command $childCommand
+    $childHandoff = New-HandoffCommand -Command $childCommand
     $powerShellLiteral = ConvertTo-PowerShellLiteral $powerShellExe
-    $childEncodedLiteral = ConvertTo-PowerShellLiteral $childEncoded
+    $childHandoffLiteral = ConvertTo-PowerShellLiteral $childHandoff
     $bootstrapCommand = @"
  try { `$Host.UI.RawUI.WindowTitle = 'Agent8088 Terminal Setup' } catch {}
  Write-Host 'Agent8088 is installing or updating Windows Terminal.' -ForegroundColor Cyan
  Write-Host 'This window will remain open and report whether installation continues.'
- & $powerShellLiteral -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEncodedLiteral
+ & $powerShellLiteral -NoProfile -ExecutionPolicy Bypass -Command $childHandoffLiteral
  `$installerExit = `$LASTEXITCODE
  if (`$installerExit -eq 0) {
      Write-Host ''
@@ -1157,22 +1194,23 @@ function Start-TerminalUpgradeBootstrap {
      [void](Read-Host)
  }
 "@
-    $bootstrapEncoded = ConvertTo-EncodedPowerShellCommand -Command $bootstrapCommand
+    $bootstrapHandoff = New-HandoffCommand -Command $bootstrapCommand
     $conhostExe = Join-Path $env:SystemRoot "System32\conhost.exe"
     try {
         if (Test-Path -LiteralPath $conhostExe) {
             $bootstrapArgs = @(
                 "`"$powerShellExe`"", "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass",
-                "-EncodedCommand", $bootstrapEncoded
+                "-Command", "`"$bootstrapHandoff`""
             )
             Start-Process -FilePath $conhostExe -ArgumentList $bootstrapArgs | Out-Null
         } else {
             Start-Process -FilePath $powerShellExe -ArgumentList @(
                 "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass",
-                "-EncodedCommand", $bootstrapEncoded
+                "-Command", "`"$bootstrapHandoff`""
             ) | Out-Null
         }
         Write-Success "Windows Terminal setup opened in a separate window. Follow its progress there."
+        Write-Info "If that window shows an error instead of progress (security software can block it), close it and install in this window: `$env:AGENT8088_SKIP_TERMINAL_CHECK = '1', then run the install command again."
         return $true
     } catch {
         Write-Err "Could not open the Windows Terminal setup window: $_"
@@ -1181,29 +1219,48 @@ function Start-TerminalUpgradeBootstrap {
 }
 
 function Ensure-SupportedTerminal {
+    if (Test-TerminalCheckSkipped) {
+        Write-Warn "Skipping the Windows Terminal check: installing in this window. Windows Terminal is the supported host; colours and box drawing may display poorly here."
+        return "continue"
+    }
     if (Test-SupportedTerminalHost) { return "continue" }
 
     $package = Get-WindowsTerminalPackage
-    $versionLabel = if ($package) { $package.Version } else { "not installed" }
-    Write-Warn "This terminal host is not supported by Agent8088."
-    Write-Host "  Windows Terminal required: $WindowsTerminalMinVersion or newer"
-    Write-Host "  Windows Terminal detected: $versionLabel"
+    $current = $package -and ([version]$package.Version -ge $WindowsTerminalMinVersion)
+    if ($current) {
+        # The old text said "not supported ... required 1.19, detected 1.24".
+        Write-Warn "Windows Terminal $($package.Version) is installed, but this window is not running inside Windows Terminal."
+    } else {
+        $versionLabel = if ($package) { $package.Version } else { "not installed" }
+        Write-Warn "Agent8088 needs Windows Terminal $WindowsTerminalMinVersion or newer (detected: $versionLabel)."
+    }
 
-    if (-not $package -or ([version]$package.Version -lt $WindowsTerminalMinVersion)) {
+    if (-not $current) {
         if (-not $TerminalBootstrap) {
             if ($NonInteractive) {
-                Write-Err "Interactive confirmation is required to install or update Windows Terminal."
+                Write-Err "Interactive confirmation is required to install or update Windows Terminal. To install in this window instead, set AGENT8088_SKIP_TERMINAL_CHECK=1 (or pass -SkipTerminalCheck) and run the installer again."
                 return "failed"
             }
             do {
-                $answer = (Read-Host "Install/update Windows Terminal and continue? [y/n]").Trim().ToLowerInvariant()
-            } while ($answer -notin @("y", "n"))
+                $answer = (Read-Host "Install/update Windows Terminal [y], continue in this window without it [c], or cancel [n]?").Trim().ToLowerInvariant()
+            } while ($answer -notin @("y", "c", "n"))
             if ($answer -eq "n") {
                 Write-Info "Installation cancelled. Agent8088 was not installed."
                 return "failed"
             }
-            if (-not (Start-TerminalUpgradeBootstrap)) { return "failed" }
-            return "relaunched"
+            if ($answer -eq "c") {
+                Write-Warn "Continuing in this window. Windows Terminal is the supported host; colours and box drawing may display poorly here."
+                return "continue"
+            }
+            # Installing over an existing Terminal can close the very window that
+            # is running this installer (an older Terminal may be hosting it, with
+            # no WT_SESSION to show for it), so that case gets a separate helper
+            # window. A Terminal that is not installed at all cannot be hosting
+            # anything: install it right here and skip the helper entirely.
+            if ($package -or $env:WT_SESSION) {
+                if (-not (Start-TerminalUpgradeBootstrap)) { return "failed" }
+                return "relaunched"
+            }
         }
         if (-not (Install-WindowsTerminal $package)) { return "failed" }
     }
