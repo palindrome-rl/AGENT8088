@@ -288,7 +288,6 @@ def test_32_bit_windows_skips_node_instead_of_downloading_x64_binary():
 
 def test_64_bit_windows_still_resolves_x64_asset_name():
     """Guards the fix itself: only x86 is diverted, arm64/x64 keep their existing asset names."""
-    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     bridge = _powershell_function("Install-Node-Bridge")
     assert '$nodeArch = if ($arch -eq "arm64") { "arm64" } else { "x64" }' in bridge
     assert bridge.index('if ($arch -eq "x86")') < bridge.index('$nodeArch = if ($arch -eq "arm64")')

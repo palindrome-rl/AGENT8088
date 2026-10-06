@@ -12,7 +12,7 @@ import pytest
 
 # These scripts run inside Linux benchmark containers. Git Bash on Windows
 # cannot use Python's Windows temp paths as bash paths.
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="Linux container scripts")
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux container scripts (GNU timeout/sed)")
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "test-mode-setting"
@@ -93,7 +93,7 @@ def _launcher(tmp_path, fake_body, budget):
 def test_launcher_passes_the_instruction_file_and_logs(tmp_path):
     result, log = _launcher(tmp_path, 'echo "got $1 $(cat $2)"; pwd\n', budget=0)
     assert result.returncode == 0, result.stderr
-    assert f"got --prompt-file do it" in log.read_text()
+    assert "got --prompt-file do it" in log.read_text()
     assert str(tmp_path) in log.read_text()   # ran in AGENT8088_WORKDIR
 
 

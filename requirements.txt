@@ -10,6 +10,7 @@
 
 openai>=1.0.0,<3
 rich>=13.0.0,<16
+psutil>=5.9,<8
 InquirerPy>=0.3.4,<1
 
 # MCP client and server runtime (external servers, and --mcp-serve). The floor

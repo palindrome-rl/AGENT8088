@@ -138,7 +138,6 @@ def test_windows_installer_requires_verified_repository():
 
 def test_windows_launcher_wait_is_bounded_and_ends_on_a_deleted_home():
     """The launcher must not sit there silently while a stuck helper spins."""
-    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     launcher = _powershell_function("Write-Agent8088Launcher")
     assert "Finishing Agent8088 cleanup" in launcher
     assert "@('|', '/', '-', '\\')" in launcher

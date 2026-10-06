@@ -5,7 +5,6 @@ trace logs, a WhatsApp session dir, a shared Playwright browser cache) that
 --non-interactive/--dry-run): program files and installation side effects
 are always removed, user-generated data is opt-in.
 """
-import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -15,6 +14,13 @@ import pytest
 from agent8088 import cli
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX uninstall path only")
+
+
+@pytest.fixture(autouse=True)
+def default_profile(monkeypatch):
+    # These tests cover compiled-in defaults, independently of the test runner's
+    # isolated profile. Each filesystem mutation targets a patched temporary home.
+    monkeypatch.delenv("AGENT8088_HOME", raising=False)
 
 
 # --- CLI flag wiring (main() -> _run_uninstall) -----------------------------

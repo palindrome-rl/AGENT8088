@@ -8,7 +8,6 @@ import urllib.request  # noqa: F401  ensures urllib.request is attached to the
                         # engine.urllib.request (_poll_once imports it lazily)
 from unittest.mock import MagicMock
 
-import pytest
 
 
 # --- header parser -----------------------------------------------------

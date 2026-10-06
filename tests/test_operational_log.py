@@ -113,7 +113,6 @@ def test_daily_rotation_opens_new_dated_file(log_dir, monkeypatch):
     L.configure_logging()
     # Emit a record for "today"
     logging.getLogger("agent8088.engine").info("day one")
-    today = datetime.now().astimezone().strftime("%Y-%m-%d")
     # Force the handler to think it's tomorrow by patching datetime in the module
     tomorrow_dt = (datetime.now().astimezone() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     class _FakeDT:

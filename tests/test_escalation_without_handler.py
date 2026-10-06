@@ -8,7 +8,6 @@ None for a sub-agent spawned without a UI. On that path the raw payload used
 to fall through and get appended as if it were ordinary tool output, which is
 how internal protocol text ends up quoted back in a final answer.
 """
-import pytest
 
 
 def _blocked_run(engine, monkeypatch, **kwargs):

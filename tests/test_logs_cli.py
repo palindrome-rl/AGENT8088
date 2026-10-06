@@ -4,15 +4,12 @@ Reads the daily JSONL file directly. v1 has no RPC/remote tail — the file is
 plain JSONL on disk so this is a tail -f with filtering.
 """
 import json
-import os
 import sys
 import time
 import threading
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 from types import SimpleNamespace
 
-import pytest
 
 from agent8088 import engine as A
 from agent8088 import cli
@@ -138,7 +135,7 @@ def test_logs_follow_emits_new_lines(tmp_path, monkeypatch, capsys):
     import agent8088.cli as _cli
     monkeypatch.setattr(_cli.time, "sleep", _fake_sleep, raising=False)
 
-    rc = cli.cmd_logs(args)  # should exit via KeyboardInterrupt internally
+    cli.cmd_logs(args)  # should exit via KeyboardInterrupt internally
     out, _ = capsys.readouterr()
     # The 5 seeded lines should print first, then the 3 new ones.
     assert "record 4" in out  # last seeded line

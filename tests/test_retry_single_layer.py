@@ -171,7 +171,7 @@ def test_missing_model_tries_configured_fallbacks(engine, monkeypatch, quick):
     assert seen == ["primary", "fallback"]
 
 
-def test_bad_key_still_raises_immediately_even_with_fallbacks(engine, monkeypatch, quick):
+def test_bad_key_preserves_primary_error_after_independent_fallback_fails(engine, monkeypatch, quick):
     monkeypatch.setattr(engine, "_fallback_targets", lambda: [("other", "m2")])
     calls = []
 
@@ -183,7 +183,7 @@ def test_bad_key_still_raises_immediately_even_with_fallbacks(engine, monkeypatc
     monkeypatch.setattr(engine, "create_completion", fake)
     with pytest.raises(openai.AuthenticationError):
         _call(engine)
-    assert calls == ["primary"]
+    assert calls == ["primary", "fallback"]
 
 
 def test_a_stream_that_drops_mid_reply_is_retried_once(engine, monkeypatch, quick):

@@ -35,7 +35,7 @@ def test_a_missing_program_is_named_from_the_shell_and_output_is_kept(engine):
 def test_real_commands_through_the_executor(engine):
     run = lambda cmd: engine._shell_missing_program_note(engine._exec_process(cmd, timeout=20, shell=True))
     # The cobol case: mkdir works, ./prog is missing, cat's output must survive.
-    shown = run("mkdir -p /tmp/a8t && cd /tmp/a8t && printf 'U001' > f.dat && ./prog; echo EXIT=$?; cat -A f.dat")
+    shown = run("mkdir -p /tmp/a8t && cd /tmp/a8t && printf 'U001' > f.dat && ./prog; echo EXIT=$?; cat -vet f.dat")
     assert "EXIT=127" in shown and "U001" in shown and "not installed" not in shown
     assert "'mkdir'" not in shown and "'cd'" not in shown
     # A genuinely missing program: the real error stays, plus a note naming it.

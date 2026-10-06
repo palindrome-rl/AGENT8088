@@ -56,7 +56,7 @@ check("tools load", len(A.TOOL_NAMES) >= 18, f"{len(A.TOOL_NAMES)} tools")
 check("subagents load",
       {"auditor", "coder", "explore", "general-purpose", "researcher"} <= set(A.SUBAGENT_SPECS),
       ", ".join(sorted(A.SUBAGENT_SPECS)))
-check("system.md loaded (not the stub)", "Agent8088 Skill Document" in A.BASE_SYSTEM_PROMPT)
+check("system.md loaded (not the stub)", A.BASE_SYSTEM_PROMPT.strip() == (ROOT / "src/agent8088/system.md").read_text(encoding="utf-8").strip())
 check("tool docs reach the prompt", "spawn_subagent(" in A.SYSTEM_PROMPT)
 check("new tools present",
       all(t in A.TOOL_NAMES for t in
@@ -254,6 +254,8 @@ built.clear()
 _orig_run = A.subprocess.run
 _orig_agent_data_dir = A._agent_data_dir
 _orig_protect_private_file = A._protect_private_file
+_saved_schedule_isolation = A._schedule_isolation_active
+A._schedule_isolation_active = lambda: False  # scheduler subprocesses are mocked below
 if A.sys.platform == "win32":
     A._agent_data_dir = lambda: VERIFY_TMP / "agent-home"
     A._protect_private_file = lambda _path: None
@@ -303,6 +305,7 @@ finally:
     A.subprocess.run = _orig_run
     A._agent_data_dir = _orig_agent_data_dir
     A._protect_private_file = _orig_protect_private_file
+    A._schedule_isolation_active = _saved_schedule_isolation
 
 # -------------------------------------------------------------- 8. PROVIDERS
 section("8. MULTI-PROVIDER LLM")

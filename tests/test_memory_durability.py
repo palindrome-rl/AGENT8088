@@ -144,8 +144,9 @@ def _terminal_console(monkeypatch):
     from rich.console import Console
     from agent8088 import cli
 
+    monkeypatch.setenv("TERM", "xterm-256color")
     out = io.StringIO()
-    monkeypatch.setattr(cli, "console", Console(file=out, force_terminal=True, width=100))
+    monkeypatch.setattr(cli, "console", Console(file=out, force_terminal=True, force_interactive=True, width=100))
     return out
 
 

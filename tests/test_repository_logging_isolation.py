@@ -26,15 +26,17 @@ print('clean')
     assert result.stderr == ''
 
 
-def test_memory_capture_never_joins(monkeypatch):
+def test_memory_capture_wait_is_bounded(monkeypatch):
     from agent8088 import cli
     class Busy:
         def is_alive(self): return True
-        def join(self, *args, **kwargs): raise AssertionError('must not wait')
+        def join(self, timeout): waits.append(timeout)
+    waits = []
     worker = Busy()
     monkeypatch.setattr(cli.S, 'memory_notifications', 'on')
     monkeypatch.setattr(cli.A, 'memory_capture_thread', worker)
     monkeypatch.setattr(cli, '_pending_captures', [])
     rows = []
     cli._await_memory_capture(rows)
+    assert waits == [cli.MEMORY_FLUSH_SECONDS]
     assert cli._pending_captures == [(worker, rows)]

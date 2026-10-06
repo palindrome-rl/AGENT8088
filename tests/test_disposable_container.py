@@ -101,7 +101,8 @@ def test_container_keeps_catastrophic_floor(monkeypatch):
 def test_floors_unchanged_without_flag(monkeypatch):
     e = _reload(monkeypatch, on=False)
     still_blocked = [c for c in CONTAINER_WORK if e._hard_blocked_shell(c)]
-    assert still_blocked == CONTAINER_WORK
+    # Source filenames stopped being credential matches in the shell audit.
+    assert still_blocked == [c for c in CONTAINER_WORK if c != "python3 count_tokens.py"]
 
 
 def test_container_file_tools_allow_token_named_files(monkeypatch):
@@ -109,7 +110,8 @@ def test_container_file_tools_allow_token_named_files(monkeypatch):
     assert not e._is_sensitive_path("/app/count_tokens.py")
     assert not e._is_shell_startup_file("/root/.bashrc")
     off = _reload(monkeypatch, on=False)
-    assert off._is_sensitive_path("/app/count_tokens.py")
+    assert not off._is_sensitive_path("/app/count_tokens.py")
+    assert off._is_sensitive_path("/app/api_token.txt")
 
 
 def _response(content):
@@ -186,8 +188,8 @@ def test_container_allows_commands_that_only_name_a_web_client(monkeypatch):
         assert "explicit http:// or https:// URL" not in result, command
 
 
-def test_web_client_url_rule_unchanged_without_flag(monkeypatch):
+def test_web_client_discovery_is_allowed_without_container_flag(monkeypatch):
     e = _reload(monkeypatch, on=False)
     e.TOOL_SPECS["execute_shell"]["host"] = "1"
     result = e.run_tool("execute_shell", {"command": "command -v curl wget python3"})
-    assert "explicit http:// or https:// URL" in result
+    assert "explicit http:// or https:// URL" not in result

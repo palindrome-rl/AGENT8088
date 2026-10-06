@@ -1,6 +1,5 @@
 import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from agent8088 import providers
 from agent8088.providers import resolve_subagent_model

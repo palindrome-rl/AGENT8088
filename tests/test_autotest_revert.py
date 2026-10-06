@@ -7,7 +7,6 @@ audit hit exactly this — the file under test came back as an older revision wi
 several functions missing. Snapshotting the bytes first turns the warning into a
 repair.
 """
-import json
 
 import pytest
 

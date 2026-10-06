@@ -1,5 +1,4 @@
 """The engine, CLI, and gateway share one layered prompt shape."""
-from agent8088 import engine
 
 
 def test_skill_index_stays_lightweight(engine):

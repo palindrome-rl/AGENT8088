@@ -6,7 +6,6 @@ registers. Follows the fake-`winreg`-module convention already used in
 test_windows_uninstall.py.
 """
 import json
-import subprocess
 import sys
 import types
 from pathlib import Path
