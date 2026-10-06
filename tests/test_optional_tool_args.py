@@ -10,6 +10,8 @@ execute_plan rejects a step missing any required arg, so the subtraction has
 to reach TOOL_REQUIRED_PARAMS too, not just the JSON schema sent to the model.
 """
 
+from types import SimpleNamespace
+
 
 def _spec(engine, **extra):
     return engine._build_spec("demo", extra, {}, "demo tool")
@@ -48,6 +50,8 @@ def test_schedule_task_no_longer_demands_schedule_and_task(engine):
 
 def test_schedule_list_reports_an_unavailable_crontab(engine, monkeypatch):
     monkeypatch.delenv("AGENT8088_HOME", raising=False)
+    monkeypatch.setattr(engine, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(engine, "_schedule_isolation_active", lambda: False)
     def unavailable(*_args, **_kwargs):
         raise PermissionError("operation not permitted")
 
@@ -57,6 +61,8 @@ def test_schedule_list_reports_an_unavailable_crontab(engine, monkeypatch):
 
 def test_schedule_add_reports_an_unavailable_crontab_write(engine, monkeypatch):
     monkeypatch.delenv("AGENT8088_HOME", raising=False)
+    monkeypatch.setattr(engine, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(engine, "_schedule_isolation_active", lambda: False)
     def crontab(command, **_kwargs):
         if command == ["crontab", "-l"]:
             return type("Result", (), {"returncode": 0, "stdout": ""})()
