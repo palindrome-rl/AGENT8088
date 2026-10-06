@@ -38,6 +38,10 @@ These commands install the public **AGENT8088-v1.2** branch.
 curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | AGENT8088_BRANCH=AGENT8088-v1.2 bash
 ```
 
+Run as your normal user, without `sudo`. The installer requests elevation only
+for system packages that need it; installing under another user's profile can
+make the command unavailable in your own terminal.
+
 **Windows (PowerShell)**
 
 ```powershell
@@ -45,9 +49,28 @@ $env:AGENT8088_BRANCH = 'AGENT8088-v1.2'
 iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
 ```
 
+Use PowerShell, not `cmd.exe`, and start from a normal, non-administrator window.
+The base installation is per-user. Windows Terminal setup confirms that the
+new installer window started instead of assuming that opening a process means
+installation succeeded.
+
+If Terminal setup is blocked or its window never starts, open Windows Terminal
+yourself and rerun the command. Alternatively, set
+`$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"` before rerunning it in the current
+PowerShell window. This only skips the terminal-host check; it does not disable
+security software. The legacy console may display colours and box drawing poorly.
+
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the
 repo into an isolated venv, exposes a global `agent8088` command, and writes a
 default `config.txt` pointing at localhost Ollama.
+
+Failures include the failed stage, relevant command output, and recovery guidance.
+Full logs are at `~/.agent8088/install.log` on macOS/Linux and
+`%LOCALAPPDATA%\agent8088\install.log` on Windows, or under your custom
+`AGENT8088_HOME`. Rerunning the same installer resumes validated stages.
+Skipped optional components are listed at the end with their repair commands.
+An existing configuration is preserved. The public repository needs no GitHub
+account or token to install.
 
 **From a clone, to work on the code.** Clone the public release branch:
 

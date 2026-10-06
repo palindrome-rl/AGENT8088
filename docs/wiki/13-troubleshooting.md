@@ -8,6 +8,64 @@ redacted bundle for a bug report.
 
 ## Install & startup
 
+### Installation fails or stops
+
+Read the named stage and the last command output before retrying. The full
+installation log is `%LOCALAPPDATA%\agent8088\install.log` on Windows or
+`~/.agent8088/install.log` on macOS/Linux, under `AGENT8088_HOME` if configured.
+Re-run the [same public v1.2 installation command](01-getting-started.md#install)
+to resume. Do not delete your configuration, memory, or entire installation home.
+
+The installer checks that the installed command can run `--version` before
+declaring success. If it says the core command does not start, follow the
+printed direct Python command to see the import error. Optional-component
+warnings do not mean the core agent failed; their summary gives repair commands.
+`install-state.json` beside the log records the skipped stages from the most
+recent installer run for support; this release does not display that file through
+`/doctor` or its startup banner.
+
+### Windows Terminal setup is blocked or no installer window appears
+
+Open Windows Terminal yourself and repeat the installation command. If Terminal
+cannot be installed or launched, use the current PowerShell window:
+
+```powershell
+$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"
+$env:AGENT8088_BRANCH = "AGENT8088-v1.2"
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+```
+
+The override only bypasses the terminal-host check, not antivirus or Windows
+permissions. Windows Terminal remains the supported display host. To restore
+the usual terminal check in this session, run
+`Remove-Item Env:AGENT8088_SKIP_TERMINAL_CHECK`.
+If security software blocks the installer itself, retain the error and consult
+your administrator or security vendor; do not disable protection.
+
+### Git asks for credentials or reports repository access errors
+
+`palindrome-rl/AGENT8088` is public: installing it needs no GitHub token,
+private-repository membership, or administrator invitation. Check the URL in
+your browser, stale Git credentials, proxy settings, and Git URL rewrites.
+Do not create a broad-access token just to install Agent8088. A TLS error needs
+certificate/proxy diagnosis, not repeated sign-in; do not disable TLS verification.
+
+### An older Agent8088 opens after reinstalling
+
+The installer warns when another command earlier in PATH shadows its launcher.
+Open a new terminal after installation and inspect `Get-Command agent8088 -All`
+on Windows, or `type -a agent8088` on macOS/Linux. Use the printed launcher path
+and PATH guidance. Start the agent and enter `/doctor` for the existing runtime
+health check; this public release does not provide `agent8088 --doctor`.
+
+### Installation was interrupted
+
+Rerun the same public installation command. macOS/Linux detects an active
+installer and cleans up its lock on normal termination. If it reports an
+existing lock, follow the printed process/lock guidance instead of starting
+multiple installers together. Windows reports a locked partial checkout
+with recovery guidance; close the reported process before retrying.
+
 ### `No module named pytest` / `No module named slack_bolt`
 
 The optional extras aren't installed. They're separate on purpose so a plain CLI

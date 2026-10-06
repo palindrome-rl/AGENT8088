@@ -119,6 +119,16 @@ $env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent
 Use these branch-specific installers for v1.2; the generic Pages installer
 may track a different release.
 
+Run the Windows command in PowerShell, not Command Prompt. On macOS/Linux,
+run as your normal user, without `sudo`; the installer asks for elevated access
+only when a system component needs it.
+
+If Windows Terminal cannot be installed or launched, you can install in the
+current PowerShell window by setting `$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"`
+and rerunning the Windows command above. This skips only the terminal-host check;
+it does not disable antivirus or change execution policy. Windows Terminal
+remains the supported host for the best display.
+
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
 <details>
@@ -150,6 +160,13 @@ The installer provisions an isolated Python environment, installs the global `ag
 
 After installing, start `agent8088` and run `/doctor [--fix]` to verify your setup, or
 `/dump` to produce a bundle for a bug report.
+
+If installation fails, the installer reports the failed step, keeps its output,
+and prints a retry command. Logs are saved to
+`%LOCALAPPDATA%\agent8088\install.log` on Windows or
+`~/.agent8088/install.log` on macOS/Linux (under `AGENT8088_HOME` when set).
+Rerun the same command to resume; optional failures are listed separately from
+core startup failures. See [installation troubleshooting](docs/wiki/13-troubleshooting.md#installation-fails-or-stops).
 
 The installers do not add the `[dev]` extra (pytest, ruff, pip-audit), and the
 root Python `tests/` suite is not included in this release branch. Neither is

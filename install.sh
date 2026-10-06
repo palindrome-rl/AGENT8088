@@ -28,7 +28,14 @@
 # .gitattributes (install.sh text eol=lf) is the actual prevention; this is the
 # diagnostic for a checkout that predates it. `exit 1` picks up the stray CR and
 # so exits 255 with a "numeric argument required" note -- cosmetic, still non-zero.
-head -n 1 "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | grep -q "$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"${BASH_SOURCE[0]}\"" "  Or:   curl -fsSL <url> | bash   (always LF)" >&2 && exit 1
+#
+# Strict POSIX, like the preflight below: `curl | sh` on Debian runs this under
+# dash, and a ${BASH_SOURCE[0]} here made dash print "Bad substitution" before the
+# friendly "needs bash" message could. "$0" is the script path whenever there is
+# a file to check (bash install.sh, sh install.sh). Piped, it is "bash"/"sh" or
+# the shell binary's own path (`curl | /bin/sh`), so only a first line that is a
+# "#!" line counts -- a binary never starts with one, and a piped download is LF.
+head -n 1 "$0" 2>/dev/null | grep -q "^#!.*$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"$0\"" "  Or:   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | bash   (use LF line endings)" >&2 && exit 1
 
 # ----------------------------------------------------------------------------
 # Shell preflight -- must be the first executable code in this file
@@ -46,14 +53,16 @@ if [ -z "${BASH_VERSION:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         # When piped, $0 is "sh"/"bash" rather than a path, so re-execing $0 cannot
         # work and there is no file to hand to bash either -- print the fix instead.
-        if [ -f "$0" ]; then exec bash "$0" "$@"; fi
+        # `curl | /bin/sh` makes $0 the sh binary itself, which IS a file; only
+        # re-exec something whose first line is a bash shebang (this script).
+        if [ -f "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!.*bash'; then exec bash "$0" "$@"; fi
         echo "This installer needs bash. Re-run it as:" >&2
-        echo "  curl -fsSL <url> | bash" >&2
+        echo "  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | bash" >&2
         exit 1
     fi
     echo "ERROR: bash is required and was not found." >&2
     echo "  Alpine / busybox:  apk add bash" >&2
-    echo "  Then:              curl -fsSL <url> | bash" >&2
+    echo "  Then:              curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | bash" >&2
     exit 1
 fi
 
@@ -176,6 +185,15 @@ INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
 PYTHON_FALLBACK_VERSIONS=("3.12" "3.10")
 NODE_VERSION="22.11.0"
+INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh"
+# Everything the heavy stages print goes here instead of /dev/null, so a failure
+# can show its last lines and the user has a file to attach to a bug report.
+INSTALL_LOG="$AGENT8088_HOME/install.log"
+# mkdir is atomic, so a directory is the lock: two installers at once would
+# race on the same clone, venv and node_modules and corrupt all three.
+INSTALL_LOCK_DIR="$AGENT8088_HOME/.install.lock"
+# Name of the stage main() is in, for the "Install stopped during ..." message.
+STAGE=""
 
 # Options
 SKIP_SETUP=false
@@ -214,12 +232,29 @@ else
     IS_INTERACTIVE=false
 fi
 
+# An option that takes a value must get one. `--branch` as the last argument
+# used to hit `shift 2` with one word left, which fails under set -e with no
+# message at all; `--branch --skip-setup` silently installed a branch named
+# "--skip-setup".
+_require_option_value() {
+    if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "ERROR: $1 needs a value, e.g. $1 $3" >&2
+        exit 1
+    fi
+    case "$2" in
+        -*) echo "ERROR: $1 needs a value, got the option '$2'. Example: $1 $3" >&2; exit 1 ;;
+    esac
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-setup) SKIP_SETUP=true; shift ;;
-        --branch)     BRANCH="$2"; shift 2 ;;
+        --branch)
+            _require_option_value "$1" "${2:-}" "AGENT8088-v1.2"
+            BRANCH="$2"; shift 2 ;;
         --memory)
+            _require_option_value "$1" "${2:-}" "native"
             case "$2" in
                 native|mem0) MEMORY_CHOICE="$2" ;;
                 *) echo "Unknown memory backend: $2 (expected native or mem0)"; exit 1 ;;
@@ -231,7 +266,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Agent8088 Installer"
             echo ""
-            echo "Usage: curl -fsSL <url> | bash -s -- [OPTIONS]"
+            echo "Usage: curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | bash -s -- [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  --skip-setup          Skip interactive setup wizard"
@@ -242,9 +277,16 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --help            Show this help"
             exit 0
             ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *) echo "Unknown option: $1 (see --help)"; exit 1 ;;
     esac
 done
+
+# The exact command to re-run, for every "re-run the installer" message.
+if [ "$BRANCH" = "AGENT8088-v1.2" ]; then
+    INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | bash"
+else
+    INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | AGENT8088_BRANCH=$BRANCH bash"
+fi
 
 # ----------------------------------------------------------------------------
 # Helper functions
@@ -364,8 +406,7 @@ install_libreoffice() {
             [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
             case "$DISTRO" in
                 ubuntu|debian)
-                    run_with_timeout "$T_LIBREOFFICE" $sudo_cmd env DEBIAN_FRONTEND=noninteractive \
-                        apt-get install -y -qq libreoffice >/dev/null 2>&1 || _rc=$?
+                    _apt_install "$T_LIBREOFFICE" libreoffice || _rc=$?
                     ;;
                 fedora)
                     run_with_timeout "$T_LIBREOFFICE" $sudo_cmd dnf install -y libreoffice \
@@ -475,6 +516,9 @@ T_UV_BOOT=$((300      * TIMEOUT_SCALE))   # uv self-installer
 # >= 1.30 do; older busybox treats -k as the command name and would run the
 # wrong thing entirely. Probed once, because getting it wrong is silent.
 _TIMEOUT_HAS_K=""
+# pid of a command the watchdog fallback below runs in the background, so the
+# INT/TERM trap can stop it (a background job in a script ignores SIGINT).
+_RWT_CHILD_PID=""
 _timeout_supports_k() {
     if [ -z "$_TIMEOUT_HAS_K" ]; then
         if timeout -k 1 1 true >/dev/null 2>&1; then _TIMEOUT_HAS_K=yes
@@ -517,6 +561,7 @@ run_with_timeout() {
 
     "$@" &
     local _pid=$!
+    _RWT_CHILD_PID=$_pid
     (
         _waited=0
         while [ "$_waited" -lt "$_secs" ]; do
@@ -531,6 +576,7 @@ run_with_timeout() {
     local _watchdog=$!
 
     wait "$_pid" 2>/dev/null || _rc=$?
+    _RWT_CHILD_PID=""
     kill -KILL "$_watchdog" 2>/dev/null || true
     wait "$_watchdog" 2>/dev/null || true
 
@@ -579,6 +625,7 @@ run_with_timeout_foreground() {
     # on its own, so this fallback was never affected by the SIGTTIN bug above.
     "$@" &
     local _pid=$!
+    _RWT_CHILD_PID=$_pid
     (
         _waited=0
         while [ "$_waited" -lt "$_secs" ]; do
@@ -593,6 +640,7 @@ run_with_timeout_foreground() {
     local _watchdog=$!
 
     wait "$_pid" 2>/dev/null || _rc=$?
+    _RWT_CHILD_PID=""
     kill -KILL "$_watchdog" 2>/dev/null || true
     wait "$_watchdog" 2>/dev/null || true
 
@@ -648,6 +696,540 @@ print_skipped_summary() {
     done
     echo ""
     echo "  The core agent is installed and works without these."
+}
+
+# JSON string body for $1 (no surrounding quotes). Pure bash, so it works
+# before any Python exists, and one character at a time on purpose: bash 3.2
+# (macOS /bin/bash) keeps quotes inside a ${var//pat/rep} replacement
+# literally, so the substitution form corrupts the output there. Bash strings
+# cannot hold NUL; non-ASCII text passes through unchanged, which JSON allows.
+_json_escape() {
+    local _s="$1" _out="" _c _i=0 _n=${#1} _code
+    while [ "$_i" -lt "$_n" ]; do
+        _c="${_s:_i:1}"
+        case "$_c" in
+            '"') _out+='\"' ;;
+            '\') _out+='\\' ;;
+            $'\n') _out+='\n' ;;
+            $'\r') _out+='\r' ;;
+            $'\t') _out+='\t' ;;
+            [[:cntrl:]])
+                printf -v _code '%d' "'$_c"
+                printf -v _c '\\u%04x' "$_code"
+                _out+="$_c" ;;
+            *) _out+="$_c" ;;
+        esac
+        _i=$((_i + 1))
+    done
+    printf '%s' "$_out"
+}
+
+# Persist the skipped-stage ledger to $AGENT8088_HOME/install-state.json for
+# installation diagnostics. This public release reports skipped stages in the
+# installer summary; it does not load this ledger in the agent. A stage fixed by a
+# re-run drops out; written to a temp file and renamed, so a reader never sees
+# half a file. Never fails the install.
+write_install_state() {
+    local _file="$AGENT8088_HOME/install-state.json"
+    local _tmp="$_file.tmp.$$" _entry _label _reason _fix _sep="" _when
+    _when="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+    {
+        printf '{"version": 1, "installed_at": "%s", "skipped": [' "$(_json_escape "$_when")"
+        if [ "${#SKIPPED_STAGES[@]}" -gt 0 ]; then
+            for _entry in "${SKIPPED_STAGES[@]}"; do
+                # Split on the first two tabs by hand: `read` with IFS=tab
+                # collapses an empty middle field and stops at a newline.
+                _label="${_entry%%$'\t'*}"
+                _entry="${_entry#*$'\t'}"
+                _reason="${_entry%%$'\t'*}"
+                _fix="${_entry#*$'\t'}"
+                printf '%s\n  {"stage": "%s", "reason": "%s", "fix": "%s"}' "$_sep" \
+                    "$(_json_escape "$_label")" "$(_json_escape "$_reason")" "$(_json_escape "$_fix")"
+                _sep=","
+            done
+        fi
+        printf '\n]}\n'
+    } > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_file" 2>/dev/null || {
+        rm -f "$_tmp" 2>/dev/null
+        log_warn "Could not save the skipped-stage diagnostics to $_file"
+    }
+    return 0
+}
+
+# The install command with one more environment variable in front of bash, for
+# messages: `_install_cmd_with UV_NATIVE_TLS=1` -> "curl ... | UV_NATIVE_TLS=1 bash".
+_install_cmd_with() {
+    echo "${INSTALL_CMD%bash}$1 bash"
+}
+
+# ----------------------------------------------------------------------------
+# Who is running this
+# ----------------------------------------------------------------------------
+# `sudo curl ... | bash` (or `curl ... | sudo bash`) installs into root's home --
+# or, where sudo keeps HOME, into the user's home as root-owned files the user
+# can then neither update nor delete. The installer asks for sudo itself for the
+# few system packages it needs, so refuse the sudo form outright. Plain root with
+# no SUDO_USER (a container, a root-only VM) is a legitimate target: allow it.
+check_invoking_user() {
+    local _uid
+    _uid="$(id -u 2>/dev/null || echo 1000)"
+    [ "$_uid" -eq 0 ] || return 0
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && [ "${AGENT8088_ALLOW_SUDO:-}" != "1" ]; then
+        log_error "Don't run the installer with sudo; it asks for sudo itself when needed."
+        log_info "Under sudo it installs for root, not for $SUDO_USER, and leaves root-owned files behind."
+        log_info "Re-run as $SUDO_USER, without sudo:"
+        log_info "  $INSTALL_CMD"
+        exit 1
+    fi
+    log_warn "Running as root: agent8088 will be installed for root, in $AGENT8088_HOME."
+    log_info "That is right for a container or a root-only machine; otherwise re-run as your normal user."
+}
+
+# ----------------------------------------------------------------------------
+# Single-instance lock
+# ----------------------------------------------------------------------------
+INSTALL_LOCK_HELD=false
+acquire_install_lock() {
+    if ! mkdir -p "$AGENT8088_HOME" 2>/dev/null; then
+        log_error "Cannot create $AGENT8088_HOME"
+        log_info "Check that $(dirname "$AGENT8088_HOME") is writable by $(id -un 2>/dev/null || echo you), or set AGENT8088_HOME."
+        exit 1
+    fi
+    local _pid=""
+    if ! mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+        _pid="$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)"
+        if [ -z "$_pid" ]; then
+            # Another installer may be between its mkdir and writing its pid.
+            sleep 1
+            _pid="$(cat "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true)"
+        fi
+        if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+            log_error "Another agent8088 installer is already running (pid $_pid)."
+            log_info "Wait for it to finish. If it is not running any more, remove the lock and re-run:"
+            log_info "  rm -rf \"$INSTALL_LOCK_DIR\""
+            exit 1
+        fi
+        log_warn "Removing a stale installer lock left by an interrupted run"
+        rm -rf "$INSTALL_LOCK_DIR"
+        if ! mkdir "$INSTALL_LOCK_DIR" 2>/dev/null; then
+            log_error "Could not take the installer lock at $INSTALL_LOCK_DIR"
+            log_info "Another installer may have just started. If not: rm -rf \"$INSTALL_LOCK_DIR\""
+            exit 1
+        fi
+    fi
+    echo "$$" > "$INSTALL_LOCK_DIR/pid" 2>/dev/null || true
+    INSTALL_LOCK_HELD=true
+}
+
+release_install_lock() {
+    if [ "$INSTALL_LOCK_HELD" = true ]; then
+        rm -rf "$INSTALL_LOCK_DIR" 2>/dev/null || true
+        INSTALL_LOCK_HELD=false
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Install log
+# ----------------------------------------------------------------------------
+init_install_log() {
+    if [ -f "$INSTALL_LOG" ]; then
+        mv -f "$INSTALL_LOG" "$INSTALL_LOG.prev" 2>/dev/null || true
+    fi
+    if ! { echo "agent8088 install log, started $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+           echo "branch=$BRANCH uname=$(uname -sm 2>/dev/null)"; } > "$INSTALL_LOG" 2>/dev/null; then
+        log_warn "Cannot write $INSTALL_LOG - command output will not be kept"
+        INSTALL_LOG="/dev/null"
+    fi
+}
+
+# Output files of run_logged calls, removed when the installer exits.
+_STEP_LOGS=()
+LAST_STEP_LOG=""
+
+# Run a command under run_with_timeout with its output captured instead of
+# thrown away: into a per-step file (LAST_STEP_LOG, for show_step_failure) and
+# appended to INSTALL_LOG. stdin is /dev/null: under `curl | bash` stdin is the
+# rest of this script, and a child that reads it eats the installer.
+#
+# RUN_LOGGED_FOREGROUND=true switches to run_with_timeout_foreground with the
+# terminal as stdin, for a git that has to ask for credentials (see
+# probe_repo_access). Call at statement level (`run_logged ... || rc=$?`):
+# LAST_STEP_LOG and _STEP_LOGS are lost in a subshell.
+RUN_LOGGED_FOREGROUND=false
+run_logged() {
+    local _secs="$1"; shift
+    local _rc=0
+    LAST_STEP_LOG="$(mktemp 2>/dev/null || echo "/tmp/agent8088-step.$$.${#_STEP_LOGS[@]}")"
+    _STEP_LOGS+=("$LAST_STEP_LOG")
+    if [ "$RUN_LOGGED_FOREGROUND" = true ] && (: </dev/tty) 2>/dev/null; then
+        run_with_timeout_foreground "$_secs" "$@" >"$LAST_STEP_LOG" 2>&1 </dev/tty || _rc=$?
+    else
+        run_with_timeout "$_secs" "$@" >"$LAST_STEP_LOG" 2>&1 </dev/null || _rc=$?
+    fi
+    { echo ""; echo "\$ $*"; cat "$LAST_STEP_LOG"; echo "[exit $_rc]"; } >> "$INSTALL_LOG" 2>/dev/null || true
+    return $_rc
+}
+
+# Print what a failed step said: its last lines, a diagnosis of the usual
+# causes, and where the full log is.
+show_step_failure() {
+    local _file="${1:-$LAST_STEP_LOG}" _lines="${2:-20}"
+    if [ -n "$_file" ] && [ -s "$_file" ]; then
+        echo "  ---- last $_lines lines of output ----"
+        tail -n "$_lines" "$_file" | sed 's/^/  | /'
+        echo "  ----"
+    fi
+    diagnose_install_output "$_file"
+    if [ "$INSTALL_LOG" != "/dev/null" ]; then
+        log_info "Full log: $INSTALL_LOG"
+    fi
+}
+
+# Name the common root causes from a step's output. Each one otherwise surfaces
+# as a page of resolver or TLS noise that never says what to change.
+diagnose_install_output() {
+    local _file="$1"
+    [ -n "$_file" ] && [ -f "$_file" ] || return 0
+    if grep -qiE 'certificate verify failed|UnknownIssuer|invalid peer certificate|unable to get local issuer|self[- ]signed certificate|SSL certificate problem|CERTIFICATE_VERIFY_FAILED' "$_file"; then
+        log_warn "TLS certificate check failed - usually a corporate proxy or antivirus that re-signs HTTPS."
+        log_info "  Trust the system certificate store:  $(_install_cmd_with UV_NATIVE_TLS=1)"
+        log_info "  Or name your CA bundle:  export SSL_CERT_FILE=/path/to/ca.pem GIT_SSL_CAINFO=/path/to/ca.pem"
+        return 0
+    fi
+    if grep -qi 'No space left on device' "$_file"; then
+        log_warn "The disk is full."
+        log_info "  Free about 4 GB (df -h \"$AGENT8088_HOME\"), then re-run: $INSTALL_CMD"
+        return 0
+    fi
+    if grep -qiE 'no matching distribution|no solution found|requires-python|has no wheels|no wheels with a matching|not compatible with|unsupported python' "$_file"; then
+        log_warn "A dependency has no build for this Python version or platform."
+        log_info "  Python 3.11 or 3.12 is the safe choice. Check the venv's version: \"$INSTALL_DIR/venv/bin/python\" --version"
+        log_info "  To start over on a fresh Python: rm -rf \"$INSTALL_DIR/venv\", then re-run: $INSTALL_CMD"
+        return 0
+    fi
+    if grep -qiE 'could not resolve host|dns error|name or service not known|temporary failure in name resolution|connection refused|network is unreachable|connection reset|operation timed out|error sending request|failed to fetch' "$_file"; then
+        log_warn "A download failed - the network, a VPN or a firewall blocked it."
+        if [ -z "${HTTPS_PROXY:-}" ]; then
+            log_info "  Behind a proxy? export HTTPS_PROXY=http://proxy.example:8080, then re-run."
+        else
+            log_info "  Check that the proxy ${HTTPS_PROXY##*@} is reachable, then re-run."
+        fi
+        return 0
+    fi
+    if grep -qiE 'permission denied|EACCES|operation not permitted|read-only file system' "$_file"; then
+        log_warn "A path is not writable - often files left root-owned by an earlier sudo run."
+        log_info "  Fix ownership:  sudo chown -R \"$(id -un 2>/dev/null || echo "$USER")\" \"$AGENT8088_HOME\""
+        return 0
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Stage tracking + traps
+# ----------------------------------------------------------------------------
+# set -e on its own ends the run silently at whatever command failed, so a user
+# saw the last stage's "-> Installing ..." line and then a prompt. The traps turn
+# that into "Install stopped during <stage> (line N)" plus the command to re-run.
+#
+# ERR only records the line. It fires exactly where set -e would (never for
+# `|| true`, `|| rc=$?`, `if` conditions or `&&` lists), and with errtrace it is
+# also inherited into $(...) subshells, where set -e is not -- so it must not
+# print anything itself; the EXIT trap decides whether to report.
+_INSTALL_ERR_LINE=""
+_INSTALL_STOP_REPORTED=false
+
+_enter_stage() {
+    STAGE="$1"
+    _INSTALL_ERR_LINE=""
+}
+
+_report_install_stop() {
+    local _rc="$1" _where=""
+    [ -n "$_INSTALL_ERR_LINE" ] && _where=" (line $_INSTALL_ERR_LINE)"
+    echo ""
+    log_error "Install stopped during $STAGE$_where, exit $_rc."
+    log_info "Re-run the same command to resume: $INSTALL_CMD"
+    if [ "$INSTALL_LOG" != "/dev/null" ]; then
+        log_info "Log: $INSTALL_LOG"
+    fi
+    log_info "If agent8088 was already installed, start it and enter /doctor to check your setup."
+}
+
+_on_install_exit() {
+    local _rc=$?
+    trap - EXIT
+    if [ "$_rc" -ne 0 ] && [ -n "$STAGE" ] && [ "$_INSTALL_STOP_REPORTED" != true ]; then
+        _report_install_stop "$_rc"
+    fi
+    release_install_lock
+    [ "${#_STEP_LOGS[@]}" -gt 0 ] && rm -f "${_STEP_LOGS[@]}" 2>/dev/null
+    exit "$_rc"
+}
+
+_on_install_signal() {
+    local _rc="$1"
+    trap - INT TERM
+    # The run_with_timeout watchdog fallback starts the command in the
+    # background, where a non-interactive shell ignores SIGINT; take it down
+    # rather than leave a uv or npm running on after the installer is gone.
+    if [ -n "$_RWT_CHILD_PID" ]; then
+        kill -TERM "$_RWT_CHILD_PID" 2>/dev/null || true
+    fi
+    if [ -n "$STAGE" ]; then
+        echo ""
+        log_error "Install interrupted during $STAGE."
+        log_info "Re-run the same command to resume: $INSTALL_CMD"
+        _INSTALL_STOP_REPORTED=true
+    fi
+    exit "$_rc"
+}
+
+install_traps() {
+    set -E
+    trap '_INSTALL_ERR_LINE=$LINENO' ERR
+    trap '_on_install_exit' EXIT
+    trap '_on_install_signal 130' INT
+    trap '_on_install_signal 143' TERM
+}
+
+# ----------------------------------------------------------------------------
+# Public repository access
+# ----------------------------------------------------------------------------
+# Echoes one of: tls access auth network unknown. Order matters: a TLS failure
+# also says "unable to access", and GitHub answers "Repository not found" (404)
+# to a logged-in account that lacks access, which no password prompt can fix.
+classify_git_error() {
+    local _text="$1"
+    if printf '%s' "$_text" | grep -qiE 'SSL certificate problem|certificate verify|unable to get local issuer|server certificate verification failed'; then
+        echo tls
+    elif printf '%s' "$_text" | grep -qiE 'repository not found|repository .* does not exist'; then
+        echo access
+    elif printf '%s' "$_text" | grep -qiE 'authentication failed|could not read username|could not read password|terminal prompts disabled|invalid username or password|returned error: 40[13]|permission denied \(publickey\)|permission to .* denied'; then
+        echo auth
+    elif printf '%s' "$_text" | grep -qiE 'could not resolve|failed to connect|connection timed out|connection refused|network is unreachable|operation timed out|proxy|unable to access'; then
+        echo network
+    else
+        echo unknown
+    fi
+}
+
+_print_repo_auth_help() {
+    log_info "This repository is public and needs no GitHub token."
+    log_info "Check stale github.com credentials, Git URL rewrites (git config --get-regexp url),"
+    log_info "and your proxy configuration, then re-run."
+    log_info "Re-run: $INSTALL_CMD"
+}
+
+# Check the public repository and branch BEFORE clone/fetch so missing branches,
+# TLS failures, and credential/proxy misconfiguration have distinct guidance.
+#
+# The first probe is non-interactive: a credential prompt from a command under
+# `timeout` lands in a background process group and is stopped (SIGTTIN), which
+# looks like a hang. Stored credentials (gh, osxkeychain, libsecret, an SSH
+# agent) still work. Public access needs no interactive sign-in.
+probe_repo_access() {
+    log_info "Checking access to $REPO_URL (branch $BRANCH)..."
+    local _rc=0 _kind
+    run_logged 60 env GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never \
+        GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" \
+        git ls-remote --heads "$REPO_URL" "$BRANCH" || _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        _check_branch_listed
+        return 0
+    fi
+    if [ "$_rc" -eq 124 ]; then
+        log_error "Timed out reaching github.com while checking the repository."
+        log_info "Check your connection, VPN or proxy (HTTPS_PROXY), then re-run: $INSTALL_CMD"
+        exit 1
+    fi
+    _kind="$(classify_git_error "$(cat "$LAST_STEP_LOG" 2>/dev/null)")"
+    case "$_kind" in
+        access)
+            log_error "GitHub could not find the public repository at $REPO_URL."
+            show_step_failure
+            log_info "This is a public repository. Check the URL in your browser and your Git/proxy configuration."
+            log_info "No private-repository membership or GitHub token is required."
+            log_info "Re-run: $INSTALL_CMD"
+            ;;
+        auth)
+            log_error "Git reported an authentication error accessing $REPO_URL."
+            show_step_failure
+            _print_repo_auth_help
+            ;;
+        tls)
+            log_error "git could not verify github.com's TLS certificate."
+            show_step_failure
+            ;;
+        network)
+            log_error "Could not reach github.com."
+            show_step_failure
+            log_info "Re-run: $INSTALL_CMD"
+            ;;
+        *)
+            log_error "git ls-remote $REPO_URL failed (exit $_rc)."
+            show_step_failure
+            log_info "Re-run: $INSTALL_CMD"
+            ;;
+    esac
+    exit 1
+}
+
+_check_branch_listed() {
+    if awk -v ref="refs/heads/$BRANCH" '$2 == ref { found = 1 } END { exit !found }' "$LAST_STEP_LOG" 2>/dev/null; then
+        log_success "Repository reachable; branch $BRANCH exists"
+        return 0
+    fi
+    log_error "Branch '$BRANCH' does not exist in $REPO_URL."
+    log_info "Use an existing branch: --branch AGENT8088-v1.2 (or AGENT8088_BRANCH=AGENT8088-v1.2)"
+    log_info "List them: git ls-remote --heads $REPO_URL"
+    exit 1
+}
+
+# ----------------------------------------------------------------------------
+# Pre-flight: disk space and connectivity (ports Test-DiskSpace and
+# Test-HostConnectivity from install.ps1)
+# ----------------------------------------------------------------------------
+# The full install (Python, Playwright/Chromium, node_modules, embedding model)
+# needs roughly 3-4 GB. Unchecked, a full disk fails partway through with a
+# cryptic error from uv or npm that never names the cause. Returns 1 when there
+# is clearly not enough; a check that cannot run warns and passes.
+check_disk_space() {
+    [ "${AGENT8088_SKIP_DISK_CHECK:-}" = "1" ] && return 0
+    local _need_kb=$((4 * 1024 * 1024)) _dir="$AGENT8088_HOME" _avail
+    # An update already has most of it on disk.
+    [ -d "$INSTALL_DIR/venv" ] && _need_kb=$((1024 * 1024))
+    while [ ! -d "$_dir" ] && [ "$_dir" != "/" ] && [ "$_dir" != "." ]; do
+        _dir="$(dirname "$_dir")"
+    done
+    if ! command -v df >/dev/null 2>&1; then
+        log_warn "df is not available - skipping the free-space check"
+        return 0
+    fi
+    _avail="$(df -Pk "$_dir" 2>/dev/null | awk 'NR==2 {print $4}')"
+    case "$_avail" in
+        ''|*[!0-9]*)
+            log_warn "Could not read the free space for $_dir - skipping the check"
+            return 0
+            ;;
+    esac
+    if [ "$_avail" -lt "$_need_kb" ]; then
+        log_error "Only $((_avail / 1024)) MB free on the disk holding $_dir; agent8088 needs about $((_need_kb / 1024 / 1024)) GB"
+        log_info "(Python, Playwright/Chromium, node_modules and the embedding model)."
+        log_info "Free up space, or install on another disk: $(_install_cmd_with AGENT8088_HOME=/path/on/bigger/disk/agent8088)"
+        log_info "To skip this check: $(_install_cmd_with AGENT8088_SKIP_DISK_CHECK=1)"
+        return 1
+    fi
+    return 0
+}
+
+# A short probe of the hosts the mandatory stages download from, so a dead
+# network or a missing proxy is named up front instead of after a multi-minute
+# download timeout. Warns only: a probe can be wrong where a real download works.
+check_connectivity() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local _host _rc _bad="" _tls=false
+    for _host in github.com astral.sh; do
+        _rc=0
+        curl -sS -I -o /dev/null --connect-timeout 5 --max-time 10 "https://$_host" 2>/dev/null || _rc=$?
+        case "$_rc" in
+            0) ;;
+            35|51|53|54|58|59|60|77|83|90|91) _tls=true; _bad="$_bad $_host" ;;
+            *) _bad="$_bad $_host" ;;
+        esac
+    done
+    [ -z "$_bad" ] && return 0
+    for _host in $_bad; do
+        log_warn "Cannot reach https://$_host - check your network, VPN or firewall."
+    done
+    if [ "$_tls" = true ]; then
+        log_info "TLS verification failed: a corporate proxy or antivirus is likely re-signing HTTPS."
+        log_info "  Trust the system certificate store:  $(_install_cmd_with UV_NATIVE_TLS=1)"
+        log_info "  Or name your CA bundle:  export SSL_CERT_FILE=/path/to/ca.pem GIT_SSL_CAINFO=/path/to/ca.pem"
+    elif [ -z "${HTTPS_PROXY:-}" ]; then
+        log_info "Behind a proxy? export HTTPS_PROXY=http://proxy.example:8080, then re-run."
+    fi
+    log_warn "The install will likely fail at a download step until this is fixed."
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Completion stamps for npm/build outputs
+# ----------------------------------------------------------------------------
+# A directory's existence is not proof it is complete: a Ctrl-C'd `npm install`
+# leaves a half-populated node_modules and an interrupted build a partial dist,
+# and both used to be "already present" on every later run. A stamp is written
+# only after the step succeeds, recording what it was built from, and a rerun
+# redoes the step when the stamp is missing or names different inputs.
+_fingerprint_file() {
+    [ -f "$1" ] || return 1
+    cksum < "$1" | awk '{print $1 "-" $2}'
+}
+
+_stamp_matches() {
+    local _stamp="$1" _want="$2"
+    [ -n "$_want" ] && [ -f "$_stamp" ] && [ "$(cat "$_stamp" 2>/dev/null)" = "$_want" ]
+}
+
+_write_stamp() {
+    printf '%s\n' "$2" > "$1" 2>/dev/null || log_warn "Could not write $1 - a rerun will redo this step"
+}
+
+# Lockfile (or package.json) fingerprint for an npm project directory.
+_npm_inputs_fingerprint() {
+    _fingerprint_file "$1/package-lock.json" 2>/dev/null \
+        || _fingerprint_file "$1/package.json" 2>/dev/null \
+        || echo "none"
+}
+
+# ----------------------------------------------------------------------------
+# apt-get, without a bare sudo
+# ----------------------------------------------------------------------------
+# A bare `sudo apt-get ... >/dev/null 2>&1` can sit on a password prompt nobody
+# sees, or fail on a fresh container/cloud image that ships with no package
+# lists at all. This goes through _privileged_run_mode like the Playwright deps
+# do, refreshes the lists first when they are empty, and once more if the
+# install fails (stale lists 404 on rotated packages).
+_APT_UPDATED=false
+_apt_install() {
+    local _secs="$1"; shift
+    local _mode _rc=0 _authed=0
+    local _priv=()
+    _mode="$(_privileged_run_mode)"
+    case "$_mode" in
+        direct) ;;
+        sudo) _priv=(sudo -n) ;;
+        prompt)
+            log_info "Installing $* needs sudo - you may be prompted for your password."
+            if [ -t 0 ]; then
+                run_with_timeout_foreground "$T_PIP" sudo -v && _authed=1
+            else
+                run_with_timeout_foreground "$T_PIP" sudo -v </dev/tty && _authed=1
+            fi
+            if [ "$_authed" -ne 1 ]; then
+                log_warn "sudo authentication failed or timed out - not installing $*"
+                return 1
+            fi
+            _priv=(sudo -n)
+            ;;
+        *)
+            log_warn "Installing $* needs root, and there is no terminal to ask for a sudo password"
+            log_info "  Run it yourself: sudo apt-get update && sudo apt-get install -y $*"
+            return 1
+            ;;
+    esac
+    if [ "$_APT_UPDATED" != true ] && ! ls /var/lib/apt/lists/*_Packages >/dev/null 2>&1; then
+        _APT_UPDATED=true
+        run_logged "$_secs" ${_priv[@]+"${_priv[@]}"} env DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+    fi
+    run_logged "$_secs" ${_priv[@]+"${_priv[@]}"} env DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y -qq "$@" || _rc=$?
+    if [ "$_rc" -ne 0 ] && [ "$_APT_UPDATED" != true ]; then
+        _APT_UPDATED=true
+        run_logged "$_secs" ${_priv[@]+"${_priv[@]}"} env DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+        _rc=0
+        run_logged "$_secs" ${_priv[@]+"${_priv[@]}"} env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq "$@" || _rc=$?
+    fi
+    return $_rc
 }
 
 is_termux() {
@@ -716,7 +1298,7 @@ detect_os() {
         CYGWIN*|MINGW*|MSYS*)
             OS="windows"; DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)"
+            log_info "  powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1 | iex\""
             exit 1
             ;;
         *)
@@ -819,14 +1401,28 @@ check_python() {
         return 0
     fi
 
-    log_info "Python $PYTHON_VERSION not found, installing via uv..."
-    if "$UV_CMD" python install "$PYTHON_VERSION" >/dev/null 2>&1; then
-        PYTHON_PATH="$("$UV_CMD" python find "$PYTHON_VERSION")"
-        log_success "Python installed: $("$PYTHON_PATH" --version 2>/dev/null)"
-        return 0
-    fi
+    # Bounded and logged: `uv python install` downloads a ~30 MB CPython build,
+    # and it used to run unbounded with its output on /dev/null -- a stalled
+    # download hung here, and a TLS or proxy failure said only "Failed to find
+    # or install Python".
+    local _ver _rc _failed_log=""
+    for _ver in "$PYTHON_VERSION" "3.12"; do
+        log_info "Installing Python $_ver via uv..."
+        _rc=0
+        run_logged "$T_VENV" "$UV_CMD" python install "$_ver" || _rc=$?
+        if [ "$_rc" -eq 0 ] && PYTHON_PATH="$("$UV_CMD" python find "$_ver" 2>/dev/null)"; then
+            log_success "Python installed: $("$PYTHON_PATH" --version 2>/dev/null)"
+            return 0
+        fi
+        _failed_log="$LAST_STEP_LOG"
+        if [ "$_rc" -eq 124 ]; then
+            log_warn "uv python install $_ver timed out after $((T_VENV / 60))m"
+        else
+            log_warn "uv python install $_ver failed (exit $_rc)"
+        fi
+    done
 
-    # Fallback: try fallback versions, then any system Python 3.10+
+    # Fallback: any interpreter uv can see, then any system Python >= 3.10.
     log_info "Trying fallback Python versions..."
     for fallback_ver in "${PYTHON_FALLBACK_VERSIONS[@]}"; do
         if PYTHON_PATH="$("$UV_CMD" python find "$fallback_ver" 2>/dev/null)"; then
@@ -834,9 +1430,20 @@ check_python() {
             return 0
         fi
     done
+    local _cand
+    for _cand in python3.12 python3.11 python3.13 python3.10 python3; do
+        command -v "$_cand" >/dev/null 2>&1 || continue
+        if "$_cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+            PYTHON_PATH="$(command -v "$_cand")"
+            log_warn "Using the system $("$PYTHON_PATH" --version 2>/dev/null) at $PYTHON_PATH (uv could not download Python $PYTHON_VERSION)"
+            return 0
+        fi
+    done
 
-    log_error "Failed to find or install Python $PYTHON_VERSION"
-    log_info "Install Python 3.11 manually, then re-run this script"
+    log_error "Could not find or install Python 3.10+ (uv python install $PYTHON_VERSION failed)."
+    show_step_failure "$_failed_log"
+    log_info "Install Python 3.11 or 3.12 yourself (python.org, brew install python@3.12,"
+    log_info "or sudo apt install python3.12), then re-run: $INSTALL_CMD"
     exit 1
 }
 
@@ -892,8 +1499,7 @@ check_git() {
             case "$DISTRO" in
                 ubuntu|debian)
                     log_info "Installing Git via apt..."
-                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null 2>&1 || true
+                    _apt_install "$T_PIP" git || true
                     ;;
                 fedora)
                     log_info "Installing Git via dnf..."
@@ -933,8 +1539,7 @@ check_git() {
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
 
-    # The repository is private, so allow Git to use the member's existing
-    # GitHub credentials or request them when needed.
+    # This public repository does not need interactive GitHub credentials.
 
     # An interrupted previous clone leaves .git with no initial commit.
     if [ -d "$INSTALL_DIR/.git" ] && ! git -C "$INSTALL_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
@@ -955,31 +1560,66 @@ clone_repo() {
                 git reset -q
             fi
             log_info "Local changes detected, stashing before update..."
-            git stash push --include-untracked -m "agent8088-install-autostash-$(date -u +%Y%m%d-%H%M%S)" >/dev/null 2>&1 || true
+            if ! git stash push --include-untracked -m "agent8088-install-autostash-$(date -u +%Y%m%d-%H%M%S)"; then
+                log_error "Could not stash local installation changes; refusing to update."
+                exit 1
+            fi
         fi
-        git remote set-url origin "$REPO_URL" 2>/dev/null || true
+        if ! git remote set-url origin "$REPO_URL"; then
+            log_error "Could not configure the Agent8088 remote; refusing to update."
+            exit 1
+        fi
+        probe_repo_access
         # GIT_HTTP_LOW_SPEED_* bounds the byte-moving part; this bounds the rest
         # (ref negotiation, local object write), which those variables do not cover.
-        run_with_timeout "$T_GIT" git fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1 || {
-            log_error "git fetch timed out or failed after $((T_GIT / 60))m"
-            log_error "Check your connection, then rerun. On a slow link: AGENT8088_TIMEOUT_SCALE=3"
+        local _git_rc=0
+        run_logged "$T_GIT" git fetch --depth 1 origin "$BRANCH" || _git_rc=$?
+        if [ "$_git_rc" -ne 0 ]; then
+            if [ "$_git_rc" -eq 124 ]; then
+                log_error "git fetch timed out after $((T_GIT / 60))m"
+                log_info "On a slow link, re-run with: $(_install_cmd_with AGENT8088_TIMEOUT_SCALE=3)"
+            else
+                log_error "git fetch failed (exit $_git_rc)"
+            fi
+            show_step_failure
             exit 1
-        }
-        git checkout -B "$BRANCH" FETCH_HEAD >/dev/null 2>&1
-        git reset --hard FETCH_HEAD >/dev/null 2>&1
+        fi
+        if ! git checkout -B "$BRANCH" FETCH_HEAD; then
+            log_error "Could not check out '$BRANCH'; update did not complete."
+            exit 1
+        fi
+        if ! git reset --hard FETCH_HEAD; then
+            log_error "Could not reset the installation to '$BRANCH'; update did not complete."
+            exit 1
+        fi
     else
-        log_info "Cloning Agent8088 repository..."
-        rm -rf "$INSTALL_DIR"
+        probe_repo_access
+        log_info "Cloning Agent8088 repository (this can take a minute)..."
+        if [ -e "$INSTALL_DIR" ]; then
+            local saved_dir
+            saved_dir="$(mktemp -d "${INSTALL_DIR}.saved.XXXXXX")" || exit 1
+            log_warn "Preserving the incomplete installation at $saved_dir/checkout."
+            mv "$INSTALL_DIR" "$saved_dir/checkout" || exit 1
+        fi
         mkdir -p "$AGENT8088_HOME"
-        run_with_timeout "$T_GIT" git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR" || {
-            log_error "git clone timed out or failed after $((T_GIT / 60))m"
-            log_error "Check your connection, then rerun. On a slow link: AGENT8088_TIMEOUT_SCALE=3"
+        local _git_rc=0
+        run_logged "$T_GIT" git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR" || _git_rc=$?
+        if [ "$_git_rc" -ne 0 ]; then
+            if [ "$_git_rc" -eq 124 ]; then
+                log_error "git clone timed out after $((T_GIT / 60))m"
+                log_info "On a slow link, re-run with: $(_install_cmd_with AGENT8088_TIMEOUT_SCALE=3)"
+            else
+                log_error "git clone failed (exit $_git_rc)"
+            fi
+            show_step_failure
             exit 1
-        }
+        fi
         cd "$INSTALL_DIR"
         git config core.autocrlf false
         FRESH_INSTALL=true
     fi
+    # Nothing after repository setup should request Git credentials.
+    RUN_LOGGED_FOREGROUND=false
     local installed_commit
     installed_commit="$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     log_success "Repository ready at $INSTALL_DIR ($BRANCH@$installed_commit)"
@@ -1031,14 +1671,15 @@ install_deps() {
         # Cosmetic, and it failing must not abort an otherwise-fine install.
         run_with_timeout "$T_CORE_INSTALL" pip install --upgrade pip >/dev/null 2>&1 || true
         _core_rc=0
-        run_with_timeout "$T_CORE_INSTALL" pip install --upgrade --force-reinstall -e . \
-            >/dev/null 2>&1 || _core_rc=$?
+        run_logged "$T_CORE_INSTALL" pip install --upgrade --force-reinstall -e . || _core_rc=$?
         if [ "$_core_rc" -eq 124 ]; then
             log_error "pip install timed out after $((T_CORE_INSTALL / 60))m - a package download stalled."
-            log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+            log_error "Retry on a slower link with: $(_install_cmd_with AGENT8088_TIMEOUT_SCALE=3)"
+            show_step_failure
             exit 1
         elif [ "$_core_rc" -ne 0 ]; then
             log_error "pip install failed (exit $_core_rc)"
+            show_step_failure
             exit 1
         fi
     else
@@ -1073,27 +1714,34 @@ install_deps() {
         # This is the stage that actually hangs: playwright's and ddgs's native
         # wheels plus mcp and Pillow. Mandatory, so a timeout is a hard failure
         # with a specific message rather than a skip.
+        # Output goes to $INSTALL_LOG (it used to go to /dev/null), so a failure
+        # can say WHY: the last lines, plus a diagnosis of TLS interception, a
+        # full disk, or a dependency with no wheel for this Python.
         _core_rc=0
-        run_with_timeout "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
-            --reinstall-package agent8088 -e "$INSTALL_DIR" >/dev/null 2>&1 || _core_rc=$?
+        run_logged "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
+            --reinstall-package agent8088 -e "$INSTALL_DIR" || _core_rc=$?
         if [ "$_core_rc" -eq 124 ]; then
             log_error "uv pip install timed out after $((T_CORE_INSTALL / 60))m - a package download stalled."
-            log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+            log_error "Retry on a slower link with: $(_install_cmd_with AGENT8088_TIMEOUT_SCALE=3)"
+            show_step_failure
             log_error "Or see the underlying error with:"
             log_error "  $UV_CMD pip install --python $_py -e \"$INSTALL_DIR\""
             exit 1
         elif [ "$_core_rc" -ne 0 ]; then
-            log_error "uv pip install failed (exit $_core_rc); retrying with --reinstall"
+            log_warn "uv pip install failed (exit $_core_rc); retrying with --reinstall"
             _core_rc=0
-            run_with_timeout "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
-                --reinstall -e "$INSTALL_DIR" >/dev/null 2>&1 || _core_rc=$?
+            run_logged "$T_CORE_INSTALL" "$UV_CMD" pip install --python "$_py" \
+                --reinstall -e "$INSTALL_DIR" || _core_rc=$?
             if [ "$_core_rc" -ne 0 ]; then
                 if [ "$_core_rc" -eq 124 ]; then
                     log_error "Retry also timed out after $((T_CORE_INSTALL / 60))m"
-                    log_error "Retry on a slower link with: AGENT8088_TIMEOUT_SCALE=3"
+                    log_error "Retry on a slower link with: $(_install_cmd_with AGENT8088_TIMEOUT_SCALE=3)"
                 else
                     log_error "Failed to install agent8088 (exit $_core_rc)"
                 fi
+                show_step_failure
+                log_info "See the underlying error with:"
+                log_info "  $UV_CMD pip install --python $_py -e \"$INSTALL_DIR\""
                 exit 1
             fi
         fi
@@ -1107,10 +1755,10 @@ install_deps() {
     log_info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
     _gw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        run_with_timeout "$T_PIP" pip install -e ".[gateway]" >/dev/null 2>&1 || _gw_rc=$?
+        run_with_timeout "$T_PIP" pip install -e ".[gateway]" >>"$INSTALL_LOG" 2>&1 </dev/null || _gw_rc=$?
     else
         run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
-            -e "$INSTALL_DIR[gateway]" >/dev/null 2>&1 || _gw_rc=$?
+            -e "$INSTALL_DIR[gateway]" >>"$INSTALL_LOG" 2>&1 </dev/null || _gw_rc=$?
     fi
     if [ "$_gw_rc" -eq 0 ]; then
         GATEWAY_EXTRAS_INSTALLED=true
@@ -1127,10 +1775,10 @@ install_deps() {
     log_info "Installing keyless web search backend (ddgs)..."
     _search_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        run_with_timeout "$T_PIP" pip install -e ".[search]" >/dev/null 2>&1 || _search_rc=$?
+        run_with_timeout "$T_PIP" pip install -e ".[search]" >>"$INSTALL_LOG" 2>&1 </dev/null || _search_rc=$?
     else
         run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
-            -e "$INSTALL_DIR[search]" >/dev/null 2>&1 || _search_rc=$?
+            -e "$INSTALL_DIR[search]" >>"$INSTALL_LOG" 2>&1 </dev/null || _search_rc=$?
     fi
     if [ "$_search_rc" -eq 0 ]; then
         SEARCH_EXTRAS_INSTALLED=true
@@ -1151,10 +1799,10 @@ install_deps() {
     local _ocr_installed=false
     _ocr_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        run_with_timeout "$T_PIP" pip install -e ".[ocr]" >/dev/null 2>&1 || _ocr_rc=$?
+        run_with_timeout "$T_PIP" pip install -e ".[ocr]" >>"$INSTALL_LOG" 2>&1 </dev/null || _ocr_rc=$?
     else
         run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
-            -e "$INSTALL_DIR[ocr]" >/dev/null 2>&1 || _ocr_rc=$?
+            -e "$INSTALL_DIR[ocr]" >>"$INSTALL_LOG" 2>&1 </dev/null || _ocr_rc=$?
     fi
     if [ "$_ocr_rc" -eq 0 ]; then
         _ocr_installed=true
@@ -1170,7 +1818,7 @@ install_deps() {
         log_info "Downloading OCR models (~90 MB)..."
         _ocr_models_rc=0
         run_with_timeout "$T_OCR_MODELS" "$_py" -c \
-            "from rapidocr import RapidOCR; RapidOCR()" >/dev/null 2>&1 || _ocr_models_rc=$?
+            "from rapidocr import RapidOCR; RapidOCR()" >>"$INSTALL_LOG" 2>&1 </dev/null || _ocr_models_rc=$?
         if [ "$_ocr_models_rc" -eq 0 ]; then
             OCR_INSTALLED=true
         else
@@ -1190,10 +1838,10 @@ install_deps() {
         log_info "Installing the mem0 memory backend (mem0ai, ollama, qdrant)..."
         _mem0_rc=0
         if [ "$DISTRO" = "termux" ]; then
-            run_with_timeout "$T_PIP" pip install -e ".[mem0]" >/dev/null 2>&1 || _mem0_rc=$?
+            run_with_timeout "$T_PIP" pip install -e ".[mem0]" >>"$INSTALL_LOG" 2>&1 </dev/null || _mem0_rc=$?
         else
             run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
-                -e "$INSTALL_DIR[mem0]" >/dev/null 2>&1 || _mem0_rc=$?
+                -e "$INSTALL_DIR[mem0]" >>"$INSTALL_LOG" 2>&1 </dev/null || _mem0_rc=$?
         fi
         if [ "$_mem0_rc" -eq 0 ]; then
             MEM0_INSTALLED=true
@@ -1234,10 +1882,10 @@ install_deps() {
     log_info "Installing repository context support (optional, for repository_read)..."
     _repo_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        run_with_timeout "$T_PIP" pip install -e ".[repository]" >/dev/null 2>&1 || _repo_rc=$?
+        run_with_timeout "$T_PIP" pip install -e ".[repository]" >>"$INSTALL_LOG" 2>&1 </dev/null || _repo_rc=$?
     else
         run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
-            -e "$INSTALL_DIR[repository]" >/dev/null 2>&1 || _repo_rc=$?
+            -e "$INSTALL_DIR[repository]" >>"$INSTALL_LOG" 2>&1 </dev/null || _repo_rc=$?
     fi
     if [ "$_repo_rc" -eq 0 ]; then
         REPOSITORY_INSTALLED=true
@@ -1257,10 +1905,10 @@ install_deps() {
     local _playwright_installed=false
     _pw_rc=0
     if [ "$DISTRO" = "termux" ]; then
-        run_with_timeout "$T_PIP" pip install -e ".[browser]" >/dev/null 2>&1 || _pw_rc=$?
+        run_with_timeout "$T_PIP" pip install -e ".[browser]" >>"$INSTALL_LOG" 2>&1 </dev/null || _pw_rc=$?
     else
         run_with_timeout "$T_PIP" "$UV_CMD" pip install --python "$_py" \
-            -e "$INSTALL_DIR[browser]" >/dev/null 2>&1 || _pw_rc=$?
+            -e "$INSTALL_DIR[browser]" >>"$INSTALL_LOG" 2>&1 </dev/null || _pw_rc=$?
     fi
     if [ "$_pw_rc" -eq 0 ]; then
         _playwright_installed=true
@@ -1278,7 +1926,7 @@ install_deps() {
         # rather than the OS-shared ms-playwright cache other tools may use.
         export PLAYWRIGHT_BROWSERS_PATH="$AGENT8088_HOME/playwright-browsers"
         run_with_timeout "$T_CHROMIUM" "$_py" -m playwright install chromium \
-            >/dev/null 2>&1 || _chromium_rc=$?
+            >>"$INSTALL_LOG" 2>&1 </dev/null || _chromium_rc=$?
         if [ "$_chromium_rc" -eq 0 ]; then
             CHROMIUM_INSTALLED=true
         else
@@ -1436,11 +2084,14 @@ install_node_bridge() {
         # Fallback: download a portable Node tarball (no admin needed)
         if [ "$_node_ok" = false ] && [ "$OS" != "android" ]; then
             log_info "Downloading portable Node $NODE_VERSION..."
-            local _arch
+            local _arch=""
             case "$(uname -m)" in
                 x86_64|amd64) _arch="x64" ;;
                 aarch64|arm64) _arch="arm64" ;;
-                *)            _arch="x64" ;;
+                armv7l)       _arch="armv7l" ;;
+                # Anything else has no official build. Defaulting to x64 used to
+                # download one anyway, which then could not execute.
+                *)            _arch="" ;;
             esac
             local _os_tag _ext
             # .tar.gz on both: .tar.xz needs xz-utils, which minimal images
@@ -1452,7 +2103,11 @@ install_node_bridge() {
             esac
             local _url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$_os_tag-$_arch.$_ext"
             local _tmp="/tmp/node-v$NODE_VERSION.$$_tarball"
-            if _download_file "$_url" "$_tmp" "$T_NODE_DL"; then
+            if [ -z "$_arch" ]; then
+                log_warn "No portable Node.js build for CPU architecture $(uname -m)"
+                record_skip "Node.js (WhatsApp bridge, sandbox)" "no Node.js build for CPU $(uname -m)" \
+                    "install Node 20.11+ with your package manager, then rerun the installer"
+            elif _download_file "$_url" "$_tmp" "$T_NODE_DL"; then
                 mkdir -p "$AGENT8088_HOME/node"
                 # Guarded: Node is optional (WhatsApp bridge only), so a bad
                 # tarball or missing decompressor must warn, not abort the run.
@@ -1483,19 +2138,25 @@ install_node_bridge() {
         log_warn "WhatsApp bridge package.json not found at $_bridge_dir - skipping npm install"
         return 0
     fi
-    if [ -d "$_bridge_dir/node_modules" ]; then
+    # The stamp, not the directory, says the install finished: a Ctrl-C'd npm
+    # install leaves node_modules behind, half-populated.
+    local _bridge_stamp="$_bridge_dir/node_modules/.agent8088-install-stamp" _bridge_inputs
+    _bridge_inputs="$(_npm_inputs_fingerprint "$_bridge_dir")"
+    if [ -d "$_bridge_dir/node_modules" ] && _stamp_matches "$_bridge_stamp" "$_bridge_inputs"; then
         log_success "WhatsApp bridge node_modules already present"
         WHATSAPP_BRIDGE_READY=true
         return 0
     fi
+    [ -d "$_bridge_dir/node_modules" ] && log_info "WhatsApp bridge node_modules is incomplete or out of date - reinstalling"
 
     log_info "Installing WhatsApp bridge npm dependencies..."
     _npm_rc=0
     run_with_timeout "$T_NPM" npm install --prefix "$_bridge_dir" --no-audit --no-fund \
-        >/dev/null 2>&1 || _npm_rc=$?
+        >>"$INSTALL_LOG" 2>&1 </dev/null || _npm_rc=$?
     if [ "$_npm_rc" -eq 0 ]; then
         if [ -d "$_bridge_dir/node_modules" ]; then
             WHATSAPP_BRIDGE_READY=true
+            _write_stamp "$_bridge_stamp" "$_bridge_inputs"
             log_success "WhatsApp bridge npm dependencies installed"
         else
             log_warn "WhatsApp bridge npm install reported success but node_modules missing"
@@ -1536,7 +2197,12 @@ install_webui() {
         return
     fi
     local _dist_index="$_web_dir/dist/index.html"
-    if [ -f "$_dist_index" ]; then
+    # dist is current when it was built from this exact web/ tree: the tree hash
+    # changes with any web source change, and an interrupted build never got a
+    # stamp. Without git (no hash), trust an existing build as before.
+    local _build_stamp="$_web_dir/dist/.agent8088-build-stamp" _web_tree
+    _web_tree="$(git -C "$INSTALL_DIR" rev-parse HEAD:web 2>/dev/null || true)"
+    if [ -f "$_dist_index" ] && { [ -z "$_web_tree" ] || _stamp_matches "$_build_stamp" "$_web_tree"; }; then
         log_success "Web UI frontend already built ($_web_dir/dist)"
         return
     fi
@@ -1546,22 +2212,30 @@ install_webui() {
         return
     fi
     local _rc=0
-    if [ ! -d "$_web_dir/node_modules" ]; then
+    local _modules_stamp="$_web_dir/node_modules/.agent8088-install-stamp" _web_inputs
+    _web_inputs="$(_npm_inputs_fingerprint "$_web_dir")"
+    if [ ! -d "$_web_dir/node_modules" ] || ! _stamp_matches "$_modules_stamp" "$_web_inputs"; then
         log_info "Installing Web UI npm dependencies..."
         run_with_timeout "$T_NPM" npm install --prefix "$_web_dir" \
-            --no-audit --no-fund >/dev/null 2>&1 || _rc=$?
+            --no-audit --no-fund >>"$INSTALL_LOG" 2>&1 </dev/null || _rc=$?
         if [ "$_rc" -ne 0 ]; then
             warn_stage "$_rc" "$T_NPM" "Web UI npm dependencies" \
                 "agent8088 --web unavailable" \
                 "cd \"$_web_dir\"; npm install"
             return
         fi
+        _write_stamp "$_modules_stamp" "$_web_inputs"
     fi
-    log_info "Building Web UI frontend..."
+    if [ -f "$_dist_index" ]; then
+        log_info "Rebuilding Web UI frontend (sources changed or the last build did not finish)..."
+    else
+        log_info "Building Web UI frontend..."
+    fi
     _rc=0
     run_with_timeout "$T_NPM" npm run build --prefix "$_web_dir" \
-        >/dev/null 2>&1 || _rc=$?
+        >>"$INSTALL_LOG" 2>&1 </dev/null || _rc=$?
     if [ "$_rc" -eq 0 ] && [ -f "$_dist_index" ]; then
+        [ -n "$_web_tree" ] && _write_stamp "$_build_stamp" "$_web_tree"
         log_success "Web UI frontend built ($_web_dir/dist)"
     else
         warn_stage "$_rc" "$T_NPM" "Web UI build" \
@@ -1573,17 +2247,21 @@ install_webui() {
 install_code_review() {
     # Run after install_node_bridge so a fresh machine can use managed Node.
     local prefix="$INSTALL_DIR/code-review" candidate rc=0
+    local _review_stamp="$prefix/.agent8088-install-stamp"
     for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
         [ -f "$candidate" ] || continue
         case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
         REVIEW_EXECUTABLE="$candidate"
         break
     done
-    if [ -n "$REVIEW_EXECUTABLE" ]; then
+    # The pinned version is the delegation contract, so an install of another
+    # version -- or one interrupted before its stamp -- is reinstalled.
+    if [ -n "$REVIEW_EXECUTABLE" ] && _stamp_matches "$_review_stamp" "$OPEN_CODE_REVIEW_VERSION"; then
         REVIEW_INSTALLED=true
         log_success "Code review engine already installed (skipping)"
         return
     fi
+    [ -n "$REVIEW_EXECUTABLE" ] && log_info "Code review engine is not the pinned $OPEN_CODE_REVIEW_VERSION or did not finish installing - reinstalling"
     if ! command -v npm >/dev/null 2>&1; then
         record_skip "code review engine" "npm not found" "install Node.js, then rerun the installer"
         return
@@ -1591,7 +2269,7 @@ install_code_review() {
     log_info "Installing code review engine (optional, for /review)..."
     run_with_timeout "$T_PIP" npm install --silent --no-fund --no-audit \
         --prefix "$prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" \
-        >/dev/null 2>&1 || rc=$?
+        >>"$INSTALL_LOG" 2>&1 </dev/null || rc=$?
     REVIEW_EXECUTABLE=""
     for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
         [ -f "$candidate" ] || continue
@@ -1601,6 +2279,7 @@ install_code_review() {
     done
     if [ "$rc" -eq 0 ] && [ -n "$REVIEW_EXECUTABLE" ]; then
         REVIEW_INSTALLED=true
+        _write_stamp "$_review_stamp" "$OPEN_CODE_REVIEW_VERSION"
         log_success "Code review engine installed"
     else
         warn_stage "$rc" "$T_PIP" "code review engine" \
@@ -1697,7 +2376,7 @@ install_native_sandbox() {
                                 crontab)    _apt_pkgs+=("cron") ;;
                             esac
                         done
-                        $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_apt_pkgs[@]}" >/dev/null 2>&1 || true
+                        _apt_install "$T_PIP" "${_apt_pkgs[@]}" || true
                         ;;
                     fedora)
                         local _dnf_pkgs=()
@@ -1782,25 +2461,46 @@ EOF
     log_success "agent8088 command linked at $shim"
 
     # Edit shell rc files to add link_dir to PATH if not present.
-    # macOS zsh on a clean install has no ~/.zshrc — touch it first.
-    local rc_files=()
-    case "$(basename "$SHELL")" in
-        zsh)  rc_files=("$HOME/.zshrc" "$HOME/.zprofile") ;;
-        bash) rc_files=("$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile") ;;
-        fish) rc_files=() ;;  # fish_add_path handles it differently
-        *)    rc_files=("$HOME/.profile") ;;
+    # The login shell's files are created when missing (macOS zsh on a clean
+    # install has no ~/.zshrc). Another shell's files are only edited when they
+    # already exist: someone whose SHELL is zsh but who opens bash in VS Code
+    # still gets the command, without the installer inventing dotfiles.
+    local rc_files=() other_rc=() bash_login="$HOME/.profile"
+    # bash reads only the FIRST of these at login; creating ~/.bash_profile next
+    # to an existing ~/.profile would silently stop ~/.profile being read.
+    if [ -f "$HOME/.bash_profile" ]; then bash_login="$HOME/.bash_profile"
+    elif [ -f "$HOME/.bash_login" ]; then bash_login="$HOME/.bash_login"
+    fi
+    case "$(basename "${SHELL:-sh}")" in
+        zsh)  rc_files=("$HOME/.zshrc" "$HOME/.zprofile")
+              other_rc=("$HOME/.bashrc" "$bash_login") ;;
+        bash) rc_files=("$HOME/.bashrc" "$bash_login")
+              other_rc=("$HOME/.zshrc" "$HOME/.zprofile") ;;
+        fish) rc_files=()  # conf.d file below
+              other_rc=("$HOME/.bashrc" "$bash_login" "$HOME/.zshrc" "$HOME/.zprofile") ;;
+        *)    rc_files=("$HOME/.profile")
+              other_rc=("$HOME/.bashrc" "$HOME/.zshrc") ;;
     esac
     local path_line="export PATH=\"$link_dir:\$PATH\""
-    for rc in "${rc_files[@]}"; do
+    for rc in ${rc_files[@]+"${rc_files[@]}"}; do
         [ -f "$rc" ] || touch "$rc"
         if ! grep -qF "$link_dir" "$rc" 2>/dev/null; then
             echo "$path_line" >> "$rc"
             log_info "Added $link_dir to PATH in $rc"
         fi
     done
-    # fish
-    if [ "$(basename "$SHELL")" = "fish" ] && command -v fish >/dev/null 2>&1; then
-        fish -c "fish_add_path $link_dir" 2>/dev/null || true
+    for rc in ${other_rc[@]+"${other_rc[@]}"}; do
+        [ -f "$rc" ] || continue
+        if ! grep -qF "$link_dir" "$rc" 2>/dev/null; then
+            echo "$path_line" >> "$rc"
+            log_info "Added $link_dir to PATH in $rc"
+        fi
+    done
+    # fish reads none of the files above. A conf.d snippet covers PATH and
+    # AGENT8088_CONFIG, is plain to read and remove, and works on fish < 3.2,
+    # which has no fish_add_path.
+    if command -v fish >/dev/null 2>&1 || [ -d "$HOME/.config/fish" ]; then
+        write_fish_config "$link_dir"
     fi
 
     # Probe whether the command is now resolvable in a fresh login shell.
@@ -1812,6 +2512,26 @@ EOF
                 grep -qF "$link_dir" "$HOME/.bashrc" 2>/dev/null || echo "$path_line" >> "$HOME/.bashrc"
             fi
         fi
+    fi
+}
+
+FISH_CONF_FILE="$HOME/.config/fish/conf.d/agent8088.fish"
+write_fish_config() {
+    local _dir="$1"
+    if ! mkdir -p "$(dirname "$FISH_CONF_FILE")" 2>/dev/null; then
+        log_warn "Could not create $(dirname "$FISH_CONF_FILE") - add $_dir to PATH in fish yourself"
+        return 0
+    fi
+    if {
+        echo "# Added by the agent8088 installer"
+        echo "if not contains -- \"$_dir\" \$PATH"
+        echo "    set -gx PATH \"$_dir\" \$PATH"
+        echo "end"
+        echo "set -gx AGENT8088_CONFIG \"$AGENT8088_HOME/config.txt\""
+    } > "$FISH_CONF_FILE" 2>/dev/null; then
+        log_info "Added $_dir to PATH for fish in $FISH_CONF_FILE"
+    else
+        log_warn "Could not write $FISH_CONF_FILE - add $_dir to PATH in fish yourself"
     fi
 }
 
@@ -1864,7 +2584,7 @@ drop_config() {
     # Set AGENT8088_CONFIG env var so the engine finds the user config.
     # Persist to shell rc files.
     local config_line="export AGENT8088_CONFIG=\"$AGENT8088_HOME/config.txt\""
-    for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    for rc in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
         [ -f "$rc" ] || continue
         if ! grep -qF "AGENT8088_CONFIG" "$rc" 2>/dev/null; then
             echo "$config_line" >> "$rc"
@@ -1876,14 +2596,65 @@ drop_config() {
 # ----------------------------------------------------------------------------
 # Stage 9: Verify + finish
 # ----------------------------------------------------------------------------
+# Which agent8088 a NEW terminal will run, and the one on the current PATH.
+# Warns when either is not the shim just written: a pip-installed or older copy
+# earlier in PATH otherwise runs instead, and every fix the user tries lands in
+# the copy that is not being used.
+check_command_shadowing() {
+    local _shim="$1" _link_dir="$2" _login="" _current="" _p
+    _current="$(command -v agent8088 2>/dev/null || true)"
+    case "$(basename "${SHELL:-}")" in
+        bash|zsh|sh|dash|ksh|fish)
+            if [ -x "${SHELL:-}" ]; then
+                _login="$(run_with_timeout 15 "$SHELL" -lc 'command -v agent8088' </dev/null 2>/dev/null | tail -n 1 || true)"
+            fi
+            ;;
+    esac
+    for _p in "$_login" "$_current"; do
+        [ -n "$_p" ] || continue
+        [ "$_p" = "$_shim" ] && continue
+        [ -e "$_p" ] && [ "$_p" -ef "$_shim" ] && continue
+        log_warn "Another agent8088 at $_p will run instead of $_shim."
+        log_info "  Remove it, or put $_link_dir first in PATH."
+        return 0
+    done
+    return 0
+}
+
 verify_install() {
     log_info "Verifying install..."
-    local shim="$(get_command_link_dir)/agent8088"
+    local link_dir shim _ready=false _version=""
+    link_dir="$(get_command_link_dir)"
+    shim="$link_dir/agent8088"
+    # Actually run it: a shim that exists but cannot import the package used to
+    # print "Done. Run agent8088 to start." anyway.
     if [ -x "$shim" ]; then
-        "$shim" --version 2>/dev/null && log_success "agent8088 is ready" || true
+        if run_logged 120 "$shim" --version; then
+            _ready=true
+            _version="$(tail -n 1 "$LAST_STEP_LOG" 2>/dev/null)"
+        fi
     fi
+    if [ "$_ready" = true ]; then
+        log_success "agent8088 is ready${_version:+ ($_version)}"
+    else
+        echo ""
+        log_error "agent8088 was installed but does not start."
+        if [ -x "$shim" ]; then
+            show_step_failure
+        else
+            log_error "The command shim is missing: $shim"
+        fi
+        log_info "See the error directly:  \"$INSTALL_DIR/venv/bin/python\" -m agent8088.cli --version"
+        log_info "Fix: re-run the installer: $INSTALL_CMD"
+        log_info "If that fails too, rebuild the environment: rm -rf \"$INSTALL_DIR/venv\", then re-run."
+    fi
+    check_command_shadowing "$shim" "$link_dir"
     echo ""
-    echo -e "\033[0;32mDone.\033[0m  Run \033[1magent8088\033[0m to start."
+    if [ "$_ready" = true ]; then
+        echo -e "\033[0;32mDone.\033[0m  Run \033[1magent8088\033[0m to start."
+    else
+        echo -e "\033[0;31mInstall incomplete:\033[0m agent8088 does not start (see above)."
+    fi
     echo "  Config: $AGENT8088_HOME/config.txt"
     # Readiness summary - reflects what actually installed, not static text.
     if [ "$GATEWAY_EXTRAS_INSTALLED" = true ]; then
@@ -1941,12 +2712,26 @@ verify_install() {
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
     echo "  Update: curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh | AGENT8088_BRANCH=$BRANCH bash"
+    [ "$INSTALL_LOG" != "/dev/null" ] && echo "  Log:    $INSTALL_LOG"
     echo ""
-    echo "If 'agent8088: command not found', open a NEW terminal (PATH was updated)."
+    case ":$PATH:" in
+        *":$link_dir:"*) ;;
+        *)
+            echo "New terminals will find agent8088. To use it in THIS terminal now, run:"
+            if [ "$(basename "${SHELL:-}")" = "fish" ]; then
+                echo "  set -gx PATH \"$link_dir\" \$PATH"
+            else
+                echo "  export PATH=\"$link_dir:\$PATH\""
+            fi
+            ;;
+    esac
+    [ "$_ready" = true ] && echo "Start agent8088, then enter /doctor to check your setup."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
     # view minutes ago on a multi-minute install, which is how a failed WhatsApp
     # bridge got reported and still went unnoticed.
+    write_install_state
     print_skipped_summary
+    [ "$_ready" = true ]
 }
 
 run_agent8088_command() {
@@ -2026,21 +2811,37 @@ launch_initial_agent() {
 # ----------------------------------------------------------------------------
 main() {
     print_banner
-    detect_os
-    install_uv
-    check_python
-    check_git
-    clone_repo
-    install_deps
-    install_node_bridge
-    install_webui
-    install_code_review
-    install_embedding_model
-    install_native_sandbox
-    setup_path
-    drop_config
-    run_initial_setup
-    verify_install
+    # Before anything is written into $HOME: under sudo that is the wrong home.
+    check_invoking_user
+    acquire_install_lock
+    init_install_log
+    install_traps
+
+    _enter_stage "OS detection";                 detect_os
+    _enter_stage "pre-flight checks"
+    if ! check_disk_space; then _INSTALL_STOP_REPORTED=true; exit 1; fi
+    check_connectivity
+    _enter_stage "uv setup";                     install_uv
+    _enter_stage "Python setup";                 check_python
+    _enter_stage "Git setup";                    check_git
+    _enter_stage "repository download";          clone_repo
+    _enter_stage "Python package install";       install_deps
+    _enter_stage "Node.js / WhatsApp bridge";    install_node_bridge
+    _enter_stage "Web UI build";                 install_webui
+    _enter_stage "code review engine";           install_code_review
+    _enter_stage "embedding model";              install_embedding_model
+    _enter_stage "native sandbox";               install_native_sandbox
+    _enter_stage "command link";                 setup_path
+    _enter_stage "config";                       drop_config
+    # The install itself is done. Ctrl-C in the setup wizard or the agent is the
+    # user leaving it, not an interrupted install, so drop the INT/TERM report
+    # (the EXIT trap still releases the lock).
+    trap - INT TERM
+    _enter_stage "first-run setup";              run_initial_setup
+    _enter_stage "verification"
+    if ! verify_install; then _INSTALL_STOP_REPORTED=true; exit 1; fi
+    STAGE=""
+    release_install_lock
     launch_initial_agent
 }
 
