@@ -43,6 +43,44 @@ without an isolated `HOME` during testing. See
 agent8088 --setup
 ```
 
+### Windows: "This script contains malicious content and has been blocked by your antivirus software"
+
+The Windows installer works inside Windows Terminal. If it is not installed (or
+is too old), the installer sets it up and reopens itself there. Security
+software on some machines blocked the helper window that did this, because it
+was launched with an encoded PowerShell command. The handoff now uses plain,
+readable text instead, and when Windows Terminal is not installed at all it is
+installed from the window you are already in, with no helper window.
+
+If a security product still blocks the new window, install in the window you
+are in:
+
+```powershell
+$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"
+$env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+```
+
+Or answer `c` ("continue in this window") at the Windows Terminal prompt. Agent8088
+still runs in a plain PowerShell window, but colours and box drawing may display
+poorly; Windows Terminal remains the supported host.
+
+An installer driven by another program (an agent, a script) cannot answer that
+prompt and stops with a message naming `AGENT8088_SKIP_TERMINAL_CHECK=1`. Set it
+in that environment to install without Windows Terminal. The installer also
+accepts `-SkipTerminalCheck` when run as a script file.
+
+### Windows: "continuing in the new window", but no window opens
+
+The installer used to report success as soon as it had asked Windows to open
+Windows Terminal, and the helper window ("Agent8088 Terminal Setup") could quit
+right after its banner without installing anything at all. Now the new window
+reports back when it starts, and the installer waits for that (60 seconds by
+default) before saying it continues there. If no window starts in time you get
+an error naming the fix instead of a silent stop: open Windows Terminal yourself
+and run the install command in it, or install in the current window with
+`AGENT8088_SKIP_TERMINAL_CHECK=1` as above. On a slow machine, allow longer with
+`$env:AGENT8088_HANDOFF_TIMEOUT = "120"`.
+
 ## Model & providers
 
 ### `'anthropic' is not a known provider`

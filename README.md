@@ -79,7 +79,7 @@ The installer provisions an isolated Python environment, installs the global `ag
 | macOS 12+ (Apple Silicon & Intel) | Supported | `install.sh` |
 | Ubuntu / Debian / Fedora / Arch (x64, arm64) | Supported | `install.sh` |
 | WSL2 | Supported | `install.sh`; clone with LF line endings, not CRLF |
-| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1` |
+| Windows 10 (1903+) / 11, in Windows Terminal | Supported | `install.ps1`; blocked by security software or unattended? set `AGENT8088_SKIP_TERMINAL_CHECK=1` ([troubleshooting](docs/wiki/13-troubleshooting.md)) |
 | Windows Server, legacy Console Host, PowerShell ISE | Not supported | needs a modern terminal host — see `install.ps1`'s terminal check |
 | Alpine / other non-glibc Linux | Best-effort | works if bash, curl-or-wget, and Python 3.10+ are present |
 | Corporate proxy (`HTTP_PROXY`/`HTTPS_PROXY`) | Supported | both installers honor standard proxy env vars |

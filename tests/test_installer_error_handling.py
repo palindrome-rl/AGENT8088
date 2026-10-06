@@ -715,3 +715,15 @@ def test_ps_warns_when_running_elevated():
     assert "Show-AdministratorWarningIfNeeded" in source
     warn = _ps_function("Show-AdministratorWarningIfNeeded")
     assert "non-admin" in warn
+
+
+def test_ps_uv_copies_instead_of_hardlinking_but_keeps_a_user_choice():
+    """uv hardlinks package files out of one shared cache. Once a cached file is
+    also linked into a venv inside a OneDrive-synced folder, Windows refuses any
+    further hardlink to it ("The cloud operation cannot be performed on a file
+    with incompatible hardlinks", os error 396), and every new install on that
+    machine failed at `uv pip install`."""
+    source = (ROOT / "install.ps1").read_text(encoding="utf-8")
+    line = 'if (-not $env:UV_LINK_MODE) { $env:UV_LINK_MODE = "copy" }'
+    assert line in source
+    assert source.index(line) < source.index("function Install-Uv")  # before any uv runs
