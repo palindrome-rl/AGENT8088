@@ -24,6 +24,14 @@ from agent8088 import engine
 
 
 @pytest.fixture(autouse=True)
+def _no_static_fetch(monkeypatch):
+    """browse_page falls back to a static HTML read when Playwright/Chromium is
+    missing; keep these tests off the network by making that fetch fail."""
+    monkeypatch.setattr(engine, "_fetch_url_bytes",
+                        lambda url: (None, "network disabled in tests", None))
+
+
+@pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
     # Each test gets a fresh memoization cache: cached successes from another
