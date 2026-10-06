@@ -46,6 +46,14 @@ function Set-InstallerExitStatus {
 # checks and Test-Path instead, matching the Hermes installer pattern.
 $ErrorActionPreference = "Continue"
 
+# uv hardlinks package files out of one shared cache. Once a cached file is also
+# linked into a venv inside a OneDrive-synced folder, Windows refuses any further
+# hardlink to it ("The cloud operation cannot be performed on a file with
+# incompatible hardlinks", os error 396), and every new install on that machine
+# failed at `uv pip install`. Copying costs some disk and cannot fail that way.
+# A value the user set is kept.
+if (-not $env:UV_LINK_MODE) { $env:UV_LINK_MODE = "copy" }
+
 # Suppress Invoke-WebRequest's per-chunk progress bar. Windows PowerShell 5.1's
 # progress UI repaints synchronously on every received byte, pegging CPU on a
 # single core and throttling downloads by 10-100x.
