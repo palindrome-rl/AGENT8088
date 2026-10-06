@@ -171,3 +171,40 @@ def test_mcp_server_entrypoint_uses_configure_logging():
         "mcp_server.py must import and call configure_logging from "
         "logging_setup to attach the operational log sink."
     )
+
+
+def test_asyncio_noise_goes_to_the_log_file_not_the_terminal(log_dir, capsys):
+    # Playwright's sync driver leaves tasks that asyncio reports as "Task was
+    # destroyed but it is pending!" -- it used to land under the prompt at exit.
+    asyncio_logger = logging.getLogger("asyncio")
+    saved = (asyncio_logger.handlers[:], asyncio_logger.propagate, asyncio_logger.level)
+    # The browser path sets this logger to CRITICAL and it outlives that test.
+    asyncio_logger.setLevel(logging.NOTSET)
+    # An earlier configure_logging in this process left its handler (another tmp dir).
+    asyncio_logger.handlers = [h for h in asyncio_logger.handlers
+                               if not isinstance(h, L.DailyJsonlHandler)]
+    try:
+        L.configure_logging()
+        asyncio_logger.error("Task was destroyed but it is pending!")
+        assert "Task was destroyed" not in capsys.readouterr().err
+        for handler in asyncio_logger.handlers:
+            handler.flush()
+        assert any("Task was destroyed" in r.get("msg", "") for r in _read_jsonl(_today_file(log_dir)))
+    finally:
+        asyncio_logger.handlers, asyncio_logger.propagate = saved[0], saved[1]
+        asyncio_logger.setLevel(saved[2])
+
+
+def test_a_record_after_close_is_dropped_quietly(tmp_path, capsys):
+    # At exit logging.shutdown() closes the handler, then asyncio reports a
+    # library's orphaned task through it; that printed "--- Logging error ---".
+    handler = L.DailyJsonlHandler(tmp_path)
+    logger = logging.getLogger("agent8088.test_after_close")
+    logger.addHandler(handler)
+    try:
+        logger.error("before close")
+        handler.close()
+        logger.error("after close")
+    finally:
+        logger.removeHandler(handler)
+    assert "Logging error" not in capsys.readouterr().err
