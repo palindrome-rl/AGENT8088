@@ -6,6 +6,68 @@ Symptom-first. Run `/doctor [--fix]` in the REPL for an automated health check
 (`--fix` repairs a broken web-search install), or `/dump` to produce a
 redacted bundle for a bug report.
 
+## Reduced modes and fallbacks
+
+When an optional piece is missing or fails, agent8088 keeps working on a
+fallback instead of stopping — and says so. Every surface reads the same
+registry, so they always agree:
+
+- **Startup banner** — `⚠ limited: search=ddgs · memory_embed=keyword-only (BM25) — /doctor`
+  lists each capability not running as preferred (`name=what is serving`, or
+  `off` when nothing is). No line means nothing is limited.
+- **Mid-session notices** — a dim `⚠ search switched to ddgs (...)` /
+  `✓ search upgraded back to searxng` line, printed after a tool result or
+  before the next prompt, only when a state *changes*.
+- **`/status`** — one `Limited` row per degraded capability: what serves, why,
+  and the fix. The `Model` row shows `→ answering with <fallback>` after a
+  failover.
+- **`/doctor`** (and `--doctor`, `/api/doctor`) — a `warn` row per limited
+  capability (`Limited: <name>`, or its own row for web search, OCR and
+  document conversion) with the fix command. Only an unavailable *model* is a
+  `fail`; everything else is optional.
+- **Web UI** — a `⚠ N limited` badge in the header. Click it for each
+  capability's active vs. preferred backend, reason, impact and a copyable
+  fix. It updates live (the server pushes a `capabilities` websocket event on
+  every state change). The status bar shows `→ answering with X` after a model
+  failover, the model picker marks a built-in list as `(offline list — <reason>)`,
+  and Config shows where the context window came from.
+- **The model** — tool results from a degraded backend carry a one-line
+  `[note: ...]` caveat (e.g. ddgs: "coverage may be incomplete"), and
+  `/capabilities` has a "Limited right now" section, so the agent can qualify
+  its answer instead of over-trusting a fallback.
+
+**Web search fallback policy.** With `web_search_provider=auto` (the default),
+startup picks the best backend that actually answers. If a local SearXNG stops
+answering mid-session, searches move to the keyless `ddgs` without prompting,
+and the switch is announced. auto never falls through to a keyed vendor
+(tavily/exa) or a remote SearXNG without your approval. SearXNG is re-probed
+at most every `web_search_reprobe_seconds` (default 300, `0` = never) and auto
+switches back up when it answers. An explicit `web_search_provider=searxng`
+is a pin: it never auto-switches and keeps its per-query prompt, so with
+SearXNG down a search fails or asks before using public ddgs
+(`/search use auto` restores the silent fallback).
+
+| Capability | Typical fallback | Typical fix |
+|---|---|---|
+| `search` | ddgs instead of SearXNG | `/search setup` (local SearXNG) or add a tavily/exa key; `/doctor --fix` if ddgs itself is broken |
+| `model` | a `fallback_models` entry answers | `/doctor` to see why the primary failed, or `/model` |
+| `context` | assumed default context window | `provider.<name>.context_window=<tokens>` in config.txt |
+| `memory` | native engine instead of mem0 | `agent8088 --memory-setup`, or `memory_engine=native` |
+| `memory_embed` | keyword-only (BM25) recall | `ollama pull <embed model>` or `agent8088 --memory-setup` |
+| `sandbox` | Docker instead of native, or none | `/sandbox setup`, or start Docker |
+| `browser` | static HTML fetch, no JavaScript | `python -m playwright install chromium` (exact command in `/doctor`) |
+| `mcp` | some or all MCP servers not connected | `/mcp` |
+| `ocr` | scanned PDFs/images unreadable | install the `[ocr]` extra (command in `/doctor`) |
+| `documents` | read/build only, no .docx/.pptx/.xlsx conversion | install LibreOffice |
+| `gateway` | an enabled adapter is disabled (missing dependency); also printed at gateway startup | `uv pip install -e ".[gateway]"` |
+| `install` | optional installer stages were skipped (from `install-state.json`) | the per-stage fix shown, or re-run the installer |
+
+The `install` entry comes from `$AGENT8088_HOME/install-state.json`, which the
+installer rewrites on every run (so a stage fixed by a re-run disappears). It
+reflects install time; when a stage has its own live entry (Chromium →
+`browser`, ddgs → `search`, ...), or its dependency is present now, only the
+live state is shown.
+
 ## Install & startup
 
 ### `No module named pytest` / `No module named slack_bolt`

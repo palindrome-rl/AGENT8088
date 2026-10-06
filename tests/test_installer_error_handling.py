@@ -40,6 +40,17 @@ def _sh_function(name: str) -> str:
     return match.group(0)
 
 
+def _default_signals():
+    # A non-interactive bash cannot trap a signal that was ignored when it
+    # started. pytest launched as a background job (or under a harness that
+    # ignores SIGINT) passes SIG_IGN down, and the installer's INT/TERM traps
+    # then silently never fire -- the interrupt test failed every time there
+    # while passing in a terminal. Start the shell the way a terminal would.
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
 def _run_sh(tmp_path: Path, body: str, *functions: str, env: dict | None = None):
     script = tmp_path / "harness.sh"
     script.write_text(
@@ -49,7 +60,8 @@ def _run_sh(tmp_path: Path, body: str, *functions: str, env: dict | None = None)
     run_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path)}
     run_env.update(env or {})
     return subprocess.run([BASH, str(script)], capture_output=True, text=True,
-                          env=run_env, timeout=60)
+                          env=run_env, timeout=60,
+                          preexec_fn=_default_signals if os.name == "posix" else None)
 
 
 def _fake_bin(tmp_path: Path, name: str, body: str) -> Path:
