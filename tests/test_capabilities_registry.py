@@ -6,6 +6,7 @@ The registry is the single place the banner, /status, /doctor, /capabilities,
 import json
 import logging
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,7 +47,7 @@ def test_repeating_a_report_is_idempotent(monkeypatch):
     seen = []
     C.subscribe(seen.append)
     clock = iter([100.0, 200.0, 300.0])
-    monkeypatch.setattr(C.time, "time", lambda: next(clock))
+    monkeypatch.setattr(C, "time", SimpleNamespace(time=lambda: next(clock)))
     _degrade_search()
     assert _degrade_search(reason="still down") is False
     entry = C.get(C.SEARCH)
@@ -58,7 +59,7 @@ def test_repeating_a_report_is_idempotent(monkeypatch):
 
 def test_a_state_change_resets_since(monkeypatch):
     clock = iter([100.0, 200.0])
-    monkeypatch.setattr(C.time, "time", lambda: next(clock))
+    monkeypatch.setattr(C, "time", SimpleNamespace(time=lambda: next(clock)))
     _degrade_search()
     assert C.report(C.SEARCH, active="searxng") is True
     assert C.get(C.SEARCH).since == 200.0
