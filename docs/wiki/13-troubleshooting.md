@@ -69,6 +69,18 @@ prompt and stops with a message naming `AGENT8088_SKIP_TERMINAL_CHECK=1`. Set it
 in that environment to install without Windows Terminal. The installer also
 accepts `-SkipTerminalCheck` when run as a script file.
 
+### Windows: "continuing in the new window", but no window opens
+
+The installer used to report success as soon as it had asked Windows to open
+Windows Terminal, and the helper window ("Agent8088 Terminal Setup") could quit
+right after its banner without installing anything at all. Now the new window
+reports back when it starts, and the installer waits for that (60 seconds by
+default) before saying it continues there. If no window starts in time you get
+an error naming the fix instead of a silent stop: open Windows Terminal yourself
+and run the install command in it, or install in the current window with
+`AGENT8088_SKIP_TERMINAL_CHECK=1` as above. On a slow machine, allow longer with
+`$env:AGENT8088_HANDOFF_TIMEOUT = "120"`.
+
 ## Model & providers
 
 ### `'anthropic' is not a known provider`

@@ -208,6 +208,12 @@ function Get-WindowsTerminalExecutable {{ return 'C:\\mock\\wt.exe' }}
 {_powershell_function('ConvertTo-PowerShellLiteral')}
 {_powershell_function('New-HandoffCommand')}
 {_powershell_function('Get-InstallerInvocation')}
+{_powershell_function('New-HandoffMarker')}
+{_powershell_function('Get-HandoffTimeoutSeconds')}
+{_powershell_function('Write-HandoffFallbackHelp')}
+# The launch is stubbed, so nothing writes the started marker; the handshake
+# itself is covered in test_installer_terminal_handoff_confirm.py.
+function Wait-HandoffStarted {{ param([string]$Marker, [int]$TimeoutSeconds) return $true }}
 {_powershell_function('Start-InstallerInWindowsTerminal')}
 $result = Start-InstallerInWindowsTerminal
 $last = $script:startedArguments[-1]
@@ -229,6 +235,7 @@ Write-Output ([IO.File]::ReadAllText($file))
     assert "-InstallDir 'C:\\Agent Install'" in launcher
     assert "-SkipSetup:$true" in launcher
     assert "Remove-Item -LiteralPath" in launcher              # the window removes the file itself
+    assert ".started" in launcher                              # ...then reports that it started
 
 
 def test_terminal_upgrade_runs_in_visible_external_bootstrap(tmp_path):

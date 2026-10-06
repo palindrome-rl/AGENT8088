@@ -1155,8 +1155,13 @@ function Start-InstallerInWindowsTerminal {
         return $false
     }
 
+    # The new window's first act is to write this marker. Start-Process returning
+    # only means wt.exe was launched; on a fresh install it can still open nothing
+    # (alias not registered yet, or the packaged exe refusing a direct launch).
+    $marker = New-HandoffMarker
+    $markerLiteral = ConvertTo-PowerShellLiteral $marker
     $installCommand = Get-InstallerInvocation -PreferLocalScript
-    $handoff = New-HandoffCommand -Command $installCommand
+    $handoff = New-HandoffCommand -Command ("[IO.File]::WriteAllText($markerLiteral, [string]`$PID)`r`n$installCommand")
     $powerShellExe = Get-PowerShellHostExe
     $terminalArgs = @(
         "-w", "new", "`"$powerShellExe`"", "-NoExit", "-ExecutionPolicy", "Bypass",
@@ -1164,15 +1169,62 @@ function Start-InstallerInWindowsTerminal {
     )
     try {
         Start-Process -FilePath $terminalExe -ArgumentList $terminalArgs | Out-Null
-        Write-Success "Continuing installation in Windows Terminal..."
+    } catch {
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+        Write-Err "Could not launch Windows Terminal: $_"
+        Write-HandoffFallbackHelp
+        return $false
+    }
+    $timeout = Get-HandoffTimeoutSeconds
+    Write-Info "Opening Windows Terminal (waiting up to $timeout seconds for it to start)..."
+    if (Wait-HandoffStarted -Marker $marker -TimeoutSeconds $timeout) {
+        Write-Success "Installation is continuing in the new Windows Terminal window."
         # A blocked launch is reported inside that new window, where this one
         # cannot see it; say here how to get past it.
         Write-Info "If that window shows an error instead of progress (security software can block it), close it and install in this window: `$env:AGENT8088_SKIP_TERMINAL_CHECK = '1', then run the install command again."
         return $true
-    } catch {
-        Write-Err "Could not launch Windows Terminal: $_"
-        return $false
     }
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    Write-Err "Windows Terminal did not start the installer within $timeout seconds."
+    Write-HandoffFallbackHelp
+    return $false
+}
+
+function Write-HandoffFallbackHelp {
+    Write-Info "Open Windows Terminal yourself (Start menu > Terminal) and run the install command there,"
+    Write-Info "or install in this window: `$env:AGENT8088_SKIP_TERMINAL_CHECK = '1', then run the install command again."
+    Write-Info "If a Windows Terminal window did appear and is installing, let it finish."
+}
+
+function New-HandoffMarker {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) "agent8088-handoff"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    return (Join-Path $dir ("{0}.started" -f [guid]::NewGuid().ToString("N")))
+}
+
+function Get-HandoffTimeoutSeconds {
+    # Windows Terminal's first launch after an install can take a while.
+    $value = 0
+    if ([int]::TryParse([string]$env:AGENT8088_HANDOFF_TIMEOUT, [ref]$value) -and $value -gt 0) {
+        return $value
+    }
+    return 60
+}
+
+function Wait-HandoffStarted {
+    param(
+        [Parameter(Mandatory = $true)][string]$Marker,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        if (Test-Path -LiteralPath $Marker) {
+            Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    return (Test-Path -LiteralPath $Marker)
 }
 
 function Start-TerminalUpgradeBootstrap {
@@ -3271,7 +3323,11 @@ function Start-InitialAgent {
 # Main
 # ----------------------------------------------------------------------------
 Write-Banner
-Set-InstallerExitStatus -ExitCode 0
+# Reset only. Set-InstallerExitStatus would `exit` here in the -TerminalBootstrap
+# child, which then quit right after the banner with status 0: it never installed
+# Windows Terminal or opened the new window, and the helper window reported
+# "continuing in the new window" anyway.
+$global:LASTEXITCODE = 0
 if ($WithLibreOffice -and $SkipLibreOffice) {
     Write-Err "-WithLibreOffice and -SkipLibreOffice cannot be used together."
     Set-InstallerExitStatus -ExitCode 1
