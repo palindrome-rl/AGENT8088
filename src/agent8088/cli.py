@@ -2462,6 +2462,115 @@ COMMAND_SPECS = (
     ("exit", "/exit, /quit", "Leave", ()),
 )
 
+# What each command and subcommand actually does, read off its handler. The
+# agent answers "what does /x do?" from this; with only the one-line usage
+# above it filled the gaps itself and got them wrong (bare /memory "lists every
+# fact" -- it shows the settings; forget "takes a fact" -- it takes an id).
+# verify_everything checks every command has an entry and none is stale.
+COMMAND_DETAILS = {
+    "tools": "/tools lists every tool with a short description; /tools --full shows the full "
+             "descriptions; /tools <name> shows one tool's schema (arguments and types).",
+    "capabilities": "Prints the full self-report: tools, MCP servers, skills, sub-agents, "
+                    "limits and active guardrails.",
+    "tool": "/tool <name> <args> runs one tool directly, args as JSON or key=value; normal "
+            "permissions apply. /tool describe <name> shows its schema.",
+    "agents": "/agents lists sub-agent profiles; /agents new [name] creates one; /agents edit "
+              "<name>; /agents delete <name>; /agents models sets which model each one uses.",
+    "agent": "/agent opens a picker; /agent <name> [task] runs that sub-agent and stays in its "
+             "loop until you type /quit; each sub-agent keeps its own conversation.",
+    "skills": "/skills lists installed skills and whether each is enabled; /skills <name> shows "
+              "one; /skills enable <name> or /skills disable <name> toggles it for this session.",
+    "cli-anything": "/cli-anything shows whether the CLI-Anything runtime is set up; "
+                    "/cli-anything <task> has the agent do that task through CLI-Anything "
+                    "(find, install and run an application's CLI harness).",
+    "plan": "/plan enters plan mode: the agent only reads and proposes a plan, and the plan runs "
+            "after you approve it. /plan <task> starts planning that task.",
+    "audit": "/audit shows whether step verification is on; /audit on checks each changing step "
+             "against the real files after it runs (one extra model call per step); /audit off "
+             "turns it off. Saved to config.txt.",
+    "fusion": "/fusion <question> asks every model on the panel in parallel and a blind judge "
+              "picks the best answer; /fusion setup configures the panel; --panel "
+              "provider:model,... and --judge provider:model override it for one question.",
+    "image": "/image <path-or-url> [question] sends a screenshot or diagram to a vision model "
+             "and answers the question about it.",
+    "raw": "/raw <prompt> makes one model call with no tools or agent loop and shows the "
+           "content, reasoning and tool_calls it returned.",
+    "model": "/model lists configured providers and the active model; /model <provider> or "
+             "/model <provider>:<model> switches; /model setup adds a provider; /model auto "
+             "(auto:fast, auto:smart) climbs a ladder of models when a turn struggles; "
+             "/model auto setup builds that ladder.",
+    "models": "/models opens a provider and model picker; /models <provider> picks a model from "
+              "that provider; /models custom connects a self-hosted endpoint.",
+    "mcp": "/mcp (or /mcp list) shows MCP servers and their state; /mcp add <name> stdio "
+           "<command> [args] [--project] or /mcp add <name> http <url> [--project]; /mcp remove "
+           "<name>; /mcp reload reconnects them.",
+    "sandbox": "/sandbox shows the sandbox backend, whether it is verified, and its network "
+               "access; /sandbox auto|native|docker picks the backend; /sandbox setup installs "
+               "the native sandbox runtime.",
+    "status": "Shows the model, context use, tools, skills and session state.",
+    "doctor": "/doctor checks the model endpoint, auth and config, tools and skills; /doctor "
+              "--fix also repairs a broken web-search install.",
+    "review": "/review lists stored reviews; /review --from REF --to REF (or --commit SHA) "
+              "reviews those Git changes and prints findings with file, line and severity; "
+              "--mode native|delegated|auto and --repo PATH adjust it; --resume <id> reopens "
+              "one. Read-only.",
+    "local": "/local (or /local check) probes this machine's hardware and scores the installed "
+             "models; /local list shows models pulled into Ollama; /local available [query] "
+             "browses ollama.com for models that fit this machine; /local pull <name> downloads "
+             "one (e.g. qwen3:0.6b); /local remove <name> deletes one.",
+    "dump": "Writes a redacted diagnostic bundle (no API keys or tokens) to dump.txt in the "
+            "agent's data folder, for bug reports.",
+    "search": "/search (or /search status) shows the web-search backends and which are ready; "
+              "/search use <searxng|ddgs|tavily|exa|auto> pins one; /search setup starts a "
+              "local SearXNG in Docker and saves it; /search stop stops it; /search doctor "
+              "checks the SearXNG setup.",
+    "mode": "/mode shows the permission mode; /mode readonly or /mode full-auto changes it "
+            "(edit is an alias for full-auto). Plan mode is started with /plan, not /mode.",
+    "new": "/new <name> creates a named session that is saved and can be resumed later.",
+    "sessions": "Lists named sessions, newest first, with their message counts.",
+    "resume": "/resume <name> loads a named session (see /sessions).",
+    "reset": "Clears the current conversation, asking first if it has messages, and keeps the "
+             "session name.",
+    "compact": "/compact [keep] summarizes older messages and keeps the newest <keep> (default "
+               "6, at least 2).",
+    "limits": "/limits shows every limit; /limits <key> <value> changes one (e.g. "
+              "/limits max_tool_timeout_seconds 120); /limits subagent <name> <turns>; /limits "
+              "tool <name> <seconds>; /limits provider <name> <key> <value|default>. Saved to "
+              "config.txt.",
+    "cost": "/cost summarizes recorded model calls, errors, latency and cost estimates "
+            "(estimates only); /cost <task-id> narrows it to one task; /cost on|off turns "
+            "recording on or off.",
+    "memory": "/memory shows the memory settings and state (engine, how many memories, the "
+              "store, the embedder) -- not the memories themselves; /memory search <query> "
+              "finds stored memories and their ids; /memory add <text> stores one; /memory "
+              "forget <id> deletes one (ids from /memory search); /memory engine native|mem0; "
+              "/memory notify off|on|verbose; /memory test runs one extraction on a sample; "
+              "/memory clear deletes all stored memories after asking; /memory on|off.",
+    "config": "Shows the active configuration (model, endpoint, paths) and where config.txt is.",
+    "history": "Shows the current conversation.",
+    "trace": "/trace on|off turns capturing the step-by-step JSON trace on or off; /trace save "
+             "[path] saves the full conversation trace.",
+    "verbose": "/verbose on|off|full sets how much tool activity is shown; full also records "
+               "the trace.",
+    "usage": "/usage shows the setting; /usage off|tokens|full sets the summary printed after "
+             "each turn.",
+    "reasoning": "/reasoning on|off shows or hides the model's thinking (hidden by default).",
+    "temp": "/temp <0.0-2.0> sets the sampling temperature for this session.",
+    "maxturns": "/maxturns <n> sets how many rounds the agent may take per request (at least 1).",
+    "tool-selection": "/tool-selection shows the mode; /tool-selection hybrid|full|auto sets how "
+                      "many tool schemas are sent to the model each turn. Saved.",
+    "save": "/save <file> saves the conversation and the last trace to a JSON file.",
+    "task": "/task start <goal> starts a durable task that survives restarts; /task resume <id>; "
+            "/task end <id>; /task output <id> shows its latest answer; /task list.",
+    "schedule": "/schedule list; /schedule add <cron> <task> runs the task on a schedule (5-field "
+                "cron, e.g. \"0 9 * * *\" is daily at 9am; uses cron or Task Scheduler); "
+                "/schedule remove <number-or-task>.",
+    "browser": "/browser status shows the reusable browser session; /browser close or /browser "
+               "reset closes it.",
+    "help": "Lists every command.",
+    "exit": "/exit or /quit leaves Agent8088.",
+}
+
 
 def command_catalog():
     """Structured command help shared by the CLI and web UI."""
@@ -2470,6 +2579,25 @@ def command_catalog():
             temperature=S.temperature, max_turns=S.max_turns), "aliases": list(aliases)}
         for name, usage, description, aliases in COMMAND_SPECS
     ]
+
+
+# The model only ever sees tool schemas; this tells the engine which commands
+# the person can type here, so "what does /local do" is answered from this
+# table instead of guessed. The web UI imports this module and shares it; the
+# gateway registers its own commands when it starts.
+def _unknown_command_message(cmd: str) -> str:
+    """`/seatch` -> suggest /search, instead of only pointing at /help."""
+    import difflib
+    close = difflib.get_close_matches(cmd.lower(), COMMANDS, n=1, cutoff=0.6)
+    hint = f" — did you mean /{close[0]}?" if close else ""
+    return f"[red]unknown command:[/red] /{cmd}{hint}  (try /help)"
+
+
+A.register_frontend_commands({
+    name: (command["usage"], command["description"], COMMAND_DETAILS.get(command["name"], ""))
+    for command in command_catalog() if command["name"]
+    for name in (command["name"], *command["aliases"])
+})
 
 
 def cmd_help(_):
@@ -4687,7 +4815,7 @@ def cmd_local(rest):
     parts = (rest or "").strip().split(None, 1)
     sub = parts[0].lower() if parts else ""
     arg = parts[1] if len(parts) > 1 else ""
-    if sub == "":
+    if sub in ("", "check"):  # `check` is the advertised name for the bare form
         _cmd_local_check()
     elif sub == "list":
         _cmd_local_list()
@@ -9406,7 +9534,7 @@ def _repl_loop():
             if handler:
                 _run_repl_command(handler, rest)
             else:
-                console.print(f"[red]unknown command:[/red] /{cmd}  (try /help)")
+                console.print(_unknown_command_message(cmd))
             continue
         pasted = _detect_pasted_file(line)
         if pasted and _handle_pasted_file(*pasted, original=line):

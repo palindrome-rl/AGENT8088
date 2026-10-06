@@ -122,6 +122,14 @@ path:
 | Extensions | `.pem`, `.key`, `.rsa`, `.p12` |
 | Globs | `*_KEY*`, `*_SECRET*`, `*_TOKEN*`, `*_PASSWORD*` (and lowercase) |
 
+Two narrow exceptions keep ordinary project files usable. Env templates
+(`.env.example`, `.env.sample`, `.env.template`, `.env.dist`) hold no values and
+are judged by their directory only, so `cat .env.example` works while `.env`,
+`.env.local`, `.envrc` and `~/.ssh/.env.example` stay blocked. The globs skip
+source files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.md`, …), so
+`count_tokens.py` and `reset_password.py` are code, while `api_key.txt`,
+`client_secret.json` and `github_token` are still credentials.
+
 This covers indirect routes too: symlinks are resolved before the check, and
 `git show HEAD:.env` / `git diff -- .env` are blocked explicitly because they'd
 otherwise read a credential without touching the file tool.
@@ -170,6 +178,14 @@ full-auto and even after a grant. The check sees through `sh -c '...'`,
 `git -C /path push`, `/usr/bin/git push`, and `echo hi; git push`. Meanwhile
 `echo git push` and `grep git push file` are correctly *not* blocked — it
 distinguishes git-as-a-command from git-as-a-word.
+
+Only operations that can lose work are refused. `git checkout -b <new>`,
+`git branch -d` / `--delete` (git itself refuses an unmerged branch) and
+`git restore --staged` (unstages, leaves the file alone) are allowed; their
+forcing or overwriting forms — `checkout -B`, `checkout <path>`, `checkout --`,
+`branch -D`, `branch -d -f`, `restore` without `--staged`, `restore --worktree` —
+stay blocked. Use `git switch <branch>` to change branches: a bare
+`git checkout <name>` cannot be told apart from `git checkout <file>`.
 
 ### 4. System-prompt exfiltration
 
@@ -346,6 +362,36 @@ whole turn budget to arrive at the same no. After N consecutive denials the requ
 ends with the model told to stop and report. One approval resets the count, and the
 count resets per request.
 
+## Config blockers: who can change this
+
+Many refusals come from a `config.txt` setting, not from the task. Without being
+told, the model reads them as obstacles to work around. So each kind of refusal
+is counted per request, and the **third** one gets a single note appended to its
+result, outside the untrusted-content wrapper. The note says which setting is
+responsible and that only the user can change it. Nothing is said up front: a
+small model told about a restriction in advance tends to give up before trying.
+
+| Refusal | The note names |
+|---|---|
+| Sandbox network closed | `sandbox_allowed_domains` and the hosts the task asked for; on the Docker fallback, `agent8088 --sandbox-setup` first |
+| Write into a blocked folder | `blocked_paths` |
+| Command on the user's deny list / missing from their allowlist | `deny_commands` / `allow_commands` |
+| Domain outside the web domain policy | `allowed_domains` / `blocked_domains` |
+| Literal LAN or loopback address | `ssrf_allow_hosts=<host>:<port>` |
+| Command timed out three times | `max_tool_timeout_seconds` and `/limits` |
+| Credential file, `.env`, startup file, secret in a request | That it is protected, and the user can open it themselves |
+| Built-in safety rule, link-local or cloud-metadata address, an internal host given by name | That it is a fixed rule no setting changes |
+
+Notes contain setting names, the config file path and what the model already
+tried (a host, a path). They never contain a URL path, a query or a config
+value. Credential refusals deliberately do **not** mention
+`allowed_sensitive_files`, so injected content cannot steer the model into
+talking the user into unlocking their keys. `ssrf_allow_hosts` is offered only
+for a literal private or loopback address, because a name can resolve anywhere.
+
+A run that hits `max_turns` ends with a footer telling the user to raise it with
+`/maxturns` or `max_turns` in `config.txt`.
+
 ## Unattended runs
 
 A scheduled run has no operator, so an approval prompt there was emitted to nobody
@@ -400,7 +446,11 @@ Enforced at the always-on floor, so an unlisted command is **not escalatable** �
 the same standing as a deny rule. Precedence:
 
 1. Unrecoverable floor wins over everything. `allow_commands=*` does **not**
-   re-enable `rm -rf /`, `mkfs`, or `curl | sh`.
+   re-enable `rm -rf /`, `mkfs`, or `curl | sh`. The floor covers `rm -r` of
+   `/`, `/*`, `~`, `~/`, `~/*`, `$HOME`, `${HOME}` (quoted or not) and the
+   top-level system directories (`/usr`, `/etc`, `/home`, `/var`, `/Users`, …),
+   and `chmod`/`chown`/`chgrp -R` on the same targets. Paths below them —
+   `rm -rf ~/projects/old`, `rm -rf /tmp/x` — are ordinary deletes.
 2. `deny_commands` wins over `allow_commands` — deny is the more specific intent.
 3. Otherwise, an allowlist (if set) must match.
 
