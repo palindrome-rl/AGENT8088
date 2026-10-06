@@ -307,6 +307,20 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def _serialize_session_changes(request: Request, call_next):
+    """Keep session switching and compaction outside running chat/command turns."""
+    if (request.url.path.startswith("/api/sessions/")
+            and request.method in {"POST", "PATCH", "DELETE"}):
+        if not _TURN_LOCK.acquire(blocking=False):
+            return _error(ANOTHER_TURN_RUNNING, 409)
+        try:
+            return await call_next(request)
+        finally:
+            _TURN_LOCK.release()
+    return await call_next(request)
+
+
 # === REST endpoints ===
 
 # --- Error contract ------------------------------------------------------
@@ -905,7 +919,7 @@ async def get_config():
 async def get_providers():
     """List all configured and built-in providers."""
     A = _eng()
-    from agent8088.providers import BUILTIN_PROVIDERS, FALLBACK_MODELS
+    from agent8088.providers import BUILTIN_PROVIDERS
     return {
         "configured": list(A.PROVIDERS.keys()),
         "builtins": list(BUILTIN_PROVIDERS.keys()),
@@ -1242,7 +1256,7 @@ async def compact_session(body: SessionActionBody):
 @app.get("/api/memory/search")
 async def memory_search(q: str):
     """Search persistent memory."""
-    A = _eng()
+    _eng()
     from agent8088.memory import recall
     results = recall(q)
     return {"query": q, "results": results}
@@ -1849,11 +1863,6 @@ async def list_artifacts(rel: str = ""):
                 continue
             rel_child = str(entry.relative_to(base))
             if entry.is_dir():
-                try:
-                    count = sum(1 for child in entry.glob("*")
-                                if not (child.name.startswith(".") or child.name == "__pycache__"))
-                except OSError:
-                    count = 0
                 items.append({"name": entry.name, "path": rel_child, "type": "dir",
                               "size": None, "modified": entry.stat().st_mtime})
             else:
@@ -2163,14 +2172,14 @@ async def websocket_endpoint(ws: WebSocket):
             elif msg_type == "approval":
                 esc_id = msg.get("id", "")
                 entry = _pending_approvals.get(esc_id)
-                if entry is not None:
+                if entry is not None and entry.get("owner") == id(ws):
                     entry["approved"] = msg.get("approved", False)
                     entry["session_scope"] = msg.get("session_scope", False)
                     entry["event"].set()
             elif msg_type == "plan_approval":
                 plan_id = msg.get("id", "")
                 entry = _pending_plan_approvals.get(plan_id)
-                if entry is not None:
+                if entry is not None and entry.get("owner") == id(ws):
                     entry["mode"] = msg.get("mode", "")
                     entry["event"].set()
     except WebSocketDisconnect:
@@ -2445,7 +2454,7 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
             A._plan_on_step = _plan_on_step
             A._plan_on_escalation = _plan_on_escalation
             A._plan_on_approval = _plan_on_approval
-            answer = A.run_agent(
+            A.run_agent(
                 S.messages,
                 document_root=_attachment_index(A, C).parent.resolve(),
                 max_turns=C._turn_max_turns(A.PERMISSION_MODE),
@@ -2524,6 +2533,9 @@ def _save_session_quietly(C) -> None:
 
 async def _handle_command(ws: WebSocket, msg: dict, A, C):
     """Execute a slash command and return the result."""
+    if _TURN_LOCK.locked():
+        await ws.send_json({"type": "error", "message": ANOTHER_TURN_RUNNING})
+        return
     command = str(msg.get("command", "")).strip().lstrip("/")
     args = msg.get("args", "")
     if command.lower() == "plan":
@@ -2590,6 +2602,14 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
             run_args = run_args[:-len("--yes")].strip()
 
         def _exec_command():
+            if not _TURN_LOCK.acquire(blocking=False):
+                raise RuntimeError(ANOTHER_TURN_RUNNING)
+            try:
+                return _exec_command_locked()
+            finally:
+                _TURN_LOCK.release()
+
+        def _exec_command_locked():
             buf = io.StringIO()
             temp_console = RichConsole(file=buf, force_terminal=False, no_color=True, width=120)
             original_console = C.console

@@ -13,11 +13,9 @@ raised out of the callback uncaught, aborting the whole rmtree walk instead
 of just leaving that one file behind and clearing everything else.
 """
 import os
-import shutil
 import stat
 import sys
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -82,7 +80,7 @@ def test_uninstall_leaves_the_surviving_directory_traversable(tmp_path, monkeypa
     problem on the directory itself) is left without its execute bit and
     becomes unlistable, even to its own owner."""
     home = tmp_path / "agent8088"
-    settings = _make_tree(home)
+    _make_tree(home)
     fake_unlink, fake_chmod = _deny_by_basename("settings.yml")
 
     monkeypatch.setattr(os, "unlink", fake_unlink)

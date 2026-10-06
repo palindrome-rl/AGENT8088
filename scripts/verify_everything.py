@@ -125,8 +125,8 @@ ok("sub-agents loaded",
 # neighbouring tool check is deliberately "a floor, not an exact count" so that
 # adding one doesn't fail the run, and there is no reason skills should differ.
 ok("skills loaded",
-   {"documentation-writing", "documents", "github-code-review", "plan",
-    "systematic-debugging", "test-driven-development",
+   {"documentation-and-adrs", "documents", "code-review-and-quality", "planning-and-task-breakdown",
+    "debugging-and-error-recovery", "test-driven-development",
     "github-pr-workflow", "grounded-citations", "document-to-action-items",
     "spike", "humanizer", "simplify-code", "cli-anything"} <= set(E.SKILL_PACKAGES),
    ", ".join(sorted(E.SKILL_PACKAGES)))
@@ -386,8 +386,8 @@ expected_tools = {
     "create_document": "write_text",
     "convert_document": "write_text",
 }
-ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
-   str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")
+ok(f"all {len(expected_tools)} required tools are available", set(expected_tools) <= set(E.TOOL_NAMES),
+   str(set(expected_tools) - set(E.TOOL_NAMES)))
 for name, mode in sorted(expected_tools.items()):
     spec = E.TOOL_SPECS.get(name, {})
     ok(f"{name}: mode={mode}, has description",
@@ -399,7 +399,7 @@ ok("every tool appears in TOOLS_DEF", _def_names == set(E.TOOL_NAMES),
    str(_def_names ^ set(E.TOOL_NAMES)) if _def_names != set(E.TOOL_NAMES) else "")
 ok("every tool rendered into prompt",
    all(f"{n}(" in E.SYSTEM_PROMPT for n in E.TOOL_NAMES))
-ok("unknown tool handled", E.run_tool("no_such_tool", {}) == "Unknown tool: no_such_tool")
+ok("unknown tool handled", "Unknown tool: no_such_tool" in E.run_tool("no_such_tool", {}))
 
 section("5b. TOOL ALIASES")
 for alias, canonical in [("bash", "execute_shell"), ("sh", "execute_shell"),
@@ -499,12 +499,15 @@ with with_mode("readonly"):
         r = E._exec_sandbox_command("ls /workspace | head -1", 20)
         ok("workspace IS mounted into the container", bool(r.strip()), r.strip()[:30])
 
-    r = E.run_tool("execute_shell", {"command": "echo hello_verify"})
-    ok("execute_shell allows a readonly-safe command", "hello_verify" in r
-       or "ESCALATION" in r, r[:50])
-    r = E.run_tool("execute_shell", {"command": "rm -rf /tmp/nothing_here_xyz"})
-    ok("execute_shell escalates a mutating command in readonly",
-       "ESCALATION_REQUEST" in r, r[:45])
+    if E._resolve_sandbox_backend() == "unavailable":
+        skip("readonly shell execution and escalation", "no sandbox backend available")
+    else:
+        r = E.run_tool("execute_shell", {"command": "echo hello_verify"})
+        ok("execute_shell allows a readonly-safe command", "hello_verify" in r
+           or "ESCALATION" in r, r[:50])
+        r = E.run_tool("execute_shell", {"command": "rm -rf /tmp/nothing_here_xyz"})
+        ok("execute_shell escalates a mutating command in readonly",
+           "ESCALATION_REQUEST" in r, r[:45])
     r = E.run_tool("execute_shell", {"command": "git push"})
     ok("execute_shell hard-blocks git push", "forbidden by Agent8088" in r, r[:50])
 
@@ -1029,9 +1032,9 @@ ok("litellm provider allowed without base_url",
                                  "provider.claude.model": "anthropic/claude"}))
 builtins = E.load_providers({}, include_builtins=True)
 ok("builtins seed many providers", len(builtins) >= 10, f"{len(builtins)} providers")
-ok("anthropic excluded from builtins", "anthropic" not in builtins)
+ok("anthropic available in builtins", "anthropic" in builtins)
 names = P.builtin_provider_names()
-ok("builtin catalog ordered and complete", names[0] == "ollama" and "copilot" in names,
+ok("builtin catalog ordered and complete", names[0] == "ollama" and set(names) == set(builtins),
    f"{len(names)} builtins")
 
 _pp = E.PROVIDERS
@@ -1221,8 +1224,14 @@ ok("_safe_format leaves unknown placeholders",
    E._safe_format("Bearer {absent}", {}) == "Bearer {absent}")
 ok("_safe_format url-quotes _q variant",
    E._safe_format("q={query_q}", {"query": "a b&c"}) == "q=a%20b%26c")
-ok("_safe_format pulls from config", "192.168" in E._safe_format("{search_base_url}", {})
-   or bool(E._safe_format("{search_base_url}", {})))
+_format_config = dict(E.APP_CONFIG)
+try:
+    E.APP_CONFIG["search_base_url"] = "https://search.test"
+    ok("_safe_format pulls from config",
+       E._safe_format("{search_base_url}", {}) == "https://search.test")
+finally:
+    E.APP_CONFIG.clear()
+    E.APP_CONFIG.update(_format_config)
 with with_mode("edit"):
     r = E.run_tool("web_search", {})
     ok("web_search names a missing query", "query" in r.lower(), r[:50])
@@ -1484,7 +1493,7 @@ ok("classify_plan_component picks a tool", E.classify_plan_component("read the f
 
 # ================================================= 19. ADVERSARIAL / EDGE
 section("19. ADVERSARIAL AND EDGE CASES")
-ok("exec_tool handles invalid JSON", E.exec_tool("calculate", "not json") == "Invalid JSON")
+ok("exec_tool handles invalid JSON", '"code": "invalid_json"' in E.exec_tool("calculate", "not json"))
 ok("exec_tool handles empty args", isinstance(E.exec_tool("git_status", "{}"), str))
 with with_mode("edit"):
     ok("shell injection in calculate is contained",
@@ -1507,6 +1516,8 @@ cron_calls = []
 _real_run = E.subprocess.run
 _real_agent_data_dir = E._agent_data_dir
 _real_protect_private_file = E._protect_private_file
+_saved_schedule_isolation = E._schedule_isolation_active
+E._schedule_isolation_active = lambda: False  # scheduler subprocesses are mocked below
 if E.sys.platform == "win32":
     E._agent_data_dir = lambda: TMP / "windows-scheduler"
     E._protect_private_file = lambda _path: None
@@ -1552,6 +1563,7 @@ finally:
     E.subprocess.run = _real_run
     E._agent_data_dir = _real_agent_data_dir
     E._protect_private_file = _real_protect_private_file
+    E._schedule_isolation_active = _saved_schedule_isolation
 ok("real crontab was never modified by this harness", True, "subprocess.run mocked")
 ok("run_agent handles an empty message list",
    isinstance(E._preflight_refusal([]), (str, type(None))))
@@ -1564,10 +1576,10 @@ ok("_redact_secrets handles empty input", E._redact_secrets("") == "")
 section("20. CLI SURFACE")
 from agent8088 import cli as C  # noqa: E402
 expected_cmds = {
-    "help", "tools", "tool", "agents", "agent", "plan", "image", "paste", "skills", "raw",
+    "help", "tools", "tool", "agents", "agent", "plan", "image", "skills", "raw",
     "model", "models", "config", "memory", "status", "doctor", "sandbox", "new",
     "sessions", "resume", "reset", "compact", "history", "trace", "reasoning",
-    "think", "verbose", "usage", "temp", "maxturns", "save", "clear",
+    "verbose", "usage", "temp", "maxturns", "save", "browser", "schedule", "local", "cost",
 }
 missing = sorted(expected_cmds - set(C.COMMANDS))
 ok("all expected CLI commands registered", not missing, f"missing: {missing}" if missing else

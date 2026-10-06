@@ -16,7 +16,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from agent8088 import engine as A
-from agent8088 import document_access
 
 
 def test_the_request_is_not_trimmed_below_the_reserve():

@@ -26,7 +26,6 @@ import socket
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import Optional
 
 from agent8088 import engine as A
 from agent8088.gateway.platforms.base import (

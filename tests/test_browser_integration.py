@@ -35,7 +35,7 @@ async def test_browser_agent_receives_browser_session_when_reuse_enabled():
     with patch("agent8088.engine.BROWSER_REUSE_SESSION", True), \
          patch("browser_use.Agent", MockAgent), \
          patch("agent8088.browser_llm.build_browser_chat_model", return_value=MagicMock()):
-        res = await engine._run_browser_agent("https://example.com", "test task")
+        await engine._run_browser_agent("https://example.com", "test task")
         assert "browser_session" in passed_kwargs
         assert passed_kwargs["browser_session"] is not None
         assert passed_kwargs["initial_actions"] == [{"navigate": {"url": "https://example.com", "new_tab": False}}]

@@ -449,7 +449,7 @@ def backend_label(hw: "HardwareBudget") -> str:
         return "CUDA"
     if hw.source == "rocm-smi" and hw.vram_total_gb:
         return "ROCm"
-    if sys.platform == "darwin":
+    if hw.source == "macos-system_profiler":
         return "Metal"
     # integrated/unknown VRAM: inference runs on CPU, the iGPU's media
     # blocks only assist -- the honest label, llm-checker shows the same

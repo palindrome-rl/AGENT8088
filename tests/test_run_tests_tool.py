@@ -93,6 +93,8 @@ def test_engine_injects_the_discovered_command(engine, tmp_path, monkeypatch):
         seen["command"] = command
         return "1 passed"
 
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
+    engine.PERMISSION_MODE = "full-auto"
     monkeypatch.setattr(engine, "_exec_shell_command", fake_shell)
     engine.run_tool("run_tests", {"path": str(tmp_path)})
     assert seen["command"] == "pytest -q"

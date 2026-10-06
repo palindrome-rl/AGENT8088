@@ -2410,19 +2410,39 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         if delta and first_token[0] is None:
             first_token[0] = round((time.monotonic() - started) * 1000)
         on_token(kind, delta)
+    def bounded_interrupt():
+        if interrupt_check and interrupt_check():
+            return True
+        return bool(_active_budget and (_active_budget.exceeded() or
+                    (_active_budget.seconds_left() is not None and _active_budget.seconds_left() <= 0)))
+
     try:
+        _check_model_budget()
+        max_tokens = _completion_token_budget(provider, selected_model, messages, tools,
+                                              system_prompt, max_tokens)
+        remaining = _check_model_budget()  # token-limit discovery may have used time
+        options = {"timeout": min(TIMEOUT_SECONDS, remaining)} if remaining is not None else {}
         response = _create_completion(
             client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
-            temperature=temperature, on_token=observe_token if on_token else None, interrupt_check=interrupt_check,
-            model_name=selected_model, provider_name=provider, thinking=thinking,
+            temperature=temperature, on_token=observe_token if on_token else None,
+            interrupt_check=bounded_interrupt if _active_budget is not None else interrupt_check,
+            model_name=selected_model, provider_name=provider, thinking=thinking, **options,
         )
     except Exception as exc:
+        if isinstance(exc, AgentInterrupted):
+            try:
+                _check_model_budget()  # distinguish deadline cancellation from the user's Stop
+            except TurnBudgetExceeded as deadline:
+                exc = deadline
         _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
                                 max_tokens=max_tokens, error=exc)
-        raise
+        raise exc
     _record_model_telemetry(provider, selected_model, telemetry_attempt, started,
                             max_tokens=max_tokens, response=response, first_token_ms=first_token[0] if first_token[0] is not None else getattr(response, 'first_token_ms', None),
                             prompt=system_prompt or current_system_prompt(), tools=tools)
+    if _active_budget and _active_budget.seconds_left() is not None and _active_budget.seconds_left() <= 0:
+        _active_budget.add_usage(response)
+    _check_model_budget()  # a late response must not authorize tool execution
     return response
 
 
@@ -2576,7 +2596,7 @@ def _resolve_temperature(provider_name: str, temperature: float) -> float:
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False,
-                       thinking=None):
+                       thinking=None, timeout=None):
     selected_model = model_name or MODEL_NAME
     full_messages = _normalised_messages(system_prompt or current_system_prompt(), messages)
     temperature = _resolve_temperature(provider_name, temperature)
@@ -2596,6 +2616,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         }
         if _native_tools_enabled(tools, provider_name):
             kwargs["tools"] = tools
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         if client.get("api_base"):
             kwargs["api_base"] = client["api_base"]
         if client.get("api_key"):
@@ -2631,6 +2653,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
     )
+    if timeout is not None:
+        request_options["timeout"] = timeout
     if _native_tools_enabled(tools, provider_name):
         request_options["tools"] = tools
     # Optional per-provider reasoning dial (provider.<name>.reasoning_effort).
@@ -2711,7 +2735,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 system_prompt=system_prompt, temperature=temperature,
                 on_token=on_token, interrupt_check=interrupt_check,
                 model_name=model_name, provider_name=provider_name, _skip_optional=True,
-                thinking=thinking)
+                thinking=thinking, timeout=timeout)
         raise
     collected, tool_chunks, finish_reason = [], {}, None
     stream_usage = None
@@ -2751,12 +2775,27 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
 
 
 def _fallback_targets() -> list:
+    CONFIG_WARNINGS[:] = [w for w in CONFIG_WARNINGS if not w.startswith("fallback_models:")]
     targets = []
     for item in str(APP_CONFIG.get("fallback_models", "")).split(","):
+        if not item.strip():
+            continue
         provider_name, separator, model_name = item.strip().partition(":")
-        if separator and provider_name in PROVIDERS and model_name.strip():
-            targets.append((provider_name, model_name.strip()))
+        provider_name, model_name = provider_name.strip(), model_name.strip()
+        if not separator:
+            _config_warn(f"fallback_models: '{item.strip()}' needs provider:model.")
+        elif provider_name not in PROVIDERS:
+            _config_warn(f"fallback_models: unknown provider '{provider_name}'.")
+        elif not model_name:
+            _config_warn(f"fallback_models: empty model for '{provider_name}'.")
+        elif (provider_name, model_name) in targets:
+            _config_warn(f"fallback_models: duplicate '{provider_name}:{model_name}' ignored.")
+        else:
+            targets.append((provider_name, model_name))
     return targets
+
+
+_fallback_targets()  # report invalid targets at startup, before a call fails
 
 
 def _retryable_model_error(error: Exception) -> bool:
@@ -2777,22 +2816,12 @@ def _retryable_model_error(error: Exception) -> bool:
 
 
 def _extract_retry_after(error):
-    """Parse Retry-After header (seconds or HTTP-date) from an OpenAI SDK error."""
-    resp = getattr(error, "response", None)
-    if not resp or not hasattr(resp, "headers"):
-        return None
-    raw = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
-    if not raw:
-        return None
+    """Parse the shared validated Retry-After value into milliseconds."""
+    from .errors import retry_after_seconds
+    seconds = retry_after_seconds(error)
     try:
-        return max(0, int(float(str(raw).strip()) * 1000))
-    except ValueError:
-        pass
-    try:
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(raw)
-        return max(0, int((dt.timestamp() - time.time()) * 1000))
-    except Exception:
+        return int(seconds * 1000) if seconds is not None else None
+    except OverflowError:
         return None
 
 
@@ -2807,19 +2836,40 @@ def _retry_delay(retry_attempt, retry_after_ms=None):
     return (delay * jitter) / 1000.0
 
 
+def _check_model_budget():
+    """Check between attempts and return the remaining request timeout."""
+    if _active_budget is None:
+        return None
+    reason = _active_budget.exceeded()
+    left = _active_budget.seconds_left()
+    if reason or left is not None and left <= 0:
+        raise TurnBudgetExceeded(reason or "Turn budget exceeded: time limit reached.")
+    return left
+
+
+def _completion_token_budget(provider, model, messages, tools, system_prompt, requested):
+    context, completion = _active_model_token_limits(provider, model)
+    prompt_tokens = _estimate_tokens(
+        _estimate_context_chars(messages, system_prompt or current_system_prompt())
+        + len(json.dumps(tools or [], default=str)))
+    headroom = context - prompt_tokens - CONTEXT_SAFETY_TOKENS
+    if headroom < 1:
+        raise ValueError(f"The conversation exceeds the available context for {provider}:{model}.")
+    return max(1, min(requested, completion, headroom))
+
+
 def _interruptible_sleep(seconds: float, interrupt_check=None, slice_seconds: float = 0.1) -> None:
-    """time.sleep that ESC can cut short. A 10s backoff used to ignore Stop."""
-    if not interrupt_check:
+    """Backoff is bounded by the turn deadline and can be interrupted."""
+    if not interrupt_check and _active_budget is None:
         time.sleep(seconds)
         return
-    # Counted down arithmetically, not against the clock, so the total slept
-    # is exactly `seconds` (and a patched time.sleep can't make this spin).
     left = max(0.0, seconds)
     while True:
+        remaining = _check_model_budget()
         _raise_if_interrupted(interrupt_check)
         if left <= 0:
             return
-        step = min(slice_seconds, left)
+        step = min(slice_seconds, left, remaining if remaining is not None else left)
         time.sleep(step)
         left -= step
 
@@ -2936,7 +2986,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     can discard the partial text it already showed.
     """
     from agent8088.errors import is_unreachable, status_code as _status_code, \
-        explain_model_error as _explain
+        explain_model_error as _explain, is_context_overflow
     active_client = client_override if client_override is not None else client
     active_provider = provider_override or ACTIVE_PROVIDER or DEFAULT_PROVIDER
     active_model = model_override or MODEL_NAME
@@ -2964,6 +3014,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     attempts = API_MAX_RETRIES + 1  # 1 initial try + API_MAX_RETRIES retries
     attempt = 0
     while attempt < attempts:
+        _check_model_budget()
         attempt += 1
         try:
             response = create_completion(
@@ -2977,7 +3028,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             )
             _note_model_served(active_provider, active_model)
             return response
-        except AgentInterrupted:
+        except (AgentInterrupted, TurnBudgetExceeded):
             raise
         except Exception as error:
             primary_error = primary_error or error
@@ -2998,13 +3049,15 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                     notify(f"Model connection dropped mid-reply; retrying once {STREAM_RESET_NOTE}.")
                     attempt -= 1  # the reset is its own budget, not a backoff attempt
                     continue
-                raise
+                if not _retryable_model_error(error):
+                    raise
+                break  # primary reset spent; switch target with partial text cleared
             if not _retryable_model_error(error):
-                # A missing model is the one hard error another model can fix:
-                # let a configured fallback_models chain try it. Everything
-                # else (bad key, bad request) would fail the same way there.
-                if _status_code(error) == 404 and _fallback_targets() and \
-                        _explain(error, model=active_model).kind == "model_not_found":
+                # A configured target can repair provider-specific auth,
+                # missing-model or capacity errors; malformed requests still stop.
+                if (_status_code(error) in (401, 403) or is_context_overflow(error) or
+                        _status_code(error) == 404 and
+                        _explain(error, model=active_model).kind == "model_not_found"):
                     break
                 raise
             if is_unreachable(error):
@@ -3027,8 +3080,24 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 _interruptible_sleep(delay, interrupt_check)
 
     for provider_name, model_name in _fallback_targets():
+        _check_model_budget()
         if provider_name == active_provider and model_name == active_model:
             continue
+        if _status_code(primary_error) in (401, 403):
+            primary_key = _provider_api_key(PROVIDERS.get(active_provider, {}))
+            fallback_key = _provider_api_key(PROVIDERS.get(provider_name, {}))
+            if provider_name == active_provider or primary_key and fallback_key == primary_key:
+                notify(f"Skipping fallback {provider_name}:{model_name}: same rejected credentials.")
+                continue
+        if emitted:
+            emitted = False
+            if on_stream_reset:
+                try:
+                    on_stream_reset()
+                except Exception as exc:
+                    _log.debug("stream reset notice failed: %s", exc)
+            elif on_token:
+                on_token("content", f"\n{STREAM_RESET_NOTE}; switching provider.\n")
         try:
             fallback_client, _ = get_client(provider_name)
             if trace is not None:
@@ -3059,11 +3128,11 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             _note_model_served(provider_name, model_name,
                                primary=(active_provider, active_model), reason=reason)
             return response
-        except AgentInterrupted:
+        except (AgentInterrupted, TurnBudgetExceeded):
             raise
         except Exception as fallback_error:
             last_error = fallback_error
-            if emitted:
+            if emitted and not _retryable_model_error(fallback_error):
                 raise
     # The primary's error is the one that explains the setup; a fallback's
     # failure is secondary. Raise the primary with the chain's outcome noted.
@@ -3178,6 +3247,10 @@ def build_image_message(text: str, images: list, resolver=None) -> dict:
 class AgentInterrupted(Exception):
     """Raised when the user interrupts the agent loop (e.g. ESC in the Rich UI)."""
     pass
+
+
+class TurnBudgetExceeded(RuntimeError):
+    """Recovery stopped because the shared request budget has been exhausted."""
 
 
 # ---------------------------------------------------------------------------
@@ -6343,9 +6416,9 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
         if snapshot is not None:
             try:
                 source.write_bytes(snapshot)
-                repair = (f" It has been restored to its exact contents from before "
-                          f"the run, so the code under test is intact; the tests the "
-                          f"sub-agent wrote may not match it.")
+                repair = (" It has been restored to its exact contents from before "
+                          "the run, so the code under test is intact; the tests the "
+                          "sub-agent wrote may not match it.")
             except OSError as exc:
                 repair = (f" Restoring it FAILED ({exc}) -- inspect this file by hand.")
         # Shown above the report on purpose: the report will claim success.
@@ -6505,7 +6578,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
             # and its run_agent also cleared the parent's _document_interrupt.
             interrupt_check=_document_interrupt,
         )
-    except AgentInterrupted:
+    except (AgentInterrupted, TurnBudgetExceeded):
         raise  # Stop ends the whole turn, not just this delegation
     except Exception as e:  # a broken sub-run must not kill the parent turn
         answer = efficiency.tool_error(
@@ -7886,7 +7959,7 @@ def _exec_browser(args: dict) -> str:
         _set_browser_use_log_verbosity(SHOW_REASONING)
         executable_path = _playwright_chromium_executable()
     except Exception as e:
-        return f"Browser error: {e}"
+        return f"Error: Browser error: {e}"
     if executable_path is None:
         return _static_page_read(url, task, "chromium", (
                 "Playwright's Chromium browser is not installed. Install it with:\n"
@@ -7906,7 +7979,7 @@ def _exec_browser(args: dict) -> str:
         else:
             browser_result = asyncio.run(_run_browser_agent(url, task, executable_path))
     except asyncio.TimeoutError:
-        return (f"Browser error: task exceeded the {_browser_task_timeout()}s "
+        return (f"Error: Browser error: task exceeded the {_browser_task_timeout()}s "
                 f"time limit (raise AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS for this "
                 "run, or browser_task_timeout_seconds in config.txt; "
                 "max_tool_timeout_seconds remains the hard cap).")
@@ -7927,7 +8000,7 @@ def _exec_browser(args: dict) -> str:
         logging.getLogger("asyncio").setLevel(logging.CRITICAL)
         raise
     except Exception as e:
-        return f"Browser error: {e}"
+        return f"Error: Browser error: {e}"
     finally:
         _active_role = saved_role
 
@@ -8926,7 +8999,7 @@ _ARTIFACTS_CD_RE = re.compile(
     r"(?=\s*(?:&&|\|\||;|$))"
 )
 _CONTAINER_ARTIFACTS_RE = re.compile(
-    r"(?i)(?P<workspace>/workspace)[\\/]artifacts(?P<tail>[\\/]|(?=[\s\"';|&<>()]|$))"
+    r"(?i)(?<![\w./\\:~-])(?P<workspace>/workspace)[\\/]artifacts(?P<tail>[\\/]|(?=[\s\"';|&<>()]|$))"
 )
 _ARTIFACTS_PATH_RE = re.compile(
     r"(?i)(?P<prefix>^|[\s=;|&<>()])(?P<quote>[\"']?)"
@@ -9403,6 +9476,26 @@ def _exec_windows_cron(action: str, schedule: str = "", task: str = "",
     return "Removed."
 
 
+def _cron_entry_task(line: str, *, shell_entry: bool = True) -> str | None:
+    """Decode a managed entry without matching task substrings or shell syntax."""
+    if _CRON_MARKER not in line:
+        return None
+    parts = line.split(None, 5)
+    if len(parts) != 6:
+        return None
+    body = parts[5].rsplit(_CRON_MARKER, 1)[0].strip()
+    if not shell_entry:
+        return body
+    try:
+        words = shlex.split(body.replace(r"\%", "%"))
+    except ValueError:
+        return body  # home-local entries store task text, not a shell command
+    for index, word in enumerate(words[:-2]):
+        if word == "printf" and words[index + 1] == r"%s\n":
+            return words[index + 2]
+    return body
+
+
 def _home_crontab_path() -> Path:
     return _agent_data_dir() / "crontab"
 
@@ -9442,7 +9535,7 @@ def _exec_home_cron(action: str, schedule: str = "", task: str = "") -> str:
         return f"Scheduled: {schedule} (isolated home: {path})"
 
     if action == "remove":
-        filtered = [l for l in lines if not (_CRON_MARKER in l and task in l)]
+        filtered = [l for l in lines if _cron_entry_task(l, shell_entry=False) != task]
         if len(filtered) == len(lines):
             return "No matching entry found."
         write_entries(filtered)
@@ -9490,6 +9583,9 @@ def _exec_cron(args: dict) -> str:
                 ["crontab", "-l"], capture_output=True, text=True, timeout=20)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return None, f"Cron unavailable: {exc}"
+        if result.returncode and (result.returncode != 1 or
+                result.stderr.strip() and "no crontab for" not in result.stderr.lower()):
+            return None, f"Cron unavailable: {result.stderr.strip() or 'could not read crontab'}"
         return ("" if result.returncode else result.stdout), None
 
     def write_crontab(payload):
@@ -9512,8 +9608,10 @@ def _exec_cron(args: dict) -> str:
         # approval prompt, so gated actions resolve from cron_mode instead of
         # emitting an ESCALATION_REQUEST nobody will ever see.
         entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
-                 f"AGENT8088_UNATTENDED=1 "
-                 f"printf '%s\\n' {shlex.quote(task)} | {shlex.quote(agent)} {_CRON_MARKER}")
+                 f"printf '%s\\n' {shlex.quote(task)} | "
+                 f"AGENT8088_UNATTENDED=1 {shlex.quote(agent)} {_CRON_MARKER}")
+        # Cron parses percent signs before the shell, including quoted ones.
+        entry = entry.replace("%", r"\%")
         current, error = read_crontab()
         if error:
             return error
@@ -9524,13 +9622,12 @@ def _exec_cron(args: dict) -> str:
         return f"Scheduled: {schedule}" if result.returncode == 0 else f"Cron error: {result.stderr.strip()}"
 
     if action == "remove":
-        quoted_task = shlex.quote(task)
         current, error = read_crontab()
         if error:
             return error
         payload = "\n".join(
             line for line in current.splitlines()
-            if not (_CRON_MARKER in line and quoted_task in line)
+            if _cron_entry_task(line) != task
         )
         if payload:
             payload += "\n"
@@ -9566,24 +9663,8 @@ def schedule_task(action: str = "list", schedule: str = "", task: str = "") -> d
         if not schedule_match:
             continue
         schedule = schedule_match.group(1)
-        # Remove schedule and extract task. Unix format has "printf '%s\n' TASK | agent8088 #marker"
-        # Windows format has "SCHEDULE TASK #marker"
-        after_schedule = line[schedule_match.end():]
-        marker_idx = after_schedule.find(_CRON_MARKER)
-        if marker_idx < 0:
-            continue
-        task_part = after_schedule[:marker_idx].strip()
-        # Try to parse Unix printf format first
-        unix_match = re.search(r"printf '%s\\n'\s+(.+?)\s+\|", line)
-        if unix_match:
-            try:
-                parsed = shlex.split(unix_match.group(1))
-                scheduled_task = parsed[0] if len(parsed) == 1 else unix_match.group(1)
-            except ValueError:
-                scheduled_task = unix_match.group(1)
-        else:
-            # Fall back to Windows format: just the task text
-            scheduled_task = task_part
+        scheduled_task = _cron_entry_task(
+            line, shell_entry=sys.platform != "win32" and not _schedule_isolation_active())
         entries.append({"schedule": schedule, "task": scheduled_task})
     return {"ok": not result.startswith(("Cron unavailable", "Windows scheduler error")),
             "detail": "" if entries else result, "entries": entries}
@@ -11010,7 +11091,7 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except (ValueError, TypeError) as e:
         result = efficiency.tool_error('invalid_input', str(e),
             'Inspect the tool schema and correct the input; do not repeat unchanged arguments.', recoverable=True)
-    except AgentInterrupted:
+    except (AgentInterrupted, TurnBudgetExceeded):
         raise  # ESC inside a tool (a sub-agent, a document run) ends the turn
     except Exception as e:
         result = f"Error: {e}" if str(e) else f"Error: {type(e).__name__}"
@@ -13685,6 +13766,13 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
                 on_trajectory_state=trajectory_changed, **kwargs,
             )
         return answer
+    except TurnBudgetExceeded as exc:
+        answer = _guard_answer(f"{exc}\n\nPartial result so far:\n{_last_tool_output[:1000] or '(none)'}")
+        if kwargs.get("on_answer"):
+            kwargs["on_answer"](answer)
+        if isinstance(kwargs.get("trace"), list):
+            kwargs["trace"].append({"type": "budget_exceeded", "content": str(exc)})
+        return answer
     finally:
         run_trajectory.finish(answer)
         trajectory_changed()
@@ -14438,7 +14526,7 @@ def _retry_after_context_overflow(messages, error, *, call, spin, trace, turn, b
         shrunk = compact_messages(messages, completion_client=loop_client,
                                   provider_name=loop_provider or "",
                                   model_name=loop_model or "", budget=budget)
-    except AgentInterrupted:
+    except (AgentInterrupted, TurnBudgetExceeded):
         raise
     except Exception as exc:  # noqa: BLE001 -- the summary call may overflow too
         _log.warning("compaction after context overflow failed: %s", exc)
@@ -14451,7 +14539,7 @@ def _retry_after_context_overflow(messages, error, *, call, spin, trace, turn, b
     try:
         with spin("thinking..."):
             return call(max(MIN_TURN_COMPLETION_TOKENS, (max_tokens or 0) // 2)), None
-    except AgentInterrupted:
+    except (AgentInterrupted, TurnBudgetExceeded):
         raise
     except Exception as retry_error:  # noqa: BLE001 -- reported by the caller
         return None, retry_error
@@ -14606,7 +14694,7 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
             trace=trace, turn=turn, client_override=client,
             provider_override=provider_name, model_override=model_name,
         )
-    except AgentInterrupted:
+    except (AgentInterrupted, TurnBudgetExceeded):
         raise
     except Exception as exc:
         _log.info("final wrap-up round failed: %s", exc)
@@ -14626,7 +14714,10 @@ DELIVERABLES_CHECK_NUDGE = (
     "and behaves exactly as specified. Remove scratch files, test users and other "
     "leftovers you created that the task did not ask for. Then give your final answer."
 )
-_REPEAT_RERUNS = frozenset({"cli_anything", "browser"})
+_REPEAT_OBSERVATIONS = frozenset({
+    "cli_anything_status", "cli_anything_list", "cli_anything_search",
+    "cli_anything_info", "cli_anything_skill",
+})
 _WAIT_COMMAND_RE = re.compile(r"(?:^|[\s;&|(])sleep\s+\d")
 
 
@@ -14703,6 +14794,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
     last_completed = None  # consecutive identical call -> (signature, output)
+    action_results = {}  # opaque external actions cannot be replayed within this request
     seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
@@ -14943,7 +15035,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     model_override=loop_model,
                     on_retry=_retry_notice, on_stream_reset=on_stream_reset,
                 )
-        except AgentInterrupted:
+        except (AgentInterrupted, TurnBudgetExceeded):
             raise
         except Exception as e:
             response = None
@@ -14996,7 +15088,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                     on_retry=_retry_notice, on_stream_reset=on_stream_reset,
                                 )
                             break
-                        except AgentInterrupted:
+                        except (AgentInterrupted, TurnBudgetExceeded):
                             raise
                         except Exception as retry_error:
                             routing.mark_cooldown(loop_provider, loop_model, 3600)
@@ -15346,27 +15438,35 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # Whether to RE-RUN the repeat is a separate question from whether
             # it counts as progress. Re-running a write or a shell command
             # repeats its side effect, so those are served from the previous
-            # output. An opaque external CLI or a browser action can legitimately
-            # observe state that changed outside this process, so those re-run —
-            # they just still do not count as progress.
+            # output. Only named read-only CLI queries refresh external state.
+            # Browser tasks and opaque CLI commands may mutate it, so their
+            # results are retained for the entire request, including timeouts.
             read_key = efficiency.read_signature(name, args, resolve_user_path, PERMISSION_MODE)
             if read_key is None:
                 read_results.clear()
             previous_output = None
             repeated = False
             no_progress = False
-            if read_key is not None and read_key in read_results:
+            opaque_action = (TOOL_SPECS.get(name, {}).get("mode") in {"browser", "cli_anything"}
+                             and name not in _REPEAT_OBSERVATIONS)
+            if opaque_action and sig in action_results:
+                previous_output, repeated = action_results[sig], True
+            elif read_key is not None and read_key in read_results:
                 previous_output, repeated = read_results[read_key], True
             elif ("__parse_error__" not in args and last_completed
                     and sig == last_completed[0]):
                 previous_output, repeated = last_completed[1], True
             if repeated and _is_wait_command(name, args):
                 repeated, previous_output = False, None
-            # Re-running these observes the world, not our own side effect.
-            if repeated and (spec_mode := (TOOL_SPECS.get(name, {}).get("mode") or "")) in _REPEAT_RERUNS:
+            # Only these built-in observation queries are safe to refresh.
+            if repeated and name in _REPEAT_OBSERVATIONS:
                 repeated, previous_output = False, None
                 no_progress = True
             if repeated:
+                if opaque_action:
+                    messages.append(_harness_turn(
+                        "Do not replay this external action. Its effects may already exist, even if it timed out. "
+                        "Inspect the current state with a different observation task before proposing another action."))
                 cached = (f"Tool '{name}' already ran with this output (do not repeat it):\n\n{_tool_result_for_model(name, previous_output)}"
                           if previous_output else f"Already tried {name} with no output. Give your final answer now.")
                 messages.append(_harness_turn(cached))
@@ -15545,6 +15645,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
 
             usable = (not _plan_step_failed(result)
                       and not result.startswith('ESCALATION_REQUEST'))
+            if opaque_action and not blocked:
+                action_results[sig] = result
             if read_key is not None and usable:
                 if len(read_results) >= 16:
                     read_results.pop(next(iter(read_results)))

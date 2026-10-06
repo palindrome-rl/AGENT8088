@@ -1,7 +1,5 @@
 import os
-import shutil
 from pathlib import Path
-import pytest
 from agent8088.browser_session import (
     get_session_user_data_dir,
     cleanup_browser_session,

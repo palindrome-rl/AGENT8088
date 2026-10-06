@@ -55,7 +55,7 @@ def test_content_takes_precedence_over_source_url(ready, tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(ready, "_fetch_url_bytes", lambda url: calls.append(url) or (b"x", None, "text/plain"))
     out = tmp_path / "text.txt"
-    result = _write(ready, str(out), content="text wins", source_url="https://example.com/x")
+    _write(ready, str(out), content="text wins", source_url="https://example.com/x")
     assert calls == []  # fetch never attempted
     assert out.read_text() == "text wins"
 
@@ -89,6 +89,6 @@ def test_extensionless_filename_derives_extension_from_content_type(
 def test_explicit_extension_is_kept(ready, tmp_path, monkeypatch):
     monkeypatch.setattr(ready, "_fetch_url_bytes",
                        lambda url: (b"data", None, "image/jpeg"))
-    result = _write(ready, str(tmp_path / "img.png"), source_url="https://example.com/x.bin")
+    _write(ready, str(tmp_path / "img.png"), source_url="https://example.com/x.bin")
     assert (tmp_path / "img.png").exists()
     assert not (tmp_path / "img.png.jpeg").exists()

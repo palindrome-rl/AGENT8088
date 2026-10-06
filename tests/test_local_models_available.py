@@ -2,9 +2,7 @@
 packaged snapshot, no daemon scraping: the daemon can't enumerate the registry)
 and score pullable tags against this machine's hardware, reusing the same
 fit math as installed-model scoring."""
-import types
 
-import pytest
 
 from agent8088 import local_models as L
 

@@ -504,6 +504,7 @@ def test_sh_libreoffice_flags_are_documented():
 def test_sh_install_libreoffice_failure_is_non_fatal():
     """A failed or unsupported install must record a skipped stage, never abort."""
     out = _run_sh(
+        'command() { [ "$1" = "-v" ] && [ "$2" = "soffice" ] && return 1; builtin command "$@"; }\n'
         'OS="freebsd"\n'  # unrecognized -> falls through every branch
         'run_with_timeout() { shift; "$@"; }\n'
         'install_libreoffice\n'

@@ -11,6 +11,8 @@ import pytest
 def shell(engine, monkeypatch):
     """execute_shell with a scripted result and a call counter."""
     engine.PERMISSION_MODE = "full-auto"
+    # Execution is stubbed below; do not require a real sandbox to classify it.
+    monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "native")
     calls = []
 
     def fake(command, timeout=25, image=""):

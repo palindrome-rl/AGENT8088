@@ -4296,6 +4296,7 @@ def _doctor_files_checks():
     elif A.CONFIG_PATH.exists() and not _doctor_writable(A.CONFIG_PATH):
         checks.append(_doctor_check("User config", "fail", f"{A.CONFIG_PATH} isn't writable",
                                     fix_owner.format(A.CONFIG_PATH)))
+    A._fallback_targets()  # validate the current chain before displaying config warnings
     for warning in list(getattr(A, "CONFIG_WARNINGS", []) or []):
         checks.append(_doctor_check("Config warning", "warn", warning,
                                     f"Edit {A.CONFIG_PATH.name} ({A.CONFIG_PATH})."))

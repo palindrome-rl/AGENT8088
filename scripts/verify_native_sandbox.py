@@ -129,7 +129,7 @@ def _child(workspace: Path, secret: Path, config: Path) -> None:
         missing_result = engine._exec_sandbox_command("echo must-not-run")
     finally:
         engine._native_sandbox_argv = original_runtime
-    if "ESCALATION_REQUEST" not in missing_result:
+    if not missing_result.startswith(("ESCALATION_REQUEST", "Error: a sandbox is required")):
         _fail("missing native sandbox fell back to local execution")
     if sys.platform == "win32":
         print("PASS: native sandbox (Windows ACL backend) enforced workspace-write, "

@@ -5,9 +5,7 @@ running under a scratch AGENT8088_HOME -- the only path in the whole audit
 that leaked outside its sandbox. The configured home is an isolation request:
 a scratch home must not register anything with a global scheduler.
 """
-import os
 import sys
-from pathlib import Path
 
 import pytest
 

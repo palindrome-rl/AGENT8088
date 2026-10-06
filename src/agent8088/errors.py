@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,7 +110,8 @@ def retry_after_seconds(exc) -> float | None:
     if raw is None or str(raw).strip() == "":
         return None
     try:
-        return max(0.0, float(str(raw).strip()))
+        seconds = float(str(raw).strip())
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except ValueError:
         pass
     try:

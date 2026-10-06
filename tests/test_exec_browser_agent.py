@@ -194,6 +194,9 @@ def fake_browser_use(monkeypatch):
     _browser_profile_kwargs still builds a genuine ProxySettings."""
     import browser_use
 
+    # These teardown checks exercise disposable profiles; persistent sessions
+    # deliberately retain the browser and are covered in test_browser_session.py.
+    monkeypatch.setenv("AGENT8088_BROWSER_REUSE_SESSION", "0")
     _FakeAgent.instances = []
     _FakeAgent.hang = False
     _FakeAgent.close_raises = None

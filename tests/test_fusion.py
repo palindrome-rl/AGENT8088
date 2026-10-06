@@ -277,7 +277,6 @@ def test_run_fusion_judge_truncated_retries_at_double_tokens(monkeypatch, engine
     monkeypatch.setattr(fusion.random, "shuffle", lambda seq: None)
     monkeypatch.setattr(engine, "get_client", lambda name: (SimpleNamespace(name=name), "judge-model"))
 
-    judge_calls = []
 
     def fake_completion(client, messages, tools, **kw):
         provider = kw["provider_name"]
@@ -301,7 +300,6 @@ def test_run_fusion_judge_truncated_retries_at_double_tokens(monkeypatch, engine
 
     # simpler: wrap
     def completion(client, messages, tools, **kw):
-        provider = kw["provider_name"]
         return _fake_response("WINNER: B\nVERDICT: ok", input_tokens=5, output_tokens=7)
 
     def tracked(client, messages, tools, **kw):

@@ -44,7 +44,7 @@ def test_modes(monkeypatch, mode, expected):
 
 @pytest.mark.parametrize('result', [{'model_name': 'other:evil'}, {}, [], {'model_name': ['p:strong']}])
 def test_untrusted_result_rejected(monkeypatch, result):
-    calls = transport(monkeypatch, result=result if result else {'model_name': None})
+    transport(monkeypatch, result=result if result else {'model_name': None})
     selected, meta = adapter.recommend({'llmrouter_mode': 'enabled'}, [{'role':'user','content':'hello'}], [('p','strong')])
     assert selected is None
     assert meta['applied'] is False

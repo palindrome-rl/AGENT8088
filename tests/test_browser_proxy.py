@@ -317,7 +317,6 @@ def test_an_ordinary_public_host_is_still_connected_to_the_address_checked():
     import socket
     import threading
 
-    from agent8088 import engine as A
 
     server = socket.socket()
     server.bind(("127.0.0.1", 0))

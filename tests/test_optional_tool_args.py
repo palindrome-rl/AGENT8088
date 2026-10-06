@@ -47,6 +47,7 @@ def test_schedule_task_no_longer_demands_schedule_and_task(engine):
 
 
 def test_schedule_list_reports_an_unavailable_crontab(engine, monkeypatch):
+    monkeypatch.delenv("AGENT8088_HOME", raising=False)
     def unavailable(*_args, **_kwargs):
         raise PermissionError("operation not permitted")
 
@@ -55,6 +56,7 @@ def test_schedule_list_reports_an_unavailable_crontab(engine, monkeypatch):
 
 
 def test_schedule_add_reports_an_unavailable_crontab_write(engine, monkeypatch):
+    monkeypatch.delenv("AGENT8088_HOME", raising=False)
     def crontab(command, **_kwargs):
         if command == ["crontab", "-l"]:
             return type("Result", (), {"returncode": 0, "stdout": ""})()
