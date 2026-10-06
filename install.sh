@@ -719,6 +719,64 @@ print_skipped_summary() {
     echo "  The core agent is installed and works without these."
 }
 
+# JSON string body for $1 (no surrounding quotes). Pure bash, so it works
+# before any Python exists, and one character at a time on purpose: bash 3.2
+# (macOS /bin/bash) keeps quotes inside a ${var//pat/rep} replacement
+# literally, so the substitution form corrupts the output there. Bash strings
+# cannot hold NUL; non-ASCII text passes through unchanged, which JSON allows.
+_json_escape() {
+    local _s="$1" _out="" _c _i=0 _n=${#1} _code
+    while [ "$_i" -lt "$_n" ]; do
+        _c="${_s:_i:1}"
+        case "$_c" in
+            '"') _out+='\"' ;;
+            '\') _out+='\\' ;;
+            $'\n') _out+='\n' ;;
+            $'\r') _out+='\r' ;;
+            $'\t') _out+='\t' ;;
+            [[:cntrl:]])
+                printf -v _code '%d' "'$_c"
+                printf -v _c '\\u%04x' "$_code"
+                _out+="$_c" ;;
+            *) _out+="$_c" ;;
+        esac
+        _i=$((_i + 1))
+    done
+    printf '%s' "$_out"
+}
+
+# Persist the skipped-stage ledger to $AGENT8088_HOME/install-state.json, which
+# agent8088 reads to report what is missing in /doctor and the startup banner
+# (agent8088/install_state.py). Rewritten on every run, so a stage fixed by a
+# re-run drops out; written to a temp file and renamed, so a reader never sees
+# half a file. Never fails the install.
+write_install_state() {
+    local _file="$AGENT8088_HOME/install-state.json"
+    local _tmp="$_file.tmp.$$" _entry _label _reason _fix _sep="" _when
+    _when="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+    {
+        printf '{"version": 1, "installed_at": "%s", "skipped": [' "$(_json_escape "$_when")"
+        if [ "${#SKIPPED_STAGES[@]}" -gt 0 ]; then
+            for _entry in "${SKIPPED_STAGES[@]}"; do
+                # Split on the first two tabs by hand: `read` with IFS=tab
+                # collapses an empty middle field and stops at a newline.
+                _label="${_entry%%$'\t'*}"
+                _entry="${_entry#*$'\t'}"
+                _reason="${_entry%%$'\t'*}"
+                _fix="${_entry#*$'\t'}"
+                printf '%s\n  {"stage": "%s", "reason": "%s", "fix": "%s"}' "$_sep" \
+                    "$(_json_escape "$_label")" "$(_json_escape "$_reason")" "$(_json_escape "$_fix")"
+                _sep=","
+            done
+        fi
+        printf '\n]}\n'
+    } > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_file" 2>/dev/null || {
+        rm -f "$_tmp" 2>/dev/null
+        log_warn "Could not write $_file (agent8088 --doctor will not list skipped stages)"
+    }
+    return 0
+}
+
 # The install command with one more environment variable in front of bash, for
 # messages: `_install_cmd_with UV_NATIVE_TLS=1` -> "curl ... | UV_NATIVE_TLS=1 bash".
 _install_cmd_with() {
@@ -2692,6 +2750,7 @@ verify_install() {
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
     # view minutes ago on a multi-minute install, which is how a failed WhatsApp
     # bridge got reported and still went unnoticed.
+    write_install_state
     print_skipped_summary
     [ "$_ready" = true ]
 }

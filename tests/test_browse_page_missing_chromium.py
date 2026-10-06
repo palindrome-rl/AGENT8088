@@ -21,6 +21,15 @@ import pytest
 from agent8088 import engine as A
 
 
+@pytest.fixture(autouse=True)
+def _no_static_fetch(monkeypatch):
+    """A missing Chromium now falls back to a static HTML read for read-only
+    tasks (tests/test_browse_page_static_fallback.py); keep these tests off
+    the network by making that fetch fail."""
+    monkeypatch.setattr(A, "_fetch_url_bytes",
+                        lambda url: (None, "network disabled in tests", None))
+
+
 class _FakeChromium:
     def __init__(self, executable_path, launch_calls):
         self.executable_path = executable_path

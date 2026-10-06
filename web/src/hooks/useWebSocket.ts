@@ -48,6 +48,14 @@ function wireSocket(ws: WebSocket) {
       case 'status':
         setStatus(data.data)
         break
+      case 'capabilities':
+        {
+          // A capability changed state server-side (search fell back, model
+          // failed over, ...): patch just that slice of the status.
+          const current = useSessionStore.getState().status
+          if (current) setStatus({ ...current, capabilities: data.data })
+        }
+        break
       case 'spin':
         if (interruptRequested) break
         setStreaming(true)

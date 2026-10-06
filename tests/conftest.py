@@ -24,3 +24,23 @@ def _load_engine():
 def engine():
     """Fresh engine module per test (module globals are mutable in tests)."""
     return _load_engine()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_capability_registry():
+    """The degradation registry is process-global and, unlike engine, never
+    reloaded: without this one test's "search degraded" leaks into the next
+    test's /doctor or banner output."""
+    from agent8088 import capabilities
+    capabilities.reset()
+    yield
+    capabilities.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_install_state(monkeypatch):
+    """The startup banner and /doctor read $AGENT8088_HOME/install-state.json.
+    Point that at a file that never exists, so a real install's skipped stages
+    cannot leak into unrelated tests (tests of the reader pass a file)."""
+    from agent8088 import install_state
+    monkeypatch.setattr(install_state, "path", lambda: ROOT / "_no_such_install_state.json")

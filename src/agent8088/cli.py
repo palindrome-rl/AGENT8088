@@ -229,6 +229,7 @@ class _SubStatusLine:
 # ---------------------------------------------------------------------------
 # Load the real Agent8088 engine
 # ---------------------------------------------------------------------------
+from agent8088 import capabilities
 from agent8088 import diffview
 from agent8088 import engine as A
 from agent8088 import fusion
@@ -796,6 +797,20 @@ def _startup_notices(extra=()):
     if len(warnings) > STARTUP_WARNING_LINES:
         lines.append(f"{len(warnings) - STARTUP_WARNING_LINES} more — /doctor")
     try:
+        # Optional stages the installer skipped (install-state.json): one
+        # small file read, reported as capabilities.INSTALL.
+        from agent8088 import install_state
+        install_state.report()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        limited = capabilities.banner_line()
+        if limited:
+            # Notices already print with a "! " marker; drop the line's own ⚠.
+            lines.append(limited.removeprefix("⚠ "))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         from agent8088 import memory as _memory
         status = _memory.memory_status()
         if status.get("error"):
@@ -833,6 +848,50 @@ def _mcp_failure_notice():
 def _print_notices(lines):
     for line in lines:
         console.print(Text(f"  ! {line}", style="yellow"))
+
+
+# --- Capability change notices (see capabilities.py) --------------------------
+#
+# capabilities.report() can fire from anywhere — a worker thread, the middle of
+# a tool call under a spinner or a Live render. So the subscriber only QUEUES;
+# the REPL prints the queue at safe points: right after a tool result is shown
+# and before each prompt. While subscribed, capabilities tells the logging
+# console handler to stay quiet, so a notice is never printed twice.
+_CAPABILITY_QUEUE = []
+_CAPABILITY_QUEUE_LOCK = threading.Lock()
+
+
+def _queue_capability_change(change):
+    with _CAPABILITY_QUEUE_LOCK:
+        _CAPABILITY_QUEUE.append(change)
+
+
+def _take_capability_changes():
+    with _CAPABILITY_QUEUE_LOCK:
+        changes = list(_CAPABILITY_QUEUE)
+        _CAPABILITY_QUEUE.clear()
+    # Several changes to one capability between two safe points: only the
+    # last one is still true, and a round trip (down, then back) is no news.
+    first_old, latest = {}, {}
+    for change in changes:
+        first_old.setdefault(change.name, change.old_state)
+        latest.pop(change.name, None)
+        latest[change.name] = change
+    return [c for c in latest.values() if c.new_state != first_old[c.name]]
+
+
+def _print_capability_changes():
+    """One dim line per capability whose state changed since the last call."""
+    for change in _take_capability_changes():
+        mark = "✓" if change.recovered else "⚠"
+        console.print(Text(f"  {mark} {change.message}", style="dim"))
+
+
+def _flush_capability_changes_to_stderr():
+    """For the non-REPL entry points: say what changed during startup."""
+    for change in _take_capability_changes():
+        if not change.recovered:
+            print(f"agent8088 ⚠ {change.message}", file=sys.stderr)
 
 
 def status_cm(msg):
@@ -2218,6 +2277,7 @@ def do_chat(query):
 
         def _on_result(name, result):
             on_result(name, result)
+            _print_capability_changes()
 
         def _on_escalation(_name, result):
             return _handle_escalation(result, live, esc)
@@ -3786,18 +3846,59 @@ def cmd_status(_):
             t.add_row("Model", f"{A.MODEL_NAME} [red](no ladder — run /model auto setup)[/red]")
     else:
         active = _active_provider_name()
-        t.add_row("Model", f"{active}:{A.MODEL_NAME}")
-    t.add_row("Context", f"{_estimate_context_pct()}% used · {len(S.messages)} messages")
+        t.add_row("Model", _model_status_value(f"{active}:{A.MODEL_NAME}"))
+    ctx_window, _ = A._active_model_token_limits()
+    t.add_row("Context", f"{_estimate_context_pct()}% used of {ctx_window:,} "
+                         f"({A.context_window_source()}) · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
-    connected = sum(item.get("state") == "connected" for item in A.MCP_RUNTIME.statuses.values())
-    t.add_row("MCP", f"{connected} connected · {sum(len(item.get('tools', [])) for item in A.MCP_RUNTIME.statuses.values())} tools")
+    mcp = A.MCP_RUNTIME.summary()
+    mcp_value = Text(f"{len(mcp['connected'])} connected")
+    if mcp["failed"]:
+        mcp_value.append(f" · {len(mcp['failed'])} failed ({', '.join(mcp['failed'][:3])}) — /mcp",
+                         style="yellow")
+    if mcp["connecting"] or mcp["pending"]:
+        mcp_value.append(" · connecting…", style="dim")
+    mcp_value.append(f" · {mcp['tools']} tools")
+    t.add_row("MCP", mcp_value)
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}; {sandbox['requested']}) · network {sandbox['network']}")
+    t.add_row("Web search", _search_status_value())
+    for entry in capabilities.degraded():
+        # The "Limited" rows: what is running on a fallback, and how to upgrade.
+        value = Text(f"{entry.label}: {entry.active or entry.state}", style="yellow")
+        if entry.reason:
+            value.append(f" — {entry.reason}", style="dim")
+        if entry.fix:
+            value.append(f" · {entry.fix}", style="dim")
+        t.add_row("Limited", value)
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
     t.add_row("Detail", f"tools {A.TOOL_SELECTION} · verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
     console.print(t)
+
+
+def _model_status_value(configured):
+    """The configured model, plus the fallback actually answering when the
+    primary failed over (capabilities.MODEL / A.LAST_MODEL_SERVED)."""
+    entry = capabilities.get(capabilities.MODEL)
+    if entry is None or entry.ok or entry.preferred != configured:
+        return configured
+    value = Text(configured)
+    value.append(f" → answering with {entry.active}", style="yellow")
+    if entry.reason:
+        value.append(f" ({entry.reason})", style="dim")
+    return value
+
+
+def _search_status_value():
+    """Backend serving web_search, with its state when it is not the preferred one."""
+    entry = capabilities.get(capabilities.SEARCH)
+    if entry is None:
+        return A._search_chain_summary()
+    if entry.ok:
+        return entry.active or A._search_chain_summary()
+    return f"{entry.active or 'none'} ({entry.state})"
 
 
 def _endpoint_probe(endpoint):
@@ -3933,8 +4034,12 @@ def _doctor_base_checks():
         auth = "configured" if A._provider_api_key(provider) else "not required / not configured"
     checks.append(_doctor_check("Model", "info", f"{active}:{A.MODEL_NAME}"))
     model_context, model_output = A._active_model_token_limits()
-    checks.append(_doctor_check("Model token limits", "info",
-                                f"{model_context:,} context / {model_output:,} output"))
+    context_source = A.context_window_source()
+    checks.append(_doctor_check(
+        "Model token limits", "warn" if context_source == "default" else "info",
+        f"{model_context:,} context ({context_source}) / {model_output:,} output"
+        + (" — window unknown, assumed" if context_source == "default" else ""),
+        f"Set provider.{active}.context_window in config.txt." if context_source == "default" else ""))
     checks.append(_doctor_check("Endpoint", "info", str(endpoint or "provider-managed")))
     if endpoint:
         reach = _endpoint_probe(endpoint)
@@ -3958,10 +4063,8 @@ def _doctor_base_checks():
                                 f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}"))
     checks.append(_doctor_check("Capabilities", "info",
                                 f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills"))
-    ddgs_ok = A.web_search._ddgs_installed()
-    checks.append(_doctor_check("Web search", "ok" if ddgs_ok else "fail",
-                                "ok" if ddgs_ok else "ddgs broken - run /doctor --fix",
-                                "" if ddgs_ok else "/doctor --fix (reinstalls ddgs)"))
+    checks.append(_doctor_search_check())
+    checks.extend(_doctor_document_checks())
     cli_state = A.cli_anything.status(A.CONFIG_PATH)
     checks.append(_doctor_check("CLI-Anything", "info",
                                 f"ready (CLI-Hub {cli_state['version']})" if cli_state["available"]
@@ -3978,6 +4081,75 @@ def _doctor_base_checks():
         checks.append(_doctor_check("Code review", "info", _review["detail"]))
     except Exception as _exc:  # a health probe must never break /doctor
         checks.append(_doctor_check("Code review", "info", f"unavailable ({_exc})"))
+    return checks
+
+
+def _doctor_search_check():
+    """The active web search backend and whether it is degraded.
+
+    Read from the capabilities registry (what actually served, or what auto
+    resolved to), not from "ddgs imports" — that said "ok" while every search
+    went through the keyless fallback."""
+    if not A.web_search._ddgs_installed():
+        return _doctor_check("Web search", "fail", "ddgs broken - run /doctor --fix",
+                             "/doctor --fix (reinstalls ddgs)")
+    entry = capabilities.get(capabilities.SEARCH)
+    if entry is None:
+        return _doctor_check("Web search", "ok", f"ok · {A._search_chain_summary()}")
+    if entry.ok:
+        return _doctor_check("Web search", "ok", f"ok · {entry.active}")
+    detail = f"{entry.state}: {entry.active or 'none'}"
+    extra = "; ".join(p for p in (entry.reason, entry.impact) if p)
+    return _doctor_check("Web search", capabilities.doctor_status(entry),
+                         f"{detail} — {extra}" if extra else detail, entry.fix)
+
+
+def _doctor_document_checks():
+    """OCR and LibreOffice: cheap presence checks (PATH lookup, find_spec —
+    no import, no conversion), reported through the capabilities registry."""
+    try:
+        A.documents.report_tooling()
+    except Exception as exc:  # noqa: BLE001
+        return [_doctor_check("Documents", "warn", f"check failed ({exc})")]
+    checks = []
+    for name, title, good in ((capabilities.OCR, "OCR", "installed (scanned PDFs, images)"),
+                              (capabilities.DOCUMENTS, "Document conversion", "LibreOffice found")):
+        entry = capabilities.get(name)
+        if entry is None or entry.ok:
+            checks.append(_doctor_check(title, "ok", good))
+            continue
+        detail = "; ".join(p for p in (entry.reason, entry.impact) if p)
+        checks.append(_doctor_check(title, capabilities.doctor_status(entry), detail, entry.fix))
+    return checks
+
+
+def _doctor_refresh_capabilities():
+    """Report the capabilities that live outside this process's subsystems:
+    installer-skipped stages (install-state.json) and gateway adapters whose
+    dependency is missing (the gateway runs as its own process). Both are
+    cheap: a small file read and find_spec, nothing imported."""
+    try:
+        from agent8088 import install_state
+        install_state.report()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from agent8088.gateway import dependencies as gateway_deps
+        gateway_deps.report(A.APP_CONFIG)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _doctor_capability_checks():
+    """One row per degraded capability that has no dedicated row of its own."""
+    checks = []
+    for entry in capabilities.degraded():
+        if entry.name in (capabilities.SEARCH, capabilities.OCR, capabilities.DOCUMENTS):
+            continue  # a dedicated row above already reports it
+        extra = "; ".join(p for p in (entry.reason, entry.impact) if p)
+        detail = f"{entry.state}: {entry.active or 'none'}" + (f" — {extra}" if extra else "")
+        checks.append(_doctor_check(f"Limited: {entry.label}",
+                                    capabilities.doctor_status(entry), detail, entry.fix))
     return checks
 
 
@@ -4275,6 +4447,11 @@ def _doctor_live_checks():
 def doctor_checks(live=True):
     """Every /doctor check, as dicts (see the comment above _doctor_check)."""
     checks = _doctor_base_checks()
+    _doctor_refresh_capabilities()
+    try:
+        checks.extend(_doctor_capability_checks())
+    except Exception as exc:  # noqa: BLE001
+        checks.append(_doctor_check("Capabilities", "warn", f"registry unavailable ({exc})"))
     if live:
         checks.extend(_doctor_live_checks())
         if any(c["name"] == "Provider API" and c["status"] == "fail" for c in checks):
@@ -4299,11 +4476,26 @@ def doctor_report(live=True):
         "configuration": first.get("Configuration", ""),
         "sandbox": first.get("Sandbox", ""),
         "capabilities": first.get("Capabilities", ""),
-        "web_search": "ok" if first.get("Web search") == "ok" else "broken",
+        "web_search": _doctor_search_flat(checks),
         "cli_anything": first.get("CLI-Anything", ""),
         "checks": checks,
+        # The degradation registry as rows (capabilities.rows()) for the web
+        # UI's "limited" badge; also on /api/status.
+        "limited": capabilities.rows(),
         "ok": not any(check["status"] == "fail" for check in checks),
     }
+
+
+def _doctor_search_flat(checks):
+    """doctor_report's legacy `web_search` string. DoctorPage colours it by
+    keyword, so: "ok …" / "limited: …" (yellow) / "broken" (red)."""
+    row = next((c for c in checks if c["name"] == "Web search"), None)
+    if row is None or row["status"] == "fail":
+        return "broken"
+    if row["status"] == "ok":
+        return row["detail"] if row["detail"].startswith("ok") else "ok"
+    entry = capabilities.get(capabilities.SEARCH)
+    return f"limited: {entry.active if entry and entry.active else 'none'} (fallback)"
 
 
 _DOCTOR_STYLES = {"ok": "#237dd7", "info": "#237dd7", "warn": "yellow", "fail": "red"}
@@ -4908,11 +5100,10 @@ def cmd_search(rest):
                           f"Choose one of: {', '.join(known)}")
             return
         A.update_simple_config(A.CONFIG_PATH, {"web_search_provider": argument})
-        A.APP_CONFIG["web_search_provider"] = argument
+        picked = A.set_search_provider(argument)
         if argument == A.web_search.AUTO:
-            # Resolve now rather than at next launch, so the confirmation names
+            # Resolved now rather than at next launch, so the confirmation names
             # the backend that will actually serve.
-            picked = A.resolve_auto_search_provider()
             console.print("Web search set to [#237dd7]auto[/#237dd7] — picked "
                           f"[#237dd7]{picked or 'none available'}[/#237dd7] "
                           "for this session.")
@@ -5030,6 +5221,15 @@ def cmd_search(rest):
     console.print(f"Active chain: [#237dd7]{A._search_chain_summary()}[/#237dd7]  ·  "
                   f"pin one with [#237dd7]/search use <backend>[/#237dd7]  ·  "
                   f"provision SearXNG with [#237dd7]/search setup[/#237dd7]")
+    entry = capabilities.get(capabilities.SEARCH)
+    if entry is not None and not entry.ok:
+        line = Text(f"Limited: {entry.active or 'no backend'} ({entry.state})", style="yellow")
+        for part in (entry.reason, entry.impact):
+            if part:
+                line.append(f" — {part}", style="dim")
+        if entry.fix:
+            line.append(f" · upgrade: {entry.fix}", style="dim")
+        console.print(line)
 
 
 def cmd_mode(rest):
@@ -6644,19 +6844,20 @@ _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit")))
 # Main REPL
 # ---------------------------------------------------------------------------
 def _estimate_context_pct():
-    """Rough ~4-chars-per-token estimate against the active model's context
-    window — good enough for a progress hint, not meant to be exact. Image
-    parts count as a flat allowance rather than their (huge) base64 length,
-    which would peg the meter at 100%."""
+    """Prompt-token estimate against the active model's context window — a
+    progress hint. Anchored on the server's last real usage.prompt_tokens for
+    this conversation when there is one, else CHARS_PER_TOKEN (see
+    A.estimate_prompt_tokens). Image parts count as a flat allowance rather
+    than their (huge) base64 length, which would peg the meter at 100%."""
     # _session_system_prompt() is what actually goes on the wire; A.SYSTEM_PROMPT
     # is the module-level build from import time and no longer matches it (it
     # still carries the prose tool catalogue this session omits), so the meter
     # was reporting a prompt that is not sent.
-    chars = A._estimate_context_chars(S.messages, _session_system_prompt())
+    tokens = A.estimate_prompt_tokens(S.messages, _session_system_prompt())
     ctx_window, _ = A._active_model_token_limits()
     if not ctx_window:
         return 0
-    return min(100, int(100 * (chars // 4) / ctx_window))
+    return min(100, int(100 * tokens / ctx_window))
 
 
 def _prompt_label():
@@ -9167,6 +9368,10 @@ def main():
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.
+    #
+    # Subscribed first, so what startup finds is queued rather than echoed to
+    # stderr ahead of the banner (which shows it as one `limited:` line).
+    unsubscribe_capabilities = capabilities.subscribe(_queue_capability_change)
     A.resolve_auto_search_provider()
     # Settle the sandbox on the same terms and for the same reason: every path
     # below can run tools, every path above exits without running any. Native is
@@ -9176,6 +9381,15 @@ def main():
     # answer from the first prompt, and a broken sandbox is announced while the
     # operator is still watching instead of midway through a turn.
     A.verify_sandbox_backend()
+    if args.doctor or args.gateway or args.gateway_setup or args.mcp_serve or args.web:
+        # No REPL to render notices: hand later changes back to the logging
+        # console handler (stderr) and say what startup already found. The
+        # doctor report lists it anyway, so it needs no extra lines.
+        unsubscribe_capabilities()
+        if args.doctor:
+            _take_capability_changes()
+        else:
+            _flush_capability_changes_to_stderr()
 
     if args.doctor:
         return run_doctor_cli()
@@ -9228,6 +9442,7 @@ def main():
     model_notices = _startup_ollama_model_check()
     banner()
     _print_notices(_startup_notices(model_notices))
+    _take_capability_changes()  # the banner's `limited:` line already said it
     warn_about_unknown_theme()
     try:
         _repl_loop()
@@ -9292,6 +9507,7 @@ def _run_repl_command(handler, rest):
 def _repl_loop():
     while True:
         _print_notices(_mcp_failure_notice())
+        _print_capability_changes()
         try:
             line = _read_line().strip()
         except (EOFError, KeyboardInterrupt):

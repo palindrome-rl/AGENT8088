@@ -631,9 +631,40 @@ function Write-StageWarning {
     Register-SkippedStage -Label $What -Reason $reason -Fix $Fix
 }
 
+# Persist the skipped-stage ledger to $Agent8088Home\install-state.json, which
+# agent8088 reads to report what is missing in /doctor and the startup banner
+# (agent8088/install_state.py). Rewritten on every run, so a stage fixed by a
+# re-run drops out; written to a temp file and renamed, so a reader never sees
+# half a file. UTF-8 without a BOM. Never fails the install.
+function Save-InstallState {
+    try {
+        $skipped = @()
+        if ($null -ne $script:SkippedStages) {
+            foreach ($s in $script:SkippedStages) {
+                $skipped += [ordered]@{ stage = [string]$s.Label; reason = [string]$s.Reason; fix = [string]$s.Fix }
+            }
+        }
+        $state = [ordered]@{
+            version      = 1
+            installed_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+            skipped      = $skipped
+        }
+        # -InputObject, not the pipeline: piping would unwrap a one-item array.
+        $json = ConvertTo-Json -InputObject $state -Depth 4
+        $file = Join-Path $Agent8088Home "install-state.json"
+        $tmp = "$file.tmp.$PID"
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
+        Move-Item -LiteralPath $tmp -Destination $file -Force
+    } catch {
+        Write-Warn "Could not write install-state.json (agent8088 --doctor will not list skipped stages): $_"
+    }
+}
+
 # Final block: what did not install, why, and the command that fixes it. Silent
 # when everything succeeded.
 function Write-SkippedSummary {
+    # Saved even when nothing was skipped, so stages fixed since drop out.
+    Save-InstallState
     if ($null -eq $script:SkippedStages -or $script:SkippedStages.Count -eq 0) { return }
     Write-Host ""
     Write-Host "$($script:SkippedStages.Count) optional component(s) did not install:" -ForegroundColor Yellow

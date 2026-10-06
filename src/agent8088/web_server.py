@@ -249,11 +249,51 @@ async def lifespan(app: FastAPI):
     # Same initialization the CLI does in main() before starting the REPL
     A.resolve_auto_search_provider()
     A.verify_sandbox_backend()
+    try:
+        from agent8088 import install_state
+        install_state.report()   # installer-skipped stages, for the badge
+    except Exception:
+        pass
+    # Push degradation-registry changes to every open tab as a lightweight
+    # {"type": "capabilities", "data": rows} frame. report() may fire on any
+    # thread, so hop onto this loop before touching the sockets.
+    unsubscribe = _subscribe_capability_broadcast(asyncio.get_running_loop())
     # log.info, not print — printing after uvicorn closes stdout crashes with
     # "I/O operation on closed file".
     log.info("Agent8088 web server ready")
-    yield
+    try:
+        yield
+    finally:
+        unsubscribe()
     log.info("Agent8088 web server shutting down")
+
+
+def _subscribe_capability_broadcast(loop):
+    """capabilities.subscribe() a thread-safe broadcaster; returns unsubscribe."""
+    try:
+        from agent8088 import capabilities
+    except Exception:
+        return lambda: None
+
+    def _on_change(_change):
+        if loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(_broadcast_capabilities()))
+        except RuntimeError:  # loop closed between the check and the call
+            pass
+    return capabilities.subscribe(_on_change)
+
+
+async def _broadcast_capabilities():
+    frame = {"type": "capabilities", "data": _capability_rows()}
+    for ws in list(manager.active):
+        try:
+            await ws.send_json(frame)
+        except Exception:
+            # A socket closing mid-broadcast is cleaned up by its own handler.
+            pass
 
 
 app = FastAPI(title="Agent8088 Web Bridge", version="0.1.0", lifespan=lifespan)
@@ -356,7 +396,28 @@ async def get_status():
             "keep_messages": A.COMPACTION_KEEP_MESSAGES,
         },
         "browser": {"current_host": A.browser_status()},
+        # Degradation registry rows (agent8088.capabilities.rows()): one dict per
+        # reported capability, worst first — {name, label, active, preferred,
+        # state: ok|degraded|unavailable, reason, impact, fix, since, ...}.
+        "capabilities": _capability_rows(),
+        # Which model actually answered the last call. fallback_for is set
+        # ("prov:model") when the configured primary failed over to it.
+        "model_served": _model_served(A),
     }
+
+
+def _capability_rows():
+    try:
+        from agent8088 import capabilities
+        return capabilities.rows()
+    except Exception:
+        return []
+
+
+def _model_served(A):
+    served = dict(getattr(A, "LAST_MODEL_SERVED", None) or {})
+    return {key: str(served.get(key) or "")
+            for key in ("provider", "model", "fallback_for", "reason")}
 
 
 @app.get("/api/commands")
@@ -908,12 +969,22 @@ async def list_models(provider: str):
     # inviting an invalid provider/model pairing in the Config picker.
     if provider not in A.PROVIDERS and provider not in BUILTIN_PROVIDERS:
         return _error(f"unknown provider: {provider}", 404)
+    from agent8088.providers import last_list_error
+    error = None
     try:
         client, _ = A.get_client(provider)
         models = _list_models(provider, client)
-    except Exception:
+        error = last_list_error(provider)
+    except Exception as exc:
         models = FALLBACK_MODELS.get(provider, [])
-    return {"provider": provider, "models": models}
+        error = exc
+    # stale/offline: the live listing failed and `models` is the built-in
+    # offline list, not what the server offers. reason says why (for a badge).
+    reason = " ".join(str(error or "").split())[:200] or (type(error).__name__ if error else "")
+    return {"provider": provider, "models": models,
+            "stale": error is not None, "offline": error is not None,
+            "source": "offline" if error is not None else "live",
+            "reason": reason}
 
 
 @app.get("/api/reviews")
@@ -1286,7 +1357,9 @@ async def use_search(body: dict = None):
     if provider not in known:
         return _error(f"unknown search provider: {provider}", 404)
     A.update_simple_config(A.CONFIG_PATH, {"web_search_provider": provider})
-    A.APP_CONFIG["web_search_provider"] = provider
+    # Resolves `auto` on the spot like the CLI's /search use; storing it
+    # unresolved ran the whole chain and prompted on every search.
+    A.set_search_provider(provider)
     return _search_status()
 
 
@@ -1929,6 +2002,9 @@ async def get_limits():
             "model": A.MODEL_NAME,
             "context_window": A._active_model_token_limits()[0],
             "max_completion_tokens": A._active_model_token_limits()[1],
+            # config | probe | ollama-served | catalog | default ("default" =
+            # unknown window, assumed; capabilities "context" is then degraded)
+            "context_window_source": A.context_window_source(),
         },
         "providers": {
             name: {

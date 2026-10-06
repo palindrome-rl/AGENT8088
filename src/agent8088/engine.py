@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088.errors import is_context_overflow
+from agent8088 import capabilities
 from agent8088 import (cli_anything, diffview, documents, efficiency, local_models,
                        memory, patching, providers, routing, testing_support,
                        tool_output,
@@ -687,6 +688,7 @@ def set_provider_limit(provider: str, key: str, value: str) -> dict:
     old_raw = PROVIDERS[provider].get(key)
     old = _positive_int(old_raw, 0)
     PROVIDERS[provider][key] = str(new)
+    (_PROBE_OWNER.get(provider) or {}).pop(key, None)  # configured now, not probed
     config_key = f"provider.{provider}.{key}"
     APP_CONFIG[config_key] = str(new)
     update_simple_config(CONFIG_PATH, {config_key: new})
@@ -731,10 +733,12 @@ def reset_provider_limit(provider: str, key: str) -> dict:
             _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
         except Exception:
             probed_ctx, probed_out = None, None
+    # Restored as probe-owned values (not config), so a later model switch
+    # on this provider re-probes instead of inheriting them.
     if key == "context_window" and probed_ctx:
-        PROVIDERS[provider]["context_window"] = str(probed_ctx)
+        _store_probed(provider, model, probed_ctx, None)
     elif key == "max_completion_tokens" and probed_out:
-        PROVIDERS[provider]["max_completion_tokens"] = str(probed_out)
+        _store_probed(provider, model, None, probed_out)
 
     new_context, new_completion = _active_model_token_limits(provider)
     new = new_context if key == "context_window" else new_completion
@@ -2101,9 +2105,32 @@ def _active_model_token_limits(provider_name: str = "", model_name: str = "") ->
 
     Most OpenAI-compatible model-list endpoints do not publish either value.
     Resolution is therefore explicit and deterministic: a provider profile
-    override wins, then a global config override, then reviewed model metadata,
-    and finally the conservative legacy defaults.
+    override wins, then a global config override, then the value probed for
+    this exact (provider, model), then reviewed model metadata, and finally
+    the conservative legacy defaults. context_window_source() says which.
     """
+    context, completion, _source = _resolve_token_limits(provider_name, model_name)
+    return context, completion
+
+
+def context_window_source(provider_name: str = "", model_name: str = "") -> str:
+    """Where the context window comes from: config | probe | ollama-served |
+    catalog | default. "default" means nothing knew it and 32768 (or the
+    global CONTEXT_WINDOW) is a guess."""
+    return _resolve_token_limits(provider_name, model_name)[2]
+
+
+def _probe_owned(provider_name: str, key: str):
+    """The model whose probe wrote PROVIDERS[provider][key], or None when the
+    value there came from config (or /limits)."""
+    owner = _PROBE_OWNER.get(provider_name)
+    value = (PROVIDERS.get(provider_name) or {}).get(key)
+    if owner and value not in (None, "") and owner.get(key) == str(value):
+        return owner["model"]
+    return None
+
+
+def _resolve_token_limits(provider_name: str = "", model_name: str = ""):
     from agent8088.providers import model_token_limits
 
     # Lazy probe: this is the accessor every consumer of a token limit goes
@@ -2115,23 +2142,57 @@ def _active_model_token_limits(provider_name: str = "", model_name: str = "") ->
     active_model = model_name or MODEL_NAME
     profile = PROVIDERS.get(active_provider, {})
     known = model_token_limits(active_provider, active_model)
-    context_value = profile.get("context_window")
-    if context_value in (None, ""):
-        context_value = (
-            APP_CONFIG.get("context_window")
-            if "context_window" in APP_CONFIG
-            else known.get("context_window")
-        )
-    completion_value = profile.get("max_completion_tokens")
-    if completion_value in (None, ""):
-        completion_value = (
-            APP_CONFIG.get("max_completion_tokens")
-            if "max_completion_tokens" in APP_CONFIG
-            else known.get("max_completion_tokens")
-        )
+    probed_ctx, probed_out = _PROBED_LIMITS.get((active_provider, active_model), (None, None))
+
+    def pick(key, probed):
+        value = profile.get(key)
+        if value not in (None, ""):
+            owner = _probe_owned(active_provider, key)
+            if owner is None:
+                return value, "config"
+            if owner != active_model:
+                # Another model's probe on the same provider: not this one's.
+                value = None
+            else:
+                return value, _PROBED_SOURCE.get((active_provider, active_model), "probe")
+        if key in APP_CONFIG:
+            return APP_CONFIG.get(key), "config"
+        if probed:
+            return probed, _PROBED_SOURCE.get((active_provider, active_model), "probe")
+        if known.get(key):
+            return known.get(key), "catalog"
+        return None, "default"
+
+    context_value, source = pick("context_window", probed_ctx)
+    completion_value, _ = pick("max_completion_tokens", probed_out)
     context = _positive_int(context_value, CONTEXT_WINDOW)
+    if context_value is not None and _positive_int(context_value, 0) <= 0:
+        source = "default"
     completion = _positive_int(completion_value, MAX_COMPLETION_TOKENS)
-    return context, min(completion, context)
+    if (active_provider == (ACTIVE_PROVIDER or DEFAULT_PROVIDER)
+            and active_model == MODEL_NAME):
+        _report_context_source(active_provider, active_model, source, context)
+    return context, min(completion, context), source
+
+
+def _report_context_source(provider_name: str, model_name: str, source: str, context: int) -> None:
+    """capabilities.CONTEXT: degraded while the active model's window is a guess."""
+    try:
+        if source != "default":
+            capabilities.report(capabilities.CONTEXT, active=f"{context:,} tokens ({source})",
+                                preferred="", state=capabilities.OK)
+            return
+        probed = (provider_name, model_name) in _PROBED_LIMITS
+        capabilities.report(
+            capabilities.CONTEXT, active=f"assumed {context:,} tokens", preferred="",
+            state=capabilities.DEGRADED,
+            reason=(f"context window unknown for {model_name}; assuming {context}"
+                    + ("" if not probed else " (probe failed)")),
+            impact="compaction may fire too early or the prompt may be truncated",
+            fix=f"set provider.{provider_name}.context_window",
+            model_note="")
+    except Exception:  # noqa: BLE001
+        _log.debug("context capability report failed", exc_info=True)
 
 
 def activate_model(provider: str = "", model: str = ""):
@@ -2172,6 +2233,31 @@ def activate_model(provider: str = "", model: str = ""):
 
 
 _PROBED_LIMITS = {}
+# provider -> {"model", "context_window", "max_completion_tokens"}: which
+# model's probe wrote the values now in PROVIDERS[provider]. A value there that
+# matches belongs to that model alone; anything else came from config.
+_PROBE_OWNER = {}
+# (provider, model) -> "probe" | "ollama-served": how the probed window was found.
+_PROBED_SOURCE = {}
+
+
+def _store_probed(name: str, model: str, ctx, out) -> None:
+    """Write a probed (provider, model) result into PROVIDERS[name], replacing
+    any values another model's probe left there, and record ownership.
+    Values from config (no probe owns them) are never overwritten."""
+    profile = PROVIDERS[name]
+    previous = _PROBE_OWNER.get(name) or {}
+    owner = dict(previous) if previous.get("model") == model else {"model": model}
+    for key, value in (("context_window", ctx), ("max_completion_tokens", out)):
+        prior = _probe_owned(name, key)
+        if prior is not None and prior != model:
+            profile.pop(key, None)  # another model's probe: not this model's limit
+        elif prior is None and profile.get(key) not in (None, ""):
+            continue  # configured
+        if value and value > 0:
+            profile[key] = str(value)
+            owner[key] = str(value)
+    _PROBE_OWNER[name] = owner
 
 
 def _maybe_probe_context_window():
@@ -2190,12 +2276,9 @@ def _maybe_probe_context_window():
     cache_key = (name, model)
     if cache_key in _PROBED_LIMITS:
         ctx, out = _PROBED_LIMITS[cache_key]
-        if ctx:
-            PROVIDERS[name]["context_window"] = str(ctx)
-        if out:
-            PROVIDERS[name]["max_completion_tokens"] = str(out)
+        _store_probed(name, model, ctx, out)
         return
-    if PROVIDERS[name].get("context_window"):
+    if PROVIDERS[name].get("context_window") and _probe_owned(name, "context_window") is None:
         return  # explicit config override — no probe needed
     if "context_window" in APP_CONFIG:
         return  # global override exists — no probe needed
@@ -2203,13 +2286,14 @@ def _maybe_probe_context_window():
         probed_ctx, probed_out = probe_model_context_window(client, model, provider_name=name)
     except Exception:
         probed_ctx, probed_out = None, None
+    _PROBED_SOURCE[cache_key] = "probe"
     if probed_ctx and probed_ctx > 0:
-        probed_ctx = _ollama_served_cap(name, model, probed_ctx)
+        served = _ollama_served_cap(name, model, probed_ctx)
+        if served != probed_ctx:
+            _PROBED_SOURCE[cache_key] = "ollama-served"
+        probed_ctx = served
     _PROBED_LIMITS[cache_key] = (probed_ctx, probed_out)
-    if probed_ctx and probed_ctx > 0:
-        PROVIDERS[name]["context_window"] = str(probed_ctx)
-    if probed_out and probed_out > 0 and not PROVIDERS[name].get("max_completion_tokens"):
-        PROVIDERS[name]["max_completion_tokens"] = str(probed_out)
+    _store_probed(name, model, probed_ctx, probed_out)
 
 
 def _ollama_served_cap(provider_name: str, model: str, probed_ctx: int) -> int:
@@ -2764,6 +2848,80 @@ def explain_model_error(error, provider_name: str = "", model_name: str = ""):
         provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER, model_name))
 
 
+# Which model actually answered the last main call, for /status. A failover
+# to a fallback_models entry is otherwise invisible: the configured MODEL_NAME
+# does not change. {"provider", "model", "fallback_for": "prov:model" or ""}.
+LAST_MODEL_SERVED: dict = {}
+
+
+def _model_label(provider_name: str, model_name: str) -> str:
+    return f"{provider_name}:{model_name}" if provider_name else str(model_name or "")
+
+
+def _short_model_error(error, provider_name: str, model_name: str) -> str:
+    """One short clause for why a model failed ("Can't reach http://...")."""
+    if error is None:
+        return "failed"
+    try:
+        friendly = explain_model_error(error, provider_name, model_name)
+        text = friendly.message
+    except Exception:  # noqa: BLE001
+        text = f"{type(error).__name__}: {error}"
+    text = " ".join(str(text).split()).rstrip(".")
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def _fallback_max_tokens(messages, system_prompt, tools, provider_name, model_name,
+                         requested=None) -> int:
+    """max_tokens for a fallback model, from ITS limits rather than the primary's.
+
+    The caller sized `requested` for the primary (its completion ceiling, its
+    window's headroom). Bound it by the fallback's ceiling and by the headroom
+    the estimated prompt leaves in the fallback's window."""
+    window, ceiling = _active_model_token_limits(provider_name, model_name)
+    try:
+        chars = (len(json.dumps(messages, default=str)) + len(system_prompt or "")
+                 + len(json.dumps(tools or [], default=str)))
+    except Exception:  # noqa: BLE001
+        chars = 0
+    headroom = window - int(chars / CHARS_PER_TOKEN) - 512  # CONTEXT_SAFETY_TOKENS
+    limit = min(ceiling, headroom)
+    if requested:
+        limit = min(limit, int(requested))
+    return max(256, limit)  # MIN_TURN_COMPLETION_TOKENS: let the server say no
+
+
+def _note_model_served(provider_name, model_name, *, primary=None, reason="") -> None:
+    """Record who answered; report capabilities.MODEL on failover/recovery.
+
+    Only failovers away from the main model (and recovery back to it) are
+    reported: sub-agents and auto rungs calling other models successfully are
+    not a degradation of anything."""
+    try:
+        main = _model_label(ACTIVE_PROVIDER or DEFAULT_PROVIDER, MODEL_NAME)
+        served = _model_label(provider_name, model_name)
+        if primary is not None:
+            preferred = _model_label(*primary)
+            LAST_MODEL_SERVED.update(provider=provider_name, model=model_name,
+                                     fallback_for=preferred, reason=reason)
+            capabilities.report(
+                capabilities.MODEL, active=served, preferred=preferred,
+                state=capabilities.DEGRADED, reason=reason or "primary failed",
+                impact=f"answers come from {served}",
+                fix="check the primary (/doctor) or /model",
+                model_note="")
+            return
+        entry = capabilities.get(capabilities.MODEL)
+        if entry is not None and not entry.ok and entry.preferred == served:
+            capabilities.report(capabilities.MODEL, active=served, preferred=served,
+                                state=capabilities.OK, reason="primary answering again")
+        if served == main:
+            LAST_MODEL_SERVED.update(provider=provider_name, model=model_name,
+                                     fallback_for="", reason="")
+    except Exception:  # noqa: BLE001 — bookkeeping must never fail a model call
+        _log.debug("model capability report failed", exc_info=True)
+
+
 def _create_completion_with_fallback(messages, tools, *, temperature, system_prompt,
                                      on_token, interrupt_check, trace, turn,
                                      max_tokens=None, client_override=None,
@@ -2808,7 +2966,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
     while attempt < attempts:
         attempt += 1
         try:
-            return create_completion(
+            response = create_completion(
                 active_client, messages, tools, temperature=temperature,
                 max_tokens=max_tokens,
                 system_prompt=system_prompt, on_token=token_handler,
@@ -2817,6 +2975,8 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 provider_name=active_provider,
                 telemetry_attempt="primary",
             )
+            _note_model_served(active_provider, active_model)
+            return response
         except AgentInterrupted:
             raise
         except Exception as error:
@@ -2878,15 +3038,27 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                     "provider": provider_name,
                     "model": model_name,
                 })
-            notify(f"{active_provider or 'primary'}:{active_model} failed; "
-                   f"trying fallback {provider_name}:{model_name}")
-            return create_completion(
+            reason = _short_model_error(primary_error or last_error, active_provider, active_model)
+            current = capabilities.get(capabilities.MODEL)
+            if not (current is not None and not current.ok
+                    and current.active == f"{provider_name}:{model_name}"):
+                # Once per failover, not on every call while it lasts: the
+                # registry entry (banner, /status) already says it's ongoing.
+                notify(f"primary {active_provider or 'primary'}:{active_model} failed ({reason}); "
+                       f"answering with {provider_name}:{model_name}")
+            response = create_completion(
                 fallback_client, messages, tools, temperature=temperature,
-                max_tokens=max_tokens,
+                # Sized for the fallback's own limits: the primary's ceiling
+                # (or headroom in its larger window) can overrun this model.
+                max_tokens=_fallback_max_tokens(messages, system_prompt, tools,
+                                                provider_name, model_name, max_tokens),
                 system_prompt=system_prompt, on_token=token_handler,
                 interrupt_check=interrupt_check, model_name=model_name,
                 provider_name=provider_name, telemetry_attempt="fallback",
             )
+            _note_model_served(provider_name, model_name,
+                               primary=(active_provider, active_model), reason=reason)
+            return response
         except AgentInterrupted:
             raise
         except Exception as fallback_error:
@@ -3214,8 +3386,12 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
                for name in sorted(names) if name in TOOL_SPECS]
     key = tuple(entries)
     cached = _TOOL_INDEX_CACHE.get(key)
-    if cached is not None:
+    if cached is not None and (cached[2] or not _tool_embedder_ready()):
         return cached
+    # No cache, or one built while the embedder was down: an empty-vector
+    # snapshot used to stick for the whole session, so tool selection stayed
+    # keyword-only after the embedder recovered. Retried at most once per
+    # embedder breaker window (a failure re-trips the breaker).
     vectors = []
     try:
         active_embedder = memory.embedder()
@@ -3227,6 +3403,15 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
     _TOOL_INDEX_CACHE.clear()
     _TOOL_INDEX_CACHE[key] = result
     return result
+
+
+def _tool_embedder_ready() -> bool:
+    """Is there an embedder whose breaker is closed (worth trying again)?"""
+    try:
+        active_embedder = memory.embedder()
+        return active_embedder is not None and active_embedder.ready()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -3473,6 +3658,7 @@ def _start_mcp_background() -> None:
     def done(tools):
         with _MCP_PENDING_LOCK:
             _MCP_PENDING["tools"] = tools
+        _report_mcp()
 
     reserved = {name for name, spec in TOOL_SPECS.items() if spec.get("mode") != "mcp"}
     MCP_RUNTIME.reload_in_background(reserved, on_done=done)
@@ -3509,7 +3695,35 @@ def reload_mcp_tools():
         _MCP_PENDING["tools"] = None
     reserved = {name: spec for name, spec in TOOL_SPECS.items() if spec.get("mode") != "mcp"}
     _apply_mcp_tools(MCP_RUNTIME.reload(reserved))
+    _report_mcp()
     return MCP_RUNTIME.statuses
+
+
+def _report_mcp() -> None:
+    """capabilities.MCP from the runtime's statuses: degraded while any
+    configured server failed, ok when all connected, cleared with none."""
+    try:
+        statuses = dict(MCP_RUNTIME.statuses)
+        summary = MCP_RUNTIME.summary()
+        connected, failed = summary["connected"], summary["failed"]
+        total = len(connected) + len([n for n in failed if not n.startswith(("config:", "teardown", "startup"))])
+        if not connected and not failed:
+            capabilities.clear(capabilities.MCP)
+            return
+        active = f"{len(connected)}/{total} servers"
+        if not failed:
+            capabilities.report(capabilities.MCP, active=active, preferred="", state=capabilities.OK)
+            return
+        first = failed[0]
+        error = str(statuses.get(first, {}).get("error") or "failed")
+        capabilities.report(
+            capabilities.MCP, active=active, preferred="",
+            state=capabilities.DEGRADED if connected else capabilities.UNAVAILABLE,
+            reason=f"{first}: {error}"[:160],
+            impact=f"tools from {', '.join(failed[:3])}{' …' if len(failed) > 3 else ''} unavailable",
+            fix="/mcp")
+    except Exception:  # noqa: BLE001 — reporting must never break a tool call
+        _log.debug("mcp capability report failed", exc_info=True)
 
 
 atexit.register(MCP_RUNTIME.close)
@@ -7489,6 +7703,134 @@ async def _run_browser_agent(url: str, task: str,
     return content, "\n".join(notes)
 
 
+# --- browse_page without a browser: a static HTML read --------------------
+# When Playwright, Chromium or browser-use is missing, a read-only request
+# ("summarize this page", "what does it say about X") is still answerable from
+# the page's HTML. Interactive tasks are refused as before: no JavaScript ran,
+# nothing can be clicked or filled.
+_BROWSER_INTERACTIVE = re.compile(
+    r"\b(click|tap|press|fill|type|enter (?:my|the|a)|submit|log ?in|sign ?(?:in|up)|"
+    r"select|choose|check ?out|book|buy|purchase|order|add to cart|upload|download|"
+    r"scroll|hover|drag|navigate|go to|open the .* (?:menu|tab|link)|play|search for|"
+    r"screenshot|interact)\b", re.IGNORECASE)
+STATIC_PAGE_MAX_CHARS = 20000
+_STATIC_PAGE_TYPES = ("text/html", "application/xhtml+xml", "text/plain", "")
+
+
+def _browser_task_is_read_only(task: str) -> bool:
+    """A read/extract request that a static HTML fetch can serve."""
+    return not _BROWSER_INTERACTIVE.search(str(task or ""))
+
+
+def _html_to_text(html: str) -> str:
+    """Readable text from HTML: drops script/style/etc., keeps block breaks."""
+    from html.parser import HTMLParser
+
+    skip = {"script", "style", "noscript", "template", "svg", "head", "iframe"}
+    blocks = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+              "section", "article", "header", "footer", "pre", "blockquote", "table"}
+
+    class _Text(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts, self.depth, self.title, self._in_title = [], 0, "", False
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "title":
+                self._in_title = True
+            if tag in skip:
+                self.depth += 1
+            elif tag in blocks:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag == "title":
+                self._in_title = False
+            if tag in skip and self.depth:
+                self.depth -= 1
+            elif tag in blocks:
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            if self._in_title:
+                self.title += data
+            elif not self.depth:
+                self.parts.append(data)
+
+    parser = _Text()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:  # noqa: BLE001 — malformed HTML: keep what was parsed
+        pass
+    lines = [" ".join(line.split()) for line in "".join(parser.parts).splitlines()]
+    text = "\n".join(line for line in lines if line)
+    title = " ".join(parser.title.split())
+    return f"Title: {title}\n\n{text}" if title else text
+
+
+def _browser_install_hint(missing: str) -> str:
+    python = sys.executable or "python"
+    if missing == "playwright":
+        return f"`{python} -m pip install playwright && {python} -m playwright install chromium`"
+    if missing == "browser-use":
+        return "reinstall agent8088 on Python 3.11+ (browser-use)"
+    return f"`{python} -m playwright install chromium`"
+
+
+def _report_browser(missing: str = "") -> None:
+    """capabilities.BROWSER: degraded to static HTML reads while `missing`."""
+    try:
+        if not missing:
+            capabilities.report(capabilities.BROWSER, active="chromium", preferred="chromium",
+                                state=capabilities.OK)
+            return
+        label = {"playwright": "Playwright", "browser-use": "browser-use"}.get(missing, "Chromium")
+        capabilities.report(
+            capabilities.BROWSER, active="static HTML fetch", preferred="chromium",
+            state=capabilities.DEGRADED, reason=f"{label} isn't installed",
+            impact="browse_page reads static HTML only: no JavaScript, no clicking or forms",
+            fix=_browser_install_hint(missing).strip("`"))
+    except Exception:  # noqa: BLE001
+        _log.debug("browser capability report failed", exc_info=True)
+
+
+def _static_page_read(url: str, task: str, missing: str, refusal: str) -> str:
+    """browse_page's fallback: fetch the page over plain HTTP and return its text.
+
+    Same guards as every other fetch: _fetch_url_bytes runs _egress_check and
+    _ssrf_check on the URL and on every redirect, connects only to the vetted
+    address (_build_safe_opener / _pinned_connection, no DNS rebinding) and
+    caps the body at MAX_HTTP_BYTES. Like the browsing proxy, the local search
+    endpoint allowance does not apply: only ssrf_allow_hosts relaxes it.
+    """
+    _report_browser(missing)
+    if not _browser_task_is_read_only(task):
+        return refusal
+    import urllib.parse
+    parts = urllib.parse.urlparse(url)
+    host = (parts.hostname or "").lower()
+    if parts.port and f"{host}:{parts.port}" in _SEARCH_ALLOW_HOSTS and not (
+            host in SSRF_ALLOW_HOSTS or f"{host}:{parts.port}" in SSRF_ALLOW_HOSTS):
+        return f"Blocked: '{host}:{parts.port}' is the local search endpoint, not a page to browse."
+    raw, error, content_type = _fetch_url_bytes(url)
+    if error:
+        return f"{refusal}\n(Static fetch fallback also failed: {error})"
+    if (content_type or "") not in _STATIC_PAGE_TYPES:
+        return f"{refusal}\n(Static fetch fallback: {url} is {content_type}, not a web page.)"
+    html = raw.decode("utf-8", errors="replace")
+    text = html if content_type == "text/plain" else _html_to_text(html)
+    if len(text) > STATIC_PAGE_MAX_CHARS:
+        text = text[:STATIC_PAGE_MAX_CHARS] + f"\n[... truncated at {STATIC_PAGE_MAX_CHARS} characters]"
+    if not text.strip():
+        text = "(the page has no static text; it is probably rendered by JavaScript)"
+    label = {"playwright": "Playwright isn't", "browser-use": "browser-use isn't"}.get(
+        missing, "Chromium isn't")
+    note = (f"[note: static HTML fetch — no JavaScript, no interaction; {label} installed "
+            f"({_browser_install_hint(missing)})]")
+    return f"{_wrap_untrusted(_strip_special_tokens(text), url)}\n{note}"
+
+
 def _exec_browser(args: dict) -> str:
     """Load a page and complete a task on it in a real headless browser --
     click, fill forms, navigate, and extract information via natural-
@@ -7521,14 +7863,17 @@ def _exec_browser(args: dict) -> str:
     if blocked:
         return blocked
     if not _playwright_available():
-        return ("Playwright is not installed. Install it with:\n"
+        return _static_page_read(url, task, "playwright", (
+                "Playwright is not installed. Install it with:\n"
                 "  pip install playwright && playwright install chromium\n"
-                "Until then, use web_search or get_page_title instead.")
+                "Until then, use web_search or get_page_title instead, or ask "
+                "browse_page only to read/extract (served as static HTML)."))
     if not _browser_use_available():
-        return ("Interactive browsing is unavailable: the browser-use package "
+        return _static_page_read(url, task, "browser-use", (
+                "Interactive browsing is unavailable: the browser-use package "
                 "is not installed. It requires Python 3.11 or newer, so it is "
                 "skipped on a Python 3.10 install. Reinstall Agent8088 on "
-                "Python 3.11+, or use web_search or get_page_title instead.")
+                "Python 3.11+, or use web_search or get_page_title instead."))
     try:
         # Before the first Playwright connection: the Chromium path probe
         # below opens one, and Playwright's teardown abandons the
@@ -7543,9 +7888,12 @@ def _exec_browser(args: dict) -> str:
     except Exception as e:
         return f"Browser error: {e}"
     if executable_path is None:
-        return ("Playwright's Chromium browser is not installed. Install it with:\n"
+        return _static_page_read(url, task, "chromium", (
+                "Playwright's Chromium browser is not installed. Install it with:\n"
                 "  playwright install chromium\n"
-                "Until then, use web_search or get_page_title instead.")
+                "Until then, use web_search or get_page_title instead, or ask "
+                "browse_page only to read/extract (served as static HTML)."))
+    _report_browser()
 
     saved_role, _active_role = _active_role, "subagent:browser"
     try:
@@ -7914,7 +8262,9 @@ def set_sandbox_backend(backend: str) -> dict:
     update_simple_config(CONFIG_PATH, {"sandbox_backend": backend})
     APP_CONFIG["sandbox_backend"] = backend
     SANDBOX_BACKEND = backend
-    return sandbox_status()
+    status = sandbox_status()
+    _report_sandbox(status)
+    return status
 
 
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
@@ -8051,6 +8401,8 @@ def _mark_native_sandbox_broken(result: str, quiet: bool = False) -> None:
         # `--sandbox-setup` run used to print the identical paragraph twice.
         _log.warning("native sandbox could not start. Reason: %s",
                      _native_sandbox_failure[:200])
+    if first_failure:
+        _report_sandbox()  # native -> docker (or nothing) mid-session: say so
 
 
 def _native_sandbox_ready(cwd: Path, readonly: bool = False,
@@ -8145,6 +8497,7 @@ def _mark_docker_sandbox_broken(result: str) -> None:
     if first_failure:
         _log.warning("docker sandbox could not start. %s",
                      _docker_sandbox_repair_hint(_docker_sandbox_failure))
+        _report_sandbox()
 
 
 def _docker_sandbox_repair_hint(result: str) -> str:
@@ -8257,10 +8610,65 @@ def verify_sandbox_backend() -> dict:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     if requested != "docker" and not _native_sandbox_missing_requirements():
         if _native_sandbox_ready(ARTIFACTS_ROOT):
-            return sandbox_status()
+            status = sandbox_status()
+            _report_sandbox(status)
+            return status
     if requested != "native" or _native_sandbox_broken:
         _docker_sandbox_ready(ARTIFACTS_ROOT)
-    return sandbox_status()
+    status = sandbox_status()
+    _report_sandbox(status)
+    return status
+
+
+SANDBOX_DOCKER_IMPACT = ("commands run in a container with no network; "
+                         "installs/downloads will fail")
+SANDBOX_DOCKER_NOTE = ("[note: this ran in the Docker sandbox — no network and a different "
+                       "image than the host; pip/npm installs and downloads fail here]")
+
+
+def _report_sandbox(status: dict | None = None) -> None:
+    """capabilities.SANDBOX from a sandbox_status() dict (computed if omitted).
+
+    Called where the backend is settled (startup verify, /sandbox) and where it
+    changes mid-session (a latched native or docker failure) — never per command,
+    since resolving can shell out to `docker info`."""
+    try:
+        status = status or sandbox_status()
+        resolved = status.get("resolved")
+        requested = str(status.get("requested") or "auto")
+        if resolved == "native":
+            capabilities.report(capabilities.SANDBOX, active="native", preferred="native",
+                                state=capabilities.OK)
+        elif resolved == "docker":
+            by_choice = requested == "docker"
+            reason = ("sandbox_backend=docker" if by_choice
+                      else "native sandbox failed" if _native_sandbox_broken
+                      else "native sandbox not installed")
+            capabilities.report(
+                capabilities.SANDBOX, active="docker",
+                preferred="docker" if by_choice else "native",
+                state=capabilities.OK if by_choice else capabilities.DEGRADED,
+                reason=reason, impact=SANDBOX_DOCKER_IMPACT,
+                fix="" if by_choice else "/sandbox setup (installs the native runtime)",
+                model_note=SANDBOX_DOCKER_NOTE)
+        else:
+            capabilities.report(
+                capabilities.SANDBOX, active="", preferred="native",
+                state=capabilities.UNAVAILABLE,
+                reason=(status.get("failure") or status.get("detail") or "no sandbox")[:160],
+                impact="sandboxed shell and Python commands are refused",
+                fix="/sandbox setup, or start Docker")
+    except Exception:  # noqa: BLE001 — reporting must never fail a command
+        _log.debug("sandbox capability report failed", exc_info=True)
+
+
+def _sandbox_model_note() -> str:
+    """The Docker caveat for a sandboxed command's result, or "". Reads the
+    registry only (no `docker info` per command)."""
+    entry = capabilities.get(capabilities.SANDBOX)
+    if entry is not None and entry.active == "docker":
+        return entry.model_note or SANDBOX_DOCKER_NOTE
+    return ""
 
 
 def _native_or_docker(native, docker):
@@ -8577,6 +8985,15 @@ def _explain_sandbox_denial(result: str, workspace: Path) -> str:
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
                           python_code: bool = False, image: str = "") -> str:
+    """Run in the sandbox; when Docker serves, say so in the result, so the
+    model reads a failed `pip install` as "no network here", not a bad command."""
+    result = _run_sandbox_command(command, timeout, python_code, image)
+    note = _sandbox_model_note()
+    return f"{result}\n{note}" if note and isinstance(result, str) else result
+
+
+def _run_sandbox_command(command: str, timeout: int = 25,
+                         python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
     if backend == "unavailable":
         return _sandbox_required_error()
@@ -9927,6 +10344,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=query[:120], reason="outbound_secret")
             return leak
+        # Before the gate: an upgrade back to SearXNG changes which prompt
+        # rules apply, and this call should already be judged by them.
+        _maybe_reprobe_searxng()
         local_no_prompt = _local_searxng_no_prompt_enabled()
         ddgs_only = _ddgs_only_chain()
         if (not local_no_prompt and not ddgs_only
@@ -9949,26 +10369,25 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             config["web_search_provider"] = "ddgs"
             _audit("tool_call", tool=name, mode=mode, decision="allowed",
                    detail=query[:200], change_type="network_fallback")
-            return _frame_search_results(web_search.run_search(
-                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
-                images=wants_images))
+            report = _run_web_search(query, config, context, wants_images)
+            _report_search_outcome(report, fallback_reason="SearXNG stopped answering")
+            return _frame_search_results(_with_search_note(report))
 
         _audit_extra = {"reason": "ddgs_no_prompt"} if ddgs_only and not local_no_prompt else {}
         _audit("tool_call", tool=name, mode=mode, decision="allowed",
                detail=query[:200], **_audit_extra)
-        if not local_no_prompt:
-            return _frame_search_results(web_search.run_search(
-                query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
-                images=wants_images))
-        outcome = web_search.run_search(
-            query, _web_search_limit(), WEB_SEARCH_REGISTRY, config, context,
-            return_failures=True, images=wants_images)
-        # Embedders may supply an older custom registry implementation. A plain
-        # string is still a valid result; it simply cannot request this fallback.
-        if not isinstance(outcome, tuple):
-            return _frame_search_results(outcome)
-        result, failures = outcome
-        if failures == ("searxng",):
+        # Under auto the pin is only the FIRST choice: hand run_search the rest
+        # of the auto order too, so a pin that stops answering falls through
+        # instead of failing. A call that skipped the approval gate on an
+        # exemption may only fall through to backends that exemption covers.
+        call_chain = (_search_call_chain(context, prompt_free=local_no_prompt or ddgs_only)
+                      if _search_auto_active() else None)
+        report = _run_web_search(query, config, context, wants_images, chain=call_chain)
+        _report_search_outcome(report)
+        if (local_no_prompt and not report.provider and call_chain is None
+                and report.failed == ("searxng",)):
+            # An explicit searxng pin with web_search_no_prompt=1 promised that
+            # queries stay local; leaving the network needs this query's consent.
             _audit("escalation_requested", tool=name, mode=mode,
                    decision="blocked", detail=query[:120],
                    change_type="network_fallback")
@@ -9979,7 +10398,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 reason=("Local SearXNG returned no results. Retry this exact query "
                         "with public DuckDuckGo search?"),
             )
-        return _frame_search_results(result)
+        return _frame_search_results(_with_search_note(report))
 
     # --- Permission gate for writes, shell, containers, cron, and browser ---
     command = ""
@@ -10256,7 +10675,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         return _exec_browser(args)
 
     if mode == "mcp":
-        return _wrap_untrusted(MCP_RUNTIME.call(name, args), f"MCP {command}")
+        mcp_result = MCP_RUNTIME.call(name, args)
+        _report_mcp()  # a call can find a server dead, or reconnect it
+        return _wrap_untrusted(mcp_result, f"MCP {command}")
 
     if mode == "read_text":
         # Documents are extracted to text first. Deliberately handled inside the
@@ -12401,6 +12822,13 @@ def _local_searxng_no_prompt_enabled() -> bool:
     # not disagree about what the configured value means.
     if str(config.get("web_search_provider") or "").strip().lower() != "searxng":
         return False
+    return _search_base_url_is_local(config)
+
+
+def _search_base_url_is_local(config=None) -> bool:
+    """Is search_base_url a loopback or explicitly allowlisted private-LAN
+    SearXNG? Queries sent there do not leave the operator's network."""
+    config = _search_config() if config is None else config
     base_url = str(config.get("search_base_url") or "")
     try:
         import ipaddress
@@ -12506,15 +12934,20 @@ def resolve_auto_search_provider(probe=None) -> str:
     path safe (see _local_searxng_no_prompt_enabled — it requires a searxng pin
     precisely because a chain could fall through to a public provider).
 
-    Consequence worth stating: when SearXNG is down the pick lands on ddgs, so
-    searches keep working but DO prompt, because the query now leaves the
-    network. Silent + external is the one combination this cannot give.
+    When SearXNG is down the pick lands on ddgs (reported as degraded in
+    capabilities.SEARCH), which needs no approval (_ddgs_only_chain). The pin
+    is auto's first choice, not its only one: _search_call_chain falls
+    through mid-session and _maybe_reprobe_searxng switches back up.
 
     Returns the resolved name ("" if nothing can serve). A no-op unless the
     configured value is AUTO, so calling it twice is harmless.
     """
     configured = str(APP_CONFIG.get("web_search_provider") or "").strip().lower()
     if configured != web_search.AUTO:
+        # Already resolved by auto earlier in this process (the web server's
+        # lifespan calls this again after cli.main did): keep auto's report.
+        if not _search_auto_active():
+            _report_search_pin(configured)
         return configured
     try:
         # Safe to build from the live config even though it still says "auto":
@@ -12527,9 +12960,211 @@ def resolve_auto_search_provider(probe=None) -> str:
                decision="allowed", detail=f"auto -> unresolved ({exc})")
         return web_search.AUTO
     APP_CONFIG["web_search_provider"] = picked
+    _SEARCH_AUTO["pin"] = picked
+    _SEARCH_AUTO["last_probe"] = time.monotonic()
     _audit("search_provider_resolved", tool="web_search", mode="search",
            decision="allowed", detail=f"auto -> {picked or 'none available'}")
+    _report_search_state(picked)
     return picked
+
+
+def set_search_provider(name: str) -> str:
+    """`/search use <name>` and POST /api/search/use: apply a choice for this
+    process. AUTO is resolved on the spot (same as at startup), so the web UI
+    no longer stores a bare "auto" that runs the whole chain and prompts on
+    every search. Persisting to config.txt is the caller's job. Returns the
+    name now in effect."""
+    name = str(name or "").strip().lower()
+    APP_CONFIG["web_search_provider"] = name
+    _SEARCH_AUTO["pin"] = ""
+    if name == web_search.AUTO:
+        return resolve_auto_search_provider()
+    capabilities.clear(capabilities.SEARCH)
+    _report_search_pin(name)
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Web search — capability state and the auto fallback (see capabilities.py)
+# ---------------------------------------------------------------------------
+SEARCH_DDGS_IMPACT = "keyless scraper: results can be incomplete, throttled or less relevant"
+SEARCH_DDGS_NOTE = ("[note: served by ddgs (keyless fallback) — coverage may be incomplete; "
+                    "cross-check important facts or try a narrower query]")
+
+# What auto resolved to. "pin" is the concrete backend auto picked ("" when
+# auto is not in effect: an explicit pin, or nothing could serve);
+# last_probe is when SearXNG was last probed (time.monotonic()).
+_SEARCH_AUTO = {"pin": "", "last_probe": 0.0}
+
+
+def _search_auto_active() -> bool:
+    """Is the current pin auto's choice (rather than an explicit pin)?"""
+    pin = _SEARCH_AUTO["pin"]
+    return bool(pin) and str(APP_CONFIG.get("web_search_provider") or "").strip().lower() == pin
+
+
+def _set_auto_pin(name: str, why: str) -> None:
+    APP_CONFIG["web_search_provider"] = name
+    _SEARCH_AUTO["pin"] = name
+    _SEARCH_AUTO["last_probe"] = time.monotonic()
+    _audit("search_provider_resolved", tool="web_search", mode="search",
+           decision="allowed", detail=f"auto -> {name} ({why})")
+
+
+def _search_upgrade_fix() -> str:
+    if shutil.which("docker"):
+        return "/search setup, or set TAVILY_API_KEY/EXA_API_KEY"
+    return "/search setup (needs Docker) or set TAVILY_API_KEY/EXA_API_KEY"
+
+
+def _ddgs_fallback_reason() -> str:
+    """Why ddgs is serving instead of SearXNG. No network: startup-safe."""
+    if SEARCH_BASE_URL_CONFIGURED and str(_search_config().get("search_base_url") or "").strip():
+        return "SearXNG not answering"
+    if not shutil.which("docker"):
+        return "no SearXNG; Docker not found"
+    return "no SearXNG configured"
+
+
+def _report_search_state(active: str, *, reason: str = "") -> None:
+    """Report capabilities.SEARCH for the backend now serving ("" = none)."""
+    C = capabilities
+    if active == "ddgs":
+        C.report(C.SEARCH, active="ddgs", preferred="searxng", state=C.DEGRADED,
+                 reason=reason or _ddgs_fallback_reason(), impact=SEARCH_DDGS_IMPACT,
+                 fix=_search_upgrade_fix(), model_note=SEARCH_DDGS_NOTE)
+    elif active:
+        C.report(C.SEARCH, active=active, preferred=active, state=C.OK, reason=reason)
+    else:
+        C.report(C.SEARCH, active="", preferred="searxng", state=C.UNAVAILABLE,
+                 reason=reason or "no web search backend can serve",
+                 impact="web_search fails; answers rely on training data",
+                 fix="/doctor --fix (reinstalls ddgs) or /search setup")
+
+
+def _report_search_pin(name: str) -> None:
+    """State for an explicit pin, without touching the network: only a ddgs
+    pin is known-limited up front; any other pin is judged by its searches."""
+    if name == "ddgs":
+        capabilities.report(capabilities.SEARCH, active="ddgs", preferred="",
+                            state=capabilities.DEGRADED,
+                            reason="pinned: web_search_provider=ddgs",
+                            impact=SEARCH_DDGS_IMPACT, model_note=SEARCH_DDGS_NOTE,
+                            fix="/search use auto, or " + _search_upgrade_fix())
+
+
+def _searxng_failed(report) -> bool:
+    """Did SearXNG actually fail in this call (not merely find nothing)?"""
+    return any(f.startswith("searxng: ") and f != "searxng: no results"
+               for f in report.failures)
+
+
+def _report_search_outcome(report, *, fallback_reason: str = "") -> None:
+    """Update capabilities.SEARCH from one call; switch auto's pin off a dead SearXNG.
+
+    A transient failure with nothing served (ddgs throttled once) leaves the
+    state alone — flipping to "unavailable" and back on every hiccup would be
+    noise. A SearXNG that really failed is recorded either way.
+    """
+    try:
+        served = report.provider
+        if served:
+            if served == "ddgs":
+                entry = capabilities.get(capabilities.SEARCH)
+                reason = (fallback_reason
+                          or ("SearXNG stopped answering" if _searxng_failed(report) else ""))
+                already = (entry is not None and entry.active == "ddgs"
+                           and entry.state == capabilities.DEGRADED)
+                if reason or not already:  # else keep the existing reason and fix
+                    _report_search_state("ddgs", reason=reason)
+            else:
+                _report_search_state(served)
+            if (_search_auto_active() and _SEARCH_AUTO["pin"] == "searxng"
+                    and served != "searxng" and _searxng_failed(report)):
+                # SearXNG's failure mode is "the instance is down", so stop
+                # trying it first on every call; _maybe_reprobe_searxng brings
+                # it back. Keyed backends are not unpinned: their failures
+                # (429, a 5xx) are transient and they fall through per call.
+                _set_auto_pin(served, "SearXNG stopped answering")
+        elif _searxng_failed(report):
+            capabilities.report(
+                capabilities.SEARCH, active="", preferred="searxng",
+                state=capabilities.UNAVAILABLE, reason="SearXNG not answering",
+                impact="searches fail or ask before using public ddgs",
+                fix="/search setup, or /search use auto to fall back to ddgs")
+    except Exception:  # noqa: BLE001 — bookkeeping must never fail a search
+        _log.debug("search capability report failed", exc_info=True)
+
+
+def _search_call_chain(context, *, prompt_free: bool):
+    """Providers for one call under auto: the pin, then the rest of the auto order.
+
+    prompt_free: this call skipped the approval gate on an exemption (ddgs-only
+    chain, or local SearXNG with web_search_no_prompt=1). It may then only fall
+    through to backends that need no approval either — ddgs, or a local
+    SearXNG — never to a keyed vendor or a remote instance the operator never
+    approved this query for.
+    """
+    pin = _SEARCH_AUTO["pin"]
+    rest = [n for n in WEB_SEARCH_REGISTRY.auto_order(context) if n != pin]
+    if prompt_free:
+        rest = [n for n in rest
+                if n == "ddgs" or (n == "searxng" and _search_base_url_is_local())]
+    providers = [WEB_SEARCH_REGISTRY.get(n) for n in [pin, *rest]]
+    return [p for p in providers if p is not None]
+
+
+def _maybe_reprobe_searxng(probe=None, now=None) -> bool:
+    """Under auto, switch back up to SearXNG once it answers again.
+
+    Cheap and rate-limited: at most one probe per web_search_reprobe_seconds
+    (default 300, 0 disables), only while auto's pin is a backend ranked BELOW
+    SearXNG (ddgs). Returns True when it upgraded.
+    """
+    try:
+        if not _search_auto_active() or _SEARCH_AUTO["pin"] == "searxng":
+            return False
+        interval = max(0, _config_int("web_search_reprobe_seconds", 300))
+        if interval <= 0:
+            return False
+        now = time.monotonic() if now is None else now
+        if now - _SEARCH_AUTO["last_probe"] < interval:
+            return False
+        context = _search_context()
+        order = WEB_SEARCH_REGISTRY.auto_order(context)
+        pin = _SEARCH_AUTO["pin"]
+        if "searxng" not in order or (pin in order and order.index(pin) < order.index("searxng")):
+            return False
+        _SEARCH_AUTO["last_probe"] = now
+        if not (probe or web_search.probe_searxng)(context):
+            return False
+    except Exception:  # noqa: BLE001 — a probe must never fail a search
+        return False
+    _set_auto_pin("searxng", "SearXNG answering again")
+    _report_search_state("searxng", reason="SearXNG answering again")
+    return True
+
+
+def _run_web_search(query, config, context, images, chain=None):
+    """run_search -> SearchReport, tolerating embedders' and tests' stand-ins
+    that still return a plain string or a (text, failures) tuple."""
+    out = web_search.run_search(query, _web_search_limit(), WEB_SEARCH_REGISTRY, config,
+                                context, images=images, chain=chain, return_report=True)
+    if isinstance(out, web_search.SearchReport):
+        return out
+    if isinstance(out, tuple):
+        text, failed = str(out[0]), tuple(out[1])
+    else:
+        text, failed = str(out), ()
+    match = re.search(r"Search results \(via (\w+)\)", text)
+    return web_search.SearchReport(text=text, provider=match.group(1) if match else "",
+                                   failed=failed)
+
+
+def _with_search_note(report) -> str:
+    """The result text plus the SEARCH caveat when the keyless fallback served."""
+    note = capabilities.model_note(capabilities.SEARCH) if report.provider == "ddgs" else ""
+    return f"{report.text}\n{note}" if note else report.text
 
 
 def _search_chain_summary() -> str:
@@ -12624,6 +13259,13 @@ def describe_tool(tool_name, specs=None) -> str:
     }, ensure_ascii=False, indent=2))
 
 
+def _limited_suffix(name: str) -> str:
+    entry = capabilities.get(name)
+    if entry is None or entry.ok:
+        return ""
+    return f" ({entry.state}: {entry.reason or entry.active})"
+
+
 def describe_capabilities() -> str:
     """Human-readable report of what this agent can actually do right now.
 
@@ -12692,6 +13334,18 @@ def describe_capabilities() -> str:
     lines += [f"- {a}" for a in sorted(SUBAGENT_SPECS)] or ["- none configured"]
     lines.append("")
 
+    # --- What is running on a fallback right now (capabilities registry) ---
+    limited = capabilities.degraded()
+    lines.append("## Limited right now")
+    if not limited:
+        lines.append("- nothing — every reported capability is on its preferred backend")
+    for entry in limited:
+        detail = "; ".join(p for p in (entry.reason, entry.impact) if p)
+        fix = f" (upgrade: {entry.fix})" if entry.fix else ""
+        lines.append(f"- {entry.label}: {entry.state}, using {entry.active or 'nothing'}"
+                     f"{' — ' + detail if detail else ''}{fix}")
+    lines.append("")
+
     # --- Guardrails. Reporting what is OFF is as useful as what is on. ---
     lines += [
         "## Active guardrails",
@@ -12707,7 +13361,7 @@ def describe_capabilities() -> str:
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
         f"- New generated files: {ARTIFACTS_ROOT}",
-        f"- Web search: {_search_chain_summary()}",
+        f"- Web search: {_search_chain_summary()}{_limited_suffix(capabilities.SEARCH)}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
         f"- Shell allowlist: {', '.join(_USER_ALLOW_GLOBS) or 'not set'}",
@@ -13656,6 +14310,47 @@ def _estimate_tokens(chars: int) -> int:
     return int(chars / CHARS_PER_TOKEN)
 
 
+# The last real prompt size a server reported for a conversation, so the
+# context meter can anchor on it instead of guessing from characters alone:
+# {"messages_id", "provider", "model", "chars", "tokens"}. Keyed by the
+# conversation list's id() so a sub-agent's or side call's numbers never
+# calibrate the main session's meter.
+PROMPT_CALIBRATION: dict = {}
+
+
+def _record_prompt_calibration(messages, system_prompt, response, provider_name, model_name) -> None:
+    """Remember usage.prompt_tokens against the characters that were sent."""
+    try:
+        tokens = int(getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0)
+        if tokens <= 0:
+            return
+        PROMPT_CALIBRATION.clear()
+        PROMPT_CALIBRATION.update(
+            messages_id=id(messages), provider=provider_name or "", model=model_name or "",
+            chars=_estimate_context_chars(messages, system_prompt or ""), tokens=tokens)
+    except Exception:  # noqa: BLE001 — a meter must never fail a turn
+        pass
+
+
+def estimate_prompt_tokens(messages, system_prompt: str = "", provider_name: str = "",
+                           model_name: str = "") -> int:
+    """Prompt tokens for `messages`, calibrated by the last real usage when
+    the server reported one for this same conversation and model: the real
+    count for what was sent then, plus a CHARS_PER_TOKEN estimate for what
+    was added since (or the real tokens-per-char ratio after a compaction
+    shrank it). Otherwise the plain CHARS_PER_TOKEN estimate."""
+    chars = _estimate_context_chars(messages, system_prompt or "")
+    cal = PROMPT_CALIBRATION
+    provider_name = provider_name or ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    model_name = model_name or MODEL_NAME or ""
+    if (cal.get("tokens") and cal.get("chars") and cal.get("messages_id") == id(messages)
+            and cal.get("model") == model_name and cal.get("provider") == provider_name):
+        if chars >= cal["chars"]:
+            return cal["tokens"] + _estimate_tokens(chars - cal["chars"])
+        return int(chars * cal["tokens"] / cal["chars"])
+    return _estimate_tokens(chars)
+
+
 def compact_messages(messages: list[dict], keep: int = COMPACTION_KEEP_MESSAGES,
                      *, completion_client=None, provider_name: str = "",
                      model_name: str = "", budget=None) -> bool:
@@ -14333,6 +15028,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         message = response.choices[0].message
         if budget:
             budget.add_usage(response, text=(message.content or ""))
+        _record_prompt_calibration(messages, round_system_prompt, response,
+                                   loop_provider or ACTIVE_PROVIDER or DEFAULT_PROVIDER,
+                                   loop_model or MODEL_NAME)
         content = _strip_reasoning(message.content or "")
         native_text = _native_tool_text(message)
         if native_text:

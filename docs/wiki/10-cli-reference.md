@@ -155,7 +155,7 @@ sensitive-file floor still applies unconditionally.
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
 | `/save <file>` | Export conversation + trace to JSON (mode `0600`) |
-| `/status` | Model, mode, tools, skills, token usage |
+| `/status` | Model, mode, tools, skills, token usage; `Limited` rows for anything on a fallback ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)) |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
 
@@ -231,7 +231,7 @@ sensitive-file floor still applies unconditionally.
 | `/capabilities` | What the agent can do and which guardrails are in force |
 | `/cost [on\|off\|<task_id>]` | Local telemetry summary of model cost/usage; `on`/`off` toggles recording, persisted to `config.txt` |
 | `/review` | Bare: list stored reviews. With arguments: launch `review_code` from the CLI — same tool the model calls, see [`review_code`](04-tools.md#review_code) |
-| `/doctor [--fix]` | Environment health check; `--fix` repairs a broken web-search install |
+| `/doctor [--fix]` | Environment health check, incl. a row per [reduced mode](13-troubleshooting.md#reduced-modes-and-fallbacks); `--fix` repairs a broken web-search install |
 | `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report |
 | `/trace [on\|off]` | Toggle JSON trace capture |
 | `/verbose` | Toggle verbose output |
