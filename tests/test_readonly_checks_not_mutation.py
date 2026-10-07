@@ -38,6 +38,11 @@ def _mutated(engine, command):
     # seen live: counting repeated messages
     "grep a data.csv | sed 's/,.*//' | sort | uniq -c | sort -rn",
     "sort -t, -k2 -n data.csv | uniq -c",
+    # seen live: silenced errors right before a ';', and a cd into the data
+    "ls -la . 2>/dev/null; find . -name data.csv 2>/dev/null",
+    "cd . && wc -l data.csv && head -5 data.csv",
+    "wc -w < data.csv",                              # input redirect only reads
+    "awk '{t++} END {print \"total:\", t, \"| rows\"}' data.csv",   # | inside a string
 ])
 def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monkeypatch, command):
     _host_shell(engine, tmp_path, monkeypatch)
@@ -48,6 +53,10 @@ def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monk
 @pytest.mark.parametrize("command", [
     "echo hi > out.txt",
     "ls && touch new.txt",
+    "cd . && touch new.txt",
+    "ls 2>/dev/null; touch new.txt",
+    "diff <(touch x.txt) data.csv",                  # process substitution runs a command
+    "cat <> data.csv",                               # opens for writing
     "awk 'BEGIN {system(\"touch x\")}'",          # awk running a command
     "awk '{print > \"copy.txt\"}' data.csv",       # awk writing a file
     "awk -f prog.awk data.csv",                      # a program it cannot inspect

@@ -5690,7 +5690,7 @@ def reset_audit_budget() -> None:
 # entry called `nul`, which then broke the sandbox copy with [WinError 87].
 # Everything else after a redirection operator is a file, so this predicate
 # refuses to call it read-only.
-_STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$)")
+_STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$|[;&|)])")
 # What separates one command from the next. Ordered so `&&` and `||` match
 # before the single-character forms. `|` is absent: `_readonly_shell` already
 # decomposes pipelines itself, under its own stricter rules.
@@ -5699,6 +5699,9 @@ _SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|&|\n")
 _AUDIT_STAGE_SPLIT = re.compile(r"&&|\|\||;|&|\n|\|")
 # `2>&1` / `>&2` point one output stream at another; no file is named.
 _FD_DUPLICATE = re.compile(r"\d?>&\d+\b")
+# `< file` only reads (seen live: `wc -w < input.txt`). Not `<<`/`<<<` (here
+# documents), `<>` (opens for writing), `<(` (runs a command) or `n<`.
+_INPUT_REDIRECT = re.compile(r"(?<![<\d])<(?![<>(&])\s*[^\s;&|<>()]+")
 # A sed script made only of line numbers and p/q/d/= prints; it cannot write,
 # run a command, or read another file (w, W, e, r, R are all letters).
 _SED_PRINT_SCRIPT = re.compile(r"[\d,$;!pqd=\s]+")
@@ -5781,8 +5784,8 @@ def _shell_call_is_read_only(command: str) -> bool:
     if probe is None:
         return False           # quoting that never closes cannot be read
     blank = lambda match: " " * len(match.group(0))
-    probe = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe))
-    original = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command))
+    probe = _INPUT_REDIRECT.sub(blank, _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe)))
+    original = _INPUT_REDIRECT.sub(blank, _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command)))
     if re.search(r"[<>]", probe):
         return False           # a redirection writes a file
     bounds = [0] + [edge for m in _AUDIT_STAGE_SPLIT.finditer(probe)
@@ -5826,7 +5829,9 @@ def _awk_prints_only(stage: str) -> bool:
             cursor += 1
         else:
             return False       # -f, -i inplace, -E, and anything else unknown
-    return cursor < len(parts) and not _AWK_SIDE_EFFECT.search(parts[cursor])
+    # String literals cannot act: `print "a | b"` only prints the bar.
+    program = re.sub(r'"(?:\\.|[^"\\])*"', '""', parts[cursor]) if cursor < len(parts) else ""
+    return cursor < len(parts) and not _AWK_SIDE_EFFECT.search(program)
 
 
 # Programs that only print what they compute from their input or arguments,
@@ -5839,6 +5844,8 @@ _TEXT_ONLY_COMMANDS = frozenset([
     "echo", "printf", "cut", "tr", "paste", "bc", "od", "nl", "cksum",
     "md5", "md5sum", "sha1sum", "sha256sum", "shasum",
     "basename", "dirname", "realpath", "stat", "which", "true",
+    # Changes only where the rest of this one command runs.
+    "cd", "pushd", "popd",
 ])
 
 
