@@ -70,7 +70,7 @@ def _tool_result_payload(name: str, result: str) -> dict:
         except (ValueError, TypeError, AttributeError):
             pass
     payload = {"type": "tool_result", "name": name,
-               "result": scrub_markup(result)[:5000]}
+               "result": scrub_markup(_eng().display_tool_result(name, result))[:5000]}
     try:
         diff = _result_diff()
     except Exception:

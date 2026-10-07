@@ -790,6 +790,14 @@ def _startup_notices(extra=()):
     memory store, MCP servers that already failed. Never raises."""
     lines = list(extra)
     warnings = list(getattr(A, "CONFIG_WARNINGS", []) or [])
+    try:
+        # Without its key every request fails; say so before the first one,
+        # not as that request's 401.
+        missing_key = _missing_provider_key_notice(_active_provider_name())
+    except Exception:  # noqa: BLE001 -- a startup nicety must never stop startup
+        missing_key = ""
+    if missing_key:
+        warnings.insert(0, missing_key)
     # Provider mistakes first: they explain why every request then fails
     # (a typo'd default_provider silently lands on localhost Ollama).
     warnings.sort(key=lambda w: 0 if "provider" in w.lower() else 1)
@@ -1344,10 +1352,39 @@ def _repository_result(result):
     return out
 
 
+def _tool_error_lines(result):
+    """A failed tool's result as lines for a person: the message, its error
+    code dimmed for bug reports, and any note that followed. The structured
+    part (recoverable, suggested_action) is advice written for the model, and
+    printed whole it reads as a JSON blob; an error without one is shown as
+    it came."""
+    lines = result.strip().splitlines()
+    for index, line in enumerate(lines):
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or "suggested_action" not in payload:
+            continue
+        message = "\n".join(lines[:index]).strip()
+        message = message[len("Error:"):].strip() if message.startswith("Error:") else message
+        head = Text(f"  ⎿  {message}", style="red")
+        if payload.get("code"):
+            head.append(f"  ({payload['code']})", style="dim")
+        notes = "\n".join(lines[index + 1:]).strip()
+        return [head] + ([Text(f"     {notes}", style="dim")] if notes else [])
+    return [Text(f"  ⎿  {result}", style="red")]
+
+
 def on_result(name, result):
     if S.verbose == "off":
         return
     mode = A.TOOL_SPECS.get(name, {}).get("mode")
+    # The <<<EXTERNAL_UNTRUSTED_CONTENT>>> frame tells the model what is data;
+    # shown to a person it reads as broken output.
+    result = A.strip_untrusted_markers(result)
 
     if result.lstrip().startswith("ESCALATION_REQUEST\x1f"):
         fields = result.strip().split("\x1f", 4)
@@ -1360,7 +1397,8 @@ def on_result(name, result):
         return
 
     if result.lstrip().startswith('Error:'):
-        console.print(Text(f"  ⎿  {result}", style='red'))
+        for line in _tool_error_lines(result):
+            console.print(line)
         return
 
     if name == "web_search":
@@ -1722,6 +1760,27 @@ def _hold_back(text):
     return 0
 
 
+_MARKER_NAMES = ("<<<EXTERNAL_UNTRUSTED_CONTENT", "<<<END_UNTRUSTED_CONTENT>>>")
+
+
+def _marker_hold(text):
+    """Length of the suffix to withhold because it could still become an
+    untrusted-content marker, so a model copying one into its answer never
+    flashes `<<<EXTERNAL_UNTR` on screen before the whole tag can be removed."""
+    start = text.rfind("<<<")
+    if start == -1:
+        for n in (2, 1):
+            if text.endswith("<" * n):
+                return n
+        return 0
+    tail = text[start:]
+    if ">>>" in tail[3:] or len(tail) > 200:
+        return 0
+    if any(name.startswith(tail) or tail.startswith(name) for name in _MARKER_NAMES):
+        return len(tail)
+    return 0
+
+
 class _StreamFilter:
     """Splits a raw content stream into prose the user should see and tool-call
     protocol they should not.
@@ -1748,9 +1807,10 @@ class _StreamFilter:
 
     def prose_text(self):
         if self._cut is not None:
-            return self._seen[:self._cut]
+            return A.strip_untrusted_markers(self._seen[:self._cut])
         keep = _hold_back(self._seen)
-        return self._seen[:len(self._seen) - keep] if keep else self._seen
+        prose = self._seen[:len(self._seen) - keep] if keep else self._seen
+        return A.strip_untrusted_markers(prose[:len(prose) - _marker_hold(prose)])
 
     def feed(self, delta):
         """Absorb one content delta. Returns True while a tool call is streaming."""
@@ -2603,8 +2663,11 @@ A.register_frontend_commands({
 def cmd_help(_):
     t = Table(title="Commands", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Command", style="#237dd7", no_wrap=True)
-    t.add_column("What it does", style="#237dd7")
+    # Capped and folding: one long usage line (/review's flags run to 91
+    # characters) used to set the column's width, which squeezed every
+    # description to a character or two below 120 columns, or off entirely.
+    t.add_column("Command", style="#237dd7", max_width=34, overflow="fold")
+    t.add_column("What it does", style="#237dd7", ratio=1)
     for command in command_catalog():
         t.add_row(command["usage"], command["description"])
     console.print(t)
@@ -3712,12 +3775,21 @@ def _user_configured_providers():
     return names
 
 
-def _warn_missing_provider_key(provider):
-    """Say so at switch time, not as the first chat's 401."""
+def _missing_provider_key_notice(provider):
+    """"OPENAI_API_KEY isn't set — …" when `provider` needs a key it lacks, else ""."""
     profile = A.PROVIDERS.get(provider) or {}
     env = profile.get("api_key_env", "")
     if env and not A._provider_api_key(profile):
-        console.print(f"[yellow]{env} isn't set[/yellow] — set it or run `agent8088 --setup`.")
+        return f"{env} isn't set — set it or run `agent8088 --setup`."
+    return ""
+
+
+def _warn_missing_provider_key(provider):
+    """Say so at switch time, not as the first chat's 401."""
+    notice = _missing_provider_key_notice(provider)
+    if notice:
+        env, _, rest = notice.partition(" isn't set")
+        console.print(f"[yellow]{env} isn't set[/yellow]{rest}")
 
 
 # provider -> why its last live model listing failed ("" when it worked).
@@ -4502,13 +4574,25 @@ def _doctor_search_flat(checks):
 _DOCTOR_STYLES = {"ok": "#237dd7", "info": "#237dd7", "warn": "yellow", "fail": "red"}
 
 
+def _tilde(text):
+    """`text` with the home folder written as ~, only where it is a whole path
+    segment: /Users/al becomes ~, /Users/alice does not."""
+    home = str(Path.home())
+    if not home or home in ("/", "\\"):
+        return text
+    return re.sub(re.escape(home) + r"(?![^\\/\s;,:)\]'\"])", "~", text)
+
+
 def _render_doctor(checks):
     t = Table(title="Doctor", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Check", style="#00edff", no_wrap=True)
-    t.add_column("Result", style="#237dd7")
+    # fold, not the default ellipsis: a long path is one unbreakable word, and
+    # cutting it off hid the folder name the row was there to report.
+    t.add_column("Result", style="#237dd7", overflow="fold")
     for check in checks:
-        t.add_row(check["name"], Text(check["detail"], style=_DOCTOR_STYLES.get(check["status"], "")))
+        t.add_row(check["name"], Text(_tilde(check["detail"]),
+                                      style=_DOCTOR_STYLES.get(check["status"], "")))
     console.print(t)
     problems = [c for c in checks if c["status"] in ("fail", "warn") and c.get("fix")]
     for check in problems:
@@ -4516,7 +4600,7 @@ def _render_doctor(checks):
         line.append("  ✗ " if check["status"] == "fail" else "  ! ",
                     style=_DOCTOR_STYLES[check["status"]])
         line.append(f"{check['name']}: ")
-        line.append(check["fix"])
+        line.append(_tilde(check["fix"]))
         console.print(line)
 
 

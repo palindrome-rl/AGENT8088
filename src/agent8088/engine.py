@@ -1574,6 +1574,23 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
     return False
 
 
+_SHELL_CHAIN_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
+
+
+def _readonly_chain(command: str) -> bool:
+    """A chain of read-only commands joined by &&, || or ;, like `pwd && ls`.
+
+    For change bookkeeping only, never for permission: _readonly_shell refuses
+    every chain, and readonly mode keeps escalating them, because the file
+    checks that gate a local read do not follow a chain. Counting `pwd && ls`
+    as a change ended read-only answers with "Changed work was inspected, but
+    no automated verification passed" when nothing had changed."""
+    if re.search(r"[<>\n`]|\$\(", command):
+        return False
+    parts = _SHELL_CHAIN_RE.split(command.strip())
+    return len(parts) > 1 and all(part and _readonly_shell(part) for part in parts)
+
+
 def _readonly_shell(command: str) -> bool:
     if "|" in command:
         if re.search(r"[&;<>\n`]|\$\(", command):
@@ -10998,7 +11015,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         # blocked with no way to approve it.
         if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
             return text.strip()
-        if not _readonly_shell(command):
+        if not (_readonly_shell(command) or _readonly_chain(command)):
             # Ordered before the recording below so this run's own verdict is
             # stamped with the sequence its side effects produced.
             note_mutation(f"{name}: {command[:80]}")
@@ -12187,6 +12204,27 @@ def _wrap_untrusted(text: str, source: str = "") -> str:
     return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
 
 
+_UNTRUSTED_MARKER_RE = re.compile(
+    r'<<<EXTERNAL_UNTRUSTED_CONTENT(?: source="[^"\n]*")?>>>\n?|\n?<<<END_UNTRUSTED_CONTENT>>>')
+
+
+def strip_untrusted_markers(text: str) -> str:
+    """`text` without _wrap_untrusted's boundary markers, for showing a tool
+    result to a person. The markers tell the model what is data; to a user
+    they read as broken output. Display only: the model keeps them."""
+    return _UNTRUSTED_MARKER_RE.sub("", text) if text else text
+
+
+def display_tool_result(name: str, text: str) -> str:
+    """A tool result as a person should see it: without the untrusted-content
+    markers, and for web_search without the "[Retrieved ...]" note that tells
+    the model to check each result's date."""
+    text = strip_untrusted_markers(text)
+    if name == "web_search" and text:
+        text = re.sub(r"^\s*\[Retrieved [^\]\n]*\]\s*", "", text)
+    return text
+
+
 # Distinctive lines of the base system prompt, used to detect a verbatim leak.
 _SYSTEM_FINGERPRINTS = [ln.strip() for ln in BASE_SYSTEM_PROMPT.splitlines()
                         if len(ln.strip()) >= 40]
@@ -12306,7 +12344,9 @@ def _guard_answer(answer: str) -> str:
     if _is_system_leak(answer):
         return ("I can't share my internal system instructions or configuration. "
                 "Tell me what you'd like help with instead.")
-    return _redact_secrets(answer)
+    # A model quoting a search result sometimes copies its untrusted-content
+    # markers into the answer; they mean nothing there.
+    return _redact_secrets(strip_untrusted_markers(answer))
 
 
 # Requests that target the agent's own internals — refused instantly (no model
