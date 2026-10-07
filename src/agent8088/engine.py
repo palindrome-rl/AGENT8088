@@ -520,6 +520,11 @@ MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 600))
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
+# Tool rounds allowed after a finishing nudge (deliverables re-check,
+# verification, re-plan, tests) with no state change before the model is told to
+# answer; at this + 2 the best answer so far is returned. A write resets the
+# count, so a fix found by a check is never cut off. 0 disables the cap.
+MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
@@ -5795,6 +5800,111 @@ def _structured_tool_argv(name: str, args: dict):
 
 # The git tools that talk to a remote, and so can fail on authentication.
 _REMOTE_GIT_TOOLS = frozenset(["git_push", "git_clone", "git_create_pr"])
+
+
+# Structured git tools that change files in the working tree. Push, PR creation
+# and remote listing touch only the remote or git config, so a model repeating
+# them is not doing new local work (and must not retire cached verdicts).
+_GIT_TREE_TOOLS = frozenset({"git_commit", "git_checkout", "git_branch", "git_init", "git_clone"})
+
+
+def _git_tool_changed_tree(name: str, result: str) -> bool:
+    """Did this structured git call change the working tree? Only a tree tool
+    that succeeded: a failed commit, or one with nothing to commit, did not."""
+    if name not in _GIT_TREE_TOOLS:
+        return False
+    text = str(result or "")
+    return not (text.lstrip().startswith("Error") or "exited with status" in text
+                or "nothing to commit" in text or "nothing added to commit" in text)
+
+
+# --- what a shell command after a finishing check is -------------------------
+# Used only to decide whether a round after a finishing nudge changed anything
+# (MAX_POST_CHECK_ROUNDS), never for permission. Errs towards "change": an
+# unrecognised command resets the cap, which is today's behaviour.
+_CHECK_PROGRAMS = frozenset({
+    "pytest", "py.test", "cd", "echo", "printf", "test", "[", "true", "false",
+    "diff", "cmp", "stat", "file", "which", "command", "type", "jq", "ps", "pgrep",
+    "sha256sum", "sha1sum", "sha512sum", "md5sum", "md5", "shasum", "cksum",
+    "xxd", "od", "hexdump", "id", "uname", "date", "sleep", "ss", "netstat", "lsof",
+    "sort", "uniq", "cut", "tr", "nl", "column", "basename", "dirname", "realpath",
+    "readlink", "env", "printenv", "nproc", "free", "df", "du",
+})
+_TEST_RUNNER_COMMANDS = {("go", "test"), ("cargo", "test"), ("npm", "test"), ("yarn", "test"),
+                         ("pnpm", "test"), ("make", "test"), ("make", "check"),
+                         ("npm", "run", "test"), ("dotnet", "test")}
+_PY_MODULE_CHECKS = frozenset({"pytest", "unittest", "doctest", "json.tool"})
+_PY_CODE_WRITES = re.compile(
+    r"""open\([^)]*['"][wax+]|\.write(?:_text|_bytes|lines)?\(|remove\(|unlink|rmtree|"""
+    r"""rename\(|mkdir|makedirs|system\(|subprocess|shutil|chmod|truncate""")
+_HARMLESS_REDIRECTS = re.compile(r"\s*(?:[12&]?>>?\s*/dev/null|\d?>&\d)")
+_CURL_WRITES = frozenset({"-o", "-O", "--output", "--remote-name", "-T", "--upload-file",
+                          "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+                          "-F", "--form", "--json"})
+
+
+def _shell_part_is_check(part: str) -> bool:
+    try:
+        words = shlex.split(part)
+    except ValueError:
+        return False
+    while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in ("sudo", "time")):
+        words = words[1:]
+    if words[:1] == ["timeout"]:
+        words = words[1:]
+        while words and words[0].startswith("-"):
+            words = words[1:]
+        words = words[1:]  # the duration
+    if not words:
+        return False
+    program = Path(words[0]).name
+    if program in _CHECK_PROGRAMS or _readonly_shell(part):
+        return True
+    if any(tuple(words[:len(c)]) == c for c in _TEST_RUNNER_COMMANDS):
+        return True
+    if program in ("python", "python3", "node"):
+        args = words[1:]
+        if args[:1] == ["-m"]:
+            return len(args) > 1 and args[1] in _PY_MODULE_CHECKS
+        if args[:1] in (["-c"], ["-e"]):
+            return len(args) > 1 and not _PY_CODE_WRITES.search(args[1])
+        # A script run after a finishing check is almost always a check; a fix
+        # script is written first, and that write resets the cap anyway.
+        return bool(args) and not args[0].startswith("-")
+    if program == "curl":
+        args = words[1:]
+        if any(a in _CURL_WRITES or a.startswith(("--data", "--output=", "--json")) for a in args):
+            return False
+        for i, a in enumerate(args):
+            if a in ("-X", "--request") and i + 1 < len(args) and args[i + 1].upper() not in ("GET", "HEAD"):
+                return False
+        return True
+    return False
+
+
+def _shell_may_change(command: str) -> bool:
+    """Could this shell command, run after a finishing check, have changed the
+    workspace? True for writes, installs, redirects to files, command
+    substitution, background jobs and anything unrecognised; False for test
+    runners, verify scripts, HTTP GETs and reads."""
+    text = _HARMLESS_REDIRECTS.sub(" ", str(command or ""))
+    if re.search(r">|`|\$\(|\btee\b", text) or re.search(r"(?<![&|])&(?![&])", text):
+        return True
+    parts = [p for p in re.split(r"\s*(?:&&|\|\||;|\||\n)\s*", text.strip()) if p.strip()]
+    return not parts or not all(_shell_part_is_check(p) for p in parts)
+
+
+def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
+    """For the post-check cap: did this call change state? `mutated` is
+    whether it bumped the mutation counter, which counts every shell command
+    outside the read-only list (right for retiring verdicts, too broad here)."""
+    if not mutated:
+        return False
+    if name == "execute_shell":
+        return _shell_may_change(args.get("command", ""))
+    if name == "run_tests":
+        return False
+    return True
 
 
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
@@ -11468,7 +11578,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         if reuse:
             return reuse
         if _structured_tool_argv(name, args):
-            return _exec_structured_tool(name, args, timeout)
+            result = _exec_structured_tool(name, args, timeout)
+            # A commit or checkout changes the tree as much as a write does;
+            # without this a fix made through git looked like a read.
+            if _git_tool_changed_tree(name, result):
+                note_mutation(name)
+            return result
         command = _format_with_args(spec.get("command") or "{command}", args)
         if spec.get("host"):
             # Never replace a shell command's output (see _shell_missing_program_note).
@@ -15300,8 +15415,21 @@ DELIVERABLES_CHECK_NUDGE = (
     "Before finishing: re-read the original task. For each required output "
     "(file path, format, service or port), run a check now that confirms it exists "
     "and behaves exactly as specified. Remove scratch files, test users and other "
-    "leftovers you created that the task did not ask for. Then give your final answer."
+    "leftovers you created that the task did not ask for. Check each item once with "
+    "a single command, then give your final answer. Do not keep exploring."
 )
+POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
+
+
+def _with_task_notes(answer: str, trajectory) -> str:
+    """The controller's end-of-run notes, on every way a run can finish: an
+    unverified change, or the task-state review."""
+    if trajectory is not None and trajectory.needs_verification():
+        return answer + ("\n\nVerification note: changes were made, but no fresh automated "
+                         "verification evidence was recorded.")
+    if trajectory is not None and (review := trajectory.review()):
+        return answer + f"\n\nTask-state note: {review}"
+    return answer
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
     "cli_anything_info", "cli_anything_skill",
@@ -15398,6 +15526,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     tool_failed = False  # any tool call this run returned an error
     fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
+    post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
+    post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
+    last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     plan_mutation_retries = 0
@@ -15961,16 +16092,21 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                   "trigger": "environment_claim", "outcome": status})
                 continue
 
-            if DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
+            last_text_answer = answer
+            # Once told to answer, take this reply: a gate firing again here is
+            # exactly the open-ended checking the cap exists to end.
+            gates_open = not post_check_told
+            if gates_open and DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
                 # Graded on exact outputs with nobody to ask: before the one
                 # final answer, re-check every deliverable against the task.
                 deliverables_checked = True
                 messages.append(_harness_turn(DELIVERABLES_CHECK_NUDGE))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "deliverables_check"})
+                post_check_rounds = 0
                 continue
 
-            if trajectory is not None and trajectory.request_replan():
+            if gates_open and trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()
                 messages.append(_harness_turn((
@@ -15978,17 +16114,23 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Do not repeat them. State a short revised approach, then take one "
                     "different safe next action; if blocked by missing access, say so plainly."
                 )))
+                # Not a finishing check: the approach failed and the model is
+                # back to working, so the cap must not cut that short.
+                post_check_rounds, post_check_told = None, False
                 continue
-            if trajectory is not None and trajectory.request_verification():
+            if gates_open and trajectory is not None and trajectory.request_verification():
                 if on_trajectory_state:
                     on_trajectory_state()
                 messages.append(_harness_turn((
                     "Controller state says a changed result has no fresh verification evidence. "
                     "Before your final answer, inspect or test the changed result if a suitable "
-                    "tool is available. If verification is not possible, say that plainly."
+                    "tool is available. If verification is not possible, say that plainly. "
+                    "Check each item once with a single command, then give your final "
+                    "answer. Do not keep exploring."
                 )))
+                post_check_rounds = 0
                 continue
-            if (trajectory is not None and not DISPOSABLE_CONTAINER
+            if (gates_open and trajectory is not None and not DISPOSABLE_CONTAINER
                     and trajectory.request_tests()):
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -15998,13 +16140,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Before your final answer, call generate_tests on each one, or "
                     "state plainly why tests do not apply to this change."
                 )))
+                post_check_rounds = 0
                 continue
-            answer = _guard_answer(answer)
-            if trajectory is not None and trajectory.needs_verification():
-                answer += ("\n\nVerification note: changes were made, but no fresh automated "
-                           "verification evidence was recorded.")
-            elif trajectory is not None and (review := trajectory.review()):
-                answer += f"\n\nTask-state note: {review}"
+            answer = _with_task_notes(_guard_answer(answer), trajectory)
             if on_answer:
                 on_answer(answer)
             if trace is not None:
@@ -16015,6 +16153,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             on_calls(calls)
 
         executed = False
+        round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
         turn_tools = [] if trace is not None else None
@@ -16189,11 +16328,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # on_calls already announced "Searching the web..." once; this spinner
             # is the next beat, not a repeat of it.
             spin_msg = "Fetching results…" if name == "web_search" else f"running {name}..."
+            cap_seq_before = _MUTATION_SEQ
             with spin(spin_msg):
                 result = exec_tool(name, json.dumps(args), depth=depth)
             for event in _drain_trace_events():
                 if trace is not None:
                     trace.append(dict(event, turn=turn, tool=name))
+            round_changed = round_changed or _tool_call_changed_state(
+                name, args, _MUTATION_SEQ != cap_seq_before)
             if trajectory is not None and operation is not None:
                 verdict = tool_output.detect_verdict(result)
                 # detect_verdict reads test output; it has no idea what an
@@ -16424,6 +16566,41 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
+        if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:
+            if round_changed:
+                # A check found something and the model fixed it: real work,
+                # never cut off. The count starts over.
+                post_check_rounds, post_check_told = 0, False
+            else:
+                post_check_rounds += 1
+                if post_check_rounds >= MAX_POST_CHECK_ROUNDS + 2:
+                    # Hard backstop: told to answer and still checking. Ask once
+                    # more with no tools: the reply the nudge sent back predates
+                    # these checks, and a fix made after it would make it stale.
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "post_check_backstop",
+                                      "rounds": post_check_rounds})
+                    fresh = _answer_from_context(
+                        messages, system_prompt=(system_prompt() if callable(system_prompt)
+                                                 else system_prompt),
+                        temperature=temperature, budget=budget, on_token=on_token,
+                        interrupt_check=interrupt_check, trace=trace, turn=turn,
+                        client=client, provider_name=provider_name, model_name=model_name)
+                    fresh = strip_tool_json(fresh or "").strip()
+                    answer = _with_task_notes(_guard_answer(
+                        fresh or last_text_answer
+                        or "Stopped after repeated checks with no further changes."), trajectory)
+                    if on_answer:
+                        on_answer(answer)
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "final_answer", "content": answer})
+                    return answer
+                if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
+                    post_check_told = True
+                    messages.append(_harness_turn(POST_CHECK_CAP_NUDGE))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "post_check_cap",
+                                      "rounds": post_check_rounds})
         if executed:
             forcing = False
             policy.record_round(
