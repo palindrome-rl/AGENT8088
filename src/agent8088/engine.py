@@ -3714,13 +3714,106 @@ def _choose_shell_cwd() -> Path | None:
     and the model concluded the whole environment was broken. A fallback never
     widens access, so with none allowed this returns None and the caller says
     why."""
-    if _is_dir(SHELL_CWD):
+    if _dir_usable(SHELL_CWD):
         return SHELL_CWD
     for candidate in (LAUNCH_DIR, PROJECT_ROOT):
-        if (_is_dir(candidate) and _path_is_allowed(candidate)
+        if (_dir_usable(candidate) and _path_is_allowed(candidate)
                 and _check_path_zone(candidate) != "blocked"):
             return candidate
     return None
+
+
+def _dir_usable(path: Path) -> bool:
+    """A directory a process can start in: it exists and can be entered. A
+    folder without search permission fails a process start just like a missing
+    one, so it is no better a place to run commands."""
+    return _is_dir(path) and os.access(path, os.X_OK)
+
+
+def _dir_problem(path: Path) -> str:
+    """Why `path` cannot be a working directory, as the end of a sentence."""
+    return "cannot be entered (permission denied)" if _is_dir(path) else "does not exist"
+
+
+_PROBE_LISTING_CAP = 8  # names shown from the working directory
+_PROBE_SCAN_CAP = 1000   # entries counted before "+many more", for huge folders
+
+
+def _probe_interpreters() -> tuple:
+    """(found, missing) among the interpreters a model most often assumes."""
+    names = ("python" if sys.platform == "win32" else "python3", "node", "git")
+    found = [name for name in names if shutil.which(name)]
+    return found, [name for name in names if name not in found]
+
+
+def _probe_listing(cwd: Path) -> str:
+    """The visible top-level names in `cwd`, capped, or why they are not shown.
+    Gathered with the same path checks a file tool applies: a folder outside
+    allowed_paths or in blocked_paths is not listed."""
+    if not _path_is_allowed(cwd):
+        return "is not listed (outside allowed_paths)"
+    if _check_path_zone(cwd) == "blocked":
+        return "is not listed (in blocked_paths)"
+    names, more = [], False
+    try:
+        with os.scandir(cwd) as entries:
+            for count, entry in enumerate(entries):
+                if count >= _PROBE_SCAN_CAP:
+                    more = True
+                    break
+                if not entry.name.startswith("."):
+                    names.append(entry.name)
+    except OSError:
+        return "cannot be listed"
+    if not names:
+        return "has no visible files"
+    names.sort()
+    shown = [n if len(n) <= 30 else n[:27] + "..." for n in names[:_PROBE_LISTING_CAP]]
+    extra = len(names) - len(shown)
+    tail = " (+many more)" if more else (f" (+{extra} more)" if extra else "")
+    return f"contains {', '.join(shown)}{tail}"
+
+
+def _probe_user() -> str:
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:  # no login name in some containers and services
+        return ""
+
+
+def _environment_probe(cwd: Path | None) -> str:
+    """One compact line of facts about where commands run, gathered without a
+    model call or a shell: what the folder holds, who runs the commands, and
+    which common interpreters this host has. A model that starts out knowing
+    the folder and its files does not need to guess, and does not read one
+    failed command as proof that nothing is there."""
+    facts = []
+    user = _probe_user()
+    if user:
+        facts.append(f"user {user}")
+    found, missing = _probe_interpreters()
+    facts.append(f"on PATH: {', '.join(found) or 'none of ' + ', '.join(missing)}"
+                 + (f" (not found: {', '.join(missing)})" if found and missing else ""))
+    tail = "; ".join(facts)
+    # The listing gives way first: a folder of long names must not crowd the
+    # user and interpreter facts out of the 400-character line.
+    if cwd is not None:
+        listing = _probe_listing(cwd)
+        room = 400 - len(tail) - 2
+        if len(listing) > room:
+            listing = listing[:max(0, room - 3)] + "..."
+        tail = f"{listing}; {tail}"
+    # Defined further down this module; at import (the first grounding) it is
+    # not there yet, and the only secrets then are config values a folder
+    # listing does not carry.
+    redact = globals().get("_redact_secrets")
+    return (redact(tail) if redact else tail)[:400]
+
+
+# What _ground_execute_shell_description last appended, so a later grounding
+# replaces it instead of stacking a second one.
+_SHELL_GROUNDING = {"cwd": None, "suffix": ""}
 
 
 def _ground_execute_shell_description(specs: dict) -> None:
@@ -3741,22 +3834,49 @@ def _ground_execute_shell_description(specs: dict) -> None:
         # `pip install` there, where nothing else can import the packages.
         python_hint = ("If you need Python, use the system `python3` and `pip` "
                        "(install packages there); ")
+    elif _probe_interpreters()[0][:1] == [("python" if sys.platform == "win32" else "python3")]:
+        # The probe below already says python3 is on PATH; warning not to
+        # assume it would contradict that.
+        python_hint = f"If you need Python, use \"{sys.executable}\". "
     else:
         python_hint = (f"If you need Python, use \"{sys.executable}\" -- do not assume "
                        f"`python3` is on PATH. ")
     cwd = _choose_shell_cwd()
     if cwd is None:
-        where = (f"none: the configured {SHELL_CWD} does not exist, so commands "
-                 f"cannot run until the user sets shell_cwd")
+        where = (f"none: the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)}, so "
+                 f"commands cannot run until the user sets shell_cwd")
     elif cwd != SHELL_CWD:
-        where = f"{cwd} (the configured {SHELL_CWD} does not exist)"
+        where = f"{cwd} (the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)})"
     else:
         where = str(cwd)
-    spec["description"] += (
+    suffix = (
         f" Environment: {sys.platform}, using {shell_kind}. Working directory: "
-        f"{where}. {python_hint}Before guessing any interpreter or command name, "
-        f"check it exists first with `{check_cmd}`."
+        f"{where}. At session start the folder {_environment_probe(cwd)}. {python_hint}"
+        f"Before guessing any interpreter or command name, check it exists "
+        f"first with `{check_cmd}`."
     )
+    base = spec["description"]
+    previous = _SHELL_GROUNDING["suffix"]
+    if previous and base.endswith(previous):
+        base = base[:-len(previous)]
+    spec["description"] = base + suffix
+    _SHELL_GROUNDING.update(cwd=cwd, suffix=suffix)
+
+
+def refresh_shell_grounding() -> bool:
+    """Re-describe execute_shell when the folder commands run in is no longer
+    the one its description names: a fallback was taken, or the folder went
+    away mid-session. Only then — the listing is a start-of-session snapshot,
+    and rewriting the tool list every turn would defeat the provider's prompt
+    cache. True when the description changed."""
+    global TOOLS_DEF, SYSTEM_PROMPT
+    if "execute_shell" not in TOOL_SPECS or _choose_shell_cwd() == _SHELL_GROUNDING["cwd"]:
+        return False
+    _ground_execute_shell_description(TOOL_SPECS)
+    TOOLS_DEF = build_tools_def(TOOL_SPECS)
+    if "SYSTEM_PROMPT" in globals():  # not yet composed during import
+        SYSTEM_PROMPT = compose_system_prompt()
+    return True
 
 
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
@@ -4871,15 +4991,37 @@ class WorkingDirectoryMissing(FileNotFoundError):
 _cwd_fallback_noted = None
 _pending_cwd_fallback = None
 
+# Trace events raised inside tools, which have no handle on the run's trace:
+# the agent loop drains them into it after each tool call. Bounded, so a
+# caller that never drains (a bare exec_tool in a script) cannot grow it.
+_PENDING_TRACE_EVENTS = []
+_PENDING_TRACE_LOCK = threading.Lock()
+
+
+def _note_trace_event(event: dict) -> None:
+    with _PENDING_TRACE_LOCK:
+        _PENDING_TRACE_EVENTS.append(event)
+        del _PENDING_TRACE_EVENTS[:-50]
+
+
+def _drain_trace_events() -> list:
+    with _PENDING_TRACE_LOCK:
+        events = list(_PENDING_TRACE_EVENTS)
+        _PENDING_TRACE_EVENTS.clear()
+    return events
+
 
 def _shell_cwd() -> Path | None:
-    """_choose_shell_cwd(), and the first time it falls back, a log warning
-    and a pending note for the model (see _take_cwd_note)."""
+    """_choose_shell_cwd(), and the first time it falls back, a log warning,
+    a trace event and a pending note for the model (see _take_cwd_note)."""
     global _cwd_fallback_noted, _pending_cwd_fallback
     cwd = _choose_shell_cwd()
     if cwd is not None and cwd != SHELL_CWD and _cwd_fallback_noted != cwd:
         _cwd_fallback_noted = _pending_cwd_fallback = cwd
-        _log.warning("shell_cwd %s does not exist; commands run in %s", SHELL_CWD, cwd)
+        _log.warning("shell_cwd %s %s; commands run in %s",
+                     SHELL_CWD, _dir_problem(SHELL_CWD), cwd)
+        _note_trace_event({"type": "cwd_repaired", "from": str(SHELL_CWD),
+                           "to": str(cwd), "reason": _dir_problem(SHELL_CWD)})
     return cwd
 
 
@@ -4894,13 +5036,19 @@ def _take_cwd_note(sandboxed: bool) -> str:
         return ""
     where = ARTIFACTS_ROOT if sandboxed else cwd
     return (f"\n{_HARNESS_PREFIX}The configured working directory {SHELL_CWD} "
-            f"does not exist. Commands now run in {where}.")
+            f"{_dir_problem(SHELL_CWD)}. Commands now run in {where}.")
 
 
-def _missing_cwd_error() -> str:
+def _missing_cwd_error(path: Path | None = None) -> str:
+    """The error for a command that could not start because its folder is
+    unusable. `path` is the folder that failed, when it is not the configured
+    one (a fallback that vanished between the check and the start)."""
+    path = path or SHELL_CWD
+    _note_trace_event({"type": "working_directory_missing", "path": str(path),
+                       "reason": _dir_problem(path)})
     return efficiency.tool_error(
         'working_directory_missing',
-        f'The working directory {SHELL_CWD} does not exist, so no command can start.',
+        f'The working directory {path} {_dir_problem(path)}, so no command can start.',
         f'This is a setting, not a missing program or file: tell the user to set '
         f'shell_cwd in {_config_file()} to an existing folder inside allowed_paths. '
         f'Do not retry commands until then.')
@@ -4908,21 +5056,81 @@ def _missing_cwd_error() -> str:
 
 def working_directory_status() -> tuple:
     """(status, detail, fix) for /doctor: where commands and files go, and any
-    configured directory that does not exist here."""
-    missing = [f"{key} {path} does not exist"
-               for key, path in (("project_root", _configured_dir(APP_CONFIG, "project_root", LAUNCH_DIR)),
-                                 ("shell_cwd", SHELL_CWD))
-               if path is not None and not _is_dir(path)]
+    configured directory that cannot be used here."""
+    project_root = _configured_dir(APP_CONFIG, "project_root", LAUNCH_DIR)
+    missing = []
+    if project_root is not None and not _is_dir(project_root):
+        missing.append(("project_root", f"project_root {project_root} does not exist"))
+    if not _dir_usable(SHELL_CWD):
+        missing.append(("shell_cwd", f"shell_cwd {SHELL_CWD} {_dir_problem(SHELL_CWD)}"))
+    problems = "; ".join(text for _, text in missing)
     cwd = _choose_shell_cwd()
     if cwd is None:
-        return ("fail", "; ".join(missing) + "; no allowed folder to run commands in",
+        return ("fail", problems + "; no allowed folder to run commands in",
                 f"Set shell_cwd in {_config_file()} to an existing folder inside allowed_paths.")
     detail = f"commands run in {cwd}; files in {PROJECT_ROOT}"
     if not missing:
         return "ok", detail, ""
-    keys = " and ".join(item.split()[0] for item in missing)
-    return ("warn", "; ".join(missing) + f" — using fallbacks: {detail}",
+    keys = " and ".join(key for key, _ in missing)
+    return ("warn", problems + f" — using fallbacks: {detail}",
             f"Set {keys} in {_config_file()} to an existing folder, or remove it.")
+
+
+DIAGNOSTIC_AFTER_FAILURES = max(2, _config_int("diagnostic_after_failures", 2))
+
+
+def environment_diagnostic() -> tuple:
+    """(text, status): a read-only look at where commands run — the /doctor
+    working-directory check, the folder's contents, the user, free disk space
+    and interpreters. Gathered in Python, not by running pwd/ls: the failure
+    being diagnosed may be that no shell can start at all. Listing follows the
+    same allowed_paths/blocked_paths checks as a file tool, and the output is
+    redacted and bounded."""
+    status, detail, fix = working_directory_status()
+    cwd = _choose_shell_cwd()
+    lines = [f"working directory: {status} — {detail}"]
+    if fix:
+        lines.append(f"fix: {fix}")
+    probe = _environment_probe(cwd)
+    lines.append(f"{cwd} {probe}" if cwd is not None else probe)
+    if cwd is not None:
+        try:
+            free = shutil.disk_usage(cwd).free / 1024 ** 3
+            lines.append(f"free disk space: {free:.1f} GB")
+        except OSError:
+            pass
+    return _redact_secrets("\n".join(lines))[:1500], status
+
+
+_ENV_SUBJECT = (r"(?:environment|workspace|working director(?:y|ies)|sandbox|shell|"
+                r"file ?system|container|terminal|project (?:folder|directory))")
+_ENV_FAILURE = (r"(?:inaccessible|unavailable|not (?:available|accessible|reachable|usable|working)|"
+                r"unusable|broken|missing|(?:does not|doesn['’]t) exist|"
+                r"(?:is|are|seems?|appears?) (?:to be )?(?:down|corrupt(?:ed)?|misconfigured))")
+_ENV_UNAVAILABLE_RE = re.compile(
+    rf"\b{_ENV_SUBJECT}\b[^.!?\n]{{0,60}}?\b{_ENV_FAILURE}"
+    rf"|\b(?:can(?:no|['’])t|cannot|could(?: not|n['’]t)|unable to)\s+"
+    rf"(?:access|reach|use|run (?:any )?commands? in)\s+(?:the |this |your |any )?{_ENV_SUBJECT}\b",
+    re.IGNORECASE)
+
+
+def _claims_environment_unavailable(answer: str) -> bool:
+    """Does a final answer conclude that the environment itself cannot be
+    used? Matched loosely on purpose: a false match costs one read-only check
+    and one more turn, a miss lets an unverified "it's broken" end the run."""
+    return bool(_ENV_UNAVAILABLE_RE.search(answer or ""))
+
+
+_TOOL_ERROR_CODE_RE = re.compile(r'"code":\s*"([A-Za-z_]+)"')
+
+
+def _tool_error_code(result: str) -> str | None:
+    """The structured error code of a failed tool call, "error" for an
+    unstructured "Error: ...", or None for a call that did not fail."""
+    if not isinstance(result, str) or not result.startswith("Error:"):
+        return None
+    match = _TOOL_ERROR_CODE_RE.search(result)
+    return match.group(1) if match else "error"
 
 
 def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
@@ -11160,10 +11368,14 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
     missing = getattr(error, "filename", None) or getattr(error, "filename2", None)
     # A process started in a directory that vanished between the check and the
     # start reports that directory as its missing file; say what it really is.
-    if isinstance(error, WorkingDirectoryMissing) or (
-            missing and Path(str(missing)) in (SHELL_CWD, LAUNCH_DIR, PROJECT_ROOT)
-            and not _is_dir(Path(str(missing)))):
+    if isinstance(error, WorkingDirectoryMissing):
         return _missing_cwd_error()
+    if (missing and Path(str(missing)) in (SHELL_CWD, LAUNCH_DIR, PROJECT_ROOT)
+            and not _is_dir(Path(str(missing)))):
+        # Name the folder that vanished: with a fallback in use that is not
+        # the configured shell_cwd, and naming that would send the user to
+        # fix a setting that is not the problem.
+        return _missing_cwd_error(Path(str(missing)))
     if not missing:
         return efficiency.tool_error('not_found', 'The requested file or executable was not found.',
             'Check the path or installed executable, correct the arguments, then retry.', recoverable=True)
@@ -13762,6 +13974,9 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         # MCP servers connect in the background at startup; their tools must be
         # registered before this turn's tool list is built.
         ensure_mcp_ready()
+        # Same seam for the shell's folder: if it changed since execute_shell
+        # was described, the model must not keep being told the old one.
+        refresh_shell_grounding()
     user_turns = _genuine_user_turns(messages)
     goal = str(user_turns[-1].get("content") or "") if user_turns else ""
     run_trajectory = trajectory.TrajectoryState(
@@ -14931,6 +15146,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     length_retries = 0   # token-limited calls are incomplete and must never execute
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
+    tool_failed = False  # any tool call this run returned an error
+    fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
+    diagnostic_seen = False  # the model has been shown environment_diagnostic()
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     plan_mutation_retries = 0
@@ -15401,6 +15619,26 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
+            if (tool_failed and not diagnostic_seen
+                    and _claims_environment_unavailable(answer)):
+                # "The environment is inaccessible" after a failed tool call is
+                # a conclusion, and one failure does not prove it: a wrong
+                # working directory once ended runs this way with the files
+                # right there. Show the evidence first, once.
+                diagnostic_seen = True
+                diagnosis, status = environment_diagnostic()
+                messages.append(_harness_turn(
+                    "You concluded that the environment cannot be used, but nothing has "
+                    "checked that yet. A read-only check of where commands run:\n"
+                    f"{diagnosis}\n"
+                    "If this shows a usable working directory, continue the task from "
+                    "there. If it confirms a real problem, give your final answer and "
+                    "say what this check shows."))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "diagnostic_run",
+                                  "trigger": "environment_claim", "outcome": status})
+                continue
+
             if DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
                 # Graded on exact outputs with nobody to ask: before the one
                 # final answer, re-check every deliverable against the task.
@@ -15617,6 +15855,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             spin_msg = "Fetching results…" if name == "web_search" else f"running {name}..."
             with spin(spin_msg):
                 result = exec_tool(name, json.dumps(args), depth=depth)
+            for event in _drain_trace_events():
+                if trace is not None:
+                    trace.append(dict(event, turn=turn, tool=name))
             if trajectory is not None and operation is not None:
                 verdict = tool_output.detect_verdict(result)
                 # detect_verdict reads test output; it has no idea what an
@@ -15805,6 +16046,26 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"have, and there is nobody to ask. Do not retry it. "
                           f"Continue without it, or explain what you could not do.")
             model_result = _tool_result_for_model(name, result)
+            # The same tool failing the same way again says more about the
+            # environment than about the call: after DIAGNOSTIC_AFTER_FAILURES
+            # in a row, show the model a read-only check of where commands run
+            # rather than let it keep retrying or conclude the place is broken.
+            code = _tool_error_code(result)
+            tool_failed = tool_failed or code is not None
+            key = (name, code) if code else None
+            fail_streak = (key, fail_streak[1] + 1 if key and key == fail_streak[0] else int(bool(key)))
+            if key and fail_streak[1] == DIAGNOSTIC_AFTER_FAILURES:
+                diagnostic_seen = True
+                diagnosis, status = environment_diagnostic()
+                model_result += (
+                    f"\n\n{_HARNESS_PREFIX}{name} failed the same way ({code}) "
+                    f"{fail_streak[1]} times in a row. A read-only check of where "
+                    f"commands run:\n{diagnosis}\nUse it to choose a different next "
+                    f"step; do not repeat the failing call unchanged.")
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "diagnostic_run",
+                                  "trigger": "repeated_failure", "tool": name,
+                                  "code": code, "outcome": status})
             messages.append({"role": "user", "content":
                              f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
 

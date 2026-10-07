@@ -163,6 +163,10 @@ browser_hitl=1
 # usage crosses this percentage. Set to 0 to disable.
 # compaction_threshold_pct=75
 
+# After this many identical tool failures in a row, show the model a read-only
+# check of where commands run (working directory, listing, disk, interpreters).
+# diagnostic_after_failures=2
+
 # --- display ---
 # Pygments theme for the code the agent reads and writes: file listings, diffs
 # and fenced code blocks in its answers. Any Pygments style name works —
