@@ -85,7 +85,7 @@ def test_retry_after_length_cutoff_gets_a_small_adaptive_cap(monkeypatch, engine
     # to agree with the defaults.
     context_window, completion_limit = engine._active_model_token_limits()
     assert calls[0] == completion_limit
-    assert calls[1] == max(engine.MAIN_LLM_MIN_TOKENS, min(completion_limit, 0))
+    assert calls[1] == min(completion_limit, engine.MAIN_LLM_MIN_TOKENS)  # the floor
 
 
 @pytest.mark.parametrize("ctx,comp", [("1048576", "131072"), ("262144", "32768")])
@@ -654,3 +654,74 @@ def test_cutoff_then_recovery_resets_cap_and_keeps_roles_alternating(monkeypatch
     assert seen[2]["thinking"] == "length_retry" and seen[0]["max"] > seen[1]["max"]
     assert not any(a == b for r in (s["roles"] for s in seen) for a, b in zip(r, r[1:]) if a == "assistant")
     assert any(t["type"] == "cap_reset" and t["after_cutoffs"] == 2 for t in trace)
+
+
+def test_zero_max_retries_never_ends_the_run_on_cutoffs(monkeypatch, engine):
+    """length_cutoff_max_retries=0 disables the final no-tools round."""
+    monkeypatch.setattr(engine, "LENGTH_CUTOFF_MAX_RETRIES", 0)
+    monkeypatch.setattr(engine, "compact_messages", lambda *a, **k: False)
+    calls = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        calls.append(tools)
+        return _length_response("x" * 30) if len(calls) <= 5 else _stop_response("done")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    assert engine.run_agent([{"role": "user", "content": "go"}], max_turns=10) == "done"
+    assert [] not in calls  # no tool-less final round
+
+
+def test_adaptive_cap_never_exceeds_the_completion_limit(monkeypatch, engine):
+    monkeypatch.setattr(engine, "_active_model_token_limits", lambda *a: (131072, 1000))
+    sizes = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        sizes.append(max_tokens)
+        return _length_response("x") if len(sizes) == 1 else _stop_response("ok")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    engine.run_agent([{"role": "user", "content": "go"}], max_turns=5)
+    assert sizes[1] <= 1000
+
+
+def test_adjacent_user_turns_are_folded_before_sending(engine):
+    sent = engine._normalised_messages("sys", [
+        {"role": "user", "content": "prompt"},
+        {"role": "user", "content": "harness note"},
+        {"role": "assistant", "content": "a"},
+        {"role": "user", "content": [{"type": "text", "text": "image turn"}]},
+        {"role": "user", "content": "after image"},
+    ])
+    roles = [m["role"] for m in sent]
+    assert roles == ["system", "user", "assistant", "user", "user"]
+    assert sent[1]["content"] == "prompt" + chr(10) * 2 + "harness note"
+
+
+def test_length_retry_merges_template_kwargs(monkeypatch, engine):
+    monkeypatch.setattr(engine, "_provider_extra_body",
+                        lambda name: {"chat_template_kwargs": {"keep": 1}})
+    monkeypatch.setattr(engine, "_length_retry_extra_body",
+                        lambda name: {"chat_template_kwargs": {"enable_thinking": False}})
+    seen = {}
+
+    class _Completions:
+        def create(self, **kw):
+            seen.update(kw)
+            return _stop_response("ok")
+
+    client = type("C", (), {"chat": type("Ch", (), {"completions": _Completions()})()})()
+    engine._create_completion(client, [{"role": "user", "content": "hi"}], [],
+                              model_name="m", provider_name="vllm", thinking="length_retry")
+    assert seen["extra_body"]["chat_template_kwargs"] == {"keep": 1, "enable_thinking": False}
+
+
+def test_any_400_on_the_length_retry_call_retries_without_extras(engine):
+    exc = type("E", (Exception,), {"status_code": 400})(
+        "Invalid value: 'none'. Supported values are: 'low', 'medium', 'high'.")
+    assert engine._extras_rejected(exc, "length_retry")
+    assert not engine._extras_rejected(exc, None)
+
+
+def test_extract_reasoning_reads_the_gemini_nested_shape(engine):
+    d = type("D", (), {"reasoning_content": {"reasoningContent": {"reasoningText": {"text": "plan"}}}})()
+    assert engine._extract_reasoning(d) == "plan"

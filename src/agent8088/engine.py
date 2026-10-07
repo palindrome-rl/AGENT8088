@@ -2456,6 +2456,19 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
     return response
 
 
+def _extras_rejected(exc: Exception, thinking=None) -> bool:
+    """Whether to resend without the optional request fields.
+
+    The length-retry fields are a guess per provider family, and a provider
+    that rejects a value ("Invalid value ... Supported values ...", e.g.
+    reasoning_effort=none on o-series) does not word it as an unknown field.
+    Any 400 on that call is treated as a rejected extra, so the guess costs
+    one call, not the turn."""
+    if _is_unknown_param_error(exc):
+        return True
+    return thinking == "length_retry" and getattr(exc, "status_code", None) == 400
+
+
 def _is_unknown_param_error(exc: Exception) -> bool:
     """Whether an API rejection looks like an unrecognized-request-field 400."""
     text = str(exc)
@@ -2491,6 +2504,16 @@ def _normalised_messages(system_prompt: str, messages: list) -> list:
             content = message.get("content")
             if isinstance(content, str) and content.strip():
                 leading.append(content)
+            continue
+        # Strict chat templates (Gemma, Mistral on vLLM/Ollama) 400 on two user
+        # turns in a row -- which a discarded cut-off reply followed by its
+        # harness note produces. Fold plain-text neighbours into one turn at
+        # send time; the stored history keeps them apart.
+        previous = rest[-1] if rest else None
+        if (previous is not None and message.get("role") == "user" == previous.get("role")
+                and isinstance(message.get("content"), str)
+                and isinstance(previous.get("content"), str)):
+            rest[-1] = {**previous, "content": previous["content"] + "\n\n" + message["content"]}
             continue
         rest.append(message)
     return [{"role": "system", "content": "\n\n".join(part for part in leading if part)}, *rest]
@@ -2764,7 +2787,12 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         # reasoning, so force thinking down for THIS call only. Restored on the
         # next ordinary turn so planning quality is not permanently reduced.
         extra_body = dict(extra_body or {})
-        extra_body.update(_length_retry_extra_body(provider_name))
+        for key, value in _length_retry_extra_body(provider_name).items():
+            # Merge rather than replace: a provider's own template switches
+            # (chat_template_kwargs) must survive, as in the branch above.
+            if isinstance(value, dict) and isinstance(extra_body.get(key), dict):
+                value = {**extra_body[key], **value}
+            extra_body[key] = value
     if extra_body and not _skip_optional:
         request_options["extra_body"] = extra_body
     _raise_if_interrupted(interrupt_check)
@@ -2788,7 +2816,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         try:
             return _do_create()
         except Exception as exc:
-            if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
+            if request_options.pop("extra_body", None) and _extras_rejected(exc, thinking):
                 return _do_create()
             raise
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
@@ -2824,7 +2852,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             stream = client.chat.completions.create(**request_options, stream=True)
     except Exception as exc:
         _close_stream_ctx()
-        if not _skip_optional and _is_unknown_param_error(exc):
+        if not _skip_optional and _extras_rejected(exc, thinking):
             return _create_completion(
                 client, messages, tools, max_tokens=max_tokens,
                 system_prompt=system_prompt, temperature=temperature,
@@ -15114,7 +15142,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         # never below the floor); any normal finish resets to the full limit.
         turn_max_tokens = (
             turn_completion_limit if not length_retries else
-            max(MAIN_LLM_MIN_TOKENS, min(turn_completion_limit, 2 * last_call_tokens))
+            min(turn_completion_limit,
+                max(MAIN_LLM_MIN_TOKENS, min(turn_completion_limit, 2 * last_call_tokens)))
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
@@ -15289,13 +15318,17 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 trace.append({"turn": turn, "type": "length_cutoff",
                               "tokens": turn_max_tokens,
                               "seconds": round(time.monotonic() - call_started, 1),
-                              "had_content": bool(content)})
+                              "had_content": bool(content),
+                              # What the allowance went to: the captured reasoning
+                              # (streamed or on the message) shows a runaway
+                              # think apart from a long answer.
+                              "reasoning_chars": len(_extract_reasoning(message))})
             # A3.3: the truncated reply is discarded, not stored -- only a short
             # harness note enters the context.
             # A3.4: a cut-off never ends the run until the ladder is spent:
             # 1st small cap, 2nd thinking off, 3rd compact + progress note,
             # then one final no-tools round that returns the partial work.
-            if length_retries >= max(1, LENGTH_CUTOFF_MAX_RETRIES):
+            if LENGTH_CUTOFF_MAX_RETRIES and length_retries >= LENGTH_CUTOFF_MAX_RETRIES:
                 if trace is not None:
                     trace.append({"turn": turn, "type": "final_round_no_tools",
                                   "cutoffs": length_retries})
