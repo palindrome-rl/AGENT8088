@@ -2603,13 +2603,12 @@ def _extract_reasoning(obj) -> str:
 
     The text is returned as sent: a streamed delta can continue mid-word, so
     trimming each chunk would glue them together without the space between
-    ("options" + "and" -> "optionsand"). strip() decides only whether a value
-    counts as found.
+    ("options" + "and" -> "optionsand"). Whitespace-only chunks are kept too.
     """
     for field, key in _REASONING_FIELDS:
         value = getattr(obj, field, None)
         if isinstance(value, str):
-            if key is None and value.strip():
+            if key is None and value:
                 return value
             continue
         if isinstance(value, list):
@@ -2622,7 +2621,7 @@ def _extract_reasoning(obj) -> str:
             text = str(node.get(key or "text") or "") if isinstance(node, dict) else ""
         else:
             continue
-        if text.strip():
+        if text:
             return text
     return ""
 
@@ -14778,7 +14777,7 @@ def _turn_policy(max_turns: int, *, depth: int = 0, role: str | None = None,
 
 def _answer_from_context(messages, *, system_prompt, temperature, budget, on_token,
                          interrupt_check, trace, turn, client, provider_name,
-                         model_name):
+                         model_name, ask=None):
     """One last round with no tools, so an exhausted run reports its work.
 
     The run is over either way; the only question is whether the user gets what
@@ -14786,7 +14785,7 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
     design -- a failure here falls back to the old report rather than replacing
     one bad ending with a crash.
     """
-    ask = ("You have reached this turn's budget and no more tools will run. "
+    ask = ask or ("You have reached this turn's budget and no more tools will run. "
            "Answer now from what you already have: give the result you did "
            "reach and say plainly what is still missing. Do not ask to "
            "continue and do not request another tool.")
@@ -14907,7 +14906,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     missing_args_retries = 0  # times a call arrived without its arguments
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
-    length_retries = 0   # token-limited calls are incomplete and must never execute
+    length_retries = 0   # consecutive token-limited calls; incomplete, never executed
+    last_call_tokens = 0  # completion tokens of the last call that finished normally
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
@@ -15110,13 +15110,22 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                               "tokens_after": _estimate_tokens(
                                   _estimate_context_chars(messages, round_system_prompt or "")
                                   + len(json.dumps(round_tools_def or [], default=str)))})
+        # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
+        # never below the floor); any normal finish resets to the full limit.
         turn_max_tokens = (
             turn_completion_limit if not length_retries else
-            min(turn_completion_limit * 2, turn_context_window) if length_retries == 1 else
-            min(1024, turn_completion_limit)
+            max(MAIN_LLM_MIN_TOKENS, min(turn_completion_limit, 2 * last_call_tokens))
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
+        # A3.2/A3.4: from the 2nd consecutive cut-off, this one call runs with
+        # thinking off; the next ordinary turn is back to normal thinking.
+        retry_kwargs = {"thinking": "length_retry"} if length_retries >= 2 else {}
+        if length_retries and trace is not None:
+            trace.append({"turn": turn, "type": "retry_mode",
+                          "mode": "reduced_thinking" if retry_kwargs else "small_cap",
+                          "max_tokens": turn_max_tokens})
+        call_started = time.monotonic()
         # Fit the request in the window: a strict OpenAI-compatible server (vLLM)
         # rejects prompt + max_tokens > max_model_len with a 400, which ends the
         # turn. Asking for the full completion limit on a long history -- or
@@ -15138,6 +15147,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     provider_override=loop_provider,
                     model_override=loop_model,
                     on_retry=_retry_notice, on_stream_reset=on_stream_reset,
+                    **retry_kwargs,
                 )
         except (AgentInterrupted, TurnBudgetExceeded):
             raise
@@ -15231,7 +15241,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         native_text = _native_tool_text(message)
         if native_text:
             content = "\n".join(part for part in (content, native_text) if part)
-        messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
         for call in calls:
@@ -15274,21 +15283,76 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 )
             if on_result:
                 on_result("error", warning)
+            length_retries += 1
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
-            # Never end the run on cut-offs: a model that overruns its output
-            # limit is told to reply briefly and the run carries on, bounded by
-            # its turn and time budget -- the same behaviour as comparable
-            # agents, which retry until their clock runs out rather than giving
-            # up with time left (#18).
-            length_retries += 1
-            messages.append(_harness_turn((
-                retry_instruction if length_retries == 1 else
-                "Your last responses reached the output limit. Reply within 200 tokens "
-                "with exactly one complete tool call or a final answer. Do not include analysis "
-                "or thinking."
-            )))
+                trace.append({"turn": turn, "type": "length_cutoff",
+                              "tokens": turn_max_tokens,
+                              "seconds": round(time.monotonic() - call_started, 1),
+                              "had_content": bool(content)})
+            # A3.3: the truncated reply is discarded, not stored -- only a short
+            # harness note enters the context.
+            # A3.4: a cut-off never ends the run until the ladder is spent:
+            # 1st small cap, 2nd thinking off, 3rd compact + progress note,
+            # then one final no-tools round that returns the partial work.
+            if length_retries >= max(1, LENGTH_CUTOFF_MAX_RETRIES):
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "final_round_no_tools",
+                                  "cutoffs": length_retries})
+                answer = _answer_from_context(
+                    messages, system_prompt=round_system_prompt,
+                    temperature=temperature, budget=budget, on_token=on_token,
+                    interrupt_check=interrupt_check, trace=trace, turn=turn,
+                    client=loop_client, provider_name=loop_provider,
+                    model_name=loop_model,
+                    ask=("Your output was cut off repeatedly and no more tools will "
+                         "run. Answer now, briefly, from what already exists: say what "
+                         "is done and what is still missing."))
+                answer = (answer or str(_last_tool_output or "")
+                          or "No answer was produced before the output limit.")
+                answer = _guard_answer(
+                    f"{answer}\n\n[Stopped after {length_retries} output-limit "
+                    "cut-offs. Raise main_llm_min_tokens or length_retry_max_tokens "
+                    "(or the provider's max_completion_tokens) if replies are "
+                    "legitimately this long.]")
+                if on_answer:
+                    on_answer(answer)
+                return answer
+            if length_retries == 3:
+                try:
+                    compact_messages(messages, completion_client=loop_client,
+                                     provider_name=loop_provider or "",
+                                     model_name=loop_model or "", budget=budget)
+                except Exception as exc:
+                    _log.warning("compaction after repeated cut-offs failed: %s", exc)
+                last = str(_last_tool_output or "")[:500]
+                retry_instruction = (
+                    f"{warning} Progress so far is in the summary above"
+                    + (f"; last tool output: {last}" if last else "")
+                    + ". Reply within 200 tokens with exactly one short tool call "
+                    "or a final answer. Do not include analysis.")
+            elif length_retries == 1:
+                retry_instruction = (
+                    f"{warning} The previous attempt was cut off and discarded. "
+                    + ("Make one short, complete tool call; split large work across calls."
+                       if content else
+                       "That budget went entirely to reasoning: stop reasoning and "
+                       "reply in plain text or call one tool."))
+            else:
+                retry_instruction = (
+                    "Your last responses reached the output limit and were discarded. "
+                    "Reply within 200 tokens with exactly one complete tool call or a "
+                    "final answer. Do not include analysis or thinking.")
+            messages.append(_harness_turn(retry_instruction))
             continue
+        # A normal finish: store the reply, reset the cap, remember its size.
+        messages.append({"role": "assistant", "content": content})
+        last_call_tokens = int(getattr(getattr(response, "usage", None),
+                                       "completion_tokens", 0) or 0) or _estimate_tokens(len(content))
+        if length_retries:
+            if trace is not None:
+                trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
+            length_retries = 0
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])

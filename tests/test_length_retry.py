@@ -64,9 +64,8 @@ def test_large_answer_overflow_keeps_split_work_nudge(monkeypatch, engine):
     assert "split large work" in retry_nudge.lower()
 
 
-def test_retry_after_length_cutoff_gets_a_bigger_budget(monkeypatch, engine):
-    """The one automatic retry must ask for more than the default budget, so
-    a model that keeps reasoning almost as long still has room for an answer."""
+def test_retry_after_length_cutoff_gets_a_small_adaptive_cap(monkeypatch, engine):
+    """A3.1: the retry is capped small (floor main_llm_min_tokens), not doubled."""
     calls = []
 
     def _fake(messages, tools, max_tokens=None, **kw):
@@ -86,8 +85,7 @@ def test_retry_after_length_cutoff_gets_a_bigger_budget(monkeypatch, engine):
     # to agree with the defaults.
     context_window, completion_limit = engine._active_model_token_limits()
     assert calls[0] == completion_limit
-    assert calls[1] == min(completion_limit * 2, context_window)
-    assert calls[1] > calls[0]
+    assert calls[1] == max(engine.MAIN_LLM_MIN_TOKENS, min(completion_limit, 0))
 
 
 @pytest.mark.parametrize("ctx,comp", [("1048576", "131072"), ("262144", "32768")])
@@ -179,7 +177,7 @@ def test_two_cutoffs_get_a_concise_last_recovery_attempt(monkeypatch, engine):
     result = engine.run_agent([{"role": "user", "content": "use a tool"}], max_turns=5)
 
     assert result == "recovered"
-    assert calls[2]["max_tokens"] == min(1024, engine.MAX_COMPLETION_TOKENS)
+    assert calls[2]["max_tokens"] == engine.MAIN_LLM_MIN_TOKENS
     assert "within 200 tokens" in calls[2]["messages"][-1]["content"]
 
 
@@ -607,3 +605,52 @@ def test_request_never_exceeds_the_context_window(monkeypatch, engine):
 
     assert len(seen) == 2
     assert all(total <= 32768 for total in seen), seen
+
+
+def test_cutoff_ladder_discards_replies_and_ends_with_no_tools_round(monkeypatch, engine):
+    """A3.2-A3.5: truncated replies are not stored, thinking goes off from the
+    2nd cut-off, and the Nth cut-off ends in one tool-less round + config note."""
+    monkeypatch.setattr(engine, "LENGTH_CUTOFF_MAX_RETRIES", 4)
+    monkeypatch.setattr(engine, "compact_messages", lambda *a, **k: False)
+    calls = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        calls.append({"messages": list(messages), "tools": tools, "kw": kw})
+        if tools == []:
+            return _stop_response("partial work")
+        return _length_response("x" * 50)
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    trace = []
+    result = engine.run_agent([{"role": "user", "content": "go"}], max_turns=10, trace=trace)
+
+    assert len(calls) == 5 and calls[-1]["tools"] == []
+    assert [c["kw"].get("thinking") for c in calls[:4]] == [None, None, "length_retry", "length_retry"]
+    assert not any(m["content"] == "x" * 50 for m in calls[-1]["messages"])
+    assert "partial work" in result and "main_llm_min_tokens" in result
+    kinds = {t["type"] for t in trace}
+    assert {"length_cutoff", "retry_mode", "final_round_no_tools"} <= kinds
+
+
+def test_extract_reasoning_keeps_whitespace_chunks(engine):
+    d = type("D", (), {"reasoning_content": " "})()
+    assert engine._extract_reasoning(d) == " "
+    assert engine._extract_reasoning(type("D", (), {"reasoning": chr(10)})()) == chr(10)
+
+
+def test_cutoff_then_recovery_resets_cap_and_keeps_roles_alternating(monkeypatch, engine):
+    """End to end: two cut-offs, a normal reply, then a fresh turn -- full cap,
+    normal thinking, cap_reset traced, and no two same-role messages in a row."""
+    seen = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        seen.append({"roles": [m["role"] for m in messages], "max": max_tokens,
+                     "thinking": kw.get("thinking")})
+        return _length_response("x" * 40) if len(seen) <= 2 else _stop_response("done")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    trace = []
+    assert engine.run_agent([{"role": "user", "content": "go"}], max_turns=6, trace=trace) == "done"
+    assert seen[2]["thinking"] == "length_retry" and seen[0]["max"] > seen[1]["max"]
+    assert not any(a == b for r in (s["roles"] for s in seen) for a, b in zip(r, r[1:]) if a == "assistant")
+    assert any(t["type"] == "cap_reset" and t["after_cutoffs"] == 2 for t in trace)
