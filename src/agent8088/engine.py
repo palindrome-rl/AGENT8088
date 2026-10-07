@@ -496,6 +496,11 @@ MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 600))
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
+# Tool rounds allowed after a finishing nudge (deliverables re-check,
+# verification, re-plan, tests) with no state change before the model is told to
+# answer; at this + 2 the best answer so far is returned. A write resets the
+# count, so a fix found by a check is never cut off. 0 disables the cap.
+MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
@@ -14712,8 +14717,10 @@ DELIVERABLES_CHECK_NUDGE = (
     "Before finishing: re-read the original task. For each required output "
     "(file path, format, service or port), run a check now that confirms it exists "
     "and behaves exactly as specified. Remove scratch files, test users and other "
-    "leftovers you created that the task did not ask for. Then give your final answer."
+    "leftovers you created that the task did not ask for. Check each item once with "
+    "a single command, then give your final answer. Do not keep exploring."
 )
+POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
     "cli_anything_info", "cli_anything_skill",
@@ -14806,6 +14813,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     length_retries = 0   # token-limited calls are incomplete and must never execute
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
+    post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
+    post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
+    last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     plan_mutation_retries = 0
@@ -15276,16 +15286,21 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
-            if DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
+            last_text_answer = answer
+            # Once told to answer, take this reply: a gate firing again here is
+            # exactly the open-ended checking the cap exists to end.
+            gates_open = not post_check_told
+            if gates_open and DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
                 # Graded on exact outputs with nobody to ask: before the one
                 # final answer, re-check every deliverable against the task.
                 deliverables_checked = True
                 messages.append(_harness_turn(DELIVERABLES_CHECK_NUDGE))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "deliverables_check"})
+                post_check_rounds = 0
                 continue
 
-            if trajectory is not None and trajectory.request_replan():
+            if gates_open and trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()
                 messages.append(_harness_turn((
@@ -15293,17 +15308,21 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Do not repeat them. State a short revised approach, then take one "
                     "different safe next action; if blocked by missing access, say so plainly."
                 )))
+                post_check_rounds = 0
                 continue
-            if trajectory is not None and trajectory.request_verification():
+            if gates_open and trajectory is not None and trajectory.request_verification():
                 if on_trajectory_state:
                     on_trajectory_state()
                 messages.append(_harness_turn((
                     "Controller state says a changed result has no fresh verification evidence. "
                     "Before your final answer, inspect or test the changed result if a suitable "
-                    "tool is available. If verification is not possible, say that plainly."
+                    "tool is available. If verification is not possible, say that plainly. "
+                    "Check each item once with a single command, then give your final "
+                    "answer. Do not keep exploring."
                 )))
+                post_check_rounds = 0
                 continue
-            if (trajectory is not None and not DISPOSABLE_CONTAINER
+            if (gates_open and trajectory is not None and not DISPOSABLE_CONTAINER
                     and trajectory.request_tests()):
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -15313,6 +15332,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Before your final answer, call generate_tests on each one, or "
                     "state plainly why tests do not apply to this change."
                 )))
+                post_check_rounds = 0
                 continue
             answer = _guard_answer(answer)
             if trajectory is not None and trajectory.needs_verification():
@@ -15330,6 +15350,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             on_calls(calls)
 
         executed = False
+        round_mutation_seq = _MUTATION_SEQ  # a write this round resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
         turn_tools = [] if trace is not None else None
@@ -15701,6 +15722,31 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
+        if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:
+            if _MUTATION_SEQ != round_mutation_seq:
+                # A check found something and the model fixed it: real work,
+                # never cut off. The count starts over.
+                post_check_rounds, post_check_told = 0, False
+            else:
+                post_check_rounds += 1
+                if post_check_rounds >= MAX_POST_CHECK_ROUNDS + 2:
+                    # Hard backstop: told to answer and still checking.
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "post_check_backstop",
+                                      "rounds": post_check_rounds})
+                    answer = _guard_answer(last_text_answer or
+                                           "Stopped after repeated checks with no further changes.")
+                    if on_answer:
+                        on_answer(answer)
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "final_answer", "content": answer})
+                    return answer
+                if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
+                    post_check_told = True
+                    messages.append(_harness_turn(POST_CHECK_CAP_NUDGE))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "post_check_cap",
+                                      "rounds": post_check_rounds})
         if executed:
             forcing = False
             policy.record_round(
