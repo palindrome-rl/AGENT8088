@@ -43,6 +43,9 @@ def _mutated(engine, command):
     "cd . && wc -l data.csv && head -5 data.csv",
     "wc -w < data.csv",                              # input redirect only reads
     "awk '{t++} END {print \"total:\", t, \"| rows\"}' data.csv",   # | inside a string
+    # seen live: checking a written file through a substitution
+    'echo "report: [$(cat data.csv)]"; echo "lines: $(wc -l < data.csv)"',
+    'count=$(wc -l < data.csv | tr -d " ") && [ "$count" = 3 ] && echo same',
 ])
 def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monkeypatch, command):
     _host_shell(engine, tmp_path, monkeypatch)
@@ -69,6 +72,9 @@ def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monk
     "sed 's/a/b/w out.txt' data.csv",                # sed's w flag writes a file
     "sed -i 's/a/b/' data.csv",                      # in place
     "echo $(touch sneaky.txt)",
+    "echo $(cat data.csv; touch sneaky.txt)",
+    "x=$(cat data.csv) && touch y.txt",
+    "echo `cat data.csv`",                           # backticks stay refused
 ])
 def test_anything_that_can_write_still_counts(engine, tmp_path, monkeypatch, command):
     _host_shell(engine, tmp_path, monkeypatch)

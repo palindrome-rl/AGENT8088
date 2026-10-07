@@ -5755,6 +5755,28 @@ def _sed_prints_only(command: str) -> bool:
                  or _SED_SUBSTITUTE.fullmatch(operands[0]) is not None))
 
 
+_INNERMOST_SUBSTITUTION = re.compile(r"\$\(([^()`]*)\)")
+
+
+def _without_read_only_substitutions(command: str):
+    """`command` with each $(...) whose inner command is itself read-only
+    replaced by a plain word, innermost first; None when one is not.
+
+    Seen in the benchmark: a model checked the file it had just written with
+    `echo "report: [$(cat report.txt)]"`, and refusing every substitution
+    counted that check as a new change. Backticks stay refused outright, and
+    anything left unresolved (arithmetic, unbalanced text) is refused by the
+    caller."""
+    for _ in range(16):
+        match = _INNERMOST_SUBSTITUTION.search(command)
+        if match is None:
+            return command
+        if not _shell_call_is_read_only(match.group(1)):
+            return None
+        command = command[:match.start()] + "X" + command[match.end():]
+    return None
+
+
 def _shell_call_is_read_only(command: str) -> bool:
     """Read-only for the purposes of AUDITING, which is not the same question
     `_readonly_shell` answers.
@@ -5778,7 +5800,8 @@ def _shell_call_is_read_only(command: str) -> bool:
     can still be read from the original text. Auditing those reads, plus
     `sed -n '415,445p'` and `2>&1`, took 144 of a 293-second live run.
     """
-    if re.search(r"[`]|\$\(", command):
+    command = _without_read_only_substitutions(command)
+    if command is None or re.search(r"[`]|\$\(", command):
         return False           # substitution can run anything, anywhere
     probe = _mask_quoted_operators(command)
     if probe is None:
@@ -5793,8 +5816,13 @@ def _shell_call_is_read_only(command: str) -> bool:
     stages = [(probe[start:end].strip(), original[start:end].strip())
               for start, end in zip(bounds[::2], bounds[1::2])]
     return all(masked and (_readonly_shell(masked) or _sed_prints_only(original)
-                           or _text_only_stage(masked) or _awk_prints_only(original))
+                           or _text_only_stage(masked) or _awk_prints_only(original)
+                           or _ASSIGNMENT_ONLY.fullmatch(masked) is not None)
                for masked, original in stages)
+
+
+# `name=value` alone sets a shell variable for the rest of this one command.
+_ASSIGNMENT_ONLY = re.compile(r"[A-Za-z_]\w*=\S*")
 
 
 # What lets an awk program act beyond printing: running a command, reading
@@ -5846,6 +5874,8 @@ _TEXT_ONLY_COMMANDS = frozenset([
     "basename", "dirname", "realpath", "stat", "which", "true",
     # Changes only where the rest of this one command runs.
     "cd", "pushd", "popd",
+    # Comparisons: `[ "$count" = 3 ]`.
+    "[", "test",
 ])
 
 
@@ -11276,6 +11306,31 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
         'Check the path (list the directory first), correct the arguments, then retry.', recoverable=True)
 
 
+_EXIT_STATUS_RE = re.compile(r"Command exited with status \d+|timed out after \d+s")
+
+
+def _runs_changed_program(name: str, args: dict, result: str, trajectory) -> bool:
+    """Whether a shell call ran, successfully, a code file this run changed
+    while that change still waits for a check.
+
+    Seen in the glm-5.3-flash benchmark: after writing fib.py, `python fib.py`
+    counted as yet another change, re-armed the verification nudge, and the
+    model re-ran the same check twice. Named by file name, so `python3
+    ./src/fib.py` and `cd src && python3 fib.py` both count; a failing or
+    timed-out run is not a check."""
+    if name != "execute_shell" or not trajectory.needs_verification():
+        return False
+    text = str(result or "")
+    if text.startswith("Error:") or _EXIT_STATUS_RE.search(text):
+        return False
+    command = str(args.get("command") or "")
+    for path in trajectory.changed_code_paths():
+        stem = Path(path).name
+        if stem and re.search(rf"(?<![\w.-]){re.escape(stem)}(?![\w.-])", command):
+            return True
+    return False
+
+
 DIAGNOSE_AFTER_FAILURES = 3
 _DIAGNOSTIC_LISTING_MAX = 20
 _failure_streak = 0
@@ -15863,10 +15918,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 status = verdict.status
                 if f"audit: {AUDIT_PASSED_NOTE}" in result:
                     status = "passed"
+                mutated = _MUTATION_SEQ != mutation_seq_before
+                if mutated and _runs_changed_program(name, args, result, trajectory):
+                    # Running the code this run just changed is how it gets
+                    # checked. Only the verification bookkeeping treats it as
+                    # a check; caches were already invalidated as for any run.
+                    mutated = False
                 trajectory.after_tool(
                     operation, result, failed=_plan_step_failed(result),
                     blocked=result.startswith("ESCALATION_REQUEST\x1f"),
-                    mutated=_MUTATION_SEQ != mutation_seq_before, verdict=status,
+                    mutated=mutated, verdict=status,
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
