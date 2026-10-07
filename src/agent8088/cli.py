@@ -2332,7 +2332,7 @@ def do_chat(query):
         # Show the animated status line now, not when the engine first reports it:
         # recall and routing run before the model call, and the screen was blank
         # for that whole stretch.
-        live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=True))
+        live.update(_StatusLine("thinking...", turn_start, tokens_ref, interruptible=True))
         try:
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
