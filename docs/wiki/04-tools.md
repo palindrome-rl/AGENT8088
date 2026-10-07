@@ -12,6 +12,18 @@ Use `/tools read_text` or `/tool describe read_text` to inspect one tool without
 executing it. With no name, `/tools` still lists all active tools. Names must match
 the registry exactly; unknown names return an actionable error, not the full list.
 
+The model also knows the commands the person can type. Each front end registers
+its own table with the engine (`register_frontend_commands`): the CLI and web UI
+register `COMMAND_SPECS`, the gateway its chat commands. When a message names a
+command (`/local`) or a tool (`read_text`, or a family in words such as "cli
+anything"), that turn's system prompt gets a short block of facts from these
+registries, at most eight lines, so the answer comes from the registry instead
+of a guess. A command's line carries every subcommand and its arguments (from
+`COMMAND_DETAILS` in `cli.py`, which `verify_everything.py` keeps in step with
+`COMMAND_SPECS`); a tool's line shows how it is called, e.g.
+`read_text(filename, [offset], [limit])`. Only the person's own message is read, never tool output, and
+nothing is added when nothing is named.
+
 The model-facing `describe_tool(tool_name)` uses the same live schema, including
 required fields, optional fields, types, and native MCP parameter schemas. It is
 available in read-only and plan-only modes and exposed by the MCP server. Web API
@@ -36,9 +48,9 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | `ref`*, `offset`*, `length`* | ✅ | Re-read the previous tool's output without re-running it; pass a truncation `ref` to read the elided part. |
 | `memory_forget` | `memory` | `query` | prompt | Delete one specific memory, but only when exactly one clearly matches; several matches are listed back instead. |
-| `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, mode, sandbox, and active guardrails. |
-| `describe_tool` | `introspect` | `tool_name` | ✅ | Describe one named tool's live schema — purpose, required/optional args and types. |
-| `web_search` | `search` | `query` | no prompt with the default ddgs-only chain; prompts otherwise | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
+| `describe_capabilities` | `introspect` | — | ✅ | Report own tools, MCP servers, skills, subagents, the commands the user can type, mode, sandbox, and active guardrails. |
+| `describe_tool` | `introspect` | `tool_name` | ✅ | Describe one named tool's live schema — purpose, required/optional args and types. Given `/name` (or a command name), describes that slash command instead, or says it does not exist and suggests the nearest. |
+| `web_search` | `search` | `query` | prompt by default | Routes to the configured backend and falls back automatically. A pinned loopback or allowlisted private-LAN SearXNG can opt into no-prompt search with `web_search_no_prompt=1`. See [Web search backends](#web-search-backends). |
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url`, `task` | prompt | Headless browser — click, fill forms, navigate, and extract via natural-language instructions, not just read static text. |
 | `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
@@ -57,7 +69,7 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `git_branch` | `shell` | `name`, `repo`* | prompt | Create a branch without switching. Use this rather than `git branch` through `execute_shell`, which the sandbox refuses. |
 | `git_checkout` | `shell` | `name`, `create`*, `repo`* | prompt | Switch branches (or create and switch with `create=true`). Refuses rather than discarding uncommitted work. |
 | `git_commit` | `shell` | `message`, `repo`* | prompt | Stage all changes and commit. Only when the user asked. |
-| `git_push` | `shell` | `remote`*, `branch`*, `set_upstream`*, `repo`* | **always asks** | Asks every time, in every mode including full-auto, and the approval covers only that exact remote and branch. A raw `git push` through `execute_shell` is refused at the always-on floor. |
+| `git_push` | `shell` | `remote`*, `branch`*, `set_upstream`*, `repo`* | **blocked** | Refused at the always-on floor, and separately requires a grant bound to the exact target. |
 | `git_create_pr` | `shell` | `title`, `body` | prompt | Open a PR via `gh`. |
 | `git_remote` | `shell` | `action`, `name`*, `url`*, `repo`* | prompt | Inspect/configure remotes: `list`, `add`, `set-url`, `remove`. |
 | `check_local_hardware` | `local_models` | — | ✅ | Probe RAM and NVIDIA VRAM and recommend which local Ollama models fit. Read-only, loopback only. |
@@ -313,13 +325,11 @@ goes first. An optional backend whose key is absent stays out entirely.
 `web_search_no_prompt=1` only takes effect while a *local* SearXNG is the
 effective pin, because approval-free search is safe only when the query cannot
 leave your network. So under `auto`: SearXNG up means silent searches; SearXNG
-down means `ddgs` serves. A chain that is `ddgs` alone (the default on a fresh
-install, with no SearXNG and no keyed backend) also runs without a prompt, in
-every mode, even though those queries do reach a third party. The query guards
-and the outbound-secret check still run first. Configure SearXNG, Tavily or Exa
-and searches that can leave your network ask again. If startup resolution is
-skipped entirely (an embedder calling the engine directly), the unresolved
-value never matches the local-SearXNG exemption.
+down means `ddgs` serves and each search asks, because those queries do reach a
+third party. Silent *and* external is the one combination this cannot produce.
+If startup resolution is skipped entirely (an embedder calling the engine
+directly), the unresolved value never matches the exemption, so it fails closed
+to prompting.
 
 If the chosen backend fails at call time — instance stopped, rate limited — the
 next available one serves the request, so a broken primary does not mean "no web

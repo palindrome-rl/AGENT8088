@@ -36,6 +36,14 @@ export function StatusBar() {
       </span>
       <span className="text-zinc-300 dark:text-zinc-700">·</span>
       <span className="truncate">{status.provider}:{status.model}</span>
+      {status.model_served?.fallback_for && status.model_served.model && (
+        <span
+          className="truncate text-amber-600 dark:text-amber-400"
+          title={status.model_served.reason ? `primary failed: ${status.model_served.reason}` : undefined}
+        >
+          → answering with {status.model_served.provider ? `${status.model_served.provider}:` : ''}{status.model_served.model}
+        </span>
+      )}
       <span className="text-zinc-300 dark:text-zinc-700">·</span>
       <span>{status.context_pct}% ctx</span>
       <span className="text-zinc-300 dark:text-zinc-700">·</span>

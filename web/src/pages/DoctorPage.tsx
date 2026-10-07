@@ -4,7 +4,7 @@ import {
   CheckCircle2, XCircle, Activity, Network, KeyRound, Settings as SettingsIcon,
   Shield, Search, Terminal,
 } from 'lucide-react'
-import type { DoctorCheck } from '@/types/api'
+import type { DoctorCheck, DoctorReport } from '@/types/api'
 import { cn } from '@/lib/utils'
 import { apiFetch, handled, assertOk } from '@/lib/api'
 import { ErrorCard } from '@/components/ErrorCard'
@@ -87,22 +87,22 @@ function CheckRow({ label, value, icon: Icon }: {
 }) {
   const state = classifyHealth(value)
   return (
-    <tr className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/20 last:border-0">
-      <td className="px-4 py-3">
+    <tr className="block border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/20 last:border-0 sm:table-row">
+      <td className="block px-4 pb-1 pt-3 sm:table-cell sm:py-3">
         <div className="flex items-center gap-2.5">
           <Icon className="h-4 w-4 text-zinc-500" />
           <span className="text-sm text-zinc-300">{label}</span>
         </div>
       </td>
-      <td className="px-4 py-3">
+      <td className="block px-4 pb-3 pt-1 sm:table-cell sm:py-3">
         <div className="flex items-center gap-2">
           <HealthDot state={state} />
-          <span className={cn('font-mono text-xs', state === 'fail' ? 'text-red-400' : state === 'ok' ? 'text-zinc-200' : 'text-zinc-400')}>
+          <span className={cn('min-w-0 break-all font-mono text-xs', state === 'fail' ? 'text-red-400' : state === 'ok' ? 'text-zinc-200' : 'text-zinc-400')}>
             {value}
           </span>
         </div>
       </td>
-      <td className="px-4 py-3 text-right">
+      <td className="hidden px-4 py-3 text-right sm:table-cell">
         <HealthIcon state={state} />
       </td>
     </tr>
@@ -123,7 +123,7 @@ function SummaryCard({ label, value, icon: Icon, color }: {
         <Icon className={cn('h-4 w-4', color)} />
         <span className="text-xs text-zinc-500">{label}</span>
       </div>
-      <p className="truncate font-mono text-sm text-zinc-200">{value}</p>
+      <p className="break-all font-mono text-sm text-zinc-200">{value}</p>
     </div>
   )
 }
@@ -136,7 +136,7 @@ export default function DoctorPage() {
   // Doctor health check
   const doctorQuery = useQuery({
     queryKey: ['doctor'],
-    queryFn: () => fetchJSON<DoctorCheck>('/api/doctor'),
+    queryFn: () => fetchJSON<DoctorReport>('/api/doctor'),
   })
 
   // Fix mutation
@@ -261,15 +261,15 @@ export default function DoctorPage() {
                 Health Checks
               </h3>
             </div>
-            <table className="w-full">
-              <thead>
+            <table className="block w-full sm:table">
+              <thead className="hidden sm:table-header-group">
                 <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wider text-zinc-600">
                   <th className="px-4 py-3 font-medium">Check</th>
                   <th className="px-4 py-3 font-medium">Result</th>
                   <th className="px-4 py-3 text-right font-medium">Status</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="block sm:table-row-group">
                 {checkMeta.map(({ key, label, icon }) => (
                   <CheckRow
                     key={key}
@@ -282,10 +282,54 @@ export default function DoctorPage() {
             </table>
           </div>
 
+          {/* What failed, and the command that fixes it */}
+          <ProblemList checks={data.checks ?? []} limited={data.limited ?? []} />
+
           {/* Overall status */}
           <OverallStatus data={data} />
         </>
       )}
+    </div>
+  )
+}
+
+// ---- Problems with fixes ----
+
+// Capabilities /doctor reports under a dedicated row instead of "Limited: …".
+const DEDICATED_CAPABILITY_ROWS = new Set(['search', 'ocr', 'documents'])
+
+function ProblemList({ checks, limited }: {
+  checks: NonNullable<DoctorReport['checks']>
+  limited: NonNullable<DoctorReport['limited']>
+}) {
+  const problems = checks.filter((c) => c.status === 'fail' || c.status === 'warn')
+  // Registry rows the check list did not already cover (an older server, or a
+  // capability reported after the checks ran) still belong in Problems.
+  for (const row of limited) {
+    if (row.state === 'ok' || DEDICATED_CAPABILITY_ROWS.has(row.name)) continue
+    const name = `Limited: ${row.label}`
+    if (problems.some((c) => c.name === name)) continue
+    const extra = [row.reason, row.impact].filter(Boolean).join('; ')
+    problems.push({
+      name,
+      status: 'warn',
+      detail: `${row.state}: ${row.active || 'none'}${extra ? ` — ${extra}` : ''}`,
+      fix: row.fix,
+      repair: '',
+    })
+  }
+  if (problems.length === 0) return null
+  return (
+    <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
+      <h3 className="text-sm font-semibold text-zinc-200">Problems</h3>
+      {problems.map((c, i) => (
+        <div key={`${c.name}-${i}`} className="text-xs">
+          <span className={c.status === 'fail' ? 'text-red-400' : 'text-yellow-400'}>
+            {c.name}: {c.detail}
+          </span>
+          {c.fix && <div className="font-mono text-zinc-400">{c.fix}</div>}
+        </div>
+      ))}
     </div>
   )
 }

@@ -44,17 +44,14 @@ Verified against `check_permission()`:
 |---|---|
 | `read_text`, `last_output`, `python_eval`, `plan`, `introspect` | ✅ allowed |
 | `cron` with `action=list` | ✅ allowed |
-| `write_text`, `shell`, `http_get`, `http_post`, `search` (see the note below), `docker`, `cron` (add/remove), `browser`, `subagent` | ❌ refused |
+| `write_text`, `shell`, `http_get`, `http_post`, `search`, `docker`, `cron` (add/remove), `browser`, `subagent` | ❌ refused |
 
 `write_text` to a path in `no_prompt_paths` is also allowed. When `read_paths`
 is set, a `read_text` outside it asks first.
 
-Note that **network reads are refused too** — `get_page_title` and the
-HTTP tools need approval in readonly, because fetching a URL is an outbound
-side effect and a route for untrusted content. `web_search` is the exception:
-when `ddgs` is the only backend (the default on a fresh install) or a no-prompt
-local SearXNG is set, it runs without a prompt in every mode. With another
-backend configured it asks like the other network tools.
+Note that **network reads are refused too** — `web_search` and
+`get_page_title` need approval in readonly, because fetching a URL is an
+outbound side effect and a route for untrusted content.
 
 Shell is the exception that has nuance: a command on the readonly-safe list
 runs without a prompt. That list is inspection-only:
@@ -118,6 +115,14 @@ with per-step verification (see `plan_audit`). It is not how a plan is proposed.
 These are refused in **every** mode — full-auto included — and no escalation
 grant unlocks them.
 
+> **Exception: `AGENT8088_DISPOSABLE_CONTAINER=1`.** This environment variable
+> is meant for throwaway benchmark containers holding no user data. It turns off
+> the credential-file floor, the shell-startup-file floor, the destructive-git
+> check, and the pipe-to-shell (`curl | sh`) patterns (`engine.py`:
+> `_is_sensitive_path`, `_is_shell_startup_file`, `_dangerous_git_args`, the
+> unrecoverable-command check). Never set it on a machine with real credentials
+> or history.
+
 ### 1. Credential files
 
 Blocked for both reading and writing, matched on filename *and* anywhere in the
@@ -128,6 +133,14 @@ path:
 | Names | `.env`, `config.txt`, `configb.txt`, `id_rsa`, `id_ed25519`, `.ssh`, `.gnupg`, `.aws`, `.gitconfig` |
 | Extensions | `.pem`, `.key`, `.rsa`, `.p12` |
 | Globs | `*_KEY*`, `*_SECRET*`, `*_TOKEN*`, `*_PASSWORD*` (and lowercase) |
+
+Two narrow exceptions keep ordinary project files usable. Env templates
+(`.env.example`, `.env.sample`, `.env.template`, `.env.dist`) hold no values and
+are judged by their directory only, so `cat .env.example` works while `.env`,
+`.env.local`, `.envrc` and `~/.ssh/.env.example` stay blocked. The globs skip
+source files (`.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.md`, …), so
+`count_tokens.py` and `reset_password.py` are code, while `api_key.txt`,
+`client_secret.json` and `github_token` are still credentials.
 
 This covers indirect routes too: symlinks are resolved before the check, and
 `git show HEAD:.env` / `git diff -- .env` are blocked explicitly because they'd
@@ -178,9 +191,13 @@ full-auto and even after a grant. The check sees through `sh -c '...'`,
 `echo git push` and `grep git push file` are correctly *not* blocked — it
 distinguishes git-as-a-command from git-as-a-word.
 
-The one way to push is the dedicated `git_push` tool. It always asks, in every
-mode including full-auto, and your approval covers only that exact remote and
-branch.
+Only operations that can lose work are refused. `git checkout -b <new>`,
+`git branch -d` / `--delete` (git itself refuses an unmerged branch) and
+`git restore --staged` (unstages, leaves the file alone) are allowed; their
+forcing or overwriting forms — `checkout -B`, `checkout <path>`, `checkout --`,
+`branch -D`, `branch -d -f`, `restore` without `--staged`, `restore --worktree` —
+stay blocked. Use `git switch <branch>` to change branches: a bare
+`git checkout <name>` cannot be told apart from `git checkout <file>`.
 
 ### 4. System-prompt exfiltration
 
@@ -357,6 +374,36 @@ whole turn budget to arrive at the same no. After N consecutive denials the requ
 ends with the model told to stop and report. One approval resets the count, and the
 count resets per request.
 
+## Config blockers: who can change this
+
+Many refusals come from a `config.txt` setting, not from the task. Without being
+told, the model reads them as obstacles to work around. So each kind of refusal
+is counted per request, and the **third** one gets a single note appended to its
+result, outside the untrusted-content wrapper. The note says which setting is
+responsible and that only the user can change it. Nothing is said up front: a
+small model told about a restriction in advance tends to give up before trying.
+
+| Refusal | The note names |
+|---|---|
+| Sandbox network closed | `sandbox_allowed_domains` and the hosts the task asked for; on the Docker fallback, `agent8088 --sandbox-setup` first |
+| Write into a blocked folder | `blocked_paths` |
+| Command on the user's deny list / missing from their allowlist | `deny_commands` / `allow_commands` |
+| Domain outside the web domain policy | `allowed_domains` / `blocked_domains` |
+| Literal LAN or loopback address | `ssrf_allow_hosts=<host>:<port>` |
+| Command timed out three times | `max_tool_timeout_seconds` and `/limits` |
+| Credential file, `.env`, startup file, secret in a request | That it is protected, and the user can open it themselves |
+| Built-in safety rule, link-local or cloud-metadata address, an internal host given by name | That it is a fixed rule no setting changes |
+
+Notes contain setting names, the config file path and what the model already
+tried (a host, a path). They never contain a URL path, a query or a config
+value. Credential refusals deliberately do **not** mention
+`allowed_sensitive_files`, so injected content cannot steer the model into
+talking the user into unlocking their keys. `ssrf_allow_hosts` is offered only
+for a literal private or loopback address, because a name can resolve anywhere.
+
+A run that hits `max_turns` ends with a footer telling the user to raise it with
+`/maxturns` or `max_turns` in `config.txt`.
+
 ## Unattended runs
 
 A scheduled run has no operator, so an approval prompt there was emitted to nobody
@@ -411,7 +458,11 @@ Enforced at the always-on floor, so an unlisted command is **not escalatable** �
 the same standing as a deny rule. Precedence:
 
 1. Unrecoverable floor wins over everything. `allow_commands=*` does **not**
-   re-enable `rm -rf /`, `mkfs`, or `curl | sh`.
+   re-enable `rm -rf /`, `mkfs`, or `curl | sh`. The floor covers `rm -r` of
+   `/`, `/*`, `~`, `~/`, `~/*`, `$HOME`, `${HOME}` (quoted or not) and the
+   top-level system directories (`/usr`, `/etc`, `/home`, `/var`, `/Users`, …),
+   and `chmod`/`chown`/`chgrp -R` on the same targets. Paths below them —
+   `rm -rf ~/projects/old`, `rm -rf /tmp/x` — are ordinary deletes.
 2. `deny_commands` wins over `allow_commands` — deny is the more specific intent.
 3. Otherwise, an allowlist (if set) must match.
 
@@ -555,32 +606,10 @@ so "which guardrails are active?" in chat gets the same facts. See
 
 ## Verifying any of this yourself
 
-The root Python suite is maintained on `development`, not shipped in this
-release checkout. Maintainers run the following test commands from a checkout that includes `tests/`.
-
-> **Correction.** This page used to point at a dedicated
-> `tests/test_permission.py` / `test_ssrf.py` / `test_egress.py` /
-> `test_exfil_guard.py` / `test_turn_budget.py` / `test_audit_log.py` /
-> `test_command_allowlist.py` / `test_capabilities.py` /
-> `tests/gateway/test_rate_limit.py` suite. None of those files exist in the
-> development tree (verified against that branch's `tests/`) — security behavior
-> is exercised as part of the general test suite instead, under names tied to
-> the feature rather than to "security", e.g. `tests/test_local_search_ssrf_exemption.py`
-> (the loopback SSRF exemption), `tests/test_operational_log.py` (the audit
-> trail), `tests/test_web_search_permission.py`, and `tests/test_describe_tool.py`.
-
-Run the full suite to exercise everything on this page at once:
+Run the public regression checks from a source checkout:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -v
+uv run --extra dev python -m pytest scripts/installer_checks/ -q
 ```
 
-Or verify the default-mode claim above directly:
-
-```sh
-AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$(mktemp -d)" python -c \
-  "from agent8088 import engine as A; print(A.PERMISSION_MODE)"
-# -> full-auto
-```
-
-See [Testing & Verification](12-testing-and-verification.md).
+The root Python test suite is maintained separately and is not required to install or use this release. See [Testing & Verification](12-testing-and-verification.md).

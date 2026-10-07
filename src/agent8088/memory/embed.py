@@ -13,6 +13,8 @@ import logging
 import threading
 import time
 
+from agent8088 import capabilities
+
 log = logging.getLogger("agent8088.memory")
 
 # Retry an embedder that failed only this often. A model that is not pulled is
@@ -48,11 +50,34 @@ class Embedder:
         self._last_error = str(exc)[:200]
         self._probed = False
         log.debug("memory embedder unavailable: %s", self._last_error)
+        self._report(False)
 
     def _note_success(self) -> None:
         self._failed_at = 0.0
         self._last_error = ""
         self._probed = True
+        self._report(True)
+
+    def _report(self, ok: bool) -> None:
+        """capabilities.MEMORY_EMBED: recall is keyword-only while this fails."""
+        try:
+            if ok:
+                capabilities.report(capabilities.MEMORY_EMBED, active=self.model,
+                                    preferred=self.model, state=capabilities.OK)
+                return
+            capabilities.report(
+                capabilities.MEMORY_EMBED, active="keyword-only (BM25)", preferred=self.model,
+                state=capabilities.DEGRADED,
+                reason=f"embedder {self.model} failed: {self._last_error[:120]}",
+                impact="keyword-only recall and tool selection; semantic matches missed",
+                fix=(f"ollama pull {self.model} (if Ollama serves it), or agent8088 --memory-setup"
+                     if self.model else "agent8088 --memory-setup"))
+        except Exception:  # noqa: BLE001 — reporting must never break recall
+            pass
+
+    def ready(self) -> bool:
+        """Worth calling: has a model and the failure breaker is not open."""
+        return bool(self.model) and not self._blocked()
 
     def available(self) -> bool:
         """Whether the model answers. Probed once with a trivial input, then

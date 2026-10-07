@@ -1,4 +1,4 @@
-"""Compatibility boundaries for the installation-only public backport."""
+"""Compatibility boundaries for the public v1.2 release."""
 import os
 from pathlib import Path
 import re
@@ -19,7 +19,6 @@ def test_install_and_recovery_stay_on_the_public_release(name):
     assert "RT-Internal-DS" not in source
     assert "staging-1.2" not in source
     assert "agent8088-installer.pages.dev" not in source
-    assert "agent8088 --doctor" not in source
     assert "private repository" not in source
     assert "repo scope" not in source
 
@@ -58,11 +57,13 @@ def test_config_acl_works_even_when_system32_is_not_on_path(tmp_path):
     assert config.read_text(encoding="utf-8") == "test-only=true\n"
 
 
-def test_diagnostics_do_not_require_unshipped_runtime_modules():
+def test_diagnostics_have_their_shipped_runtime_modules():
+    for name in ("install_state", "capabilities", "errors"):
+        assert (ROOT / "src/agent8088" / (name + ".py")).is_file()
     for name in ("install.ps1", "install.sh"):
         source = (ROOT / name).read_text(encoding="utf-8")
-        assert "agent8088/install_state.py" not in source
-        assert "does not load this ledger in the agent" in source
+        assert "does not load this ledger in the agent" not in source
+        assert "agent8088 --doctor" in source
 
 
 def test_linux_retry_command_uses_the_public_default_branch():

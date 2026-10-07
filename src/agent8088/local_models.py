@@ -25,6 +25,46 @@ from dataclasses import dataclass
 _GIB = 1024 ** 3
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 _MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$")
+# Set by the engine from an explicitly configured provider.ollama.base_url.
+_configured_host = ""
+
+
+def set_default_host(url: str | None) -> None:
+    """Point every helper here at the Ollama the user configured.
+
+    Accepts an OpenAI-style base URL (http://box:11434/v1) and strips the
+    /v1; empty clears it. No network access.
+    """
+    global _configured_host
+    _configured_host = _normalize_host(url) if url else ""
+
+
+def _normalize_host(raw: str, default_port: bool = False) -> str:
+    host = str(raw or "").strip().rstrip("/")
+    if not host:
+        return ""
+    if "://" not in host:
+        host = "http://" + host  # OLLAMA_HOST is often bare host:port
+    for suffix in ("/v1", "/api"):
+        if host.endswith(suffix):
+            host = host[: -len(suffix)]
+    parsed = urllib.parse.urlparse(host)
+    if parsed.hostname == "0.0.0.0":  # a bind address, not one to connect to
+        host = host.replace("0.0.0.0", "127.0.0.1", 1)
+    # OLLAMA_HOST=box means box:11434 to Ollama itself; a configured URL is
+    # taken as written (it may be a proxy on port 80/443).
+    if default_port and parsed.port is None and parsed.path in ("", "/"):
+        host = host + ":11434"
+    return host
+
+
+def resolve_host(host: str | None = None) -> str:
+    """The Ollama to talk to: explicit argument > configured provider.ollama
+    base_url > OLLAMA_HOST > http://localhost:11434."""
+    import os
+    return (_normalize_host(host) if host else "") or _configured_host \
+        or _normalize_host(os.environ.get("OLLAMA_HOST", ""), default_port=True) \
+        or DEFAULT_OLLAMA_HOST
 
 
 class OllamaError(Exception):
@@ -409,7 +449,7 @@ def backend_label(hw: "HardwareBudget") -> str:
         return "CUDA"
     if hw.source == "rocm-smi" and hw.vram_total_gb:
         return "ROCm"
-    if sys.platform == "darwin":
+    if hw.source == "macos-system_profiler":
         return "Metal"
     # integrated/unknown VRAM: inference runs on CPU, the iGPU's media
     # blocks only assist -- the honest label, llm-checker shows the same
@@ -528,7 +568,8 @@ def format_hardware_report(hw: HardwareBudget) -> str:
 # --- Ollama lifecycle wrappers, over Ollama's own REST API ---------------
 
 def _ollama_request(path: str, method: str = "GET", body: dict | None = None,
-                     host: str = DEFAULT_OLLAMA_HOST, timeout: int = 15) -> dict:
+                     host: str | None = None, timeout: int = 15) -> dict:
+    host = resolve_host(host)
     url = f"{host.rstrip('/')}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
@@ -554,12 +595,45 @@ def _ollama_request(path: str, method: str = "GET", body: dict | None = None,
         raise OllamaError(f"Ollama returned unparseable output: {exc}") from exc
 
 
-def list_installed_models(host: str = DEFAULT_OLLAMA_HOST) -> list[dict]:
+def list_installed_models(host: str | None = None) -> list[dict]:
     return _ollama_request("/api/tags", host=host).get("models", [])
 
 
-def running_models(host: str = DEFAULT_OLLAMA_HOST) -> list[dict]:
+def running_models(host: str | None = None) -> list[dict]:
     return _ollama_request("/api/ps", host=host).get("models", [])
+
+
+def pick_installed_ollama_model(base_url: str | None, preferred: str,
+                                timeout: float = 2.0) -> str:
+    """`preferred` if that Ollama has it, else its first installed chat model.
+
+    The shipped default (qwen14b-tooluse-v3) is a custom build almost nobody
+    has pulled, so a fresh install's first request was a 404. One quick
+    /api/tags call, no retries; on any failure (daemon down, odd reply) the
+    preferred name comes back unchanged and the real request reports it.
+    Embedding-only models are skipped -- they cannot chat.
+    """
+    try:
+        installed = _ollama_request("/api/tags", host=base_url, timeout=timeout).get("models", [])
+    except (OllamaError, OSError, ValueError):
+        return preferred
+    names = [str(m.get("name") or m.get("model") or "") for m in installed]
+    names = [n for n in names if n]
+
+    def bare(name):
+        return name[:-len(":latest")] if name.endswith(":latest") else name
+
+    wanted = bare(preferred or "")
+    for name in names:
+        if bare(name) == wanted:
+            return preferred
+    for model, name in zip(installed, names):
+        details = model.get("details") or {}
+        family = " ".join([str(details.get("family") or "")] + [str(f) for f in details.get("families") or []]).lower()
+        if "embed" in name.lower() or "bert" in family:
+            continue
+        return name
+    return preferred
 
 
 def _validate_model_name(name: str) -> str:
@@ -569,12 +643,13 @@ def _validate_model_name(name: str) -> str:
     return name
 
 
-def pull_model(name: str, host: str = DEFAULT_OLLAMA_HOST, timeout: int = 600) -> str:
+def pull_model(name: str, host: str | None = None, timeout: int = 600) -> str:
     """Streams NDJSON progress from /api/pull, returns the last status line.
     A large model can take longer than the default tool timeout on a slow
     connection -- raise max_tool_timeout_seconds in config.txt if pulls
     keep timing out partway."""
     name = _validate_model_name(name)
+    host = resolve_host(host)
     url = f"{host.rstrip('/')}/api/pull"
     req = urllib.request.Request(
         url, data=json.dumps({"model": name}).encode("utf-8"),
@@ -597,13 +672,14 @@ def pull_model(name: str, host: str = DEFAULT_OLLAMA_HOST, timeout: int = 600) -
     return last_status or "pull finished"
 
 
-def pull_model_stream(name: str, host: str = DEFAULT_OLLAMA_HOST, timeout: int = 600):
+def pull_model_stream(name: str, host: str | None = None, timeout: int = 600):
     """Yield each NDJSON event from /api/pull as it arrives.
 
     Each event is a dict with at least a ``status`` key; download events
     also contain ``completed`` (int, bytes so far) and ``total`` (int,
     bytes for the current layer).  Raises ``OllamaError`` on failure."""
     name = _validate_model_name(name)
+    host = resolve_host(host)
     url = f"{host.rstrip('/')}/api/pull"
     req = urllib.request.Request(
         url, data=json.dumps({"model": name}).encode("utf-8"),
@@ -624,7 +700,7 @@ def pull_model_stream(name: str, host: str = DEFAULT_OLLAMA_HOST, timeout: int =
         raise OllamaError(_daemon_unreachable_message(host, exc)) from exc
 
 
-def remove_model(name: str, host: str = DEFAULT_OLLAMA_HOST) -> str:
+def remove_model(name: str, host: str | None = None) -> str:
     name = _validate_model_name(name)
     _ollama_request("/api/delete", method="DELETE", body={"model": name}, host=host)
     return f"Removed {name}"

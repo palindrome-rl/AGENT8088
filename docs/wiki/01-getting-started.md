@@ -204,6 +204,14 @@ rather than prompted for. See [Sandboxing](06-sandboxing.md).
 
 On Windows, `config.txt` and `.env` live at `%LOCALAPPDATA%\agent8088\`.
 
+## Check your setup
+
+Run `agent8088 --doctor` from your terminal, or `/doctor` inside the agent.
+Optional components that are missing or using a fallback are reported with
+repair guidance. In the Web UI, the limited-capabilities badge explains the
+same reduced modes. An optional component warning does not mean the core
+installation failed.
+
 ## Next
 
 - [Configuration](02-configuration.md) — every key explained

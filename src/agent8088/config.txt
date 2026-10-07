@@ -359,13 +359,10 @@ memory_embed_provider=ollama
 #          different, and only one of them is a problem
 # Change it live with `/memory notify off|on|verbose`.
 #
-# When a message explicitly asks to remember something ("remember ...",
-# "don't forget ...", "save this", "note that ..."), the turn waits up to 15s
-# after the answer for the extraction call to finish, so the store lands before
-# the prompt returns. Every other save finishes in the background. A save that
-# is not done in time is shown with your NEXT message instead, marked "(from
-# your previous message)" -- deferred rather than dropped, and silence stays
-# distinguishable from memory not working. Pending saves are flushed on exit.
+# Explicit requests to remember something wait up to 15s after the answer for
+# extraction to finish. Other saves run in the background. If extraction takes
+# longer, its result is shown with your NEXT message, marked "(from your previous
+# message)". Pending saves are flushed on exit; /memory test checks extraction.
 #
 # `/memory test` runs one real extraction call on a sample exchange and shows the
 # raw reply, what parsed out of it, and how long it took. Use it when memory seems
@@ -392,9 +389,11 @@ memory_embed_provider=ollama
 #
 #   auto       (default) At startup, probe and pick the highest-priority
 #              backend that can actually serve: a keyed tavily/exa first, else
-#              SearXNG if it ANSWERS, else ddgs. The winner is then pinned for
-#              the session — auto decides *which* backend, it does not fall
-#              through mid-session.
+#              SearXNG if it ANSWERS, else ddgs. The winner is the session's
+#              first choice. If it fails mid-session the search falls through to
+#              the next backend (a dead SearXNG is then replaced by ddgs, and
+#              re-probed every web_search_reprobe_seconds to switch back up).
+#              A fallback is announced in the REPL, /status and /doctor.
 #   <name>     Pin exactly one of searxng/ddgs/tavily/exa. No auto-selection,
 #              no fallback. `/search use <name>` writes this for you.
 #   (unset)    Use the whole chain and fall through at call time: a backend
@@ -402,12 +401,16 @@ memory_embed_provider=ollama
 #              so web search keeps working — at the cost of a prompt per
 #              search, since it may reach a public provider.
 #
-# Why auto pins instead of staying dynamic: web_search_no_prompt=1 below only
-# takes effect while a LOCAL SearXNG is pinned (see
-# _local_searxng_no_prompt_enabled), because approval-free search is safe only
-# when the query cannot leave your network. So with auto: SearXNG up means
-# silent searches, and SearXNG down means ddgs serves instead and each search
-# asks — because those queries do go to a third party.
+# Why auto still pins: web_search_no_prompt=1 below only takes effect while a
+# LOCAL SearXNG is the pin (see _local_searxng_no_prompt_enabled). With auto,
+# SearXNG up means silent local searches; SearXNG down means ddgs serves —
+# the bundled keyless backend, which never asks (engine._ddgs_only_chain) — and
+# that is true whether SearXNG was down at startup or stopped mid-session. A
+# search that skipped approval only ever falls through to ddgs or a local
+# SearXNG, never to a keyed vendor or a remote instance.
+#
+# How often auto re-probes SearXNG while ddgs is standing in (seconds, 0 = never):
+# web_search_reprobe_seconds=300
 #
 # Run `/search status` to see the live chain and `/search doctor` to diagnose.
 web_search_provider=auto
@@ -437,18 +440,26 @@ web_search_provider=auto
 # unauthenticated, so it is never exposed to the network.
 # searxng_host_port=8888
 #
-# Skip approval only for explicitly pinned loopback or explicitly allowlisted
-# private-LAN SearXNG. It never permits a fallback to a public provider.
-# Credentials and direct personal identifiers in search queries remain blocked.
-# With no search_base_url set (the default above) this key does nothing: ddgs
-# serves instead, and each of those searches asks — they reach a third party.
+# Skip approval only for a pinned loopback or explicitly allowlisted
+# private-LAN SearXNG. With an EXPLICIT web_search_provider=searxng it never
+# permits a silent fallback: a failed search asks before retrying on public
+# ddgs. Under auto, a failed SearXNG falls back to ddgs like a SearXNG that was
+# down at startup (see above). Credentials and direct personal identifiers in
+# search queries remain blocked.
 web_search_no_prompt=1
 #
 # Results per search (default 5, max 20):
 # web_search_results=5
 #
-# Searches one request may run before it must answer (default 6, 0 = no cap):
+# Searches one request may run before it must answer (default 6, 0 = no cap).
+# This is a starting allowance: while the latest two searches each keep finding
+# mostly new pages, the request earns web_search_extension more searches, up to
+# web_search_max_per_turn x web_search_ceiling_multiplier. Rephrasing the same
+# question returns the same pages, so it never earns more. A search that
+# returns no pages is skipped, neither earning nor blocking more.
 # web_search_max_per_turn=6
+# web_search_extension=3
+# web_search_ceiling_multiplier=3   (1 = fixed cap, no growth)
 #
 # Optional backends. Add a key and they join the chain automatically; leave them
 # unset and they stay out of it entirely. Keys live in the .env store next to

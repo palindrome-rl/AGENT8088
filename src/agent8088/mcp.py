@@ -12,6 +12,15 @@ from pathlib import Path
 _SAFE_STDIO_ENV = ("HOME", "LANG", "LC_ALL", "PATH", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "USERPROFILE")
 
 
+_log = logging.getLogger("agent8088.mcp")
+
+
+def _describe(exc):
+    """str(exc), or the class name when that is empty (TimeoutError(), CancelledError())."""
+    text = " ".join(str(exc).split())
+    return text or type(exc).__name__
+
+
 class _InvalidJSONNoiseFilter(logging.Filter):
     """Hide the MCP SDK's full traceback for malformed server stdout."""
 
@@ -61,6 +70,9 @@ class MCPRuntime:
         self.statuses = {}
         self._server_errors = {}      # server -> consecutive failure count
         self._breaker_opened_at = {}  # server -> monotonic time the breaker opened
+        self._configs = {}            # server -> (config, transport), for reconnects
+        self._loop_lock = threading.Lock()
+        self._background = None       # thread running a startup reload, if any
 
     @staticmethod
     def _now():
@@ -94,15 +106,25 @@ class MCPRuntime:
         return (_agent_home() / "mcp.json", self.project_root / ".agent8088" / "mcp.json")
 
     def _start_loop(self):
-        if self._loop:
-            return
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="agent8088-mcp")
-        self._thread.start()
+        # Locked: the startup reload runs on a background thread and a tool
+        # call or /mcp can arrive on the main thread at the same moment.
+        with self._loop_lock:
+            if self._loop:
+                return
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(target=self._loop.run_forever, daemon=True, name="agent8088-mcp")
+            self._thread.start()
 
     def _run(self, coroutine, timeout=35):
         self._start_loop()
-        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result(timeout)
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        try:
+            return future.result(timeout)
+        except BaseException:
+            # A timed-out call kept running on the loop thread, holding the
+            # session; cancel it so a dead server can't pile up stuck calls.
+            future.cancel()
+            raise
 
     def _load_config(self):
         servers = {}
@@ -208,6 +230,13 @@ class MCPRuntime:
                 if not ready.done():
                     ready.set_result(list(listed.tools))
                 await stop.wait()
+            except asyncio.CancelledError:
+                # Cancel, don't set_exception: nobody awaits `ready` after a
+                # timeout, and an unread exception prints "Future exception was
+                # never retrieved" at exit.
+                if not ready.done():
+                    ready.cancel()
+                raise
             except BaseException as exc:
                 if not ready.done():
                     ready.set_exception(exc)
@@ -224,7 +253,16 @@ class MCPRuntime:
 
         task = asyncio.get_running_loop().create_task(_host())
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
-        tools = await asyncio.wait_for(asyncio.shield(ready), timeout=config.get("connect_timeout", 15))
+        try:
+            tools = await asyncio.wait_for(asyncio.shield(ready), timeout=config.get("connect_timeout", 15))
+        except BaseException:
+            # Gave up (timeout, or the caller cancelled us): the host task still
+            # owns a live child process. Cancel it so stdio_client terminates the
+            # child -- otherwise interpreter exit waits on that orphan (a server
+            # that never answers kept `agent8088 --version` alive for minutes).
+            task.cancel()
+            await asyncio.wait({task}, timeout=5)
+            raise
         self._sessions[name] = (holder.get("session"), holder.get("tools", []), stop, task, holder.get("client"))
         return tools
 
@@ -236,8 +274,8 @@ class MCPRuntime:
                 await asyncio.wait_for(task, timeout=10)
                 if client is not None:
                     await client.aclose()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 -- teardown is best-effort
+                _log.debug("closing an MCP session failed: %s", _describe(exc))
 
     def reload(self, reserved=()):
         teardown_error = ""
@@ -247,7 +285,7 @@ class MCPRuntime:
             except Exception as exc:
                 teardown_error = str(exc)
                 logging.getLogger("agent8088.mcp").warning("MCP teardown failed: %s", exc)
-        self._tools, self.statuses = {}, {}
+        self._tools, self.statuses, self._configs = {}, {}, {}
         if teardown_error:
             self.statuses["teardown"] = {
                 "state": "error", "error": f"could not close prior sessions: {teardown_error}",
@@ -260,6 +298,8 @@ class MCPRuntime:
                 if transport is None:
                     self.statuses[name] = {"state": "disabled", "tools": []}
                     continue
+                self._configs[name] = (config, transport)
+                self.statuses[name] = {"state": "connecting", "tools": []}
                 tools = self._run(self._connect(name, config, transport), config.get("connect_timeout", 15))
                 include = config.get("tools", {}).get("include", [])
                 exclude = config.get("tools", {}).get("exclude", [])
@@ -286,8 +326,99 @@ class MCPRuntime:
                     names.append(registered)
                 self.statuses[name] = {"state": "connected", "tools": names}
             except Exception as exc:
-                self.statuses[name] = {"state": "error", "error": str(exc), "tools": []}
+                error = _describe(exc)
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    error = (f"no answer within {config.get('connect_timeout', 15)}s"
+                             if isinstance(config, dict) else error)
+                self.statuses[name] = {"state": "error", "error": error, "tools": []}
+                # info: this can run on the background startup thread while the
+                # REPL owns the terminal; statuses carries it to /mcp and the banner.
+                _log.info("MCP server %s failed to connect: %s", name, error)
         return dict(self._tools)
+
+    # -- background startup ------------------------------------------------
+
+    def has_servers(self):
+        """Whether any MCP config file exists (cheap; no connection made)."""
+        return any(path.exists() for path in self.config_paths)
+
+    def reload_in_background(self, reserved=(), on_done=None):
+        """Start reload() on a daemon thread and return immediately.
+
+        Connecting is up to connect_timeout (15s) per server, and it ran at
+        engine import -- so one dead server added 15s to every command,
+        --version included. on_done(tools) runs on that thread when it ends.
+        """
+        reserved = set(reserved)
+
+        def work():
+            try:
+                tools = self.reload(reserved)
+            except Exception as exc:  # noqa: BLE001 -- recorded, never raised
+                _log.info("MCP background reload failed: %s", _describe(exc))
+                self.statuses["startup"] = {"state": "error", "error": _describe(exc), "tools": []}
+                tools = {}
+            if on_done is not None:
+                on_done(tools)
+
+        self._background = threading.Thread(target=work, daemon=True, name="agent8088-mcp-startup")
+        self._background.start()
+        return self._background
+
+    def wait_ready(self, timeout):
+        """Wait up to `timeout`s for a background reload. True once it is done."""
+        thread = self._background
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def summary(self):
+        """Counts for a banner or /doctor: connected / failed / connecting servers."""
+        servers = {name: status for name, status in self.statuses.items()
+                   if not name.startswith(("config:", "teardown", "startup"))}
+        failed = sorted(name for name, status in self.statuses.items()
+                        if status.get("state") == "error")
+        result = {
+            "connected": sorted(n for n, st in servers.items() if st.get("state") == "connected"),
+            "failed": failed,
+            "connecting": sorted(n for n, st in servers.items() if st.get("state") == "connecting"),
+            "tools": sum(len(st.get("tools", [])) for st in servers.values()),
+            "pending": bool(self._background is not None and self._background.is_alive()),
+        }
+        result["text"] = (f"MCP: {len(failed)} failed (see /mcp)" if failed
+                          else "MCP: connecting…" if result["pending"] or result["connecting"]
+                          else f"MCP: {len(result['connected'])} connected" if result["connected"]
+                          else "")
+        return result
+
+    def _host_finished(self, server):
+        entry = self._sessions.get(server)
+        if entry is None:
+            return True
+        task = entry[3]
+        return task is None or task.done()
+
+    def _reconnect(self, server):
+        """Reopen one server whose host task ended (crashed or was closed)."""
+        config, transport = self._configs.get(server, (None, None))
+        if config is None:
+            return False
+        stale = self._sessions.pop(server, None)
+        if stale is not None:
+            try:
+                # asyncio.Event is not thread-safe; set it on its own loop.
+                if self._loop:
+                    self._loop.call_soon_threadsafe(stale[2].set)
+                else:
+                    stale[2].set()
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("stopping stale MCP session %s failed: %s", server, _describe(exc))
+        self._run(self._connect(server, config, transport), config.get("connect_timeout", 15))
+        self.statuses.setdefault(server, {"tools": []})["state"] = "connected"
+        self.statuses[server].pop("error", None)
+        _log.info("MCP server %s reconnected", server)
+        return True
 
     async def _call(self, registered, arguments):
         spec = self._tools[registered]
@@ -309,25 +440,51 @@ class MCPRuntime:
                 f"yet — use another approach, or tell the user to check the server."
             )
         try:
+            if self._host_finished(server):
+                # The server's host task ended (process exited, stream died):
+                # every call would fail on the dead session until /mcp reload.
+                # Reopen just this server, here, when the breaker lets a probe through.
+                self._reconnect(server)
             result = self._run(self._call(registered, arguments), self._tools[registered].get("timeout", 30))
             data = result.model_dump(by_alias=True) if hasattr(result, "model_dump") else result
             self._note_success(server)
             return json.dumps(data, default=str, ensure_ascii=False)
         except Exception as exc:
             self._note_failure(server)
-            return f"Error: MCP {server} failed: {exc}"
+            detail = _describe(exc)
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                detail = f"no answer within {self._tools[registered].get('timeout', 30)}s"
+            if self._host_finished(server):
+                self.statuses.setdefault(server, {"tools": []}).update(state="error", error=detail)
+            return f"Error: MCP {server} failed: {detail}"
 
     def close(self):
         if self._sessions:
             try:
                 self._run(self._close_all())
             except Exception as exc:
-                logging.getLogger("agent8088.mcp").warning("MCP shutdown teardown failed: %s", exc)
+                _log.warning("MCP shutdown teardown failed: %s", _describe(exc))
         if self._loop:
+            self._cancel_leftover_tasks()
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=1)
             self._loop.close()
             self._loop = self._thread = None
+
+    def _cancel_leftover_tasks(self):
+        """Cancel whatever still runs on the loop (a server mid-handshake, a
+        stuck call) so its child process is terminated before exit."""
+        async def cancel_all():
+            current = asyncio.current_task()
+            pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=3)
+        try:
+            self._run(cancel_all(), timeout=5)
+        except BaseException as exc:  # noqa: BLE001 -- teardown is best-effort
+            _log.debug("cancelling leftover MCP tasks failed: %s", _describe(exc))
 
     def _write_config(self, path, payload):
         path.parent.mkdir(parents=True, exist_ok=True)

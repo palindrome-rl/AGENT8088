@@ -137,8 +137,13 @@ def build_sidebar() -> str:
 
 
 def update_sidebar(existing: str) -> str:
-    """Publish the canonical navigation for this public release wiki."""
-    return build_sidebar()
+    """Refresh this release's navigation without deleting other wiki entries."""
+    block = build_sidebar().rstrip()
+    pattern = re.compile(re.escape(SIDEBAR_START) + r".*?" + re.escape(SIDEBAR_END), re.DOTALL)
+    if pattern.search(existing):
+        return pattern.sub(block, existing).rstrip() + "\n"
+    prefix = existing.rstrip()
+    return (prefix + "\n\n" if prefix else "") + block + "\n"
 
 
 def main() -> int:

@@ -97,6 +97,16 @@ analysis, academic research and community pain-points.
 
 ---
 
+## Reliability updates on the v1.2 branch
+
+This branch includes clearer CLI and Web UI health reporting, automatic search
+fallback notices, scanned-document OCR improvements, working-directory recovery,
+bounded verification loops, and better handling of model output limits.
+Run `agent8088 --doctor` (or `/doctor` inside the agent) for actionable setup
+diagnostics. The Web UI also shows which optional capabilities are limited.
+OpenCodeReview installation is pinned, reports download errors, and retries
+transient network failures. Existing configuration and memory are preserved.
+
 ## Quick start
 
 ### Install Agent8088 v1.2

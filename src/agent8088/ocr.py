@@ -40,6 +40,12 @@ OCR_SUFFIXES = IMAGE_SUFFIXES | {".pdf"}
 _MISSING = ("OCR is not installed. Install the extra with: "
             'pip install -e ".[ocr]"')
 
+
+def install_command() -> str:
+    """The command that installs OCR into this interpreter (the [ocr] extra)."""
+    return (f'"{sys.executable}" -m pip install "rapidocr>=3,<4" '
+            f'"onnxruntime>=1.17,<2" "pypdfium2>=4,<6"')
+
 _engine_instance = None
 
 
@@ -62,6 +68,34 @@ def available() -> bool:
     except Exception:
         return False
     return True
+
+
+def installed() -> bool:
+    """Cheap check (no import, no model load): are the OCR packages present?"""
+    import importlib.util
+    try:
+        return all(importlib.util.find_spec(name) is not None
+                   for name in ("rapidocr", "onnxruntime", "pypdfium2"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def report_state(ok: bool) -> None:
+    """capabilities.OCR: unavailable while the OCR packages are missing."""
+    try:
+        from agent8088 import capabilities
+        if ok:
+            capabilities.report(capabilities.OCR, active="rapidocr", preferred="rapidocr",
+                                state=capabilities.OK)
+        else:
+            capabilities.report(
+                capabilities.OCR, active="", preferred="rapidocr",
+                state=capabilities.UNAVAILABLE,
+                reason="OCR packages (rapidocr, onnxruntime, pypdfium2) not installed",
+                impact="scanned PDFs and images can't be read by text-only models",
+                fix=install_command())
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _engine():
@@ -102,20 +136,25 @@ def _image_text(path) -> str:
     return "\n".join(_recognised_lines(_engine()(str(path))))
 
 
-def _pdf_text(path, max_pages=MAX_OCR_PAGES) -> str:
+def _pdf_text(path, max_pages=MAX_OCR_PAGES, only=None) -> str:
+    """OCR a PDF's pages; `only` (1-based page numbers) limits it to those,
+    for a PDF whose other pages already have a text layer."""
     document = _pdfium().PdfDocument(str(path))
     try:
         total = len(document)
         pages = []
-        for index in range(min(total, max_pages)):
+        wanted = ([n - 1 for n in only if 0 < n <= total] if only
+                  else list(range(total)))
+        skipped = max(0, len(wanted) - max_pages)
+        for index in wanted[:max_pages]:
             image = document[index].render(scale=RENDER_SCALE).to_pil()
             body = "\n".join(_recognised_lines(_engine()(image)))
             pages.append(f"## Page {index + 1}\n{body}" if body
                          else f"## Page {index + 1}\n(no text recognised on this page)")
-        if total > max_pages:
+        if skipped:
             # Say so in the output rather than truncating silently: a model
             # asked to summarise "the document" must know it saw part of it.
-            pages.append(f"[{total - max_pages} further pages were not read; "
+            pages.append(f"[{skipped} further pages were not read; "
                          f"OCR stops at {max_pages} pages]")
         return "\n\n".join(pages)
     finally:
@@ -132,7 +171,7 @@ def _cache_key(path: Path):
     return (str(path), stat.st_mtime_ns, stat.st_size)
 
 
-def text_for(path, *, max_pages=MAX_OCR_PAGES) -> str:
+def text_for(path, *, max_pages=MAX_OCR_PAGES, pages=None) -> str:
     """Recognised text for one image or scanned PDF.
 
     Raises ValueError with a message meant for the user (and for the model,
@@ -141,6 +180,7 @@ def text_for(path, *, max_pages=MAX_OCR_PAGES) -> str:
     """
     path = Path(path).resolve()
     if not available():
+        report_state(False)
         raise ValueError(_MISSING)
     suffix = path.suffix.lower()
     if suffix not in OCR_SUFFIXES:
@@ -150,7 +190,8 @@ def text_for(path, *, max_pages=MAX_OCR_PAGES) -> str:
     if path.stat().st_size > MAX_OCR_BYTES:
         raise ValueError(f"File is too large for OCR (limit: {MAX_OCR_BYTES // (1024 * 1024)}MB)")
 
-    key = _cache_key(path)
+    only = sorted({int(n) for n in pages}) if pages else []
+    key = _cache_key(path) + (tuple(only),)
     with _lock:
         if key in _cache:
             _cache.move_to_end(key)
@@ -158,6 +199,8 @@ def text_for(path, *, max_pages=MAX_OCR_PAGES) -> str:
 
     argv = [sys.executable, "-m", "agent8088.ocr", "--extract", str(path),
             "--max-pages", str(max_pages)]
+    if only and suffix == ".pdf":
+        argv += ["--pages", ",".join(str(n) for n in only)]
     try:
         result = subprocess.run(argv, capture_output=True, timeout=OCR_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -192,10 +235,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="agent8088.ocr")
     parser.add_argument("--extract", required=True)
     parser.add_argument("--max-pages", type=int, default=MAX_OCR_PAGES)
+    parser.add_argument("--pages", default="")
     options = parser.parse_args()
 
     _limit_worker_memory()
     source = Path(options.extract)
-    output = (_pdf_text(source, max_pages=options.max_pages)
+    only = [int(n) for n in options.pages.split(",") if n.strip().isdigit()]
+    output = (_pdf_text(source, max_pages=options.max_pages, only=only or None)
               if source.suffix.lower() == ".pdf" else _image_text(source))
     sys.stdout.buffer.write((output or "").encode("utf-8"))

@@ -39,6 +39,10 @@ interface ProvidersResponse {
 interface ModelsResponse {
   provider: string
   models: string[]
+  /** The live listing failed; `models` is the built-in offline list. */
+  stale?: boolean
+  offline?: boolean
+  reason?: string
 }
 
 interface ModelSwitchResponse {
@@ -69,7 +73,7 @@ interface LimitsResponse {
   denial_breaker_threshold: number
   context_window: number
   max_completion_tokens: number
-  active_model?: { provider: string; model: string; context_window: number; max_completion_tokens: number }
+  active_model?: { provider: string; model: string; context_window: number; max_completion_tokens: number; context_window_source?: string }
   providers?: Record<string, { context_window: string; max_completion_tokens: string }>
 }
 
@@ -199,6 +203,11 @@ function ModelSwitcher({ providers, config, onSwitch, switching }: {
               </select>
               <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-600" />
             </div>
+          )}
+          {(modelsQuery.data?.stale || modelsQuery.data?.offline) && (
+            <p className="mt-1 text-[11px] text-amber-500" title={modelsQuery.data.reason || undefined}>
+              (offline list{modelsQuery.data.reason ? ` — ${modelsQuery.data.reason}` : ''})
+            </p>
           )}
         </div>
       )}
@@ -859,7 +868,7 @@ export default function ConfigPage() {
       {configQuery.data && (
         <Section icon={Activity} title="Runtime Visibility" subtitle="Dynamic model, compaction, and browser state">
           <div className="grid grid-cols-1 gap-x-8 gap-y-0 sm:grid-cols-2">
-            <InfoRow label="Active model limits" value={limitsQuery.data?.active_model ? `${limitsQuery.data.active_model.context_window.toLocaleString()} context / ${limitsQuery.data.active_model.max_completion_tokens.toLocaleString()} output` : 'Loading…'} mono />
+            <InfoRow label="Active model limits" value={limitsQuery.data?.active_model ? `${limitsQuery.data.active_model.context_window.toLocaleString()} context${limitsQuery.data.active_model.context_window_source ? ` (${limitsQuery.data.active_model.context_window_source === 'default' ? 'assumed default' : `from ${limitsQuery.data.active_model.context_window_source}`})` : ''} / ${limitsQuery.data.active_model.max_completion_tokens.toLocaleString()} output` : 'Loading…'} mono />
             <InfoRow label="Auto-compact" value={configQuery.data.auto_compaction ? `${configQuery.data.auto_compaction.threshold_pct}% threshold · keep ${configQuery.data.auto_compaction.keep_messages}` : '—'} />
             <InfoRow label="Browser progress" value={configQuery.data.browser?.current_host ? `visiting ${configQuery.data.browser.current_host}` : 'idle'} />
             <InfoRow label="Browser limits" value={configQuery.data.browser ? `${configQuery.data.browser.max_steps} steps · ${configQuery.data.browser.task_timeout_seconds}s` : '—'} />

@@ -250,15 +250,14 @@ Ordered outermost-first; each layer can only refuse, never grant:
 4. write path zones         — blocked / no-prompt / prompt
 5. check_permission(mode)   — readonly / full-auto / plan-only
 6. shell classifier         — safe inspection vs mutation, sees through sh -c
-7. hard git blocks          — shell push / reset --hard, always
+7. hard git blocks          — push / reset --hard, always
 8. SSRF guard               — outbound URLs, including redirects
 9. sandbox                  — OS isolation for whatever survived
 10. output guards           — secret redaction, untrusted wrapping, leak check
 ```
 
 Layers 2, 3, 7 are the "always-on floor": no mode and no escalation grant
-unlocks them. The `git_push` tool is the only way to push: it asks every time,
-and an approval covers just that exact remote and branch. See [Permissions & Security](03-permissions-and-security.md).
+unlocks them. See [Permissions & Security](03-permissions-and-security.md).
 
 ## State on disk
 

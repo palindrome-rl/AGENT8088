@@ -10,7 +10,7 @@ adapters, Playwright Chromium, the WhatsApp bridge, and the Docker CLI for
 ## Quick start
 
 ```sh
-cd /path/to/AGENT8088                         # docker-compose.yml lives here
+cd /path/to/Agent8088-Features-added        # docker-compose.yml lives here
 
 docker compose run --rm agent8088 --setup    # first-time config wizard
 docker compose run --rm agent8088            # interactive REPL
@@ -94,7 +94,7 @@ Everything persists in the `agent8088-data` named volume, mounted at
 Inspect or back it up:
 
 ```sh
-docker volume inspect agent8088_agent8088-data
+docker volume inspect agent8088-features-added_agent8088-data
 ```
 
 ## Starting fresh
@@ -122,8 +122,8 @@ volumes:
 ## What the Dockerfile does not include
 
 - **`dev` extras** (pytest, ruff, pip-audit) — not needed to run the agent.
-  The image excludes `tests/`, and this release branch does not track the
-  root Python suite. Run those tests from a separate `development` checkout;
+  The image excludes `tests/`, and this public release does not track the
+  root Python suite. Run those tests from a separate maintainer checkout;
   installing `.[dev]` inside this image cannot provide the missing files.
 
 - **The `repomap` extra** (`tree-sitter`, `tree-sitter-language-pack`) — the

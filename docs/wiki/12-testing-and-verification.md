@@ -18,6 +18,19 @@ Three layers, all runnable offline with no model backend.
 `--prompt-file` runs one unattended, full-auto turn. Use it only in a trusted,
 isolated environment.
 
+## Public release regression checks
+
+The release includes portable installer and runtime compatibility checks:
+
+```sh
+uv run --extra dev python -m pytest scripts/installer_checks/ -q
+```
+
+These checks use temporary files and simulated failures rather than personal
+configuration or live model credentials. They are run by public CI on Windows,
+macOS and Linux. Live model and browser acceptance tests are separate; passing
+these regressions does not establish that every external provider is available.
+
 ## Prerequisites
 
 Install the sandbox runtime before running anything here:

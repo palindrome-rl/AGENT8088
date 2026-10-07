@@ -18,6 +18,13 @@ def main() -> None:
 
     from agent8088.gateway.runner import build_runner
     runner = build_runner()
+    from agent8088.gateway.dependencies import startup_notice
+    notice = startup_notice(getattr(runner, "disabled_adapters", []))
+    if notice:
+        # stderr as well as the log: the log file is not where an operator
+        # starting the gateway looks, and this explains a silent platform.
+        log.warning(notice)
+        print(notice, file=sys.stderr)
     if not runner.adapters:
         message = ("No messaging platforms enabled. Set one of slack_enabled, "
                    "whatsapp_enabled, discord_enabled, email_enabled, or "

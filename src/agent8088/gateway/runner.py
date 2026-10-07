@@ -127,9 +127,14 @@ def _dedup_reply(clean: str) -> str:
 
 class GatewayRunner:
     def __init__(self, sessions: SessionStore, allowlist: Allowlist):
+        # Chat users type these, not the CLI's; the model answers from them.
+        A.register_frontend_commands(
+            {name: (name, description) for name, description in SLASH_COMMANDS.items()})
         self.sessions = sessions
         self.allowlist = allowlist
         self.adapters = []
+        # (AdapterSpec, reason) for enabled adapters that could not load.
+        self.disabled_adapters = []
         self._active: dict = {}
         self._pending: dict = {}
         self._lock = asyncio.Lock()
@@ -569,39 +574,20 @@ def build_runner() -> GatewayRunner:
     mode = A.APP_CONFIG.get("gateway_permission_mode", "readonly")
     A.PERMISSION_MODE = mode
 
-    if config.get("slack_enabled", "0") in ("1", "true", "True"):
+    # A missing dependency used to be a file-only warning: the gateway came up
+    # and that platform simply never answered. Now it is also reported through
+    # capabilities.GATEWAY (/doctor, /status) and printed at startup.
+    import importlib
+    from agent8088.gateway import dependencies as gateway_deps
+    disabled = []
+    for spec in gateway_deps.enabled_adapters(config):
         try:
-            from agent8088.gateway.platforms.slack import SlackAdapter
-            runner.register_adapter(SlackAdapter(config, runner))
-        except ImportError:
-            log.warning("Slack enabled but slack-bolt not installed. "
-                        "Run: uv pip install -e \".[gateway]\"")
-    if config.get("whatsapp_enabled", "0") in ("1", "true", "True"):
-        try:
-            from agent8088.gateway.platforms.whatsapp import WhatsAppAdapter
-            runner.register_adapter(WhatsAppAdapter(config, runner))
-        except ImportError:
-            log.warning("WhatsApp enabled but httpx not installed. "
-                        "Run: uv pip install -e \".[gateway]\"")
-    if config.get("discord_enabled", "0") in ("1", "true", "True"):
-        try:
-            from agent8088.gateway.platforms.discord import DiscordAdapter
-            runner.register_adapter(DiscordAdapter(config, runner))
-        except ImportError:
-            log.warning("Discord enabled but discord.py not installed. "
-                        "Run: uv pip install -e \".[gateway]\"")
-    if config.get("email_enabled", "0") in ("1", "true", "True"):
-        try:
-            from agent8088.gateway.platforms.email import EmailAdapter
-            runner.register_adapter(EmailAdapter(config, runner))
-        except ImportError:
-            log.warning("Email enabled but failed to import. "
-                        "Email uses stdlib only — check config.")
-    if config.get("telegram_enabled", "0") in ("1", "true", "True"):
-        try:
-            from agent8088.gateway.platforms.telegram import TelegramAdapter
-            runner.register_adapter(TelegramAdapter(config, runner))
-        except ImportError:
-            log.warning("Telegram enabled but python-telegram-bot not installed. "
-                        "Run: uv pip install -e \".[gateway]\"")
+            module = importlib.import_module(spec.module)
+            runner.register_adapter(getattr(module, spec.cls)(config, runner))
+        except ImportError as exc:
+            why = gateway_deps.disabled_reason(spec, exc)
+            log.warning("%s enabled but %s. Run: %s", spec.platform, why,
+                        gateway_deps.GATEWAY_FIX if spec.package else "check config.txt")
+            disabled.append((spec, why))
+    runner.disabled_adapters = gateway_deps.report(config, disabled)
     return runner

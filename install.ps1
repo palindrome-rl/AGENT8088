@@ -219,7 +219,7 @@ $OcrInstalled = $false
 $ReviewInstalled = $false
 $ReviewExecutable = ""
 # Pinned: the delegation JSON contract is version-specific.
-$OpenCodeReviewVersion = "1.12.1"
+$script:OpenCodeReviewVersion = "1.12.1"
 $Mem0Installed = $false
 $MemoryEngine = ""
 $RepositoryInstalled = $false
@@ -630,8 +630,7 @@ function Write-StageWarning {
 }
 
 # Persist the skipped-stage ledger to $Agent8088Home\install-state.json for
-# installation diagnostics. This public release reports skipped stages in the
-# installer summary; it does not load this ledger in the agent. A stage fixed by a
+# the startup banner, /doctor and agent8088 --doctor. A stage fixed by a
 # re-run drops out; written to a temp file and renamed, so a reader never sees
 # half a file. UTF-8 without a BOM. Never fails the install.
 function Save-InstallState {
@@ -2804,22 +2803,43 @@ function Install-WebUI {
 # the model is there. The message names the exact command to fix it.
 $EmbedModel = "nomic-embed-text"
 
+function Find-VerifiedReviewExecutable {
+    param([string]$Prefix)
+    foreach ($candidate in @(Get-ChildItem -LiteralPath $Prefix -Recurse -Filter "opencodereview*.exe" -ErrorAction SilentlyContinue)) {
+        if ($candidate.PSIsContainer) { continue }
+        $check = Invoke-WithTimeout -FilePath $candidate.FullName -Arguments @("--version") -TimeoutSec 15 -CaptureOutput
+        $text = ("$($check.Output)`n$($check.ErrorOutput)").Trim()
+        Add-InstallLog -Title "Code review executable verification" -Text $text
+        if ($check.ExitCode -eq 0 -and $text -match ("(?m)\bopen-code-review\s+v?" + [regex]::Escape($script:OpenCodeReviewVersion) + "(?:\s|$)")) {
+            return $candidate.FullName
+        }
+    }
+    return ""
+}
+
 function Install-CodeReview {
     # Run after Install-Node-Bridge: a fresh machine gets portable Node there.
     $reviewPrefix = Join-Path $InstallDir "code-review"
-    $reviewBin = Get-ChildItem -Path $reviewPrefix -Recurse -Filter "opencodereview*" `
-        -ErrorAction SilentlyContinue | Where-Object {
-            -not $_.PSIsContainer -and $_.Extension -notin @(".cmd", ".ps1", ".bat")
-        } | Select-Object -First 1
+    $script:ReviewInstalled = $false
+    $script:ReviewExecutable = ""
+    if ($script:OpenCodeReviewVersion -notmatch '^\d+\.\d+\.\d+$') {
+        Write-StageWarning -Result @{ ExitCode = 1 } -TimeoutSec $TPip -What "code review engine" `
+            -Consequence "the pinned version is missing; refusing an unpinned download" -Fix "rerun the latest public installer"
+        return
+    }
+    $reviewBin = Find-VerifiedReviewExecutable -Prefix $reviewPrefix
     if ((Test-StageComplete "codereview") -and $reviewBin) {
         $script:ReviewInstalled = $true
-        $script:ReviewExecutable = $reviewBin.FullName
+        $script:ReviewExecutable = $reviewBin
         Write-Success "Code review engine already installed (skipping)"
         return
     }
-    $npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $npm) {
+    $npmPath = $script:NpmExe
+    if (-not $npmPath -or -not (Test-Path -LiteralPath $npmPath)) {
+        $npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $npmPath = if ($npm) { $npm.Source } else { "" }
+    }
+    if (-not $npmPath) {
         Write-StageWarning -Result @{ ExitCode = 1 } -TimeoutSec $TPip `
             -What "code review engine" `
             -Consequence "/review will report the install command instead of running" `
@@ -2827,21 +2847,34 @@ function Install-CodeReview {
         return
     }
     Write-Info "Installing code review engine (optional, for /review)..."
-    $reviewResult = Invoke-WithTimeout -FilePath $npm.Source `
-        -Arguments @("install", "--silent", "--no-fund", "--no-audit", "--prefix",
-                     $reviewPrefix,
-                     "@alibaba-group/open-code-review@$script:OpenCodeReviewVersion") `
-        -TimeoutSec $TPip -Activity "Installing code review engine"
-    $reviewBin = Get-ChildItem -Path $reviewPrefix -Recurse -Filter "opencodereview*" `
-        -ErrorAction SilentlyContinue | Where-Object {
-            -not $_.PSIsContainer -and $_.Extension -notin @(".cmd", ".ps1", ".bat")
-        } | Select-Object -First 1
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $reviewResult = Invoke-WithTimeout -FilePath $npmPath `
+            -Arguments @("install", "--no-fund", "--no-audit", "--prefix", $reviewPrefix,
+                         "@alibaba-group/open-code-review@$script:OpenCodeReviewVersion") `
+            -TimeoutSec $TPip -CaptureOutput -Activity "Installing code review engine"
+        $reviewText = ("$($reviewResult.Output)`n$($reviewResult.ErrorOutput)`n$($reviewResult.Error)").Trim()
+        Add-InstallLog -Title "Code review installation attempt $attempt (exit $($reviewResult.ExitCode))" -Text $reviewText
+        if ($reviewResult.ExitCode -eq 0 -or $reviewResult.TimedOut) { break }
+        $transient = $reviewText -match '(?i)ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|could not resolve host'
+        if (-not $transient -or $attempt -eq 3) { break }
+        Write-Warn "Code review download could not reach its server; retrying ($attempt/3)."
+        Start-Sleep -Seconds (2 * $attempt)
+    }
+    $reviewBin = Find-VerifiedReviewExecutable -Prefix $reviewPrefix
     if ($reviewResult.ExitCode -eq 0 -and $reviewBin) {
         $script:ReviewInstalled = $true
-        $script:ReviewExecutable = $reviewBin.FullName
+        $script:ReviewExecutable = $reviewBin
         Set-StageComplete "codereview"
         Write-Success "Code review engine installed"
     } else {
+        if ($reviewResult.ExitCode -eq 0) {
+            $reviewResult.ExitCode = 1
+            $reviewText += "`nThe pinned OpenCodeReview executable is missing, cannot run, or reports the wrong version."
+        }
+        Write-OutputTail -Text $reviewText -Lines 15
+        if ($reviewText -match '(?i)ENOTFOUND|EAI_AGAIN|could not resolve host') {
+            Write-Warn "DNS lookup failed while downloading code review. Check the named host, DNS, VPN and proxy settings. Docker is not required."
+        }
         Write-StageWarning -Result $reviewResult -TimeoutSec $TPip `
             -What "code review engine" `
             -Consequence "/review will report the install command instead of running" `

@@ -36,8 +36,13 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Playwright Chromium for browse_page.
-RUN playwright install chromium
+# Playwright Chromium for browse_page. Installed as root, so without an
+# explicit path it lands in /root/.cache/ms-playwright, which the non-root
+# a8088 user below can neither see nor read -- browse_page then reported
+# Chromium as missing. A fixed, world-readable path both users share; the
+# engine honours an explicit PLAYWRIGHT_BROWSERS_PATH ahead of its defaults.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install chromium && chmod -R a+rX /ms-playwright
 
 # WhatsApp bridge deps (Baileys/express). The bridge ships in the wheel
 # (pyproject force-include) but its node_modules do not, so install them here.

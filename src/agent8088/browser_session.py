@@ -46,9 +46,24 @@ def get_session_event_loop() -> asyncio.AbstractEventLoop:
 
 def run_in_session_loop(coro, timeout: float | None = None) -> Any:
     """Execute a coroutine on the session event loop and block for the result."""
+    async def run():
+        # These exceptions escape asyncio Tasks and stop the loop; carry them
+        # back to the waiting caller instead, keeping the session reusable.
+        try:
+            return True, await coro
+        except (KeyboardInterrupt, SystemExit) as exc:
+            return False, exc
+
     loop = get_session_event_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=timeout)
+    future = asyncio.run_coroutine_threadsafe(run(), loop)
+    try:
+        ok, result = future.result(timeout=timeout)
+    except BaseException:
+        future.cancel()  # a timed-out/interrupted caller must not leave actions running
+        raise
+    if not ok:
+        raise result
+    return result
 
 
 def get_session_user_data_dir() -> Path:

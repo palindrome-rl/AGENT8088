@@ -4,6 +4,29 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.2 branch maintenance - 2026-10-07
+
+### Improved
+
+- Shared capability health reporting across the CLI, Web UI, gateway and Doctor.
+- Search fallback/recovery notices, transient DDGS retries and bounded dynamic
+  search allowances while queries continue finding new evidence.
+- Working-directory recovery and failure diagnostics, output-limit recovery,
+  verification accounting and bounded post-check loops.
+- CLI readability, toggle status commands, timestamped diagnostic exports,
+  memory capture, provider discovery and local-model context reporting.
+- Scanned-document OCR, gateway dependency reporting and Docker browser access.
+
+### Fixed
+
+- Windows OpenCodeReview version pin scope under `iex`, missing download
+  diagnostics, and false readiness based only on an executable's presence.
+- OpenCodeReview now retries transient network failures with bounded backoff;
+  both installers verify the pinned executable before reporting success.
+
+Public version metadata remains 1.2.0. Public installation URLs, MIT licensing,
+CI, support files and existing installation-recovery safeguards are preserved.
+
 ## [1.2.0] - 2026-09-29
 
 ### Added

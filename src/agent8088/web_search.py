@@ -22,7 +22,14 @@ Selection precedence (mirrors Hermes' agent/web_search_registry.py):
 Unlike Hermes, which only *selects* a backend, run_search() also *falls
 through* the chain at call time: a backend that is configured but broken
 (instance stopped, rate-limited) must not mean "no web search". Because ddgs is
-bundled, the chain is effectively never empty.
+bundled, the chain is effectively never empty. Under ``auto`` the engine hands
+run_search an explicit chain (the pin, then the rest of the auto order) so a
+pinned SearXNG that stops answering falls through too — see
+engine._search_call_chain.
+
+ddgs results are quality-checked (assess_results): a thin or one-domain answer
+is retried with a different engine group and then handed down the chain before
+it is accepted, and the result says which backends were tried.
 
 This module deliberately does NOT import engine.py — that would be circular.
 Security guards (egress policy, SSRF, outbound-secret check, untrusted-content
@@ -33,6 +40,7 @@ from __future__ import annotations
 
 import abc
 import importlib.util
+import inspect
 import ipaddress
 import json as _json
 import time
@@ -53,10 +61,11 @@ from dataclasses import dataclass, field
 # that backend. tavily wins the tie if both are configured.
 PREFERENCE = ("searxng", "ddgs", "tavily", "exa")
 
-# web_search_provider=auto — "pick the best available at startup, then behave
-# like a pin for the rest of the session". A pin is what keeps the approval-free
-# local-SearXNG path safe (it cannot fall through to a public provider), so AUTO
+# web_search_provider=auto — "pick the best available at startup and pin it".
+# A pin is what keeps the approval-free local-SearXNG path well-defined, so AUTO
 # deliberately RESOLVES to a real name at startup instead of staying dynamic.
+# The engine still lets auto's pin fall through mid-session (an explicit chain
+# passed to run_search) and re-probes SearXNG to switch back up.
 AUTO = "auto"
 
 # This runs on the startup path, so an unreachable instance must not stall
@@ -93,6 +102,9 @@ class SearchResult:
 class SearchSuccess:
     results: list
     provider: str
+    # Short, trusted remarks rendered after the results ("retried with other
+    # engines", "images not supported by ddgs"). Never untrusted page text.
+    notes: list = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +115,22 @@ class SearchFailure:
     # chain: trying another vendor would be routing around a decision, not
     # around an outage.
     retryable: bool = True
+
+
+@dataclass
+class SearchReport:
+    """Everything run_search knows about one call (``return_report=True``).
+
+    The engine needs more than the text: which backend served (to report the
+    capability state and pick the model note), and which ones failed (to
+    decide on a fallback prompt or a pin change).
+    """
+    text: str
+    provider: str = ""          # who served; "" when nothing did
+    tried: tuple = ()
+    failed: tuple = ()          # retryable failures and empty answers, in order
+    failures: tuple = ()        # "name: error" strings, same order as failed
+    weak: str = ""              # why the served answer is thin, if it is
 
 
 @dataclass
@@ -240,6 +268,12 @@ class Registry:
         return [self._providers[n] for n in self._dynamic_order(ctx)
                 if n in self._providers and self._providers[n].is_available(ctx)]
 
+    def auto_order(self, ctx) -> list:
+        """Names the auto chain would try, best first, filtered by is_available()
+        (no network). Same ranking as chain() and startup_pick()."""
+        return [n for n in self._dynamic_order(ctx)
+                if n in self._providers and self._providers[n].is_available(ctx)]
+
     def startup_pick(self, ctx, probe=None) -> str:
         """The one backend to pin for this process, or "" if none can serve.
 
@@ -263,43 +297,111 @@ class Registry:
 # ---------------------------------------------------------------------------
 # Rendering and the fallback chain
 # ---------------------------------------------------------------------------
-def format_results(success: SearchSuccess, ctx: SearchContext) -> str:
+# A ddgs answer is "weak" below this many results (or the limit, if smaller).
+WEAK_MIN_RESULTS = 3
+# ...or when this share of the results comes from one domain.
+WEAK_DOMAIN_SHARE = 0.8
+
+
+def _domain(url: str) -> str:
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def assess_results(results: list, limit: int) -> str:
+    """Why a result set is too thin to trust as-is, or "" when it is fine.
+
+    Applied to the keyless scraper only (providers with check_quality=True):
+    a SearXNG/keyed answer with two hits is an answer, a ddgs answer with two
+    hits is usually a throttled or half-failed scrape.
+    """
+    if not results:
+        return "no results"
+    floor = max(1, min(WEAK_MIN_RESULTS, limit))
+    if len(results) < floor:
+        return f"only {len(results)} result{'s' if len(results) != 1 else ''}"
+    if len(results) >= WEAK_MIN_RESULTS:
+        domains = [_domain(r.url) for r in results]
+        top = max(set(domains), key=domains.count)
+        if top and domains.count(top) / len(domains) >= WEAK_DOMAIN_SHARE:
+            return f"{domains.count(top)} of {len(domains)} results from {top}"
+    return ""
+
+
+def accepts_images(provider) -> bool:
+    """Does provider.search take an ``images`` argument?
+
+    Read from the signature rather than by calling and catching TypeError: that
+    catch also swallowed a TypeError raised INSIDE a provider and then ran the
+    search a second time, and it hid that the images request was dropped.
+    """
+    try:
+        params = inspect.signature(provider.search).parameters
+    except (TypeError, ValueError):
+        return False
+    return "images" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def format_results(success: SearchSuccess, ctx: SearchContext, notes=()) -> str:
     """Render results as compact text, wrapped as untrusted external content.
 
     The serving provider is always named: a silent fallback would hide a
     broken primary, so "via ddgs" when SearXNG was expected is visible.
+    `notes` (and success.notes) are trusted remarks rendered AFTER the
+    untrusted wrapper, one ``[note: ...]`` line each.
     """
+    all_notes = [n for n in (*success.notes, *notes) if n]
+    tail = "".join(f"\n[note: {n}]" for n in all_notes)
     if not success.results:
-        return f"No results from {success.provider}."
+        return f"No results from {success.provider}.{tail}"
     lines = [f"Search results (via {success.provider}):", ""]
     for index, result in enumerate(success.results, 1):
         lines.append(f"{index}. {result.title}")
         lines.append(f"   {result.url}")
         if result.snippet:
             lines.append(f"   {result.snippet}")
-    return ctx.wrap("\n".join(lines), source=f"web_search:{success.provider}")
+    return ctx.wrap("\n".join(lines), source=f"web_search:{success.provider}") + tail
 
 
 def run_search(query: str, limit: int, registry: Registry, config: dict,
                ctx: SearchContext, *, return_failures: bool = False,
-               images: bool = False):
+               images: bool = False, chain=None, return_report: bool = False):
     """Search the configured chain, optionally returning retryable failures.
 
     The opt-in failure list lets engine.py distinguish a local SearXNG outage
     from a policy denial without parsing text that may be shown to the model.
     images=True asks image-capable backends for image results (SearXNG's
-    images category); backends without image support ignore it.
+    images category); a backend without image support is called without it
+    and the result says so.
+
+    ``chain`` overrides registry.chain() — the engine passes the auto fallback
+    order here. ``return_report=True`` returns a SearchReport instead (wins
+    over return_failures).
+
+    Weak ddgs answers (assess_results) are retried with another engine group,
+    then the rest of the chain is tried; the best weak answer is returned only
+    when nothing better turned up, with a note naming what was tried.
     """
     failed_providers = []
+    failures = []
+    tried = []
 
-    def finish(message: str):
+    def finish(message: str, provider: str = "", weak: str = ""):
+        if return_report:
+            return SearchReport(text=message, provider=provider, tried=tuple(tried),
+                                failed=tuple(failed_providers),
+                                failures=tuple(failures), weak=weak)
         return (message, tuple(failed_providers)) if return_failures else message
 
     query = (query or "").strip()
     if not query:
         return finish("Error: web_search requires a non-empty 'query'.")
 
-    chain = registry.chain(config, ctx)
+    chain = list(chain) if chain is not None else registry.chain(config, ctx)
     if not chain:
         configured = str(config.get("web_search_provider") or "").strip()
         if configured:
@@ -309,26 +411,66 @@ def run_search(query: str, limit: int, registry: Registry, config: dict,
         return finish("No web search provider is configured. Run `/search setup` to "
                       f"provision a local SearXNG, or enable one of:\n{hints}")
 
-    failures = []
+    best = None          # (SearchSuccess, weak reason, image note)
     for provider in chain:
-        try:
+        tried.append(provider.name)
+        takes_images = accepts_images(provider)
+        image_note = (f"images not supported by {provider.name}; these are web results"
+                      if images and not takes_images else "")
+        if takes_images:
             outcome = provider.search(query, limit, ctx, images=images)
-        except TypeError:
-            # A custom/embedder provider predating the images kwarg.
+        else:
             outcome = provider.search(query, limit, ctx)
-        if isinstance(outcome, SearchSuccess) and outcome.results:
-            return finish(format_results(outcome, ctx))
         if isinstance(outcome, SearchFailure):
             if not outcome.retryable:
                 return finish(outcome.error)
             failed_providers.append(provider.name)
             failures.append(f"{provider.name}: {outcome.error}")
-        else:
+            continue
+        if not isinstance(outcome, SearchSuccess):
             failed_providers.append(provider.name)
             failures.append(f"{provider.name}: no results")
+            continue
+        weak = assess_results(outcome.results, limit) if getattr(
+            provider, "check_quality", False) else ("" if outcome.results else "no results")
+        if weak and hasattr(provider, "search_alternate"):
+            retry = provider.search_alternate(query, limit, ctx, outcome)
+            if isinstance(retry, SearchSuccess):
+                outcome = retry
+                weak = assess_results(outcome.results, limit)
+        if not weak:
+            return finish(_render(outcome, ctx, tried, failures, image_note),
+                          provider=provider.name)
+        if not outcome.results:
+            failed_providers.append(provider.name)
+        failures.append(f"{provider.name}: {weak}")
+        if outcome.results and (best is None or len(outcome.results) > len(best[0].results)):
+            best = (outcome, weak, image_note)
+
+    if best is not None:
+        outcome, weak, image_note = best
+        note = (f"results may be incomplete ({weak}); tried: {', '.join(tried)}")
+        return finish(_render(outcome, ctx, (), (), image_note, extra=note),
+                      provider=outcome.provider, weak=weak)
+    if failures and all(f.endswith(": no results") for f in failures):
+        return finish(f"No results found (tried: {', '.join(tried)}). Try a broader "
+                      "or differently worded query.")
     return finish("Every configured web search provider failed:\n"
                   + "\n".join(f"  - {f}" for f in failures)
                   + "\nRun `/search doctor` to diagnose.")
+
+
+def _render(outcome, ctx, tried, failures, image_note, extra=""):
+    """format_results plus the fallback notes for this call."""
+    notes = []
+    if failures:
+        notes.append("fell back after " + "; ".join(failures)
+                     + f" — served by {outcome.provider}")
+    if image_note:
+        notes.append(image_note)
+    if extra:
+        notes.append(extra)
+    return format_results(outcome, ctx, notes=notes)
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +669,12 @@ _DDGS_TIMEOUT = 10
 _DDGS_MIN_INTERVAL = 2.0
 _ddgs_last_call = 0.0
 
+# A search that starts this soon after the previous ddgs call is part of a
+# burst. Mid-burst, "no results found" usually means a throttled engine served
+# nothing rather than that the topic is empty: live, two of ten back-to-back
+# city lookups ("current mayor of Vienna 2026") came back empty that way.
+_DDGS_BURST_WINDOW = 20.0
+
 # Attempts per search. One retry is not padding: a 202 is issued per-engine
 # per-IP on a sliding window, so a later attempt lands elsewhere in the rotation
 # and usually serves. Hermes: "Wait a few seconds and retry."
@@ -711,6 +859,10 @@ class DdgsProvider(WebSearchProvider):
     the decision. See _ddgs_allowed_engines for why the check is per-engine.
     """
 
+    # run_search quality-checks this backend's answers (assess_results) and
+    # calls search_alternate() before accepting a weak one.
+    check_quality = True
+
     @property
     def name(self):
         return "ddgs"
@@ -749,6 +901,8 @@ class DdgsProvider(WebSearchProvider):
         throttles = _ddgs_throttle_errors()
         last_error = ""
         throttled = False
+        in_burst = bool(_ddgs_last_call) and (
+            time.monotonic() - _ddgs_last_call < _DDGS_BURST_WINDOW)
 
         for attempt in range(_DDGS_ATTEMPTS):
             if _DDGS_BACKOFF[attempt]:
@@ -758,12 +912,29 @@ class DdgsProvider(WebSearchProvider):
                 raw = _ddgs_text(query, limit, backend=backend,
                                  timeout=_DDGS_TIMEOUT, proxy=proxy) or []
             except Exception as exc:  # noqa: BLE001 — a provider must never raise
-                last_error = str(exc) or exc.__class__.__name__
+                message = str(exc) or exc.__class__.__name__
                 # Upstream signals "zero hits" by raising. That is not a provider
                 # failure, and reporting it as one would send run_search shopping
                 # for another backend over a query nothing can answer.
-                if "no results found" in last_error.lower():
-                    return SearchSuccess([], provider=self.name)
+                if "no results found" in message.lower():
+                    if in_burst and not (throttled or last_error):
+                        # Possibly throttled: spend the backed-off attempts
+                        # before calling it empty. Every attempt empty is a
+                        # real "no results".
+                        if attempt + 1 < _DDGS_ATTEMPTS:
+                            continue
+                        return SearchSuccess([], provider=self.name)
+                    if not (throttled or last_error):
+                        return SearchSuccess([], provider=self.name)
+                    # ...unless earlier attempts were throttled or failed: then
+                    # "nothing" most likely means "nothing served", and saying
+                    # "no results found" would tell the model the topic is empty.
+                    return SearchFailure(
+                        f"ddgs returned nothing after {attempt} failed attempt"
+                        f"{'s' if attempt != 1 else ''} ({last_error}) — search may "
+                        "be throttled, not empty. Retry shortly, or configure "
+                        "SearXNG or an API-key backend (`/search setup`).")
+                last_error = message
                 if throttles and isinstance(exc, throttles):
                     throttled = True
                 # Retry everything else too, not just recognised throttle types:
@@ -789,6 +960,40 @@ class DdgsProvider(WebSearchProvider):
                 f"{_DDGS_ATTEMPTS} attempts. Configure SearXNG or an API-key "
                 "backend for sustained use — run `/search setup`.")
         return SearchFailure(f"ddgs search failed: {last_error}")
+
+    def search_alternate(self, query, limit, ctx, first):
+        """One more pass with the engine rotation started halfway round.
+
+        ddgs stops at the first engines that fill max_results, so a thin answer
+        came from the head of the rotation; starting from the other half asks
+        different throttle buckets and different indexes. Merged with `first`
+        (deduplicated by URL). Returns None when there is nothing else to try or
+        the pass fails — run_search then keeps the first answer. Never raises.
+        """
+        engines, _blocked = _ddgs_allowed_engines(ctx)
+        if len(engines) < 2:
+            return None
+        split = max(1, len(engines) // 2)
+        rotated = engines[split:] + engines[:split]
+        _ddgs_wait_turn()
+        try:
+            raw = _ddgs_text(query, limit, backend=",".join(rotated),
+                             timeout=_DDGS_TIMEOUT, proxy=_ddgs_proxy(ctx) or None) or []
+        except Exception:  # noqa: BLE001 — a provider must never raise
+            return None
+        seen = {r.url for r in first.results}
+        merged = list(first.results)
+        for r in list(raw):
+            url = str(r.get("href") or "")
+            if url and url not in seen and len(merged) < limit:
+                seen.add(url)
+                merged.append(SearchResult(title=str(r.get("title") or ""), url=url,
+                                           snippet=str(r.get("body") or "")[:MAX_SNIPPET_CHARS]))
+        if merged:
+            _ddgs_cache_put(query, limit, merged)
+        return SearchSuccess(merged, provider=self.name,
+                             notes=[*first.notes,
+                                    f"ddgs retried with engines starting at {rotated[0]}"])
 
 
 # ---------------------------------------------------------------------------
@@ -835,21 +1040,44 @@ class _KeyedProvider(WebSearchProvider):
         blocked = ctx.check_url(self.endpoint)
         if blocked:
             return SearchFailure(blocked, retryable=False)
-        try:
-            payload = _http_json(**self._request(query, limit, key))
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                return SearchFailure(
-                    f"{self.label} rejected the credential — check {self.env_var}.",
-                    retryable=False)
-            if exc.code == 429:
-                return SearchFailure(f"{self.label} rate limit reached (HTTP 429).")
-            return SearchFailure(f"{self.label} returned HTTP {exc.code}")
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return SearchFailure(f"Could not reach {self.label}: {exc}")
-        except (ValueError, _json.JSONDecodeError):
-            return SearchFailure(f"{self.label} returned a malformed response")
-        return SearchSuccess(self._parse(payload)[:limit], provider=self.name)
+        for attempt in range(KEYED_ATTEMPTS):
+            try:
+                payload = _http_json(**self._request(query, limit, key))
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    return SearchFailure(
+                        f"{self.label} rejected the credential — check {self.env_var}.",
+                        retryable=False)
+                transient = exc.code == 429 or exc.code >= 500
+                if transient and attempt + 1 < KEYED_ATTEMPTS:
+                    # One retry, honouring Retry-After but never stalling a turn
+                    # for long: past the cap, falling to the next backend is better.
+                    time.sleep(_retry_after_seconds(exc))
+                    continue
+                if exc.code == 429:
+                    return SearchFailure(f"{self.label} rate limit reached (HTTP 429).")
+                return SearchFailure(f"{self.label} returned HTTP {exc.code}")
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                return SearchFailure(f"Could not reach {self.label}: {exc}")
+            except (ValueError, _json.JSONDecodeError):
+                return SearchFailure(f"{self.label} returned a malformed response")
+            return SearchSuccess(self._parse(payload)[:limit], provider=self.name)
+        return SearchFailure(f"{self.label} did not answer")  # unreachable in practice
+
+
+# Keyed backends: one retry on 429/5xx, waiting Retry-After up to this cap.
+KEYED_ATTEMPTS = 2
+KEYED_RETRY_CAP = 5.0
+KEYED_RETRY_DEFAULT = 1.0
+
+
+def _retry_after_seconds(exc) -> float:
+    """Retry-After in seconds (delta form only), clamped to KEYED_RETRY_CAP."""
+    try:
+        value = float((exc.headers or {}).get("Retry-After") or KEYED_RETRY_DEFAULT)
+    except (TypeError, ValueError, AttributeError):
+        value = KEYED_RETRY_DEFAULT
+    return max(0.0, min(value, KEYED_RETRY_CAP))
 
 
 class TavilyProvider(_KeyedProvider):

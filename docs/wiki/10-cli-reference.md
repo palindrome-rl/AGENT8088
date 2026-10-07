@@ -11,7 +11,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
                  [--mode {readonly,full-auto}]
                  [--uninstall] [--workspace] [--all] [--yes]
                  [--non-interactive] [--dry-run]
-                 [--update] [--force] [--setup] [--model-setup] [--sandbox-setup] [--memory-setup]
+                 [--update] [--force] [--setup] [--doctor] [--model-setup] [--sandbox-setup] [--memory-setup]
                  [--libreoffice-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
@@ -27,6 +27,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mode {readonly,full-auto}` | Permission mode at startup. Plan mode is not settable here — start it with `/plan` |
 | `--full-auto` | Start in full-auto (no per-action prompts) |
 | `--setup` | Interactive config wizard, then exit |
+| `--doctor` | Check provider, model, configuration and optional capabilities without entering the REPL; prints fixes and exits non-zero on a failing check |
 | `--model-setup` | Configure a model provider profile |
 | `--sandbox-setup` | Install the native sandbox runtime |
 | `--memory-setup` | Install the mem0 memory backend deps and set `memory_engine=mem0`; switch back with `/memory engine native` |
@@ -41,13 +42,13 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--web-port PORT` | Web UI server port (default `8180`) |
 | `--web-host HOST` | Web UI bind host (default `127.0.0.1`); loopback only |
 | `--web-dev` | Run the web backend without serving built frontend files; use with Vite |
-| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment. |
+| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment; the benchmark adapter supplies a disposable task container. |
 | `--logs [MODE]` | Print the operational log; pass `follow` to tail it in real time. Bare `--logs` prints the last `--limit` lines and exits |
 | `-n`, `--limit LIMIT` | With `--logs`: number of lines to print (default 50) |
 | `--level LEVEL` | With `--logs`: filter by level (`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`) |
 | `--subsystem SUBSYSTEM` | With `--logs`: substring filter on subsystem name |
 | `--json` | With `--logs`: emit raw JSONL instead of the human-formatted view |
-| `--update` | Pull latest code + reinstall, then exit |
+| `--update` | Update from the public `AGENT8088-v1.2` branch and reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove the install dir, shim, PATH/config lines, and crontab/scheduled-task entries, then exit. Trace logs and the WhatsApp session dir are kept unless `--workspace`/`--all` is also passed |
 | `--workspace` | With `--uninstall`: also remove trace logs and the WhatsApp session directory |
@@ -133,7 +134,11 @@ agent8088 --uninstall --all --yes --non-interactive   # fully unattended, full r
 ## Slash commands
 
 **45 registered commands** (`COMMANDS` in `src/agent8088/cli.py`). Prefix-matched,
-so `/mo` offers `/mode`, `/model`, `/models`.
+so `/mo` offers `/mode`, `/model`, `/models`. A mistyped command names the
+nearest real one: `/seatch` → `unknown command: /seatch — did you mean /search?`.
+
+The agent knows this list too, so "what does /local do?" is answered from it
+rather than guessed (see [Tools](04-tools.md)).
 
 Pasting a bare file path into the prompt — nothing else on the line — reads it
 immediately: images go to a vision model, documents are extracted to text.
@@ -153,7 +158,7 @@ sensitive-file floor still applies unconditionally.
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
 | `/save <file>` | Export conversation + trace to JSON (mode `0600`) |
-| `/status` | Model, mode, tools, skills, token usage |
+| `/status` | Model, mode, tools, skills, token usage; `Limited` rows for anything on a fallback ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)) |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
 
@@ -229,7 +234,7 @@ sensitive-file floor still applies unconditionally.
 | `/capabilities` | What the agent can do and which guardrails are in force |
 | `/cost [on\|off\|<task_id>]` | Local telemetry summary of model cost/usage; `on`/`off` toggles recording, persisted to `config.txt` |
 | `/review` | Bare: list stored reviews. With arguments: launch `review_code` from the CLI — same tool the model calls, see [`review_code`](04-tools.md#review_code) |
-| `/doctor [--fix]` | Environment health check; `--fix` repairs a broken web-search install |
+| `/doctor [--fix]` | Environment health check, incl. a row per [reduced mode](13-troubleshooting.md#reduced-modes-and-fallbacks); `--fix` repairs a broken web-search install |
 | `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report |
 | `/trace [on\|off]` | Toggle JSON trace capture |
 | `/verbose` | Toggle verbose output |

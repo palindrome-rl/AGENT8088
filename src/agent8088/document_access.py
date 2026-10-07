@@ -139,7 +139,7 @@ def _extract_text_bounded(path):
                             capture_output=True, timeout=45)
     if result.returncode:
         raise ValueError("Document extraction failed: " + result.stderr.decode("utf-8", errors="replace")[-500:])
-    return result.stdout.decode("utf-8")
+    return documents.ocr_scanned_pages(path, result.stdout.decode("utf-8"))
 
 
 def discard(path):
@@ -348,5 +348,8 @@ if __name__ == "__main__":
         raise SystemExit("Usage: document_access --extract PATH")
     _limit_worker_memory()
     source = Path(sys.argv[2])
-    output = _workbook_text(source) if source.suffix.lower() == ".xlsx" else documents.extract_text(source)
+    # ocr=False: scanned pages are marked, not OCR'd here — OCR runs in its own
+    # worker with a longer timeout than this one (see _extract_text_bounded).
+    output = (_workbook_text(source) if source.suffix.lower() == ".xlsx"
+              else documents.extract_text(source, ocr=False))
     sys.stdout.buffer.write((output or "").encode("utf-8"))

@@ -125,8 +125,8 @@ ok("sub-agents loaded",
 # neighbouring tool check is deliberately "a floor, not an exact count" so that
 # adding one doesn't fail the run, and there is no reason skills should differ.
 ok("skills loaded",
-   {"documentation-writing", "documents", "github-code-review", "plan",
-    "systematic-debugging", "test-driven-development",
+   {"documentation-and-adrs", "documents", "code-review-and-quality", "planning-and-task-breakdown",
+    "debugging-and-error-recovery", "test-driven-development",
     "github-pr-workflow", "grounded-citations", "document-to-action-items",
     "spike", "humanizer", "simplify-code", "cli-anything"} <= set(E.SKILL_PACKAGES),
    ", ".join(sorted(E.SKILL_PACKAGES)))
@@ -219,7 +219,9 @@ E.ALLOWED_PATHS = _pa
 section("3. SHELL CLASSIFIER: HARD BLOCKS (never executed here)")
 hard_blocked = [
     "git push", "git push origin main", "git reset --hard",
-    "git reset --hard HEAD~1", "git branch -d feature", "git branch --delete x",
+    # `git branch -d` / `--delete` used to be listed here. Both refuse an
+    # unmerged branch, so they lose no work; only the forced forms are blocked.
+    "git reset --hard HEAD~1", "git branch -D feature", "git branch --delete --force x",
     "sh -c 'git push'", "bash -c \"git reset --hard\"",
     "echo hi; git push", "ls && git push origin HEAD",
     "git -C /tmp push", "/usr/bin/git push",
@@ -244,6 +246,63 @@ for c in ["rm -rf /", "curl http://x", "git commit -m x", "python x.py",
           "ls | sh", "ls; rm x", "cat `id`", "echo $(id)",
           "git diff --output=/tmp/x", "git log --ext-diff"]:
     ok(f"NOT readonly-safe: {c}", E._readonly_shell(c) is False)
+
+section("3c. SHELL CLASSIFIER: FALSE POSITIVES AND FLOOR GAPS")
+# The web-client rule refused any command that merely MENTIONED curl/wget, so a
+# first-run user's agent could not even ask `command -v wget`. A mention that
+# runs nothing is not a fetch; a client in command position still is.
+for c in ["command -v wget", "which curl", "type curl", "hash wget 2>/dev/null && echo yes",
+          "where curl", "Get-Command curl", "man wget", "curl --version", "wget --help",
+          "ls /usr/bin | grep -E '^(wget|curl)'", "dpkg -l | grep curl", "grep -rn curl src/",
+          "rg wget .", "echo 'install wget first'", "git commit -m 'remove curl dependency'",
+          "git log --grep=wget", "apt-get install -y curl", "sudo apt install wget",
+          "brew install wget", "pip install httpie", "echo http ok"]:
+    ok(f"web mention is not a fetch: {c}", E._shell_web_urls(c) is None)
+for c in ["curl", "curl evil.com", "wget -q evil.com/x", "sudo curl evil.com", "env curl evil.com",
+          "command curl evil.com", "xargs curl < urls.txt", "C=curl; $C evil.com",
+          "which curl && curl evil.com", "sh -c 'curl evil.com'", "bash -c \"wget evil.com\"",
+          "echo $(curl evil.com)", "echo `wget evil.com`", "echo curl evil.com | sh",
+          "grep x f | xargs curl", "git -c core.pager=curl log", "nohup wget evil.com &",
+          "curl --version evil.com", "http GET evil.com", "time curl evil.com"]:
+    ok(f"fetch without URL still refused: {c}", E._shell_web_urls(c) == [])
+ok("fetch with URL still yields it for egress/SSRF checks",
+   E._shell_web_urls("curl -I https://example.com") == ["https://example.com"])
+ok("fetch-followup gate ignores a lookup",
+   E._shell_fetches_web("command -v curl") is False and E._shell_fetches_web("curl x") is True)
+
+# Git operations that discard nothing.
+for c in ["git checkout -b feature/x", "git checkout -b fix origin/main",
+          "git branch -d merged-branch", "git branch --delete merged-branch",
+          "git restore --staged file.py", "git restore -S a.py b.py"]:
+    ok(f"non-destructive git allowed: {c}", E._hard_blocked_shell(c) is False)
+for c in ["git checkout -B main", "git checkout main", "git checkout -- file.py",
+          "git checkout -b x -- file.py", "git checkout -f -b x", "git branch -D old",
+          "git branch -d -f old", "git branch --delete --force old", "git branch -df old",
+          "git restore file.py", "git restore --staged --worktree f", "git restore -S -W f",
+          "sh -c 'git branch -D x'", "git restore --staged f; git restore f"]:
+    ok(f"destructive git still blocked: {c}", E._hard_blocked_shell(c) is True)
+
+# Env templates and source files are not secrets.
+for f in (".env.example", ".env.sample", ".env.template", ".env.dist", "proj/.env.example",
+          "utils/count_tokens.py", "src/auth/reset_password.py", "tests/test_api_keys.py",
+          "models/primary_key.ts", "docs/rotate_secrets.md"):
+    ok(f"not sensitive: {f}", E._is_sensitive_path(f) is False)
+for f in (".env", ".env.local", ".envrc", "~/.ssh/.env.example", "client_secret.json",
+          "api_key.txt", "github_token", "AUTH_TOKEN.yaml", "deploy.key", "~/.aws/x.py"):
+    ok(f"still sensitive: {f}", E._is_sensitive_path(f) is True)
+ok("shell may read an env template", E._hard_blocked_shell("cat .env.example") is False)
+ok("shell may not create .env from it", E._hard_blocked_shell("cp .env.example .env") is True)
+
+# Wipe-the-world variants the unrecoverable floor missed.
+for c in ["rm -rf ~/", "rm -rf ~/*", "rm -rf $HOME", "rm -rf \"$HOME\"", "rm -rf ${HOME}",
+          "rm -fr $HOME/", "rm -rf /*", "rm -rf /home", "rm -rf /usr/", "rm -rf /etc",
+          "sudo rm -rf /var", "sh -c 'rm -rf ~/'", "rm -rf /Users", "chmod -R 777 /",
+          "chown -R nobody /", "sudo chmod -R 000 /*"]:
+    ok(f"unrecoverable: {c}", E._hard_blocked_shell(c) is True)
+for c in ["rm -rf /tmp/horse-race", "rm -rf ./build dist", "rm -rf node_modules",
+          "rm -rf ~/projects/old", "rm -rf $HOME/.cache/pip", "rm -rf /home/u/tmp",
+          "chmod -R 755 ./dist", "chown -R u /srv/app", "echo 'rm -rf ~/'"]:
+    ok(f"ordinary delete allowed: {c}", E._hard_blocked_shell(c) is False)
 
 # =================================================== 4. PERMISSION SYSTEM
 section("4. PERMISSION MODES")
@@ -327,8 +386,8 @@ expected_tools = {
     "create_document": "write_text",
     "convert_document": "write_text",
 }
-ok(f"exactly the expected {len(expected_tools)} tools", set(E.TOOL_NAMES) == set(expected_tools),
-   str(set(E.TOOL_NAMES) ^ set(expected_tools)) if set(E.TOOL_NAMES) != set(expected_tools) else "")
+ok(f"all {len(expected_tools)} required tools are available", set(expected_tools) <= set(E.TOOL_NAMES),
+   str(set(expected_tools) - set(E.TOOL_NAMES)))
 for name, mode in sorted(expected_tools.items()):
     spec = E.TOOL_SPECS.get(name, {})
     ok(f"{name}: mode={mode}, has description",
@@ -340,7 +399,7 @@ ok("every tool appears in TOOLS_DEF", _def_names == set(E.TOOL_NAMES),
    str(_def_names ^ set(E.TOOL_NAMES)) if _def_names != set(E.TOOL_NAMES) else "")
 ok("every tool rendered into prompt",
    all(f"{n}(" in E.SYSTEM_PROMPT for n in E.TOOL_NAMES))
-ok("unknown tool handled", E.run_tool("no_such_tool", {}) == "Unknown tool: no_such_tool")
+ok("unknown tool handled", "Unknown tool: no_such_tool" in E.run_tool("no_such_tool", {}))
 
 section("5b. TOOL ALIASES")
 for alias, canonical in [("bash", "execute_shell"), ("sh", "execute_shell"),
@@ -354,6 +413,49 @@ for alias, canonical in [("bash", "execute_shell"), ("sh", "execute_shell"),
     ok(f"alias {alias} -> {canonical}", E._resolve_tool_name(alias) == canonical)
 ok("canonical names pass through", E._resolve_tool_name("execute_shell") == "execute_shell")
 ok("unknown names pass through", E._resolve_tool_name("zzz") == "zzz")
+
+section("5c. SELF-DESCRIPTION — commands the user types, tools by name")
+# Asked "what does /local do", the model said no such command existed: it is a
+# real CLI command, and nothing told the model its own front end's commands.
+_fc = dict(E.FRONTEND_COMMANDS)
+E.register_frontend_commands({})
+ok("no front end registered: /local is unknown", "No /local command" in E.describe_tool("/local"))
+E.register_frontend_commands({
+    "local": ("/local [check|list|available [query]|pull <name>|remove <name>]",
+              "Probe hardware, show installed Ollama models or browse pullable ones"),
+    "search": ("/search [status|use|setup|stop]", "Inspect and configure web-search backends"),
+})
+d = E.describe_tool("/local")
+ok("describe_tool explains a command", "Ollama" in d and "/local [check" in d, d[:80])
+ok("...and says it is typed by the user, not called",
+   "not a tool you can call" in d)
+ok("bare name of a command works too", "Ollama" in E.describe_tool("local"))
+ok("a typo suggests the real command", "/search" in E.describe_tool("/seatch"))
+ok("describe_capabilities lists the commands",
+   "/local" in E.describe_capabilities() and "Commands the user can type" in E.describe_capabilities())
+
+def _facts(text, extra=()):
+    msgs = [*extra, {"role": "user", "content": text}]
+    prompt = E._mentioned_capabilities_prompt(msgs, "BASE")
+    return prompt() if callable(prompt) else prompt
+
+f = _facts("what does /local do")
+ok("a mentioned command brings its facts into this turn", "Ollama" in f and f.startswith("BASE"), f[-80:])
+ok("a typo'd command is named as one", "/search" in _facts("what does /seatch do"))
+for text in ("what is in /usr/local/bin", "open https://example.com/local", "what's in /etc",
+             "list ~/local files", "hello there"):
+    ok(f"no facts for: {text}", _facts(text) == "BASE")
+f = _facts("what task can I perform with cli anything")
+ok("a tool family named in words lists its tools", "cli_anything_status" in f, f[-80:])
+ok("...at most six of them", f.count("- tool `cli_anything_") <= 6)
+ok("an exact tool name brings its description", "read_text" in _facts("what does read_text do"))
+ok("...and how to call it", "read_text(" in _facts("what does read_text do"),
+   _facts("what does read_text do")[-120:])
+ok("tool output never triggers it", _facts("thanks", extra=(
+    {"role": "user", "content": E._TOOL_RESULT_PREFIX + "see /local"},)) == "BASE")
+many = "/local /search " + " ".join(list(E.TOOL_SPECS)[:20])
+ok("capped at eight entries", _facts(many).count("\n- ") <= 8)
+E.register_frontend_commands(_fc)
 
 # ================================================ 6. TOOL EXECUTION (readonly)
 section("6. TOOL EXECUTION — readonly-safe tools, real runs")
@@ -397,12 +499,15 @@ with with_mode("readonly"):
         r = E._exec_sandbox_command("ls /workspace | head -1", 20)
         ok("workspace IS mounted into the container", bool(r.strip()), r.strip()[:30])
 
-    r = E.run_tool("execute_shell", {"command": "echo hello_verify"})
-    ok("execute_shell allows a readonly-safe command", "hello_verify" in r
-       or "ESCALATION" in r, r[:50])
-    r = E.run_tool("execute_shell", {"command": "rm -rf /tmp/nothing_here_xyz"})
-    ok("execute_shell escalates a mutating command in readonly",
-       "ESCALATION_REQUEST" in r, r[:45])
+    if E._resolve_sandbox_backend() == "unavailable":
+        skip("readonly shell execution and escalation", "no sandbox backend available")
+    else:
+        r = E.run_tool("execute_shell", {"command": "echo hello_verify"})
+        ok("execute_shell allows a readonly-safe command", "hello_verify" in r
+           or "ESCALATION" in r, r[:50])
+        r = E.run_tool("execute_shell", {"command": "rm -rf /tmp/nothing_here_xyz"})
+        ok("execute_shell escalates a mutating command in readonly",
+           "ESCALATION_REQUEST" in r, r[:45])
     r = E.run_tool("execute_shell", {"command": "git push"})
     ok("execute_shell hard-blocks git push", "forbidden by Agent8088" in r, r[:50])
 
@@ -570,6 +675,37 @@ ok("docker mounts the workspace", "type=bind" in argv_s and "/workspace" in argv
 ok("docker runs python -c for code", "python" in argv_s and "-c" in argv_s)
 ok("invalid image name rejected",
    "invalid container image" in E._exec_docker_command("x", 5, image="bad;rm -rf /"))
+# The native backend runs the snippet through the platform shell, and cmd.exe
+# ends a command at its first newline: multi-line code ran only `import sys`
+# and reported "Command completed." with no output.
+_snippet = getattr(E, "_python_snippet_command", lambda code: "")("import sys\nprint('second ' + 'line')")
+_ran = subprocess.run(_snippet, shell=True, capture_output=True, text=True) if _snippet else None
+ok("multi-line python snippet survives the shell",
+   bool(_ran) and "second line" in _ran.stdout, repr(_ran.stdout[:80]) if _ran else "no helper")
+
+# A run spent ~12 turns probing which folders the sandbox lets it write
+# (uv cache, venv, downloaded interpreter) because "Access is denied" alone
+# does not say the boundary is deliberate or where it is.
+_uv_denied = ("error: Failed to initialize cache at `C:\\x\\uv\\cache`\n  Caused by: failed "
+              "to open file: Access is denied. (os error 5)\nCommand exited with status 2.")
+_explain = getattr(E, "_explain_sandbox_denial", lambda text, workspace: text)
+ok("sandbox access denial names the writable folder",
+   str(E.ARTIFACTS_ROOT) in _explain(_uv_denied, E.ARTIFACTS_ROOT)
+   and "install" in _explain(_uv_denied, E.ARTIFACTS_ROOT))
+ok("sandbox denial note skips unrelated output",
+   _explain("Command completed.", E.ARTIFACTS_ROOT) == "Command completed."
+   and "[sandbox]" not in _explain("git@x: Permission denied (publickey).", E.ARTIFACTS_ROOT))
+# Only the filesystem's wording counts: an API or registry that says
+# "Permission denied" is not the sandbox, and the note would mislead.
+for _fs_denied in ("PermissionError: [Errno 13] Permission denied: 'C:\\\\venv\\\\x'",
+                   "mkdir: cannot create directory '/opt/x': Permission denied",
+                   "bash: /usr/local/bin/tool: Permission denied"):
+    ok(f"filesystem denial gets the note: {_fs_denied[:40]}",
+       "[sandbox]" in _explain(_fs_denied, E.ARTIFACTS_ROOT))
+for _api_denied in ('{"message": "Permission denied"}',
+                    "npm error 403 Forbidden - PUT https://registry.npmjs.org/x - Permission denied"):
+    ok(f"API denial gets no sandbox note: {_api_denied[:40]}",
+       "[sandbox]" not in _explain(_api_denied, E.ARTIFACTS_ROOT))
 
 section("8c. SANDBOX — real execution")
 E.SANDBOX_BACKEND = prev_backend
@@ -705,38 +841,209 @@ E._docker_available = _da
 E._native_sandbox_broken = _nsb
 E.SANDBOX_BACKEND = prev_backend
 
+section("8f. SANDBOX — repeated network failures point at the setting")
+# A first-run user's agent spent its whole turn trying to download a file the
+# sandbox could never reach: the network is closed unless sandbox_allowed_domains
+# names the host. Telling the model up front makes it give up before trying, so
+# the note comes only after the third failure, once per turn.
+_rb, _ad = E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS
+E._resolve_sandbox_backend = lambda: "native"
+E.SANDBOX_ALLOWED_DOMAINS = []
+E.reset_turn_counters()
+dns_fail = "curl: (6) Could not resolve host: onfe.itch.io\nCommand exited with status 6."
+fetch = 'curl -sL -o onfe.zip "https://onfe.itch.io/pack?key=sk-supersecret1234567890"'
+notes = [E._sandbox_network_note(dns_fail, fetch) for _ in range(4)]
+ok("silent for the first two failures", notes[0] == "" and notes[1] == "")
+ok("third failure names the setting", "sandbox_allowed_domains" in notes[2], notes[2][:60])
+ok("note names the domain the task needs", "onfe.itch.io" in notes[2])
+ok("note leaks no URL path, query or secret",
+   "sk-supersecret" not in notes[2] and "pack?key" not in notes[2])
+ok("note tells the model to ask the user, not work around it",
+   "user" in notes[2].lower() and "config.txt" in notes[2])
+ok("once per turn", notes[3] == "")
+E.reset_turn_counters()
+ok("reset each turn", [E._sandbox_network_note(dns_fail, fetch) for _ in range(3)][2] != "")
+E.reset_turn_counters()
+for failure in ("<urlopen error [Errno -3] Temporary failure in name resolution>",
+                "wget: unable to resolve host address 'onfe.itch.io'",
+                "curl: (56) CONNECT tunnel failed, response 403",
+                "Failed to establish a new connection: [Errno 101] Network is unreachable",
+                "getaddrinfo ENOTFOUND registry.npmjs.org",
+                "System.Net.Sockets.SocketException: No such host is known.",
+                "Invoke-WebRequest : The remote name could not be resolved: 'onfe.itch.io'",
+                "[WinError 10013] An attempt was made to access a socket in a way forbidden "
+                "by its access permissions"):
+    E.reset_turn_counters()
+    ok(f"counts as a network failure: {failure[:45]}",
+       [E._sandbox_network_note(failure, "x") for _ in range(3)][2] != "")
+E.reset_turn_counters()
+ok("ordinary failures do not count",
+   all(E._sandbox_network_note("Permission denied\nCommand exited with status 1.", "x") == ""
+       for _ in range(5)))
+E.reset_turn_counters()
+E._resolve_sandbox_backend = lambda: "docker"
+docker_note = [E._sandbox_network_note(dns_fail, fetch) for _ in range(3)][2]
+ok("docker fallback says why, and how to get the native sandbox",
+   "docker" in docker_note.lower() and "--sandbox-setup" in docker_note, docker_note[:80])
+# Wired into run_tool, after the untrusted-content wrapper so it reads as the
+# harness speaking, not as command output the model is told to distrust.
+E._resolve_sandbox_backend = lambda: "native"
+E.reset_turn_counters()
+_es = E._exec_shell_command
+E._exec_shell_command = lambda command, timeout=25, image="": (
+    "urllib.error.URLError: <urlopen error [Errno -3] Temporary failure in name resolution>")
+with with_mode("full-auto"):
+    runs = [E.run_tool("execute_shell", {"command": (
+        f"python3 -c \"import urllib.request as u; u.urlopen('https://onfe.itch.io/{i}')\"")})
+        for i in range(3)]
+E._exec_shell_command = _es
+ok("run_tool adds the note on the third failure", "sandbox_allowed_domains" in runs[2]
+   and "sandbox_allowed_domains" not in runs[1], runs[2][-80:])
+ok("note sits outside the untrusted wrapper",
+   runs[2].rfind("sandbox_allowed_domains") > runs[2].rfind("END_UNTRUSTED_CONTENT"))
+E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS = _rb, _ad
+E.reset_turn_counters()
+
+section("8g. CONFIG BLOCKERS — the third refusal names who can change it")
+# Same rule as 8f for every refusal a config.txt setting causes: silent twice,
+# then one note naming the setting. Credential and fixed-safety refusals never
+# name a way to unlock them.
+def third(results):
+    return results[0] == results[0].split("[agent8088]")[0] and "[agent8088]" not in results[1] \
+        and "[agent8088]" in results[2]
+
+E.reset_turn_counters()
+_bp, _pa = E.BLOCKED_PATHS, E.ALLOWED_PATHS
+E.BLOCKED_PATHS, E.ALLOWED_PATHS = [(TMP / "locked").resolve()], [TMP]
+with with_mode("edit"):
+    r = [E.run_tool("write_file", {"filename": str(TMP / "locked" / f"f{i}.txt"), "content": "x"})
+         for i in range(3)]
+E.BLOCKED_PATHS, E.ALLOWED_PATHS = _bp, _pa
+ok("blocked_paths: silent twice, then a note", third(r), r[2][-90:])
+ok("blocked_paths note names the setting and config.txt",
+   "blocked_paths" in r[2] and "config.txt" in r[2])
+
+E.reset_turn_counters()
+_deny, _allow = E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS
+E._USER_DENY_GLOBS = ["npm publish*"]
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"npm publish --tag t{i}"}) for i in range(3)]
+ok("deny_commands: note names the user's own rule", third(r) and "deny_commands" in r[2], r[2][-90:])
+E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS = [], ["ls*"]
+E.reset_turn_counters()
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"whoami /{i}"}) for i in range(3)]
+ok("allow_commands: note names the allowlist", third(r) and "allow_commands" in r[2], r[2][-90:])
+E._USER_DENY_GLOBS, E._USER_ALLOW_GLOBS = _deny, _allow
+
+E.reset_turn_counters()
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"git push --force origin b{i}"}) for i in range(3)]
+ok("built-in rule: note says no setting changes it",
+   third(r) and "fixed safety rule" in r[2] and "deny_commands" not in r[2], r[2][-90:])
+
+E.reset_turn_counters()
+secret_file = TMP / ".env"
+secret_file.write_text("K=v")
+_pa = E.ALLOWED_PATHS
+E.ALLOWED_PATHS = [TMP]
+r = [E.run_tool("read_text", {"filename": str(secret_file)}) for _ in range(3)]
+E.ALLOWED_PATHS = _pa
+secret_file.unlink(missing_ok=True)
+ok("credential file: note says protected", third(r) and "protected" in r[2], r[2][-90:])
+ok("credential note never names the unlock setting", "allowed_sensitive_files" not in r[2])
+
+E.reset_turn_counters()
+_ea = E.EGRESS_ALLOWED_DOMAINS
+E.EGRESS_ALLOWED_DOMAINS = ["example.com"]
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="https://evil.example.net/x?token=abc123")
+note = E._take_blocker_note()
+E.EGRESS_ALLOWED_DOMAINS = _ea
+ok("allowed_domains: note names setting and host", "allowed_domains" in note
+   and "evil.example.net" in note, note[:90])
+ok("egress note leaks no URL path or query", "token=abc123" not in note and "/x" not in note)
+E.reset_turn_counters()
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="http://192.168.1.10:8888/search?q=x")
+note = E._take_blocker_note()
+ok("LAN service: note names ssrf_allow_hosts with host:port",
+   "ssrf_allow_hosts=192.168.1.10:8888" in note, note[:90])
+E.reset_turn_counters()
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="egress_policy",
+             detail="http://169.254.169.254/latest/meta-data/")
+note = E._take_blocker_note()
+ok("cloud metadata address is never offered as allowable",
+   "ssrf_allow_hosts" not in note and "fixed safety rule" in note, note[:90])
+
+E.reset_turn_counters()
+_es = E._exec_shell_command
+E._exec_shell_command = lambda command, timeout=25, image="": f"Command timed out after {timeout}s."
+_rb = E._resolve_sandbox_backend
+E._resolve_sandbox_backend = lambda: "native"
+with with_mode("full-auto"):
+    r = [E.run_tool("execute_shell", {"command": f"findstr /s TODO part{i}"}) for i in range(3)]
+E._exec_shell_command, E._resolve_sandbox_backend = _es, _rb
+ok("timeouts: third one names max_tool_timeout_seconds and /limits",
+   third(r) and "max_tool_timeout_seconds" in r[2] and "/limits" in r[2], r[2][-90:])
+
+E.reset_turn_counters()
+log = TMP / "build.log"
+log.write_text("Command timed out after 5s.")
+_pa = E.ALLOWED_PATHS
+E.ALLOWED_PATHS = [TMP]
+r = [E.run_tool("read_text", {"filename": str(log)}) for _ in range(3)]
+E.ALLOWED_PATHS = _pa
+ok("reading a file that mentions a timeout is not a timeout", "[agent8088]" not in r[2], r[2][-60:])
+
+ok("turn-limit footer tells the user how to raise it",
+   "/maxturns" in E._turn_limit_reason(10) and "max_turns" in E._turn_limit_reason(10))
+
+E.reset_turn_counters()
+for _ in range(5):
+    E._audit("tool_call", decision="denied", reason="blocked_path", detail="/p")
+notes = [E._take_blocker_note() for _ in range(2)]
+ok("one note per kind per turn, taken once", notes[0] != "" and notes[1] == "")
+for _ in range(3):
+    E._audit("tool_call", decision="denied", reason="readonly_floor", detail="x")
+ok("refusals with no setting behind them stay silent", E._take_blocker_note() == "")
+E.reset_turn_counters()
+
 # ============================================================ 9. PROVIDERS
 section("9. PROVIDERS")
 provs = E.load_providers({
     "provider.openai.base_url": "https://api.openai.com/v1",
     "provider.openai.model": "gpt-4o",
     "provider.openai.api_key": "sk-verysecretkey123456",
-    "provider.lan.base_url": "http://192.0.2.10:8080/v1/chat/completions",
-    "provider.lan.model": "local-35b",
+    "provider.example.base_url": "http://192.0.2.10:8080/v1/chat/completions",
+    "provider.example.model": "example-model",
     "provider.broken.model": "no-url",
     "unrelated": "x",
 })
-ok("parses providers", set(provs) == {"openai", "lan"}, ", ".join(sorted(provs)))
+ok("parses providers", set(provs) == {"openai", "example"}, ", ".join(sorted(provs)))
 ok("drops provider without base_url", "broken" not in provs)
 ok("normalizes /chat/completions suffix",
-   provs["lan"]["base_url"] == "http://192.0.2.10:8080/v1", provs["lan"]["base_url"])
+   provs["example"]["base_url"] == "http://192.0.2.10:8080/v1", provs["example"]["base_url"])
 ok("litellm provider allowed without base_url",
    "claude" in E.load_providers({"provider.claude.api_mode": "litellm",
                                  "provider.claude.model": "anthropic/claude"}))
 builtins = E.load_providers({}, include_builtins=True)
 ok("builtins seed many providers", len(builtins) >= 10, f"{len(builtins)} providers")
-ok("anthropic excluded from builtins", "anthropic" not in builtins)
+ok("anthropic available in builtins", "anthropic" in builtins)
 names = P.builtin_provider_names()
-ok("builtin catalog ordered and complete", names[0] == "ollama" and "copilot" in names,
+ok("builtin catalog ordered and complete", names[0] == "ollama" and set(names) == set(builtins),
    f"{len(names)} builtins")
 
 _pp = E.PROVIDERS
 E.PROVIDERS = provs
 c, m = E.get_client("openai")
 ok("get_client for named provider", m == "gpt-4o" and "api.openai.com" in str(c.base_url))
-os.environ["AGENT8088_PROVIDER"] = "lan"
+os.environ["AGENT8088_PROVIDER"] = "example"
 _, m = E.get_client()
-ok("env var selects provider", m == "local-35b")
+ok("env var selects provider", m == "example-model")
 del os.environ["AGENT8088_PROVIDER"]
 _, m = E.get_client("ghost")
 ok("unknown provider falls back", bool(m), m)
@@ -843,6 +1150,27 @@ for prompt in ("hello how are you", "read notes.txt and summarize",
     ok(f"pre-flight allows: {prompt[:34]}",
        E._preflight_refusal([{"role": "user", "content": prompt}]) is None)
 
+section("11a. CONTROLLER REMINDERS")
+from agent8088.trajectory import TrajectoryState
+# A run answered each "no fresh verification evidence" reminder by writing a
+# new verification script; every write re-armed the reminder, so it fired 4
+# times and the agent kept producing low-value checks instead of finishing.
+_traj = TrajectoryState(None, goal="validate the paper", message_count=1)
+_nudges = 0
+for _ in range(5):
+    _traj.after_tool(_traj.before_tool("write_file"), "Wrote 10 bytes", failed=False,
+                     blocked=False, mutated=True, path="check.py")
+    _nudges += _traj.request_verification()
+ok("verification reminder is capped per task", _nudges <= 2, f"{_nudges} reminders")
+ok("unverified change is still disclosed after the cap", _traj.needs_verification())
+# The cap is per request. A request that ends unverified keeps its state for
+# the next message (it is unresolved), and the spent count must not come
+# with it, or every later request in the session gets no reminder at all.
+_next = TrajectoryState(_traj.data, goal="now fix the parser", message_count=3)
+_next.after_tool(_next.before_tool("write_file"), "Wrote 10 bytes", failed=False,
+                 blocked=False, mutated=True, path="parser.py")
+ok("the next request gets its own reminders", _next.request_verification())
+
 section("11b. TOOL-CALL PARSING")
 ok("parses FUNCTION/ARGS form",
    E.find_tool_calls('✿FUNCTION✿: calculate ✿ARGS✿: {"expression":"1"}')[0]["name"] == "calculate")
@@ -853,6 +1181,30 @@ ok("parses loose FUNCTION with no args",
 ok("resolves alias while parsing",
    E.find_tool_calls('✿FUNCTION✿: bash ✿ARGS✿: {"command":"ls"}')[0]["name"] == "execute_shell")
 ok("ignores unknown tool names", E.find_tool_calls('✿FUNCTION✿: current_time') == [])
+# Shapes glm-5.3 sent as native arguments after seeing ✿ARGS✿ in its history:
+# the real object nested under an "ARGS" key, inside a marker-prefixed key, or
+# inside a marker-prefixed value. Each surfaced as "called with no arguments".
+for label, wrapped in (
+        ("ARGS key", '{"ARGS": "{\\"command\\": \\"dir\\"}"}'),
+        ("marker key", '{"\\u273fARGS\\u273f: {\\"command\\": \\"dir\\"}": ""}'),
+        ("marker value", '{"": "ARGS\\u273f: {\\"command\\": \\"dir\\"}"}')):
+    ok(f"unwraps ARGS envelope ({label})",
+       E.find_tool_calls(f"✿FUNCTION✿: execute_shell ✿ARGS✿: {wrapped}")[0]["arguments"]
+       == {"command": "dir"})
+def _loads_or_none(raw):
+    try:
+        return E._loads_tool_args(raw)
+    except ValueError:
+        return None
+ok("args repair keeps escaped backslashes and quotes intact",
+   _loads_or_none('{"filename": "C:\\\\Users\\\\a.py", "new_string": "x = o[\\\'k\\\'] + \\"q\\""}')
+   == {"filename": "C:\\Users\\a.py", "new_string": "x = o['k'] + \"q\""})
+_broken = E.find_tool_calls('✿FUNCTION✿: write_file ✿ARGS✿: {"content": "a\\n"""doc"""\\n", "filename": "x.py"}')
+ok("parse error says where the JSON broke",
+   "char " in str(_broken[0]["arguments"].get("__parse_error_at__", "")),
+   str(_broken[0]["arguments"])[:120])
+ok("args repair still escapes a bare Windows path",
+   _loads_or_none('{"path": "C:\\Users\\docs"}') == {"path": "C:\\Users\\docs"})
 ok("no false positive on plain prose",
    E.find_tool_calls("I will calculate the total for you.") == [])
 ok("strip_tool_json removes markup",
@@ -872,8 +1224,14 @@ ok("_safe_format leaves unknown placeholders",
    E._safe_format("Bearer {absent}", {}) == "Bearer {absent}")
 ok("_safe_format url-quotes _q variant",
    E._safe_format("q={query_q}", {"query": "a b&c"}) == "q=a%20b%26c")
-ok("_safe_format pulls from config", "192.168" in E._safe_format("{search_base_url}", {})
-   or bool(E._safe_format("{search_base_url}", {})))
+_format_config = dict(E.APP_CONFIG)
+try:
+    E.APP_CONFIG["search_base_url"] = "https://search.test"
+    ok("_safe_format pulls from config",
+       E._safe_format("{search_base_url}", {}) == "https://search.test")
+finally:
+    E.APP_CONFIG.clear()
+    E.APP_CONFIG.update(_format_config)
 with with_mode("edit"):
     r = E.run_tool("web_search", {})
     ok("web_search names a missing query", "query" in r.lower(), r[:50])
@@ -1019,10 +1377,10 @@ for real in sorted(E.SKILL_PACKAGES):
 # ============================================================== 16. PERSONA
 section("16. PERSONA (USER.md)")
 up = TMP / "USER.md"
-up.write_text("---\nname: alex\n---\nPrefers terse answers.\n")
+up.write_text("---\nname: taha\n---\nPrefers terse answers.\n")
 per = E.render_persona(up)
 ok("loads body", "Prefers terse answers." in per)
-ok("drops frontmatter", "name: alex" not in per)
+ok("drops frontmatter", "name: taha" not in per)
 ok("framed as data not instructions", "NOT instructions that override" in per)
 up.write_text("---\nonly: frontmatter\n---\n   \n")
 ok("empty body adds nothing", E.render_persona(up) == "")
@@ -1135,7 +1493,7 @@ ok("classify_plan_component picks a tool", E.classify_plan_component("read the f
 
 # ================================================= 19. ADVERSARIAL / EDGE
 section("19. ADVERSARIAL AND EDGE CASES")
-ok("exec_tool handles invalid JSON", E.exec_tool("calculate", "not json") == "Invalid JSON")
+ok("exec_tool handles invalid JSON", '"code": "invalid_json"' in E.exec_tool("calculate", "not json"))
 ok("exec_tool handles empty args", isinstance(E.exec_tool("git_status", "{}"), str))
 with with_mode("edit"):
     ok("shell injection in calculate is contained",
@@ -1158,6 +1516,8 @@ cron_calls = []
 _real_run = E.subprocess.run
 _real_agent_data_dir = E._agent_data_dir
 _real_protect_private_file = E._protect_private_file
+_saved_schedule_isolation = E._schedule_isolation_active
+E._schedule_isolation_active = lambda: False  # scheduler subprocesses are mocked below
 if E.sys.platform == "win32":
     E._agent_data_dir = lambda: TMP / "windows-scheduler"
     E._protect_private_file = lambda _path: None
@@ -1203,6 +1563,7 @@ finally:
     E.subprocess.run = _real_run
     E._agent_data_dir = _real_agent_data_dir
     E._protect_private_file = _real_protect_private_file
+    E._schedule_isolation_active = _saved_schedule_isolation
 ok("real crontab was never modified by this harness", True, "subprocess.run mocked")
 ok("run_agent handles an empty message list",
    isinstance(E._preflight_refusal([]), (str, type(None))))
@@ -1215,10 +1576,10 @@ ok("_redact_secrets handles empty input", E._redact_secrets("") == "")
 section("20. CLI SURFACE")
 from agent8088 import cli as C  # noqa: E402
 expected_cmds = {
-    "help", "tools", "tool", "agents", "agent", "plan", "image", "paste", "skills", "raw",
+    "help", "tools", "tool", "agents", "agent", "plan", "image", "skills", "raw",
     "model", "models", "config", "memory", "status", "doctor", "sandbox", "new",
     "sessions", "resume", "reset", "compact", "history", "trace", "reasoning",
-    "think", "verbose", "usage", "temp", "maxturns", "save", "clear",
+    "verbose", "usage", "temp", "maxturns", "save", "browser", "schedule", "local", "cost",
 }
 missing = sorted(expected_cmds - set(C.COMMANDS))
 ok("all expected CLI commands registered", not missing, f"missing: {missing}" if missing else
@@ -1226,6 +1587,42 @@ ok("all expected CLI commands registered", not missing, f"missing: {missing}" if
 for cmd in sorted(expected_cmds & set(C.COMMANDS)):
     ok(f"/{cmd} is callable", callable(C.COMMANDS[cmd]))
 ok("engine reachable from cli", hasattr(C, "A") or hasattr(C, "engine"))
+ok("CLI registers its commands with the engine",
+   "local" in E.FRONTEND_COMMANDS and "Ollama" in E.FRONTEND_COMMANDS["local"][1])
+# A one-line usage left the model to invent the rest: asked about /memory it
+# said bare /memory lists every fact (it shows the settings) and that forget
+# takes a fact (it takes an id). Every command carries its real usage.
+_names = {name for name, *_ in C.COMMAND_SPECS if name}
+ok("every command has usage details", not (_names - set(C.COMMAND_DETAILS)),
+   sorted(_names - set(C.COMMAND_DETAILS)))
+ok("no details for a command that does not exist", not (set(C.COMMAND_DETAILS) - _names),
+   sorted(set(C.COMMAND_DETAILS) - _names))
+d = E.describe_tool("/memory")
+ok("describe_tool /memory gives the real subcommands",
+   "forget <id>" in d and "search <query>" in d and "settings" in d, d[:120])
+p = E._mentioned_capabilities_prompt([{"role": "user", "content": "what does /memory do"}], "B")
+p = p() if callable(p) else p
+ok("asking about /memory brings its usage into the turn", "forget <id>" in p, p[-120:])
+_lc = C._cmd_local_check
+C._cmd_local_check = lambda: setattr(C, "_local_check_ran", True)
+C._local_check_ran = False
+C.cmd_local("check")
+C._cmd_local_check = _lc
+ok("/local check runs the check it advertises", C._local_check_ran)
+ok("an unknown typed command suggests the near one", "/search" in C._unknown_command_message("seatch"))
+ok("...and stays plain when nothing is near", "did you mean" not in C._unknown_command_message("zzzzqq"))
+try:
+    from agent8088.gateway.runner import GatewayRunner
+    from agent8088.gateway.session import SessionStore
+    from agent8088.gateway.auth import Allowlist
+except ImportError as exc:
+    skip("gateway registers its own commands", f"gateway extra not installed: {exc}")
+else:
+    _cli_commands = dict(E.FRONTEND_COMMANDS)
+    GatewayRunner(SessionStore(str(TMP / "gw")), Allowlist([], session_dir=TMP / "gw"))
+    ok("gateway registers its own commands, not the CLI's",
+       "approve" in E.FRONTEND_COMMANDS and "local" not in E.FRONTEND_COMMANDS)
+    E.register_frontend_commands(_cli_commands)
 ok("save_model_profile never writes a literal key", True, "covered by unit tests")
 
 # =============================================================== SUMMARY

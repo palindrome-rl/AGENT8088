@@ -13,7 +13,7 @@ import { apiFetch } from '@/lib/api'
 
 type ProviderDetail = { label: string; base_url: string; default_model: string; api_key_env: string; has_key: boolean }
 type ProvidersResponse = { configured: string[]; builtins: string[]; active: string; details: Record<string, ProviderDetail> }
-type ModelsResponse = { models: string[] }
+type ModelsResponse = { models: string[]; stale?: boolean; offline?: boolean; reason?: string }
 type ModelSwitchResponse = { ok: boolean; provider?: string; model?: string; error?: string }
 
 export function ModelSwitcher() {
@@ -115,6 +115,11 @@ export function ModelSwitcher() {
           <label htmlFor="header-model-name" className="mb-1 block text-[11px] text-zinc-500">Model</label>
           <input id="header-model-name" list="header-model-options" value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} placeholder={modelsQuery.isLoading ? 'Loading models…' : 'Select or type a model'} className="w-full rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none placeholder:text-zinc-400 focus:border-brand-primary dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-600" />
           <datalist id="header-model-options">{modelsQuery.data?.models.map((model) => <option key={model} value={model} />)}</datalist>
+          {(modelsQuery.data?.stale || modelsQuery.data?.offline) && (
+            <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400" title={modelsQuery.data.reason || undefined}>
+              (offline list{modelsQuery.data.reason ? ` — ${modelsQuery.data.reason}` : ''})
+            </p>
+          )}
           {error && <p role="alert" className="mt-2 text-[11px] text-red-500 dark:text-red-400">{error}</p>}
           <button type="button" disabled={!selectedProvider || !selectedModel || changing} onClick={() => void switchModel()} className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg bg-brand-primary px-2 py-1.5 text-xs font-medium text-white disabled:opacity-40">
             {changing && <Loader2 className="h-3.5 w-3.5 animate-spin" />}Switch model

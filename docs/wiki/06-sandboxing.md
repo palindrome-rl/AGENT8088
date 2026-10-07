@@ -78,6 +78,26 @@ tools* may reach. Shell commands that invoke a web client such as `curl` or
 domain and SSRF policies before the command can run. Both layers apply
 independently.
 
+A command that only *names* a client is not a fetch and needs no URL: lookups
+(`command -v wget`, `which curl`, `curl --version`), text search and printing
+(`grep -rn curl src/`, `echo 'install wget'`), package installs
+(`apt-get install curl`) and git text (`git commit -m 'drop curl'`). The
+exemption is void if anything in the command could run text as a command —
+`sh`, `xargs`, `env`, `sudo` with options, `$(...)`, backticks, a newline — so
+`which curl && curl host`, `env curl host` and `echo curl host | sh` are still
+refused.
+
+A blocked fetch only says the host could not be reached, so a model can spend a
+whole turn on workarounds. After the **third** network failure from sandboxed
+code in one turn, Agent8088 appends one note to the result. It names the setting
+and the hosts the task asked for, then tells the model to stop and let the user
+decide. On the Docker fallback, which has no network at all, it names
+`agent8088 --sandbox-setup` first. The note never includes a URL path, a query
+or any other config value, and the model cannot change `config.txt` itself. It
+is not shown earlier because a small model told about the restriction up front
+tends to give up before trying. This is one case of the general config-blocker
+notes described in [Permissions and security](03-permissions-and-security.md).
+
 ## No unsandboxed fallback
 
 When neither backend is available, Agent8088 refuses shell and code execution
@@ -87,6 +107,16 @@ this requirement.
 Commands start in `artifacts/`, the only project directory they may write. A
 read-only auditor runs tests in a disposable copy, so runtime files created by a
 test disappear afterward and the real workspace remains unchanged.
+
+When a sandboxed command fails with an access error (`Access is denied`,
+`Permission denied`, `os error 5`), the result gets a `[sandbox]` note naming
+the writable folder and saying that creating virtual environments or installing
+packages from the shell will not work. The boundary itself is unchanged; the note
+only stops the model from probing folder after folder to find it.
+
+`run_sandboxed` passes the snippet to Python base64-encoded, because `cmd.exe`
+ends a command at its first newline and would otherwise run only the first line
+of multi-line code.
 
 ## What sandboxing does *not* cover
 
@@ -112,8 +142,4 @@ instead (in `readonly`, `git_status`/`git_diff`/`git_log` ask first).
 
 ## Verifying it works
 
-Run `/sandbox` in the REPL: it reports the resolved backend and whether native
-isolation is `verified`, `unverified` or `failed`. The feature-verification
-script (`scripts/verify_features.py`) and the test suite live on the
-maintainer test checkout, not in this public release branch — see
-[Testing & Verification](12-testing-and-verification.md).
+Run `/sandbox` in the REPL to check the selected backend and verification state. The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).

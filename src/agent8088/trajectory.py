@@ -13,6 +13,7 @@ MAX_EVIDENCE = 6
 
 
 MAX_UNTESTED = 8
+MAX_VERIFICATION_REQUESTS = 2
 
 # Suffixes worth a test. Config, data, docs and markup are excluded because a
 # generated test for them asserts that a file parses, which nobody needed.
@@ -71,6 +72,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "mutation_count": 0,
         "verification": "not_needed",
         "verification_requested": False,
+        "verification_requests": 0,
         "untested_changes": [],
         "tests_requested": False,
         "consecutive_setbacks": 0,
@@ -117,6 +119,10 @@ class TrajectoryState:
         if goal and (not self.data.get("goal") or (message_count > previous_count and not unresolved)):
             self.data.clear()
             self.data.update(_blank(goal, workspace))
+        elif message_count > previous_count:
+            # Unresolved state carries over to the next request; the reminder
+            # budget is per request and must not, or the session goes silent.
+            self.data["verification_requests"] = 0
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -140,6 +146,11 @@ class TrajectoryState:
             self.data["stalled"] = False
         else:
             self.data["consecutive_setbacks"] = int(self.data.get("consecutive_setbacks") or 0) + 1
+        if mutated and path and operation["status"] == "done" and _is_code_path(path):
+            changed = self.data.setdefault("changed_code", [])
+            if path not in changed:
+                changed.append(path)
+                del changed[:-MAX_UNTESTED]
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self.data["verification"] = "pending"
@@ -202,6 +213,10 @@ class TrajectoryState:
             # about different files.
             self.data["tests_requested"] = False
 
+    def changed_code_paths(self) -> list[str]:
+        """Code files this run wrote, newest last."""
+        return list(self.data.get("changed_code") or [])
+
     def untested_paths(self) -> list[str]:
         return list(self.data.get("untested_changes") or [])
 
@@ -224,9 +239,14 @@ class TrajectoryState:
         return self.data.get("verification") == "pending"
 
     def request_verification(self) -> bool:
-        if not self.needs_verification() or self.data.get("verification_requested"):
+        # Each write re-arms the reminder, and a model that answers it by
+        # writing yet another check re-arms it again; capped, an unresolved
+        # change is still disclosed by the final answer's verification note.
+        if (not self.needs_verification() or self.data.get("verification_requested")
+                or int(self.data.get("verification_requests") or 0) >= MAX_VERIFICATION_REQUESTS):
             return False
         self.data["verification_requested"] = True
+        self.data["verification_requests"] = int(self.data.get("verification_requests") or 0) + 1
         return True
 
     def needs_replan(self) -> bool:

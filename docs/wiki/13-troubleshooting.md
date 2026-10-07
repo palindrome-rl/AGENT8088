@@ -6,6 +6,68 @@ Symptom-first. Run `/doctor [--fix]` in the REPL for an automated health check
 (`--fix` repairs a broken web-search install), or `/dump` to produce a
 redacted bundle for a bug report.
 
+## Reduced modes and fallbacks
+
+When an optional piece is missing or fails, agent8088 keeps working on a
+fallback instead of stopping — and says so. Every surface reads the same
+registry, so they always agree:
+
+- **Startup banner** — `⚠ limited: search=ddgs · memory_embed=keyword-only (BM25) — /doctor`
+  lists each capability not running as preferred (`name=what is serving`, or
+  `off` when nothing is). No line means nothing is limited.
+- **Mid-session notices** — a dim `⚠ search switched to ddgs (...)` /
+  `✓ search upgraded back to searxng` line, printed after a tool result or
+  before the next prompt, only when a state *changes*.
+- **`/status`** — one `Limited` row per degraded capability: what serves, why,
+  and the fix. The `Model` row shows `→ answering with <fallback>` after a
+  failover.
+- **`/doctor`** (and `--doctor`, `/api/doctor`) — a `warn` row per limited
+  capability (`Limited: <name>`, or its own row for web search, OCR and
+  document conversion) with the fix command. Only an unavailable *model* is a
+  `fail`; everything else is optional.
+- **Web UI** — a `⚠ N limited` badge in the header. Click it for each
+  capability's active vs. preferred backend, reason, impact and a copyable
+  fix. It updates live (the server pushes a `capabilities` websocket event on
+  every state change). The status bar shows `→ answering with X` after a model
+  failover, the model picker marks a built-in list as `(offline list — <reason>)`,
+  and Config shows where the context window came from.
+- **The model** — tool results from a degraded backend carry a one-line
+  `[note: ...]` caveat (e.g. ddgs: "coverage may be incomplete"), and
+  `/capabilities` has a "Limited right now" section, so the agent can qualify
+  its answer instead of over-trusting a fallback.
+
+**Web search fallback policy.** With `web_search_provider=auto` (the default),
+startup picks the best backend that actually answers. If a local SearXNG stops
+answering mid-session, searches move to the keyless `ddgs` without prompting,
+and the switch is announced. auto never falls through to a keyed vendor
+(tavily/exa) or a remote SearXNG without your approval. SearXNG is re-probed
+at most every `web_search_reprobe_seconds` (default 300, `0` = never) and auto
+switches back up when it answers. An explicit `web_search_provider=searxng`
+is a pin: it never auto-switches and keeps its per-query prompt, so with
+SearXNG down a search fails or asks before using public ddgs
+(`/search use auto` restores the silent fallback).
+
+| Capability | Typical fallback | Typical fix |
+|---|---|---|
+| `search` | ddgs instead of SearXNG | `/search setup` (local SearXNG) or add a tavily/exa key; `/doctor --fix` if ddgs itself is broken |
+| `model` | a `fallback_models` entry answers | `/doctor` to see why the primary failed, or `/model` |
+| `context` | assumed default context window | `provider.<name>.context_window=<tokens>` in config.txt |
+| `memory` | native engine instead of mem0 | `agent8088 --memory-setup`, or `memory_engine=native` |
+| `memory_embed` | keyword-only (BM25) recall | `ollama pull <embed model>` or `agent8088 --memory-setup` |
+| `sandbox` | Docker instead of native, or none | `/sandbox setup`, or start Docker |
+| `browser` | static HTML fetch, no JavaScript | `python -m playwright install chromium` (exact command in `/doctor`) |
+| `mcp` | some or all MCP servers not connected | `/mcp` |
+| `ocr` | scanned PDFs/images unreadable | install the `[ocr]` extra (command in `/doctor`) |
+| `documents` | read/build only, no .docx/.pptx/.xlsx conversion | install LibreOffice |
+| `gateway` | an enabled adapter is disabled (missing dependency); also printed at gateway startup | `uv pip install -e ".[gateway]"` |
+| `install` | optional installer stages were skipped (from `install-state.json`) | the per-stage fix shown, or re-run the installer |
+
+The `install` entry comes from `$AGENT8088_HOME/install-state.json`, which the
+installer rewrites on every run (so a stage fixed by a re-run disappears). It
+reflects install time; when a stage has its own live entry (Chromium →
+`browser`, ddgs → `search`, ...), or its dependency is present now, only the
+live state is shown.
+
 ## Install & startup
 
 ### Installation fails or stops
@@ -21,8 +83,8 @@ declaring success. If it says the core command does not start, follow the
 printed direct Python command to see the import error. Optional-component
 warnings do not mean the core agent failed; their summary gives repair commands.
 `install-state.json` beside the log records the skipped stages from the most
-recent installer run for support; this release does not display that file through
-`/doctor` or its startup banner.
+recent installer run. The startup banner, `/doctor`, and `agent8088 --doctor`
+report outstanding stages, labelled as install-time information.
 
 ### Windows Terminal setup is blocked or no installer window appears
 
@@ -55,8 +117,25 @@ certificate/proxy diagnosis, not repeated sign-in; do not disable TLS verificati
 The installer warns when another command earlier in PATH shadows its launcher.
 Open a new terminal after installation and inspect `Get-Command agent8088 -All`
 on Windows, or `type -a agent8088` on macOS/Linux. Use the printed launcher path
-and PATH guidance. Start the agent and enter `/doctor` for the existing runtime
-health check; this public release does not provide `agent8088 --doctor`.
+and PATH guidance. Run `agent8088 --doctor` or enter `/doctor` in the agent
+to check your setup.
+
+### OpenCodeReview download fails with `ENOTFOUND github.com`
+
+The npm package was fetched, but its executable download could not resolve
+GitHub. Docker is not involved. The installer retries transient network errors
+up to three attempts, keeps the underlying output in `install.log`, and only
+marks the engine ready when its executable reports the pinned version.
+Check DNS, VPN and proxy settings without disabling TLS or antivirus protection.
+On Windows, retry the pinned package with:
+
+```powershell
+npm.cmd install --no-fund --no-audit --prefix "$env:LOCALAPPDATA\agent8088\agent8088\code-review" "@alibaba-group/open-code-review@1.12.1"
+```
+
+For a custom installation home, use the prefix printed by the installer.
+Then run `/doctor` to check availability. Rerunning the installer also resumes
+optional stages without deleting your configuration or memory.
 
 ### Installation was interrupted
 
@@ -143,9 +222,7 @@ Only **retryable** errors trigger it: HTTP 429, 503, connection errors. A 401 or
 
 ### Every write asks for approval
 
-That's `readonly` mode. The default is `full-auto`, so `--mode readonly`,
-`/mode`, `AGENT8088_PERMISSION` or `default_permission_mode` switched it.
-Options: approve per action, `/mode full-auto`,
+That's `readonly`, the default. Options: approve per action, `/mode full-auto`,
 or add the directory to `no_prompt_paths`.
 
 ### `Writing to sensitive file denied` and I meant it
@@ -179,10 +256,8 @@ line is how you tell the two apart. Reply to have it revise and actually call
 
 ### full-auto still won't `git push`
 
-Correct for a shell `git push`: destructive git (`push`, `reset --hard`,
-`branch -D`) run through the shell is on the always-on floor. To push, ask for
-it: the `git_push` tool asks you to approve the exact remote and branch, then
-pushes.
+Correct. Destructive git (`push`, `reset --hard`, `branch -D`) is on the
+always-on floor. Run it yourself.
 
 ### Approving once didn't stick
 
@@ -359,9 +434,10 @@ Note this is separate from `ssrf_allow_hosts`, which governs the HTTP *tools*.
 
 ### A test passes alone but fails in the suite (or vice versa)
 
-`tests/test_cli_setup.py` has known cross-test fixture dependence — 3 cases fail
-in isolation but pass in the full suite. Pre-existing; run the full suite to
-judge.
+Use a temporary `AGENT8088_HOME` and a configuration path you know does not
+exist. Tests must not load personal settings or rely on leftovers from another
+test. The root maintainer suite is not shipped in this release; public
+regression checks live under `scripts/installer_checks/`.
 
 ### Duplicate function silently ignored
 
@@ -372,6 +448,12 @@ python scripts/check_duplicate_defs.py
 ```
 
 Don't rely on ruff `F811`; it has verifiably missed this in this codebase.
+
+### CI checks failing instantly
+
+Open the failed job in [GitHub Actions](https://github.com/palindrome-rl/AGENT8088/actions)
+and inspect its actual error. Distinguish a runner or account issue from a test,
+dependency or build failure; do not assume either cause without the job log.
 
 ## Still stuck
 

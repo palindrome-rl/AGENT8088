@@ -10,7 +10,6 @@ Requires (set in config.txt):
   telegram_allowed_users  = numeric user IDs, comma-separated, or * for all
 """
 
-import asyncio
 import logging
 import re
 from typing import Optional

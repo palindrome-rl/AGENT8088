@@ -8,7 +8,7 @@ Requires (set in config.txt):
   whatsapp_enabled      = 0 or 1
   whatsapp_bridge_port  = 3000
   whatsapp_session_dir  = ~/.local/share/agent8088/whatsapp/session
-  whatsapp_allowed_users = +15551234567
+  whatsapp_allowed_users = +923214567891
 
 Pairing (one-time):
   cd src/agent8088/gateway/platforms/whatsapp_bridge

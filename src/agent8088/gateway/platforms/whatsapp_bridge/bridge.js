@@ -259,7 +259,7 @@ function handleInboundMessage(msg) {
   // --- LID → phone resolution ---
   // Resolve both chatId and senderId to phone numbers using the mapping files.
   // The Python adapter uses resolvedSenderId for allowlist matching against
-  // human-readable phone numbers in config (e.g. whatsapp_allowed_users=+15551234567).
+  // human-readable phone numbers in config (e.g. whatsapp_allowed_users=+923214567891).
   const resolvedChatId = resolveToPhone(rawChatId);
   const resolvedSenderId = resolveToPhone(rawSenderId);
 

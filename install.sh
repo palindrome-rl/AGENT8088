@@ -725,8 +725,7 @@ _json_escape() {
 }
 
 # Persist the skipped-stage ledger to $AGENT8088_HOME/install-state.json for
-# installation diagnostics. This public release reports skipped stages in the
-# installer summary; it does not load this ledger in the agent. A stage fixed by a
+# the startup banner, /doctor and agent8088 --doctor. A stage fixed by a
 # re-run drops out; written to a temp file and renamed, so a reader never sees
 # half a file. Never fails the install.
 write_install_state() {
@@ -2244,16 +2243,26 @@ install_webui() {
     fi
 }
 
+find_verified_review_executable() {
+    local candidate version
+    for candidate in "$1"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
+        [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
+        version="$(run_with_timeout 15 "$candidate" --version 2>/dev/null)" || continue
+        case "$version" in
+            "open-code-review v$OPEN_CODE_REVIEW_VERSION "*|"open-code-review $OPEN_CODE_REVIEW_VERSION "*)
+                printf '%s\n' "$candidate"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
 install_code_review() {
     # Run after install_node_bridge so a fresh machine can use managed Node.
-    local prefix="$INSTALL_DIR/code-review" candidate rc=0
+    local prefix="$INSTALL_DIR/code-review" attempt rc=0
+    REVIEW_INSTALLED=false
+    REVIEW_EXECUTABLE="$(find_verified_review_executable "$prefix")"
     local _review_stamp="$prefix/.agent8088-install-stamp"
-    for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
-        [ -f "$candidate" ] || continue
-        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
-        REVIEW_EXECUTABLE="$candidate"
-        break
-    done
     # The pinned version is the delegation contract, so an install of another
     # version -- or one interrupted before its stamp -- is reinstalled.
     if [ -n "$REVIEW_EXECUTABLE" ] && _stamp_matches "$_review_stamp" "$OPEN_CODE_REVIEW_VERSION"; then
@@ -2267,21 +2276,32 @@ install_code_review() {
         return
     fi
     log_info "Installing code review engine (optional, for /review)..."
-    run_with_timeout "$T_PIP" npm install --silent --no-fund --no-audit \
-        --prefix "$prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" \
-        >>"$INSTALL_LOG" 2>&1 </dev/null || rc=$?
-    REVIEW_EXECUTABLE=""
-    for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
-        [ -f "$candidate" ] || continue
-        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
-        REVIEW_EXECUTABLE="$candidate"
-        break
+    for attempt in 1 2 3; do
+        rc=0
+        run_logged "$T_PIP" npm install --no-fund --no-audit \
+            --prefix "$prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" || rc=$?
+        [ "$rc" -eq 0 ] && break
+        [ "$rc" -eq 124 ] && break
+        if [ "$attempt" -eq 3 ] || ! grep -qiE 'ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|could not resolve host' "$LAST_STEP_LOG"; then
+            break
+        fi
+        log_warn "Code review download could not reach its server; retrying ($attempt/3)."
+        sleep "$((2 * attempt))"
     done
+    REVIEW_EXECUTABLE="$(find_verified_review_executable "$prefix")"
     if [ "$rc" -eq 0 ] && [ -n "$REVIEW_EXECUTABLE" ]; then
         REVIEW_INSTALLED=true
         _write_stamp "$_review_stamp" "$OPEN_CODE_REVIEW_VERSION"
         log_success "Code review engine installed"
     else
+        if [ "$rc" -eq 0 ]; then
+            rc=1
+            echo "The pinned OpenCodeReview executable is missing, cannot run, or reports the wrong version." >> "$LAST_STEP_LOG"
+        fi
+        show_step_failure
+        if grep -qiE 'ENOTFOUND|EAI_AGAIN|could not resolve host' "$LAST_STEP_LOG"; then
+            log_warn "DNS lookup failed while downloading code review. Check the named host, DNS, VPN and proxy settings. Docker is not required."
+        fi
         warn_stage "$rc" "$T_PIP" "code review engine" \
             "/review and review_code will report the install command instead of running" \
             "npm install --prefix \"$prefix\" @alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION"
