@@ -31,6 +31,8 @@ def _mutated(engine, command):
     "cat data.csv; wc -l data.csv",
     "cut -d, -f2 data.csv | paste -sd+ - | bc",
     "cat data.csv && echo '---' && md5 data.csv 2>/dev/null || md5sum data.csv",
+    "awk -F',' '{sum+=$2} END {print sum}' data.csv",       # seen live: the sum itself
+    "cat data.csv && awk '{print}' data.csv",
 ])
 def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monkeypatch, command):
     _host_shell(engine, tmp_path, monkeypatch)
@@ -41,7 +43,9 @@ def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monk
 @pytest.mark.parametrize("command", [
     "echo hi > out.txt",
     "ls && touch new.txt",
-    "cat data.csv && awk '{print}' data.csv",   # awk can run commands: not trusted
+    "awk 'BEGIN {system(\"touch x\")}'",          # awk running a command
+    "awk '{print > \"copy.txt\"}' data.csv",       # awk writing a file
+    "awk -f prog.awk data.csv",                      # a program it cannot inspect
     "sort -o data.csv data.csv",
     "echo $(touch sneaky.txt)",
 ])

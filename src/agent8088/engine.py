@@ -5786,8 +5786,32 @@ def _shell_call_is_read_only(command: str) -> bool:
     stages = [(probe[start:end].strip(), original[start:end].strip())
               for start, end in zip(bounds[::2], bounds[1::2])]
     return all(masked and (_readonly_shell(masked) or _sed_prints_only(original)
-                           or _text_only_stage(masked))
+                           or _text_only_stage(masked) or _awk_prints_only(original))
                for masked, original in stages)
+
+
+_AWK_SIDE_EFFECT = re.compile(r"\bsystem\b|\bgetline\b|\bclose\s*\(|[|>]")
+
+
+def _awk_prints_only(stage: str) -> bool:
+    """An awk call whose inline program can only print: no system(), no
+    getline (which can run a command), no output redirection or pipe, and no
+    -f program file or in-place flag it cannot inspect. The common case is a
+    column sum, `awk -F',' '{s+=$2} END {print s}' data.csv`: seen live, that
+    counted as a change and re-armed the verification nudge twice."""
+    parts = _shell_parts(stage)
+    if not parts or Path(parts[0]).stem.lower() not in {"awk", "gawk", "mawk", "nawk"}:
+        return False
+    cursor = 1
+    while cursor < len(parts) and parts[cursor].startswith("-"):
+        flag = parts[cursor]
+        if flag in {"-F", "-v"}:
+            cursor += 2
+        elif flag.startswith(("-F", "-v")):
+            cursor += 1
+        else:
+            return False       # -f, -i inplace, -E, and anything else unknown
+    return cursor < len(parts) and not _AWK_SIDE_EFFECT.search(parts[cursor])
 
 
 # Programs that only print what they compute from their input or arguments,
