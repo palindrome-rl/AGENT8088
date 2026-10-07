@@ -1017,10 +1017,13 @@ def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
+    global _failure_streak, _diagnostic_shown
     _turn_writes = 0
     _plan_tool_ran = False
     _turn_blocker_counts = {}
     _pending_blocker_note = ""
+    _failure_streak = 0
+    _diagnostic_shown = False
 
 
 # ---------------------------------------------------------------------------
@@ -4010,6 +4013,11 @@ def _ground_execute_shell_description(specs: dict) -> None:
     if cwd is None:
         where = (f"none: the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)}, so "
                  f"commands cannot run until the user sets shell_cwd")
+    elif not spec.get("host"):
+        # The sandbox moves every command into the artifacts workspace, so
+        # naming the shell folder here was one folder off from what `pwd` prints.
+        where = (f"{ARTIFACTS_ROOT} (the sandbox workspace; project files are "
+                 f"under {PROJECT_ROOT})")
     elif cwd != SHELL_CWD:
         where = f"{cwd} (the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)})"
     else:
@@ -6160,7 +6168,7 @@ def reset_audit_budget() -> None:
 # entry called `nul`, which then broke the sandbox copy with [WinError 87].
 # Everything else after a redirection operator is a file, so this predicate
 # refuses to call it read-only.
-_STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$)")
+_STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$|[;&|)])")
 # What separates one command from the next. Ordered so `&&` and `||` match
 # before the single-character forms. `|` is absent: `_readonly_shell` already
 # decomposes pipelines itself, under its own stricter rules.
@@ -6169,9 +6177,15 @@ _SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|&|\n")
 _AUDIT_STAGE_SPLIT = re.compile(r"&&|\|\||;|&|\n|\|")
 # `2>&1` / `>&2` point one output stream at another; no file is named.
 _FD_DUPLICATE = re.compile(r"\d?>&\d+\b")
+# `< file` only reads (seen live: `wc -w < input.txt`). Not `<<`/`<<<` (here
+# documents), `<>` (opens for writing), `<(` (runs a command) or `n<`.
+_INPUT_REDIRECT = re.compile(r"(?<![<\d])<(?![<>(&])\s*[^\s;&|<>()]+")
 # A sed script made only of line numbers and p/q/d/= prints; it cannot write,
 # run a command, or read another file (w, W, e, r, R are all letters).
 _SED_PRINT_SCRIPT = re.compile(r"[\d,$;!pqd=\s]+")
+# One s/old/new/ with only print-safe flags. The w flag writes a file and e
+# runs a command, so neither is allowed; -i is refused by _SED_READ_FLAGS.
+_SED_SUBSTITUTE = re.compile(r"s([^\\\n\w\s])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gIi\d]*")
 _SED_READ_FLAGS = {"-n", "-E", "-r", "--quiet", "--silent"}
 
 
@@ -6215,7 +6229,30 @@ def _sed_prints_only(command: str) -> bool:
     flags = [part for part in parts[1:] if part.startswith("-")]
     operands = [part for part in parts[1:] if not part.startswith("-")]
     return (bool(operands) and all(flag in _SED_READ_FLAGS for flag in flags)
-            and _SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None)
+            and (_SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None
+                 or _SED_SUBSTITUTE.fullmatch(operands[0]) is not None))
+
+
+_INNERMOST_SUBSTITUTION = re.compile(r"\$\(([^()`]*)\)")
+
+
+def _without_read_only_substitutions(command: str):
+    """`command` with each $(...) whose inner command is itself read-only
+    replaced by a plain word, innermost first; None when one is not.
+
+    Seen in the benchmark: a model checked the file it had just written with
+    `echo "report: [$(cat report.txt)]"`, and refusing every substitution
+    counted that check as a new change. Backticks stay refused outright, and
+    anything left unresolved (arithmetic, unbalanced text) is refused by the
+    caller."""
+    for _ in range(16):
+        match = _INNERMOST_SUBSTITUTION.search(command)
+        if match is None:
+            return command
+        if not _shell_call_is_read_only(match.group(1)):
+            return None
+        command = command[:match.start()] + "X" + command[match.end():]
+    return None
 
 
 def _shell_call_is_read_only(command: str) -> bool:
@@ -6241,22 +6278,101 @@ def _shell_call_is_read_only(command: str) -> bool:
     can still be read from the original text. Auditing those reads, plus
     `sed -n '415,445p'` and `2>&1`, took 144 of a 293-second live run.
     """
-    if re.search(r"[`]|\$\(", command):
+    command = _without_read_only_substitutions(command)
+    if command is None or re.search(r"[`]|\$\(", command):
         return False           # substitution can run anything, anywhere
     probe = _mask_quoted_operators(command)
     if probe is None:
         return False           # quoting that never closes cannot be read
     blank = lambda match: " " * len(match.group(0))
-    probe = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe))
-    original = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command))
+    probe = _INPUT_REDIRECT.sub(blank, _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe)))
+    original = _INPUT_REDIRECT.sub(blank, _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command)))
     if re.search(r"[<>]", probe):
         return False           # a redirection writes a file
     bounds = [0] + [edge for m in _AUDIT_STAGE_SPLIT.finditer(probe)
                     for edge in m.span()] + [len(probe)]
     stages = [(probe[start:end].strip(), original[start:end].strip())
               for start, end in zip(bounds[::2], bounds[1::2])]
-    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original))
+    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original)
+                           or _text_only_stage(masked) or _awk_prints_only(original)
+                           or _ASSIGNMENT_ONLY.fullmatch(masked) is not None)
                for masked, original in stages)
+
+
+# `name=value` alone sets a shell variable for the rest of this one command.
+_ASSIGNMENT_ONLY = re.compile(r"[A-Za-z_]\w*=\S*")
+
+
+# What lets an awk program act beyond printing: running a command, reading
+# one (getline), closing a pipe, or a print/printf whose output is redirected
+# (`>`, `>>`) or piped (`|`). A bare `>` elsewhere is a comparison: NR>0.
+_AWK_SIDE_EFFECT = re.compile(
+    r"\bsystem\b|\bgetline\b|\bclose\s*\(|\bprintf?\b[^;{}]*(?:>|\|)")
+
+
+def _awk_prints_only(stage: str) -> bool:
+    """An awk call whose inline program can only print: no system(), no
+    getline (which can run a command), no redirected or piped print, and no
+    -f program file or in-place flag it cannot inspect. The common case is a
+    column sum, `awk -F, 'NR>0 {s+=$2} END {print s}' data.csv`: seen live,
+    that counted as a change and re-armed the verification nudge twice."""
+    if re.search(r"[`]|\$\(", stage):
+        return False
+    try:
+        # Not _shell_parts: it refuses any `>` or `|`, even inside the quoted
+        # program, where they are usually comparisons and logic.
+        parts = shlex.split(stage, posix=True)
+    except ValueError:
+        return False
+    if not parts or Path(parts[0]).stem.lower() not in {"awk", "gawk", "mawk", "nawk"}:
+        return False
+    cursor = 1
+    while cursor < len(parts) and parts[cursor].startswith("-"):
+        flag = parts[cursor]
+        if flag in {"-F", "-v"}:
+            cursor += 2
+        elif flag.startswith(("-F", "-v")):
+            cursor += 1
+        else:
+            return False       # -f, -i inplace, -E, and anything else unknown
+    # String literals cannot act: `print "a | b"` only prints the bar.
+    program = re.sub(r'"(?:\\.|[^"\\])*"', '""', parts[cursor]) if cursor < len(parts) else ""
+    return cursor < len(parts) and not _AWK_SIDE_EFFECT.search(program)
+
+
+# Programs that only print what they compute from their input or arguments,
+# with no way to write a file or run another program. Used only to decide
+# whether a call changed anything, never for approval prompts. Left out on
+# purpose: file (-C) and anything that interprets code. sort and uniq are
+# allowed without their output forms (_text_only_stage); awk is judged by its
+# program text (_awk_prints_only).
+_TEXT_ONLY_COMMANDS = frozenset([
+    "echo", "printf", "cut", "tr", "paste", "bc", "od", "nl", "cksum",
+    "md5", "md5sum", "sha1sum", "sha256sum", "shasum",
+    "basename", "dirname", "realpath", "stat", "which", "true",
+    # Changes only where the rest of this one command runs.
+    "cd", "pushd", "popd",
+    # Comparisons: `[ "$count" = 3 ]`.
+    "[", "test",
+])
+
+
+def _text_only_stage(stage: str) -> bool:
+    parts = _shell_parts(stage)
+    if not parts:
+        return False
+    name = Path(parts[0]).stem.lower()
+    if name == "sort":
+        # Writes only through -o/--output (possibly bundled: -rno).
+        return not any(p.startswith("--output") or p.startswith("--compress")
+                       or (p.startswith("-") and not p.startswith("--")
+                           and "o" in p[1:].split("=")[0])
+                       for p in parts[1:])
+    if name == "uniq":
+        # A second operand is the output file: `uniq in.txt out.txt`.
+        operands = [p for p in parts[1:] if not p.startswith("-") and not p.isdigit()]
+        return len(operands) <= 1
+    return name in _TEXT_ONLY_COMMANDS
 
 
 def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
@@ -9928,13 +10044,21 @@ def _save_windows_schedules(entries: list) -> None:
     )
 
 
+def _scheduled_task_cwd() -> Path:
+    """Where a scheduled run starts: the folder commands use now. A shell_cwd
+    that does not exist here would make every scheduled run fail at its `cd`
+    before agent8088 even starts; with no usable folder, keep the configured
+    one so the failure names the setting."""
+    return _choose_shell_cwd() or SHELL_CWD
+
+
 def _windows_task_script(identifier: str, task: str) -> Path:
     import base64
 
     scripts = _agent_data_dir() / "scheduled-tasks"
     script = scripts / f"{identifier}.ps1"
     prompt = base64.b64encode(task.encode("utf-8")).decode("ascii")
-    cwd = str(SHELL_CWD).replace("'", "''")
+    cwd = str(_scheduled_task_cwd()).replace("'", "''")
     agent = str(_which_executable("agent8088") or "agent8088").replace("'", "''")
     content = (
         "$ErrorActionPreference = 'Stop'\n"
@@ -10202,7 +10326,7 @@ def _exec_cron(args: dict) -> str:
         # AGENT8088_UNATTENDED tells the engine there is no operator to answer an
         # approval prompt, so gated actions resolve from cron_mode instead of
         # emitting an ESCALATION_REQUEST nobody will ever see.
-        entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
+        entry = (f"{schedule} cd {shlex.quote(str(_scheduled_task_cwd()))} && "
                  f"printf '%s\\n' {shlex.quote(task)} | "
                  f"AGENT8088_UNATTENDED=1 {shlex.quote(agent)} {_CRON_MARKER}")
         # Cron parses percent signs before the shell, including quoted ones.
@@ -11600,7 +11724,14 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         # blocked with no way to approve it.
         if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
             return text.strip()
-        if not (_readonly_shell(command) or _readonly_chain(command)):
+        # The audit predicate, not the approval one: `pwd && ls -la` changes
+        # nothing, but counting it as a change re-armed "changed work has no
+        # fresh verification evidence", and a model re-checked a finished
+        # answer three times (seen live with glm-5.3-flash).
+        # Either bookkeeping predicate (#237's chain check, #238's quote-aware
+        # check) proves every segment read-only; neither gates permission.
+        if not (_readonly_shell(command) or _readonly_chain(command)
+                or _shell_call_is_read_only(command)):
             # Ordered before the recording below so this run's own verdict is
             # stamped with the sequence its side effects produced.
             note_mutation(f"{name}: {command[:80]}")
@@ -11663,6 +11794,89 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
         return efficiency.tool_error('not_found', f'Program not found: {stem}', action, recoverable=True)
     return efficiency.tool_error('not_found', f'File not found: {missing}',
         'Check the path (list the directory first), correct the arguments, then retry.', recoverable=True)
+
+
+_EXIT_STATUS_RE = re.compile(r"Command exited with status \d+|timed out after \d+s")
+
+
+def _runs_changed_program(name: str, args: dict, result: str, trajectory) -> bool:
+    """Whether a shell call ran, successfully, a code file this run changed
+    while that change still waits for a check.
+
+    Seen in the glm-5.3-flash benchmark: after writing fib.py, `python fib.py`
+    counted as yet another change, re-armed the verification nudge, and the
+    model re-ran the same check twice. Named by file name, so `python3
+    ./src/fib.py` and `cd src && python3 fib.py` both count; a failing or
+    timed-out run is not a check."""
+    if name != "execute_shell" or not trajectory.needs_verification():
+        return False
+    text = str(result or "")
+    if text.startswith("Error:") or _EXIT_STATUS_RE.search(text):
+        return False
+    command = str(args.get("command") or "")
+    for path in trajectory.changed_code_paths():
+        stem = Path(path).name
+        if stem and re.search(rf"(?<![\w.-]){re.escape(stem)}(?![\w.-])", command):
+            return True
+    return False
+
+
+DIAGNOSE_AFTER_FAILURES = 3
+_DIAGNOSTIC_LISTING_MAX = 20
+_failure_streak = 0
+_diagnostic_shown = False
+
+
+def _failure_diagnostic(result: str) -> str:
+    """At the DIAGNOSE_AFTER_FAILURES-th failed call in a row, once per turn,
+    a read-only look at the environment for the model; otherwise "".
+
+    Seen live with the working directory missing: four tools failed four
+    different ways, and the model concluded "the workspace itself appears to be
+    missing" without one look. Gathered here in Python rather than by running
+    `pwd`/`ls`, so it needs no approval and works when commands cannot start."""
+    global _failure_streak, _diagnostic_shown
+    if result.startswith("ESCALATION_REQUEST\x1f"):
+        return ""          # waiting on the user, not a failure
+    if not result.startswith("Error:"):
+        _failure_streak = 0
+        return ""
+    _failure_streak += 1
+    if _failure_streak < DIAGNOSE_AFTER_FAILURES or _diagnostic_shown:
+        return ""
+    _diagnostic_shown = True
+    try:
+        return "\n" + _environment_diagnostic()
+    except Exception as exc:  # noqa: BLE001 — advice must never break a tool result
+        _log.debug("failure diagnostic failed: %s", exc)
+        return ""
+
+
+def _environment_diagnostic() -> str:
+    def state(path: Path) -> str:
+        return "exists" if _is_dir(path) else "MISSING"
+
+    cwd = _choose_shell_cwd()
+    lines = [f"{_HARNESS_PREFIX}{DIAGNOSE_AFTER_FAILURES} tool calls in a row failed. "
+             "Read-only check of this environment, gathered by the harness:"]
+    lines.append(f"- Commands start in: {cwd}" if cwd else
+                 f"- Commands cannot start: the configured working directory "
+                 f"{SHELL_CWD} does not exist, and no allowed fallback does")
+    lines.append(f"- Sandboxed commands run in: {ARTIFACTS_ROOT} ({state(ARTIFACTS_ROOT)})")
+    lines.append(f"- Project files resolve against: {PROJECT_ROOT} ({state(PROJECT_ROOT)})")
+    listed = cwd or (PROJECT_ROOT if _is_dir(PROJECT_ROOT) else None)
+    if listed is not None:
+        names = sorted(p.name + ("/" if p.is_dir() else "")
+                       for p in listed.iterdir() if not p.name.startswith("."))
+        more = len(names) - _DIAGNOSTIC_LISTING_MAX
+        shown = ", ".join(names[:_DIAGNOSTIC_LISTING_MAX]) or "(empty)"
+        lines.append(f"- {listed} contains: {shown}" + (f" (+{more} more)" if more > 0 else ""))
+        free = shutil.disk_usage(listed).free / 1024 ** 3
+        lines.append(f"- Disk: {free:.1f} GB free")
+    lines.append("If these look right, the environment is usable: fix the failing call "
+                 "instead of concluding the environment is unavailable. If something "
+                 "above is MISSING, tell the user which setting points there.")
+    return "\n".join(lines)
 
 
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
@@ -11729,7 +11943,7 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     _remember_escalation(name, args, result)
 
     # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
-    result = _redact_secrets(result)
+    result = _redact_secrets(result) + _failure_diagnostic(result)
     if runtime and operation_id:
         runtime.after_tool(operation_id, result)
 
@@ -16346,10 +16560,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 status = verdict.status
                 if f"audit: {AUDIT_PASSED_NOTE}" in result:
                     status = "passed"
+                mutated = _MUTATION_SEQ != mutation_seq_before
+                if mutated and _runs_changed_program(name, args, result, trajectory):
+                    # Running the code this run just changed is how it gets
+                    # checked. Only the verification bookkeeping treats it as
+                    # a check; caches were already invalidated as for any run.
+                    mutated = False
                 trajectory.after_tool(
                     operation, result, failed=_plan_step_failed(result),
                     blocked=result.startswith("ESCALATION_REQUEST\x1f"),
-                    mutated=_MUTATION_SEQ != mutation_seq_before, verdict=status,
+                    mutated=mutated, verdict=status,
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.

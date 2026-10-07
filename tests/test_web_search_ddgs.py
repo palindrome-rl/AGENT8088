@@ -487,3 +487,51 @@ def test_run_search_passes_images_flag_to_provider(monkeypatch):
                                 web_search.Registry([FakeProvider()]), {}, ctx, images=True)
     assert got["images"] is True
     assert "https://a.test" in out
+
+
+def test_empty_answer_during_a_burst_is_retried(monkeypatch):
+    """Seen live: two of ten back-to-back city lookups ("current mayor of
+    Vienna 2026") came back "No results found". Mid-burst, empty most likely
+    means throttled, so the backed-off attempts run before accepting it."""
+    import time
+    calls = []
+
+    def fake(query, limit, *, backend, timeout, proxy=None, region=None):
+        calls.append(query)
+        if len(calls) == 1:
+            raise RuntimeError("No results found for the query")
+        return _hits()
+
+    _stub(monkeypatch, fake)
+    web_search._ddgs_last_call = time.monotonic() - 3   # a search just ran
+    out = DdgsProvider().search("q", 5, FakeCtx())
+    assert isinstance(out, SearchSuccess) and out.results
+    assert len(calls) == 2
+
+
+def test_empty_after_every_burst_attempt_is_still_no_results(monkeypatch):
+    import time
+    calls = []
+
+    def fake(query, limit, *, backend, timeout, proxy=None, region=None):
+        calls.append(query)
+        raise RuntimeError("No results found for the query")
+
+    _stub(monkeypatch, fake)
+    web_search._ddgs_last_call = time.monotonic() - 3
+    out = DdgsProvider().search("q", 5, FakeCtx())
+    assert isinstance(out, SearchSuccess) and out.results == []
+    assert len(calls) == web_search._DDGS_ATTEMPTS
+
+
+def test_empty_answer_outside_a_burst_is_not_retried(monkeypatch):
+    calls = []
+
+    def fake(query, limit, *, backend, timeout, proxy=None, region=None):
+        calls.append(query)
+        raise RuntimeError("No results found for the query")
+
+    _stub(monkeypatch, fake)
+    out = DdgsProvider().search("q", 5, FakeCtx())
+    assert isinstance(out, SearchSuccess) and out.results == []
+    assert len(calls) == 1

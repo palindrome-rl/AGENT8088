@@ -146,6 +146,11 @@ class TrajectoryState:
             self.data["stalled"] = False
         else:
             self.data["consecutive_setbacks"] = int(self.data.get("consecutive_setbacks") or 0) + 1
+        if mutated and path and operation["status"] == "done" and _is_code_path(path):
+            changed = self.data.setdefault("changed_code", [])
+            if path not in changed:
+                changed.append(path)
+                del changed[:-MAX_UNTESTED]
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self.data["verification"] = "pending"
@@ -207,6 +212,10 @@ class TrajectoryState:
             # A new untested change re-arms the one-shot: the previous nudge was
             # about different files.
             self.data["tests_requested"] = False
+
+    def changed_code_paths(self) -> list[str]:
+        """Code files this run wrote, newest last."""
+        return list(self.data.get("changed_code") or [])
 
     def untested_paths(self) -> list[str]:
         return list(self.data.get("untested_changes") or [])

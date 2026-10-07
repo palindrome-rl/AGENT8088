@@ -669,6 +669,12 @@ _DDGS_TIMEOUT = 10
 _DDGS_MIN_INTERVAL = 2.0
 _ddgs_last_call = 0.0
 
+# A search that starts this soon after the previous ddgs call is part of a
+# burst. Mid-burst, "no results found" usually means a throttled engine served
+# nothing rather than that the topic is empty: live, two of ten back-to-back
+# city lookups ("current mayor of Vienna 2026") came back empty that way.
+_DDGS_BURST_WINDOW = 20.0
+
 # Attempts per search. One retry is not padding: a 202 is issued per-engine
 # per-IP on a sliding window, so a later attempt lands elsewhere in the rotation
 # and usually serves. Hermes: "Wait a few seconds and retry."
@@ -895,6 +901,8 @@ class DdgsProvider(WebSearchProvider):
         throttles = _ddgs_throttle_errors()
         last_error = ""
         throttled = False
+        in_burst = bool(_ddgs_last_call) and (
+            time.monotonic() - _ddgs_last_call < _DDGS_BURST_WINDOW)
 
         for attempt in range(_DDGS_ATTEMPTS):
             if _DDGS_BACKOFF[attempt]:
@@ -909,6 +917,13 @@ class DdgsProvider(WebSearchProvider):
                 # failure, and reporting it as one would send run_search shopping
                 # for another backend over a query nothing can answer.
                 if "no results found" in message.lower():
+                    if in_burst and not (throttled or last_error):
+                        # Possibly throttled: spend the backed-off attempts
+                        # before calling it empty. Every attempt empty is a
+                        # real "no results".
+                        if attempt + 1 < _DDGS_ATTEMPTS:
+                            continue
+                        return SearchSuccess([], provider=self.name)
                     if not (throttled or last_error):
                         return SearchSuccess([], provider=self.name)
                     # ...unless earlier attempts were throttled or failed: then
