@@ -43,9 +43,3 @@ def test_trace_display_collapses_tool_list_but_keeps_other_steps():
     shown = cli._trace_for_display(trace)
     assert shown[0]["initial"] == "3 tools" and shown[1] == trace[1]
     assert trace[0]["initial"] == ["a", "b", "c"]  # the saved copy is untouched
-
-
-def test_default_exports_share_one_folder(tmp_path, monkeypatch):
-    from agent8088 import cli
-    monkeypatch.setattr(cli.A, "_agent_data_dir", lambda: tmp_path)
-    assert cli._default_export_path("dump", "txt").parent == tmp_path / "exports"

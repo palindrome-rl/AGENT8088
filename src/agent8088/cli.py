@@ -4950,12 +4950,6 @@ def _stamped(stem, ext):
     return f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
 
 
-def _default_export_path(stem, ext):
-    """Where a default-named /dump, /save or /trace save goes: one exports
-    folder in the data dir, so the three never end up in different places."""
-    return A._agent_data_dir() / "exports" / _stamped(stem, ext)
-
-
 def _trace_for_display(trace):
     """The on-screen copy of a turn trace: the 50-odd tool names collapse to a
     count. The saved trace file keeps the full list."""
@@ -5012,7 +5006,7 @@ def cmd_dump(_rest):
     for secret in A.collect_secret_values(A.APP_CONFIG):
         text = text.replace(secret, "[REDACTED]")
 
-    out_path = _default_export_path("dump", "txt")
+    out_path = A._agent_data_dir() / _stamped("dump", "txt")
     A._write_private_text(out_path, text)
     console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff] "
                   f"[dim]({out_path.stat().st_size // 1024 or 1} KB)[/dim]")
@@ -5852,12 +5846,10 @@ def cmd_trace(rest):
     arg = raw.lower()
     if arg == "save" or arg.startswith("save "):
         _, _, requested = raw.partition(" ")
-        text = json.dumps(_trace_export_data(), indent=2)
-        if requested.strip():
-            path = _write_user_export(requested.strip(), text)
-        else:
-            path = _default_export_path(f"{S.name or 'agent8088'}_trace", "json")
-            _write_private_text(path, text)
+        path = _write_user_export(
+            requested.strip() or _stamped(f"{S.name or 'agent8088'}_trace", "json"),
+            json.dumps(_trace_export_data(), indent=2),
+        )
         if not path:
             return
         S.trace_path = str(path)
@@ -6449,16 +6441,11 @@ def cmd_limits(rest):
 
 
 def cmd_save(rest):
-    path = rest.strip()
+    path = rest.strip() or _stamped("agent8088_session", "json")
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
             "conversation_trace": S.conversation_trace, "session": S.name or None,
             "disabled_skills": sorted(S.disabled_skills)}
-    text = json.dumps(data, indent=2)
-    if path:
-        destination = _write_user_export(path, text)
-    else:
-        destination = _default_export_path("agent8088_session", "json")
-        _write_private_text(destination, text)
+    destination = _write_user_export(path, json.dumps(data, indent=2))
     if destination:
         console.print(f"[#237dd7]saved[/#237dd7] -> {destination}")
 
