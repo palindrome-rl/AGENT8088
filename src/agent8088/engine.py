@@ -500,6 +500,16 @@ MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
 LENGTH_RETRY_MAX_TOKENS = max(0, _config_int("length_retry_max_tokens", 0))
+# Floor for the completion cap a length cut-off earns (A3.1). The old behaviour
+# clamped every retry to 1024 tokens, which no real tool call fits — after two
+# cut-offs a large file write became impossible for the rest of the run. The
+# adaptive cap instead allows a full-size call: the floor must fit one, the
+# ceiling stays the configured limit, and the cap resets after any normal call.
+MAIN_LLM_MIN_TOKENS = max(1, _config_int("main_llm_min_tokens", 4096))
+# Consecutive length cut-offs tolerated before the final no-tools round (A3.4).
+# "Retry until the clock runs out" is replaced by a deterministic ending that
+# leaves partial work in place. 0 disables the ladder (restores unbounded retry).
+LENGTH_CUTOFF_MAX_RETRIES = max(0, _config_int("length_cutoff_max_retries", 4))
 PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
 PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 2))
 MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
@@ -2571,6 +2581,84 @@ def _provider_extra_body(provider_name: str) -> dict:
     return extra
 
 
+# Reasoning arrives under different field names and shapes per provider, and the
+# cut-off handler needs to know how much of the budget went to thinking rather
+# than to an answer. One helper reads them all so no lane has to guess.
+#   reasoning / reasoning_content   vLLM, Ollama, DeepSeek, Moonshot
+#   reasoning_details[].text        OpenRouter
+#   content[] with type "thinking"  Anthropic
+#   reasoningContent.reasoningText  Gemini (nested dict)
+# OpenAI exposes only summaries, never the raw chain, so "" is the normal result.
+_REASONING_FIELDS = (
+    ("reasoning", None),
+    ("reasoning_content", None),
+    ("reasoning_details", "text"),
+    ("content", "thinking"),
+)
+_GEMINI_REASONING_PATH = ("reasoningContent", "reasoningText")
+
+
+def _extract_reasoning(obj) -> str:
+    """Reasoning text from a delta/message in whichever shape it arrives.
+
+    The text is returned as sent: a streamed delta can continue mid-word, so
+    trimming each chunk would glue them together without the space between
+    ("options" + "and" -> "optionsand"). strip() decides only whether a value
+    counts as found.
+    """
+    for field, key in _REASONING_FIELDS:
+        value = getattr(obj, field, None)
+        if isinstance(value, str):
+            if key is None and value.strip():
+                return value
+            continue
+        if isinstance(value, list):
+            text = "".join(str(i.get(key or "text") or "") for i in value
+                           if isinstance(i, dict))
+        elif isinstance(value, dict):
+            node = value
+            for step in _GEMINI_REASONING_PATH:
+                node = node.get(step) if isinstance(node, dict) else None
+            text = str(node.get(key or "text") or "") if isinstance(node, dict) else ""
+        else:
+            continue
+        if text.strip():
+            return text
+    return ""
+
+
+def _length_retry_extra_body(provider_name: str) -> dict:
+    """Request fields that disable or lower thinking for ONE retry call.
+
+    Asking a thinking model to "stop reasoning" in the retry message cannot
+    switch reasoning off -- it reasons again and overruns again. These fields
+    act on the request itself, so the retry has a real chance of producing an
+    answer. provider.<name>.length_retry_extra_body overrides the default per
+    provider; a provider that ignores the field still falls back to the
+    adaptive cap, so a wrong guess costs one call, not the run.
+    """
+    profile = (PROVIDERS.get(provider_name) or {}) if provider_name else {}
+    raw = str(profile.get("length_retry_extra_body") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        logging.getLogger(__name__).warning(
+            "Ignoring provider.%s.length_retry_extra_body: not a JSON object.",
+            provider_name)
+    # Default per provider family. Ollama takes a boolean; OpenAI-compatible
+    # servers take the reasoning effort dial; vLLM needs the template switch.
+    name = (provider_name or "").lower()
+    if "ollama" in name:
+        return {"think": False}
+    if "vllm" in name:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {"reasoning_effort": "none"}
+
+
 def _resolve_temperature(provider_name: str, temperature: float) -> float:
     """provider.<name>.temperature overrides the session/global value.
 
@@ -2626,7 +2714,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         response = completion(**kwargs)
         if on_token is None:
             return response
-        collected, tool_chunks, finish_reason = [], {}, None
+        collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
         stop, watcher = _start_interrupt_watcher(response, interrupt_check)
         try:
             for chunk in response:
@@ -2634,9 +2722,10 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 choice = chunk.choices[0]
                 delta = choice.delta
                 finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-                reasoning = getattr(delta, "reasoning_content", None)
+                reasoning = _extract_reasoning(delta)
                 if reasoning:
                     on_token("reasoning", reasoning)
+                    collected_reasoning.append(reasoning)
                 if delta.content:
                     on_token("content", delta.content)
                     collected.append(delta.content)
@@ -2648,7 +2737,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             raise
         finally:
             _finish_interrupt_watcher(stop, watcher)
-        return _build_response("".join(collected), tool_chunks, finish_reason)
+        return _build_response("".join(collected), tool_chunks, finish_reason,
+                               "".join(collected_reasoning))
     request_options = dict(
         model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
@@ -2670,6 +2760,12 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         template_kwargs["enable_thinking"] = False
         extra_body["chat_template_kwargs"] = template_kwargs
         extra_body.pop("reasoning_effort", None)
+    elif thinking == "length_retry":
+        # The retry after a cut-off: the model just spent a whole allowance
+        # reasoning, so force thinking down for THIS call only. Restored on the
+        # next ordinary turn so planning quality is not permanently reduced.
+        extra_body = dict(extra_body or {})
+        extra_body.update(_length_retry_extra_body(provider_name))
     if extra_body and not _skip_optional:
         request_options["extra_body"] = extra_body
     _raise_if_interrupted(interrupt_check)
@@ -2737,7 +2833,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 model_name=model_name, provider_name=provider_name, _skip_optional=True,
                 thinking=thinking, timeout=timeout)
         raise
-    collected, tool_chunks, finish_reason = [], {}, None
+    collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
     stream_usage = None
     stream_first = None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
@@ -2750,12 +2846,13 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
-            if stream_first is None and any(getattr(delta, key, None) for key in ('content', 'reasoning_content', 'tool_calls')):
+            if stream_first is None and any(getattr(delta, key, None) for key in ('content', 'reasoning', 'reasoning_content', 'tool_calls')):
                 stream_first = round((time.monotonic() - stream_started) * 1000)
             finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-            rc = getattr(delta, "reasoning_content", None)
+            rc = _extract_reasoning(delta)
             if rc:
                 on_token("reasoning", rc)
+                collected_reasoning.append(rc)
             if delta.content:
                 on_token("content", delta.content)
                 collected.append(delta.content)
@@ -2768,7 +2865,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     finally:
         _finish_interrupt_watcher(stop, watcher)
         _close_stream_ctx()
-    response = _build_response("".join(collected), tool_chunks, finish_reason)
+    response = _build_response("".join(collected), tool_chunks, finish_reason,
+                               "".join(collected_reasoning))
     response.usage = stream_usage
     response.first_token_ms = stream_first
     return response
@@ -2976,7 +3074,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                                      on_token, interrupt_check, trace, turn,
                                      max_tokens=None, client_override=None,
                                      provider_override=None, model_override=None,
-                                     on_retry=None, on_stream_reset=None):
+                                     on_retry=None, on_stream_reset=None, thinking=None):
     """One model call with retries and the fallback_models chain.
 
     This is the single retry layer (the SDK clients are built with
@@ -3025,6 +3123,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 model_name=active_model,
                 provider_name=active_provider,
                 telemetry_attempt="primary",
+                thinking=thinking,
             )
             _note_model_served(active_provider, active_model)
             return response
@@ -3157,9 +3256,13 @@ def _collect_stream_tool_calls(delta, chunks):
             entry["arguments"] += getattr(function, "arguments", None) or ""
 
 
-def _build_response(content, tool_chunks=None, finish_reason=None):
+def _build_response(content, tool_chunks=None, finish_reason=None, reasoning=""):
     """Reconstruct a ChatCompletion-like object from streamed content
-    so run_agent() can read .choices[0].message.content uniformly."""
+    so run_agent() can read .choices[0].message.content uniformly.
+
+    `reasoning` carries whatever the provider streamed as thinking, so a
+    length cut-off can tell "the budget went to reasoning" from "the budget
+    went to a large answer" and report which one it was."""
     tool_calls = []
     for index in sorted(tool_chunks or {}):
         call = tool_chunks[index]
@@ -3170,7 +3273,8 @@ def _build_response(content, tool_chunks=None, finish_reason=None):
             "id": call["id"] or f"call_{index}", "type": "function", "function": function,
         })())
     return type("R", (), {"choices": [type("C", (), {
-        "message": type("M", (), {"content": content, "tool_calls": tool_calls}),
+        "message": type("M", (), {"content": content, "tool_calls": tool_calls,
+                                  "reasoning_content": reasoning}),
         "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
     })()]})
 
