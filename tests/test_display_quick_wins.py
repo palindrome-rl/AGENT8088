@@ -371,3 +371,31 @@ def test_toggle_status_keeps_bracketed_options(monkeypatch):
     cli.cmd_trace("bogus")
     text = out.export_text()
     assert "/trace save [file]" in text and "/trace on|off|save [file]" in text
+
+
+# --- found in the live run ----------------------------------------------------
+
+def test_marker_quoted_as_inline_code_leaves_no_empty_backticks(engine):
+    # glm-5.3-flash, asked about the markers, wrote: the closing `<<<END…>>>` sits after result 5
+    answer = "the closing `<<<END_UNTRUSTED_CONTENT>>>` sits after result 5"
+    assert engine._guard_answer(answer) == "the closing  sits after result 5"
+    fenced = "```\n<<<EXTERNAL_UNTRUSTED_CONTENT>>>\nSearch results\n```"
+    assert engine.strip_untrusted_markers(fenced) == "```\nSearch results\n```"
+
+
+@pytest.mark.parametrize("command", [
+    "cd /work && test -e missing.csv && echo PRESENT || echo ABSENT",
+    "cd /work && ls", "[ -f data.csv ] && echo yes", "printf 'checking\\n'; pwd", "true && ls",
+])
+def test_harmless_shell_builtins_in_a_chain_change_nothing(engine, command):
+    # The live run's verification step (cd … && test -e … || echo …) was
+    # recorded as a change and ended two answers with "changes were made".
+    assert engine._readonly_chain(command)
+
+
+@pytest.mark.parametrize("command", [
+    "cd /work && awk '{s+=$1} END {print s}' data.csv",  # awk can system() and write
+    "cd /work && echo hi > f", "cd /work && sed -i s/a/b/ f", "test -e f && rm f",
+])
+def test_builtins_do_not_open_the_door_to_writes(engine, command):
+    assert not engine._readonly_chain(command)

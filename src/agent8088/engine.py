@@ -1588,7 +1588,19 @@ def _readonly_chain(command: str) -> bool:
     if re.search(r"[<>\n`]|\$\(", command):
         return False
     parts = _SHELL_CHAIN_RE.split(command.strip())
-    return len(parts) > 1 and all(part and _readonly_shell(part) for part in parts)
+    return len(parts) > 1 and all(
+        part and (_readonly_shell(part) or _harmless_builtin(part)) for part in parts)
+
+
+# Shell builtins that change nothing once redirects, $() and backticks are
+# ruled out (which _readonly_chain does first). Models wrap their checks in
+# them: `cd <dir> && test -e f && echo PRESENT || echo ABSENT`.
+_HARMLESS_BUILTINS = frozenset({"cd", "echo", "printf", "test", "[", "true", "false"})
+
+
+def _harmless_builtin(part: str) -> bool:
+    words = _shell_parts(part)
+    return bool(words) and words[0] in _HARMLESS_BUILTINS
 
 
 def _readonly_shell(command: str) -> bool:
@@ -12204,8 +12216,11 @@ def _wrap_untrusted(text: str, source: str = "") -> str:
     return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
 
 
+# A marker the model quoted as inline code takes its backticks with it, so the
+# answer does not keep an empty `` where the marker was.
 _UNTRUSTED_MARKER_RE = re.compile(
-    r'<<<EXTERNAL_UNTRUSTED_CONTENT(?: source="[^"\n]*")?>>>\n?|\n?<<<END_UNTRUSTED_CONTENT>>>')
+    r'`?<<<EXTERNAL_UNTRUSTED_CONTENT(?: source="[^"\n]*")?>>>`?\n?'
+    r'|\n?`?<<<END_UNTRUSTED_CONTENT>>>`?')
 
 
 def strip_untrusted_markers(text: str) -> str:
