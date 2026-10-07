@@ -5001,8 +5001,8 @@ def cmd_dump(_rest):
     out_path = A._agent_data_dir() / _stamped("dump", "txt")
     A._write_private_text(out_path, text)
     console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
-    return out_path
     console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
+    return out_path
 
 
 def cmd_sandbox(rest):
