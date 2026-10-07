@@ -4058,6 +4058,7 @@ def _doctor_base_checks():
         "Configuration", "ok" if config_found else "warn",
         f"{A.CONFIG_PATH} ({'found' if config_found else 'missing'})",
         "" if config_found else "Run `agent8088 --setup`."))
+    checks.append(_doctor_check("Working directory", *A.working_directory_status()))
     sandbox = A.sandbox_status()
     checks.append(_doctor_check("Sandbox", "info",
                                 f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}"))

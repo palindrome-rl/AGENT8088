@@ -386,6 +386,23 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
+def _is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _configured_dir(config: dict, key: str, launch: Path) -> Path | None:
+    """The directory config names under `key`, resolved against the launch
+    directory, or None when the key is unset."""
+    raw = str(config.get(key, "")).strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return (path if path.is_absolute() else launch / path).resolve()
+
+
 def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     """Choose the workspace setup named, even when launched somewhere else.
 
@@ -397,10 +414,16 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     the workspace those installers meant.
     """
     launch = Path(cwd or os.getcwd()).expanduser().resolve()
-    explicit = str(config.get("project_root", "")).strip()
+    explicit = _configured_dir(config, "project_root", launch)
     if explicit:
-        path = Path(explicit).expanduser()
-        return (path if path.is_absolute() else launch / path).resolve()
+        if _is_dir(explicit):
+            return explicit
+        # A project_root copied from another machine or image (an installer
+        # default, a container that works in /workspace, not /app) names a
+        # folder that is not here. Every relative path would point into
+        # nothing, so choose as if it were unset; /doctor reports the miss.
+        _log.warning("project_root %s does not exist; choosing the workspace "
+                     "as if it were unset", explicit)
 
     candidates = []
     for raw in str(config.get("allowed_paths", "")).split(","):
@@ -420,7 +443,8 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     return candidates[0] if candidates else launch
 
 
-PROJECT_ROOT = _configured_project_root(APP_CONFIG)
+LAUNCH_DIR = Path(os.getcwd()).resolve()
+PROJECT_ROOT = _configured_project_root(APP_CONFIG, LAUNCH_DIR)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 # Set by an evaluation harness that runs Agent8088 inside a throwaway task
 # container (Terminal-Bench under Harbor). The container is the sandbox: there
@@ -837,6 +861,25 @@ ALLOWED_PATHS = [
     for p in APP_CONFIG.get("allowed_paths", str(PROJECT_ROOT)).split(",")
     if p.strip()
 ]
+
+
+def _path_is_allowed(resolved: Path) -> bool:
+    """True when `resolved` falls inside an ALLOWED_PATHS base. Both sides are
+    normalized with os.path.normcase so the comparison survives the Windows
+    short-form (8.3 "ADMINI~1") vs long-form ("Administrator") mismatch:
+    tempfile and env-var paths come in either shape, and Path.resolve() only
+    normalizes the side it touches."""
+    import os
+
+    if not ALLOWED_PATHS:
+        return True
+    norm = os.path.normcase(str(resolved))
+    for base in ALLOWED_PATHS:
+        base_norm = os.path.normcase(str(Path(str(base)).resolve()))
+        if norm == base_norm or norm.startswith(base_norm.rstrip("\\/") + os.sep):
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Permission layer -- full-auto by default (configurable), escalates only when
@@ -3661,6 +3704,25 @@ def build_tools_def(tool_specs: dict) -> list:
     return result
 
 
+def _choose_shell_cwd() -> Path | None:
+    """Where commands start: shell_cwd when it exists, else the launch
+    directory or the project root, if allowed_paths covers it.
+
+    Checked on every command, not once at import: a shell_cwd that does not
+    exist here (a path from another machine or container image) failed every
+    command before it started, with an error that read like a missing program,
+    and the model concluded the whole environment was broken. A fallback never
+    widens access, so with none allowed this returns None and the caller says
+    why."""
+    if _is_dir(SHELL_CWD):
+        return SHELL_CWD
+    for candidate in (LAUNCH_DIR, PROJECT_ROOT):
+        if (_is_dir(candidate) and _path_is_allowed(candidate)
+                and _check_path_zone(candidate) != "blocked"):
+            return candidate
+    return None
+
+
 def _ground_execute_shell_description(specs: dict) -> None:
     """Append real OS/shell/cwd/python facts to execute_shell's description.
 
@@ -3682,9 +3744,17 @@ def _ground_execute_shell_description(specs: dict) -> None:
     else:
         python_hint = (f"If you need Python, use \"{sys.executable}\" -- do not assume "
                        f"`python3` is on PATH. ")
+    cwd = _choose_shell_cwd()
+    if cwd is None:
+        where = (f"none: the configured {SHELL_CWD} does not exist, so commands "
+                 f"cannot run until the user sets shell_cwd")
+    elif cwd != SHELL_CWD:
+        where = f"{cwd} (the configured {SHELL_CWD} does not exist)"
+    else:
+        where = str(cwd)
     spec["description"] += (
         f" Environment: {sys.platform}, using {shell_kind}. Working directory: "
-        f"{SHELL_CWD}. {python_hint}Before guessing any interpreter or command name, "
+        f"{where}. {python_hint}Before guessing any interpreter or command name, "
         f"check it exists first with `{check_cmd}`."
     )
 
@@ -4488,24 +4558,6 @@ def _from_container_path(raw_path: str) -> str:
     return str(ARTIFACTS_ROOT / relative)
 
 
-def _path_is_allowed(resolved: Path) -> bool:
-    """True when `resolved` falls inside an ALLOWED_PATHS base. Both sides are
-    normalized with os.path.normcase so the comparison survives the Windows
-    short-form (8.3 "ADMINI~1") vs long-form ("Administrator") mismatch:
-    tempfile and env-var paths come in either shape, and Path.resolve() only
-    normalizes the side it touches."""
-    import os
-
-    if not ALLOWED_PATHS:
-        return True
-    norm = os.path.normcase(str(resolved))
-    for base in ALLOWED_PATHS:
-        base_norm = os.path.normcase(str(Path(str(base)).resolve()))
-        if norm == base_norm or norm.startswith(base_norm.rstrip("\\/") + os.sep):
-            return True
-    return False
-
-
 def resolve_user_path(raw_path: str) -> Path:
     p = Path(_from_container_path(raw_path)).expanduser()
     if not p.is_absolute():
@@ -4811,7 +4863,72 @@ def _wait_interruptibly(process, timeout):
             raise AgentInterrupted()
 
 
+class WorkingDirectoryMissing(FileNotFoundError):
+    """No directory a command may start in exists. A FileNotFoundError, so
+    callers that already handle a failed start keep doing so."""
+
+
+_cwd_fallback_noted = None
+_pending_cwd_fallback = None
+
+
+def _shell_cwd() -> Path | None:
+    """_choose_shell_cwd(), and the first time it falls back, a log warning
+    and a pending note for the model (see _take_cwd_note)."""
+    global _cwd_fallback_noted, _pending_cwd_fallback
+    cwd = _choose_shell_cwd()
+    if cwd is not None and cwd != SHELL_CWD and _cwd_fallback_noted != cwd:
+        _cwd_fallback_noted = _pending_cwd_fallback = cwd
+        _log.warning("shell_cwd %s does not exist; commands run in %s", SHELL_CWD, cwd)
+    return cwd
+
+
+def _take_cwd_note(sandboxed: bool) -> str:
+    """The once-only fallback note, naming the folder the model's commands
+    really run in: a sandboxed command is moved into artifacts/ whatever
+    directory its process started in, so naming the fallback there would be
+    one folder off from what `pwd` prints."""
+    global _pending_cwd_fallback
+    cwd, _pending_cwd_fallback = _pending_cwd_fallback, None
+    if cwd is None:
+        return ""
+    where = ARTIFACTS_ROOT if sandboxed else cwd
+    return (f"\n{_HARNESS_PREFIX}The configured working directory {SHELL_CWD} "
+            f"does not exist. Commands now run in {where}.")
+
+
+def _missing_cwd_error() -> str:
+    return efficiency.tool_error(
+        'working_directory_missing',
+        f'The working directory {SHELL_CWD} does not exist, so no command can start.',
+        f'This is a setting, not a missing program or file: tell the user to set '
+        f'shell_cwd in {_config_file()} to an existing folder inside allowed_paths. '
+        f'Do not retry commands until then.')
+
+
+def working_directory_status() -> tuple:
+    """(status, detail, fix) for /doctor: where commands and files go, and any
+    configured directory that does not exist here."""
+    missing = [f"{key} {path} does not exist"
+               for key, path in (("project_root", _configured_dir(APP_CONFIG, "project_root", LAUNCH_DIR)),
+                                 ("shell_cwd", SHELL_CWD))
+               if path is not None and not _is_dir(path)]
+    cwd = _choose_shell_cwd()
+    if cwd is None:
+        return ("fail", "; ".join(missing) + "; no allowed folder to run commands in",
+                f"Set shell_cwd in {_config_file()} to an existing folder inside allowed_paths.")
+    detail = f"commands run in {cwd}; files in {PROJECT_ROOT}"
+    if not missing:
+        return "ok", detail, ""
+    keys = " and ".join(item.split()[0] for item in missing)
+    return ("warn", "; ".join(missing) + f" — using fallbacks: {detail}",
+            f"Set {keys} in {_config_file()} to an existing folder, or remove it.")
+
+
 def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
+    cwd = _shell_cwd()
+    if cwd is None:
+        raise WorkingDirectoryMissing(2, "Working directory does not exist", str(SHELL_CWD))
     kwargs = {
         "shell": shell,
         # Closed, not inherited: a child that reads stdin would otherwise
@@ -4820,7 +4937,7 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
-        "cwd": str(SHELL_CWD),
+        "cwd": str(cwd),
         "env": _non_interactive_env(),
     }
     if sys.platform == "win32":
@@ -10033,7 +10150,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # Only command runners count timeouts: a file that merely contains the phrase
     # must not.
     runs_commands = (TOOL_SPECS.get(name) or {}).get("mode") in ("shell", "docker")
-    return result + (_take_blocker_note() or (_timeout_note(result) if runs_commands else ""))
+    cwd_note = (_take_cwd_note(sandboxed=not (TOOL_SPECS.get(name) or {}).get("host"))
+                if runs_commands else "")
+    return result + cwd_note + (_take_blocker_note() or (_timeout_note(result) if runs_commands else ""))
 
 
 def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
@@ -11039,6 +11158,12 @@ _INSTALL_HINTS = {
 def _not_found_tool_error(error: FileNotFoundError) -> str:
     """Name the missing file or program instead of "something was not found"."""
     missing = getattr(error, "filename", None) or getattr(error, "filename2", None)
+    # A process started in a directory that vanished between the check and the
+    # start reports that directory as its missing file; say what it really is.
+    if isinstance(error, WorkingDirectoryMissing) or (
+            missing and Path(str(missing)) in (SHELL_CWD, LAUNCH_DIR, PROJECT_ROOT)
+            and not _is_dir(Path(str(missing)))):
+        return _missing_cwd_error()
     if not missing:
         return efficiency.tool_error('not_found', 'The requested file or executable was not found.',
             'Check the path or installed executable, correct the arguments, then retry.', recoverable=True)
