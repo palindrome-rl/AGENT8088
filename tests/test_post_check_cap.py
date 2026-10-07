@@ -77,3 +77,14 @@ def test_zero_disables_the_cap(engine, monkeypatch):
     answer, _calls, kinds = _run(engine, monkeypatch, script, cap=0)
     assert answer.startswith("final")
     assert "post_check_cap" not in kinds and "post_check_backstop" not in kinds
+
+
+def test_structured_git_writes_count_as_state_changes(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_structured_tool_argv", lambda name, args: ["git"])
+    monkeypatch.setattr(engine, "_exec_structured_tool", lambda name, args, timeout: "ok")
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    before = engine._MUTATION_SEQ
+    engine.run_tool("git_status", {})
+    assert engine._MUTATION_SEQ == before
+    engine.run_tool("git_commit", {"message": "fix"})
+    assert engine._MUTATION_SEQ > before

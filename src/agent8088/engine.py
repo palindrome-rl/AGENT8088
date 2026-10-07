@@ -5317,6 +5317,9 @@ def _structured_tool_argv(name: str, args: dict):
 _REMOTE_GIT_TOOLS = frozenset(["git_push", "git_clone", "git_create_pr"])
 
 
+_READONLY_GIT_TOOLS = frozenset({"git_status", "git_log", "git_diff"})
+
+
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     argv = _structured_tool_argv(name, args)
     on_host = bool((TOOL_SPECS.get(name) or {}).get("host"))
@@ -10986,7 +10989,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         if reuse:
             return reuse
         if _structured_tool_argv(name, args):
-            return _exec_structured_tool(name, args, timeout)
+            result = _exec_structured_tool(name, args, timeout)
+            # A commit or checkout changes the tree as much as a write does;
+            # without this a fix made through git looked like a read.
+            if name not in _READONLY_GIT_TOOLS:
+                note_mutation(name)
+            return result
         command = _format_with_args(spec.get("command") or "{command}", args)
         if spec.get("host"):
             # Never replace a shell command's output (see _shell_missing_program_note).
