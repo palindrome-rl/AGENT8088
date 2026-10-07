@@ -1,6 +1,9 @@
 """After a finishing nudge fires, read-only check rounds are capped: the model is
 told to answer after max_post_check_rounds, and the best answer so far is
 returned two rounds later. A write resets the count; 0 disables the cap."""
+import json
+
+import pytest
 
 
 def _response(content):
@@ -43,13 +46,30 @@ def _keeps_checking(i, _messages):
     return "done" if i == 1 else _calc(i)
 
 
-def test_read_only_checks_hit_the_backstop_with_the_best_answer(engine, monkeypatch):
-    answer, calls, kinds = _run(engine, monkeypatch, _keeps_checking)
+def _wrap_up_asked(messages):
+    return "no more tools will run" in str(messages[-1].get("content"))
+
+
+def test_read_only_checks_hit_the_backstop_with_a_fresh_answer(engine, monkeypatch):
+    def script(i, messages):
+        return "fresh summary" if _wrap_up_asked(messages) else _keeps_checking(i, messages)
+
+    answer, calls, kinds = _run(engine, monkeypatch, script)
     assert kinds.count("post_check_cap") == 1
     assert "post_check_backstop" in kinds
+    # The backstop asks once more with no tools, so the answer reflects the
+    # checks just run rather than the reply from before them.
+    assert answer.startswith("fresh summary")
+    # 1 tool + 1 reply + (5 + 2) check rounds + 1 wrap-up
+    assert len(calls) == 10
+
+
+def test_backstop_falls_back_to_the_last_reply_when_the_wrap_up_fails(engine, monkeypatch):
+    answer, _calls, kinds = _run(engine, monkeypatch, _keeps_checking)
+    # The wrap-up reply here is another tool call: no usable text, so the
+    # last text reply is used.
+    assert "post_check_backstop" in kinds
     assert answer.startswith("done")
-    # 1 tool + 1 reply + (5 + 2) check rounds
-    assert len(calls) == 9
 
 
 def test_model_that_obeys_the_cap_nudge_answers_without_more_gates(engine, monkeypatch):
@@ -67,7 +87,19 @@ def test_a_write_after_the_nudge_resets_the_count(engine, monkeypatch):
     # check round 3 (call index 4) writes; the cap then needs 5 more clean rounds.
     _answer, calls, kinds = _run(engine, monkeypatch, _keeps_checking, mutate_at=(4,))
     assert "post_check_backstop" in kinds
-    assert len(calls) == 9 + 3
+    assert len(calls) == 10 + 3
+
+
+def test_backstop_keeps_the_unverified_change_note(engine, monkeypatch):
+    # A write after the nudge leaves verification pending; the backstop must
+    # still say so, as a normal finish would.
+    def script(i, messages):
+        return "fresh summary" if _wrap_up_asked(messages) else _keeps_checking(i, messages)
+
+    answer, _calls, kinds = _run(engine, monkeypatch, script, mutate_at=(4,))
+    assert "post_check_backstop" in kinds
+    assert answer.startswith("fresh summary")
+    assert "Verification note" in answer
 
 
 def test_zero_disables_the_cap(engine, monkeypatch):
@@ -79,12 +111,150 @@ def test_zero_disables_the_cap(engine, monkeypatch):
     assert "post_check_cap" not in kinds and "post_check_backstop" not in kinds
 
 
-def test_structured_git_writes_count_as_state_changes(engine, monkeypatch):
-    monkeypatch.setattr(engine, "_structured_tool_argv", lambda name, args: ["git"])
-    monkeypatch.setattr(engine, "_exec_structured_tool", lambda name, args, timeout: "ok")
+_GIT_ARGV = {"git_push": ["git", "push", "origin", "HEAD"], "git_create_pr": ["gh", "pr", "create"],
+             "git_remote": ["git", "remote", "-v"]}
+
+
+def _git(engine, monkeypatch, result):
+    monkeypatch.setattr(engine, "_structured_tool_argv",
+                        lambda name, args: _GIT_ARGV.get(name, ["git", name.split("_", 1)[1]]))
+    monkeypatch.setattr(engine, "_exec_structured_tool", lambda name, args, timeout: result)
     monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+
+
+def test_structured_git_writes_count_as_state_changes(engine, monkeypatch):
+    _git(engine, monkeypatch, "[main 1a2b3c4] fix\n 1 file changed")
     before = engine._MUTATION_SEQ
     engine.run_tool("git_status", {})
     assert engine._MUTATION_SEQ == before
     engine.run_tool("git_commit", {"message": "fix"})
     assert engine._MUTATION_SEQ > before
+
+
+@pytest.mark.parametrize("name,args", [
+    ("git_remote", {"action": "list"}), ("git_push", {}), ("git_create_pr", {"title": "t"}),
+    ("git_log", {}), ("git_diff", {}),
+])
+def test_git_tools_that_leave_the_tree_alone_are_not_changes(engine, monkeypatch, name, args):
+    _git(engine, monkeypatch, "ok")
+    before = engine._MUTATION_SEQ
+    engine.run_tool(name, args)
+    assert engine._MUTATION_SEQ == before
+
+
+@pytest.mark.parametrize("result", [
+    "On branch main\nnothing to commit, working tree clean",
+    "Error: git commit exited with status 1",
+])
+def test_a_failed_git_write_is_not_a_change(engine, monkeypatch, result):
+    _git(engine, monkeypatch, result)
+    before = engine._MUTATION_SEQ
+    engine.run_tool("git_commit", {"message": "fix"})
+    assert engine._MUTATION_SEQ == before
+
+
+# --- shell checks are checks; shell writes are changes ------------------------
+
+@pytest.mark.parametrize("command", [
+    "pytest -q", "python -m pytest tests/", "python3 verify.py", "node check.js",
+    "curl -s http://localhost:8000/health", "curl -sf localhost:8080/api | jq .",
+    "cd /app && python3 test_outputs.py", "test -f /app/out.txt && echo ok",
+    "ls -la /app && cat /app/out.txt", "python3 -c 'print(open(\"out.txt\").read())'",
+    "go test ./...", "cargo test", "npm test", "make test", "diff a.txt b.txt",
+    "sha256sum out.bin", "ps aux | grep server", "timeout 10 pytest -x", "FOO=1 python3 run_checks.py",
+    "python3 verify.py 2>&1 | tail -20", "pytest -q >/dev/null 2>&1; echo $?",
+])
+def test_checks_are_not_state_changes(engine, command):
+    assert not engine._shell_may_change(command)
+
+
+@pytest.mark.parametrize("command", [
+    "echo hi > out.txt", "cat a >> b", "sed -i s/a/b/ f.py", "rm -f out.txt", "mv a b",
+    "cp a b", "mkdir -p out", "touch f", "pip install requests", "npm install",
+    "git commit -am fix", "python3 -c 'open(\"f\",\"w\").write(\"x\")'",
+    "curl -o page.html http://x", "curl -X POST http://localhost:8000/items -d '{}'",
+    "tee out.txt < in", "make", "python3 fix.py && echo done > log", "chmod +x run.sh",
+    "ls $(rm -rf x)", "some-unknown-tool --flag", "wget http://x/file",
+])
+def test_writes_and_unknown_commands_are_state_changes(engine, command):
+    assert engine._shell_may_change(command)
+
+
+def _run_shell(engine, monkeypatch, commands, cap=3):
+    """The model runs `commands` as execute_shell checks after a finishing
+    nudge; exec_tool bumps the mutation counter as run_tool does for any
+    command outside the read-only list."""
+    monkeypatch.setattr(engine, "DISPOSABLE_CONTAINER", True)
+    monkeypatch.setattr(engine, "MAX_POST_CHECK_ROUNDS", cap)
+
+    def script(i, messages):
+        if _wrap_up_asked(messages):
+            return "fresh summary"
+        if i == 1:
+            return "done"
+        command = commands[(i - 2) % len(commands)] if i >= 2 else "ls"
+        # Distinct each round: an identical repeat is short-circuited by the
+        # loop guard and never runs, so it would not count as a round.
+        command = f"{command} # round {i}"
+        return f'✿FUNCTION✿: execute_shell ✿ARGS✿: {json.dumps({"command": command})}'
+
+    calls = []
+
+    def fake_model(messages, tools, **kwargs):
+        calls.append(messages)
+        return _response(script(len(calls) - 1, messages))
+
+    def fake_exec(name, arguments, depth=0):
+        command = json.loads(arguments).get("command", "")
+        if not engine._readonly_shell(command):
+            engine.note_mutation(command)
+        return "ok"
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", fake_model)
+    monkeypatch.setattr(engine, "exec_tool", fake_exec)
+    trace = []
+    answer = engine.run_agent([{"role": "user", "content": "do it"}], max_turns=40,
+                              trace=trace, dynamic_turns=False)
+    return answer, calls, [t["type"] for t in trace]
+
+
+def test_shell_checks_hit_the_cap(engine, monkeypatch):
+    # The PR's own tests only used calculate; real checks are shell commands,
+    # which used to reset the count every round so the cap never fired.
+    checks = ["pytest -q", "python3 verify.py", "curl -s localhost:8000/health"]
+    _answer, _calls, kinds = _run_shell(engine, monkeypatch, checks)
+    assert "post_check_cap" in kinds and "post_check_backstop" in kinds
+
+
+def test_shell_writes_still_reset_the_cap(engine, monkeypatch):
+    commands = ["pytest -q", "sed -i s/bug/fix/ app.py"] * 10
+    _answer, _calls, kinds = _run_shell(engine, monkeypatch, commands)
+    assert "post_check_cap" not in kinds and "post_check_backstop" not in kinds
+
+
+def test_replan_nudge_does_not_start_the_cap(engine, monkeypatch):
+    # Two failed actions bring the re-plan nudge: the model is not finishing,
+    # it is changing approach, so reading for a while must not be cut short.
+    monkeypatch.setattr(engine, "MAX_POST_CHECK_ROUNDS", 2)
+    calls = []
+
+    def fake_model(messages, tools, **kwargs):
+        calls.append(messages)
+        i = len(calls) - 1
+        if i == 2:
+            return _response("I cannot do this.")       # final-looking -> re-plan nudge
+        if i >= 12:
+            return _response("finished after reading")
+        return _response(_calc(i))
+
+    def fake_exec(name, arguments, depth=0):
+        return "Error: failed" if len(calls) <= 2 else "2"
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", fake_model)
+    monkeypatch.setattr(engine, "exec_tool", fake_exec)
+    trace = []
+    answer = engine.run_agent([{"role": "user", "content": "compute"}], max_turns=40,
+                              trace=trace, dynamic_turns=False)
+    kinds = [t["type"] for t in trace]
+    assert answer.startswith("finished after reading")
+    assert "post_check_cap" not in kinds and "post_check_backstop" not in kinds
