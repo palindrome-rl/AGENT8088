@@ -44,6 +44,9 @@ const RULES: Array<[RegExp, string]> = [
   ],
   // <|mask_start|>...<|mask_end|>
   [/<\|mask_start\|>[\s\S]*?<\|mask_end\|>/g, ''],
+  // untrusted-content markers a model copied from a tool result
+  // (with the backticks around one quoted as inline code)
+  [/`?<<<EXTERNAL_UNTRUSTED_CONTENT(?: source="[^"\n]*")?>>>`?\n?|\n?`?<<<END_UNTRUSTED_CONTENT>>>`?/g, ''],
   // leftover <flower>...<flower> fragments, then any stray flowers
   [new RegExp(FLOWER + '[^' + FLOWER + '\\n]*' + FLOWER, 'g'), ''],
   [new RegExp(FLOWER, 'g'), ''],

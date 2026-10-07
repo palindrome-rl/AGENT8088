@@ -32,7 +32,14 @@ def test_dump_redacts_a_configured_secret(tmp_path, monkeypatch):
         "detail": "test", "verification": "n/a",
     })
 
-    cli.cmd_dump("")
-
-    dump_text = (tmp_path / "dump.txt").read_text(encoding="utf-8")
+    dump_text = cli.cmd_dump("").read_text(encoding="utf-8")
     assert "sk-super-secret-value" not in dump_text
+
+
+def test_trace_display_collapses_tool_list_but_keeps_other_steps():
+    from agent8088 import cli
+    trace = [{"type": "tool_exposure", "initial": ["a", "b", "c"], "schema_count": 4},
+             {"type": "final_answer", "content": "hi"}]
+    shown = cli._trace_for_display(trace)
+    assert shown[0]["initial"] == "3 tools" and shown[1] == trace[1]
+    assert trace[0]["initial"] == ["a", "b", "c"]  # the saved copy is untouched
