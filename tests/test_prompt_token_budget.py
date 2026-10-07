@@ -171,6 +171,15 @@ def test_hybrid_request_is_the_path_that_actually_ships():
     the test above is the one that grew, and only a provider asked for every
     schema at once pays it.
 
+    The ceiling below stood at 7,100. 7,100 -> 7,200 buys the start-up
+    environment probe in execute_shell's description: the folder's first
+    names, the user, and whether python3/node/git exist. It measured 7,053
+    -> 7,084 here, and is bounded at about 80 tokens (8 names of at most 30
+    characters, plus two short facts), so its cost depends on the folder an
+    agent starts in. The probe is what stops a model reading one failed
+    command as "nothing is here"; the description is the one place the model
+    sees it before the first command.
+
     """
     prompt = E.current_system_prompt(native_tools=True)
     selected = {name: E.TOOL_SPECS[name]
@@ -178,7 +187,7 @@ def test_hybrid_request_is_the_path_that_actually_ships():
                 if name in E.TOOL_SPECS}
     schema = json.dumps(E.build_tools_def(selected))
     total = approx_tokens(prompt) + approx_tokens(schema)
-    assert total < 7_100, f"hybrid request overhead regressed to {total} tokens"
+    assert total < 7_200, f"hybrid request overhead regressed to {total} tokens"
 
 
 def test_every_tool_name_is_visible_to_native_providers():

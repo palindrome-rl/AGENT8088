@@ -22,8 +22,8 @@ Secrets do **not** belong here — see [API keys](#api-keys-and-the-env-store).
 | Key | Default | Purpose |
 |---|---|---|
 | `allowed_paths` | `.` | Roots the agent may touch at all; `.` is the launch workspace. Anything outside is refused before any other check. |
-| `project_root` | cwd | Base for relative paths. |
-| `shell_cwd` | cwd | Working directory for shell commands. |
+| `project_root` | cwd | Base for relative paths. A folder that does not exist here is ignored with a warning, and the workspace is chosen as if the key were unset. |
+| `shell_cwd` | cwd | Working directory for shell commands. Checked before every command: if it does not exist or cannot be entered, commands start in the launch folder, or else `project_root`, but only inside `allowed_paths` and outside `blocked_paths`. The model is told once, the switch is logged and traced (`cwd_repaired`), and `/doctor` shows it. With no allowed fallback, commands fail with `working_directory_missing`. |
 | `no_prompt_paths` | (empty) | Writes here are auto-approved, no prompt. |
 | `prompt_paths` | `~` | Writes here require per-action approval. Code's own fallback if the key is absent entirely is `.`, but the shipped `config.txt` sets it to `~` explicitly, so that's the real default for anyone running the packaged config. |
 | `blocked_paths` | (empty) | Writes here are **always** refused, even in full-auto. |
@@ -213,6 +213,7 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
 | `max_tool_timeout_seconds` | `600` | Hard ceiling for one tool call. |
 | `compaction_threshold_pct` | `75` | Automatically summarize older messages at this estimated context usage (`0` disables). |
+| `diagnostic_after_failures` | `2` | After this many identical failures in a row (same tool, same error code), the model is shown a read-only check of where commands run: the working-directory status, a short listing, the user, free disk space and which interpreters exist. The same check is shown before the agent accepts an answer that says the environment is unavailable. Minimum `2`. |
 | `max_image_bytes` | `20 MB` | Cap on an image attachment. |
 | `document_process_concurrency` | `4` | Document chunks `document_read action=process` keeps in flight (clamped 1-16). Chunk requests are independent, so this multiplies throughput almost linearly until the provider rate-limits. |
 | `browser_max_steps` | `25` | Max steps `browse_page`'s browsing agent takes on one task. Override once with `AGENT8088_BROWSER_MAX_STEPS`. |
@@ -270,6 +271,7 @@ number of rounds. All default to `0`, meaning disabled.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
+| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check (deliverables, verification, re-plan, tests) before the model is told to answer; the answer so far is returned 2 rounds later. A write resets the count. `0` disables it. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
 | `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
