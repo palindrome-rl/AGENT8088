@@ -1587,10 +1587,8 @@ async def get_dump():
     """Generate redacted diagnostic bundle."""
     C = _cl()
     try:
-        C.cmd_dump("")
-        A = _eng()
-        dump_path = A._agent_data_dir() / "dump.txt"
-        if dump_path.exists():
+        dump_path = C.cmd_dump("")
+        if dump_path and dump_path.exists():
             return PlainTextResponse(dump_path.read_text(encoding="utf-8"))
         return _error("dump not generated", 500)
     except Exception as exc:

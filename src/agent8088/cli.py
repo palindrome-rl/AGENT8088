@@ -2389,6 +2389,10 @@ def do_chat(query):
         A._plan_on_escalation = _plan_on_escalation
         A._plan_on_approval = _make_plan_approval(live, esc)
 
+        # Show the animated status line now, not when the engine first reports it:
+        # recall and routing run before the model call, and the screen was blank
+        # for that whole stretch.
+        live.update(_StatusLine("thinking...", turn_start, tokens_ref, interruptible=True))
         try:
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
@@ -2448,7 +2452,7 @@ def do_chat(query):
     _await_memory_capture(memory_stored)
     if trace is not None:
         _record_trace(query, trace, elapsed)
-        console.print(Panel(Text(json.dumps(trace, indent=2)), title="[#237dd7]trace[/#237dd7]",
+        console.print(Panel(Text(json.dumps(_trace_for_display(trace), indent=2)), title="[#237dd7]trace[/#237dd7]",
                             box=box.MINIMAL, border_style="#0077B6"))
     _after_turn_plan_state()
     _save_active_session()
@@ -2578,7 +2582,7 @@ COMMAND_DETAILS = {
              "models; /local list shows models pulled into Ollama; /local available [query] "
              "browses ollama.com for models that fit this machine; /local pull <name> downloads "
              "one (e.g. qwen3:0.6b); /local remove <name> deletes one.",
-    "dump": "Writes a redacted diagnostic bundle (no API keys or tokens) to dump.txt in the "
+    "dump": "Writes a redacted diagnostic bundle (no API keys or tokens) to dump-<date>-<time>.txt in the "
             "agent's data folder, for bug reports.",
     "search": "/search (or /search status) shows the web-search backends and which are ready; "
               "/search use <searxng|ddgs|tavily|exa|auto> pins one; /search setup starts a "
@@ -4197,6 +4201,7 @@ def _doctor_base_checks():
         "Configuration", "ok" if config_found else "warn",
         f"{A.CONFIG_PATH} ({'found' if config_found else 'missing'})",
         "" if config_found else "Run `agent8088 --setup`."))
+    checks.append(_doctor_check("Working directory", *A.working_directory_status()))
     sandbox = A.sandbox_status()
     checks.append(_doctor_check("Sandbox", "info",
                                 f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}"))
@@ -5095,8 +5100,22 @@ def cmd_browser(rest: str):
     console.print(f"[#237dd7]{msg}[/#237dd7]")
 
 
+def _stamped(stem, ext):
+    """A default export name with the date and time, so a new dump, save or
+    trace never overwrites an earlier one. Explicit names are used as given."""
+    return f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
+
+
+def _trace_for_display(trace):
+    """The on-screen copy of a turn trace: the 50-odd tool names collapse to a
+    count. The saved trace file keeps the full list."""
+    return [({**step, "initial": f"{len(step['initial'])} tools"}
+             if step.get("type") == "tool_exposure" and isinstance(step.get("initial"), list)
+             else step) for step in trace]
+
+
 def cmd_dump(_rest):
-    """Write a redacted, shareable diagnostic bundle to the user data dir's dump.txt."""
+    """Write a redacted, shareable diagnostic bundle to dump-<date>-<time>.txt in the user data dir; returns its path."""
     import platform
     from agent8088 import __version__
 
@@ -5143,10 +5162,12 @@ def cmd_dump(_rest):
     for secret in A.collect_secret_values(A.APP_CONFIG):
         text = text.replace(secret, "[REDACTED]")
 
-    out_path = A._agent_data_dir() / "dump.txt"
+    out_path = A._agent_data_dir() / _stamped("dump", "txt")
     A._write_private_text(out_path, text)
-    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
+    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff] "
+                  f"[dim]({out_path.stat().st_size // 1024 or 1} KB)[/dim]")
     console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
+    return out_path
 
 
 def cmd_sandbox(rest):
@@ -5982,7 +6003,7 @@ def cmd_trace(rest):
     if arg == "save" or arg.startswith("save "):
         _, _, requested = raw.partition(" ")
         path = _write_user_export(
-            requested.strip() or f"{S.name or 'agent8088'}_trace.json",
+            requested.strip() or _stamped(f"{S.name or 'agent8088'}_trace", "json"),
             json.dumps(_trace_export_data(), indent=2),
         )
         if not path:
@@ -6592,7 +6613,7 @@ def cmd_limits(rest):
 
 
 def cmd_save(rest):
-    path = rest.strip() or "agent8088_session.json"
+    path = rest.strip() or _stamped("agent8088_session", "json")
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
             "conversation_trace": S.conversation_trace, "session": S.name or None,
             "disabled_skills": sorted(S.disabled_skills)}
@@ -9661,9 +9682,15 @@ def _first_run_check():
         console.print(f"\n[dim]{SETUP_CANCELLED_MESSAGE}[/dim]")
 
 
-def _run_repl_command(handler, rest):
+# Read-only commands that can take a while and never prompt. A spinner would
+# fight an interactive picker, so only these get one.
+_SPINNER_COMMANDS = frozenset({"doctor", "dump", "status", "tools", "skills"})
+
+
+def _run_repl_command(handler, rest, name=""):
     try:
-        handler(rest)
+        with (status_cm(f"running /{name}...") if name in _SPINNER_COMMANDS else nullcontext()):
+            handler(rest)
     except KeyboardInterrupt:
         # Ctrl+C inside a command's picker or prompt cancels that command;
         # it is Ctrl+C during a chat turn that quits.
@@ -9700,7 +9727,7 @@ def _repl_loop():
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:
-                _run_repl_command(handler, rest)
+                _run_repl_command(handler, rest, cmd.lower())
             else:
                 console.print(_unknown_command_message(cmd))
             continue
