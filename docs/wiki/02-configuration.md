@@ -94,7 +94,9 @@ provider. Details in [Model Providers](05-model-providers.md).
 | `searxng_host_port` | `8888` | Loopback port for the container `/search setup` provisions. Change it if 8888 is taken. Always published to `127.0.0.1` only. |
 | `search_date_augmentation` | `1` | Append the current year (or month, for "today"/"this week" questions) to a search query that means "as of now" and names no year of its own. Set `0` to send queries exactly as the model wrote them. |
 | `web_search_results` | `5` | Results per search (max 20). |
-| `web_search_max_per_turn` | `6` | Searches one request may run before the model must answer from what it has. `0` removes the cap. |
+| `web_search_max_per_turn` | `6` | Searches one request may *start* with before the model must answer from what it has. When it is reached and the latest two searches each returned mostly pages the request had not seen, it grows by `web_search_extension`; rephrasing one question returns the same pages and never earns more. A search that returns no pages (for example, a throttled backend) is skipped rather than counted against the request, but each extension still needs a search that found new pages since the last one. `0` removes the cap. |
+| `web_search_extension` | `3` | Searches granted each time the allowance grows. |
+| `web_search_ceiling_multiplier` | `3` | Hard search ceiling as a multiple of `web_search_max_per_turn` (default 18). `1` disables growth and restores a fixed cap. |
 | `ssrf_allow_private` | `0` | `1` opens the entire private network. Prefer the allowlist. |
 | `allowed_domains` | (empty) | If set, the **only** public hosts the agent may reach. Empty means all are reachable. |
 | `blocked_domains` | (empty) | Public hosts the agent may never reach. Wins over `allowed_domains`. |
