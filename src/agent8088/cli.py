@@ -4951,7 +4951,7 @@ def _stamped(stem, ext):
 
 
 def cmd_dump(_rest):
-    """Write a redacted, shareable diagnostic bundle to the user data dir's dump.txt."""
+    """Write a redacted, shareable diagnostic bundle to dump-<date>-<time>.txt in the user data dir; returns its path."""
     import platform
     from agent8088 import __version__
 
