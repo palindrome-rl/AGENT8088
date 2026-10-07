@@ -2700,24 +2700,66 @@ def cmd_tools(rest):
     _render_tools_table(show_full=False)
 
 
+def _add_name_column(table, header, names):
+    """A column of names the user types back (/tools <name>, /skills <name>,
+    /limits <key>): never narrower than the longest one. Rich otherwise
+    shrinks every column of a narrow terminal alike, and cut the names to
+    `cli_anything_inst…` while a description column wrapped beside it."""
+    longest = max((len(str(n)) for n in names), default=0)
+    table.add_column(header, style="#237dd7", no_wrap=True, min_width=max(longest, len(header)))
+
+
+# Below this width a many-column table cannot fit whole names and a readable
+# description at once; /tools, /skills and /agents print a short block per
+# entry instead.
+_NARROW_LIST_WIDTH = 110
+
+
+def _print_entry_blocks(title, entries, caption=""):
+    """entries: (name, meta, description, detail) -> one block per entry:
+    the name and its meta on one line, then the description, then a detail
+    line, each wrapped to the terminal."""
+    console.print(Text(title, style="bold #00edff"))
+    for name, meta, description, detail in entries:
+        head = Text(f"  {name}", style="bold #237dd7")
+        if meta:
+            head.append(f"  {meta}", style="dim")
+        console.print(head)
+        if description:
+            console.print(Padding(Text(description, style="#237dd7"), (0, 0, 0, 4)))
+        if detail:
+            console.print(Padding(Text(detail, style="dim"), (0, 0, 0, 4)))
+    if caption:
+        console.print(Text(caption, style="dim"))
+
+
 def _render_tools_table(show_full: bool = False):
     caption = "Run  /tools <name>  to inspect full schema and arguments  ·  /tools --full  for complete descriptions"
     t = Table(title="Tools", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6",
               caption=caption, caption_style="dim")
-    t.add_column("Name", style="#237dd7")
-    t.add_column("Args", style="#237dd7")
-    t.add_column("Mode", style="#237dd7")
-    t.add_column("Description", style="#237dd7")
     specs = _active_tool_specs()
+
+    def describe(spec):
+        if show_full:
+            return spec.get("description", "")
+        return spec.get("summary") or _summarize_tool_description(spec.get("description", ""))
+
+    if console.width < _NARROW_LIST_WIDTH:
+        _print_entry_blocks("Tools", [
+            (name, " · ".join(filter(None, [specs[name].get("mode", "?"),
+                                            ", ".join(specs[name].get("args") or [])])),
+             describe(specs[name]), "")
+            for name in sorted(specs)], caption)
+        return
+    _add_name_column(t, "Name", specs)
+    t.add_column("Args", style="#237dd7", overflow="fold")
+    t.add_column("Mode", style="#237dd7", overflow="fold")
+    t.add_column("Description", style="#237dd7")
     for name in sorted(specs):
         spec = specs[name]
         args = ", ".join(spec.get("args") or []) or "—"
-        if show_full:
-            desc = spec.get("description", "")
-        else:
-            desc = spec.get("summary") or _summarize_tool_description(spec.get("description", ""))
-        t.add_row(name, args, spec.get("mode", "?"), desc)
+        t.add_row(name, args, spec.get("mode", "?"), describe(spec))
     console.print(t)
 
 
@@ -2852,19 +2894,32 @@ def cmd_skills(rest):
                       "skills_installed/<name>/ with SKILL.md + tools.txt "
                       "(see skills_installed/README.md)[/dim]")
         return
+    caption = "Run  /skills <name>  for the full description and playbook"
+    if console.width < _NARROW_LIST_WIDTH:
+        _print_entry_blocks("Installed Skills", [
+            (name, " · ".join([str(s_.get("category", "general")), f"v{s_['version']}",
+                               "disabled" if name in S.disabled_skills else "active"]),
+             _summarize_tool_description(s_["description"]),
+             f"tools: {', '.join(sorted(s_['tools']))}" if s_["tools"] else "")
+            for name, s_ in sorted(A.SKILL_PACKAGES.items())], caption)
+        return
     t = Table(title="Installed Skills", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
-              header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Name", style="#237dd7")
-    t.add_column("Category", style="#237dd7")
+              header_style="bold #00edff", border_style="#0077B6",
+              caption=caption, caption_style="dim")
+    _add_name_column(t, "Name", A.SKILL_PACKAGES)
+    t.add_column("Category", style="#237dd7", overflow="fold")
     t.add_column("Version", style="#237dd7")
     t.add_column("State", style="#237dd7")
-    t.add_column("Tools", style="#237dd7")
+    t.add_column("Tools", style="#237dd7", overflow="fold")
     t.add_column("Description", style="#237dd7")
     for name in sorted(A.SKILL_PACKAGES):
         s = A.SKILL_PACKAGES[name]
+        # First sentence, as /tools does: the full text is the skill's routing
+        # description, written for the model and often a paragraph long.
         t.add_row(name, str(s.get("category", "general")), str(s["version"]),
                   "disabled" if name in S.disabled_skills else "active",
-                  ", ".join(sorted(s["tools"])) or "—", s["description"])
+                  ", ".join(sorted(s["tools"])) or "—",
+                  _summarize_tool_description(s["description"]))
     console.print(t)
 
 
@@ -3141,24 +3196,36 @@ def cmd_agent(rest):
         task = None
 
 
-def _cmd_agents_list():
-    t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
-              caption="run one with  /agent  (arrow-key picker)  or  /agent <name> <task>  ·  "
-                      "manage with  /agents new|edit|delete|models",
-              caption_style="dim")
-    t.add_column("Name", style="#237dd7")
-    t.add_column("Source", style="#237dd7")
-    t.add_column("Max turns", style="#237dd7")
-    t.add_column("Model", style="#237dd7")
-    t.add_column("Tools", style="#237dd7")
-    t.add_column("Description", style="#237dd7")
+_AGENTS_CAPTION = ("run one with  /agent  (arrow-key picker)  or  /agent <name> <task>  ·  "
+                   "manage with  /agents new|edit|delete|models")
+def _agent_rows():
     for name in sorted(A.SUBAGENT_SPECS):
         p = A.SUBAGENT_SPECS[name]
-        tools = ", ".join(t_ for t_ in p["tools"] if t_ in A.TOOL_NAMES) or "—"
-        source = "built-in" if p.get("builtin") else "custom"
-        model = p.get("model") or "inherit"
-        t.add_row(name, source, str(p["max_turns"]), model, tools, p["description"])
-    console.print(t)
+        yield (name, "built-in" if p.get("builtin") else "custom", str(p["max_turns"]),
+               p.get("model") or "inherit", [t_ for t_ in p["tools"] if t_ in A.TOOL_NAMES],
+               p["description"])
+
+
+def _cmd_agents_list():
+    if console.width < _NARROW_LIST_WIDTH:
+        _print_entry_blocks("Subagents", [
+            (name, f"{source} · {turns} turns · model {model}", description,
+             f"tools: {', '.join(tools) or '—'}")
+            for name, source, turns, model, tools, description in _agent_rows()],
+            _AGENTS_CAPTION)
+    else:
+        t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
+                  caption=_AGENTS_CAPTION, caption_style="dim")
+        _add_name_column(t, "Name", A.SUBAGENT_SPECS)
+        t.add_column("Source", style="#237dd7")
+        t.add_column("Max turns", style="#237dd7")
+        t.add_column("Model", style="#237dd7", overflow="fold")
+        # One tool per line: a comma list folded mid-name ("execute_she" / "ll,").
+        _add_name_column(t, "Tools", [tool for row in _agent_rows() for tool in row[4]])
+        t.add_column("Description", style="#237dd7")
+        for name, source, turns, model, tools, description in _agent_rows():
+            t.add_row(name, source, turns, model, "\n".join(tools) or "—", description)
+        console.print(t)
 
     provider = _active_provider_name()
     models = _fetch_models_for_provider(provider)
@@ -5924,12 +5991,15 @@ def cmd_trace(rest):
         _save_active_session()
         console.print(f"[#237dd7]full conversation trace saved[/#237dd7] -> {path}")
         return
-    if arg == "on":
-        S.show_trace = True
-    elif arg == "off":
-        S.show_trace = False
-    else:
-        S.show_trace = not S.show_trace
+    if arg not in ("on", "off"):
+        # A bare /trace used to flip capture and save it, so asking for the
+        # state switched on a JSON dump after every answer, for good.
+        _show_toggle("trace capture", S.show_trace, "/trace on|off · /trace save [file]",
+                     S.trace_path or "")
+        if arg:
+            console.print("[red]usage:[/red] /trace on|off|save \\[file]")
+        return
+    S.show_trace = arg == "on"
     if S.show_trace and not S.trace_path:
         try:
             _start_trace_export()
@@ -5942,14 +6012,24 @@ def cmd_trace(rest):
     _save_preferences()
 
 
+def _show_toggle(label, value, options, detail=""):
+    """The current state of an on/off setting and how to change it, for a bare
+    command — the way /usage and /tool-selection already answer."""
+    state = value if isinstance(value, str) else ("on" if value else "off")
+    color = "red" if state == "off" else "green"
+    from rich.markup import escape
+    tail = f"  [dim]{escape(detail)}[/dim]" if detail else ""
+    console.print(f"{label}: [{color}]{state}[/] · set with {escape(options)}{tail}")
+
+
 def cmd_reasoning(rest):
     arg = rest.strip().lower()
-    if arg == "on":
-        S.show_reasoning = True
-    elif arg == "off":
-        S.show_reasoning = False
-    else:
-        S.show_reasoning = not S.show_reasoning
+    if arg not in ("on", "off"):
+        _show_toggle("reasoning display", S.show_reasoning, "/reasoning on|off")
+        if arg:
+            console.print("[red]usage:[/red] /reasoning on|off")
+        return
+    S.show_reasoning = arg == "on"
     A.SHOW_REASONING = S.show_reasoning
     state = "on" if S.show_reasoning else "off"
     note = "  [dim](secrets & system text are masked even when shown)[/dim]" if S.show_reasoning else ""
@@ -5958,7 +6038,10 @@ def cmd_reasoning(rest):
 
 
 def cmd_verbose(rest):
-    mode = (rest or "").strip().lower() or "on"
+    mode = (rest or "").strip().lower()
+    if not mode:
+        _show_toggle("tool activity", S.verbose, "/verbose on|off|full")
+        return
     if mode not in {"on", "off", "full"}:
         console.print("[red]usage:[/red] /verbose \\[on|off|full]")
         return
@@ -6064,8 +6147,8 @@ def _report_limit_change(change):
 def _show_limits():
     t = Table(title="Limits", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Limit", style="#237dd7")
-    t.add_column("Value", style="#237dd7")
+    _add_name_column(t, "Limit", ["max_turns", *A.LIMIT_SPECS])
+    t.add_column("Value", style="#237dd7", overflow="fold")
     t.add_column("What it bounds", style="dim")
     t.add_row("max_turns", str(S.max_turns), "Rounds the main agent may take")
     for key, (const_name, _caster, blurb) in A.LIMIT_SPECS.items():

@@ -243,3 +243,131 @@ def test_startup_notices_are_quiet_when_the_key_is_set_or_not_needed(monkeypatch
     monkeypatch.setattr(cli, "_active_provider_name", lambda: "ollama")
     monkeypatch.setattr(cli.A, "_provider_api_key", lambda profile: "")
     assert cli._startup_notices() == []
+
+
+# --- tables never cut off a name the user types back -------------------------
+
+def _render(monkeypatch, fn, width=80):
+    from rich.console import Console
+    out = Console(width=width, record=True, force_terminal=False, file=open(os.devnull, "w"))
+    monkeypatch.setattr(cli, "console", out)
+    fn()
+    return out.export_text()
+
+
+def test_tools_table_shows_whole_tool_names(monkeypatch):
+    text = _render(monkeypatch, cli._render_tools_table)
+    for name in cli._active_tool_specs():
+        assert name in text, f"{name} cut off in /tools at 80 cols"
+    assert "…" not in text
+    assert len(text.splitlines()) < 5 * len(cli._active_tool_specs())
+
+
+@pytest.mark.parametrize("width", [120, 160])
+def test_wide_tool_and_skill_tables_keep_whole_names(monkeypatch, width):
+    text = _render(monkeypatch, cli._render_tools_table, width=width)
+    assert "Mode" in text  # the table layout
+    for name in cli._active_tool_specs():
+        assert name in text
+    text = _render(monkeypatch, lambda: cli.cmd_skills(""), width=width)
+    for name in cli.A.SKILL_PACKAGES:
+        assert name in text
+
+
+def test_skills_table_shows_whole_names_and_one_line_descriptions(monkeypatch):
+    if not cli.A.SKILL_PACKAGES:
+        pytest.skip("no skills installed")
+    text = _render(monkeypatch, lambda: cli.cmd_skills(""))
+    for name in cli.A.SKILL_PACKAGES:
+        assert name in text, f"{name} cut off in /skills at 80 cols"
+    # One short description per skill, not every full playbook summary.
+    assert len(text.splitlines()) < 6 * len(cli.A.SKILL_PACKAGES)
+    assert "…" not in text
+
+
+def test_limits_table_shows_whole_setting_names(monkeypatch):
+    text = _render(monkeypatch, cli._show_limits)
+    for key in cli.A.LIMIT_SPECS:
+        assert key in text, f"{key} cut off in /limits at 80 cols"
+
+
+def test_agents_table_shows_whole_tool_names(monkeypatch):
+    monkeypatch.setattr(cli, "_fetch_models_for_provider", lambda provider: [])
+    text = _render(monkeypatch, cli._cmd_agents_list)
+    flat = "".join(text.split())  # a folded name is still whole, split over lines
+    for name in cli.A.SUBAGENT_SPECS:
+        assert name in text
+        for tool in cli.A.SUBAGENT_SPECS[name]["tools"]:
+            if tool in cli.A.TOOL_NAMES:
+                assert tool in flat, f"{tool} cut off in /agents at 80 cols"
+    assert "…" not in text
+
+
+# --- a bare toggle shows its setting instead of flipping it -----------------
+
+def _quiet(monkeypatch):
+    printed = []
+    monkeypatch.setattr(cli.console, "print", lambda *a, **k: printed.append(str(a[0]) if a else ""))
+    saved = []
+    monkeypatch.setattr(cli, "_save_preferences", lambda: saved.append(True))
+    return printed, saved
+
+
+@pytest.mark.parametrize("arg", ["", "status", "bogus"])
+def test_bare_or_unknown_trace_does_not_flip_it(monkeypatch, arg):
+    printed, saved = _quiet(monkeypatch)
+    monkeypatch.setattr(cli.S, "show_trace", False)
+    cli.cmd_trace(arg)
+    assert cli.S.show_trace is False and not saved
+    assert "off" in " ".join(printed)
+
+
+@pytest.mark.parametrize("arg", ["", "status", "bogus"])
+def test_bare_or_unknown_reasoning_does_not_flip_it(monkeypatch, arg):
+    printed, saved = _quiet(monkeypatch)
+    monkeypatch.setattr(cli.S, "show_reasoning", True)
+    cli.cmd_reasoning(arg)
+    assert cli.S.show_reasoning is True and not saved
+    assert "on" in " ".join(printed)
+
+
+def test_bare_verbose_does_not_reset_it(monkeypatch):
+    printed, saved = _quiet(monkeypatch)
+    monkeypatch.setattr(cli.S, "verbose", "full")
+    cli.cmd_verbose("")
+    assert cli.S.verbose == "full" and not saved
+    assert "full" in " ".join(printed)
+
+
+def test_explicit_toggles_still_work(monkeypatch, tmp_path):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(cli.S, "show_reasoning", False)
+    cli.cmd_reasoning("on")
+    assert cli.S.show_reasoning is True
+    monkeypatch.setattr(cli.S, "show_trace", True)
+    cli.cmd_trace("off")
+    assert cli.S.show_trace is False
+    monkeypatch.setattr(cli.S, "verbose", "on")
+    cli.cmd_verbose("off")
+    assert cli.S.verbose == "off"
+
+
+def test_agents_table_on_a_wide_terminal_keeps_names_and_tools_whole(monkeypatch):
+    monkeypatch.setattr(cli, "_fetch_models_for_provider", lambda provider: [])
+    text = _render(monkeypatch, cli._cmd_agents_list, width=140)
+    assert "Max turns" in text  # the table layout, not the narrow blocks
+    for name, spec in cli.A.SUBAGENT_SPECS.items():
+        assert name in text
+        for tool in spec["tools"]:
+            if tool in cli.A.TOOL_NAMES:
+                assert tool in text
+
+
+def test_toggle_status_keeps_bracketed_options(monkeypatch):
+    from rich.console import Console
+    out = Console(width=120, record=True, force_terminal=False, file=open(os.devnull, "w"))
+    monkeypatch.setattr(cli, "console", out)
+    monkeypatch.setattr(cli.S, "show_trace", False)
+    cli.cmd_trace("bogus")
+    text = out.export_text()
+    assert "/trace save [file]" in text and "/trace on|off|save [file]" in text
