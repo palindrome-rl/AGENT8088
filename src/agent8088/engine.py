@@ -12860,11 +12860,73 @@ def _web_search_limit() -> int:
 
 
 def _web_search_turn_cap() -> int:
-    """Searches one request may run before it must answer; 0 means no cap."""
+    """Searches one request may run before it must answer; 0 means no cap.
+
+    This is the starting allowance: _grown_search_allowance raises it while
+    searches keep finding new pages, up to a hard ceiling."""
     try:
         return max(0, _config_int("web_search_max_per_turn", 6))
     except (TypeError, ValueError):
         return 6
+
+
+# How many of the latest searches must each have found new pages to earn more.
+# Two, not one: a single rephrasing can turn up a few new pages by chance.
+_SEARCH_PRODUCTIVE_WINDOW = 2
+_SEARCH_URL_LINE = re.compile(r"^\s+(https?://\S+)\s*$", re.MULTILINE)
+
+
+def _search_result_urls(result: str) -> set:
+    """The result pages a web_search returned, normalized so the same page
+    reached by a slightly different link still counts as already seen."""
+    urls = set()
+    for raw in _SEARCH_URL_LINE.findall(result or ""):
+        parts = urllib.parse.urlsplit(raw)
+        path = parts.path.rstrip("/")
+        urls.add(urllib.parse.urlunsplit(
+            (parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "")))
+    return urls
+
+
+def _search_found_new_pages(result: str, seen: set):
+    """True when a completed search brought back mostly pages this request had
+    not seen yet, False when it repeated earlier pages, None when it returned
+    no pages at all; adds its pages to `seen`. A rephrasing of one question
+    returns the same pages, so it never counts as new."""
+    urls = _search_result_urls(result) if _search_was_usable(result) else set()
+    if not urls:
+        return None
+    new = urls - seen
+    seen |= urls
+    return len(new) * 2 >= len(urls)
+
+
+def _grown_search_allowance(allowance: int, cap: int, productive: list,
+                            since: int = 0) -> int:
+    """`allowance` plus one more block of searches when the latest searches
+    each found new pages, never past cap x web_search_ceiling_multiplier.
+
+    A fixed cap stopped real research mid-way while every search was still
+    bringing back pages the run had not seen. Growth is earned the same way
+    the dynamic turn budget earns rounds: from what the searches returned,
+    not from anything the model asks for.
+
+    `productive` holds _search_found_new_pages per search that ran. A search
+    with no pages (None) is skipped rather than counted against the run: live,
+    DDGS throttled two of ten distinct city lookups to "No results found", and
+    counting those stopped real work at the starting cap. So that empty
+    searches cannot chain extensions on their own, growth also needs a search
+    that found new pages since the last extension (`since`)."""
+    try:
+        ceiling = cap * max(1, _config_int("web_search_ceiling_multiplier", 3))
+        extension = max(1, _config_int("web_search_extension", 3))
+    except (TypeError, ValueError):
+        ceiling, extension = cap * 3, 3
+    recent = [p for p in productive if p is not None][-_SEARCH_PRODUCTIVE_WINDOW:]
+    if (allowance < ceiling and len(recent) == _SEARCH_PRODUCTIVE_WINDOW
+            and all(recent) and any(productive[since:])):
+        return min(ceiling, allowance + extension)
+    return allowance
 
 
 _WEB_SEARCH_MAX_QUERY_CHARS = 500
@@ -14943,7 +15005,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
-    searches_run = 0     # web searches that actually ran, against _web_search_turn_cap
+    searches_run = 0     # web searches that actually ran, against search_allowance
+    search_allowance = 0     # current cap; starts at _web_search_turn_cap, can grow
+    search_pages_seen = set()    # result pages earlier searches returned
+    search_productive = []       # per search that ran: new pages? (None = no pages)
+    search_grant_mark = 0        # len(search_productive) at the last extension
     forced_stop = False
     user_turns = _genuine_user_turns(messages)
     durable_browser_goal = next((str(message.get("content") or "")
@@ -15530,8 +15596,22 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # detail that snippets never carry (a full 20-team table from
                 # five-result DDGS searches) rephrased 23 times until the turn
                 # was killed with no answer; stop it and make it answer.
+                # Searches still finding new pages earn more (see
+                # _grown_search_allowance); a rephrasing model finds the same
+                # pages, earns nothing, and stops at the starting cap.
                 cap = _web_search_turn_cap()
-                if cap and searches_run >= cap:
+                search_allowance = max(search_allowance, cap)
+                if cap and searches_run >= search_allowance:
+                    search_allowance = _grown_search_allowance(
+                        search_allowance, cap, search_productive, search_grant_mark)
+                    if search_allowance > searches_run:
+                        search_grant_mark = len(search_productive)
+                        _log.info("web search allowance raised to %d: recent "
+                                  "searches found new pages", search_allowance)
+                        if trace is not None:
+                            trace.append({"turn": turn, "type": "search_allowance",
+                                          "allowance": search_allowance})
+                if cap and searches_run >= search_allowance:
                     result = (f"Search limit reached: {searches_run} web searches "
                               "already ran for this request. Do not search again. "
                               "Answer now from the results above, and say plainly "
@@ -15719,6 +15799,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # user had just authorised was answered from the escalation text.
                 search_results[_search_signature(str(args.get("query") or ""))] = result
                 searches_run += 1
+                search_productive.append(_search_found_new_pages(result, search_pages_seen))
             searched = searched or (name == "web_search" and _search_was_usable(result))
 
             blocked = result.startswith("ESCALATION_REQUEST\x1f")

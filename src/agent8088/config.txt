@@ -453,8 +453,15 @@ web_search_no_prompt=1
 # Results per search (default 5, max 20):
 # web_search_results=5
 #
-# Searches one request may run before it must answer (default 6, 0 = no cap):
+# Searches one request may run before it must answer (default 6, 0 = no cap).
+# This is a starting allowance: while the latest two searches each keep finding
+# mostly new pages, the request earns web_search_extension more searches, up to
+# web_search_max_per_turn x web_search_ceiling_multiplier. Rephrasing the same
+# question returns the same pages, so it never earns more. A search that
+# returns no pages is skipped, neither earning nor blocking more.
 # web_search_max_per_turn=6
+# web_search_extension=3
+# web_search_ceiling_multiplier=3   (1 = fixed cap, no growth)
 #
 # Optional backends. Add a key and they join the chain automatically; leave them
 # unset and they stay out of it entirely. Keys live in the .env store next to
