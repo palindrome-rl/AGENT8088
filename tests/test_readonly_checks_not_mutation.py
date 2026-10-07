@@ -33,6 +33,8 @@ def _mutated(engine, command):
     "cat data.csv && echo '---' && md5 data.csv 2>/dev/null || md5sum data.csv",
     "awk -F',' '{sum+=$2} END {print sum}' data.csv",       # seen live: the sum itself
     "cat data.csv && awk '{print}' data.csv",
+    "awk -F, 'NR>0 {s+=$2} END {print s}' data.csv",       # seen live: > is a comparison
+    "awk -F, '$2 > 500 && $2 < 900 {n++} END {print n}' data.csv",
 ])
 def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monkeypatch, command):
     _host_shell(engine, tmp_path, monkeypatch)
@@ -46,6 +48,8 @@ def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monk
     "awk 'BEGIN {system(\"touch x\")}'",          # awk running a command
     "awk '{print > \"copy.txt\"}' data.csv",       # awk writing a file
     "awk -f prog.awk data.csv",                      # a program it cannot inspect
+    "awk '{print | \"sh\"}' data.csv",              # awk piping to a command
+    "awk '{printf \"%s\", $1 >> \"log.txt\"}' data.csv",
     "sort -o data.csv data.csv",
     "echo $(touch sneaky.txt)",
 ])

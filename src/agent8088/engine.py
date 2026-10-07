@@ -5790,16 +5790,27 @@ def _shell_call_is_read_only(command: str) -> bool:
                for masked, original in stages)
 
 
-_AWK_SIDE_EFFECT = re.compile(r"\bsystem\b|\bgetline\b|\bclose\s*\(|[|>]")
+# What lets an awk program act beyond printing: running a command, reading
+# one (getline), closing a pipe, or a print/printf whose output is redirected
+# (`>`, `>>`) or piped (`|`). A bare `>` elsewhere is a comparison: NR>0.
+_AWK_SIDE_EFFECT = re.compile(
+    r"\bsystem\b|\bgetline\b|\bclose\s*\(|\bprintf?\b[^;{}]*(?:>|\|)")
 
 
 def _awk_prints_only(stage: str) -> bool:
     """An awk call whose inline program can only print: no system(), no
-    getline (which can run a command), no output redirection or pipe, and no
+    getline (which can run a command), no redirected or piped print, and no
     -f program file or in-place flag it cannot inspect. The common case is a
-    column sum, `awk -F',' '{s+=$2} END {print s}' data.csv`: seen live, that
-    counted as a change and re-armed the verification nudge twice."""
-    parts = _shell_parts(stage)
+    column sum, `awk -F, 'NR>0 {s+=$2} END {print s}' data.csv`: seen live,
+    that counted as a change and re-armed the verification nudge twice."""
+    if re.search(r"[`]|\$\(", stage):
+        return False
+    try:
+        # Not _shell_parts: it refuses any `>` or `|`, even inside the quoted
+        # program, where they are usually comparisons and logic.
+        parts = shlex.split(stage, posix=True)
+    except ValueError:
+        return False
     if not parts or Path(parts[0]).stem.lower() not in {"awk", "gawk", "mawk", "nawk"}:
         return False
     cursor = 1
@@ -5817,8 +5828,8 @@ def _awk_prints_only(stage: str) -> bool:
 # Programs that only print what they compute from their input or arguments,
 # with no way to write a file or run another program. Used only to decide
 # whether a call changed anything, never for approval prompts. Left out on
-# purpose: awk (system()), sort (-o), uniq (an output operand), file (-C), and
-# anything that interprets code.
+# purpose: sort (-o), uniq (an output operand), file (-C), and anything that
+# interprets code. awk is judged by its program text (_awk_prints_only).
 _TEXT_ONLY_COMMANDS = frozenset([
     "echo", "printf", "cut", "tr", "paste", "bc", "od", "nl", "cksum",
     "md5", "md5sum", "sha1sum", "sha256sum", "shasum",
