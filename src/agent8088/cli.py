@@ -2329,6 +2329,10 @@ def do_chat(query):
         A._plan_on_escalation = _plan_on_escalation
         A._plan_on_approval = _make_plan_approval(live, esc)
 
+        # Show the animated status line now, not when the engine first reports it:
+        # recall and routing run before the model call, and the screen was blank
+        # for that whole stretch.
+        live.update(_StatusLine("thinking...", turn_start, tokens_ref, interruptible=True))
         try:
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
@@ -2388,7 +2392,7 @@ def do_chat(query):
     _await_memory_capture(memory_stored)
     if trace is not None:
         _record_trace(query, trace, elapsed)
-        console.print(Panel(Text(json.dumps(trace, indent=2)), title="[#237dd7]trace[/#237dd7]",
+        console.print(Panel(Text(json.dumps(_trace_for_display(trace), indent=2)), title="[#237dd7]trace[/#237dd7]",
                             box=box.MINIMAL, border_style="#0077B6"))
     _after_turn_plan_state()
     _save_active_session()
@@ -2603,7 +2607,9 @@ A.register_frontend_commands({
 def cmd_help(_):
     t = Table(title="Commands", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Command", style="#237dd7", no_wrap=True)
+    # Capped: one long usage string (/review ...) otherwise widens this column
+    # until the description is squeezed into a few words per line.
+    t.add_column("Command", style="#237dd7", max_width=34)
     t.add_column("What it does", style="#237dd7")
     for command in command_catalog():
         t.add_row(command["usage"], command["description"])
@@ -4951,6 +4957,14 @@ def _stamped(stem, ext):
     return f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
 
 
+def _trace_for_display(trace):
+    """The on-screen copy of a turn trace: the 50-odd tool names collapse to a
+    count. The saved trace file keeps the full list."""
+    return [({**step, "initial": f"{len(step['initial'])} tools"}
+             if step.get("type") == "tool_exposure" and isinstance(step.get("initial"), list)
+             else step) for step in trace]
+
+
 def cmd_dump(_rest):
     """Write a redacted, shareable diagnostic bundle to dump-<date>-<time>.txt in the user data dir; returns its path."""
     import platform
@@ -5001,7 +5015,8 @@ def cmd_dump(_rest):
 
     out_path = A._agent_data_dir() / _stamped("dump", "txt")
     A._write_private_text(out_path, text)
-    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
+    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff] "
+                  f"[dim]({out_path.stat().st_size // 1024 or 1} KB)[/dim]")
     console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
     return out_path
 
@@ -9502,9 +9517,15 @@ def _first_run_check():
         console.print(f"\n[dim]{SETUP_CANCELLED_MESSAGE}[/dim]")
 
 
-def _run_repl_command(handler, rest):
+# Read-only commands that can take a while and never prompt. A spinner would
+# fight an interactive picker, so only these get one.
+_SPINNER_COMMANDS = frozenset({"doctor", "dump", "status", "tools", "skills"})
+
+
+def _run_repl_command(handler, rest, name=""):
     try:
-        handler(rest)
+        with (status_cm(f"running /{name}...") if name in _SPINNER_COMMANDS else nullcontext()):
+            handler(rest)
     except KeyboardInterrupt:
         # Ctrl+C inside a command's picker or prompt cancels that command;
         # it is Ctrl+C during a chat turn that quits.
@@ -9541,7 +9562,7 @@ def _repl_loop():
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:
-                _run_repl_command(handler, rest)
+                _run_repl_command(handler, rest, cmd.lower())
             else:
                 console.print(_unknown_command_message(cmd))
             continue
