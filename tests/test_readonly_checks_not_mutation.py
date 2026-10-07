@@ -35,6 +35,9 @@ def _mutated(engine, command):
     "cat data.csv && awk '{print}' data.csv",
     "awk -F, 'NR>0 {s+=$2} END {print s}' data.csv",       # seen live: > is a comparison
     "awk -F, '$2 > 500 && $2 < 900 {n++} END {print n}' data.csv",
+    # seen live: counting repeated messages
+    "grep a data.csv | sed 's/,.*//' | sort | uniq -c | sort -rn",
+    "sort -t, -k2 -n data.csv | uniq -c",
 ])
 def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monkeypatch, command):
     _host_shell(engine, tmp_path, monkeypatch)
@@ -51,6 +54,11 @@ def test_chained_read_only_checks_do_not_count_as_changes(engine, tmp_path, monk
     "awk '{print | \"sh\"}' data.csv",              # awk piping to a command
     "awk '{printf \"%s\", $1 >> \"log.txt\"}' data.csv",
     "sort -o data.csv data.csv",
+    "sort -rno data.csv data.csv",                   # -o hidden in combined flags
+    "sort --output=x.txt data.csv",
+    "uniq data.csv out.txt",                         # uniq writes its second operand
+    "sed 's/a/b/w out.txt' data.csv",                # sed's w flag writes a file
+    "sed -i 's/a/b/' data.csv",                      # in place
     "echo $(touch sneaky.txt)",
 ])
 def test_anything_that_can_write_still_counts(engine, tmp_path, monkeypatch, command):

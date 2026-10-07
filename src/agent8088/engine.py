@@ -5702,6 +5702,9 @@ _FD_DUPLICATE = re.compile(r"\d?>&\d+\b")
 # A sed script made only of line numbers and p/q/d/= prints; it cannot write,
 # run a command, or read another file (w, W, e, r, R are all letters).
 _SED_PRINT_SCRIPT = re.compile(r"[\d,$;!pqd=\s]+")
+# One s/old/new/ with only print-safe flags. The w flag writes a file and e
+# runs a command, so neither is allowed; -i is refused by _SED_READ_FLAGS.
+_SED_SUBSTITUTE = re.compile(r"s([^\\\n\w\s])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gIi\d]*")
 _SED_READ_FLAGS = {"-n", "-E", "-r", "--quiet", "--silent"}
 
 
@@ -5745,7 +5748,8 @@ def _sed_prints_only(command: str) -> bool:
     flags = [part for part in parts[1:] if part.startswith("-")]
     operands = [part for part in parts[1:] if not part.startswith("-")]
     return (bool(operands) and all(flag in _SED_READ_FLAGS for flag in flags)
-            and _SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None)
+            and (_SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None
+                 or _SED_SUBSTITUTE.fullmatch(operands[0]) is not None))
 
 
 def _shell_call_is_read_only(command: str) -> bool:
@@ -5828,8 +5832,9 @@ def _awk_prints_only(stage: str) -> bool:
 # Programs that only print what they compute from their input or arguments,
 # with no way to write a file or run another program. Used only to decide
 # whether a call changed anything, never for approval prompts. Left out on
-# purpose: sort (-o), uniq (an output operand), file (-C), and anything that
-# interprets code. awk is judged by its program text (_awk_prints_only).
+# purpose: file (-C) and anything that interprets code. sort and uniq are
+# allowed without their output forms (_text_only_stage); awk is judged by its
+# program text (_awk_prints_only).
 _TEXT_ONLY_COMMANDS = frozenset([
     "echo", "printf", "cut", "tr", "paste", "bc", "od", "nl", "cksum",
     "md5", "md5sum", "sha1sum", "sha256sum", "shasum",
@@ -5839,7 +5844,20 @@ _TEXT_ONLY_COMMANDS = frozenset([
 
 def _text_only_stage(stage: str) -> bool:
     parts = _shell_parts(stage)
-    return bool(parts) and Path(parts[0]).stem.lower() in _TEXT_ONLY_COMMANDS
+    if not parts:
+        return False
+    name = Path(parts[0]).stem.lower()
+    if name == "sort":
+        # Writes only through -o/--output (possibly bundled: -rno).
+        return not any(p.startswith("--output") or p.startswith("--compress")
+                       or (p.startswith("-") and not p.startswith("--")
+                           and "o" in p[1:].split("=")[0])
+                       for p in parts[1:])
+    if name == "uniq":
+        # A second operand is the output file: `uniq in.txt out.txt`.
+        operands = [p for p in parts[1:] if not p.startswith("-") and not p.isdigit()]
+        return len(operands) <= 1
+    return name in _TEXT_ONLY_COMMANDS
 
 
 def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
