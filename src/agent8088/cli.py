@@ -2329,6 +2329,10 @@ def do_chat(query):
         A._plan_on_escalation = _plan_on_escalation
         A._plan_on_approval = _make_plan_approval(live, esc)
 
+        # Show the animated status line now, not when the engine first reports it:
+        # recall and routing run before the model call, and the screen was blank
+        # for that whole stretch.
+        live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=True))
         try:
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
@@ -9510,9 +9514,15 @@ def _first_run_check():
         console.print(f"\n[dim]{SETUP_CANCELLED_MESSAGE}[/dim]")
 
 
-def _run_repl_command(handler, rest):
+# Read-only commands that can take a while and never prompt. A spinner would
+# fight an interactive picker, so only these get one.
+_SPINNER_COMMANDS = frozenset({"doctor", "dump", "status", "tools", "skills"})
+
+
+def _run_repl_command(handler, rest, name=""):
     try:
-        handler(rest)
+        with (status_cm(f"running /{name}...") if name in _SPINNER_COMMANDS else nullcontext()):
+            handler(rest)
     except KeyboardInterrupt:
         # Ctrl+C inside a command's picker or prompt cancels that command;
         # it is Ctrl+C during a chat turn that quits.
@@ -9549,7 +9559,7 @@ def _repl_loop():
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:
-                _run_repl_command(handler, rest)
+                _run_repl_command(handler, rest, cmd.lower())
             else:
                 console.print(_unknown_command_message(cmd))
             continue
