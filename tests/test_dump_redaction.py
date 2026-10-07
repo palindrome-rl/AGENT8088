@@ -32,7 +32,5 @@ def test_dump_redacts_a_configured_secret(tmp_path, monkeypatch):
         "detail": "test", "verification": "n/a",
     })
 
-    cli.cmd_dump("")
-
-    dump_text = (tmp_path / "dump.txt").read_text(encoding="utf-8")
+    dump_text = cli.cmd_dump("").read_text(encoding="utf-8")
     assert "sk-super-secret-value" not in dump_text

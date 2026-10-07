@@ -2518,7 +2518,7 @@ COMMAND_DETAILS = {
              "models; /local list shows models pulled into Ollama; /local available [query] "
              "browses ollama.com for models that fit this machine; /local pull <name> downloads "
              "one (e.g. qwen3:0.6b); /local remove <name> deletes one.",
-    "dump": "Writes a redacted diagnostic bundle (no API keys or tokens) to dump.txt in the "
+    "dump": "Writes a redacted diagnostic bundle (no API keys or tokens) to dump-<date>-<time>.txt in the "
             "agent's data folder, for bug reports.",
     "search": "/search (or /search status) shows the web-search backends and which are ready; "
               "/search use <searxng|ddgs|tavily|exa|auto> pins one; /search setup starts a "
@@ -4944,6 +4944,12 @@ def cmd_browser(rest: str):
     console.print(f"[#237dd7]{msg}[/#237dd7]")
 
 
+def _stamped(stem, ext):
+    """A default export name with the date and time, so a new dump, save or
+    trace never overwrites an earlier one. Explicit names are used as given."""
+    return f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
+
+
 def cmd_dump(_rest):
     """Write a redacted, shareable diagnostic bundle to the user data dir's dump.txt."""
     import platform
@@ -4992,9 +4998,10 @@ def cmd_dump(_rest):
     for secret in A.collect_secret_values(A.APP_CONFIG):
         text = text.replace(secret, "[REDACTED]")
 
-    out_path = A._agent_data_dir() / "dump.txt"
+    out_path = A._agent_data_dir() / _stamped("dump", "txt")
     A._write_private_text(out_path, text)
     console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
+    return out_path
     console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
 
 
@@ -5831,7 +5838,7 @@ def cmd_trace(rest):
     if arg == "save" or arg.startswith("save "):
         _, _, requested = raw.partition(" ")
         path = _write_user_export(
-            requested.strip() or f"{S.name or 'agent8088'}_trace.json",
+            requested.strip() or _stamped(f"{S.name or 'agent8088'}_trace", "json"),
             json.dumps(_trace_export_data(), indent=2),
         )
         if not path:
@@ -6425,7 +6432,7 @@ def cmd_limits(rest):
 
 
 def cmd_save(rest):
-    path = rest.strip() or "agent8088_session.json"
+    path = rest.strip() or _stamped("agent8088_session", "json")
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
             "conversation_trace": S.conversation_trace, "session": S.name or None,
             "disabled_skills": sorted(S.disabled_skills)}
