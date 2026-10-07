@@ -2607,7 +2607,9 @@ A.register_frontend_commands({
 def cmd_help(_):
     t = Table(title="Commands", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Command", style="#237dd7", no_wrap=True)
+    # Capped: one long usage string (/review ...) otherwise widens this column
+    # until the description is squeezed into a few words per line.
+    t.add_column("Command", style="#237dd7", max_width=34)
     t.add_column("What it does", style="#237dd7")
     for command in command_catalog():
         t.add_row(command["usage"], command["description"])
