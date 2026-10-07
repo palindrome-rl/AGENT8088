@@ -386,6 +386,23 @@ except Exception as _e:
     import logging as _logging
     _logging.getLogger("agent8088").debug("key migration skipped: %s", _e)
 
+def _is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _configured_dir(config: dict, key: str, launch: Path) -> Path | None:
+    """The directory config names under `key`, resolved against the launch
+    directory, or None when the key is unset."""
+    raw = str(config.get(key, "")).strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return (path if path.is_absolute() else launch / path).resolve()
+
+
 def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     """Choose the workspace setup named, even when launched somewhere else.
 
@@ -397,10 +414,16 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     the workspace those installers meant.
     """
     launch = Path(cwd or os.getcwd()).expanduser().resolve()
-    explicit = str(config.get("project_root", "")).strip()
+    explicit = _configured_dir(config, "project_root", launch)
     if explicit:
-        path = Path(explicit).expanduser()
-        return (path if path.is_absolute() else launch / path).resolve()
+        if _is_dir(explicit):
+            return explicit
+        # A project_root copied from another machine or image (an installer
+        # default, a container that works in /workspace, not /app) names a
+        # folder that is not here. Every relative path would point into
+        # nothing, so choose as if it were unset; /doctor reports the miss.
+        _log.warning("project_root %s does not exist; choosing the workspace "
+                     "as if it were unset", explicit)
 
     candidates = []
     for raw in str(config.get("allowed_paths", "")).split(","):
@@ -420,7 +443,8 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     return candidates[0] if candidates else launch
 
 
-PROJECT_ROOT = _configured_project_root(APP_CONFIG)
+LAUNCH_DIR = Path(os.getcwd()).resolve()
+PROJECT_ROOT = _configured_project_root(APP_CONFIG, LAUNCH_DIR)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
 # Set by an evaluation harness that runs Agent8088 inside a throwaway task
 # container (Terminal-Bench under Harbor). The container is the sandbox: there
@@ -496,10 +520,25 @@ MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 600))
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
+# Tool rounds allowed after a finishing nudge (deliverables re-check,
+# verification, re-plan, tests) with no state change before the model is told to
+# answer; at this + 2 the best answer so far is returned. A write resets the
+# count, so a fix found by a check is never cut off. 0 disables the cap.
+MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
 LENGTH_RETRY_MAX_TOKENS = max(0, _config_int("length_retry_max_tokens", 0))
+# Floor for the completion cap a length cut-off earns (A3.1). The old behaviour
+# clamped every retry to 1024 tokens, which no real tool call fits — after two
+# cut-offs a large file write became impossible for the rest of the run. The
+# adaptive cap instead allows a full-size call: the floor must fit one, the
+# ceiling stays the configured limit, and the cap resets after any normal call.
+MAIN_LLM_MIN_TOKENS = max(1, _config_int("main_llm_min_tokens", 4096))
+# Consecutive length cut-offs tolerated before the final no-tools round (A3.4).
+# "Retry until the clock runs out" is replaced by a deterministic ending that
+# leaves partial work in place. 0 disables the ladder (restores unbounded retry).
+LENGTH_CUTOFF_MAX_RETRIES = max(0, _config_int("length_cutoff_max_retries", 4))
 PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
 PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 2))
 MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
@@ -838,6 +877,25 @@ ALLOWED_PATHS = [
     if p.strip()
 ]
 
+
+def _path_is_allowed(resolved: Path) -> bool:
+    """True when `resolved` falls inside an ALLOWED_PATHS base. Both sides are
+    normalized with os.path.normcase so the comparison survives the Windows
+    short-form (8.3 "ADMINI~1") vs long-form ("Administrator") mismatch:
+    tempfile and env-var paths come in either shape, and Path.resolve() only
+    normalizes the side it touches."""
+    import os
+
+    if not ALLOWED_PATHS:
+        return True
+    norm = os.path.normcase(str(resolved))
+    for base in ALLOWED_PATHS:
+        base_norm = os.path.normcase(str(Path(str(base)).resolve()))
+        if norm == base_norm or norm.startswith(base_norm.rstrip("\\/") + os.sep):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Permission layer -- full-auto by default (configurable), escalates only when
 # dropped to a tighter mode (readonly/plan-only/edit) via config.txt, --mode,
@@ -959,10 +1017,13 @@ def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
+    global _failure_streak, _diagnostic_shown
     _turn_writes = 0
     _plan_tool_ran = False
     _turn_blocker_counts = {}
     _pending_blocker_note = ""
+    _failure_streak = 0
+    _diagnostic_shown = False
 
 
 # ---------------------------------------------------------------------------
@@ -1583,6 +1644,35 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
             if Path(part).stem.lower() == "git" and _dangerous_git_args(segment[index + 1:]):
                 return True
     return False
+
+
+_SHELL_CHAIN_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
+
+
+def _readonly_chain(command: str) -> bool:
+    """A chain of read-only commands joined by &&, || or ;, like `pwd && ls`.
+
+    For change bookkeeping only, never for permission: _readonly_shell refuses
+    every chain, and readonly mode keeps escalating them, because the file
+    checks that gate a local read do not follow a chain. Counting `pwd && ls`
+    as a change ended read-only answers with "Changed work was inspected, but
+    no automated verification passed" when nothing had changed."""
+    if re.search(r"[<>\n`]|\$\(", command):
+        return False
+    parts = _SHELL_CHAIN_RE.split(command.strip())
+    return len(parts) > 1 and all(
+        part and (_readonly_shell(part) or _harmless_builtin(part)) for part in parts)
+
+
+# Shell builtins that change nothing once redirects, $() and backticks are
+# ruled out (which _readonly_chain does first). Models wrap their checks in
+# them: `cd <dir> && test -e f && echo PRESENT || echo ABSENT`.
+_HARMLESS_BUILTINS = frozenset({"cd", "echo", "printf", "test", "[", "true", "false"})
+
+
+def _harmless_builtin(part: str) -> bool:
+    words = _shell_parts(part)
+    return bool(words) and words[0] in _HARMLESS_BUILTINS
 
 
 def _readonly_shell(command: str) -> bool:
@@ -2457,6 +2547,19 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
     return response
 
 
+def _extras_rejected(exc: Exception, thinking=None) -> bool:
+    """Whether to resend without the optional request fields.
+
+    The length-retry fields are a guess per provider family, and a provider
+    that rejects a value ("Invalid value ... Supported values ...", e.g.
+    reasoning_effort=none on o-series) does not word it as an unknown field.
+    Any 400 on that call is treated as a rejected extra, so the guess costs
+    one call, not the turn."""
+    if _is_unknown_param_error(exc):
+        return True
+    return thinking == "length_retry" and getattr(exc, "status_code", None) == 400
+
+
 def _is_unknown_param_error(exc: Exception) -> bool:
     """Whether an API rejection looks like an unrecognized-request-field 400."""
     text = str(exc)
@@ -2492,6 +2595,16 @@ def _normalised_messages(system_prompt: str, messages: list) -> list:
             content = message.get("content")
             if isinstance(content, str) and content.strip():
                 leading.append(content)
+            continue
+        # Strict chat templates (Gemma, Mistral on vLLM/Ollama) 400 on two user
+        # turns in a row -- which a discarded cut-off reply followed by its
+        # harness note produces. Fold plain-text neighbours into one turn at
+        # send time; the stored history keeps them apart.
+        previous = rest[-1] if rest else None
+        if (previous is not None and message.get("role") == "user" == previous.get("role")
+                and isinstance(message.get("content"), str)
+                and isinstance(previous.get("content"), str)):
+            rest[-1] = {**previous, "content": previous["content"] + "\n\n" + message["content"]}
             continue
         rest.append(message)
     return [{"role": "system", "content": "\n\n".join(part for part in leading if part)}, *rest]
@@ -2582,6 +2695,83 @@ def _provider_extra_body(provider_name: str) -> dict:
     return extra
 
 
+# Reasoning arrives under different field names and shapes per provider, and the
+# cut-off handler needs to know how much of the budget went to thinking rather
+# than to an answer. One helper reads them all so no lane has to guess.
+#   reasoning / reasoning_content   vLLM, Ollama, DeepSeek, Moonshot
+#   reasoning_details[].text        OpenRouter
+#   content[] with type "thinking"  Anthropic
+#   reasoningContent.reasoningText  Gemini (nested dict)
+# OpenAI exposes only summaries, never the raw chain, so "" is the normal result.
+_REASONING_FIELDS = (
+    ("reasoning", None),
+    ("reasoning_content", None),
+    ("reasoning_details", "text"),
+    ("content", "thinking"),
+)
+_GEMINI_REASONING_PATH = ("reasoningContent", "reasoningText")
+
+
+def _extract_reasoning(obj) -> str:
+    """Reasoning text from a delta/message in whichever shape it arrives.
+
+    The text is returned as sent: a streamed delta can continue mid-word, so
+    trimming each chunk would glue them together without the space between
+    ("options" + "and" -> "optionsand"). Whitespace-only chunks are kept too.
+    """
+    for field, key in _REASONING_FIELDS:
+        value = getattr(obj, field, None)
+        if isinstance(value, str):
+            if key is None and value:
+                return value
+            continue
+        if isinstance(value, list):
+            text = "".join(str(i.get(key or "text") or "") for i in value
+                           if isinstance(i, dict))
+        elif isinstance(value, dict):
+            node = value
+            for step in _GEMINI_REASONING_PATH:
+                node = node.get(step) if isinstance(node, dict) else None
+            text = str(node.get(key or "text") or "") if isinstance(node, dict) else ""
+        else:
+            continue
+        if text:
+            return text
+    return ""
+
+
+def _length_retry_extra_body(provider_name: str) -> dict:
+    """Request fields that disable or lower thinking for ONE retry call.
+
+    Asking a thinking model to "stop reasoning" in the retry message cannot
+    switch reasoning off -- it reasons again and overruns again. These fields
+    act on the request itself, so the retry has a real chance of producing an
+    answer. provider.<name>.length_retry_extra_body overrides the default per
+    provider; a provider that ignores the field still falls back to the
+    adaptive cap, so a wrong guess costs one call, not the run.
+    """
+    profile = (PROVIDERS.get(provider_name) or {}) if provider_name else {}
+    raw = str(profile.get("length_retry_extra_body") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        logging.getLogger(__name__).warning(
+            "Ignoring provider.%s.length_retry_extra_body: not a JSON object.",
+            provider_name)
+    # Default per provider family. Ollama takes a boolean; OpenAI-compatible
+    # servers take the reasoning effort dial; vLLM needs the template switch.
+    name = (provider_name or "").lower()
+    if "ollama" in name:
+        return {"think": False}
+    if "vllm" in name:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {"reasoning_effort": "none"}
+
+
 def _resolve_temperature(provider_name: str, temperature: float) -> float:
     """provider.<name>.temperature overrides the session/global value.
 
@@ -2637,7 +2827,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         response = completion(**kwargs)
         if on_token is None:
             return response
-        collected, tool_chunks, finish_reason = [], {}, None
+        collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
         stop, watcher = _start_interrupt_watcher(response, interrupt_check)
         try:
             for chunk in response:
@@ -2645,9 +2835,10 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 choice = chunk.choices[0]
                 delta = choice.delta
                 finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-                reasoning = getattr(delta, "reasoning_content", None)
+                reasoning = _extract_reasoning(delta)
                 if reasoning:
                     on_token("reasoning", reasoning)
+                    collected_reasoning.append(reasoning)
                 if delta.content:
                     on_token("content", delta.content)
                     collected.append(delta.content)
@@ -2659,7 +2850,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             raise
         finally:
             _finish_interrupt_watcher(stop, watcher)
-        return _build_response("".join(collected), tool_chunks, finish_reason)
+        return _build_response("".join(collected), tool_chunks, finish_reason,
+                               "".join(collected_reasoning))
     request_options = dict(
         model=selected_model, messages=full_messages, max_tokens=max_tokens,
         temperature=temperature, **penalties,
@@ -2681,6 +2873,17 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         template_kwargs["enable_thinking"] = False
         extra_body["chat_template_kwargs"] = template_kwargs
         extra_body.pop("reasoning_effort", None)
+    elif thinking == "length_retry":
+        # The retry after a cut-off: the model just spent a whole allowance
+        # reasoning, so force thinking down for THIS call only. Restored on the
+        # next ordinary turn so planning quality is not permanently reduced.
+        extra_body = dict(extra_body or {})
+        for key, value in _length_retry_extra_body(provider_name).items():
+            # Merge rather than replace: a provider's own template switches
+            # (chat_template_kwargs) must survive, as in the branch above.
+            if isinstance(value, dict) and isinstance(extra_body.get(key), dict):
+                value = {**extra_body[key], **value}
+            extra_body[key] = value
     if extra_body and not _skip_optional:
         request_options["extra_body"] = extra_body
     _raise_if_interrupted(interrupt_check)
@@ -2704,7 +2907,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         try:
             return _do_create()
         except Exception as exc:
-            if request_options.pop("extra_body", None) and _is_unknown_param_error(exc):
+            if request_options.pop("extra_body", None) and _extras_rejected(exc, thinking):
                 return _do_create()
             raise
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
@@ -2740,7 +2943,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             stream = client.chat.completions.create(**request_options, stream=True)
     except Exception as exc:
         _close_stream_ctx()
-        if not _skip_optional and _is_unknown_param_error(exc):
+        if not _skip_optional and _extras_rejected(exc, thinking):
             return _create_completion(
                 client, messages, tools, max_tokens=max_tokens,
                 system_prompt=system_prompt, temperature=temperature,
@@ -2748,7 +2951,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 model_name=model_name, provider_name=provider_name, _skip_optional=True,
                 thinking=thinking, timeout=timeout)
         raise
-    collected, tool_chunks, finish_reason = [], {}, None
+    collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
     stream_usage = None
     stream_first = None
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
@@ -2761,12 +2964,13 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
-            if stream_first is None and any(getattr(delta, key, None) for key in ('content', 'reasoning_content', 'tool_calls')):
+            if stream_first is None and any(getattr(delta, key, None) for key in ('content', 'reasoning', 'reasoning_content', 'tool_calls')):
                 stream_first = round((time.monotonic() - stream_started) * 1000)
             finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-            rc = getattr(delta, "reasoning_content", None)
+            rc = _extract_reasoning(delta)
             if rc:
                 on_token("reasoning", rc)
+                collected_reasoning.append(rc)
             if delta.content:
                 on_token("content", delta.content)
                 collected.append(delta.content)
@@ -2779,7 +2983,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     finally:
         _finish_interrupt_watcher(stop, watcher)
         _close_stream_ctx()
-    response = _build_response("".join(collected), tool_chunks, finish_reason)
+    response = _build_response("".join(collected), tool_chunks, finish_reason,
+                               "".join(collected_reasoning))
     response.usage = stream_usage
     response.first_token_ms = stream_first
     return response
@@ -2987,7 +3192,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                                      on_token, interrupt_check, trace, turn,
                                      max_tokens=None, client_override=None,
                                      provider_override=None, model_override=None,
-                                     on_retry=None, on_stream_reset=None):
+                                     on_retry=None, on_stream_reset=None, thinking=None):
     """One model call with retries and the fallback_models chain.
 
     This is the single retry layer (the SDK clients are built with
@@ -3036,6 +3241,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
                 model_name=active_model,
                 provider_name=active_provider,
                 telemetry_attempt="primary",
+                thinking=thinking,
             )
             _note_model_served(active_provider, active_model)
             return response
@@ -3168,9 +3374,13 @@ def _collect_stream_tool_calls(delta, chunks):
             entry["arguments"] += getattr(function, "arguments", None) or ""
 
 
-def _build_response(content, tool_chunks=None, finish_reason=None):
+def _build_response(content, tool_chunks=None, finish_reason=None, reasoning=""):
     """Reconstruct a ChatCompletion-like object from streamed content
-    so run_agent() can read .choices[0].message.content uniformly."""
+    so run_agent() can read .choices[0].message.content uniformly.
+
+    `reasoning` carries whatever the provider streamed as thinking, so a
+    length cut-off can tell "the budget went to reasoning" from "the budget
+    went to a large answer" and report which one it was."""
     tool_calls = []
     for index in sorted(tool_chunks or {}):
         call = tool_chunks[index]
@@ -3181,7 +3391,8 @@ def _build_response(content, tool_chunks=None, finish_reason=None):
             "id": call["id"] or f"call_{index}", "type": "function", "function": function,
         })())
     return type("R", (), {"choices": [type("C", (), {
-        "message": type("M", (), {"content": content, "tool_calls": tool_calls}),
+        "message": type("M", (), {"content": content, "tool_calls": tool_calls,
+                                  "reasoning_content": reasoning}),
         "finish_reason": finish_reason or ("tool_calls" if tool_calls else "stop"),
     })()]})
 
@@ -3672,6 +3883,118 @@ def build_tools_def(tool_specs: dict) -> list:
     return result
 
 
+def _choose_shell_cwd() -> Path | None:
+    """Where commands start: shell_cwd when it exists, else the launch
+    directory or the project root, if allowed_paths covers it.
+
+    Checked on every command, not once at import: a shell_cwd that does not
+    exist here (a path from another machine or container image) failed every
+    command before it started, with an error that read like a missing program,
+    and the model concluded the whole environment was broken. A fallback never
+    widens access, so with none allowed this returns None and the caller says
+    why."""
+    if _dir_usable(SHELL_CWD):
+        return SHELL_CWD
+    for candidate in (LAUNCH_DIR, PROJECT_ROOT):
+        if (_dir_usable(candidate) and _path_is_allowed(candidate)
+                and _check_path_zone(candidate) != "blocked"):
+            return candidate
+    return None
+
+
+def _dir_usable(path: Path) -> bool:
+    """A directory a process can start in: it exists and can be entered. A
+    folder without search permission fails a process start just like a missing
+    one, so it is no better a place to run commands."""
+    return _is_dir(path) and os.access(path, os.X_OK)
+
+
+def _dir_problem(path: Path) -> str:
+    """Why `path` cannot be a working directory, as the end of a sentence."""
+    return "cannot be entered (permission denied)" if _is_dir(path) else "does not exist"
+
+
+_PROBE_LISTING_CAP = 8  # names shown from the working directory
+_PROBE_SCAN_CAP = 1000   # entries counted before "+many more", for huge folders
+
+
+def _probe_interpreters() -> tuple:
+    """(found, missing) among the interpreters a model most often assumes."""
+    names = ("python" if sys.platform == "win32" else "python3", "node", "git")
+    found = [name for name in names if shutil.which(name)]
+    return found, [name for name in names if name not in found]
+
+
+def _probe_listing(cwd: Path) -> str:
+    """The visible top-level names in `cwd`, capped, or why they are not shown.
+    Gathered with the same path checks a file tool applies: a folder outside
+    allowed_paths or in blocked_paths is not listed."""
+    if not _path_is_allowed(cwd):
+        return "is not listed (outside allowed_paths)"
+    if _check_path_zone(cwd) == "blocked":
+        return "is not listed (in blocked_paths)"
+    names, more = [], False
+    try:
+        with os.scandir(cwd) as entries:
+            for count, entry in enumerate(entries):
+                if count >= _PROBE_SCAN_CAP:
+                    more = True
+                    break
+                if not entry.name.startswith("."):
+                    names.append(entry.name)
+    except OSError:
+        return "cannot be listed"
+    if not names:
+        return "has no visible files"
+    names.sort()
+    shown = [n if len(n) <= 30 else n[:27] + "..." for n in names[:_PROBE_LISTING_CAP]]
+    extra = len(names) - len(shown)
+    tail = " (+many more)" if more else (f" (+{extra} more)" if extra else "")
+    return f"contains {', '.join(shown)}{tail}"
+
+
+def _probe_user() -> str:
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:  # no login name in some containers and services
+        return ""
+
+
+def _environment_probe(cwd: Path | None) -> str:
+    """One compact line of facts about where commands run, gathered without a
+    model call or a shell: what the folder holds, who runs the commands, and
+    which common interpreters this host has. A model that starts out knowing
+    the folder and its files does not need to guess, and does not read one
+    failed command as proof that nothing is there."""
+    facts = []
+    user = _probe_user()
+    if user:
+        facts.append(f"user {user}")
+    found, missing = _probe_interpreters()
+    facts.append(f"on PATH: {', '.join(found) or 'none of ' + ', '.join(missing)}"
+                 + (f" (not found: {', '.join(missing)})" if found and missing else ""))
+    tail = "; ".join(facts)
+    # The listing gives way first: a folder of long names must not crowd the
+    # user and interpreter facts out of the 400-character line.
+    if cwd is not None:
+        listing = _probe_listing(cwd)
+        room = 400 - len(tail) - 2
+        if len(listing) > room:
+            listing = listing[:max(0, room - 3)] + "..."
+        tail = f"{listing}; {tail}"
+    # Defined further down this module; at import (the first grounding) it is
+    # not there yet, and the only secrets then are config values a folder
+    # listing does not carry.
+    redact = globals().get("_redact_secrets")
+    return (redact(tail) if redact else tail)[:400]
+
+
+# What _ground_execute_shell_description last appended, so a later grounding
+# replaces it instead of stacking a second one.
+_SHELL_GROUNDING = {"cwd": None, "suffix": ""}
+
+
 def _ground_execute_shell_description(specs: dict) -> None:
     """Append real OS/shell/cwd/python facts to execute_shell's description.
 
@@ -3690,14 +4013,54 @@ def _ground_execute_shell_description(specs: dict) -> None:
         # `pip install` there, where nothing else can import the packages.
         python_hint = ("If you need Python, use the system `python3` and `pip` "
                        "(install packages there); ")
+    elif _probe_interpreters()[0][:1] == [("python" if sys.platform == "win32" else "python3")]:
+        # The probe below already says python3 is on PATH; warning not to
+        # assume it would contradict that.
+        python_hint = f"If you need Python, use \"{sys.executable}\". "
     else:
         python_hint = (f"If you need Python, use \"{sys.executable}\" -- do not assume "
                        f"`python3` is on PATH. ")
-    spec["description"] += (
+    cwd = _choose_shell_cwd()
+    if cwd is None:
+        where = (f"none: the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)}, so "
+                 f"commands cannot run until the user sets shell_cwd")
+    elif not spec.get("host"):
+        # The sandbox moves every command into the artifacts workspace, so
+        # naming the shell folder here was one folder off from what `pwd` prints.
+        where = (f"{ARTIFACTS_ROOT} (the sandbox workspace; project files are "
+                 f"under {PROJECT_ROOT})")
+    elif cwd != SHELL_CWD:
+        where = f"{cwd} (the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)})"
+    else:
+        where = str(cwd)
+    suffix = (
         f" Environment: {sys.platform}, using {shell_kind}. Working directory: "
-        f"{SHELL_CWD}. {python_hint}Before guessing any interpreter or command name, "
-        f"check it exists first with `{check_cmd}`."
+        f"{where}. At session start the folder {_environment_probe(cwd)}. {python_hint}"
+        f"Before guessing any interpreter or command name, check it exists "
+        f"first with `{check_cmd}`."
     )
+    base = spec["description"]
+    previous = _SHELL_GROUNDING["suffix"]
+    if previous and base.endswith(previous):
+        base = base[:-len(previous)]
+    spec["description"] = base + suffix
+    _SHELL_GROUNDING.update(cwd=cwd, suffix=suffix)
+
+
+def refresh_shell_grounding() -> bool:
+    """Re-describe execute_shell when the folder commands run in is no longer
+    the one its description names: a fallback was taken, or the folder went
+    away mid-session. Only then — the listing is a start-of-session snapshot,
+    and rewriting the tool list every turn would defeat the provider's prompt
+    cache. True when the description changed."""
+    global TOOLS_DEF, SYSTEM_PROMPT
+    if "execute_shell" not in TOOL_SPECS or _choose_shell_cwd() == _SHELL_GROUNDING["cwd"]:
+        return False
+    _ground_execute_shell_description(TOOL_SPECS)
+    TOOLS_DEF = build_tools_def(TOOL_SPECS)
+    if "SYSTEM_PROMPT" in globals():  # not yet composed during import
+        SYSTEM_PROMPT = compose_system_prompt()
+    return True
 
 
 TOOL_SPECS = load_tool_specs(TOOLS_FILE, APP_CONFIG)
@@ -4499,24 +4862,6 @@ def _from_container_path(raw_path: str) -> str:
     return str(ARTIFACTS_ROOT / relative)
 
 
-def _path_is_allowed(resolved: Path) -> bool:
-    """True when `resolved` falls inside an ALLOWED_PATHS base. Both sides are
-    normalized with os.path.normcase so the comparison survives the Windows
-    short-form (8.3 "ADMINI~1") vs long-form ("Administrator") mismatch:
-    tempfile and env-var paths come in either shape, and Path.resolve() only
-    normalizes the side it touches."""
-    import os
-
-    if not ALLOWED_PATHS:
-        return True
-    norm = os.path.normcase(str(resolved))
-    for base in ALLOWED_PATHS:
-        base_norm = os.path.normcase(str(Path(str(base)).resolve()))
-        if norm == base_norm or norm.startswith(base_norm.rstrip("\\/") + os.sep):
-            return True
-    return False
-
-
 def resolve_user_path(raw_path: str) -> Path:
     p = Path(_from_container_path(raw_path)).expanduser()
     if not p.is_absolute():
@@ -4822,7 +5167,160 @@ def _wait_interruptibly(process, timeout):
             raise AgentInterrupted()
 
 
+class WorkingDirectoryMissing(FileNotFoundError):
+    """No directory a command may start in exists. A FileNotFoundError, so
+    callers that already handle a failed start keep doing so."""
+
+
+_cwd_fallback_noted = None
+_pending_cwd_fallback = None
+
+# Trace events raised inside tools, which have no handle on the run's trace:
+# the agent loop drains them into it after each tool call. Bounded, so a
+# caller that never drains (a bare exec_tool in a script) cannot grow it.
+_PENDING_TRACE_EVENTS = []
+_PENDING_TRACE_LOCK = threading.Lock()
+
+
+def _note_trace_event(event: dict) -> None:
+    with _PENDING_TRACE_LOCK:
+        _PENDING_TRACE_EVENTS.append(event)
+        del _PENDING_TRACE_EVENTS[:-50]
+
+
+def _drain_trace_events() -> list:
+    with _PENDING_TRACE_LOCK:
+        events = list(_PENDING_TRACE_EVENTS)
+        _PENDING_TRACE_EVENTS.clear()
+    return events
+
+
+def _shell_cwd() -> Path | None:
+    """_choose_shell_cwd(), and the first time it falls back, a log warning,
+    a trace event and a pending note for the model (see _take_cwd_note)."""
+    global _cwd_fallback_noted, _pending_cwd_fallback
+    cwd = _choose_shell_cwd()
+    if cwd is not None and cwd != SHELL_CWD and _cwd_fallback_noted != cwd:
+        _cwd_fallback_noted = _pending_cwd_fallback = cwd
+        _log.warning("shell_cwd %s %s; commands run in %s",
+                     SHELL_CWD, _dir_problem(SHELL_CWD), cwd)
+        _note_trace_event({"type": "cwd_repaired", "from": str(SHELL_CWD),
+                           "to": str(cwd), "reason": _dir_problem(SHELL_CWD)})
+    return cwd
+
+
+def _take_cwd_note(sandboxed: bool) -> str:
+    """The once-only fallback note, naming the folder the model's commands
+    really run in: a sandboxed command is moved into artifacts/ whatever
+    directory its process started in, so naming the fallback there would be
+    one folder off from what `pwd` prints."""
+    global _pending_cwd_fallback
+    cwd, _pending_cwd_fallback = _pending_cwd_fallback, None
+    if cwd is None:
+        return ""
+    where = ARTIFACTS_ROOT if sandboxed else cwd
+    return (f"\n{_HARNESS_PREFIX}The configured working directory {SHELL_CWD} "
+            f"{_dir_problem(SHELL_CWD)}. Commands now run in {where}.")
+
+
+def _missing_cwd_error(path: Path | None = None) -> str:
+    """The error for a command that could not start because its folder is
+    unusable. `path` is the folder that failed, when it is not the configured
+    one (a fallback that vanished between the check and the start)."""
+    path = path or SHELL_CWD
+    _note_trace_event({"type": "working_directory_missing", "path": str(path),
+                       "reason": _dir_problem(path)})
+    return efficiency.tool_error(
+        'working_directory_missing',
+        f'The working directory {path} {_dir_problem(path)}, so no command can start.',
+        f'This is a setting, not a missing program or file: tell the user to set '
+        f'shell_cwd in {_config_file()} to an existing folder inside allowed_paths. '
+        f'Do not retry commands until then.')
+
+
+def working_directory_status() -> tuple:
+    """(status, detail, fix) for /doctor: where commands and files go, and any
+    configured directory that cannot be used here."""
+    project_root = _configured_dir(APP_CONFIG, "project_root", LAUNCH_DIR)
+    missing = []
+    if project_root is not None and not _is_dir(project_root):
+        missing.append(("project_root", f"project_root {project_root} does not exist"))
+    if not _dir_usable(SHELL_CWD):
+        missing.append(("shell_cwd", f"shell_cwd {SHELL_CWD} {_dir_problem(SHELL_CWD)}"))
+    problems = "; ".join(text for _, text in missing)
+    cwd = _choose_shell_cwd()
+    if cwd is None:
+        return ("fail", problems + "; no allowed folder to run commands in",
+                f"Set shell_cwd in {_config_file()} to an existing folder inside allowed_paths.")
+    detail = f"commands run in {cwd}; files in {PROJECT_ROOT}"
+    if not missing:
+        return "ok", detail, ""
+    keys = " and ".join(key for key, _ in missing)
+    return ("warn", problems + f" — using fallbacks: {detail}",
+            f"Set {keys} in {_config_file()} to an existing folder, or remove it.")
+
+
+DIAGNOSTIC_AFTER_FAILURES = max(2, _config_int("diagnostic_after_failures", 2))
+
+
+def environment_diagnostic() -> tuple:
+    """(text, status): a read-only look at where commands run — the /doctor
+    working-directory check, the folder's contents, the user, free disk space
+    and interpreters. Gathered in Python, not by running pwd/ls: the failure
+    being diagnosed may be that no shell can start at all. Listing follows the
+    same allowed_paths/blocked_paths checks as a file tool, and the output is
+    redacted and bounded."""
+    status, detail, fix = working_directory_status()
+    cwd = _choose_shell_cwd()
+    lines = [f"working directory: {status} — {detail}"]
+    if fix:
+        lines.append(f"fix: {fix}")
+    probe = _environment_probe(cwd)
+    lines.append(f"{cwd} {probe}" if cwd is not None else probe)
+    if cwd is not None:
+        try:
+            free = shutil.disk_usage(cwd).free / 1024 ** 3
+            lines.append(f"free disk space: {free:.1f} GB")
+        except OSError:
+            pass
+    return _redact_secrets("\n".join(lines))[:1500], status
+
+
+_ENV_SUBJECT = (r"(?:environment|workspace|working director(?:y|ies)|sandbox|shell|"
+                r"file ?system|container|terminal|project (?:folder|directory))")
+_ENV_FAILURE = (r"(?:inaccessible|unavailable|not (?:available|accessible|reachable|usable|working)|"
+                r"unusable|broken|missing|(?:does not|doesn['’]t) exist|"
+                r"(?:is|are|seems?|appears?) (?:to be )?(?:down|corrupt(?:ed)?|misconfigured))")
+_ENV_UNAVAILABLE_RE = re.compile(
+    rf"\b{_ENV_SUBJECT}\b[^.!?\n]{{0,60}}?\b{_ENV_FAILURE}"
+    rf"|\b(?:can(?:no|['’])t|cannot|could(?: not|n['’]t)|unable to)\s+"
+    rf"(?:access|reach|use|run (?:any )?commands? in)\s+(?:the |this |your |any )?{_ENV_SUBJECT}\b",
+    re.IGNORECASE)
+
+
+def _claims_environment_unavailable(answer: str) -> bool:
+    """Does a final answer conclude that the environment itself cannot be
+    used? Matched loosely on purpose: a false match costs one read-only check
+    and one more turn, a miss lets an unverified "it's broken" end the run."""
+    return bool(_ENV_UNAVAILABLE_RE.search(answer or ""))
+
+
+_TOOL_ERROR_CODE_RE = re.compile(r'"code":\s*"([A-Za-z_]+)"')
+
+
+def _tool_error_code(result: str) -> str | None:
+    """The structured error code of a failed tool call, "error" for an
+    unstructured "Error: ...", or None for a call that did not fail."""
+    if not isinstance(result, str) or not result.startswith("Error:"):
+        return None
+    match = _TOOL_ERROR_CODE_RE.search(result)
+    return match.group(1) if match else "error"
+
+
 def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
+    cwd = _shell_cwd()
+    if cwd is None:
+        raise WorkingDirectoryMissing(2, "Working directory does not exist", str(SHELL_CWD))
     kwargs = {
         "shell": shell,
         # Closed, not inherited: a child that reads stdin would otherwise
@@ -4831,7 +5329,7 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
-        "cwd": str(SHELL_CWD),
+        "cwd": str(cwd),
         "env": _non_interactive_env(),
     }
     if sys.platform == "win32":
@@ -5323,6 +5821,111 @@ def _structured_tool_argv(name: str, args: dict):
 _REMOTE_GIT_TOOLS = frozenset(["git_push", "git_clone", "git_create_pr"])
 
 
+# Structured git tools that change files in the working tree. Push, PR creation
+# and remote listing touch only the remote or git config, so a model repeating
+# them is not doing new local work (and must not retire cached verdicts).
+_GIT_TREE_TOOLS = frozenset({"git_commit", "git_checkout", "git_branch", "git_init", "git_clone"})
+
+
+def _git_tool_changed_tree(name: str, result: str) -> bool:
+    """Did this structured git call change the working tree? Only a tree tool
+    that succeeded: a failed commit, or one with nothing to commit, did not."""
+    if name not in _GIT_TREE_TOOLS:
+        return False
+    text = str(result or "")
+    return not (text.lstrip().startswith("Error") or "exited with status" in text
+                or "nothing to commit" in text or "nothing added to commit" in text)
+
+
+# --- what a shell command after a finishing check is -------------------------
+# Used only to decide whether a round after a finishing nudge changed anything
+# (MAX_POST_CHECK_ROUNDS), never for permission. Errs towards "change": an
+# unrecognised command resets the cap, which is today's behaviour.
+_CHECK_PROGRAMS = frozenset({
+    "pytest", "py.test", "cd", "echo", "printf", "test", "[", "true", "false",
+    "diff", "cmp", "stat", "file", "which", "command", "type", "jq", "ps", "pgrep",
+    "sha256sum", "sha1sum", "sha512sum", "md5sum", "md5", "shasum", "cksum",
+    "xxd", "od", "hexdump", "id", "uname", "date", "sleep", "ss", "netstat", "lsof",
+    "sort", "uniq", "cut", "tr", "nl", "column", "basename", "dirname", "realpath",
+    "readlink", "env", "printenv", "nproc", "free", "df", "du",
+})
+_TEST_RUNNER_COMMANDS = {("go", "test"), ("cargo", "test"), ("npm", "test"), ("yarn", "test"),
+                         ("pnpm", "test"), ("make", "test"), ("make", "check"),
+                         ("npm", "run", "test"), ("dotnet", "test")}
+_PY_MODULE_CHECKS = frozenset({"pytest", "unittest", "doctest", "json.tool"})
+_PY_CODE_WRITES = re.compile(
+    r"""open\([^)]*['"][wax+]|\.write(?:_text|_bytes|lines)?\(|remove\(|unlink|rmtree|"""
+    r"""rename\(|mkdir|makedirs|system\(|subprocess|shutil|chmod|truncate""")
+_HARMLESS_REDIRECTS = re.compile(r"\s*(?:[12&]?>>?\s*/dev/null|\d?>&\d)")
+_CURL_WRITES = frozenset({"-o", "-O", "--output", "--remote-name", "-T", "--upload-file",
+                          "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+                          "-F", "--form", "--json"})
+
+
+def _shell_part_is_check(part: str) -> bool:
+    try:
+        words = shlex.split(part)
+    except ValueError:
+        return False
+    while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in ("sudo", "time")):
+        words = words[1:]
+    if words[:1] == ["timeout"]:
+        words = words[1:]
+        while words and words[0].startswith("-"):
+            words = words[1:]
+        words = words[1:]  # the duration
+    if not words:
+        return False
+    program = Path(words[0]).name
+    if program in _CHECK_PROGRAMS or _readonly_shell(part):
+        return True
+    if any(tuple(words[:len(c)]) == c for c in _TEST_RUNNER_COMMANDS):
+        return True
+    if program in ("python", "python3", "node"):
+        args = words[1:]
+        if args[:1] == ["-m"]:
+            return len(args) > 1 and args[1] in _PY_MODULE_CHECKS
+        if args[:1] in (["-c"], ["-e"]):
+            return len(args) > 1 and not _PY_CODE_WRITES.search(args[1])
+        # A script run after a finishing check is almost always a check; a fix
+        # script is written first, and that write resets the cap anyway.
+        return bool(args) and not args[0].startswith("-")
+    if program == "curl":
+        args = words[1:]
+        if any(a in _CURL_WRITES or a.startswith(("--data", "--output=", "--json")) for a in args):
+            return False
+        for i, a in enumerate(args):
+            if a in ("-X", "--request") and i + 1 < len(args) and args[i + 1].upper() not in ("GET", "HEAD"):
+                return False
+        return True
+    return False
+
+
+def _shell_may_change(command: str) -> bool:
+    """Could this shell command, run after a finishing check, have changed the
+    workspace? True for writes, installs, redirects to files, command
+    substitution, background jobs and anything unrecognised; False for test
+    runners, verify scripts, HTTP GETs and reads."""
+    text = _HARMLESS_REDIRECTS.sub(" ", str(command or ""))
+    if re.search(r">|`|\$\(|\btee\b", text) or re.search(r"(?<![&|])&(?![&])", text):
+        return True
+    parts = [p for p in re.split(r"\s*(?:&&|\|\||;|\||\n)\s*", text.strip()) if p.strip()]
+    return not parts or not all(_shell_part_is_check(p) for p in parts)
+
+
+def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
+    """For the post-check cap: did this call change state? `mutated` is
+    whether it bumped the mutation counter, which counts every shell command
+    outside the read-only list (right for retiring verdicts, too broad here)."""
+    if not mutated:
+        return False
+    if name == "execute_shell":
+        return _shell_may_change(args.get("command", ""))
+    if name == "run_tests":
+        return False
+    return True
+
+
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     argv = _structured_tool_argv(name, args)
     on_host = bool((TOOL_SPECS.get(name) or {}).get("host"))
@@ -5576,7 +6179,7 @@ def reset_audit_budget() -> None:
 # entry called `nul`, which then broke the sandbox copy with [WinError 87].
 # Everything else after a redirection operator is a file, so this predicate
 # refuses to call it read-only.
-_STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$)")
+_STDERR_TO_NULL = re.compile(r"2>\s*/dev/null(?=\s|$|[;&|)])")
 # What separates one command from the next. Ordered so `&&` and `||` match
 # before the single-character forms. `|` is absent: `_readonly_shell` already
 # decomposes pipelines itself, under its own stricter rules.
@@ -5585,9 +6188,15 @@ _SHELL_SEQUENCERS = re.compile(r"&&|\|\||;|&|\n")
 _AUDIT_STAGE_SPLIT = re.compile(r"&&|\|\||;|&|\n|\|")
 # `2>&1` / `>&2` point one output stream at another; no file is named.
 _FD_DUPLICATE = re.compile(r"\d?>&\d+\b")
+# `< file` only reads (seen live: `wc -w < input.txt`). Not `<<`/`<<<` (here
+# documents), `<>` (opens for writing), `<(` (runs a command) or `n<`.
+_INPUT_REDIRECT = re.compile(r"(?<![<\d])<(?![<>(&])\s*[^\s;&|<>()]+")
 # A sed script made only of line numbers and p/q/d/= prints; it cannot write,
 # run a command, or read another file (w, W, e, r, R are all letters).
 _SED_PRINT_SCRIPT = re.compile(r"[\d,$;!pqd=\s]+")
+# One s/old/new/ with only print-safe flags. The w flag writes a file and e
+# runs a command, so neither is allowed; -i is refused by _SED_READ_FLAGS.
+_SED_SUBSTITUTE = re.compile(r"s([^\\\n\w\s])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gIi\d]*")
 _SED_READ_FLAGS = {"-n", "-E", "-r", "--quiet", "--silent"}
 
 
@@ -5631,7 +6240,30 @@ def _sed_prints_only(command: str) -> bool:
     flags = [part for part in parts[1:] if part.startswith("-")]
     operands = [part for part in parts[1:] if not part.startswith("-")]
     return (bool(operands) and all(flag in _SED_READ_FLAGS for flag in flags)
-            and _SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None)
+            and (_SED_PRINT_SCRIPT.fullmatch(operands[0]) is not None
+                 or _SED_SUBSTITUTE.fullmatch(operands[0]) is not None))
+
+
+_INNERMOST_SUBSTITUTION = re.compile(r"\$\(([^()`]*)\)")
+
+
+def _without_read_only_substitutions(command: str):
+    """`command` with each $(...) whose inner command is itself read-only
+    replaced by a plain word, innermost first; None when one is not.
+
+    Seen in the benchmark: a model checked the file it had just written with
+    `echo "report: [$(cat report.txt)]"`, and refusing every substitution
+    counted that check as a new change. Backticks stay refused outright, and
+    anything left unresolved (arithmetic, unbalanced text) is refused by the
+    caller."""
+    for _ in range(16):
+        match = _INNERMOST_SUBSTITUTION.search(command)
+        if match is None:
+            return command
+        if not _shell_call_is_read_only(match.group(1)):
+            return None
+        command = command[:match.start()] + "X" + command[match.end():]
+    return None
 
 
 def _shell_call_is_read_only(command: str) -> bool:
@@ -5657,22 +6289,101 @@ def _shell_call_is_read_only(command: str) -> bool:
     can still be read from the original text. Auditing those reads, plus
     `sed -n '415,445p'` and `2>&1`, took 144 of a 293-second live run.
     """
-    if re.search(r"[`]|\$\(", command):
+    command = _without_read_only_substitutions(command)
+    if command is None or re.search(r"[`]|\$\(", command):
         return False           # substitution can run anything, anywhere
     probe = _mask_quoted_operators(command)
     if probe is None:
         return False           # quoting that never closes cannot be read
     blank = lambda match: " " * len(match.group(0))
-    probe = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe))
-    original = _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command))
+    probe = _INPUT_REDIRECT.sub(blank, _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, probe)))
+    original = _INPUT_REDIRECT.sub(blank, _FD_DUPLICATE.sub(blank, _STDERR_TO_NULL.sub(blank, command)))
     if re.search(r"[<>]", probe):
         return False           # a redirection writes a file
     bounds = [0] + [edge for m in _AUDIT_STAGE_SPLIT.finditer(probe)
                     for edge in m.span()] + [len(probe)]
     stages = [(probe[start:end].strip(), original[start:end].strip())
               for start, end in zip(bounds[::2], bounds[1::2])]
-    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original))
+    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original)
+                           or _text_only_stage(masked) or _awk_prints_only(original)
+                           or _ASSIGNMENT_ONLY.fullmatch(masked) is not None)
                for masked, original in stages)
+
+
+# `name=value` alone sets a shell variable for the rest of this one command.
+_ASSIGNMENT_ONLY = re.compile(r"[A-Za-z_]\w*=\S*")
+
+
+# What lets an awk program act beyond printing: running a command, reading
+# one (getline), closing a pipe, or a print/printf whose output is redirected
+# (`>`, `>>`) or piped (`|`). A bare `>` elsewhere is a comparison: NR>0.
+_AWK_SIDE_EFFECT = re.compile(
+    r"\bsystem\b|\bgetline\b|\bclose\s*\(|\bprintf?\b[^;{}]*(?:>|\|)")
+
+
+def _awk_prints_only(stage: str) -> bool:
+    """An awk call whose inline program can only print: no system(), no
+    getline (which can run a command), no redirected or piped print, and no
+    -f program file or in-place flag it cannot inspect. The common case is a
+    column sum, `awk -F, 'NR>0 {s+=$2} END {print s}' data.csv`: seen live,
+    that counted as a change and re-armed the verification nudge twice."""
+    if re.search(r"[`]|\$\(", stage):
+        return False
+    try:
+        # Not _shell_parts: it refuses any `>` or `|`, even inside the quoted
+        # program, where they are usually comparisons and logic.
+        parts = shlex.split(stage, posix=True)
+    except ValueError:
+        return False
+    if not parts or Path(parts[0]).stem.lower() not in {"awk", "gawk", "mawk", "nawk"}:
+        return False
+    cursor = 1
+    while cursor < len(parts) and parts[cursor].startswith("-"):
+        flag = parts[cursor]
+        if flag in {"-F", "-v"}:
+            cursor += 2
+        elif flag.startswith(("-F", "-v")):
+            cursor += 1
+        else:
+            return False       # -f, -i inplace, -E, and anything else unknown
+    # String literals cannot act: `print "a | b"` only prints the bar.
+    program = re.sub(r'"(?:\\.|[^"\\])*"', '""', parts[cursor]) if cursor < len(parts) else ""
+    return cursor < len(parts) and not _AWK_SIDE_EFFECT.search(program)
+
+
+# Programs that only print what they compute from their input or arguments,
+# with no way to write a file or run another program. Used only to decide
+# whether a call changed anything, never for approval prompts. Left out on
+# purpose: file (-C) and anything that interprets code. sort and uniq are
+# allowed without their output forms (_text_only_stage); awk is judged by its
+# program text (_awk_prints_only).
+_TEXT_ONLY_COMMANDS = frozenset([
+    "echo", "printf", "cut", "tr", "paste", "bc", "od", "nl", "cksum",
+    "md5", "md5sum", "sha1sum", "sha256sum", "shasum",
+    "basename", "dirname", "realpath", "stat", "which", "true",
+    # Changes only where the rest of this one command runs.
+    "cd", "pushd", "popd",
+    # Comparisons: `[ "$count" = 3 ]`.
+    "[", "test",
+])
+
+
+def _text_only_stage(stage: str) -> bool:
+    parts = _shell_parts(stage)
+    if not parts:
+        return False
+    name = Path(parts[0]).stem.lower()
+    if name == "sort":
+        # Writes only through -o/--output (possibly bundled: -rno).
+        return not any(p.startswith("--output") or p.startswith("--compress")
+                       or (p.startswith("-") and not p.startswith("--")
+                           and "o" in p[1:].split("=")[0])
+                       for p in parts[1:])
+    if name == "uniq":
+        # A second operand is the output file: `uniq in.txt out.txt`.
+        operands = [p for p in parts[1:] if not p.startswith("-") and not p.isdigit()]
+        return len(operands) <= 1
+    return name in _TEXT_ONLY_COMMANDS
 
 
 def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
@@ -9344,13 +10055,21 @@ def _save_windows_schedules(entries: list) -> None:
     )
 
 
+def _scheduled_task_cwd() -> Path:
+    """Where a scheduled run starts: the folder commands use now. A shell_cwd
+    that does not exist here would make every scheduled run fail at its `cd`
+    before agent8088 even starts; with no usable folder, keep the configured
+    one so the failure names the setting."""
+    return _choose_shell_cwd() or SHELL_CWD
+
+
 def _windows_task_script(identifier: str, task: str) -> Path:
     import base64
 
     scripts = _agent_data_dir() / "scheduled-tasks"
     script = scripts / f"{identifier}.ps1"
     prompt = base64.b64encode(task.encode("utf-8")).decode("ascii")
-    cwd = str(SHELL_CWD).replace("'", "''")
+    cwd = str(_scheduled_task_cwd()).replace("'", "''")
     agent = str(_which_executable("agent8088") or "agent8088").replace("'", "''")
     content = (
         "$ErrorActionPreference = 'Stop'\n"
@@ -9618,7 +10337,7 @@ def _exec_cron(args: dict) -> str:
         # AGENT8088_UNATTENDED tells the engine there is no operator to answer an
         # approval prompt, so gated actions resolve from cron_mode instead of
         # emitting an ESCALATION_REQUEST nobody will ever see.
-        entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
+        entry = (f"{schedule} cd {shlex.quote(str(_scheduled_task_cwd()))} && "
                  f"printf '%s\\n' {shlex.quote(task)} | "
                  f"AGENT8088_UNATTENDED=1 {shlex.quote(agent)} {_CRON_MARKER}")
         # Cron parses percent signs before the shell, including quoted ones.
@@ -10044,7 +10763,9 @@ def run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> 
     # Only command runners count timeouts: a file that merely contains the phrase
     # must not.
     runs_commands = (TOOL_SPECS.get(name) or {}).get("mode") in ("shell", "docker")
-    return result + (_take_blocker_note() or (_timeout_note(result) if runs_commands else ""))
+    cwd_note = (_take_cwd_note(sandboxed=not (TOOL_SPECS.get(name) or {}).get("host"))
+                if runs_commands else "")
+    return result + cwd_note + (_take_blocker_note() or (_timeout_note(result) if runs_commands else ""))
 
 
 def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) -> str:
@@ -10999,7 +11720,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         if reuse:
             return reuse
         if _structured_tool_argv(name, args):
-            return _exec_structured_tool(name, args, timeout)
+            result = _exec_structured_tool(name, args, timeout)
+            # A commit or checkout changes the tree as much as a write does;
+            # without this a fix made through git looked like a read.
+            if _git_tool_changed_tree(name, result):
+                note_mutation(name)
+            return result
         command = _format_with_args(spec.get("command") or "{command}", args)
         if spec.get("host"):
             # Never replace a shell command's output (see _shell_missing_program_note).
@@ -11016,7 +11742,14 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         # blocked with no way to approve it.
         if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
             return text.strip()
-        if not _readonly_shell(command):
+        # The audit predicate, not the approval one: `pwd && ls -la` changes
+        # nothing, but counting it as a change re-armed "changed work has no
+        # fresh verification evidence", and a model re-checked a finished
+        # answer three times (seen live with glm-5.3-flash).
+        # Either bookkeeping predicate (#237's chain check, #238's quote-aware
+        # check) proves every segment read-only; neither gates permission.
+        if not (_readonly_shell(command) or _readonly_chain(command)
+                or _shell_call_is_read_only(command)):
             # Ordered before the recording below so this run's own verdict is
             # stamped with the sequence its side effects produced.
             note_mutation(f"{name}: {command[:80]}")
@@ -11057,6 +11790,16 @@ _INSTALL_HINTS = {
 def _not_found_tool_error(error: FileNotFoundError) -> str:
     """Name the missing file or program instead of "something was not found"."""
     missing = getattr(error, "filename", None) or getattr(error, "filename2", None)
+    # A process started in a directory that vanished between the check and the
+    # start reports that directory as its missing file; say what it really is.
+    if isinstance(error, WorkingDirectoryMissing):
+        return _missing_cwd_error()
+    if (missing and Path(str(missing)) in (SHELL_CWD, LAUNCH_DIR, PROJECT_ROOT)
+            and not _is_dir(Path(str(missing)))):
+        # Name the folder that vanished: with a fallback in use that is not
+        # the configured shell_cwd, and naming that would send the user to
+        # fix a setting that is not the problem.
+        return _missing_cwd_error(Path(str(missing)))
     if not missing:
         return efficiency.tool_error('not_found', 'The requested file or executable was not found.',
             'Check the path or installed executable, correct the arguments, then retry.', recoverable=True)
@@ -11069,6 +11812,89 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
         return efficiency.tool_error('not_found', f'Program not found: {stem}', action, recoverable=True)
     return efficiency.tool_error('not_found', f'File not found: {missing}',
         'Check the path (list the directory first), correct the arguments, then retry.', recoverable=True)
+
+
+_EXIT_STATUS_RE = re.compile(r"Command exited with status \d+|timed out after \d+s")
+
+
+def _runs_changed_program(name: str, args: dict, result: str, trajectory) -> bool:
+    """Whether a shell call ran, successfully, a code file this run changed
+    while that change still waits for a check.
+
+    Seen in the glm-5.3-flash benchmark: after writing fib.py, `python fib.py`
+    counted as yet another change, re-armed the verification nudge, and the
+    model re-ran the same check twice. Named by file name, so `python3
+    ./src/fib.py` and `cd src && python3 fib.py` both count; a failing or
+    timed-out run is not a check."""
+    if name != "execute_shell" or not trajectory.needs_verification():
+        return False
+    text = str(result or "")
+    if text.startswith("Error:") or _EXIT_STATUS_RE.search(text):
+        return False
+    command = str(args.get("command") or "")
+    for path in trajectory.changed_code_paths():
+        stem = Path(path).name
+        if stem and re.search(rf"(?<![\w.-]){re.escape(stem)}(?![\w.-])", command):
+            return True
+    return False
+
+
+DIAGNOSE_AFTER_FAILURES = 3
+_DIAGNOSTIC_LISTING_MAX = 20
+_failure_streak = 0
+_diagnostic_shown = False
+
+
+def _failure_diagnostic(result: str) -> str:
+    """At the DIAGNOSE_AFTER_FAILURES-th failed call in a row, once per turn,
+    a read-only look at the environment for the model; otherwise "".
+
+    Seen live with the working directory missing: four tools failed four
+    different ways, and the model concluded "the workspace itself appears to be
+    missing" without one look. Gathered here in Python rather than by running
+    `pwd`/`ls`, so it needs no approval and works when commands cannot start."""
+    global _failure_streak, _diagnostic_shown
+    if result.startswith("ESCALATION_REQUEST\x1f"):
+        return ""          # waiting on the user, not a failure
+    if not result.startswith("Error:"):
+        _failure_streak = 0
+        return ""
+    _failure_streak += 1
+    if _failure_streak < DIAGNOSE_AFTER_FAILURES or _diagnostic_shown:
+        return ""
+    _diagnostic_shown = True
+    try:
+        return "\n" + _environment_diagnostic()
+    except Exception as exc:  # noqa: BLE001 — advice must never break a tool result
+        _log.debug("failure diagnostic failed: %s", exc)
+        return ""
+
+
+def _environment_diagnostic() -> str:
+    def state(path: Path) -> str:
+        return "exists" if _is_dir(path) else "MISSING"
+
+    cwd = _choose_shell_cwd()
+    lines = [f"{_HARNESS_PREFIX}{DIAGNOSE_AFTER_FAILURES} tool calls in a row failed. "
+             "Read-only check of this environment, gathered by the harness:"]
+    lines.append(f"- Commands start in: {cwd}" if cwd else
+                 f"- Commands cannot start: the configured working directory "
+                 f"{SHELL_CWD} does not exist, and no allowed fallback does")
+    lines.append(f"- Sandboxed commands run in: {ARTIFACTS_ROOT} ({state(ARTIFACTS_ROOT)})")
+    lines.append(f"- Project files resolve against: {PROJECT_ROOT} ({state(PROJECT_ROOT)})")
+    listed = cwd or (PROJECT_ROOT if _is_dir(PROJECT_ROOT) else None)
+    if listed is not None:
+        names = sorted(p.name + ("/" if p.is_dir() else "")
+                       for p in listed.iterdir() if not p.name.startswith("."))
+        more = len(names) - _DIAGNOSTIC_LISTING_MAX
+        shown = ", ".join(names[:_DIAGNOSTIC_LISTING_MAX]) or "(empty)"
+        lines.append(f"- {listed} contains: {shown}" + (f" (+{more} more)" if more > 0 else ""))
+        free = shutil.disk_usage(listed).free / 1024 ** 3
+        lines.append(f"- Disk: {free:.1f} GB free")
+    lines.append("If these look right, the environment is usable: fix the failing call "
+                 "instead of concluding the environment is unavailable. If something "
+                 "above is MISSING, tell the user which setting points there.")
+    return "\n".join(lines)
 
 
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
@@ -11135,7 +11961,7 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     _remember_escalation(name, args, result)
 
     # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
-    result = _redact_secrets(result)
+    result = _redact_secrets(result) + _failure_diagnostic(result)
     if runtime and operation_id:
         runtime.after_tool(operation_id, result)
 
@@ -12205,6 +13031,30 @@ def _wrap_untrusted(text: str, source: str = "") -> str:
     return f"{tag}\n{text}\n<<<END_UNTRUSTED_CONTENT>>>"
 
 
+# A marker the model quoted as inline code takes its backticks with it, so the
+# answer does not keep an empty `` where the marker was.
+_UNTRUSTED_MARKER_RE = re.compile(
+    r'`?<<<EXTERNAL_UNTRUSTED_CONTENT(?: source="[^"\n]*")?>>>`?\n?'
+    r'|\n?`?<<<END_UNTRUSTED_CONTENT>>>`?')
+
+
+def strip_untrusted_markers(text: str) -> str:
+    """`text` without _wrap_untrusted's boundary markers, for showing a tool
+    result to a person. The markers tell the model what is data; to a user
+    they read as broken output. Display only: the model keeps them."""
+    return _UNTRUSTED_MARKER_RE.sub("", text) if text else text
+
+
+def display_tool_result(name: str, text: str) -> str:
+    """A tool result as a person should see it: without the untrusted-content
+    markers, and for web_search without the "[Retrieved ...]" note that tells
+    the model to check each result's date."""
+    text = strip_untrusted_markers(text)
+    if name == "web_search" and text:
+        text = re.sub(r"^\s*\[Retrieved [^\]\n]*\]\s*", "", text)
+    return text
+
+
 # Distinctive lines of the base system prompt, used to detect a verbatim leak.
 _SYSTEM_FINGERPRINTS = [ln.strip() for ln in BASE_SYSTEM_PROMPT.splitlines()
                         if len(ln.strip()) >= 40]
@@ -12324,7 +13174,9 @@ def _guard_answer(answer: str) -> str:
     if _is_system_leak(answer):
         return ("I can't share my internal system instructions or configuration. "
                 "Tell me what you'd like help with instead.")
-    return _redact_secrets(answer)
+    # A model quoting a search result sometimes copies its untrusted-content
+    # markers into the answer; they mean nothing there.
+    return _redact_secrets(strip_untrusted_markers(answer))
 
 
 # Requests that target the agent's own internals — refused instantly (no model
@@ -12753,11 +13605,73 @@ def _web_search_limit() -> int:
 
 
 def _web_search_turn_cap() -> int:
-    """Searches one request may run before it must answer; 0 means no cap."""
+    """Searches one request may run before it must answer; 0 means no cap.
+
+    This is the starting allowance: _grown_search_allowance raises it while
+    searches keep finding new pages, up to a hard ceiling."""
     try:
         return max(0, _config_int("web_search_max_per_turn", 6))
     except (TypeError, ValueError):
         return 6
+
+
+# How many of the latest searches must each have found new pages to earn more.
+# Two, not one: a single rephrasing can turn up a few new pages by chance.
+_SEARCH_PRODUCTIVE_WINDOW = 2
+_SEARCH_URL_LINE = re.compile(r"^\s+(https?://\S+)\s*$", re.MULTILINE)
+
+
+def _search_result_urls(result: str) -> set:
+    """The result pages a web_search returned, normalized so the same page
+    reached by a slightly different link still counts as already seen."""
+    urls = set()
+    for raw in _SEARCH_URL_LINE.findall(result or ""):
+        parts = urllib.parse.urlsplit(raw)
+        path = parts.path.rstrip("/")
+        urls.add(urllib.parse.urlunsplit(
+            (parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "")))
+    return urls
+
+
+def _search_found_new_pages(result: str, seen: set):
+    """True when a completed search brought back mostly pages this request had
+    not seen yet, False when it repeated earlier pages, None when it returned
+    no pages at all; adds its pages to `seen`. A rephrasing of one question
+    returns the same pages, so it never counts as new."""
+    urls = _search_result_urls(result) if _search_was_usable(result) else set()
+    if not urls:
+        return None
+    new = urls - seen
+    seen |= urls
+    return len(new) * 2 >= len(urls)
+
+
+def _grown_search_allowance(allowance: int, cap: int, productive: list,
+                            since: int = 0) -> int:
+    """`allowance` plus one more block of searches when the latest searches
+    each found new pages, never past cap x web_search_ceiling_multiplier.
+
+    A fixed cap stopped real research mid-way while every search was still
+    bringing back pages the run had not seen. Growth is earned the same way
+    the dynamic turn budget earns rounds: from what the searches returned,
+    not from anything the model asks for.
+
+    `productive` holds _search_found_new_pages per search that ran. A search
+    with no pages (None) is skipped rather than counted against the run: live,
+    DDGS throttled two of ten distinct city lookups to "No results found", and
+    counting those stopped real work at the starting cap. So that empty
+    searches cannot chain extensions on their own, growth also needs a search
+    that found new pages since the last extension (`since`)."""
+    try:
+        ceiling = cap * max(1, _config_int("web_search_ceiling_multiplier", 3))
+        extension = max(1, _config_int("web_search_extension", 3))
+    except (TypeError, ValueError):
+        ceiling, extension = cap * 3, 3
+    recent = [p for p in productive if p is not None][-_SEARCH_PRODUCTIVE_WINDOW:]
+    if (allowance < ceiling and len(recent) == _SEARCH_PRODUCTIVE_WINDOW
+            and all(recent) and any(productive[since:])):
+        return min(ceiling, allowance + extension)
+    return allowance
 
 
 _WEB_SEARCH_MAX_QUERY_CHARS = 500
@@ -13655,6 +14569,9 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         # MCP servers connect in the background at startup; their tools must be
         # registered before this turn's tool list is built.
         ensure_mcp_ready()
+        # Same seam for the shell's folder: if it changed since execute_shell
+        # was described, the model must not keep being told the old one.
+        refresh_shell_grounding()
     user_turns = _genuine_user_turns(messages)
     goal = str(user_turns[-1].get("content") or "") if user_turns else ""
     run_trajectory = trajectory.TrajectoryState(
@@ -14692,7 +15609,7 @@ def _turn_policy(max_turns: int, *, depth: int = 0, role: str | None = None,
 
 def _answer_from_context(messages, *, system_prompt, temperature, budget, on_token,
                          interrupt_check, trace, turn, client, provider_name,
-                         model_name):
+                         model_name, ask=None):
     """One last round with no tools, so an exhausted run reports its work.
 
     The run is over either way; the only question is whether the user gets what
@@ -14700,7 +15617,7 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
     design -- a failure here falls back to the old report rather than replacing
     one bad ending with a crash.
     """
-    ask = ("You have reached this turn's budget and no more tools will run. "
+    ask = ask or ("You have reached this turn's budget and no more tools will run. "
            "Answer now from what you already have: give the result you did "
            "reach and say plainly what is still missing. Do not ask to "
            "continue and do not request another tool.")
@@ -14730,8 +15647,21 @@ DELIVERABLES_CHECK_NUDGE = (
     "Before finishing: re-read the original task. For each required output "
     "(file path, format, service or port), run a check now that confirms it exists "
     "and behaves exactly as specified. Remove scratch files, test users and other "
-    "leftovers you created that the task did not ask for. Then give your final answer."
+    "leftovers you created that the task did not ask for. Check each item once with "
+    "a single command, then give your final answer. Do not keep exploring."
 )
+POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
+
+
+def _with_task_notes(answer: str, trajectory) -> str:
+    """The controller's end-of-run notes, on every way a run can finish: an
+    unverified change, or the task-state review."""
+    if trajectory is not None and trajectory.needs_verification():
+        return answer + ("\n\nVerification note: changes were made, but no fresh automated "
+                         "verification evidence was recorded.")
+    if trajectory is not None and (review := trajectory.review()):
+        return answer + f"\n\nTask-state note: {review}"
+    return answer
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
     "cli_anything_info", "cli_anything_skill",
@@ -14821,9 +15751,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     missing_args_retries = 0  # times a call arrived without its arguments
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
-    length_retries = 0   # token-limited calls are incomplete and must never execute
+    length_retries = 0   # consecutive token-limited calls; incomplete, never executed
+    last_call_tokens = 0  # completion tokens of the last call that finished normally
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
+    tool_failed = False  # any tool call this run returned an error
+    fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
+    diagnostic_seen = False  # the model has been shown environment_diagnostic()
+    post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
+    post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
+    last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     plan_mutation_retries = 0
@@ -14836,7 +15773,11 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     auto_signals_seen: set = set()   # each struggle signal escalates at most once
     searched = False     # prevents redundant lightweight fetches after search results
     search_results = {}  # query signature -> that search's output, for reuse
-    searches_run = 0     # web searches that actually ran, against _web_search_turn_cap
+    searches_run = 0     # web searches that actually ran, against search_allowance
+    search_allowance = 0     # current cap; starts at _web_search_turn_cap, can grow
+    search_pages_seen = set()    # result pages earlier searches returned
+    search_productive = []       # per search that ran: new pages? (None = no pages)
+    search_grant_mark = 0        # len(search_productive) at the last extension
     forced_stop = False
     user_turns = _genuine_user_turns(messages)
     durable_browser_goal = next((str(message.get("content") or "")
@@ -15024,13 +15965,23 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                               "tokens_after": _estimate_tokens(
                                   _estimate_context_chars(messages, round_system_prompt or "")
                                   + len(json.dumps(round_tools_def or [], default=str)))})
+        # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
+        # never below the floor); any normal finish resets to the full limit.
         turn_max_tokens = (
             turn_completion_limit if not length_retries else
-            min(turn_completion_limit * 2, turn_context_window) if length_retries == 1 else
-            min(1024, turn_completion_limit)
+            min(turn_completion_limit,
+                max(MAIN_LLM_MIN_TOKENS, min(turn_completion_limit, 2 * last_call_tokens)))
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
+        # A3.2/A3.4: from the 2nd consecutive cut-off, this one call runs with
+        # thinking off; the next ordinary turn is back to normal thinking.
+        retry_kwargs = {"thinking": "length_retry"} if length_retries >= 2 else {}
+        if length_retries and trace is not None:
+            trace.append({"turn": turn, "type": "retry_mode",
+                          "mode": "reduced_thinking" if retry_kwargs else "small_cap",
+                          "max_tokens": turn_max_tokens})
+        call_started = time.monotonic()
         # Fit the request in the window: a strict OpenAI-compatible server (vLLM)
         # rejects prompt + max_tokens > max_model_len with a 400, which ends the
         # turn. Asking for the full completion limit on a long history -- or
@@ -15052,6 +16003,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     provider_override=loop_provider,
                     model_override=loop_model,
                     on_retry=_retry_notice, on_stream_reset=on_stream_reset,
+                    **retry_kwargs,
                 )
         except (AgentInterrupted, TurnBudgetExceeded):
             raise
@@ -15145,7 +16097,6 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
         native_text = _native_tool_text(message)
         if native_text:
             content = "\n".join(part for part in (content, native_text) if part)
-        messages.append({"role": "assistant", "content": content})
 
         calls = find_tool_calls(content, round_allowed_tools)
         for call in calls:
@@ -15188,21 +16139,80 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 )
             if on_result:
                 on_result("error", warning)
+            length_retries += 1
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
-            # Never end the run on cut-offs: a model that overruns its output
-            # limit is told to reply briefly and the run carries on, bounded by
-            # its turn and time budget -- the same behaviour as comparable
-            # agents, which retry until their clock runs out rather than giving
-            # up with time left (#18).
-            length_retries += 1
-            messages.append(_harness_turn((
-                retry_instruction if length_retries == 1 else
-                "Your last responses reached the output limit. Reply within 200 tokens "
-                "with exactly one complete tool call or a final answer. Do not include analysis "
-                "or thinking."
-            )))
+                trace.append({"turn": turn, "type": "length_cutoff",
+                              "tokens": turn_max_tokens,
+                              "seconds": round(time.monotonic() - call_started, 1),
+                              "had_content": bool(content),
+                              # What the allowance went to: the captured reasoning
+                              # (streamed or on the message) shows a runaway
+                              # think apart from a long answer.
+                              "reasoning_chars": len(_extract_reasoning(message))})
+            # A3.3: the truncated reply is discarded, not stored -- only a short
+            # harness note enters the context.
+            # A3.4: a cut-off never ends the run until the ladder is spent:
+            # 1st small cap, 2nd thinking off, 3rd compact + progress note,
+            # then one final no-tools round that returns the partial work.
+            if LENGTH_CUTOFF_MAX_RETRIES and length_retries >= LENGTH_CUTOFF_MAX_RETRIES:
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "final_round_no_tools",
+                                  "cutoffs": length_retries})
+                answer = _answer_from_context(
+                    messages, system_prompt=round_system_prompt,
+                    temperature=temperature, budget=budget, on_token=on_token,
+                    interrupt_check=interrupt_check, trace=trace, turn=turn,
+                    client=loop_client, provider_name=loop_provider,
+                    model_name=loop_model,
+                    ask=("Your output was cut off repeatedly and no more tools will "
+                         "run. Answer now, briefly, from what already exists: say what "
+                         "is done and what is still missing."))
+                answer = (answer or str(_last_tool_output or "")
+                          or "No answer was produced before the output limit.")
+                answer = _guard_answer(
+                    f"{answer}\n\n[Stopped after {length_retries} output-limit "
+                    "cut-offs. Raise main_llm_min_tokens or length_retry_max_tokens "
+                    "(or the provider's max_completion_tokens) if replies are "
+                    "legitimately this long.]")
+                if on_answer:
+                    on_answer(answer)
+                return answer
+            if length_retries == 3:
+                try:
+                    compact_messages(messages, completion_client=loop_client,
+                                     provider_name=loop_provider or "",
+                                     model_name=loop_model or "", budget=budget)
+                except Exception as exc:
+                    _log.warning("compaction after repeated cut-offs failed: %s", exc)
+                last = str(_last_tool_output or "")[:500]
+                retry_instruction = (
+                    f"{warning} Progress so far is in the summary above"
+                    + (f"; last tool output: {last}" if last else "")
+                    + ". Reply within 200 tokens with exactly one short tool call "
+                    "or a final answer. Do not include analysis.")
+            elif length_retries == 1:
+                retry_instruction = (
+                    f"{warning} The previous attempt was cut off and discarded. "
+                    + ("Make one short, complete tool call; split large work across calls."
+                       if content else
+                       "That budget went entirely to reasoning: stop reasoning and "
+                       "reply in plain text or call one tool."))
+            else:
+                retry_instruction = (
+                    "Your last responses reached the output limit and were discarded. "
+                    "Reply within 200 tokens with exactly one complete tool call or a "
+                    "final answer. Do not include analysis or thinking.")
+            messages.append(_harness_turn(retry_instruction))
             continue
+        # A normal finish: store the reply, reset the cap, remember its size.
+        messages.append({"role": "assistant", "content": content})
+        last_call_tokens = int(getattr(getattr(response, "usage", None),
+                                       "completion_tokens", 0) or 0) or _estimate_tokens(len(content))
+        if length_retries:
+            if trace is not None:
+                trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
+            length_retries = 0
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -15294,16 +16304,41 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
                           if unknown else "I wasn't able to produce an answer to that.")
 
-            if DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
+            if (tool_failed and not diagnostic_seen
+                    and _claims_environment_unavailable(answer)):
+                # "The environment is inaccessible" after a failed tool call is
+                # a conclusion, and one failure does not prove it: a wrong
+                # working directory once ended runs this way with the files
+                # right there. Show the evidence first, once.
+                diagnostic_seen = True
+                diagnosis, status = environment_diagnostic()
+                messages.append(_harness_turn(
+                    "You concluded that the environment cannot be used, but nothing has "
+                    "checked that yet. A read-only check of where commands run:\n"
+                    f"{diagnosis}\n"
+                    "If this shows a usable working directory, continue the task from "
+                    "there. If it confirms a real problem, give your final answer and "
+                    "say what this check shows."))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "diagnostic_run",
+                                  "trigger": "environment_claim", "outcome": status})
+                continue
+
+            last_text_answer = answer
+            # Once told to answer, take this reply: a gate firing again here is
+            # exactly the open-ended checking the cap exists to end.
+            gates_open = not post_check_told
+            if gates_open and DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
                 # Graded on exact outputs with nobody to ask: before the one
                 # final answer, re-check every deliverable against the task.
                 deliverables_checked = True
                 messages.append(_harness_turn(DELIVERABLES_CHECK_NUDGE))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "deliverables_check"})
+                post_check_rounds = 0
                 continue
 
-            if trajectory is not None and trajectory.request_replan():
+            if gates_open and trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()
                 messages.append(_harness_turn((
@@ -15311,17 +16346,23 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Do not repeat them. State a short revised approach, then take one "
                     "different safe next action; if blocked by missing access, say so plainly."
                 )))
+                # Not a finishing check: the approach failed and the model is
+                # back to working, so the cap must not cut that short.
+                post_check_rounds, post_check_told = None, False
                 continue
-            if trajectory is not None and trajectory.request_verification():
+            if gates_open and trajectory is not None and trajectory.request_verification():
                 if on_trajectory_state:
                     on_trajectory_state()
                 messages.append(_harness_turn((
                     "Controller state says a changed result has no fresh verification evidence. "
                     "Before your final answer, inspect or test the changed result if a suitable "
-                    "tool is available. If verification is not possible, say that plainly."
+                    "tool is available. If verification is not possible, say that plainly. "
+                    "Check each item once with a single command, then give your final "
+                    "answer. Do not keep exploring."
                 )))
+                post_check_rounds = 0
                 continue
-            if (trajectory is not None and not DISPOSABLE_CONTAINER
+            if (gates_open and trajectory is not None and not DISPOSABLE_CONTAINER
                     and trajectory.request_tests()):
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -15331,13 +16372,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                     "Before your final answer, call generate_tests on each one, or "
                     "state plainly why tests do not apply to this change."
                 )))
+                post_check_rounds = 0
                 continue
-            answer = _guard_answer(answer)
-            if trajectory is not None and trajectory.needs_verification():
-                answer += ("\n\nVerification note: changes were made, but no fresh automated "
-                           "verification evidence was recorded.")
-            elif trajectory is not None and (review := trajectory.review()):
-                answer += f"\n\nTask-state note: {review}"
+            answer = _with_task_notes(_guard_answer(answer), trajectory)
             if on_answer:
                 on_answer(answer)
             if trace is not None:
@@ -15348,6 +16385,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             on_calls(calls)
 
         executed = False
+        round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
         turn_tools = [] if trace is not None else None
@@ -15423,8 +16461,22 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # detail that snippets never carry (a full 20-team table from
                 # five-result DDGS searches) rephrased 23 times until the turn
                 # was killed with no answer; stop it and make it answer.
+                # Searches still finding new pages earn more (see
+                # _grown_search_allowance); a rephrasing model finds the same
+                # pages, earns nothing, and stops at the starting cap.
                 cap = _web_search_turn_cap()
-                if cap and searches_run >= cap:
+                search_allowance = max(search_allowance, cap)
+                if cap and searches_run >= search_allowance:
+                    search_allowance = _grown_search_allowance(
+                        search_allowance, cap, search_productive, search_grant_mark)
+                    if search_allowance > searches_run:
+                        search_grant_mark = len(search_productive)
+                        _log.info("web search allowance raised to %d: recent "
+                                  "searches found new pages", search_allowance)
+                        if trace is not None:
+                            trace.append({"turn": turn, "type": "search_allowance",
+                                          "allowance": search_allowance})
+                if cap and searches_run >= search_allowance:
                     result = (f"Search limit reached: {searches_run} web searches "
                               "already ran for this request. Do not search again. "
                               "Answer now from the results above, and say plainly "
@@ -15508,8 +16560,14 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # on_calls already announced "Searching the web..." once; this spinner
             # is the next beat, not a repeat of it.
             spin_msg = "Fetching results…" if name == "web_search" else f"running {name}..."
+            cap_seq_before = _MUTATION_SEQ
             with spin(spin_msg):
                 result = exec_tool(name, json.dumps(args), depth=depth)
+            for event in _drain_trace_events():
+                if trace is not None:
+                    trace.append(dict(event, turn=turn, tool=name))
+            round_changed = round_changed or _tool_call_changed_state(
+                name, args, _MUTATION_SEQ != cap_seq_before)
             if trajectory is not None and operation is not None:
                 verdict = tool_output.detect_verdict(result)
                 # detect_verdict reads test output; it has no idea what an
@@ -15520,10 +16578,16 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 status = verdict.status
                 if f"audit: {AUDIT_PASSED_NOTE}" in result:
                     status = "passed"
+                mutated = _MUTATION_SEQ != mutation_seq_before
+                if mutated and _runs_changed_program(name, args, result, trajectory):
+                    # Running the code this run just changed is how it gets
+                    # checked. Only the verification bookkeeping treats it as
+                    # a check; caches were already invalidated as for any run.
+                    mutated = False
                 trajectory.after_tool(
                     operation, result, failed=_plan_step_failed(result),
                     blocked=result.startswith("ESCALATION_REQUEST\x1f"),
-                    mutated=_MUTATION_SEQ != mutation_seq_before, verdict=status,
+                    mutated=mutated, verdict=status,
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
@@ -15612,6 +16676,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                 # user had just authorised was answered from the escalation text.
                 search_results[_search_signature(str(args.get("query") or ""))] = result
                 searches_run += 1
+                search_productive.append(_search_found_new_pages(result, search_pages_seen))
             searched = searched or (name == "web_search" and _search_was_usable(result))
 
             blocked = result.startswith("ESCALATION_REQUEST\x1f")
@@ -15698,6 +16763,26 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                           f"have, and there is nobody to ask. Do not retry it. "
                           f"Continue without it, or explain what you could not do.")
             model_result = _tool_result_for_model(name, result)
+            # The same tool failing the same way again says more about the
+            # environment than about the call: after DIAGNOSTIC_AFTER_FAILURES
+            # in a row, show the model a read-only check of where commands run
+            # rather than let it keep retrying or conclude the place is broken.
+            code = _tool_error_code(result)
+            tool_failed = tool_failed or code is not None
+            key = (name, code) if code else None
+            fail_streak = (key, fail_streak[1] + 1 if key and key == fail_streak[0] else int(bool(key)))
+            if key and fail_streak[1] == DIAGNOSTIC_AFTER_FAILURES:
+                diagnostic_seen = True
+                diagnosis, status = environment_diagnostic()
+                model_result += (
+                    f"\n\n{_HARNESS_PREFIX}{name} failed the same way ({code}) "
+                    f"{fail_streak[1]} times in a row. A read-only check of where "
+                    f"commands run:\n{diagnosis}\nUse it to choose a different next "
+                    f"step; do not repeat the failing call unchanged.")
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "diagnostic_run",
+                                  "trigger": "repeated_failure", "tool": name,
+                                  "code": code, "outcome": status})
             messages.append({"role": "user", "content":
                              f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
 
@@ -15719,6 +16804,41 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
+        if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:
+            if round_changed:
+                # A check found something and the model fixed it: real work,
+                # never cut off. The count starts over.
+                post_check_rounds, post_check_told = 0, False
+            else:
+                post_check_rounds += 1
+                if post_check_rounds >= MAX_POST_CHECK_ROUNDS + 2:
+                    # Hard backstop: told to answer and still checking. Ask once
+                    # more with no tools: the reply the nudge sent back predates
+                    # these checks, and a fix made after it would make it stale.
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "post_check_backstop",
+                                      "rounds": post_check_rounds})
+                    fresh = _answer_from_context(
+                        messages, system_prompt=(system_prompt() if callable(system_prompt)
+                                                 else system_prompt),
+                        temperature=temperature, budget=budget, on_token=on_token,
+                        interrupt_check=interrupt_check, trace=trace, turn=turn,
+                        client=client, provider_name=provider_name, model_name=model_name)
+                    fresh = strip_tool_json(fresh or "").strip()
+                    answer = _with_task_notes(_guard_answer(
+                        fresh or last_text_answer
+                        or "Stopped after repeated checks with no further changes."), trajectory)
+                    if on_answer:
+                        on_answer(answer)
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "final_answer", "content": answer})
+                    return answer
+                if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
+                    post_check_told = True
+                    messages.append(_harness_turn(POST_CHECK_CAP_NUDGE))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "post_check_cap",
+                                      "rounds": post_check_rounds})
         if executed:
             forcing = False
             policy.record_round(

@@ -790,6 +790,14 @@ def _startup_notices(extra=()):
     memory store, MCP servers that already failed. Never raises."""
     lines = list(extra)
     warnings = list(getattr(A, "CONFIG_WARNINGS", []) or [])
+    try:
+        # Without its key every request fails; say so before the first one,
+        # not as that request's 401.
+        missing_key = _missing_provider_key_notice(_active_provider_name())
+    except Exception:  # noqa: BLE001 -- a startup nicety must never stop startup
+        missing_key = ""
+    if missing_key:
+        warnings.insert(0, missing_key)
     # Provider mistakes first: they explain why every request then fails
     # (a typo'd default_provider silently lands on localhost Ollama).
     warnings.sort(key=lambda w: 0 if "provider" in w.lower() else 1)
@@ -1344,10 +1352,39 @@ def _repository_result(result):
     return out
 
 
+def _tool_error_lines(result):
+    """A failed tool's result as lines for a person: the message, its error
+    code dimmed for bug reports, and any note that followed. The structured
+    part (recoverable, suggested_action) is advice written for the model, and
+    printed whole it reads as a JSON blob; an error without one is shown as
+    it came."""
+    lines = result.strip().splitlines()
+    for index, line in enumerate(lines):
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or "suggested_action" not in payload:
+            continue
+        message = "\n".join(lines[:index]).strip()
+        message = message[len("Error:"):].strip() if message.startswith("Error:") else message
+        head = Text(f"  ⎿  {message}", style="red")
+        if payload.get("code"):
+            head.append(f"  ({payload['code']})", style="dim")
+        notes = "\n".join(lines[index + 1:]).strip()
+        return [head] + ([Text(f"     {notes}", style="dim")] if notes else [])
+    return [Text(f"  ⎿  {result}", style="red")]
+
+
 def on_result(name, result):
     if S.verbose == "off":
         return
     mode = A.TOOL_SPECS.get(name, {}).get("mode")
+    # The <<<EXTERNAL_UNTRUSTED_CONTENT>>> frame tells the model what is data;
+    # shown to a person it reads as broken output.
+    result = A.strip_untrusted_markers(result)
 
     if result.lstrip().startswith("ESCALATION_REQUEST\x1f"):
         fields = result.strip().split("\x1f", 4)
@@ -1360,7 +1397,8 @@ def on_result(name, result):
         return
 
     if result.lstrip().startswith('Error:'):
-        console.print(Text(f"  ⎿  {result}", style='red'))
+        for line in _tool_error_lines(result):
+            console.print(line)
         return
 
     if name == "web_search":
@@ -1722,6 +1760,27 @@ def _hold_back(text):
     return 0
 
 
+_MARKER_NAMES = ("<<<EXTERNAL_UNTRUSTED_CONTENT", "<<<END_UNTRUSTED_CONTENT>>>")
+
+
+def _marker_hold(text):
+    """Length of the suffix to withhold because it could still become an
+    untrusted-content marker, so a model copying one into its answer never
+    flashes `<<<EXTERNAL_UNTR` on screen before the whole tag can be removed."""
+    start = text.rfind("<<<")
+    if start == -1:
+        for n in (2, 1):
+            if text.endswith("<" * n):
+                return n
+        return 0
+    tail = text[start:]
+    if ">>>" in tail[3:] or len(tail) > 200:
+        return 0
+    if any(name.startswith(tail) or tail.startswith(name) for name in _MARKER_NAMES):
+        return len(tail)
+    return 0
+
+
 class _StreamFilter:
     """Splits a raw content stream into prose the user should see and tool-call
     protocol they should not.
@@ -1748,9 +1807,10 @@ class _StreamFilter:
 
     def prose_text(self):
         if self._cut is not None:
-            return self._seen[:self._cut]
+            return A.strip_untrusted_markers(self._seen[:self._cut])
         keep = _hold_back(self._seen)
-        return self._seen[:len(self._seen) - keep] if keep else self._seen
+        prose = self._seen[:len(self._seen) - keep] if keep else self._seen
+        return A.strip_untrusted_markers(prose[:len(prose) - _marker_hold(prose)])
 
     def feed(self, delta):
         """Absorb one content delta. Returns True while a tool call is streaming."""
@@ -2332,9 +2392,10 @@ def do_chat(query):
         A._plan_on_escalation = _plan_on_escalation
         A._plan_on_approval = _make_plan_approval(live, esc)
 
-        # Paint the spinner now: run_agent's own spin("thinking") only fires after
-        # memory recall / prompt / tool-def setup, which left a dead gap after Enter.
-        live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=True))
+        # Show the animated status line now, not when the engine first reports it:
+        # recall and routing run before the model call, and the screen was blank
+        # for that whole stretch.
+        live.update(_StatusLine("thinking...", turn_start, tokens_ref, interruptible=True))
         try:
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),
@@ -2394,7 +2455,7 @@ def do_chat(query):
     _await_memory_capture(memory_stored, query)
     if trace is not None:
         _record_trace(query, trace, elapsed)
-        console.print(Panel(Text(json.dumps(trace, indent=2)), title="[#237dd7]trace[/#237dd7]",
+        console.print(Panel(Text(json.dumps(_trace_for_display(trace), indent=2)), title="[#237dd7]trace[/#237dd7]",
                             box=box.MINIMAL, border_style="#0077B6"))
     _after_turn_plan_state()
     _save_active_session()
@@ -2524,7 +2585,7 @@ COMMAND_DETAILS = {
              "models; /local list shows models pulled into Ollama; /local available [query] "
              "browses ollama.com for models that fit this machine; /local pull <name> downloads "
              "one (e.g. qwen3:0.6b); /local remove <name> deletes one.",
-    "dump": "Writes a redacted diagnostic bundle (no API keys or tokens) to dump.txt in the "
+    "dump": "Writes a redacted diagnostic bundle (no API keys or tokens) to dump-<date>-<time>.txt in the "
             "agent's data folder, for bug reports.",
     "search": "/search (or /search status) shows the web-search backends and which are ready; "
               "/search use <searxng|ddgs|tavily|exa|auto> pins one; /search setup starts a "
@@ -2609,8 +2670,11 @@ A.register_frontend_commands({
 def cmd_help(_):
     t = Table(title="Commands", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Command", style="#237dd7", no_wrap=True)
-    t.add_column("What it does", style="#237dd7")
+    # Capped and folding: one long usage line (/review's flags run to 91
+    # characters) used to set the column's width, which squeezed every
+    # description to a character or two below 120 columns, or off entirely.
+    t.add_column("Command", style="#237dd7", max_width=34, overflow="fold")
+    t.add_column("What it does", style="#237dd7", ratio=1)
     for command in command_catalog():
         t.add_row(command["usage"], command["description"])
     console.print(t)
@@ -2643,24 +2707,66 @@ def cmd_tools(rest):
     _render_tools_table(show_full=False)
 
 
+def _add_name_column(table, header, names):
+    """A column of names the user types back (/tools <name>, /skills <name>,
+    /limits <key>): never narrower than the longest one. Rich otherwise
+    shrinks every column of a narrow terminal alike, and cut the names to
+    `cli_anything_inst…` while a description column wrapped beside it."""
+    longest = max((len(str(n)) for n in names), default=0)
+    table.add_column(header, style="#237dd7", no_wrap=True, min_width=max(longest, len(header)))
+
+
+# Below this width a many-column table cannot fit whole names and a readable
+# description at once; /tools, /skills and /agents print a short block per
+# entry instead.
+_NARROW_LIST_WIDTH = 110
+
+
+def _print_entry_blocks(title, entries, caption=""):
+    """entries: (name, meta, description, detail) -> one block per entry:
+    the name and its meta on one line, then the description, then a detail
+    line, each wrapped to the terminal."""
+    console.print(Text(title, style="bold #00edff"))
+    for name, meta, description, detail in entries:
+        head = Text(f"  {name}", style="bold #237dd7")
+        if meta:
+            head.append(f"  {meta}", style="dim")
+        console.print(head)
+        if description:
+            console.print(Padding(Text(description, style="#237dd7"), (0, 0, 0, 4)))
+        if detail:
+            console.print(Padding(Text(detail, style="dim"), (0, 0, 0, 4)))
+    if caption:
+        console.print(Text(caption, style="dim"))
+
+
 def _render_tools_table(show_full: bool = False):
     caption = "Run  /tools <name>  to inspect full schema and arguments  ·  /tools --full  for complete descriptions"
     t = Table(title="Tools", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6",
               caption=caption, caption_style="dim")
-    t.add_column("Name", style="#237dd7")
-    t.add_column("Args", style="#237dd7")
-    t.add_column("Mode", style="#237dd7")
-    t.add_column("Description", style="#237dd7")
     specs = _active_tool_specs()
+
+    def describe(spec):
+        if show_full:
+            return spec.get("description", "")
+        return spec.get("summary") or _summarize_tool_description(spec.get("description", ""))
+
+    if console.width < _NARROW_LIST_WIDTH:
+        _print_entry_blocks("Tools", [
+            (name, " · ".join(filter(None, [specs[name].get("mode", "?"),
+                                            ", ".join(specs[name].get("args") or [])])),
+             describe(specs[name]), "")
+            for name in sorted(specs)], caption)
+        return
+    _add_name_column(t, "Name", specs)
+    t.add_column("Args", style="#237dd7", overflow="fold")
+    t.add_column("Mode", style="#237dd7", overflow="fold")
+    t.add_column("Description", style="#237dd7")
     for name in sorted(specs):
         spec = specs[name]
         args = ", ".join(spec.get("args") or []) or "—"
-        if show_full:
-            desc = spec.get("description", "")
-        else:
-            desc = spec.get("summary") or _summarize_tool_description(spec.get("description", ""))
-        t.add_row(name, args, spec.get("mode", "?"), desc)
+        t.add_row(name, args, spec.get("mode", "?"), describe(spec))
     console.print(t)
 
 
@@ -2795,19 +2901,32 @@ def cmd_skills(rest):
                       "skills_installed/<name>/ with SKILL.md + tools.txt "
                       "(see skills_installed/README.md)[/dim]")
         return
+    caption = "Run  /skills <name>  for the full description and playbook"
+    if console.width < _NARROW_LIST_WIDTH:
+        _print_entry_blocks("Installed Skills", [
+            (name, " · ".join([str(s_.get("category", "general")), f"v{s_['version']}",
+                               "disabled" if name in S.disabled_skills else "active"]),
+             _summarize_tool_description(s_["description"]),
+             f"tools: {', '.join(sorted(s_['tools']))}" if s_["tools"] else "")
+            for name, s_ in sorted(A.SKILL_PACKAGES.items())], caption)
+        return
     t = Table(title="Installed Skills", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
-              header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Name", style="#237dd7")
-    t.add_column("Category", style="#237dd7")
+              header_style="bold #00edff", border_style="#0077B6",
+              caption=caption, caption_style="dim")
+    _add_name_column(t, "Name", A.SKILL_PACKAGES)
+    t.add_column("Category", style="#237dd7", overflow="fold")
     t.add_column("Version", style="#237dd7")
     t.add_column("State", style="#237dd7")
-    t.add_column("Tools", style="#237dd7")
+    t.add_column("Tools", style="#237dd7", overflow="fold")
     t.add_column("Description", style="#237dd7")
     for name in sorted(A.SKILL_PACKAGES):
         s = A.SKILL_PACKAGES[name]
+        # First sentence, as /tools does: the full text is the skill's routing
+        # description, written for the model and often a paragraph long.
         t.add_row(name, str(s.get("category", "general")), str(s["version"]),
                   "disabled" if name in S.disabled_skills else "active",
-                  ", ".join(sorted(s["tools"])) or "—", s["description"])
+                  ", ".join(sorted(s["tools"])) or "—",
+                  _summarize_tool_description(s["description"]))
     console.print(t)
 
 
@@ -3084,24 +3203,36 @@ def cmd_agent(rest):
         task = None
 
 
-def _cmd_agents_list():
-    t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
-              caption="run one with  /agent  (arrow-key picker)  or  /agent <name> <task>  ·  "
-                      "manage with  /agents new|edit|delete|models",
-              caption_style="dim")
-    t.add_column("Name", style="#237dd7")
-    t.add_column("Source", style="#237dd7")
-    t.add_column("Max turns", style="#237dd7")
-    t.add_column("Model", style="#237dd7")
-    t.add_column("Tools", style="#237dd7")
-    t.add_column("Description", style="#237dd7")
+_AGENTS_CAPTION = ("run one with  /agent  (arrow-key picker)  or  /agent <name> <task>  ·  "
+                   "manage with  /agents new|edit|delete|models")
+def _agent_rows():
     for name in sorted(A.SUBAGENT_SPECS):
         p = A.SUBAGENT_SPECS[name]
-        tools = ", ".join(t_ for t_ in p["tools"] if t_ in A.TOOL_NAMES) or "—"
-        source = "built-in" if p.get("builtin") else "custom"
-        model = p.get("model") or "inherit"
-        t.add_row(name, source, str(p["max_turns"]), model, tools, p["description"])
-    console.print(t)
+        yield (name, "built-in" if p.get("builtin") else "custom", str(p["max_turns"]),
+               p.get("model") or "inherit", [t_ for t_ in p["tools"] if t_ in A.TOOL_NAMES],
+               p["description"])
+
+
+def _cmd_agents_list():
+    if console.width < _NARROW_LIST_WIDTH:
+        _print_entry_blocks("Subagents", [
+            (name, f"{source} · {turns} turns · model {model}", description,
+             f"tools: {', '.join(tools) or '—'}")
+            for name, source, turns, model, tools, description in _agent_rows()],
+            _AGENTS_CAPTION)
+    else:
+        t = Table(title="Subagents", box=box.SIMPLE_HEAVY, title_style="bold #00edff",
+                  caption=_AGENTS_CAPTION, caption_style="dim")
+        _add_name_column(t, "Name", A.SUBAGENT_SPECS)
+        t.add_column("Source", style="#237dd7")
+        t.add_column("Max turns", style="#237dd7")
+        t.add_column("Model", style="#237dd7", overflow="fold")
+        # One tool per line: a comma list folded mid-name ("execute_she" / "ll,").
+        _add_name_column(t, "Tools", [tool for row in _agent_rows() for tool in row[4]])
+        t.add_column("Description", style="#237dd7")
+        for name, source, turns, model, tools, description in _agent_rows():
+            t.add_row(name, source, turns, model, "\n".join(tools) or "—", description)
+        console.print(t)
 
     provider = _active_provider_name()
     models = _fetch_models_for_provider(provider)
@@ -3718,12 +3849,21 @@ def _user_configured_providers():
     return names
 
 
-def _warn_missing_provider_key(provider):
-    """Say so at switch time, not as the first chat's 401."""
+def _missing_provider_key_notice(provider):
+    """"OPENAI_API_KEY isn't set — …" when `provider` needs a key it lacks, else ""."""
     profile = A.PROVIDERS.get(provider) or {}
     env = profile.get("api_key_env", "")
     if env and not A._provider_api_key(profile):
-        console.print(f"[yellow]{env} isn't set[/yellow] — set it or run `agent8088 --setup`.")
+        return f"{env} isn't set — set it or run `agent8088 --setup`."
+    return ""
+
+
+def _warn_missing_provider_key(provider):
+    """Say so at switch time, not as the first chat's 401."""
+    notice = _missing_provider_key_notice(provider)
+    if notice:
+        env, _, rest = notice.partition(" isn't set")
+        console.print(f"[yellow]{env} isn't set[/yellow]{rest}")
 
 
 # provider -> why its last live model listing failed ("" when it worked).
@@ -4119,6 +4259,7 @@ def _doctor_base_checks():
         "Configuration", "ok" if config_found else "warn",
         f"{A.CONFIG_PATH} ({'found' if config_found else 'missing'})",
         "" if config_found else "Run `agent8088 --setup`."))
+    checks.append(_doctor_check("Working directory", *A.working_directory_status()))
     sandbox = A.sandbox_status()
     checks.append(_doctor_check("Sandbox", "info",
                                 f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}"))
@@ -4563,13 +4704,25 @@ def _doctor_search_flat(checks):
 _DOCTOR_STYLES = {"ok": "#237dd7", "info": "#237dd7", "warn": "yellow", "fail": "red"}
 
 
+def _tilde(text):
+    """`text` with the home folder written as ~, only where it is a whole path
+    segment: /Users/al becomes ~, /Users/alice does not."""
+    home = str(Path.home())
+    if not home or home in ("/", "\\"):
+        return text
+    return re.sub(re.escape(home) + r"(?![^\\/\s;,:)\]'\"])", "~", text)
+
+
 def _render_doctor(checks):
     t = Table(title="Doctor", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Check", style="#00edff", no_wrap=True)
-    t.add_column("Result", style="#237dd7")
+    # fold, not the default ellipsis: a long path is one unbreakable word, and
+    # cutting it off hid the folder name the row was there to report.
+    t.add_column("Result", style="#237dd7", overflow="fold")
     for check in checks:
-        t.add_row(check["name"], Text(check["detail"], style=_DOCTOR_STYLES.get(check["status"], "")))
+        t.add_row(check["name"], Text(_tilde(check["detail"]),
+                                      style=_DOCTOR_STYLES.get(check["status"], "")))
     console.print(t)
     problems = [c for c in checks if c["status"] in ("fail", "warn") and c.get("fix")]
     for check in problems:
@@ -4577,7 +4730,7 @@ def _render_doctor(checks):
         line.append("  ✗ " if check["status"] == "fail" else "  ! ",
                     style=_DOCTOR_STYLES[check["status"]])
         line.append(f"{check['name']}: ")
-        line.append(check["fix"])
+        line.append(_tilde(check["fix"]))
         console.print(line)
 
 
@@ -5005,8 +5158,22 @@ def cmd_browser(rest: str):
     console.print(f"[#237dd7]{msg}[/#237dd7]")
 
 
+def _stamped(stem, ext):
+    """A default export name with the date and time, so a new dump, save or
+    trace never overwrites an earlier one. Explicit names are used as given."""
+    return f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}.{ext}"
+
+
+def _trace_for_display(trace):
+    """The on-screen copy of a turn trace: the 50-odd tool names collapse to a
+    count. The saved trace file keeps the full list."""
+    return [({**step, "initial": f"{len(step['initial'])} tools"}
+             if step.get("type") == "tool_exposure" and isinstance(step.get("initial"), list)
+             else step) for step in trace]
+
+
 def cmd_dump(_rest):
-    """Write a redacted, shareable diagnostic bundle to the user data dir's dump.txt."""
+    """Write a redacted, shareable diagnostic bundle to dump-<date>-<time>.txt in the user data dir; returns its path."""
     import platform
     from agent8088 import __version__
 
@@ -5053,10 +5220,12 @@ def cmd_dump(_rest):
     for secret in A.collect_secret_values(A.APP_CONFIG):
         text = text.replace(secret, "[REDACTED]")
 
-    out_path = A._agent_data_dir() / "dump.txt"
+    out_path = A._agent_data_dir() / _stamped("dump", "txt")
     A._write_private_text(out_path, text)
-    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff]")
+    console.print(f"Diagnostic bundle written to [#00edff]{out_path}[/#00edff] "
+                  f"[dim]({out_path.stat().st_size // 1024 or 1} KB)[/dim]")
     console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
+    return out_path
 
 
 def cmd_sandbox(rest):
@@ -5892,7 +6061,7 @@ def cmd_trace(rest):
     if arg == "save" or arg.startswith("save "):
         _, _, requested = raw.partition(" ")
         path = _write_user_export(
-            requested.strip() or f"{S.name or 'agent8088'}_trace.json",
+            requested.strip() or _stamped(f"{S.name or 'agent8088'}_trace", "json"),
             json.dumps(_trace_export_data(), indent=2),
         )
         if not path:
@@ -5901,12 +6070,15 @@ def cmd_trace(rest):
         _save_active_session()
         console.print(f"[#237dd7]full conversation trace saved[/#237dd7] -> {path}")
         return
-    if arg == "on":
-        S.show_trace = True
-    elif arg == "off":
-        S.show_trace = False
-    else:
-        S.show_trace = not S.show_trace
+    if arg not in ("on", "off"):
+        # A bare /trace used to flip capture and save it, so asking for the
+        # state switched on a JSON dump after every answer, for good.
+        _show_toggle("trace capture", S.show_trace, "/trace on|off · /trace save [file]",
+                     S.trace_path or "")
+        if arg:
+            console.print("[red]usage:[/red] /trace on|off|save \\[file]")
+        return
+    S.show_trace = arg == "on"
     if S.show_trace and not S.trace_path:
         try:
             _start_trace_export()
@@ -5919,14 +6091,24 @@ def cmd_trace(rest):
     _save_preferences()
 
 
+def _show_toggle(label, value, options, detail=""):
+    """The current state of an on/off setting and how to change it, for a bare
+    command — the way /usage and /tool-selection already answer."""
+    state = value if isinstance(value, str) else ("on" if value else "off")
+    color = "red" if state == "off" else "green"
+    from rich.markup import escape
+    tail = f"  [dim]{escape(detail)}[/dim]" if detail else ""
+    console.print(f"{label}: [{color}]{state}[/] · set with {escape(options)}{tail}")
+
+
 def cmd_reasoning(rest):
     arg = rest.strip().lower()
-    if arg == "on":
-        S.show_reasoning = True
-    elif arg == "off":
-        S.show_reasoning = False
-    else:
-        S.show_reasoning = not S.show_reasoning
+    if arg not in ("on", "off"):
+        _show_toggle("reasoning display", S.show_reasoning, "/reasoning on|off")
+        if arg:
+            console.print("[red]usage:[/red] /reasoning on|off")
+        return
+    S.show_reasoning = arg == "on"
     A.SHOW_REASONING = S.show_reasoning
     state = "on" if S.show_reasoning else "off"
     note = "  [dim](secrets & system text are masked even when shown)[/dim]" if S.show_reasoning else ""
@@ -5935,7 +6117,10 @@ def cmd_reasoning(rest):
 
 
 def cmd_verbose(rest):
-    mode = (rest or "").strip().lower() or "on"
+    mode = (rest or "").strip().lower()
+    if not mode:
+        _show_toggle("tool activity", S.verbose, "/verbose on|off|full")
+        return
     if mode not in {"on", "off", "full"}:
         console.print("[red]usage:[/red] /verbose \\[on|off|full]")
         return
@@ -6041,8 +6226,8 @@ def _report_limit_change(change):
 def _show_limits():
     t = Table(title="Limits", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
-    t.add_column("Limit", style="#237dd7")
-    t.add_column("Value", style="#237dd7")
+    _add_name_column(t, "Limit", ["max_turns", *A.LIMIT_SPECS])
+    t.add_column("Value", style="#237dd7", overflow="fold")
     t.add_column("What it bounds", style="dim")
     t.add_row("max_turns", str(S.max_turns), "Rounds the main agent may take")
     for key, (const_name, _caster, blurb) in A.LIMIT_SPECS.items():
@@ -6486,7 +6671,7 @@ def cmd_limits(rest):
 
 
 def cmd_save(rest):
-    path = rest.strip() or "agent8088_session.json"
+    path = rest.strip() or _stamped("agent8088_session", "json")
     data = {"model": A.MODEL_NAME, "messages": S.messages, "trace": S.last_trace,
             "conversation_trace": S.conversation_trace, "session": S.name or None,
             "disabled_skills": sorted(S.disabled_skills)}
@@ -9559,9 +9744,15 @@ def _first_run_check():
         console.print(f"\n[dim]{SETUP_CANCELLED_MESSAGE}[/dim]")
 
 
-def _run_repl_command(handler, rest):
+# Read-only commands that can take a while and never prompt. A spinner would
+# fight an interactive picker, so only these get one.
+_SPINNER_COMMANDS = frozenset({"doctor", "dump", "status", "tools", "skills"})
+
+
+def _run_repl_command(handler, rest, name=""):
     try:
-        handler(rest)
+        with (status_cm(f"running /{name}...") if name in _SPINNER_COMMANDS else nullcontext()):
+            handler(rest)
     except KeyboardInterrupt:
         # Ctrl+C inside a command's picker or prompt cancels that command;
         # it is Ctrl+C during a chat turn that quits.
@@ -9598,7 +9789,7 @@ def _repl_loop():
             cmd, _, rest = line[1:].partition(" ")
             handler = COMMANDS.get(cmd.lower())
             if handler:
-                _run_repl_command(handler, rest)
+                _run_repl_command(handler, rest, cmd.lower())
             else:
                 console.print(_unknown_command_message(cmd))
             continue
