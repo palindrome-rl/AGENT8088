@@ -1002,10 +1002,13 @@ def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
+    global _failure_streak, _diagnostic_shown
     _turn_writes = 0
     _plan_tool_ran = False
     _turn_blocker_counts = {}
     _pending_blocker_note = ""
+    _failure_streak = 0
+    _diagnostic_shown = False
 
 
 # ---------------------------------------------------------------------------
@@ -3748,6 +3751,11 @@ def _ground_execute_shell_description(specs: dict) -> None:
     if cwd is None:
         where = (f"none: the configured {SHELL_CWD} does not exist, so commands "
                  f"cannot run until the user sets shell_cwd")
+    elif not spec.get("host"):
+        # The sandbox moves every command into the artifacts workspace, so
+        # naming the shell folder here was one folder off from what `pwd` prints.
+        where = (f"{ARTIFACTS_ROOT} (the sandbox workspace; project files are "
+                 f"under {PROJECT_ROOT})")
     elif cwd != SHELL_CWD:
         where = f"{cwd} (the configured {SHELL_CWD} does not exist)"
     else:
@@ -5777,8 +5785,26 @@ def _shell_call_is_read_only(command: str) -> bool:
                     for edge in m.span()] + [len(probe)]
     stages = [(probe[start:end].strip(), original[start:end].strip())
               for start, end in zip(bounds[::2], bounds[1::2])]
-    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original))
+    return all(masked and (_readonly_shell(masked) or _sed_prints_only(original)
+                           or _text_only_stage(masked))
                for masked, original in stages)
+
+
+# Programs that only print what they compute from their input or arguments,
+# with no way to write a file or run another program. Used only to decide
+# whether a call changed anything, never for approval prompts. Left out on
+# purpose: awk (system()), sort (-o), uniq (an output operand), file (-C), and
+# anything that interprets code.
+_TEXT_ONLY_COMMANDS = frozenset([
+    "echo", "printf", "cut", "tr", "paste", "bc", "od", "nl", "cksum",
+    "md5", "md5sum", "sha1sum", "sha256sum", "shasum",
+    "basename", "dirname", "realpath", "stat", "which", "true",
+])
+
+
+def _text_only_stage(stage: str) -> bool:
+    parts = _shell_parts(stage)
+    return bool(parts) and Path(parts[0]).stem.lower() in _TEXT_ONLY_COMMANDS
 
 
 def _tool_call_mutates(tool_name: str, tool_args: dict = None) -> bool:
@@ -9450,13 +9476,21 @@ def _save_windows_schedules(entries: list) -> None:
     )
 
 
+def _scheduled_task_cwd() -> Path:
+    """Where a scheduled run starts: the folder commands use now. A shell_cwd
+    that does not exist here would make every scheduled run fail at its `cd`
+    before agent8088 even starts; with no usable folder, keep the configured
+    one so the failure names the setting."""
+    return _choose_shell_cwd() or SHELL_CWD
+
+
 def _windows_task_script(identifier: str, task: str) -> Path:
     import base64
 
     scripts = _agent_data_dir() / "scheduled-tasks"
     script = scripts / f"{identifier}.ps1"
     prompt = base64.b64encode(task.encode("utf-8")).decode("ascii")
-    cwd = str(SHELL_CWD).replace("'", "''")
+    cwd = str(_scheduled_task_cwd()).replace("'", "''")
     agent = str(_which_executable("agent8088") or "agent8088").replace("'", "''")
     content = (
         "$ErrorActionPreference = 'Stop'\n"
@@ -9724,7 +9758,7 @@ def _exec_cron(args: dict) -> str:
         # AGENT8088_UNATTENDED tells the engine there is no operator to answer an
         # approval prompt, so gated actions resolve from cron_mode instead of
         # emitting an ESCALATION_REQUEST nobody will ever see.
-        entry = (f"{schedule} cd {shlex.quote(str(SHELL_CWD))} && "
+        entry = (f"{schedule} cd {shlex.quote(str(_scheduled_task_cwd()))} && "
                  f"printf '%s\\n' {shlex.quote(task)} | "
                  f"AGENT8088_UNATTENDED=1 {shlex.quote(agent)} {_CRON_MARKER}")
         # Cron parses percent signs before the shell, including quoted ones.
@@ -11117,7 +11151,11 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         # blocked with no way to approve it.
         if text.lstrip().startswith("ESCALATION_REQUEST\x1f"):
             return text.strip()
-        if not _readonly_shell(command):
+        # The audit predicate, not the approval one: `pwd && ls -la` changes
+        # nothing, but counting it as a change re-armed "changed work has no
+        # fresh verification evidence", and a model re-checked a finished
+        # answer three times (seen live with glm-5.3-flash).
+        if not _shell_call_is_read_only(command):
             # Ordered before the recording below so this run's own verdict is
             # stamped with the sequence its side effects produced.
             note_mutation(f"{name}: {command[:80]}")
@@ -11176,6 +11214,64 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
         return efficiency.tool_error('not_found', f'Program not found: {stem}', action, recoverable=True)
     return efficiency.tool_error('not_found', f'File not found: {missing}',
         'Check the path (list the directory first), correct the arguments, then retry.', recoverable=True)
+
+
+DIAGNOSE_AFTER_FAILURES = 3
+_DIAGNOSTIC_LISTING_MAX = 20
+_failure_streak = 0
+_diagnostic_shown = False
+
+
+def _failure_diagnostic(result: str) -> str:
+    """At the DIAGNOSE_AFTER_FAILURES-th failed call in a row, once per turn,
+    a read-only look at the environment for the model; otherwise "".
+
+    Seen live with the working directory missing: four tools failed four
+    different ways, and the model concluded "the workspace itself appears to be
+    missing" without one look. Gathered here in Python rather than by running
+    `pwd`/`ls`, so it needs no approval and works when commands cannot start."""
+    global _failure_streak, _diagnostic_shown
+    if result.startswith("ESCALATION_REQUEST\x1f"):
+        return ""          # waiting on the user, not a failure
+    if not result.startswith("Error:"):
+        _failure_streak = 0
+        return ""
+    _failure_streak += 1
+    if _failure_streak < DIAGNOSE_AFTER_FAILURES or _diagnostic_shown:
+        return ""
+    _diagnostic_shown = True
+    try:
+        return "\n" + _environment_diagnostic()
+    except Exception as exc:  # noqa: BLE001 — advice must never break a tool result
+        _log.debug("failure diagnostic failed: %s", exc)
+        return ""
+
+
+def _environment_diagnostic() -> str:
+    def state(path: Path) -> str:
+        return "exists" if _is_dir(path) else "MISSING"
+
+    cwd = _choose_shell_cwd()
+    lines = [f"{_HARNESS_PREFIX}{DIAGNOSE_AFTER_FAILURES} tool calls in a row failed. "
+             "Read-only check of this environment, gathered by the harness:"]
+    lines.append(f"- Commands start in: {cwd}" if cwd else
+                 f"- Commands cannot start: the configured working directory "
+                 f"{SHELL_CWD} does not exist, and no allowed fallback does")
+    lines.append(f"- Sandboxed commands run in: {ARTIFACTS_ROOT} ({state(ARTIFACTS_ROOT)})")
+    lines.append(f"- Project files resolve against: {PROJECT_ROOT} ({state(PROJECT_ROOT)})")
+    listed = cwd or (PROJECT_ROOT if _is_dir(PROJECT_ROOT) else None)
+    if listed is not None:
+        names = sorted(p.name + ("/" if p.is_dir() else "")
+                       for p in listed.iterdir() if not p.name.startswith("."))
+        more = len(names) - _DIAGNOSTIC_LISTING_MAX
+        shown = ", ".join(names[:_DIAGNOSTIC_LISTING_MAX]) or "(empty)"
+        lines.append(f"- {listed} contains: {shown}" + (f" (+{more} more)" if more > 0 else ""))
+        free = shutil.disk_usage(listed).free / 1024 ** 3
+        lines.append(f"- Disk: {free:.1f} GB free")
+    lines.append("If these look right, the environment is usable: fix the failing call "
+                 "instead of concluding the environment is unavailable. If something "
+                 "above is MISSING, tell the user which setting points there.")
+    return "\n".join(lines)
 
 
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
@@ -11242,7 +11338,7 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     _remember_escalation(name, args, result)
 
     # Redact config secrets (api keys/tokens) so tool output can't exfiltrate them.
-    result = _redact_secrets(result)
+    result = _redact_secrets(result) + _failure_diagnostic(result)
     if runtime and operation_id:
         runtime.after_tool(operation_id, result)
 

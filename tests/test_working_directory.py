@@ -122,10 +122,26 @@ def test_missing_project_root_still_honours_allowed_paths(engine, tmp_path):
 
 def test_tool_description_names_the_directory_actually_used(engine, monkeypatch, tmp_path):
     launch, missing = _layout(engine, monkeypatch, tmp_path)
-    specs = {"execute_shell": {"description": "Run a command."}}
+    specs = {"execute_shell": {"description": "Run a command.", "host": "1"}}
     engine._ground_execute_shell_description(specs)
     assert f"Working directory: {launch} (the configured {missing} does not exist)" \
         in specs["execute_shell"]["description"]
+
+
+def test_sandboxed_tool_description_names_the_sandbox_workspace(engine, monkeypatch, tmp_path):
+    launch, _ = _layout(engine, monkeypatch, tmp_path)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", launch / "artifacts")
+    specs = {"execute_shell": {"description": "Run a command."}}
+    engine._ground_execute_shell_description(specs)
+    assert (f"Working directory: {launch / 'artifacts'} (the sandbox workspace; "
+            f"project files are under {launch})") in specs["execute_shell"]["description"]
+
+
+def test_scheduled_tasks_start_in_the_folder_commands_use(engine, monkeypatch, tmp_path):
+    launch, missing = _layout(engine, monkeypatch, tmp_path)
+    assert engine._scheduled_task_cwd() == launch
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path / "nowhere"])
+    assert engine._scheduled_task_cwd() == missing   # nothing usable: name the setting
 
 
 def test_doctor_row_warns_on_a_fallback_and_fails_without_one(engine, monkeypatch, tmp_path):
