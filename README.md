@@ -87,6 +87,11 @@ The installer provisions an isolated Python environment, installs the global `ag
 After installing, run `agent8088 --doctor` (or `/doctor [--fix]` inside the agent) to verify your setup, or
 `/dump` to produce a bundle for a bug report. If the install itself fails, it prints the likely cause and the command to re-run; the full output is in `~/.agent8088/install.log`.
 
+The Windows installer verifies dependencies by running their executables,
+importing installed Python/Node packages, checking Chromium and OCR resources,
+and validating WebUI assets. A stale resume marker or partial dependency folder
+triggers repair instead of being treated as success.
+
 The `[dev]` extra (pytest, ruff, pip-audit) is **not** installed — run `uv pip install -e ".[dev]"` if you need the test suite.
 
 ### Configure and run

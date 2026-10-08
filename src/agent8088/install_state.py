@@ -116,6 +116,11 @@ def outstanding(data: dict) -> list[dict]:
     dependency accounts for."""
     remaining = []
     for item in data.get("skipped", []):
+        # Declining an explicitly optional, slow component is a user choice,
+        # not a partial installation. Keep it in install-state.json for
+        # diagnostics, but don't warn on every CLI startup about it.
+        if item["reason"].lower().startswith("not selected (optional"):
+            continue
         capability, check = _stage_rule(item["stage"])
         if capability and capabilities.get(capability) is not None:
             continue  # the live subsystem entry is authoritative

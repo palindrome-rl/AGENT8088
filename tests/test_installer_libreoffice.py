@@ -69,6 +69,7 @@ def test_existing_install_is_detected_and_winget_is_never_invoked():
     out = _run(
         'function Test-Path { param($Path) $Path -like "*LibreOffice\\program\\soffice.exe" -and $Path -notlike "*x86*" }\n'
         'function Get-Command { throw "winget must not be called when soffice already exists" }\n'
+        'function Invoke-WithTimeout { @{ ExitCode = 0; TimedOut = $false; Output = "LibreOffice" } }\n'
         '$r = Install-LibreOffice\n'
         'Write-Output "Result=$r"',
         "Install-LibreOffice",
@@ -227,6 +228,7 @@ def test_an_existing_install_is_never_prompted_about():
     out = _run(
         'function Test-Path { param($Path) $Path -like "*LibreOffice\\program\\soffice.exe" -and $Path -notlike "*x86*" }\n'
         'function Read-LibreOfficeConsent { throw "must not ask about an install that already exists" }\n'
+        'function Invoke-WithTimeout { @{ ExitCode = 0; TimedOut = $false; Output = "LibreOffice" } }\n'
         '$r = Install-LibreOffice\n'
         'Write-Output "Result=$r"',
         "Install-LibreOffice",

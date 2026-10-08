@@ -55,10 +55,19 @@ def _run(body: str, *functions: str) -> str:
         'Write-Host "SKIPPED:$Label|$Reason|$Fix" }\n'
         'function Write-StageWarning { param($Result, [int]$TimeoutSec, [string]$What, [string]$Consequence, [string]$Fix) '
         'Write-Host "STAGEWARN:$What|$Consequence|$Fix" }\n'
-        'function Invoke-WithTimeout { param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec, [string]$Activity) '
+        'function Invoke-WithTimeout { param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec, [string]$Activity, [string]$WorkingDirectory, [switch]$CaptureOutput) '
         'Write-Host "RUN:$FilePath $($Arguments -join [char]32)"; return @{ ExitCode = 0 } }\n'
     )
-    script = stubs + "\n".join(_powershell_function(f) for f in functions) + "\n" + body
+    expanded = []
+    for function in functions:
+        if function == "Install-WebUI":
+            expanded.append("Test-WebUIDist")
+        if function == "Install-Node-Bridge":
+            expanded.extend(("Invoke-DependencyProbe", "Test-NodeModules"))
+        expanded.append(function)
+    # Preserve order while avoiding duplicate function definitions.
+    expanded = list(dict.fromkeys(expanded))
+    script = stubs + "\n".join(_powershell_function(f) for f in expanded) + "\n" + body
     result = subprocess.run(
         [_powershell(), "-NoProfile", "-Command", script],
         capture_output=True, text=True, timeout=120, encoding="utf-8", errors="replace",
@@ -67,7 +76,16 @@ def _run(body: str, *functions: str) -> str:
     return result.stdout
 
 
+@pytest.fixture(params=["powershell", "pwsh"])
+def windows_shell(request, monkeypatch):
+    executable = shutil.which(request.param)
+    if not executable:
+        pytest.skip(f"{request.param} is not installed")
+    monkeypatch.setattr(sys.modules[__name__], "_powershell", lambda: executable)
+
+
 @needs_windows
+@pytest.mark.usefixtures("windows_shell")
 class TestInstallWebUIStage:
     """Install-WebUI: build web/dist during install; skip, never abort."""
 
@@ -84,9 +102,13 @@ class TestInstallWebUIStage:
 $InstallDir = "{tmp_path}"
 $script:NpmExe = "{npm_exe}"
 $script:NodeInstalled = $true
-function Invoke-WithTimeout {{ param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec, [string]$Activity)
+function Invoke-WithTimeout {{ param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec, [string]$Activity, [string]$WorkingDirectory, [switch]$CaptureOutput)
     Write-Host "RUN:$FilePath $($Arguments -join [char]32)"
-    if ($Arguments -contains "build") {{ New-Item -ItemType Directory -Force -Path "{web_dir}\\dist" | Out-Null; New-Item -ItemType File -Force -Path "{web_dir}\\dist\\index.html" | Out-Null }}
+    if ($Arguments -contains "build") {{
+        New-Item -ItemType Directory -Force -Path "{web_dir}\\dist\\assets" | Out-Null
+        Set-Content -Path "{web_dir}\\dist\\index.html" -Value '<script type="module" src="/assets/app.js"></script>'
+        Set-Content -Path "{web_dir}\\dist\\assets\\app.js" -Value 'console.log("ok")'
+    }}
     return @{{ ExitCode = 0 }} }}
 Install-WebUI
 Write-Host "FLAG:WebUIReady=$script:WebUIReady"
@@ -102,7 +124,11 @@ Write-Host "FLAG:WebUIReady=$script:WebUIReady"
         web_dir.mkdir()
         (web_dir / "package.json").write_text("{}", encoding="utf-8")
         (web_dir / "dist").mkdir()
-        (web_dir / "dist" / "index.html").write_text("x", encoding="utf-8")
+        (web_dir / "dist" / "assets").mkdir()
+        (web_dir / "dist" / "index.html").write_text(
+            '<script type="module" src="/assets/app.js"></script>', encoding="utf-8"
+        )
+        (web_dir / "dist" / "assets" / "app.js").write_text("ok", encoding="utf-8")
         body = f"""
 $InstallDir = "{tmp_path}"
 $script:NpmExe = "C:\\fake\\npm.cmd"
@@ -154,7 +180,7 @@ Write-Host "FLAG:WebUIReady=$script:WebUIReady"
 $InstallDir = "{tmp_path}"
 $script:NpmExe = "{npm_exe}"
 $script:NodeInstalled = $true
-function Invoke-WithTimeout {{ param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec, [string]$Activity)
+function Invoke-WithTimeout {{ param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec, [string]$Activity, [string]$WorkingDirectory, [switch]$CaptureOutput)
     Write-Host "RUN:$FilePath $($Arguments -join [char]32)"
     if ($Arguments -contains "install") {{ return @{{ ExitCode = 0 }} }}
     return @{{ ExitCode = 1; Stderr = "build error" }} }}
@@ -163,8 +189,113 @@ Write-Host "FLAG:WebUIReady=$script:WebUIReady"
 """
         out = _run(body, "Install-WebUI")
         assert "STAGEWARN:Web UI build" in out
-        assert "npm run build" in out
+        assert "npm.cmd run build" in out
         assert "FLAG:WebUIReady=False" in out
+
+    def test_partial_dependencies_reinstalled_from_lockfile(self, tmp_path):
+        web_dir = tmp_path / "web"
+        web_dir.mkdir()
+        (web_dir / "package.json").write_text("{}", encoding="utf-8")
+        lock = web_dir / "package-lock.json"
+        lock.write_text('{"sentinel":true}', encoding="utf-8")
+        (web_dir / "node_modules").mkdir()
+        npm_exe = tmp_path / "npm.cmd"
+        npm_exe.write_text("@echo off", encoding="utf-8")
+        out = _run(f'''
+$InstallDir = "{tmp_path}"
+$script:NpmExe = "{npm_exe}"
+$env:NODE_ENV = "production"
+$env:npm_config_omit = "optional"
+function Invoke-WithTimeout {{
+    param($FilePath, $Arguments, $TimeoutSec, $Activity, $WorkingDirectory, [switch]$CaptureOutput)
+    Write-Host "ARGS:$($Arguments -join '|')"
+    Write-Host "CWD:$WorkingDirectory CAPTURE:$CaptureOutput"
+    if ($Arguments -contains "build") {{
+        New-Item -ItemType Directory -Force "{web_dir}\\dist\\assets" | Out-Null
+        Set-Content -Path "{web_dir}\\dist\\index.html" -Value '<script type="module" src="/assets/app.js"></script>'
+        Set-Content -Path "{web_dir}\\dist\\assets\\app.js" -Value 'console.log("ok")'
+    }}
+    return @{{ ExitCode = 0 }}
+}}
+Install-WebUI
+Write-Host "READY:$script:WebUIReady"
+''', "Install-WebUI")
+        assert f"ARGS:ci|--prefix|{web_dir}|--include=dev|--include=optional" in out
+        assert f"CWD:{web_dir} CAPTURE:True" in out
+        assert "READY:True" in out
+        assert lock.read_text(encoding="utf-8") == '{"sentinel":true}'
+
+    def test_dependency_failure_stops_before_build_and_reports_details(self, tmp_path):
+        web_dir = tmp_path / "web"
+        web_dir.mkdir()
+        (web_dir / "package.json").write_text("{}", encoding="utf-8")
+        (web_dir / "package-lock.json").write_text("{}", encoding="utf-8")
+        npm_exe = tmp_path / "npm.cmd"
+        npm_exe.write_text("@echo off", encoding="utf-8")
+        out = _run(f'''
+$InstallDir = "{tmp_path}"
+$script:NpmExe = "{npm_exe}"
+$TNpm = 300
+function Invoke-WithTimeout {{
+    param($FilePath, $Arguments, $TimeoutSec, $Activity, $WorkingDirectory, [switch]$CaptureOutput)
+    Write-Host "ARGS:$($Arguments -join '|')"
+    return @{{ ExitCode = 1; ErrorOutput = "npm ERR! ECONNRESET" }}
+}}
+Install-WebUI
+Write-Host "READY:$script:WebUIReady"
+''', "Write-StageWarning", "Install-WebUI")
+        assert "ECONNRESET" in out
+        assert "ARGS:run|build" not in out
+        assert "npm.cmd ci --include=dev --include=optional" in out
+        assert "READY:False" in out
+
+    def test_diagnostics_keep_cause_and_bound_stack_trace(self):
+        out = _run('''
+$stack = @("Cannot find native binding") + (1..20 | ForEach-Object { "frame $_" })
+$stack += "https://user:secret@example.test/package"
+Write-StageWarning -Result @{ ExitCode = 1; ErrorOutput = ($stack -join "`n") } `
+    -TimeoutSec 300 -What "Web UI build" -Consequence "unavailable" -Fix "rerun"
+''', "Write-StageWarning")
+        assert "Cannot find native binding" in out
+        assert "frame 10" not in out
+        assert "frame 20" in out
+        assert "https://***@example.test/package" in out
+        assert "secret" not in out
+
+
+@needs_windows
+@pytest.mark.usefixtures("windows_shell")
+class TestInstallNodeBridgeDependencies:
+    @pytest.mark.parametrize("exit_code", [0, 1])
+    def test_partial_bridge_is_reinstalled_before_marked_ready(self, tmp_path, exit_code):
+        node = shutil.which("node.exe")
+        if not node or not Path(node).with_name("npm.cmd").exists():
+            pytest.skip("Node with a matching npm.cmd is required")
+        bridge = tmp_path / "src/agent8088/gateway/platforms/whatsapp_bridge"
+        bridge.mkdir(parents=True)
+        (bridge / "package.json").write_text("{}", encoding="utf-8")
+        (bridge / "package-lock.json").write_text("{}", encoding="utf-8")
+        (bridge / "node_modules").mkdir()
+        out = _run(f'''
+$InstallDir = "{tmp_path}"
+$Agent8088Home = "{tmp_path}"
+$script:LongPathsEnabled = $true
+$script:WhatsAppBridgeReady = $false
+$TNpm = 300
+function Get-Command {{ param($Name, $CommandType, $ErrorAction) [pscustomobject]@{{ Source = "{node}" }} }}
+function Invoke-WithTimeout {{
+    param($FilePath, $Arguments, $TimeoutSec, $Activity, $WorkingDirectory, [switch]$CaptureOutput)
+    Write-Host "ARGS:$($Arguments -join '|')"
+    Write-Host "CWD:$WorkingDirectory CAPTURE:$CaptureOutput"
+    $code = if ($Arguments.Count -eq 1 -and $Arguments[0] -eq '--version') {{ 0 }} else {{ {exit_code} }}
+    return @{{ ExitCode = $code }}
+}}
+Install-Node-Bridge
+Write-Host "READY:$script:WhatsAppBridgeReady"
+''', "Install-Node-Bridge")
+        assert f"ARGS:ci|--prefix|{bridge}|--include=optional" in out
+        assert f"CWD:{bridge} CAPTURE:True" in out
+        assert f"READY:{'True' if exit_code == 0 else 'False'}" in out
 
 
 class TestFrontendRootResolution:
