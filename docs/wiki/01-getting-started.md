@@ -69,6 +69,10 @@ private repository, no wheel for your Python) and the command to re-run. Every
 step's full output is kept in `~/.agent8088/install.log`
 (`%LOCALAPPDATA%\agent8088\install.log` on Windows). Re-running the same
 command resumes; anything already complete is skipped.
+On Windows, resume markers are hints rather than proof: the installer launches
+or imports each dependency again before skipping it. Missing packages, native
+DLLs, browser files, or executables are repaired automatically. Optional stages
+that still fail are listed at the end with the exact repair command.
 
 **From a clone, to work on the code.** Contributions are branched from
 `development`, so this deliberately clones that rather than `staging-1.2`:
