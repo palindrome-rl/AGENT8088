@@ -384,7 +384,7 @@ def test_managed_node_fast_path_falls_through_on_launch_exception(tmp_path):
         "Install-Node-Bridge",
     )
     assert "THREW:" not in out
-    assert "WARN:Existing Node at" in out and "did not run - reinstalling" in out
+    assert "WARN:Existing Node/npm at" in out and "did not run - reinstalling" in out
     assert "Completed" in out
 
 
