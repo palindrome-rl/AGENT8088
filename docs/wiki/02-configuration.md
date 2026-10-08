@@ -272,6 +272,7 @@ number of rounds. All default to `0`, meaning disabled.
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
 | `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check (deliverables, verification, re-plan, tests) before the model is told to answer; the answer so far is returned 2 rounds later. A write resets the count. `0` disables it. |
+| `initial_completion_cap` | `8192` | Completion-token cap for an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry; plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
 | `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
