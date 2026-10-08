@@ -14,6 +14,9 @@ def _length_response(content):
     })()]})()
 
 
+_PARTIAL_CALL = "✿FUNCTION✿: write_file ✿ARGS✿: {\"path\": \"a\", \"content\": \"xxxx"
+
+
 def _stop_response(content):
     return type("R", (), {"choices": [type("C", (), {
         "message": type("M", (), {"content": content})(),
@@ -84,7 +87,7 @@ def test_retry_after_length_cutoff_gets_a_small_adaptive_cap(monkeypatch, engine
     # source the engine uses, or this test only passes when the probe happens
     # to agree with the defaults.
     context_window, completion_limit = engine._active_model_token_limits()
-    assert calls[0] == completion_limit
+    assert calls[0] == min(completion_limit, engine.INITIAL_COMPLETION_CAP)
     assert calls[1] == min(completion_limit, engine.MAIN_LLM_MIN_TOKENS)  # the floor
 
 
@@ -127,7 +130,7 @@ def test_agent_call_receives_the_active_models_completion_limit(monkeypatch, eng
         [{"role": "user", "content": "build it"}], max_turns=1
     )
     assert result == "done"
-    assert seen == [131_072]
+    assert seen == [min(131_072, engine.INITIAL_COMPLETION_CAP or 131_072)]
 
 
 def test_provider_token_override_wins_over_global_config(monkeypatch, engine):
@@ -618,7 +621,7 @@ def test_cutoff_ladder_discards_replies_and_ends_with_no_tools_round(monkeypatch
         calls.append({"messages": list(messages), "tools": tools, "kw": kw})
         if tools == []:
             return _stop_response("partial work")
-        return _length_response("x" * 50)
+        return _length_response(_PARTIAL_CALL)
 
     monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
     trace = []
@@ -626,7 +629,7 @@ def test_cutoff_ladder_discards_replies_and_ends_with_no_tools_round(monkeypatch
 
     assert len(calls) == 5 and calls[-1]["tools"] == []
     assert [c["kw"].get("thinking") for c in calls[:4]] == [None, None, "length_retry", "length_retry"]
-    assert not any(m["content"] == "x" * 50 for m in calls[-1]["messages"])
+    assert not any(m["content"] == _PARTIAL_CALL for m in calls[-1]["messages"])
     assert "partial work" in result and "main_llm_min_tokens" in result
     kinds = {t["type"] for t in trace}
     assert {"length_cutoff", "retry_mode", "final_round_no_tools"} <= kinds
@@ -646,12 +649,12 @@ def test_cutoff_then_recovery_resets_cap_and_keeps_roles_alternating(monkeypatch
     def _fake(messages, tools, max_tokens=None, **kw):
         seen.append({"roles": [m["role"] for m in messages], "max": max_tokens,
                      "thinking": kw.get("thinking")})
-        return _length_response("x" * 40) if len(seen) <= 2 else _stop_response("done")
+        return _length_response(_PARTIAL_CALL) if len(seen) <= 2 else _stop_response("done")
 
     monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
     trace = []
     assert engine.run_agent([{"role": "user", "content": "go"}], max_turns=6, trace=trace) == "done"
-    assert seen[2]["thinking"] == "length_retry" and seen[0]["max"] > seen[1]["max"]
+    assert seen[2]["thinking"] == "length_retry" and seen[1]["max"] > seen[0]["max"]  # a cut-off tool call earns room
     assert not any(a == b for r in (s["roles"] for s in seen) for a, b in zip(r, r[1:]) if a == "assistant")
     assert any(t["type"] == "cap_reset" and t["after_cutoffs"] == 2 for t in trace)
 
@@ -725,3 +728,72 @@ def test_any_400_on_the_length_retry_call_retries_without_extras(engine):
 def test_extract_reasoning_reads_the_gemini_nested_shape(engine):
     d = type("D", (), {"reasoning_content": {"reasoningContent": {"reasoningText": {"text": "plan"}}}})()
     assert engine._extract_reasoning(d) == "plan"
+
+
+def test_first_call_cap_is_bounded_and_can_be_disabled(monkeypatch, engine):
+    """A runaway first call must not be allowed the provider's whole limit."""
+    seen = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        seen.append(max_tokens)
+        return _stop_response("done")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    monkeypatch.setattr(engine, "_active_model_token_limits", lambda *a, **k: (1000000, 16384))
+    monkeypatch.setattr(engine, "INITIAL_COMPLETION_CAP", 8192)
+    engine.run_agent([{"role": "user", "content": "hi"}], max_turns=2)
+    monkeypatch.setattr(engine, "INITIAL_COMPLETION_CAP", 0)
+    engine.run_agent([{"role": "user", "content": "hi"}], max_turns=2)
+    assert seen == [8192, 16384]
+
+
+def test_cut_off_tool_call_retry_gets_a_larger_cap(monkeypatch, engine):
+    """A tool call that was being written needs room: the retry doubles the cap."""
+    seen = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        seen.append(max_tokens)
+        if len(seen) == 1:
+            return _length_response('✿FUNCTION✿: write_file ✿ARGS✿: {"path": "a", "content": "xx')
+        return _stop_response("done")
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    monkeypatch.setattr(engine, "_active_model_token_limits", lambda *a, **k: (1000000, 16384))
+    monkeypatch.setattr(engine, "INITIAL_COMPLETION_CAP", 4096)
+    engine.run_agent([{"role": "user", "content": "go"}], max_turns=4)
+    assert seen[:2] == [4096, 8192]
+
+
+def test_two_prose_loops_end_in_the_final_no_tools_round(monkeypatch, engine):
+    """Plain text with no call in progress is a loop: stop after two, not four."""
+    monkeypatch.setattr(engine, "LENGTH_CUTOFF_MAX_RETRIES", 4)
+    monkeypatch.setattr(engine, "compact_messages", lambda *a, **k: False)
+    calls = []
+
+    def _fake(messages, tools, max_tokens=None, **kw):
+        calls.append(tools)
+        if tools == []:
+            return _stop_response("partial work")
+        return _length_response("Wait, let me re-check the board. " * 5)
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _fake)
+    trace = []
+    result = engine.run_agent([{"role": "user", "content": "go"}], max_turns=10, trace=trace)
+    assert len(calls) == 3 and calls[-1] == []
+    assert "partial work" in result
+    assert [t["kind"] for t in trace if t["type"] == "length_cutoff"] == ["prose", "prose"]
+
+
+def test_clean_tool_name_salvages_only_registered_tools(engine):
+    assert engine._clean_tool_name("execute_shell") == "execute_shell"
+    assert engine._clean_tool_name("execute_shell ✿ARGS✿:") == "execute_shell"
+    assert engine._clean_tool_name("not_a_tool ✿ARGS✿:") == "not_a_tool ✿ARGS✿:"
+    assert engine._clean_tool_name("") == ""
+
+
+def test_native_tool_text_uses_the_salvaged_name(engine):
+    fn = type("F", (), {"name": "execute_shell ✿ARGS✿:", "arguments": '{"command": "ls"}'})()
+    msg = type("M", (), {"tool_calls": [type("T", (), {"function": fn})()]})()
+    text = engine._native_tool_text(msg)
+    assert text.startswith("✿FUNCTION✿: execute_shell ✿ARGS✿: {")
+    assert engine.find_tool_calls(text, {"execute_shell"})[0]["name"] == "execute_shell"
