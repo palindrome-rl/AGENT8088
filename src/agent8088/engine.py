@@ -535,6 +535,16 @@ LENGTH_RETRY_MAX_TOKENS = max(0, _config_int("length_retry_max_tokens", 0))
 # adaptive cap instead allows a full-size call: the floor must fit one, the
 # ceiling stays the configured limit, and the cap resets after any normal call.
 MAIN_LLM_MIN_TOKENS = max(1, _config_int("main_llm_min_tokens", 4096))
+# Completion cap for an ordinary call. Healthy replies are short, so a model that
+# runs away (an unclosed tool call, a reasoning loop) should not be allowed to
+# burn the provider's whole completion limit before the ladder even starts: at a
+# 16K limit that is minutes per stuck call. A call that is genuinely cut off while
+# writing a tool call earns a larger cap on its retry (see cap_hint). 0 = always
+# use the provider's full completion limit.
+INITIAL_COMPLETION_CAP = max(0, _config_int("initial_completion_cap", 8192))
+# Consecutive prose-only cut-offs (no tool call in progress: the model is looping
+# in plain text) tolerated before the final no-tools round.
+PROSE_CUTOFF_MAX = 2
 # Consecutive length cut-offs tolerated before the final no-tools round (A3.4).
 # "Retry until the clock runs out" is replaced by a deterministic ending that
 # leaves partial work in place. 0 disables the ladder (restores unbounded retry).
@@ -3397,6 +3407,21 @@ def _build_response(content, tool_chunks=None, finish_reason=None, reasoning="")
     })()]})
 
 
+def _clean_tool_name(name: str) -> str:
+    """Salvage a tool name that arrived with call syntax stuck to it.
+
+    Small models mixing the native and text call formats sometimes emit a name
+    such as "execute_shell <marker>ARGS<marker>:" while the arguments arrive
+    correctly in the structured field. Only a name that fails as-is is touched:
+    the leading token is used when it is exactly a registered tool, otherwise the
+    name is returned unchanged and fails exactly as before."""
+    name = str(name or "")
+    if _resolve_tool_name(name) in TOOL_SPECS:
+        return name
+    head = re.split(r"[\s✿]", name.strip(), maxsplit=1)[0]
+    return head if head and _resolve_tool_name(head) in TOOL_SPECS else name
+
+
 def _native_tool_text(message) -> str:
     lines = []
     for tool_call in getattr(message, "tool_calls", None) or []:
@@ -3418,7 +3443,7 @@ def _native_tool_text(message) -> str:
             # required field as missing and blame the model for an omission
             # that never happened.
             arguments = str(arguments)
-        lines.append(f"✿FUNCTION✿: {function.name} ✿ARGS✿: {arguments}")
+        lines.append(f"✿FUNCTION✿: {_clean_tool_name(function.name)} ✿ARGS✿: {arguments}")
     return "\n".join(lines)
 
 
@@ -15753,6 +15778,8 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # consecutive token-limited calls; incomplete, never executed
     last_call_tokens = 0  # completion tokens of the last call that finished normally
+    cap_hint = 0         # cap a cut-off tool call earned for its retry (0 = none)
+    prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     tool_failed = False  # any tool call this run returned an error
@@ -15967,10 +15994,12 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
                                   + len(json.dumps(round_tools_def or [], default=str)))})
         # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
         # never below the floor); any normal finish resets to the full limit.
+        normal_cap = (min(turn_completion_limit, INITIAL_COMPLETION_CAP)
+                      if INITIAL_COMPLETION_CAP else turn_completion_limit)
         turn_max_tokens = (
-            turn_completion_limit if not length_retries else
+            normal_cap if not length_retries else
             min(turn_completion_limit,
-                max(MAIN_LLM_MIN_TOKENS, min(turn_completion_limit, 2 * last_call_tokens)))
+                max(MAIN_LLM_MIN_TOKENS, cap_hint, min(turn_completion_limit, 2 * last_call_tokens)))
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
@@ -16140,9 +16169,24 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if on_result:
                 on_result("error", warning)
             length_retries += 1
+            # What was cut off decides the retry. A tool call that was being
+            # written (marker present) is real work that needs room: its retry
+            # gets a larger cap. Plain prose with no call in progress is a loop,
+            # and more room only repeats it. Empty output is a hidden runaway
+            # (e.g. an unclosed native tool call); it keeps the small retry cap.
+            if content and "✿FUNCTION✿" in content:
+                cutoff_kind, cap_hint = "tool_call", min(turn_completion_limit, 2 * turn_max_tokens)
+                prose_cutoffs = 0
+            elif content:
+                cutoff_kind, cap_hint = "prose", 0
+                prose_cutoffs += 1
+            else:
+                cutoff_kind, cap_hint = "empty", 0
+                prose_cutoffs = 0
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
                 trace.append({"turn": turn, "type": "length_cutoff",
+                              "kind": cutoff_kind,
                               "tokens": turn_max_tokens,
                               "seconds": round(time.monotonic() - call_started, 1),
                               "had_content": bool(content),
@@ -16155,7 +16199,9 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             # A3.4: a cut-off never ends the run until the ladder is spent:
             # 1st small cap, 2nd thinking off, 3rd compact + progress note,
             # then one final no-tools round that returns the partial work.
-            if LENGTH_CUTOFF_MAX_RETRIES and length_retries >= LENGTH_CUTOFF_MAX_RETRIES:
+            if LENGTH_CUTOFF_MAX_RETRIES and (
+                    length_retries >= LENGTH_CUTOFF_MAX_RETRIES
+                    or prose_cutoffs >= PROSE_CUTOFF_MAX):
                 if trace is not None:
                     trace.append({"turn": turn, "type": "final_round_no_tools",
                                   "cutoffs": length_retries})
@@ -16213,6 +16259,7 @@ def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
             if trace is not None:
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
             length_retries = 0
+        cap_hint = prose_cutoffs = 0
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])

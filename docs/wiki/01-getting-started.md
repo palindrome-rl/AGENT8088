@@ -71,6 +71,10 @@ Full logs are at `~/.agent8088/install.log` on macOS/Linux and
 Skipped optional components are listed at the end with their repair commands.
 An existing configuration is preserved. The public repository needs no GitHub
 account or token to install.
+On Windows, resume markers are hints rather than proof: the installer launches
+or imports each dependency again before skipping it. Missing packages, native
+DLLs, browser files, or executables are repaired automatically. Optional stages
+that still fail are listed at the end with the exact repair command.
 
 **From a clone, to work on the code.** Clone the public release branch:
 

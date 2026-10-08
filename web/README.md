@@ -14,6 +14,29 @@ agent8088 --web
 
 Open `http://127.0.0.1:8180` in your browser.
 
+### Windows: missing native binding during build
+
+If Vite reports `Cannot find native binding` from `@tailwindcss/oxide`, the
+platform-specific optional dependency may be missing. A partial `node_modules`
+directory does not mean installation succeeded. The Windows installer now
+reinstalls dependencies from the committed lockfile before a frontend build,
+including build tools and optional native packages even when npm user settings
+omit them.
+
+To repair an existing installation, run this in PowerShell from its `web` folder:
+
+```powershell
+npm.cmd ci --include=dev --include=optional
+if ($LASTEXITCODE -eq 0) { npm.cmd run build }
+```
+
+`npm ci` replaces `node_modules`; keep the committed `package-lock.json`. Using
+`npm.cmd` also avoids PowerShell execution-policy errors from `npm.ps1`.
+If this still fails, collect `node --version`, `npm.cmd --version`,
+`node -p "process.platform + ' ' + process.arch"`, and the first error in the
+installation/build output. Missing packages, a native DLL that cannot load,
+network failures, and an unsupported Node version need different fixes.
+
 ### Development mode (Vite dev server + FastAPI backend)
 
 ```bash

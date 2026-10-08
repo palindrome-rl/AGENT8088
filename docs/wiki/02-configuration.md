@@ -47,11 +47,16 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `provider.<name>.temperature` | Sampling temperature for one provider; overrides the session value, including `/temp`, on that provider's requests. Useful when a server expects a particular sampling setting. |
 | `provider.<name>.extra_body` | JSON object sent as additional request fields for that provider, such as vLLM `chat_template_kwargs`. Invalid JSON is ignored with a warning. Only configure fields your server accepts. |
+| `provider.<name>.length_retry_extra_body` | JSON fields sent only on the retry after a length cut-off, to turn thinking off for that one call. Defaults by provider: Ollama `{"think": false}`, vLLM `{"chat_template_kwargs": {"enable_thinking": false}}`, others `{"reasoning_effort": "none"}`. A provider that rejects them gets the call again without them. |
 | `fallback_models` | Comma-separated `provider:model` chain for transient errors, missing models, capacity failures, and independent-provider authentication failures. |
 | `tool_selection` | Which tool schemas go on the wire for native function-calling. `hybrid` (default) sends the ~10 most relevant via keyword + embedding retrieval, falling back to `full` when the two signals disagree or embeddings are unavailable; `full` always sends every schema; `auto` enables hybrid only for the measured `provider:model` entries in `tool_selection_models`. `/tool-selection <mode>` changes it live. |
 | `tool_selection_models` | Comma-separated `provider:model` entries `tool_selection=auto` treats as measured-safe for hybrid mode. |
 | `context_window` | Token budget for history trimming. |
 | `max_completion_tokens` | Global output-token ceiling when the active model has no reviewed limit or provider override. |
+| `chars_per_token` | Characters per token for the context-size estimate (default `4`). Code, JSON and Qwen tokenizers run nearer `3`; set it lower if requests are rejected for exceeding the context length. |
+| `model_base_url` | Endpoint used when no `provider.<name>` profile is active (legacy flat setting; the `OLLAMA_URL` environment variable also sets it). Default `http://localhost:11434/v1`. |
+| `model_name` | Model id for `model_base_url` (the `MODEL_NAME` environment variable also sets it). |
+| `gemma_base_url`, `gemma_model_name` | Endpoint and model for the legacy `USE_GEMMA4=1` switch. Defaults `http://localhost:8003/v1` and `gemma-4-12B-it-Q4_K_M.gguf`. |
 | `timeout_seconds` | Per-request timeout (default `120`). |
 
 Transient provider failures are retried before the turn fails or `fallback_models`
@@ -167,6 +172,7 @@ See [Messaging Gateway](08-messaging-gateway.md).
 
 | Key | Default | Purpose |
 |---|---|---|
+| `mcp_startup_wait_seconds` | `20` | How long a turn waits for MCP servers to connect at startup before going ahead without their tools. Late servers are picked up on a later turn. |
 | `mcp_server_allow_writes` | `0` | `1` exposes `write_file` over `--mcp-serve`. Writes are **unattended** — MCP has no approval channel. |
 
 MCP *servers you connect to* are configured in `mcp.json`, not here. See
@@ -186,6 +192,7 @@ On by default. Full explanation in [Memory](16-memory.md).
 | `memory_embed_model` | `nomic-embed-text` | Embedding model for semantic recall (274 MB; the installers pull it). Missing or unreachable degrades recall to keyword-only rather than failing. |
 | `memory_embed_provider` | `ollama` | Provider asked for embeddings. Deliberately **not** your chat provider — chat and embeddings are separate services, and the default embed model is an Ollama model. Whatever serves chat is irrelevant here. |
 | `memory_extract_model` | *(chat model)* | Model for the fact-extraction call. Point at something small to spend less. |
+| `memory_extract_max_tokens` | `4000` | Output budget for the fact-extraction call (minimum `256`). Reasoning models need room to think before they answer. |
 | `memory_capture` | `1` | `0` keeps recall and stops learning new facts. |
 | `memory_recall_limit` | `5` | Facts injected into a turn's prompt. |
 | `memory_rrf_k` | `60` | RRF damping constant. Lower makes rank 1 dominate; higher flattens. |
@@ -211,6 +218,9 @@ never does — and a recalled memory can never authorise a tool call.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_read_bytes` | `2 MB` | Cap on a single file read. |
+| `tool_result_max_chars` | `3000` | Characters of one tool result shown to the model. The rest stays reachable with `read_content`. |
+| `read_content_window_chars` | `2400` | Characters `read_content` returns per call. |
+| `reuse_known_verdicts` | `1` | Reuse a recorded check or test result while nothing has changed since it ran. `0` always reruns. |
 | `max_http_bytes` | `5 MB` | Cap on an HTTP response. |
 | `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
 | `max_tool_timeout_seconds` | `600` | Hard ceiling for one tool call. |
@@ -223,6 +233,8 @@ never does — and a recalled memory can never authorise a tool call.
 | `browser_screenshots` | `0` | Enable browser screenshots for a vision-capable model; override once with `AGENT8088_BROWSER_SCREENSHOTS=1`. |
 | `browser_max_actions_per_step` | `1` | Actions the browsing model may batch into one step. Raise for form-heavy sites; keep at 1 where clicks reshuffle the DOM. |
 | `browser_headless` | `1` | `0` opens a visible window (demos, debugging a stuck selector). Visibility only — every guard is unaffected. |
+| `browser_window_size` | (unset) | Visible browser window size as `W,H`. Only used with `browser_headless=0`. |
+| `browser_window_position` | (unset) | Visible browser window position as `X,Y`, so it does not land on top of the terminal. Only used with `browser_headless=0`. |
 | `browser_reuse_session` | `1` | Keep the browser alive across consecutive tasks in the session, preserving cookies and in-memory tabs. |
 | `browser_hitl` | `1` | Human-in-the-loop interrupts (`ask_human`) for captchas, passwords and user input. |
 | `browser_flash_mode` | `0` | Much smaller system prompt (~2.4 KB vs ~22 KB) and leaner action schema — each step 2-4x faster on a small model. Off by default: A/B it on your model first. |
@@ -274,6 +286,10 @@ number of rounds. All default to `0`, meaning disabled.
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
 | `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check (deliverables, verification, re-plan, tests) before the model is told to answer; the answer so far is returned 2 rounds later. A write resets the count. `0` disables it. |
+| `initial_completion_cap` | `8192` | Completion-token cap for an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry; plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
+| `main_llm_min_tokens` | `4096` | Floor for the completion cap after a length cut-off: the retry gets about twice what the last normal reply used, never less than this and never more than the provider's limit. Resets after a normal reply. |
+| `length_retry_max_tokens` | `0` | Ceiling for the cap a cut-off retry earns. `0` = only the provider's limit. |
+| `length_cutoff_max_retries` | `4` | Consecutive length cut-offs before one final round with no tools that returns the partial answer and names the setting to raise. On the way: the 2nd retry turns thinking off, the 3rd compacts the conversation. `0` disables the final round. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
 | `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
@@ -341,6 +357,16 @@ where a silently half-done plan does damage.
 | `open_code_review_max_tools` | `50` | Tool rounds the reviewer may take (50-200). |
 | `open_code_review_concurrency` | `8` | Parallel file reviews (1-16). |
 | `open_code_review_file_timeout_minutes` | `15` | Per-file ceiling (1-60). The lever to raise on a slow endpoint — lowering the token budget or reviewing a smaller range are the alternatives. |
+
+## Display, logs and local data
+
+| Key | Default | Purpose |
+|---|---|---|
+| `syntax_theme` | `monokai` | Pygments style for code and diffs in the terminal. |
+| `log_enabled` | `1` | `0` turns off the JSONL log under `<data dir>/logs`. |
+| `log_level` | `INFO` | Level for that log: `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
+| `searxng_port` | `8080` | Host port for the local SearXNG container that `/search setup` provisions. |
+| `task_db_path` | `tasks.db` beside `config.txt` | SQLite store for long-running tasks. |
 
 ## Extension points
 

@@ -224,6 +224,7 @@ $Mem0Installed = $false
 $MemoryEngine = ""
 $RepositoryInstalled = $false
 $NodeInstalled = $false
+$script:NodeExe = $null
 $WhatsAppBridgeReady = $false
 $SandboxInstalled = $false
 
@@ -506,6 +507,8 @@ function Invoke-BoundedDownload {
 
     $result = @{ Success = $false; TimedOut = $false; Error = "" }
     $client = $null
+    $task = $null
+    $partialFile = "$OutFile.part-$PID-$([Guid]::NewGuid().ToString('N'))"
     $activityState = $null
     try {
         $client = New-Object System.Net.WebClient
@@ -513,7 +516,11 @@ function Invoke-BoundedDownload {
         $client.Headers.Add('User-Agent', 'agent8088-installer')
         if ($Proxy) { $client.Proxy = $Proxy }
 
-        $task = $client.DownloadFileTaskAsync($Uri, $OutFile)
+        # Download beside the destination and publish it only after completion.
+        # A timed-out WebClient can retain its file handle after CancelAsync on
+        # Windows; using a unique partial path ensures callers never observe a
+        # truncated archive at the requested destination.
+        $task = $client.DownloadFileTaskAsync($Uri, $partialFile)
         if ($Activity) { $activityState = Start-InstallerActivity -Message $Activity }
         $waitClock = New-Object System.Diagnostics.Stopwatch
         $waitClock.Start()
@@ -528,11 +535,20 @@ function Invoke-BoundedDownload {
             } elseif ($task.IsCanceled) {
                 $result.Error = "download was cancelled"
             } else {
-                $result.Success = $true
+                try {
+                    Move-Item -LiteralPath $partialFile -Destination $OutFile -Force -ErrorAction Stop
+                    $result.Success = $true
+                } catch {
+                    $result.Error = $_.Exception.Message
+                }
             }
         } else {
             $result.TimedOut = $true
             try { $client.CancelAsync() } catch { }
+            # Cancellation is asynchronous. Give WebClient a bounded window to
+            # close its output stream before cleanup tries to remove the partial
+            # archive. Without this, Windows can leave the file locked briefly.
+            try { [void]$task.Wait(5000) } catch { }
         }
     } catch {
         $result.Error = $_.Exception.Message
@@ -541,11 +557,17 @@ function Invoke-BoundedDownload {
         if ($client) { try { $client.Dispose() } catch { } }
     }
 
-    # A cancelled or faulted transfer leaves a truncated file. Removing it matters:
-    # every caller's next step is Expand-Archive or a self-extractor, and a partial
-    # archive fails there with a corruption error that names the wrong cause.
+    # A cancelled or faulted transfer leaves a truncated temporary file. Remove
+    # it when Windows releases the handle. The public destination was never
+    # created, so callers cannot mistake it for a complete archive.
     if (-not $result.Success) {
-        Remove-Item -Force -ErrorAction SilentlyContinue $OutFile
+        $cleanupClock = [System.Diagnostics.Stopwatch]::StartNew()
+        do {
+            Remove-Item -LiteralPath $partialFile -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $partialFile)) { break }
+            Start-Sleep -Milliseconds 100
+        } while ($cleanupClock.Elapsed.TotalSeconds -lt 5)
+        $cleanupClock.Stop()
     }
     return $result
 }
@@ -625,6 +647,17 @@ function Write-StageWarning {
     } else {
         $reason = "failed (exit $($Result.ExitCode))"
         Write-Warn "$What failed (exit $($Result.ExitCode)) - $Consequence"
+    }
+    # Captured process output used to disappear, leaving users with only an exit
+    # code. Keep the initial cause and final details, rather than only the tail
+    # of a native loader's stack trace. Include launch errors too.
+    $diagnostic = @($Result.Output, $Result.ErrorOutput, $Result.Error) -join "`n"
+    $lines = @($diagnostic -split '\r?\n' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($lines.Count -gt 12) {
+        $lines = @($lines | Select-Object -First 6) + @('...') + @($lines | Select-Object -Last 6)
+    }
+    foreach ($line in $lines) {
+        Write-Warn ("  " + ($line -replace '(https?://)[^\s/@]+:[^\s/@]+@', '$1***@'))
     }
     Register-SkippedStage -Label $What -Reason $reason -Fix $Fix
 }
@@ -907,8 +940,13 @@ function Install-LibreOffice {
     )
     $existing = $sofficePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($existing) {
-        Write-Success "LibreOffice found at $existing"
-        return $true
+        $existingProbe = Invoke-WithTimeout -FilePath $existing `
+            -Arguments @("--headless", "--version") -TimeoutSec 30 -CaptureOutput
+        if ($existingProbe.ExitCode -eq 0) {
+            Write-Success "LibreOffice found and verified at $existing"
+            return $true
+        }
+        Write-Warn "LibreOffice exists at $existing but does not run - attempting repair with WinGet"
     }
 
     if (-not (Read-LibreOfficeConsent)) {
@@ -941,8 +979,14 @@ function Install-LibreOffice {
 
     $installed = $sofficePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($installed) {
-        Write-Success "LibreOffice installed at $installed"
-        return $true
+        $installedProbe = Invoke-WithTimeout -FilePath $installed `
+            -Arguments @("--headless", "--version") -TimeoutSec 30 -CaptureOutput
+        if ($installedProbe.ExitCode -eq 0) {
+            Write-Success "LibreOffice installed and verified at $installed"
+            return $true
+        }
+        $wingetResult = $installedProbe
+        $wingetExit = $installedProbe.ExitCode
     }
 
     $wingetReason = if ($wingetResult.TimedOut) {
@@ -1535,6 +1579,67 @@ function Set-StageComplete {
     }
 }
 
+# Resume markers are only a performance hint. A marker can outlive the package,
+# native DLL, browser cache, or executable it represents, so every fast path
+# below pairs it with one of these real process-level health probes.
+$script:LastDependencyProbe = $null
+
+function Invoke-DependencyProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$WorkingDirectory,
+        [int]$TimeoutSec = 60
+    )
+    $probe = Invoke-WithTimeout -FilePath $FilePath -Arguments $Arguments `
+        -WorkingDirectory $WorkingDirectory -TimeoutSec $TimeoutSec -CaptureOutput
+    $script:LastDependencyProbe = $probe
+    return (-not $probe.TimedOut -and $probe.ExitCode -eq 0)
+}
+
+function Test-PythonModules {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonExe,
+        [Parameter(Mandatory = $true)][string[]]$Modules,
+        [int]$TimeoutSec = 60
+    )
+    if (-not (Test-Path -LiteralPath $PythonExe)) { return $false }
+    foreach ($module in $Modules) {
+        if ($module -notmatch '^[A-Za-z_][A-Za-z0-9_.]*$') { return $false }
+    }
+    $names = ($Modules | ForEach-Object { "'$_'" }) -join ', '
+    $code = "import importlib; [importlib.import_module(n) for n in ($names,)]"
+    return (Invoke-DependencyProbe -FilePath $PythonExe -Arguments @("-c", $code) -TimeoutSec $TimeoutSec)
+}
+
+function Test-PythonCode {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonExe,
+        [Parameter(Mandatory = $true)][string]$Code,
+        [int]$TimeoutSec = 60
+    )
+    if (-not (Test-Path -LiteralPath $PythonExe)) { return $false }
+    return (Invoke-DependencyProbe -FilePath $PythonExe -Arguments @("-c", $Code) -TimeoutSec $TimeoutSec)
+}
+
+function Test-NodeModules {
+    param(
+        [Parameter(Mandatory = $true)][string]$NodeExe,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string[]]$Modules,
+        [int]$TimeoutSec = 60
+    )
+    if (-not (Test-Path -LiteralPath $NodeExe)) { return $false }
+    foreach ($module in $Modules) {
+        if ($module -notmatch '^[@A-Za-z0-9_.][@A-Za-z0-9_./-]*$') { return $false }
+    }
+    $names = ($Modules | ForEach-Object { "'$_'" }) -join ', '
+    $code = "Promise.all([$names].map((name) => import(name))).catch((error) => { console.error(error); process.exit(1) })"
+    return (Invoke-DependencyProbe -FilePath $NodeExe `
+        -Arguments @("--input-type=module", "-e", $code) `
+        -WorkingDirectory $WorkingDirectory -TimeoutSec $TimeoutSec)
+}
+
 # ----------------------------------------------------------------------------
 # Stage 1: Install uv (managed, into $Agent8088Home\bin)
 # ----------------------------------------------------------------------------
@@ -1616,10 +1721,12 @@ function Install-UvFromGitHubRelease {
             Write-Warn "GitHub release archive did not contain uv.exe"
             return $false
         }
-        Copy-Item $uvExeFound.FullName (Join-Path $binDir "uv.exe") -Force
+        $targetUv = Join-Path $binDir "uv.exe"
+        Copy-Item $uvExeFound.FullName $targetUv -Force
         $uvxFound = Get-ChildItem -Path $tmpExtract -Recurse -Filter "uvx.exe" | Select-Object -First 1
         if ($uvxFound) { Copy-Item $uvxFound.FullName (Join-Path $binDir "uvx.exe") -Force }
-        return (Test-Path (Join-Path $binDir "uv.exe"))
+        return ((Test-Path $targetUv) -and `
+            (Invoke-DependencyProbe -FilePath $targetUv -Arguments @("--version")))
     } catch {
         Write-Warn "GitHub release fallback for uv failed: $_"
         return $false
@@ -1669,11 +1776,15 @@ function Install-Uv {
             Write-Warn "The uv installer timed out after $([int]($TUvBoot / 60))m"
         }
 
-        if (Test-Path $managedUv) {
+        if ((Test-Path $managedUv) -and `
+            (Invoke-DependencyProbe -FilePath $managedUv -Arguments @("--version"))) {
             $script:UvCmd = $managedUv
-            $version = & $managedUv --version
+            $version = "$($script:LastDependencyProbe.Output)".Trim()
             Write-Success "Managed uv installed ($version)"
             return $true
+        }
+        if (Test-Path $managedUv) {
+            Write-Warn "uv bootstrap produced an executable that did not run - trying the GitHub fallback"
         }
 
         # astral.sh was unreachable, or the bootstrap failed/timed out - try
@@ -1794,10 +1905,15 @@ function Test-Python {
 function Install-Git {
     Write-Info "Checking Git..."
 
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-        $version = git --version
-        Write-Success "Git found ($version)"
-        return $true
+    $existingGit = Get-Command git -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($existingGit) {
+        if (Invoke-DependencyProbe -FilePath $existingGit.Source -Arguments @("--version")) {
+            $version = "$($script:LastDependencyProbe.Output)".Trim()
+            Write-Success "Git found ($version)"
+            return $true
+        }
+        Write-Warn "Git exists at $($existingGit.Source) but does not run - installing PortableGit"
     }
 
     Write-Info "Git not found - downloading PortableGit to $Agent8088Home\git\ ..."
@@ -1872,14 +1988,16 @@ function Install-Git {
         # Persist to User PATH
         $newPathEntries = @("$gitDir\cmd", "$gitDir\bin", "$gitDir\usr\bin")
         $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        $userPathItems = if ($userPath) { $userPath -split ";" } else { @() }
-        $changed = $false
-        foreach ($entry in $newPathEntries) {
-            if ($userPathItems -notcontains $entry) { $userPathItems += $entry; $changed = $true }
-        }
-        if ($changed) { [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User") }
+        $userPathItems = if ($userPath) { @($userPath -split ";" | Where-Object { $_ }) } else { @() }
+        # Managed Git must win in a new shell when the Git already on PATH was
+        # present but broken. De-duplicate and prepend all three tool folders.
+        $remainingPathItems = @($userPathItems | Where-Object { $_ -notin $newPathEntries })
+        [Environment]::SetEnvironmentVariable("Path", (($newPathEntries + $remainingPathItems) -join ";"), "User")
 
-        $version = & $gitExe --version
+        if (-not (Invoke-DependencyProbe -FilePath $gitExe -Arguments @("--version"))) {
+            throw "git.exe did not run after extraction"
+        }
+        $version = "$($script:LastDependencyProbe.Output)".Trim()
         Write-Success "Git $version installed to $gitDir (portable, user-scoped)"
         return $true
     } catch {
@@ -2222,6 +2340,14 @@ function Clone-Repo {
         Write-Err "Repository verification failed at $InstallDir."
         return $false
     }
+    $requiredRepoPaths = @("pyproject.toml", "src\agent8088", "web\package.json", "web\package-lock.json")
+    $missingRepoPaths = @($requiredRepoPaths | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $InstallDir $_))
+    })
+    if ($missingRepoPaths.Count -gt 0) {
+        Write-Err "Repository checkout is incomplete; missing: $($missingRepoPaths -join ', ')"
+        return $false
+    }
     Write-Success "Repository ready at $InstallDir ($Branch@$installedCommit)"
     return $true
 }
@@ -2303,6 +2429,14 @@ function Install-Deps {
             if ($script:InstallLog) { Write-Info "Full log: $($script:InstallLog)" }
             throw "Failed to install agent8088"
         }
+        $coreModules = @("agent8088", "openai", "rich", "mcp", "PIL", "playwright", "ddgs", "fastapi", "uvicorn")
+        if (-not (Test-PythonModules -PythonExe $py -Modules $coreModules -TimeoutSec 120)) {
+            $probeText = ("$($script:LastDependencyProbe.Output)`n$($script:LastDependencyProbe.ErrorOutput)`n$($script:LastDependencyProbe.Error)").Trim()
+            Add-InstallLog -Title "core dependency import verification" -Text $probeText
+            Write-Err "Core packages were installed but could not be imported."
+            Write-OutputTail -Text $probeText
+            throw "core dependency verification failed"
+        }
     } catch {
         if ($prevEAP) { $ErrorActionPreference = $prevEAP }
         throw "Failed to install agent8088: $_"
@@ -2337,20 +2471,26 @@ function Install-Gateway-Extras {
         # WhatsApp bridge step redid every pip install and the ~280 MB
         # Chromium download from scratch, turning any single failure into a
         # full redo instead of a 30-second resume.
-        if (Test-StageComplete "gateway-extras") {
+        $gatewayModules = @("slack_bolt", "slack_sdk", "httpx", "discord", "telegram")
+        $gatewayHealthy = Test-PythonModules -PythonExe $py -Modules $gatewayModules
+        if ((Test-StageComplete "gateway-extras") -and $gatewayHealthy) {
             $script:GatewayExtrasInstalled = $true
-            Write-Success "Gateway adapters already installed (skipping)"
+            Write-Success "Gateway adapters already installed and verified (skipping)"
         } else {
+            if ((Test-StageComplete "gateway-extras") -and -not $gatewayHealthy) {
+                Write-Warn "Gateway resume marker is stale - repairing dependencies"
+            }
             Write-Info "Installing gateway adapter dependencies (Slack, Discord, WhatsApp, Telegram)..."
             $gwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[gateway]") `
                 -TimeoutSec $TPip -Activity "Installing gateway adapter dependencies"
-            if ($gwResult.ExitCode -eq 0) {
+            if ($gwResult.ExitCode -eq 0 -and (Test-PythonModules -PythonExe $py -Modules $gatewayModules)) {
                 $script:GatewayExtrasInstalled = $true
                 Set-StageComplete "gateway-extras"
                 Write-Success "Gateway adapters installed"
             } else {
-                Write-StageWarning -Result $gwResult -TimeoutSec $TPip `
+                $gwFailure = if ($gwResult.ExitCode -eq 0) { $script:LastDependencyProbe } else { $gwResult }
+                Write-StageWarning -Result $gwFailure -TimeoutSec $TPip `
                     -What "Gateway adapter extras" `
                     -Consequence "Slack/Discord/Telegram adapters unavailable" `
                     -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[gateway]`""
@@ -2358,20 +2498,26 @@ function Install-Gateway-Extras {
         }
 
         # Keyless web search backend ([search] extra - see pyproject.toml).
-        if (Test-StageComplete "search-extras") {
+        $searchModules = @("ddgs")
+        $searchHealthy = Test-PythonModules -PythonExe $py -Modules $searchModules
+        if ((Test-StageComplete "search-extras") -and $searchHealthy) {
             $script:SearchExtrasInstalled = $true
-            Write-Success "Keyless web search backend already installed (skipping)"
+            Write-Success "Keyless web search backend already installed and verified (skipping)"
         } else {
+            if ((Test-StageComplete "search-extras") -and -not $searchHealthy) {
+                Write-Warn "Search resume marker is stale - repairing dependencies"
+            }
             Write-Info "Installing keyless web search backend (ddgs)..."
             $searchResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[search]") `
                 -TimeoutSec $TPip -Activity "Installing keyless web search backend"
-            if ($searchResult.ExitCode -eq 0) {
+            if ($searchResult.ExitCode -eq 0 -and (Test-PythonModules -PythonExe $py -Modules $searchModules)) {
                 $script:SearchExtrasInstalled = $true
                 Set-StageComplete "search-extras"
                 Write-Success "Keyless web search backend installed"
             } else {
-                Write-StageWarning -Result $searchResult -TimeoutSec $TPip `
+                $searchFailure = if ($searchResult.ExitCode -eq 0) { $script:LastDependencyProbe } else { $searchResult }
+                Write-StageWarning -Result $searchFailure -TimeoutSec $TPip `
                     -What "Keyless web search backend (ddgs)" `
                     -Consequence "configure SearXNG or an API-key backend for web_search" `
                     -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[search]`""
@@ -2381,10 +2527,15 @@ function Install-Gateway-Extras {
         # OCR ([ocr] extra) lets a model without vision read attached images
         # and scanned PDFs. Non-fatal at both steps: ocr.available() reports
         # the gap at runtime rather than the install failing over it.
-        if (Test-StageComplete "ocr") {
+        $ocrProbe = "from rapidocr import RapidOCR; import onnxruntime, pypdfium2; RapidOCR()"
+        $ocrHealthy = Test-PythonCode -PythonExe $py -Code $ocrProbe -TimeoutSec 120
+        if ((Test-StageComplete "ocr") -and $ocrHealthy) {
             $script:OcrInstalled = $true
-            Write-Success "OCR engine already installed (skipping)"
+            Write-Success "OCR engine and models already installed and verified (skipping)"
         } else {
+            if ((Test-StageComplete "ocr") -and -not $ocrHealthy) {
+                Write-Warn "OCR resume marker is stale - repairing dependencies and models"
+            }
             Write-Info "Installing OCR engine (optional, for models without vision)..."
             $ocrResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[ocr]") `
@@ -2417,12 +2568,21 @@ function Install-Gateway-Extras {
         # Memory backend. The engine is recorded in config.txt either way, so a
         # config asking for mem0 can never outlive the extra that makes it work.
         if (Read-Mem0Consent) {
-            if (Test-StageComplete "mem0") {
+            $mem0Probe = "from agent8088.memory.mem0_store import _import_mem0; assert _import_mem0() is not None"
+            $mem0Healthy = Test-PythonCode -PythonExe $py -Code $mem0Probe -TimeoutSec 120
+            if ((Test-StageComplete "mem0") -and $mem0Healthy) {
                 $script:Mem0Installed = $true
-                Write-Success "mem0 memory backend already installed (skipping)"
+                Write-Success "mem0 memory backend already installed and verified (skipping)"
             } elseif (Install-Mem0Extra -PythonExe $py -SourceDir $InstallDir) {
-                $script:Mem0Installed = $true
-                Set-StageComplete "mem0"
+                if (Test-PythonCode -PythonExe $py -Code $mem0Probe -TimeoutSec 120) {
+                    $script:Mem0Installed = $true
+                    Set-StageComplete "mem0"
+                } else {
+                    Write-StageWarning -Result $script:LastDependencyProbe -TimeoutSec 120 `
+                        -What "mem0 memory backend verification" `
+                        -Consequence "memory will use the native engine instead" `
+                        -Fix "rerun the installer with -WithMem0"
+                }
             }
         } else {
             Write-Info "Using the native memory backend (SQLite, no extra downloads)."
@@ -2435,20 +2595,26 @@ function Install-Gateway-Extras {
         # and pure Python, so the usual reason to leave an extra out -- a wheel
         # that may not build here -- does not apply. Still non-fatal: the tool
         # reports the exact install command at runtime.
-        if (Test-StageComplete "repository") {
+        $repositoryModules = @("gitingest")
+        $repositoryHealthy = Test-PythonModules -PythonExe $py -Modules $repositoryModules
+        if ((Test-StageComplete "repository") -and $repositoryHealthy) {
             $script:RepositoryInstalled = $true
-            Write-Success "Repository context already installed (skipping)"
+            Write-Success "Repository context already installed and verified (skipping)"
         } else {
+            if ((Test-StageComplete "repository") -and -not $repositoryHealthy) {
+                Write-Warn "Repository context resume marker is stale - repairing dependencies"
+            }
             Write-Info "Installing repository context support (optional, for repository_read)..."
             $repoResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[repository]") `
                 -TimeoutSec $TPip -Activity "Installing repository context"
-            if ($repoResult.ExitCode -eq 0) {
+            if ($repoResult.ExitCode -eq 0 -and (Test-PythonModules -PythonExe $py -Modules $repositoryModules)) {
                 $script:RepositoryInstalled = $true
                 Set-StageComplete "repository"
                 Write-Success "Repository context installed"
             } else {
-                Write-StageWarning -Result $repoResult -TimeoutSec $TPip `
+                $repoFailure = if ($repoResult.ExitCode -eq 0) { $script:LastDependencyProbe } else { $repoResult }
+                Write-StageWarning -Result $repoFailure -TimeoutSec $TPip `
                     -What "repository context" `
                     -Consequence "repository_read will report the install command instead of running" `
                     -Fix "$script:UvCmd pip install --python `"$py`" -e `"$InstallDir[repository]`""
@@ -2457,10 +2623,16 @@ function Install-Gateway-Extras {
 
         # Playwright is an optional [browser] extra, so install the package
         # before asking it to fetch the Chromium binary.
-        if (Test-StageComplete "chromium") {
+        $env:PLAYWRIGHT_BROWSERS_PATH = "$Agent8088Home\playwright-browsers"
+        $chromiumProbe = "import os; from playwright.sync_api import sync_playwright; p=sync_playwright().start(); path=p.chromium.executable_path; p.stop(); assert path and os.path.isfile(path), path"
+        $chromiumHealthy = Test-PythonCode -PythonExe $py -Code $chromiumProbe -TimeoutSec 120
+        if ((Test-StageComplete "chromium") -and $chromiumHealthy) {
             $script:ChromiumInstalled = $true
-            Write-Success "Chromium already installed (skipping)"
+            Write-Success "Chromium already installed and verified (skipping)"
         } else {
+            if ((Test-StageComplete "chromium") -and -not $chromiumHealthy) {
+                Write-Warn "Chromium resume marker is stale - repairing the browser installation"
+            }
             Write-Info "Installing Playwright (optional, for browse_page)..."
             $pwResult = Invoke-WithTimeout -FilePath $script:UvCmd `
                 -Arguments @("pip", "install", "--python", $py, "-e", "$InstallDir[browser]") `
@@ -2470,16 +2642,16 @@ function Install-Gateway-Extras {
                 # Match engine.py's _exec_browser default: browsers live inside
                 # $Agent8088Home so `agent8088 --uninstall` already covers them
                 # without touching the OS-shared ms-playwright cache.
-                $env:PLAYWRIGHT_BROWSERS_PATH = "$Agent8088Home\playwright-browsers"
                 $chromiumResult = Invoke-WithTimeout -FilePath $py `
                     -Arguments @("-m", "playwright", "install", "chromium") `
                     -TimeoutSec $TChromium -Activity "Installing Playwright Chromium"
-                if ($chromiumResult.ExitCode -eq 0) {
+                if ($chromiumResult.ExitCode -eq 0 -and (Test-PythonCode -PythonExe $py -Code $chromiumProbe -TimeoutSec 120)) {
                     $script:ChromiumInstalled = $true
                     Set-StageComplete "chromium"
                     Write-Success "Chromium installed for browse_page"
                 } else {
-                    Write-StageWarning -Result $chromiumResult -TimeoutSec $TChromium `
+                    $chromiumFailure = if ($chromiumResult.ExitCode -eq 0) { $script:LastDependencyProbe } else { $chromiumResult }
+                    Write-StageWarning -Result $chromiumFailure -TimeoutSec $TChromium `
                         -What "Chromium browser" `
                         -Consequence "browse_page will show install instructions" `
                         -Fix "`"$py`" -m playwright install chromium"
@@ -2517,9 +2689,14 @@ function Install-Node-Bridge {
             if ($major -gt 20 -or ($major -eq 20 -and $minor -ge 11)) {
                 $candidateNpm = Join-Path (Split-Path $existingNode.Source -Parent) "npm.cmd"
                 if (Test-Path $candidateNpm) {
-                    $nodeExe = $existingNode.Source
-                    $npmExe = $candidateNpm
-                    Write-Success "Node $ver found on PATH"
+                    $npmHealthy = Invoke-DependencyProbe -FilePath $candidateNpm -Arguments @("--version")
+                    if ($npmHealthy) {
+                        $nodeExe = $existingNode.Source
+                        $npmExe = $candidateNpm
+                        Write-Success "Node $ver and npm found on PATH"
+                    } else {
+                        Write-Warn "Node $ver has an unusable npm.cmd at $candidateNpm - will install portable Node"
+                    }
                 } else {
                     Write-Warn "Node $ver has no matching npm.cmd at $candidateNpm - will install portable Node"
                 }
@@ -2543,9 +2720,10 @@ function Install-Node-Bridge {
             } catch {
                 $ver = $null
             }
-            if ($ver) {
+            $managedNpm = Join-Path $Agent8088Home "node\npm.cmd"
+            if ($ver -and (Test-Path $managedNpm) -and (Invoke-DependencyProbe -FilePath $managedNpm -Arguments @("--version"))) {
                 $nodeExe = $managedNode
-                $npmExe = Join-Path $Agent8088Home "node\npm.cmd"
+                $npmExe = $managedNpm
                 Write-Success "Managed Node found ($ver)"
                 # The fresh-install branch below adds $nodeDir to $env:Path so this
                 # session's own child processes can find node - a resumed install
@@ -2558,12 +2736,10 @@ function Install-Node-Bridge {
                 }
                 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
                 $userPathItems = if ($userPath) { $userPath -split ";" } else { @() }
-                if ($userPathItems -notcontains $managedNodeDir) {
-                    $userPathItems += $managedNodeDir
-                    [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
-                }
+                $userPathItems = @($managedNodeDir) + @($userPathItems | Where-Object { $_ -and $_ -ne $managedNodeDir })
+                [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
             } else {
-                Write-Warn "Existing Node at $managedNode did not run - reinstalling"
+                Write-Warn "Existing Node/npm at $managedNode did not run - reinstalling"
             }
         }
     }
@@ -2625,11 +2801,12 @@ function Install-Node-Bridge {
             $env:Path = "$nodeDir;$env:Path"
             $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
             $userPathItems = if ($userPath) { $userPath -split ";" } else { @() }
-            if ($userPathItems -notcontains $nodeDir) {
-                $userPathItems += $nodeDir
-                [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
-            }
+            $userPathItems = @($nodeDir) + @($userPathItems | Where-Object { $_ -and $_ -ne $nodeDir })
+            [Environment]::SetEnvironmentVariable("Path", ($userPathItems -join ";"), "User")
             $ver = & $nodeExe --version
+            if (-not (Invoke-DependencyProbe -FilePath $npmExe -Arguments @("--version"))) {
+                throw "npm.cmd did not run after Node extraction"
+            }
             Write-Success "Node $ver installed to $nodeDir (portable, user-scoped)"
         } catch {
             Write-Warn "Could not install portable Node: $_"
@@ -2642,6 +2819,7 @@ function Install-Node-Bridge {
     }
 
     $script:NodeInstalled = $true
+    $script:NodeExe = $nodeExe
     # Publish npm to script scope so Install-WebUI can reuse the exact binary
     # this stage found/installed instead of re-resolving it.
     $script:NpmExe = $npmExe
@@ -2653,11 +2831,9 @@ function Install-Node-Bridge {
         return
     }
     $nodeModules = Join-Path $bridgeDir "node_modules"
-    if (Test-Path $nodeModules) {
-        Write-Success "WhatsApp bridge node_modules already present"
-        $script:WhatsAppBridgeReady = $true
-        return
-    }
+    # As with the Web UI, a partial dependency tree must not be marked ready.
+    $bridgeInstallCommand = if (Test-Path (Join-Path $bridgeDir "package-lock.json")) { "ci" } else { "install" }
+    $bridgeRepairCommand = "cd `"$bridgeDir`"; npm.cmd $bridgeInstallCommand --include=optional"
 
     # MAX_PATH is 260 unless LongPathsEnabled is on (Windows 10 1607+, off by
     # default). The bridge sits about 120 characters deep before node_modules
@@ -2685,21 +2861,30 @@ function Install-Node-Bridge {
     $ErrorActionPreference = "Continue"
     try {
         $npmResult = Invoke-WithTimeout -FilePath $npmExe `
-            -Arguments (@("install", "--prefix", $bridgeDir, "--no-audit", "--no-fund") + $npmExtraArgs) `
+            -Arguments (@($bridgeInstallCommand, "--prefix", $bridgeDir, "--include=optional", "--no-audit", "--no-fund") + $npmExtraArgs) `
+            -WorkingDirectory $bridgeDir -CaptureOutput `
             -TimeoutSec $TNpm -Activity "Installing WhatsApp bridge dependencies"
-        if ($npmResult.ExitCode -eq 0 -and (Test-Path $nodeModules)) {
+        $bridgeModules = @("@whiskeysockets/baileys", "express", "qrcode-terminal", "pino")
+        $bridgeHealthy = ($npmResult.ExitCode -eq 0 -and (Test-Path $nodeModules) -and `
+            (Test-NodeModules -NodeExe $nodeExe -WorkingDirectory $bridgeDir -Modules $bridgeModules))
+        if ($bridgeHealthy) {
             $script:WhatsAppBridgeReady = $true
             Write-Success "WhatsApp bridge npm dependencies installed"
         } elseif ($npmResult.ExitCode -eq 0) {
-            Write-Warn "WhatsApp bridge npm install reported success but node_modules missing"
-            Register-SkippedStage -Label "WhatsApp bridge" `
-                -Reason "npm reported success but node_modules missing" `
-                -Fix "cd `"$bridgeDir`"; npm install"
+            $bridgeFailure = if (Test-Path $nodeModules) {
+                $script:LastDependencyProbe
+            } else {
+                @{ ExitCode = 1; TimedOut = $false; Error = "npm reported success but node_modules is missing" }
+            }
+            Write-StageWarning -Result $bridgeFailure -TimeoutSec 60 `
+                -What "WhatsApp bridge verification" `
+                -Consequence "WhatsApp adapter unavailable" `
+                -Fix $bridgeRepairCommand
         } else {
             Write-StageWarning -Result $npmResult -TimeoutSec $TNpm `
                 -What "WhatsApp bridge npm dependencies" `
                 -Consequence "WhatsApp adapter unavailable" `
-                -Fix "cd `"$bridgeDir`"; npm install"
+                -Fix $bridgeRepairCommand
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -2717,6 +2902,30 @@ function Install-Node-Bridge {
 # failure registers a skipped stage and names the fix; it never aborts.
 $WebUIReady = $false
 
+function Test-WebUIDist {
+    param([Parameter(Mandatory = $true)][string]$WebDir)
+    $index = Join-Path $WebDir "dist\index.html"
+    try {
+        $item = Get-Item -LiteralPath $index -ErrorAction Stop
+        if ($item.Length -le 0) { return $false }
+        $html = Get-Content -LiteralPath $index -Raw -ErrorAction Stop
+        $assetMatches = [regex]::Matches($html, '(?i)(?:src|href)=["'']/?(?<asset>assets/[^"'']+)')
+        if ($assetMatches.Count -eq 0) { return $false }
+        $hasJavaScript = $false
+        foreach ($match in $assetMatches) {
+            $asset = $match.Groups['asset'].Value
+            if ($asset -match '(?i)[.]js(?:$|[?#])') { $hasJavaScript = $true }
+            $assetPath = ($asset -split '[?#]', 2)[0]
+            if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $WebDir "dist") $assetPath))) {
+                return $false
+            }
+        }
+        return $hasJavaScript
+    } catch {
+        return $false
+    }
+}
+
 function Install-WebUI {
     $webDir = Join-Path $InstallDir "web"
     if (-not (Test-Path (Join-Path $webDir "package.json"))) {
@@ -2728,9 +2937,8 @@ function Install-WebUI {
     }
 
     $distDir = Join-Path $webDir "dist"
-    $distIndex = Join-Path $distDir "index.html"
-    if (Test-Path $distIndex) {
-        Write-Success "Web UI frontend already built ($distDir)"
+    if (Test-WebUIDist -WebDir $webDir) {
+        Write-Success "Web UI frontend already built and verified ($distDir)"
         $script:WebUIReady = $true
         return
     }
@@ -2743,25 +2951,30 @@ function Install-WebUI {
         return
     }
 
-    $nodeModules = Join-Path $webDir "node_modules"
-    if (-not (Test-Path $nodeModules)) {
-        Write-Info "Installing web UI npm dependencies..."
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            $npmInstall = Invoke-WithTimeout -FilePath $script:NpmExe `
-                -Arguments @("install", "--prefix", $webDir, "--no-audit", "--no-fund") `
-                -TimeoutSec $TNpm -Activity "Installing web UI dependencies"
-            if ($npmInstall.ExitCode -ne 0) {
-                Write-StageWarning -Result $npmInstall -TimeoutSec $TNpm `
-                    -What "Web UI npm dependencies" `
-                    -Consequence "agent8088 --web unavailable" `
-                    -Fix "cd `"$webDir`"; npm install"
-                return
-            }
-        } finally {
-            $ErrorActionPreference = $prevEAP
+    # A directory is not proof of a complete install: interrupted downloads and
+    # npm's optional-dependency bug can leave Tailwind/Rollup native bindings
+    # missing. Reconcile dependencies on every build attempt. ci starts clean
+    # from our cross-platform lockfile without deleting or regenerating it.
+    # Explicit includes override NODE_ENV=production and npm omit settings.
+    $installCommand = if (Test-Path (Join-Path $webDir "package-lock.json")) { "ci" } else { "install" }
+    $repairCommand = "cd `"$webDir`"; npm.cmd $installCommand --include=dev --include=optional; npm.cmd run build"
+    Write-Info "Installing web UI npm dependencies..."
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $npmInstall = Invoke-WithTimeout -FilePath $script:NpmExe `
+            -Arguments @($installCommand, "--prefix", $webDir, "--include=dev", "--include=optional", "--no-audit", "--no-fund") `
+            -WorkingDirectory $webDir -CaptureOutput `
+            -TimeoutSec $TNpm -Activity "Installing web UI dependencies"
+        if ($npmInstall.ExitCode -ne 0) {
+            Write-StageWarning -Result $npmInstall -TimeoutSec $TNpm `
+                -What "Web UI npm dependencies" `
+                -Consequence "agent8088 --web unavailable" `
+                -Fix $repairCommand
+            return
         }
+    } finally {
+        $ErrorActionPreference = $prevEAP
     }
 
     Write-Info "Building web UI frontend..."
@@ -2770,15 +2983,16 @@ function Install-WebUI {
     try {
         $buildResult = Invoke-WithTimeout -FilePath $script:NpmExe `
             -Arguments @("run", "build", "--prefix", $webDir) `
+            -WorkingDirectory $webDir -CaptureOutput `
             -TimeoutSec $TNpm -Activity "Building web UI frontend"
-        if ($buildResult.ExitCode -eq 0 -and (Test-Path $distIndex)) {
+        if ($buildResult.ExitCode -eq 0 -and (Test-WebUIDist -WebDir $webDir)) {
             $script:WebUIReady = $true
             Write-Success "Web UI frontend built ($distDir)"
         } else {
             Write-StageWarning -Result $buildResult -TimeoutSec $TNpm `
                 -What "Web UI build" `
                 -Consequence "agent8088 --web unavailable" `
-                -Fix "cd `"$webDir`"; npm install; npm run build"
+                -Fix $repairCommand
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -2833,6 +3047,9 @@ function Install-CodeReview {
         $script:ReviewExecutable = $reviewBin
         Write-Success "Code review engine already installed (skipping)"
         return
+    }
+    if (Test-StageComplete "codereview") {
+        Write-Warn "Code review resume marker is stale - repairing the engine"
     }
     $npmPath = $script:NpmExe
     if (-not $npmPath -or -not (Test-Path -LiteralPath $npmPath)) {
@@ -2906,10 +3123,21 @@ function Install-Embedding-Model {
     $pullResult = Invoke-WithTimeout -FilePath $ollama.Source `
         -Arguments @("pull", $EmbedModel) -TimeoutSec $TOllamaPull `
         -Activity "Pulling embedding model $EmbedModel"
+    $verifyModel = $null
     if ($pullResult.ExitCode -eq 0) {
-        Write-Success "Embedding model $EmbedModel installed"
+        $verifyModel = Invoke-WithTimeout -FilePath $ollama.Source `
+            -Arguments @("list") -TimeoutSec $TOllamaCheck -CaptureOutput
+    }
+    if ($pullResult.ExitCode -eq 0 -and $verifyModel.ExitCode -eq 0 -and `
+        $verifyModel.Output -match "(?m)^$([regex]::Escape($EmbedModel))") {
+        Write-Success "Embedding model $EmbedModel installed and verified"
     } else {
-        Write-StageWarning -Result $pullResult -TimeoutSec $TOllamaPull `
+        $modelFailure = if ($pullResult.ExitCode -eq 0) {
+            if ($verifyModel.ExitCode -eq 0) {
+                @{ ExitCode = 1; TimedOut = $false; Error = "ollama pull succeeded but the model is absent from ollama list" }
+            } else { $verifyModel }
+        } else { $pullResult }
+        Write-StageWarning -Result $modelFailure -TimeoutSec $TOllamaPull `
             -What "Embedding model $EmbedModel" `
             -Consequence "memory recall will use keyword search only" `
             -Fix "ollama pull $EmbedModel"

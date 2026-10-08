@@ -157,7 +157,7 @@ sensitive-file floor still applies unconditionally.
 | `/reset` | Clear the current conversation |
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
-| `/save <file>` | Export conversation + trace to JSON (mode `0600`) |
+| `/save [file]` | Export conversation + trace to JSON (mode `0600`). Without a name it writes `agent8088_session-<date>-<time>.json`, so earlier saves are never overwritten |
 | `/status` | Model, mode, tools, skills, token usage; `Limited` rows for anything on a fallback ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)) |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
@@ -235,8 +235,8 @@ sensitive-file floor still applies unconditionally.
 | `/cost [on\|off\|<task_id>]` | Local telemetry summary of model cost/usage; `on`/`off` toggles recording, persisted to `config.txt` |
 | `/review` | Bare: list stored reviews. With arguments: launch `review_code` from the CLI — same tool the model calls, see [`review_code`](04-tools.md#review_code) |
 | `/doctor [--fix]` | Environment health check, incl. a row per [reduced mode](13-troubleshooting.md#reduced-modes-and-fallbacks); `--fix` repairs a broken web-search install |
-| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report |
-| `/trace [on\|off]` | Toggle JSON trace capture |
+| `/dump` | Write a redacted diagnostic bundle, `dump-<date>-<time>.txt` in the data folder, for sharing in a bug report |
+| `/trace [on\|off\|save [file]]` | Toggle JSON trace capture; `save` exports it (default name `<session>_trace-<date>-<time>.json`) |
 | `/verbose` | Toggle verbose output |
 
 ### Memory

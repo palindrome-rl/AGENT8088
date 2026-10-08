@@ -178,6 +178,11 @@ and prints a retry command. Logs are saved to
 Rerun the same command to resume; optional failures are listed separately from
 core startup failures. See [installation troubleshooting](docs/wiki/13-troubleshooting.md#installation-fails-or-stops).
 
+The Windows installer verifies dependencies by running their executables,
+importing installed Python/Node packages, checking Chromium and OCR resources,
+and validating WebUI assets. A stale resume marker or partial dependency folder
+triggers repair instead of being treated as success.
+
 The installers do not add the `[dev]` extra (pytest, ruff, pip-audit), and the
 root Python `tests/` suite is not included in this release branch. Neither is
 needed to install or run Agent8088.
@@ -225,7 +230,8 @@ Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
 | `/capabilities` | Show the live tool, MCP, sandbox, skill, sub-agent, and guardrail configuration. |
 | `/cli-anything <task>` | Find, install, run, build, refine, test, or validate an application CLI through the experimental CLI-Anything integration. |
 | `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
-| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report. |
+| `/dump` | Write a redacted diagnostic bundle (`dump-<date>-<time>.txt` in the data folder) for sharing in a bug report. |
+| `/save [file]` | Export the conversation and trace to JSON. Without a name it writes a new date-stamped file, so earlier saves are kept. |
 
 ---
 
@@ -273,6 +279,7 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store. Nothing leaves your machine. |
 | **Stay in your workflow** | Use the interactive CLI, the browser-based web UI with live diffs and approvals, or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
 | **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. |
+| **Finish long runs cleanly** | A reply cut off at the output limit is discarded, not replayed, and retried with a smaller cap and then with thinking off, so a run ends with an answer instead of a timeout. Checks after a final answer are capped, and a missing working directory falls back to one that exists instead of failing every command. |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
 | **See what the agent is using** | Per-turn token and timing summaries, optional local cost telemetry, provider-limit indicators where supported, and audit logs make resource use and execution visible. |
 
@@ -288,7 +295,7 @@ Agent8088 has three permission modes:
 | **`full-auto`** *(default)* | Work without per-action prompts inside the configured workspace. The always-on safety floor still applies. |
 | **`plan-only`** | Research and present a plan first; approved work then uses the regular permission path. |
 
-Some actions are blocked in every mode: credential paths, shell startup-file writes, destructive Git operations such as `push` and `reset --hard`, and system-prompt exfiltration. See the [security guide](docs/wiki/03-permissions-and-security.md) for the exact boundaries and configuration.
+Some actions are blocked in every mode: credential paths, shell startup-file writes, destructive Git operations such as `reset --hard` (and any `git push` run through the shell), and system-prompt exfiltration. Pushing goes through the `git_push` tool, which asks for approval every time, for that exact remote and branch, even in `full-auto`. See the [security guide](docs/wiki/03-permissions-and-security.md) for the exact boundaries and configuration.
 
 <details>
 <summary><b>CLI-Anything integration</b> <i>(experimental)</i></summary>
